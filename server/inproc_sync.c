@@ -290,7 +290,7 @@ void signal_inproc_sync( struct inproc_sync *sync )
     if (sync->shm_idx != ~0u)
     {
         lf_sync_set_event( &lockfree_dispatcher.arena, &lockfree_dispatcher.objects[sync->shm_idx], NULL );
-        lf_sync_wake_waiters( &lockfree_dispatcher );
+        lf_sync_wake_object( &lockfree_dispatcher, sync->shm_idx );
     }
     else
     {
@@ -343,8 +343,7 @@ void abandon_inproc_mutexes( thread_id_t tid )
 
     if (lockfree_shared)
     {
-        if (lf_sync_abandon_owned_mutexes( &lockfree_dispatcher, tid ))
-            lf_sync_wake_waiters( &lockfree_dispatcher );
+        lf_sync_abandon_owned_mutexes( &lockfree_dispatcher, tid );
         lf_sync_abandon_waits( &lockfree_dispatcher, tid );
         return;
     }

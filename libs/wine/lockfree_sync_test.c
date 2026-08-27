@@ -395,7 +395,7 @@ static void test_shared_parking(void)
     {
         if (read( ready[0], &byte, 1 ) != 1) failures++;
         lf_sync_set_event( &dispatcher.arena, &shared->objects[0], NULL );
-        lf_sync_wake_waiters( &dispatcher );
+        lf_sync_wake_object( &dispatcher, 0 );
         waitpid( child, &status, 0 );
         ok( WIFEXITED(status) && !WEXITSTATUS(status), "cross-process waiter failed with status %#x\n", status );
         ok( lf_sync_load( &dispatcher.arena, 0 ) == 0, "cross-process wait did not consume event\n" );
@@ -415,13 +415,17 @@ static void test_registered_timeout(void)
     init_dispatcher( &dispatcher, &shared );
     lf_sync_init_event( &dispatcher.arena, &shared.objects[0], 0, 0, 0 );
     ok( lf_sync_wait_begin( &dispatcher, &object, 1, 0, 88, &ticket ), "wait registration failed\n" );
+    ok( shared.objects[0].waiters[0] & (UINT64_C(1) << ticket.slot),
+        "waiter was not registered on its object\n" );
     ok( lf_sync_wait_timeout( &dispatcher, &ticket ), "registered timeout lost without a signal\n" );
     lf_sync_set_event( &dispatcher.arena, &shared.objects[0], NULL );
-    lf_sync_wake_waiters( &dispatcher );
+    lf_sync_wake_object( &dispatcher, 0 );
     result = lf_sync_wait_poll( &dispatcher, &ticket );
     ok( (result & 0xff) == LF_SYNC_WAIT_TIMED_OUT, "signal overwrote terminal timeout status\n" );
     ok( lf_sync_load( &dispatcher.arena, 0 ) == 1, "signal after timeout was incorrectly consumed\n" );
     lf_sync_wait_end( &dispatcher, &ticket );
+    ok( !(shared.objects[0].waiters[0] & (UINT64_C(1) << ticket.slot)),
+        "waiter was not removed from its object\n" );
 }
 
 static void test_registered_mutex_limit(void)

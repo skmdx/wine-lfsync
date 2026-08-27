@@ -847,7 +847,7 @@ static NTSTATUS inproc_release_semaphore( HANDLE handle, ULONG count, ULONG *pre
     {
         ret = lockfree_result_to_status( lf_sync_release_semaphore( &lockfree_dispatcher.arena,
                                                 get_lockfree_object( sync ), count, prev_count ) );
-        if (!ret) lf_sync_wake_waiters( &lockfree_dispatcher );
+        if (!ret) lf_sync_wake_object( &lockfree_dispatcher, sync->shm_idx );
     }
     else ret = linux_release_semaphore_obj( sync->fd, count, prev_count );
     release_inproc_sync( sync );
@@ -880,7 +880,7 @@ static NTSTATUS inproc_set_event( HANDLE handle, LONG *prev_state )
     {
         ret = lockfree_result_to_status( lf_sync_set_event( &lockfree_dispatcher.arena,
                                     get_lockfree_object( sync ), (uint32_t *)prev_state ) );
-        if (!ret) lf_sync_wake_waiters( &lockfree_dispatcher );
+        if (!ret) lf_sync_wake_object( &lockfree_dispatcher, sync->shm_idx );
     }
     else ret = linux_set_event_obj( sync->fd, prev_state );
     release_inproc_sync( sync );
@@ -954,7 +954,7 @@ static NTSTATUS inproc_release_mutex( HANDLE handle, LONG *prev_count )
         if (!ret)
         {
             if (prev_count) *prev_count = 1 - count;
-            lf_sync_wake_waiters( &lockfree_dispatcher );
+            lf_sync_wake_object( &lockfree_dispatcher, sync->shm_idx );
         }
     }
     else ret = linux_release_mutex_obj( sync->fd, prev_count );
@@ -1167,7 +1167,7 @@ static NTSTATUS inproc_signal_and_wait( HANDLE signal, HANDLE wait,
             break;
         default: assert( 0 ); break;
         }
-        if (!ret) lf_sync_wake_waiters( &lockfree_dispatcher );
+        if (!ret) lf_sync_wake_object( &lockfree_dispatcher, signal_sync->shm_idx );
     }
     else
     {

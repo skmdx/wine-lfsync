@@ -16,7 +16,7 @@
 
 #define LF_SYNC_MCAS_MAX_WORDS 65
 #define LF_SYNC_SHARED_MAGIC UINT64_C(0x57494e454c465359) /* WINELFSY */
-#define LF_SYNC_SHARED_VERSION 2
+#define LF_SYNC_SHARED_VERSION 3
 #define LF_SYNC_SHARED_OBJECTS 262144
 #define LF_SYNC_SHARED_WAITS 2048
 #define LF_SYNC_SHARED_DESCS 512
@@ -74,6 +74,7 @@ struct lf_sync_object
     uint32_t limit;
     uint32_t flags;
     uint64_t pulse;
+    uint64_t waiters[LF_SYNC_SHARED_WAITS / 64];
 };
 
 #define LF_SYNC_MAX_WAIT_OBJECTS 64
@@ -230,7 +231,7 @@ int lf_sync_wait_timeout( const struct lf_sync_dispatcher *dispatcher,
                           const struct lf_sync_wait_ticket *ticket );
 void lf_sync_wait_end( const struct lf_sync_dispatcher *dispatcher,
                        const struct lf_sync_wait_ticket *ticket );
-void lf_sync_wake_waiters( const struct lf_sync_dispatcher *dispatcher );
+void lf_sync_wake_object( const struct lf_sync_dispatcher *dispatcher, uint32_t object );
 enum lf_sync_result lf_sync_pulse_event( const struct lf_sync_dispatcher *dispatcher,
                                          uint32_t object, uint32_t *previous );
 void lf_sync_abandon_waits( const struct lf_sync_dispatcher *dispatcher, uint32_t owner );
