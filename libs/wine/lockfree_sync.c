@@ -557,11 +557,10 @@ enum lf_sync_result lf_sync_query_mutex( const struct lf_sync_arena *arena,
     return LF_SYNC_SUCCESS;
 }
 
-static enum lf_sync_result prepare_acquire( const struct lf_sync_arena *arena,
-                                            const struct lf_sync_object *object, uint32_t owner,
-                                            struct lf_sync_mcas_entry *entry )
+static enum lf_sync_result prepare_acquire_value( const struct lf_sync_object *object,
+                                                  uint32_t owner, uint64_t value,
+                                                  struct lf_sync_mcas_entry *entry )
 {
-    uint64_t value = lf_sync_load( arena, object->word );
     uint32_t count;
 
     entry->word = object->word;
@@ -584,6 +583,42 @@ static enum lf_sync_result prepare_acquire( const struct lf_sync_arena *arena,
         if (count == LF_MUTEX_COUNT_MASK) return LF_SYNC_LIMIT_EXCEEDED;
         entry->desired = mutex_value( owner, count + 1, 0 );
         return mutex_abandoned( value ) ? LF_SYNC_ABANDONED : LF_SYNC_SUCCESS;
+    default:
+        return LF_SYNC_INVALID;
+    }
+}
+
+static enum lf_sync_result prepare_acquire( const struct lf_sync_arena *arena,
+                                            const struct lf_sync_object *object, uint32_t owner,
+                                            struct lf_sync_mcas_entry *entry )
+{
+    return prepare_acquire_value( object, owner, lf_sync_load( arena, object->word ), entry );
+}
+
+static enum lf_sync_result prepare_signal_value( const struct lf_sync_object *object,
+                                                 uint32_t owner, uint64_t value,
+                                                 struct lf_sync_mcas_entry *entry )
+{
+    uint32_t count;
+
+    entry->word = object->word;
+    entry->pad = 0;
+    entry->expected = value;
+
+    switch (object->type)
+    {
+    case LF_SYNC_EVENT:
+        entry->desired = 1;
+        return LF_SYNC_SUCCESS;
+    case LF_SYNC_SEMAPHORE:
+        if (value >= object->limit) return LF_SYNC_LIMIT_EXCEEDED;
+        entry->desired = value + 1;
+        return LF_SYNC_SUCCESS;
+    case LF_SYNC_MUTEX:
+        count = mutex_count( value );
+        if (!count || mutex_owner( value ) != owner) return LF_SYNC_NOT_OWNER;
+        entry->desired = count == 1 ? 0 : mutex_value( owner, count - 1, 0 );
+        return LF_SYNC_SUCCESS;
     default:
         return LF_SYNC_INVALID;
     }
@@ -831,9 +866,9 @@ done:
     release_wait( wait );
 }
 
-int lf_sync_wait_begin_alert( const struct lf_sync_dispatcher *dispatcher, const uint32_t *objects,
-                              uint32_t count, int wait_all, uint32_t owner, uint32_t alert_object,
-                              struct lf_sync_wait_ticket *ticket )
+static int register_wait( const struct lf_sync_dispatcher *dispatcher, const uint32_t *objects,
+                          uint32_t count, int wait_all, uint32_t owner, uint32_t alert_object,
+                          enum lf_sync_wait_status initial_status, struct lf_sync_wait_ticket *ticket )
 {
     struct lf_sync_wait *wait;
     uint32_t generation, i, slot;
@@ -859,20 +894,34 @@ int lf_sync_wait_begin_alert( const struct lf_sync_dispatcher *dispatcher, const
     ticket->generation = generation;
     ticket->waiting = lf_sync_wait_value( generation, LF_SYNC_WAITING, 0 );
     __atomic_store_n( &dispatcher->arena.words[dispatcher->status_word_base + slot].value,
-                      ticket->waiting, __ATOMIC_RELEASE );
+                      lf_sync_wait_value( generation, initial_status, 0 ), __ATOMIC_RELEASE );
     __atomic_store_n( &wait->published, generation, __ATOMIC_RELEASE );
     for (i = 0; i < count; ++i) register_object_wait( &dispatcher->objects[objects[i]], slot );
     if (alert_object < dispatcher->object_count)
         register_object_wait( &dispatcher->objects[alert_object], slot );
 
+    return 1;
+}
+
+int lf_sync_wait_begin_alert( const struct lf_sync_dispatcher *dispatcher, const uint32_t *objects,
+                              uint32_t count, int wait_all, uint32_t owner, uint32_t alert_object,
+                              struct lf_sync_wait_ticket *ticket )
+{
+    struct lf_sync_wait *wait;
+    uint32_t i;
+
+    if (!register_wait( dispatcher, objects, count, wait_all, owner, alert_object,
+                        LF_SYNC_WAITING, ticket )) return 0;
+    wait = &dispatcher->waits[ticket->slot];
+
     /* This retry pairs with signal-side scanning and closes the registration
      * window in which an object can become signaled before publication. */
-    retry_wait( dispatcher, slot, generation );
+    retry_wait( dispatcher, ticket->slot, ticket->generation );
     for (i = 0; i < count; ++i)
     {
         uint64_t pulse_generation = load_u64( &dispatcher->objects[objects[i]].pulse ) >> 1;
         if (pulse_generation != wait->object_generations[i])
-            pulse_wait( dispatcher, slot, generation, objects[i], pulse_generation );
+            pulse_wait( dispatcher, ticket->slot, ticket->generation, objects[i], pulse_generation );
     }
     return 1;
 }
@@ -882,6 +931,92 @@ int lf_sync_wait_begin( const struct lf_sync_dispatcher *dispatcher, const uint3
                         struct lf_sync_wait_ticket *ticket )
 {
     return lf_sync_wait_begin_alert( dispatcher, objects, count, wait_all, owner, ~0u, ticket );
+}
+
+enum lf_sync_result lf_sync_signal_and_wait_begin( const struct lf_sync_dispatcher *dispatcher,
+                                                   uint32_t signal_object, uint32_t wait_object,
+                                                   uint32_t owner, uint32_t alert_object,
+                                                   struct lf_sync_wait_ticket *ticket )
+{
+    const struct lf_sync_object *signal, *wait;
+    struct lf_sync_mcas_entry entries[3], wait_entry;
+    struct lf_sync_wait *registered;
+    enum lf_sync_result result, wait_result;
+    uint32_t indices[3] = {0, 1, 2}, count, object = wait_object;
+    uint64_t signal_value, prepared, pulse_generation;
+    enum lf_sync_wait_status status;
+    int mcas;
+
+    if (signal_object >= dispatcher->object_count || wait_object >= dispatcher->object_count ||
+        !owner || owner == LF_MUTEX_ABANDONED_OWNER) return LF_SYNC_INVALID;
+    if (!register_wait( dispatcher, &object, 1, 0, owner, alert_object,
+                        LF_SYNC_WAIT_PREPARED, ticket )) return LF_SYNC_RETRY;
+
+    signal = &dispatcher->objects[signal_object];
+    wait = &dispatcher->objects[wait_object];
+    registered = &dispatcher->waits[ticket->slot];
+    prepared = lf_sync_wait_value( ticket->generation, LF_SYNC_WAIT_PREPARED, 0 );
+
+    for (;;)
+    {
+        signal_value = lf_sync_load( &dispatcher->arena, signal->word );
+        result = prepare_signal_value( signal, owner, signal_value, &entries[0] );
+        if (result != LF_SYNC_SUCCESS)
+        {
+            lf_sync_wait_end( dispatcher, ticket );
+            return result;
+        }
+
+        count = 1;
+        if (signal_object == wait_object)
+        {
+            wait_result = prepare_acquire_value( wait, owner, entries[0].desired, &wait_entry );
+            if (wait_result != LF_SYNC_SUCCESS && wait_result != LF_SYNC_ABANDONED)
+            {
+                lf_sync_wait_end( dispatcher, ticket );
+                return wait_result;
+            }
+            entries[0].desired = wait_entry.desired;
+            status = wait_result == LF_SYNC_ABANDONED ? LF_SYNC_WAIT_ABANDONED : LF_SYNC_WAIT_COMPLETE;
+        }
+        else
+        {
+            wait_result = prepare_acquire( &dispatcher->arena, wait, owner, &wait_entry );
+            if (wait_result == LF_SYNC_SUCCESS || wait_result == LF_SYNC_ABANDONED)
+            {
+                entries[count] = wait_entry;
+                ++count;
+                status = wait_result == LF_SYNC_ABANDONED ? LF_SYNC_WAIT_ABANDONED : LF_SYNC_WAIT_COMPLETE;
+            }
+            else if (wait_result == LF_SYNC_UNSATISFIED) status = LF_SYNC_WAITING;
+            else if (wait_result == LF_SYNC_LIMIT_EXCEEDED) status = LF_SYNC_WAIT_LIMIT_EXCEEDED;
+            else status = LF_SYNC_WAIT_INVALID;
+        }
+
+        entries[count].word = dispatcher->status_word_base + ticket->slot;
+        entries[count].pad = 0;
+        entries[count].expected = prepared;
+        entries[count].desired = lf_sync_wait_value( ticket->generation, status, 0 );
+        ++count;
+        sort_entries( entries, indices, count );
+        mcas = lf_sync_mcas_owned( &dispatcher->arena, entries, count, owner );
+        if (mcas > 0) break;
+        if (lf_sync_load( &dispatcher->arena, dispatcher->status_word_base + ticket->slot ) != prepared)
+        {
+            lf_sync_wait_end( dispatcher, ticket );
+            return LF_SYNC_INVALID;
+        }
+    }
+
+    lf_sync_wake_object( dispatcher, signal_object );
+    if (status == LF_SYNC_WAITING)
+    {
+        retry_wait( dispatcher, ticket->slot, ticket->generation );
+        pulse_generation = load_u64( &wait->pulse ) >> 1;
+        if (pulse_generation != registered->object_generations[0])
+            pulse_wait( dispatcher, ticket->slot, ticket->generation, wait_object, pulse_generation );
+    }
+    return LF_SYNC_SUCCESS;
 }
 
 uint64_t lf_sync_wait_poll( const struct lf_sync_dispatcher *dispatcher,

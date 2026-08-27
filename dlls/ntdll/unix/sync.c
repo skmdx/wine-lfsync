@@ -832,6 +832,7 @@ static NTSTATUS lockfree_result_to_status( enum lf_sync_result result )
     case LF_SYNC_LIMIT_EXCEEDED: return STATUS_SEMAPHORE_LIMIT_EXCEEDED;
     case LF_SYNC_NOT_OWNER:      return STATUS_MUTANT_NOT_OWNED;
     case LF_SYNC_INVALID:        return STATUS_OBJECT_TYPE_MISMATCH;
+    case LF_SYNC_RETRY:          return STATUS_NO_MEMORY;
     default:                     return STATUS_UNSUCCESSFUL;
     }
 }
@@ -1033,10 +1034,9 @@ static int get_lockfree_timeout( const LARGE_INTEGER *timeout, ULONGLONG deadlin
     return 1;
 }
 
-static NTSTATUS lockfree_wait_objs( DWORD count, const uint32_t *objects, WAIT_TYPE type,
-                                    int alert_object, const LARGE_INTEGER *timeout )
+static NTSTATUS lockfree_finish_wait( struct lf_sync_wait_ticket *ticket, WAIT_TYPE type,
+                                      const LARGE_INTEGER *timeout )
 {
-    struct lf_sync_wait_ticket ticket;
     struct timespec timespec, *timeout_ptr;
     ULONGLONG deadline = 0;
     uint64_t value;
@@ -1048,13 +1048,9 @@ static NTSTATUS lockfree_wait_objs( DWORD count, const uint32_t *objects, WAIT_T
         if (timeout->QuadPart <= 0) deadline = monotonic_counter() - timeout->QuadPart;
         else deadline = timeout->QuadPart;
     }
-    if (!lf_sync_wait_begin_alert( &lockfree_dispatcher, objects, count, type == WaitAll,
-                                   GetCurrentThreadId(), alert_object < 0 ? ~0u : alert_object, &ticket ))
-        return STATUS_NO_MEMORY;
-
     for (;;)
     {
-        value = lf_sync_wait_poll( &lockfree_dispatcher, &ticket );
+        value = lf_sync_wait_poll( &lockfree_dispatcher, ticket );
         switch (value & 0xff)
         {
         case LF_SYNC_WAIT_COMPLETE:
@@ -1084,13 +1080,13 @@ static NTSTATUS lockfree_wait_objs( DWORD count, const uint32_t *objects, WAIT_T
         wait_ret = get_lockfree_timeout( timeout, deadline, &timespec );
         if (wait_ret < 0)
         {
-            lf_sync_wait_timeout( &lockfree_dispatcher, &ticket );
+            lf_sync_wait_timeout( &lockfree_dispatcher, ticket );
             continue;
         }
         timeout_ptr = wait_ret ? &timespec : NULL;
-        if (lf_sync_wait_park( &lockfree_dispatcher, &ticket, timeout_ptr ) < 0)
+        if (lf_sync_wait_park( &lockfree_dispatcher, ticket, timeout_ptr ) < 0)
         {
-            if (errno == ETIMEDOUT) lf_sync_wait_timeout( &lockfree_dispatcher, &ticket );
+            if (errno == ETIMEDOUT) lf_sync_wait_timeout( &lockfree_dispatcher, ticket );
             else if (errno != EINTR && errno != EAGAIN)
             {
                 ret = errno_to_status( errno );
@@ -1100,8 +1096,19 @@ static NTSTATUS lockfree_wait_objs( DWORD count, const uint32_t *objects, WAIT_T
     }
 
 done:
-    lf_sync_wait_end( &lockfree_dispatcher, &ticket );
+    lf_sync_wait_end( &lockfree_dispatcher, ticket );
     return ret;
+}
+
+static NTSTATUS lockfree_wait_objs( DWORD count, const uint32_t *objects, WAIT_TYPE type,
+                                    int alert_object, const LARGE_INTEGER *timeout )
+{
+    struct lf_sync_wait_ticket ticket;
+
+    if (!lf_sync_wait_begin_alert( &lockfree_dispatcher, objects, count, type == WaitAll,
+                                   GetCurrentThreadId(), alert_object < 0 ? ~0u : alert_object, &ticket ))
+        return STATUS_NO_MEMORY;
+    return lockfree_finish_wait( &ticket, type, timeout );
 }
 
 static NTSTATUS inproc_wait( DWORD count, const HANDLE *handles, WAIT_TYPE type,
@@ -1139,6 +1146,7 @@ static NTSTATUS inproc_signal_and_wait( HANDLE signal, HANDLE wait,
                                         BOOLEAN alertable, const LARGE_INTEGER *timeout )
 {
     struct inproc_sync stack_signal, stack_wait, *signal_sync = &stack_signal, *wait_sync = &stack_wait;
+    struct lf_sync_wait_ticket ticket;
     int alert_fd = 0;
     NTSTATUS ret;
 
@@ -1151,23 +1159,12 @@ static NTSTATUS inproc_signal_and_wait( HANDLE signal, HANDLE wait,
 
     if (lockfree_shared)
     {
-        switch (signal_sync->type)
-        {
-        case INPROC_SYNC_EVENT:
-            ret = lockfree_result_to_status( lf_sync_set_event( &lockfree_dispatcher.arena,
-                                                get_lockfree_object( signal_sync ), NULL ) );
-            break;
-        case INPROC_SYNC_MUTEX:
-            ret = lockfree_result_to_status( lf_sync_release_mutex( &lockfree_dispatcher.arena,
-                                                get_lockfree_object( signal_sync ), GetCurrentThreadId(), NULL ) );
-            break;
-        case INPROC_SYNC_SEMAPHORE:
-            ret = lockfree_result_to_status( lf_sync_release_semaphore( &lockfree_dispatcher.arena,
-                                                get_lockfree_object( signal_sync ), 1, NULL ) );
-            break;
-        default: assert( 0 ); break;
-        }
-        if (!ret) lf_sync_wake_object( &lockfree_dispatcher, signal_sync->shm_idx );
+        if (alertable) alert_fd = get_inproc_alert_fd();
+        ret = lockfree_result_to_status( lf_sync_signal_and_wait_begin( &lockfree_dispatcher,
+                    signal_sync->shm_idx, wait_sync->shm_idx, GetCurrentThreadId(),
+                    alertable && alert_fd >= 0 ? alert_fd : ~0u, &ticket ) );
+        if (!ret) ret = lockfree_finish_wait( &ticket, WaitAny, timeout );
+        goto done_wait;
     }
     else
     {
@@ -1183,11 +1180,10 @@ static NTSTATUS inproc_signal_and_wait( HANDLE signal, HANDLE wait,
     if (!ret)
     {
         if (alertable) alert_fd = get_inproc_alert_fd();
-        if (lockfree_shared)
-            ret = lockfree_wait_objs( 1, &wait_sync->shm_idx, WaitAny, alertable ? alert_fd : -1, timeout );
-        else ret = linux_wait_objs( inproc_device_fd, 1, &wait_sync->fd, WaitAny, alert_fd, timeout );
+        ret = linux_wait_objs( inproc_device_fd, 1, &wait_sync->fd, WaitAny, alert_fd, timeout );
     }
 
+done_wait:
     release_inproc_sync( wait_sync );
 done:
     release_inproc_sync( signal_sync );

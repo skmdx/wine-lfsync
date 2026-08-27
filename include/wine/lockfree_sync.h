@@ -159,6 +159,7 @@ enum lf_sync_wait_status
     LF_SYNC_WAIT_ALERTED,
     LF_SYNC_WAIT_LIMIT_EXCEEDED,
     LF_SYNC_WAIT_INVALID,
+    LF_SYNC_WAIT_PREPARED,
 };
 
 /* Normal values must keep bit 63 clear. The implementation reserves it for
@@ -233,6 +234,10 @@ int lf_sync_wait_begin( const struct lf_sync_dispatcher *dispatcher, const uint3
 int lf_sync_wait_begin_alert( const struct lf_sync_dispatcher *dispatcher, const uint32_t *objects,
                               uint32_t count, int wait_all, uint32_t owner, uint32_t alert_object,
                               struct lf_sync_wait_ticket *ticket );
+enum lf_sync_result lf_sync_signal_and_wait_begin( const struct lf_sync_dispatcher *dispatcher,
+                                                   uint32_t signal_object, uint32_t wait_object,
+                                                   uint32_t owner, uint32_t alert_object,
+                                                   struct lf_sync_wait_ticket *ticket );
 uint64_t lf_sync_wait_poll( const struct lf_sync_dispatcher *dispatcher,
                             const struct lf_sync_wait_ticket *ticket );
 int lf_sync_wait_park( const struct lf_sync_dispatcher *dispatcher,

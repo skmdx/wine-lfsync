@@ -503,6 +503,69 @@ static void test_registered_mutex_limit(void)
     lf_sync_wait_end( &dispatcher, &ticket );
 }
 
+static void test_atomic_signal_and_wait(void)
+{
+    struct lf_sync_dispatcher dispatcher;
+    struct shared_fixture shared = {0};
+    struct lf_sync_wait_ticket ticket;
+    uint64_t status;
+
+    init_dispatcher( &dispatcher, &shared );
+    lf_sync_init_event( &dispatcher.arena, &shared.objects[0], 0, 0, 0 );
+    lf_sync_init_event( &dispatcher.arena, &shared.objects[1], 1, 1, 1 );
+    ok( lf_sync_signal_and_wait_begin( &dispatcher, 0, 1, 91, ~0u, &ticket ) == LF_SYNC_SUCCESS,
+        "event signal-and-wait transaction failed\n" );
+    status = lf_sync_wait_poll( &dispatcher, &ticket );
+    ok( (status & 0xff) == LF_SYNC_WAIT_COMPLETE, "ready signal-and-wait did not complete atomically\n" );
+    ok( lf_sync_load( &dispatcher.arena, 0 ) == 1, "signal event was not set\n" );
+    ok( lf_sync_load( &dispatcher.arena, 1 ) == 1, "manual wait event was consumed\n" );
+    lf_sync_wait_end( &dispatcher, &ticket );
+
+    lf_sync_init_event( &dispatcher.arena, &shared.objects[0], 0, 0, 0 );
+    ok( lf_sync_signal_and_wait_begin( &dispatcher, 0, 0, 91, ~0u, &ticket ) == LF_SYNC_SUCCESS,
+        "same-event signal-and-wait transaction failed\n" );
+    status = lf_sync_wait_poll( &dispatcher, &ticket );
+    ok( (status & 0xff) == LF_SYNC_WAIT_COMPLETE, "same-event signal-and-wait did not complete\n" );
+    ok( lf_sync_load( &dispatcher.arena, 0 ) == 0, "same auto-event signal-and-wait left it signaled\n" );
+    lf_sync_wait_end( &dispatcher, &ticket );
+
+    lf_sync_init_semaphore( &dispatcher.arena, &shared.objects[0], 0, 0, 1 );
+    lf_sync_init_semaphore( &dispatcher.arena, &shared.objects[1], 1, 1, 1 );
+    ok( lf_sync_signal_and_wait_begin( &dispatcher, 0, 1, 91, ~0u, &ticket ) == LF_SYNC_SUCCESS,
+        "semaphore signal-and-wait transaction failed\n" );
+    ok( (lf_sync_wait_poll( &dispatcher, &ticket ) & 0xff) == LF_SYNC_WAIT_COMPLETE,
+        "semaphore signal-and-wait did not complete\n" );
+    ok( lf_sync_load( &dispatcher.arena, 0 ) == 1 && lf_sync_load( &dispatcher.arena, 1 ) == 0,
+        "semaphore signal-and-wait published partial state\n" );
+    lf_sync_wait_end( &dispatcher, &ticket );
+    ok( lf_sync_signal_and_wait_begin( &dispatcher, 0, 1, 91, ~0u, &ticket ) == LF_SYNC_LIMIT_EXCEEDED,
+        "full signal semaphore did not reject the whole transaction\n" );
+    ok( lf_sync_load( &dispatcher.arena, 0 ) == 1 && lf_sync_load( &dispatcher.arena, 1 ) == 0,
+        "failed signal-and-wait changed semaphore state\n" );
+
+    lf_sync_init_mutex( &dispatcher.arena, &shared.objects[0], 0, 91, 1 );
+    ok( lf_sync_signal_and_wait_begin( &dispatcher, 0, 0, 91, ~0u, &ticket ) == LF_SYNC_SUCCESS,
+        "same-mutex signal-and-wait transaction failed\n" );
+    ok( (lf_sync_wait_poll( &dispatcher, &ticket ) & 0xff) == LF_SYNC_WAIT_COMPLETE,
+        "same-mutex signal-and-wait did not complete\n" );
+    ok( lf_sync_load( &dispatcher.arena, 0 ) == (UINT64_C(1) << 32 | 91),
+        "same-mutex signal-and-wait changed ownership\n" );
+    lf_sync_wait_end( &dispatcher, &ticket );
+
+    lf_sync_init_event( &dispatcher.arena, &shared.objects[0], 0, 0, 0 );
+    lf_sync_init_event( &dispatcher.arena, &shared.objects[1], 1, 0, 0 );
+    ok( lf_sync_signal_and_wait_begin( &dispatcher, 0, 1, 91, ~0u, &ticket ) == LF_SYNC_SUCCESS,
+        "blocking signal-and-wait transaction failed\n" );
+    ok( (lf_sync_wait_poll( &dispatcher, &ticket ) & 0xff) == LF_SYNC_WAITING,
+        "blocking signal-and-wait was not atomically armed\n" );
+    ok( lf_sync_load( &dispatcher.arena, 0 ) == 1, "blocking signal-and-wait did not signal\n" );
+    lf_sync_set_event( &dispatcher.arena, &shared.objects[1], NULL );
+    lf_sync_wake_object( &dispatcher, 1 );
+    ok( (lf_sync_wait_poll( &dispatcher, &ticket ) & 0xff) == LF_SYNC_WAIT_COMPLETE,
+        "armed signal-and-wait did not complete later\n" );
+    lf_sync_wait_end( &dispatcher, &ticket );
+}
+
 static void test_pulse_snapshot(void)
 {
     struct lf_sync_wait_ticket first, second;
@@ -709,6 +772,7 @@ int main(void)
     test_shared_parking();
     test_registered_timeout();
     test_registered_mutex_limit();
+    test_atomic_signal_and_wait();
     test_pulse_snapshot();
     test_dead_waiter_reclamation();
     test_pulse_registration_race();
