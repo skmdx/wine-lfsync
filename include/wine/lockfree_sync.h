@@ -16,10 +16,11 @@
 
 #define LF_SYNC_MCAS_MAX_WORDS 65
 #define LF_SYNC_SHARED_MAGIC UINT64_C(0x57494e454c465359) /* WINELFSY */
-#define LF_SYNC_SHARED_VERSION 4
+#define LF_SYNC_SHARED_VERSION 5
 #define LF_SYNC_SHARED_OBJECTS 262144
 #define LF_SYNC_SHARED_WAITS 2048
 #define LF_SYNC_SHARED_DESCS 512
+#define LF_SYNC_SHARED_OWNER_WORDS (LF_SYNC_SHARED_OBJECTS / 64)
 #define LF_SYNC_SHARED_WORDS (LF_SYNC_SHARED_OBJECTS + LF_SYNC_SHARED_WAITS)
 
 enum lf_sync_mcas_status
@@ -65,6 +66,8 @@ struct lf_sync_arena
     uint32_t word_count;
     struct lf_sync_mcas *descs;
     uint32_t desc_count;
+    uint64_t *dead_owners;
+    uint32_t dead_owner_count;
 };
 
 enum lf_sync_object_type
@@ -135,6 +138,7 @@ struct lf_sync_shared
     uint32_t pad;
     struct lf_sync_word words[LF_SYNC_SHARED_WORDS];
     struct lf_sync_mcas descs[LF_SYNC_SHARED_DESCS];
+    uint64_t dead_owners[LF_SYNC_SHARED_OWNER_WORDS];
     struct lf_sync_object objects[LF_SYNC_SHARED_OBJECTS];
     struct lf_sync_wait waits[LF_SYNC_SHARED_WAITS];
 };
@@ -258,6 +262,8 @@ void lf_sync_abandon_waits( const struct lf_sync_dispatcher *dispatcher, uint32_
 void lf_sync_init_shared( struct lf_sync_shared *shared );
 int lf_sync_open_shared( struct lf_sync_dispatcher *dispatcher, struct lf_sync_shared *shared,
                          lf_sync_park_func park, lf_sync_wake_func wake );
+void lf_sync_set_owner_alive( const struct lf_sync_dispatcher *dispatcher, uint32_t owner, int alive );
+int lf_sync_owner_alive( const struct lf_sync_dispatcher *dispatcher, uint32_t owner );
 int lf_sync_alloc_object( struct lf_sync_dispatcher *dispatcher, enum lf_sync_object_type type,
                           uint32_t initial, uint32_t limit, uint32_t flags, uint32_t *index );
 int lf_sync_free_object( struct lf_sync_dispatcher *dispatcher, uint32_t index );

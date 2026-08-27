@@ -376,6 +376,7 @@ static void test_owned_mutex_arena_abandonment(void)
 
 static void test_object_reuse(void)
 {
+    struct lf_sync_mcas_entry entry;
     struct lf_sync_wait_ticket ticket;
     struct lf_sync_dispatcher dispatcher;
     struct lf_sync_shared *shared;
@@ -389,6 +390,23 @@ static void test_object_reuse(void)
 
     ok( lf_sync_alloc_object( &dispatcher, LF_SYNC_EVENT, 0, 0, 0, &first ),
         "failed to allocate reusable event\n" );
+    lf_sync_set_owner_alive( &dispatcher, 84, 0 );
+    ok( !lf_sync_owner_alive( &dispatcher, 84 ), "dead owner remained live\n" );
+    object = first;
+    ok( !lf_sync_wait_begin( &dispatcher, &object, 1, 0, 84, &ticket ),
+        "dead owner published a wait\n" );
+    entry.word = dispatcher.objects[first].word;
+    entry.pad = 0;
+    entry.expected = 0;
+    entry.desired = 1;
+    ok( lf_sync_mcas_owned( &dispatcher.arena, &entry, 1, 84 ) < 0,
+        "dead owner published a descriptor\n" );
+    lf_sync_set_owner_alive( &dispatcher, 84, 1 );
+    ok( lf_sync_owner_alive( &dispatcher, 84 ), "reused owner did not become live\n" );
+    ok( lf_sync_mcas_owned( &dispatcher.arena, &entry, 1, 84 ) == 1,
+        "live reused owner could not publish a descriptor\n" );
+    ok( lf_sync_reset_event( &dispatcher.arena, &dispatcher.objects[first], NULL ) == LF_SYNC_SUCCESS,
+        "failed to reset owner-gating event\n" );
     object = first;
     ok( lf_sync_wait_begin( &dispatcher, &object, 1, 0, 80, &ticket ),
         "failed to register reuse-blocking waiter\n" );

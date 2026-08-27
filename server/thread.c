@@ -516,6 +516,7 @@ struct thread *create_thread( int fd, struct process *process, const struct secu
     if (!(thread->request_fd = create_anonymous_fd( &thread_fd_ops, fd, &thread->obj, 0 ))) goto error;
     if (!(thread->sync = create_internal_sync( 1, 0 ))) goto error;
     if (get_inproc_device_fd() >= 0 && !(thread->alert_sync = create_inproc_internal_sync( 1, 0 ))) goto error;
+    set_inproc_sync_owner_alive( thread->id );
 
     if (process->desktop)
     {

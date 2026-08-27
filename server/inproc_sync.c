@@ -489,6 +489,7 @@ void abandon_inproc_mutexes( thread_id_t tid )
 
     if (lockfree_shared)
     {
+        lf_sync_set_owner_alive( &lockfree_dispatcher, tid, 0 );
         lf_sync_abandon_owned_mutexes( &lockfree_dispatcher, tid );
         lf_sync_abandon_waits( &lockfree_dispatcher, tid );
         lf_sync_abandon_descriptors( &lockfree_dispatcher.arena, tid );
@@ -502,6 +503,11 @@ void abandon_inproc_mutexes( thread_id_t tid )
 #else
         assert( 0 );
 #endif
+}
+
+void set_inproc_sync_owner_alive( thread_id_t tid )
+{
+    if (lockfree_shared) lf_sync_set_owner_alive( &lockfree_dispatcher, tid, 1 );
 }
 
 static int get_obj_inproc_sync( struct object *obj, int *type, unsigned int *shm_idx )
@@ -568,6 +574,10 @@ void reset_inproc_sync( struct inproc_sync *sync )
 }
 
 void abandon_inproc_mutexes( thread_id_t tid )
+{
+}
+
+void set_inproc_sync_owner_alive( thread_id_t tid )
 {
 }
 
