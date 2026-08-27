@@ -374,6 +374,58 @@ static void test_owned_mutex_arena_abandonment(void)
     free( shared );
 }
 
+static void test_object_reuse(void)
+{
+    struct lf_sync_wait_ticket ticket;
+    struct lf_sync_dispatcher dispatcher;
+    struct lf_sync_shared *shared;
+    uint32_t first, reused, object, i;
+
+    shared = calloc( 1, sizeof(*shared) );
+    ok( !!shared, "failed to allocate object reuse fixture\n" );
+    if (!shared) return;
+    lf_sync_init_shared( shared );
+    ok( lf_sync_open_shared( &dispatcher, shared, NULL, NULL ), "failed to open object reuse fixture\n" );
+
+    ok( lf_sync_alloc_object( &dispatcher, LF_SYNC_EVENT, 0, 0, 0, &first ),
+        "failed to allocate reusable event\n" );
+    object = first;
+    ok( lf_sync_wait_begin( &dispatcher, &object, 1, 0, 80, &ticket ),
+        "failed to register reuse-blocking waiter\n" );
+    ok( !lf_sync_free_object( &dispatcher, first ), "object with a waiter was prematurely freed\n" );
+    lf_sync_wait_timeout( &dispatcher, &ticket );
+    lf_sync_wait_end( &dispatcher, &ticket );
+    ok( lf_sync_free_object( &dispatcher, first ), "quiescent event was not freed\n" );
+    ok( lf_sync_alloc_object( &dispatcher, LF_SYNC_EVENT, 1, 0, 0, &reused ) && reused == first,
+        "freed event slot was not reused\n" );
+    ok( lf_sync_free_object( &dispatcher, reused ), "reused event could not be freed again\n" );
+
+    ok( lf_sync_alloc_object( &dispatcher, LF_SYNC_MUTEX, 1, 0, 81, &reused ) && reused == first,
+        "failed to reuse slot for mutex\n" );
+    ok( !lf_sync_free_object( &dispatcher, reused ), "owned mutex was prematurely freed\n" );
+    ok( lf_sync_abandon_mutex( &dispatcher.arena, &dispatcher.objects[reused], 81 ) == LF_SYNC_SUCCESS,
+        "failed to abandon reusable mutex\n" );
+    ok( lf_sync_free_object( &dispatcher, reused ), "abandoned mutex was not freed\n" );
+    ok( lf_sync_alloc_object( &dispatcher, LF_SYNC_SEMAPHORE, 1, 2, 0, &object ) && object == first,
+        "failed to reuse slot for semaphore\n" );
+    ok( lf_sync_load( &dispatcher.arena, object ) == 1 && dispatcher.objects[object].limit == 2,
+        "reused object retained stale state\n" );
+
+    for (i = 0; i < LF_SYNC_SHARED_OBJECTS + 1024; ++i)
+    {
+        if (!lf_sync_free_object( &dispatcher, object ) ||
+            !lf_sync_alloc_object( &dispatcher, LF_SYNC_EVENT, i & 1, 0, 0, &reused ) || reused != first)
+        {
+            ok( 0, "object reuse failed after %u iterations\n", i );
+            break;
+        }
+        object = reused;
+    }
+    ok( i == LF_SYNC_SHARED_OBJECTS + 1024, "object reuse exhausted after %u iterations\n", i );
+
+    free( shared );
+}
+
 #ifdef __linux__
 
 struct shared_fixture
@@ -767,6 +819,7 @@ int main(void)
     test_dead_descriptor_reclamation();
     test_nt_object_transitions();
     test_owned_mutex_arena_abandonment();
+    test_object_reuse();
     test_completion_timeout_race();
 #ifdef __linux__
     test_shared_parking();

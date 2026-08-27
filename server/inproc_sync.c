@@ -43,6 +43,7 @@
 #ifdef __linux__
 
 #include <fcntl.h>
+#include <poll.h>
 #include <sys/mman.h>
 #include <sys/ioctl.h>
 #include <sys/syscall.h>
@@ -117,10 +118,137 @@ struct inproc_sync
     enum inproc_sync_type  type;
     int                    fd;
     unsigned int           shm_idx;
+    int                    ephemeral;
     struct list            entry;
+    struct lockfree_lifetime *lifetime;
 };
 
 static struct list inproc_mutexes = LIST_INIT( inproc_mutexes );
+static struct list retired_lifetimes = LIST_INIT( retired_lifetimes );
+static int creating_lockfree_lifetime;
+
+struct lockfree_lifetime
+{
+    struct object obj;
+    struct fd *fd;
+    uint32_t object;
+    int retired;
+    int hung_up;
+    struct list entry;
+};
+
+static void lockfree_lifetime_dump( struct object *obj, int verbose );
+static void lockfree_lifetime_destroy( struct object *obj );
+static void lockfree_lifetime_poll_event( struct fd *fd, int event );
+
+static const struct object_ops lockfree_lifetime_ops =
+{
+    .size = sizeof(struct lockfree_lifetime),
+    .type = &no_type,
+    .dump = lockfree_lifetime_dump,
+    .destroy = lockfree_lifetime_destroy,
+};
+
+static const struct fd_ops lockfree_lifetime_fd_ops =
+{
+    .poll_event = lockfree_lifetime_poll_event,
+};
+
+static void lockfree_lifetime_dump( struct object *obj, int verbose )
+{
+    struct lockfree_lifetime *lifetime = (struct lockfree_lifetime *)obj;
+    fprintf( stderr, "Lock-free lifetime object=%u retired=%u hung_up=%u\n",
+             lifetime->object, lifetime->retired, lifetime->hung_up );
+}
+
+static void lockfree_lifetime_destroy( struct object *obj )
+{
+    struct lockfree_lifetime *lifetime = (struct lockfree_lifetime *)obj;
+
+    list_remove( &lifetime->entry );
+    if (lifetime->fd) release_object( lifetime->fd );
+}
+
+static int reap_lockfree_lifetime( struct lockfree_lifetime *lifetime )
+{
+    if (!lifetime->retired || !lifetime->hung_up || lifetime->object == ~0u ||
+        !lf_sync_free_object( &lockfree_dispatcher, lifetime->object )) return 0;
+
+    set_fd_events( lifetime->fd, -1 );
+    lifetime->object = ~0u;
+    list_remove( &lifetime->entry );
+    list_init( &lifetime->entry );
+    release_object( lifetime ); /* persistent retirement reference */
+    return 1;
+}
+
+static void reap_lockfree_lifetimes(void)
+{
+    struct lockfree_lifetime *lifetime, *next;
+
+    LIST_FOR_EACH_ENTRY_SAFE( lifetime, next, &retired_lifetimes, struct lockfree_lifetime, entry )
+        reap_lockfree_lifetime( lifetime );
+}
+
+static void lockfree_lifetime_poll_event( struct fd *fd, int event )
+{
+    struct lockfree_lifetime *lifetime = get_fd_user( fd );
+
+    grab_object( lifetime );
+    if (event & (POLLERR | POLLHUP))
+    {
+        set_fd_events( fd, -1 );
+        lifetime->hung_up = 1;
+        reap_lockfree_lifetime( lifetime );
+    }
+    release_object( lifetime );
+}
+
+static struct lockfree_lifetime *create_lockfree_lifetime( uint32_t object, int *client_fd )
+{
+    struct lockfree_lifetime *lifetime;
+    int pipe_fd[2];
+
+    if (pipe( pipe_fd ) < 0) return NULL;
+    if (!(lifetime = alloc_object( &lockfree_lifetime_ops )))
+    {
+        close( pipe_fd[0] );
+        close( pipe_fd[1] );
+        return NULL;
+    }
+    lifetime->fd = NULL;
+    lifetime->object = object;
+    lifetime->retired = 0;
+    lifetime->hung_up = 0;
+    list_init( &lifetime->entry );
+    creating_lockfree_lifetime = 1;
+    lifetime->fd = create_anonymous_fd( &lockfree_lifetime_fd_ops, pipe_fd[0], &lifetime->obj, 0 );
+    creating_lockfree_lifetime = 0;
+    if (!lifetime->fd)
+    {
+        close( pipe_fd[1] );
+        release_object( lifetime );
+        return NULL;
+    }
+    set_fd_events( lifetime->fd, POLLIN );
+    *client_fd = pipe_fd[1];
+    return lifetime;
+}
+
+static int create_lockfree_sync( struct inproc_sync *sync, enum lf_sync_object_type type,
+                                 uint32_t initial, uint32_t limit, uint32_t flags )
+{
+    reap_lockfree_lifetimes();
+    if (!lf_sync_alloc_object( &lockfree_dispatcher, type, initial, limit, flags, &sync->shm_idx ))
+        return 0;
+    if (!(sync->lifetime = create_lockfree_lifetime( sync->shm_idx, &sync->fd )))
+    {
+        lf_sync_free_object( &lockfree_dispatcher, sync->shm_idx );
+        sync->shm_idx = ~0u;
+        return 0;
+    }
+    return 1;
+}
 
 static void inproc_sync_dump( struct object *obj, int verbose );
 static int inproc_sync_signal( struct object *obj, unsigned int access, int signal );
@@ -156,11 +284,18 @@ struct inproc_sync *create_inproc_internal_sync( int manual, int signaled )
     if (!(event = alloc_object( &inproc_sync_ops ))) return NULL;
     event->type = INPROC_SYNC_INTERNAL;
     event->shm_idx = ~0u;
+    event->ephemeral = creating_lockfree_lifetime;
+    event->lifetime = NULL;
     if (lockfree_shared)
     {
-        if (!lf_sync_alloc_object( &lockfree_dispatcher, LF_SYNC_EVENT, signaled, 0,
-                                   manual ? LF_SYNC_EVENT_MANUAL : 0, &event->shm_idx )) event->fd = -1;
-        else event->fd = -1;
+        if (event->ephemeral)
+        {
+            if (!lf_sync_alloc_object( &lockfree_dispatcher, LF_SYNC_EVENT, signaled, 0,
+                                       manual ? LF_SYNC_EVENT_MANUAL : 0, &event->shm_idx )) event->fd = -1;
+            else event->fd = -1;
+        }
+        else if (!create_lockfree_sync( event, LF_SYNC_EVENT, signaled, 0,
+                                        manual ? LF_SYNC_EVENT_MANUAL : 0 )) event->fd = -1;
     }
     else
 #ifdef NTSYNC_IOC_EVENT_READ
@@ -189,11 +324,12 @@ struct inproc_sync *create_inproc_event_sync( int manual, int signaled )
     if (!(event = alloc_object( &inproc_sync_ops ))) return NULL;
     event->type = INPROC_SYNC_EVENT;
     event->shm_idx = ~0u;
+    event->ephemeral = 0;
+    event->lifetime = NULL;
     if (lockfree_shared)
     {
-        if (!lf_sync_alloc_object( &lockfree_dispatcher, LF_SYNC_EVENT, signaled, 0,
-                                   manual ? LF_SYNC_EVENT_MANUAL : 0, &event->shm_idx )) event->fd = -1;
-        else event->fd = -1;
+        if (!create_lockfree_sync( event, LF_SYNC_EVENT, signaled, 0,
+                                   manual ? LF_SYNC_EVENT_MANUAL : 0 )) event->fd = -1;
     }
     else
 #ifdef NTSYNC_IOC_EVENT_READ
@@ -222,11 +358,11 @@ struct inproc_sync *create_inproc_mutex_sync( thread_id_t owner, unsigned int co
     if (!(mutex = alloc_object( &inproc_sync_ops ))) return NULL;
     mutex->type = INPROC_SYNC_MUTEX;
     mutex->shm_idx = ~0u;
+    mutex->ephemeral = 0;
+    mutex->lifetime = NULL;
     if (lockfree_shared)
     {
-        if (!lf_sync_alloc_object( &lockfree_dispatcher, LF_SYNC_MUTEX, count, 0, owner,
-                                   &mutex->shm_idx )) mutex->fd = -1;
-        else mutex->fd = -1;
+        if (!create_lockfree_sync( mutex, LF_SYNC_MUTEX, count, 0, owner )) mutex->fd = -1;
     }
     else
 #ifdef NTSYNC_IOC_EVENT_READ
@@ -255,11 +391,11 @@ struct inproc_sync *create_inproc_semaphore_sync( unsigned int initial, unsigned
     if (!(sem = alloc_object( &inproc_sync_ops ))) return NULL;
     sem->type = INPROC_SYNC_SEMAPHORE;
     sem->shm_idx = ~0u;
+    sem->ephemeral = 0;
+    sem->lifetime = NULL;
     if (lockfree_shared)
     {
-        if (!lf_sync_alloc_object( &lockfree_dispatcher, LF_SYNC_SEMAPHORE, initial, max, 0,
-                                   &sem->shm_idx )) sem->fd = -1;
-        else sem->fd = -1;
+        if (!create_lockfree_sync( sem, LF_SYNC_SEMAPHORE, initial, max, 0 )) sem->fd = -1;
     }
     else
 #ifdef NTSYNC_IOC_EVENT_READ
@@ -334,7 +470,17 @@ static void inproc_sync_destroy( struct object *obj )
     struct inproc_sync *sync = (struct inproc_sync *)obj;
     assert( obj->ops == &inproc_sync_ops );
     list_remove( &sync->entry );
-    if (sync->fd >= 0) close( sync->fd );
+    if (sync->ephemeral)
+        lf_sync_free_object( &lockfree_dispatcher, sync->shm_idx );
+    else if (sync->lifetime)
+    {
+        close( sync->fd );
+        sync->fd = -1;
+        sync->lifetime->retired = 1;
+        list_add_tail( &retired_lifetimes, &sync->lifetime->entry );
+        sync->lifetime = NULL; /* transfer its reference to the retired list */
+    }
+    else if (sync->fd >= 0) close( sync->fd );
 }
 
 void abandon_inproc_mutexes( thread_id_t tid )
@@ -346,6 +492,7 @@ void abandon_inproc_mutexes( thread_id_t tid )
         lf_sync_abandon_owned_mutexes( &lockfree_dispatcher, tid );
         lf_sync_abandon_waits( &lockfree_dispatcher, tid );
         lf_sync_abandon_descriptors( &lockfree_dispatcher.arena, tid );
+        reap_lockfree_lifetimes();
         return;
     }
 
@@ -442,11 +589,8 @@ DECL_HANDLER(get_inproc_sync_fd)
 
     reply->shm_idx = ~0u;
     fd = get_obj_inproc_sync( obj, &reply->type, &reply->shm_idx );
-    if (reply->shm_idx == ~0u)
-    {
-        if (fd < 0) set_error( STATUS_NOT_IMPLEMENTED );
-        else send_client_fd( current->process, fd, req->handle );
-    }
+    if (fd < 0) set_error( STATUS_NOT_IMPLEMENTED );
+    else send_client_fd( current->process, fd, req->handle );
 
     release_object( obj );
 }

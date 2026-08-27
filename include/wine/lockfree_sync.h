@@ -16,7 +16,7 @@
 
 #define LF_SYNC_MCAS_MAX_WORDS 65
 #define LF_SYNC_SHARED_MAGIC UINT64_C(0x57494e454c465359) /* WINELFSY */
-#define LF_SYNC_SHARED_VERSION 3
+#define LF_SYNC_SHARED_VERSION 4
 #define LF_SYNC_SHARED_OBJECTS 262144
 #define LF_SYNC_SHARED_WAITS 2048
 #define LF_SYNC_SHARED_DESCS 512
@@ -80,6 +80,8 @@ struct lf_sync_object
     uint32_t type;
     uint32_t limit;
     uint32_t flags;
+    uint32_t next_free;
+    uint32_t pad;
     uint64_t pulse;
     uint64_t waiters[LF_SYNC_SHARED_WAITS / 64];
 };
@@ -129,6 +131,8 @@ struct lf_sync_shared
     uint64_t magic;
     uint32_t version;
     uint32_t next_object;
+    uint32_t free_object;
+    uint32_t pad;
     struct lf_sync_word words[LF_SYNC_SHARED_WORDS];
     struct lf_sync_mcas descs[LF_SYNC_SHARED_DESCS];
     struct lf_sync_object objects[LF_SYNC_SHARED_OBJECTS];
@@ -256,5 +260,6 @@ int lf_sync_open_shared( struct lf_sync_dispatcher *dispatcher, struct lf_sync_s
                          lf_sync_park_func park, lf_sync_wake_func wake );
 int lf_sync_alloc_object( struct lf_sync_dispatcher *dispatcher, enum lf_sync_object_type type,
                           uint32_t initial, uint32_t limit, uint32_t flags, uint32_t *index );
+int lf_sync_free_object( struct lf_sync_dispatcher *dispatcher, uint32_t index );
 
 #endif /* __WINE_LOCKFREE_SYNC_H */

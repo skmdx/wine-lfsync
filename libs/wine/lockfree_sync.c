@@ -390,6 +390,7 @@ static void init_object( const struct lf_sync_arena *arena, struct lf_sync_objec
     object->type = type;
     object->limit = limit;
     object->flags = flags;
+    object->next_free = UINT32_MAX;
     memset( object->waiters, 0, sizeof(object->waiters) );
     __atomic_store_n( &object->pulse, 0, __ATOMIC_RELEASE );
     __atomic_store_n( &arena->words[word].value, value, __ATOMIC_RELEASE );
@@ -1262,6 +1263,7 @@ void lf_sync_init_shared( struct lf_sync_shared *shared )
 {
     memset( shared, 0, sizeof(*shared) );
     shared->version = LF_SYNC_SHARED_VERSION;
+    shared->free_object = UINT32_MAX;
     __atomic_store_n( &shared->magic, LF_SYNC_SHARED_MAGIC, __ATOMIC_RELEASE );
 }
 
@@ -1293,8 +1295,16 @@ int lf_sync_alloc_object( struct lf_sync_dispatcher *dispatcher, enum lf_sync_ob
     uint32_t object;
 
     if (!dispatcher->shared) return 0;
-    object = __atomic_fetch_add( &dispatcher->shared->next_object, 1, __ATOMIC_RELAXED );
-    if (object >= LF_SYNC_SHARED_OBJECTS) return 0;
+    if (type > LF_SYNC_MUTEX || (type == LF_SYNC_SEMAPHORE && (!limit || initial > limit))) return 0;
+    object = dispatcher->shared->free_object;
+    if (object != UINT32_MAX)
+        dispatcher->shared->free_object = dispatcher->objects[object].next_free;
+    else
+    {
+        object = dispatcher->shared->next_object;
+        if (object >= LF_SYNC_SHARED_OBJECTS) return 0;
+        dispatcher->shared->next_object = object + 1;
+    }
 
     switch (type)
     {
@@ -1303,7 +1313,6 @@ int lf_sync_alloc_object( struct lf_sync_dispatcher *dispatcher, enum lf_sync_ob
                             flags & LF_SYNC_EVENT_MANUAL, initial );
         break;
     case LF_SYNC_SEMAPHORE:
-        if (!limit || initial > limit) return 0;
         lf_sync_init_semaphore( &dispatcher->arena, &dispatcher->objects[object], object, initial, limit );
         break;
     case LF_SYNC_MUTEX:
@@ -1314,5 +1323,22 @@ int lf_sync_alloc_object( struct lf_sync_dispatcher *dispatcher, enum lf_sync_ob
         return 0;
     }
     *index = object;
+    return 1;
+}
+
+int lf_sync_free_object( struct lf_sync_dispatcher *dispatcher, uint32_t index )
+{
+    struct lf_sync_object *object;
+    uint32_t i;
+
+    if (!dispatcher->shared || index >= dispatcher->object_count) return 0;
+    object = &dispatcher->objects[index];
+    for (i = 0; i < LF_SYNC_SHARED_WAITS / 64; ++i)
+        if (load_u64( &object->waiters[i] )) return 0;
+    if (object->type == LF_SYNC_MUTEX && mutex_count( lf_sync_load( &dispatcher->arena, object->word ) ))
+        return 0;
+
+    object->next_free = dispatcher->shared->free_object;
+    dispatcher->shared->free_object = index;
     return 1;
 }

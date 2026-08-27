@@ -712,7 +712,11 @@ static NTSTATUS get_server_inproc_sync( HANDLE handle, struct inproc_sync *sync 
             if (lockfree_shared)
             {
                 if (sync->shm_idx >= LF_SYNC_SHARED_OBJECTS) ret = STATUS_INVALID_HANDLE;
-                else sync->fd = -1;
+                else
+                {
+                    sync->fd = wine_server_receive_fd( &fd_handle );
+                    assert( wine_server_ptr_handle(fd_handle) == handle );
+                }
             }
             else
             {
