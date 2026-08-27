@@ -20,8 +20,7 @@
 #define LF_DESC_INDEX_MASK ((UINT64_C(1) << LF_DESC_INDEX_BITS) - 1)
 #define LF_DESC_GEN_MASK   ((UINT64_C(1) << (63 - LF_DESC_INDEX_BITS)) - 1)
 
-#define LF_CONTROL_STATUS_MASK UINT64_C(3)
-#define LF_CONTROL_GEN_SHIFT   2
+#define LF_CONTROL_GEN_MASK UINT64_C(0x0fffffff)
 
 #define LF_LIFETIME_REF_MASK UINT64_C(0xffffffff)
 #define LF_LIFETIME_GEN_SHIFT 32
@@ -51,19 +50,27 @@ static uint32_t tag_generation( uint64_t tag )
     return (tag >> LF_DESC_INDEX_BITS) & LF_DESC_GEN_MASK;
 }
 
-static uint64_t make_control( uint32_t generation, enum lf_sync_mcas_status status )
+static uint64_t make_control( uint32_t owner, uint32_t generation,
+                              enum lf_sync_mcas_status status, int owner_ref )
 {
-    return ((uint64_t)generation << LF_CONTROL_GEN_SHIFT) | status;
+    return ((uint64_t)owner << LF_SYNC_MCAS_CONTROL_OWNER_SHIFT) |
+           ((uint64_t)generation << LF_SYNC_MCAS_CONTROL_GEN_SHIFT) | status |
+           (owner_ref ? LF_SYNC_MCAS_CONTROL_OWNER_REF : 0);
 }
 
 static enum lf_sync_mcas_status control_status( uint64_t control )
 {
-    return control & LF_CONTROL_STATUS_MASK;
+    return control & LF_SYNC_MCAS_CONTROL_STATUS_MASK;
 }
 
 static uint32_t control_generation( uint64_t control )
 {
-    return control >> LF_CONTROL_GEN_SHIFT;
+    return (control >> LF_SYNC_MCAS_CONTROL_GEN_SHIFT) & LF_CONTROL_GEN_MASK;
+}
+
+static uint32_t control_owner( uint64_t control )
+{
+    return LF_SYNC_MCAS_CONTROL_OWNER( control );
 }
 
 static int acquire_desc( struct lf_sync_mcas *desc, uint32_t generation )
@@ -101,9 +108,12 @@ static enum lf_sync_mcas_status help_mcas_acquired( const struct lf_sync_arena *
     if (!generation || index >= arena->desc_count) return LF_SYNC_MCAS_ABORTED;
 
     desc = &arena->descs[index];
-    active = make_control( generation, LF_SYNC_MCAS_ACTIVE );
+    active = make_control( control_owner( load_u64( &desc->control ) ), generation,
+                           LF_SYNC_MCAS_ACTIVE, 1 );
     control = load_u64( &desc->control );
-    if (control_generation( control ) != generation) return LF_SYNC_MCAS_ABORTED;
+    if (control_generation( control ) != generation || control_status( control ) != LF_SYNC_MCAS_ACTIVE)
+        return LF_SYNC_MCAS_ABORTED;
+    active = control;
 
     count = __atomic_load_n( &desc->count, __ATOMIC_ACQUIRE );
     if (!count || count > LF_SYNC_MCAS_MAX_WORDS) return LF_SYNC_MCAS_ABORTED;
@@ -141,7 +151,8 @@ static enum lf_sync_mcas_status help_mcas_acquired( const struct lf_sync_arena *
 
     control = active;
     cas_u64( &desc->control, &control,
-             make_control( generation, i == count ? LF_SYNC_MCAS_COMMITTED : LF_SYNC_MCAS_ABORTED ) );
+             make_control( control_owner( active ), generation,
+                           i == count ? LF_SYNC_MCAS_COMMITTED : LF_SYNC_MCAS_ABORTED, 1 ) );
     control = load_u64( &desc->control );
 
     /* A descriptor owner may reuse its slot after this function returns.
@@ -217,21 +228,37 @@ int lf_sync_compare_exchange( const struct lf_sync_arena *arena, uint32_t word,
     }
 }
 
-static int alloc_desc( const struct lf_sync_arena *arena, uint32_t *index, uint32_t *generation )
+static int alloc_desc( const struct lf_sync_arena *arena, uint32_t owner,
+                       uint32_t *index, uint32_t *generation )
 {
     uint32_t i;
 
     for (i = 0; i < arena->desc_count && i <= LF_DESC_INDEX_MASK; ++i)
     {
         struct lf_sync_mcas *desc = &arena->descs[i];
-        uint64_t lifetime = load_u64( &desc->lifetime ), desired;
+        uint64_t control, desired_control, lifetime, desired_lifetime;
         uint32_t next_generation;
 
+        lifetime = load_u64( &desc->lifetime );
         if (lifetime & LF_LIFETIME_REF_MASK) continue;
-        next_generation = (lifetime >> LF_LIFETIME_GEN_SHIFT) + 1;
+        control = load_u64( &desc->control );
+        if (control & LF_SYNC_MCAS_CONTROL_OWNER_REF) continue;
+        if (control_status( control ) == LF_SYNC_MCAS_ACTIVE ||
+            control_status( control ) == LF_SYNC_MCAS_PREPARING) continue;
+        next_generation = control_generation( control ) + 1;
+        if (next_generation > LF_CONTROL_GEN_MASK) next_generation = 1;
         if (!next_generation) next_generation = 1;
-        desired = ((uint64_t)next_generation << LF_LIFETIME_GEN_SHIFT) | 1;
-        if (!cas_u64( &desc->lifetime, &lifetime, desired )) continue;
+        desired_control = make_control( owner, next_generation, LF_SYNC_MCAS_PREPARING, 1 );
+        if (!cas_u64( &desc->control, &control, desired_control )) continue;
+
+        desired_lifetime = ((uint64_t)next_generation << LF_LIFETIME_GEN_SHIFT) | 1;
+        if (!cas_u64( &desc->lifetime, &lifetime, desired_lifetime ))
+        {
+            control = desired_control;
+            cas_u64( &desc->control, &control,
+                     make_control( owner, next_generation, LF_SYNC_MCAS_ABORTED, 0 ) );
+            continue;
+        }
         *index = i;
         *generation = next_generation;
         return 1;
@@ -239,8 +266,26 @@ static int alloc_desc( const struct lf_sync_arena *arena, uint32_t *index, uint3
     return 0;
 }
 
-int lf_sync_mcas( const struct lf_sync_arena *arena,
-                  const struct lf_sync_mcas_entry *entries, uint32_t count )
+static void release_desc_owner( struct lf_sync_mcas *desc, uint32_t generation )
+{
+    uint64_t control, desired;
+
+    for (;;)
+    {
+        control = load_u64( &desc->control );
+        if (control_generation( control ) != generation ||
+            !(control & LF_SYNC_MCAS_CONTROL_OWNER_REF)) return;
+        desired = control & ~LF_SYNC_MCAS_CONTROL_OWNER_REF;
+        if (cas_u64( &desc->control, &control, desired ))
+        {
+            release_desc( desc );
+            return;
+        }
+    }
+}
+
+int lf_sync_mcas_owned( const struct lf_sync_arena *arena,
+                        const struct lf_sync_mcas_entry *entries, uint32_t count, uint32_t owner )
 {
     struct lf_sync_mcas *desc;
     enum lf_sync_mcas_status status;
@@ -256,16 +301,58 @@ int lf_sync_mcas( const struct lf_sync_arena *arena,
             return 0;
     }
 
-    if (!alloc_desc( arena, &index, &generation )) return -1;
+    if (!alloc_desc( arena, owner, &index, &generation )) return -1;
     desc = &arena->descs[index];
 
     memcpy( desc->entries, entries, count * sizeof(*entries) );
     __atomic_store_n( &desc->count, count, __ATOMIC_RELAXED );
-    __atomic_store_n( &desc->control, make_control( generation, LF_SYNC_MCAS_ACTIVE ), __ATOMIC_RELEASE );
+    __atomic_store_n( &desc->control, make_control( owner, generation, LF_SYNC_MCAS_ACTIVE, 1 ),
+                      __ATOMIC_RELEASE );
 
     status = help_mcas_acquired( arena, index, generation );
-    release_desc( desc );
+    release_desc_owner( desc, generation );
     return status == LF_SYNC_MCAS_COMMITTED;
+}
+
+int lf_sync_mcas( const struct lf_sync_arena *arena,
+                  const struct lf_sync_mcas_entry *entries, uint32_t count )
+{
+    return lf_sync_mcas_owned( arena, entries, count, 0 );
+}
+
+uint32_t lf_sync_abandon_descriptors( const struct lf_sync_arena *arena, uint32_t owner )
+{
+    uint32_t abandoned = 0, generation, i;
+
+    if (!owner) return 0;
+    for (i = 0; i < arena->desc_count; ++i)
+    {
+        struct lf_sync_mcas *desc = &arena->descs[i];
+        uint64_t control = load_u64( &desc->control ), desired;
+
+        if (control_owner( control ) != owner || !(control & LF_SYNC_MCAS_CONTROL_OWNER_REF)) continue;
+        generation = control_generation( control );
+        if (control_status( control ) == LF_SYNC_MCAS_PREPARING)
+        {
+            desired = make_control( owner, generation, LF_SYNC_MCAS_ABORTED, 1 );
+            cas_u64( &desc->control, &control, desired );
+        }
+        else if (control_status( control ) == LF_SYNC_MCAS_ACTIVE)
+            help_mcas( arena, i, generation );
+
+        control = load_u64( &desc->control );
+        if (control_owner( control ) != owner || control_generation( control ) != generation ||
+            !(control & LF_SYNC_MCAS_CONTROL_OWNER_REF)) continue;
+        desired = control & ~LF_SYNC_MCAS_CONTROL_OWNER_REF;
+        if (cas_u64( &desc->control, &control, desired ))
+        {
+            uint64_t lifetime = load_u64( &desc->lifetime );
+            if ((lifetime >> LF_LIFETIME_GEN_SHIFT) == generation &&
+                (lifetime & LF_LIFETIME_REF_MASK)) release_desc( desc );
+            ++abandoned;
+        }
+    }
+    return abandoned;
 }
 
 #define LF_MUTEX_OWNER_MASK UINT64_C(0xffffffff)
@@ -559,7 +646,7 @@ static enum lf_sync_result try_wait( const struct lf_sync_arena *arena,
                 indices[1] = count;
                 sort_entries( entries, indices, 2 );
             }
-            mcas = lf_sync_mcas( arena, entries, status_word < arena->word_count ? 2 : 1 );
+            mcas = lf_sync_mcas_owned( arena, entries, status_word < arena->word_count ? 2 : 1, owner );
             if (mcas < 0) return LF_SYNC_RETRY;
             if (mcas)
             {
@@ -590,7 +677,7 @@ static enum lf_sync_result try_wait( const struct lf_sync_arena *arena,
     }
     sort_entries( entries, indices, count );
     for (i = 1; i < count; ++i) if (entries[i - 1].word == entries[i].word) return LF_SYNC_INVALID;
-    mcas = lf_sync_mcas( arena, entries, count );
+    mcas = lf_sync_mcas_owned( arena, entries, count, owner );
     if (mcas < 0) return LF_SYNC_RETRY;
     if (!mcas) return LF_SYNC_UNSATISFIED;
     if (index) *index = 0;
@@ -716,7 +803,7 @@ static void retry_wait( const struct lf_sync_dispatcher *dispatcher, uint32_t sl
             alert_entries[1].expected = lf_sync_wait_value( generation, LF_SYNC_WAITING, 0 );
             alert_entries[1].desired = lf_sync_wait_value( generation, LF_SYNC_WAIT_ALERTED, 0 );
             sort_entries( alert_entries, indices, 2 );
-            do { mcas = lf_sync_mcas( &dispatcher->arena, alert_entries, 2 ); }
+            do { mcas = lf_sync_mcas_owned( &dispatcher->arena, alert_entries, 2, wait->owner ); }
             while (mcas < 0 && load_u64( &wait->published ) == generation);
         }
     }
@@ -940,7 +1027,7 @@ static int pulse_wait( const struct lf_sync_dispatcher *dispatcher, uint32_t slo
         ++count;
         sort_entries( entries, indices, count );
         for (i = 1; i < count; ++i) if (entries[i - 1].word == entries[i].word) goto failed;
-        do { mcas = lf_sync_mcas( &dispatcher->arena, entries, count ); }
+        do { mcas = lf_sync_mcas_owned( &dispatcher->arena, entries, count, wait->owner ); }
         while (mcas < 0 && load_u64( &wait->published ) == generation);
     }
 

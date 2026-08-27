@@ -149,6 +149,63 @@ static void test_descriptor_reclamation_stress(void)
     ok( !(f.descs[0].lifetime & 0xffffffff), "descriptor reference leaked after reuse stress\n" );
 }
 
+static uint64_t test_mcas_control( uint32_t owner, uint32_t generation,
+                                   enum lf_sync_mcas_status status, int owner_ref )
+{
+    return ((uint64_t)owner << LF_SYNC_MCAS_CONTROL_OWNER_SHIFT) |
+           ((uint64_t)generation << LF_SYNC_MCAS_CONTROL_GEN_SHIFT) | status |
+           (owner_ref ? LF_SYNC_MCAS_CONTROL_OWNER_REF : 0);
+}
+
+static void test_dead_descriptor_reclamation(void)
+{
+    struct lf_sync_mcas_entry entry = {0, 0, 0, 1};
+    struct fixture f;
+    uint64_t control;
+    unsigned int i;
+
+    init_fixture( &f );
+
+    /* Model death in the only window where no helper can discover the
+     * descriptor: after its atomic owner claim but before publication. */
+    f.descs[0].lifetime = (UINT64_C(1) << 32) | 1;
+    f.descs[0].control = test_mcas_control( 77, 1, LF_SYNC_MCAS_PREPARING, 1 );
+    ok( lf_sync_abandon_descriptors( &f.arena, 77 ) == 1,
+        "preparing descriptor was not reclaimed\n" );
+    control = f.descs[0].control;
+    ok( !(control & LF_SYNC_MCAS_CONTROL_OWNER_REF), "preparing descriptor kept its owner reference\n" );
+    ok( (control & LF_SYNC_MCAS_CONTROL_STATUS_MASK) == LF_SYNC_MCAS_ABORTED,
+        "preparing descriptor was not aborted\n" );
+    ok( !(f.descs[0].lifetime & UINT32_MAX), "preparing descriptor leaked a lifetime reference\n" );
+
+    /* Model death after publication. Cleanup must help the operation to a
+     * decision before dropping exactly the dead owner's reference. */
+    f.descs[1].entries[0] = entry;
+    f.descs[1].count = 1;
+    f.descs[1].lifetime = (UINT64_C(2) << 32) | 1;
+    f.descs[1].control = test_mcas_control( 78, 2, LF_SYNC_MCAS_ACTIVE, 1 );
+    ok( lf_sync_abandon_descriptors( &f.arena, 78 ) == 1,
+        "active descriptor was not reclaimed\n" );
+    control = f.descs[1].control;
+    ok( !(control & LF_SYNC_MCAS_CONTROL_OWNER_REF), "active descriptor kept its owner reference\n" );
+    ok( (control & LF_SYNC_MCAS_CONTROL_STATUS_MASK) == LF_SYNC_MCAS_COMMITTED,
+        "active descriptor was not helped to commit\n" );
+    ok( f.words[0].value == 1, "reclaimed active descriptor did not publish its result\n" );
+    ok( !(f.descs[1].lifetime & UINT32_MAX), "active descriptor leaked a lifetime reference\n" );
+
+    entry.expected = 1;
+    for (i = 0; i < 10000; ++i)
+    {
+        entry.desired = entry.expected + 1;
+        ok( lf_sync_mcas_owned( &f.arena, &entry, 1, 79 ) == 1,
+            "descriptor reuse failed after death cleanup at iteration %u\n", i );
+        entry.expected = entry.desired;
+    }
+    for (i = 0; i < ARRAY_SIZE(f.descs); ++i)
+        ok( !(f.descs[i].lifetime & UINT32_MAX),
+            "descriptor %u leaked after post-cleanup reuse\n", i );
+}
+
 static void test_commit_and_abort(void)
 {
     struct lf_sync_mcas_entry entries[] =
@@ -644,6 +701,7 @@ int main(void)
     test_commit_and_abort();
     test_competing_wait_all();
     test_descriptor_reclamation_stress();
+    test_dead_descriptor_reclamation();
     test_nt_object_transitions();
     test_owned_mutex_arena_abandonment();
     test_completion_timeout_race();

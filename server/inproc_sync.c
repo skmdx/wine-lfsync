@@ -345,6 +345,7 @@ void abandon_inproc_mutexes( thread_id_t tid )
     {
         lf_sync_abandon_owned_mutexes( &lockfree_dispatcher, tid );
         lf_sync_abandon_waits( &lockfree_dispatcher, tid );
+        lf_sync_abandon_descriptors( &lockfree_dispatcher.arena, tid );
         return;
     }
 

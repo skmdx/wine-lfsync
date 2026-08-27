@@ -28,7 +28,14 @@ enum lf_sync_mcas_status
     LF_SYNC_MCAS_ACTIVE,
     LF_SYNC_MCAS_COMMITTED,
     LF_SYNC_MCAS_ABORTED,
+    LF_SYNC_MCAS_PREPARING,
 };
+
+#define LF_SYNC_MCAS_CONTROL_STATUS_MASK UINT64_C(0x7)
+#define LF_SYNC_MCAS_CONTROL_OWNER_REF   UINT64_C(0x8)
+#define LF_SYNC_MCAS_CONTROL_GEN_SHIFT   4
+#define LF_SYNC_MCAS_CONTROL_OWNER_SHIFT 32
+#define LF_SYNC_MCAS_CONTROL_OWNER(control) ((uint32_t)((control) >> LF_SYNC_MCAS_CONTROL_OWNER_SHIFT))
 
 struct lf_sync_word
 {
@@ -170,6 +177,9 @@ int lf_sync_compare_exchange( const struct lf_sync_arena *arena, uint32_t word,
  * internally. */
 int lf_sync_mcas( const struct lf_sync_arena *arena,
                   const struct lf_sync_mcas_entry *entries, uint32_t count );
+int lf_sync_mcas_owned( const struct lf_sync_arena *arena,
+                        const struct lf_sync_mcas_entry *entries, uint32_t count, uint32_t owner );
+uint32_t lf_sync_abandon_descriptors( const struct lf_sync_arena *arena, uint32_t owner );
 
 void lf_sync_init_event( const struct lf_sync_arena *arena, struct lf_sync_object *object,
                          uint32_t word, int manual, int signaled );
