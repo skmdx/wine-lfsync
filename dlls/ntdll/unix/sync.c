@@ -111,6 +111,12 @@ static inline ULONGLONG monotonic_counter(void)
     return ticks_from_time_t( now.tv_sec ) + now.tv_usec * 10 - server_start_time;
 }
 
+struct lockfree_park_timeout
+{
+    struct timespec timespec;
+    int realtime;
+};
+
 #ifdef __linux__
 
 #define USE_FUTEX
@@ -138,9 +144,27 @@ static inline int futex_wake_one( const LONG *addr )
     return syscall( __NR_futex, addr, FUTEX_WAKE_PRIVATE, 1, NULL, 0, 0 );
 }
 
-static int lockfree_park( uint32_t *addr, uint32_t val, const void *timeout )
+static int lockfree_park( uint32_t *addr, uint32_t val, const void *opaque )
 {
-    return syscall( __NR_futex, addr, FUTEX_WAIT, val, timeout, 0, 0 );
+    const struct lockfree_park_timeout *timeout = opaque;
+    int op = FUTEX_WAIT;
+
+    if (timeout && timeout->realtime) op = FUTEX_WAIT_BITSET | FUTEX_CLOCK_REALTIME;
+#if (defined(__i386__) || defined(__arm__)) && _TIME_BITS==64
+    if (timeout && sizeof(timeout->timespec) != 8)
+    {
+        struct
+        {
+            long tv_sec;
+            long tv_nsec;
+        } timeout32 = {timeout->timespec.tv_sec, timeout->timespec.tv_nsec};
+
+        return syscall( __NR_futex, addr, op, val, &timeout32, 0,
+                        timeout->realtime ? FUTEX_BITSET_MATCH_ANY : 0 );
+    }
+#endif
+    return syscall( __NR_futex, addr, op, val, timeout ? &timeout->timespec : NULL, 0,
+                    timeout && timeout->realtime ? FUTEX_BITSET_MATCH_ANY : 0 );
 }
 
 static void lockfree_wake( uint32_t *addr )
@@ -1019,29 +1043,37 @@ static int get_inproc_alert_fd(void)
     return fd;
 }
 
-static int get_lockfree_timeout( const LARGE_INTEGER *timeout, ULONGLONG deadline, struct timespec *timespec )
+static int get_lockfree_timeout( const LARGE_INTEGER *timeout, ULONGLONG deadline,
+                                 struct lockfree_park_timeout *park_timeout )
 {
     LARGE_INTEGER system_time;
     ULONGLONG now, ticks;
 
     if (!timeout || timeout->QuadPart == TIMEOUT_INFINITE) return 0;
-    if (timeout->QuadPart <= 0) now = monotonic_counter();
+    if (timeout->QuadPart <= 0)
+    {
+        now = monotonic_counter();
+        if (now >= deadline) return -1;
+        ticks = deadline - now;
+        park_timeout->realtime = 0;
+    }
     else
     {
         NtQuerySystemTime( &system_time );
         now = system_time.QuadPart;
+        if (now >= deadline) return -1;
+        ticks = deadline - SECS_1601_TO_1970 * (ULONGLONG)TICKSPERSEC;
+        park_timeout->realtime = 1;
     }
-    if (now >= deadline) return -1;
-    ticks = deadline - now;
-    timespec->tv_sec = ticks / TICKSPERSEC;
-    timespec->tv_nsec = (ticks % TICKSPERSEC) * 100;
+    park_timeout->timespec.tv_sec = ticks / TICKSPERSEC;
+    park_timeout->timespec.tv_nsec = (ticks % TICKSPERSEC) * 100;
     return 1;
 }
 
 static NTSTATUS lockfree_finish_wait( struct lf_sync_wait_ticket *ticket, WAIT_TYPE type,
                                       const LARGE_INTEGER *timeout )
 {
-    struct timespec timespec, *timeout_ptr;
+    struct lockfree_park_timeout park_timeout, *timeout_ptr;
     ULONGLONG deadline = 0;
     uint64_t value;
     NTSTATUS ret;
@@ -1081,13 +1113,13 @@ static NTSTATUS lockfree_finish_wait( struct lf_sync_wait_ticket *ticket, WAIT_T
             goto done;
         }
 
-        wait_ret = get_lockfree_timeout( timeout, deadline, &timespec );
+        wait_ret = get_lockfree_timeout( timeout, deadline, &park_timeout );
         if (wait_ret < 0)
         {
             lf_sync_wait_timeout( &lockfree_dispatcher, ticket );
             continue;
         }
-        timeout_ptr = wait_ret ? &timespec : NULL;
+        timeout_ptr = wait_ret ? &park_timeout : NULL;
         if (lf_sync_wait_park( &lockfree_dispatcher, ticket, timeout_ptr ) < 0)
         {
             if (errno == ETIMEDOUT) lf_sync_wait_timeout( &lockfree_dispatcher, ticket );
