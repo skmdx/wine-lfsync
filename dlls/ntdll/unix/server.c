@@ -326,8 +326,17 @@ NTSTATUS unixcall_wine_server_call( void *args )
  */
 void server_enter_uninterrupted_section( pthread_mutex_t *mutex, sigset_t *sigset )
 {
+    struct thread_data *data = get_thread_data();
+
     pthread_sigmask( SIG_BLOCK, &server_block_set, sigset );
     mutex_lock( mutex );
+    if (data)
+    {
+        /* A thread-kill reply can call abort_thread() even while the signals
+         * blocked above are still masked. Track nested locks for that path. */
+        assert( data->uninterrupted_depth < ARRAY_SIZE(data->uninterrupted_mutexes) );
+        data->uninterrupted_mutexes[data->uninterrupted_depth++] = mutex;
+    }
 }
 
 
@@ -336,6 +345,14 @@ void server_enter_uninterrupted_section( pthread_mutex_t *mutex, sigset_t *sigse
  */
 void server_leave_uninterrupted_section( pthread_mutex_t *mutex, sigset_t *sigset )
 {
+    struct thread_data *data = get_thread_data();
+
+    if (data)
+    {
+        assert( data->uninterrupted_depth );
+        assert( data->uninterrupted_mutexes[data->uninterrupted_depth - 1] == mutex );
+        data->uninterrupted_mutexes[--data->uninterrupted_depth] = NULL;
+    }
     mutex_unlock( mutex );
     pthread_sigmask( SIG_SETMASK, sigset, NULL );
 }

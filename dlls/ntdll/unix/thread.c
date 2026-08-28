@@ -1515,7 +1515,19 @@ NTSTATUS WINAPI PsCreateSystemThread( HANDLE *handle, ACCESS_MASK access, OBJECT
  */
 void abort_thread( int status )
 {
+    struct thread_data *data = get_thread_data();
+
     pthread_sigmask( SIG_BLOCK, &server_block_set, NULL );
+    /* Server-driven termination bypasses the signal mask used by
+     * server_enter_uninterrupted_section(). Do not orphan its process-wide
+     * mutexes when the current pthread exits from an unlocked server call. */
+    while (data && data->uninterrupted_depth)
+    {
+        pthread_mutex_t *mutex = data->uninterrupted_mutexes[--data->uninterrupted_depth];
+
+        data->uninterrupted_mutexes[data->uninterrupted_depth] = NULL;
+        mutex_unlock( mutex );
+    }
     if (InterlockedDecrement( &nb_threads ) <= 0) abort_process( status );
     pthread_exit_wrapper( status );
 }
