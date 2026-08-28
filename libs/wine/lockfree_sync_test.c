@@ -555,6 +555,114 @@ static void test_registered_timeout(void)
         "waiter was not removed from its object\n" );
 }
 
+static void test_waiter_summary(void)
+{
+    struct
+    {
+        struct lf_sync_word words[66];
+        struct lf_sync_mcas descs[8];
+        struct lf_sync_object object;
+        struct lf_sync_wait waits[65];
+    } shared = {0};
+    struct lf_sync_wait_ticket tickets[65];
+    struct lf_sync_dispatcher dispatcher = {0};
+    uint32_t object = 0, i;
+
+    dispatcher.arena.words = shared.words;
+    dispatcher.arena.word_count = ARRAY_SIZE(shared.words);
+    dispatcher.arena.descs = shared.descs;
+    dispatcher.arena.desc_count = ARRAY_SIZE(shared.descs);
+    dispatcher.objects = &shared.object;
+    dispatcher.object_count = 1;
+    dispatcher.waits = shared.waits;
+    dispatcher.wait_count = ARRAY_SIZE(shared.waits);
+    dispatcher.status_word_base = 1;
+    dispatcher.wake = futex_wake;
+    lf_sync_init_event( &dispatcher.arena, &shared.object, 0, 1, 0 );
+
+    for (i = 0; i < ARRAY_SIZE(tickets); ++i)
+        ok( lf_sync_wait_begin( &dispatcher, &object, 1, 0, 200 + i, &tickets[i] ),
+            "summary waiter %u registration failed\n", i );
+    ok( shared.object.waiter_summary == 3,
+        "waiter summary %#x did not cover both populated words\n", shared.object.waiter_summary );
+
+    lf_sync_set_event( &dispatcher.arena, &shared.object, NULL );
+    lf_sync_wake_object( &dispatcher, 0 );
+    for (i = 0; i < ARRAY_SIZE(tickets); ++i)
+    {
+        ok( (lf_sync_wait_poll( &dispatcher, &tickets[i] ) & 0xff) == LF_SYNC_WAIT_COMPLETE,
+            "summary waiter %u was not completed\n", i );
+        lf_sync_wait_end( &dispatcher, &tickets[i] );
+    }
+    ok( !shared.object.waiter_summary, "waiter summary was not cleared\n" );
+}
+
+struct waiter_summary_race
+{
+    struct lf_sync_dispatcher *dispatcher;
+    struct lf_sync_wait_ticket old_ticket;
+    struct lf_sync_wait_ticket new_ticket;
+    pthread_barrier_t barrier;
+    int registered;
+};
+
+static void *waiter_summary_unregister(void *arg)
+{
+    struct waiter_summary_race *race = arg;
+
+    pthread_barrier_wait( &race->barrier );
+    lf_sync_wait_end( race->dispatcher, &race->old_ticket );
+    return NULL;
+}
+
+static void *waiter_summary_register(void *arg)
+{
+    struct waiter_summary_race *race = arg;
+    uint32_t object = 0;
+
+    pthread_barrier_wait( &race->barrier );
+    race->registered = lf_sync_wait_begin( race->dispatcher, &object, 1, 0, 104,
+                                            &race->new_ticket );
+    return NULL;
+}
+
+static void test_waiter_summary_race(void)
+{
+    unsigned int i;
+
+    for (i = 0; i < 1000; ++i)
+    {
+        struct waiter_summary_race race;
+        struct lf_sync_dispatcher dispatcher;
+        struct shared_fixture shared = {0};
+        pthread_t registrar, unregistrar;
+        uint32_t object = 0;
+
+        init_dispatcher( &dispatcher, &shared );
+        lf_sync_init_event( &dispatcher.arena, &shared.objects[0], 0, 1, 0 );
+        memset( &race, 0, sizeof(race) );
+        race.dispatcher = &dispatcher;
+        ok( lf_sync_wait_begin( &dispatcher, &object, 1, 0, 103, &race.old_ticket ),
+            "summary-race initial registration failed at iteration %u\n", i );
+        pthread_barrier_init( &race.barrier, NULL, 2 );
+        pthread_create( &unregistrar, NULL, waiter_summary_unregister, &race );
+        pthread_create( &registrar, NULL, waiter_summary_register, &race );
+        pthread_join( unregistrar, NULL );
+        pthread_join( registrar, NULL );
+        pthread_barrier_destroy( &race.barrier );
+
+        ok( race.registered, "summary-race registration failed at iteration %u\n", i );
+        if (!race.registered) continue;
+        ok( shared.objects[0].waiter_summary && shared.objects[0].waiters[0],
+            "summary-race lost the registered waiter at iteration %u\n", i );
+        lf_sync_set_event( &dispatcher.arena, &shared.objects[0], NULL );
+        lf_sync_wake_object( &dispatcher, 0 );
+        ok( (lf_sync_wait_poll( &dispatcher, &race.new_ticket ) & 0xff) == LF_SYNC_WAIT_COMPLETE,
+            "summary-race waiter was not completed at iteration %u\n", i );
+        lf_sync_wait_end( &dispatcher, &race.new_ticket );
+    }
+}
+
 static void test_registered_mutex_limit(void)
 {
     struct lf_sync_dispatcher dispatcher;
@@ -842,6 +950,8 @@ int main(void)
 #ifdef __linux__
     test_shared_parking();
     test_registered_timeout();
+    test_waiter_summary();
+    test_waiter_summary_race();
     test_registered_mutex_limit();
     test_atomic_signal_and_wait();
     test_pulse_snapshot();
