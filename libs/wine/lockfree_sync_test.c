@@ -444,6 +444,35 @@ static void test_owner_death_transaction_ordering(void)
     free( shared );
 }
 
+static void test_mcas_cleanup_waits_for_active_helpers(void)
+{
+    struct fixture f;
+    struct lf_sync_mcas *desc;
+    const uint32_t generation = 7, owner = 77;
+    uint64_t tag;
+
+    init_fixture( &f );
+    desc = &f.descs[0];
+    tag = test_mcas_tag( 0, generation );
+
+    /* Model an owner reference plus a helper which entered while ACTIVE and
+     * then stalled.  A second helper may decide the transaction, but it must
+     * not remove the tags while the first helper can still install another
+     * one from an expected value which has undergone an ABA transition. */
+    desc->entries[0] = (struct lf_sync_mcas_entry){0, 0, 0, 1};
+    desc->count = 1;
+    desc->lifetime = ((uint64_t)generation << 32) | 2;
+    desc->control = test_mcas_control( owner, generation, LF_SYNC_MCAS_ACTIVE, 1 );
+    f.words[0].value = tag;
+
+    ok( lf_sync_abandon_descriptors( &f.arena, owner ) == 1,
+        "failed to settle descriptor with an active helper\n" );
+    ok( f.words[0].value == tag,
+        "descriptor tags were cleaned while an active helper could re-tag the word\n" );
+    ok( (desc->lifetime & 0xffffffff) == 1,
+        "active helper reference was not preserved\n" );
+}
+
 static void test_object_reuse(void)
 {
     struct lf_sync_mcas_entry entry;
@@ -1202,6 +1231,7 @@ int main(void)
     test_nt_object_transitions();
     test_owned_mutex_arena_abandonment();
     test_owner_death_transaction_ordering();
+    test_mcas_cleanup_waits_for_active_helpers();
     test_object_reuse();
     test_shared_initialization_does_not_touch_payload();
     test_completion_timeout_race();
