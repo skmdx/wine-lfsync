@@ -243,14 +243,22 @@ static void release_desc_owner( struct lf_sync_mcas *desc, uint32_t generation )
 static int alloc_desc( const struct lf_sync_arena *arena, uint32_t owner,
                        uint32_t *index, uint32_t *generation )
 {
-    uint32_t i;
+    uint32_t count, i, n, start;
 
     if (arena_owner_dead( arena, owner )) return 0;
-    for (i = 0; i < arena->desc_count && i <= LF_DESC_INDEX_MASK; ++i)
+    count = arena->desc_count;
+    if (count > LF_DESC_INDEX_MASK + 1) count = LF_DESC_INDEX_MASK + 1;
+    if (!count) return 0;
+    start = owner ? (owner >> 2) % count : 0;
+    for (n = 0; n < count; ++n)
     {
-        struct lf_sync_mcas *desc = &arena->descs[i];
+        struct lf_sync_mcas *desc;
         uint64_t control, desired_control, lifetime, desired_lifetime;
         uint32_t next_generation;
+
+        i = start + n;
+        if (i >= count) i -= count;
+        desc = &arena->descs[i];
 
         lifetime = load_u64( &desc->lifetime );
         if (lifetime & LF_LIFETIME_REF_MASK) continue;
