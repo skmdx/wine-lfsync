@@ -2123,26 +2123,20 @@ static void test_QueryFullProcessImageNameW(void)
         size = ARRAY_SIZE(buf);
         SetLastError(0xdeadbeef);
         *(DWORD*)buf = 0x13579acf;
-        todo_wine
-        {
         expect_eq_d(FALSE, pQueryFullProcessImageNameW(hSelf, flags, buf, &size));
         expect_eq_d((DWORD)ARRAY_SIZE(buf), size);  /* size not changed */
         expect_eq_d(ERROR_INVALID_PARAMETER, GetLastError());
         expect_eq_d(0x13579acf, *(DWORD*)buf);  /* buffer not changed */
-        }
     }
     for (flags = 16; flags != 0; flags <<= 1)
     {
         size = ARRAY_SIZE(buf);
         SetLastError(0xdeadbeef);
         *(DWORD*)buf = 0x13579acf;
-        todo_wine
-        {
         expect_eq_d(FALSE, pQueryFullProcessImageNameW(hSelf, flags, buf, &size));
         expect_eq_d((DWORD)ARRAY_SIZE(buf), size);  /* size not changed */
         expect_eq_d(ERROR_INVALID_PARAMETER, GetLastError());
         expect_eq_d(0x13579acf, *(DWORD*)buf);  /* buffer not changed */
-        }
     }
 
     /* native path */

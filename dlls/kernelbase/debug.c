@@ -1830,6 +1830,12 @@ BOOL WINAPI DECLSPEC_HOTPATCH QueryFullProcessImageNameW( HANDLE process, DWORD 
     UNICODE_STRING *result;
     NTSTATUS status;
 
+    if (flags & ~PROCESS_NAME_NATIVE)
+    {
+        SetLastError( ERROR_INVALID_PARAMETER );
+        return FALSE;
+    }
+
     status = get_process_image_file_name( process, buffer, sizeof(buffer), &dynamic_buffer, &result );
     if (status) return set_ntstatus( status );
 
