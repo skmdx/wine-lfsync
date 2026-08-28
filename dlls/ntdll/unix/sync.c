@@ -81,6 +81,11 @@ int inproc_device_fd = -1;
 static struct lf_sync_shared *lockfree_shared;
 static struct lf_sync_dispatcher lockfree_dispatcher;
 
+#define LF_SYNC_SPIN_INITIAL 4096
+#define LF_SYNC_SPIN_FLOOR 96
+#define LF_SYNC_SPIN_MAX 4096
+#define LF_SYNC_QUICK_PARK_TICKS 500 /* 50 microseconds in Win32 ticks */
+
 static const char *debugstr_timeout( const LARGE_INTEGER *timeout )
 {
     if (!timeout) return "(infinite)";
@@ -1073,11 +1078,15 @@ static int get_lockfree_timeout( const LARGE_INTEGER *timeout, ULONGLONG deadlin
 static NTSTATUS lockfree_finish_wait( struct lf_sync_wait_ticket *ticket, WAIT_TYPE type,
                                       const LARGE_INTEGER *timeout )
 {
+    struct thread_data *data = get_thread_data();
     struct lockfree_park_timeout park_timeout, *timeout_ptr;
-    ULONGLONG deadline = 0;
+    unsigned int spin_limit = data->lockfree_spin ? data->lockfree_spin : LF_SYNC_SPIN_INITIAL;
+    unsigned int spin = peb->NumberOfProcessors > 1 &&
+                        (!timeout || timeout->QuadPart == TIMEOUT_INFINITE) ? spin_limit : 0;
+    ULONGLONG deadline = 0, park_start;
     uint64_t value;
     NTSTATUS ret;
-    int wait_ret;
+    int park_errno, park_ret, spun = 0, wait_ret;
 
     if (timeout && timeout->QuadPart != TIMEOUT_INFINITE)
     {
@@ -1087,6 +1096,19 @@ static NTSTATUS lockfree_finish_wait( struct lf_sync_wait_ticket *ticket, WAIT_T
     for (;;)
     {
         value = lf_sync_wait_poll( &lockfree_dispatcher, ticket );
+        if ((value & 0xff) != LF_SYNC_WAITING && spun)
+        {
+            if (spin_limit < LF_SYNC_SPIN_MAX)
+            {
+                if (data->lockfree_spin_streak < 0) data->lockfree_spin_streak = 0;
+                if (++data->lockfree_spin_streak >= 4)
+                {
+                    data->lockfree_spin = min( spin_limit * 2, LF_SYNC_SPIN_MAX );
+                    data->lockfree_spin_streak = 0;
+                }
+            }
+            else data->lockfree_spin_streak = 0;
+        }
         switch (value & 0xff)
         {
         case LF_SYNC_WAIT_COMPLETE:
@@ -1113,6 +1135,17 @@ static NTSTATUS lockfree_finish_wait( struct lf_sync_wait_ticket *ticket, WAIT_T
             goto done;
         }
 
+        if (spin)
+        {
+            unsigned int count = min( spin, 4u );
+
+            /* A short handoff often completes before entering the kernel. */
+            spun = 1;
+            spin -= count;
+            while (count--) YieldProcessor();
+            continue;
+        }
+
         wait_ret = get_lockfree_timeout( timeout, deadline, &park_timeout );
         if (wait_ret < 0)
         {
@@ -1120,12 +1153,44 @@ static NTSTATUS lockfree_finish_wait( struct lf_sync_wait_ticket *ticket, WAIT_T
             continue;
         }
         timeout_ptr = wait_ret ? &park_timeout : NULL;
-        if (lf_sync_wait_park( &lockfree_dispatcher, ticket, timeout_ptr ) < 0)
+        park_start = !timeout_ptr ? monotonic_counter() : 0;
+        park_ret = lf_sync_wait_park( &lockfree_dispatcher, ticket, timeout_ptr );
+        park_errno = errno;
+        if (!timeout_ptr && (park_ret >= 0 || park_errno == EAGAIN))
         {
-            if (errno == ETIMEDOUT) lf_sync_wait_timeout( &lockfree_dispatcher, ticket );
-            else if (errno != EINTR && errno != EAGAIN)
+            ULONGLONG parked = monotonic_counter() - park_start;
+
+            if (parked < LF_SYNC_QUICK_PARK_TICKS)
             {
-                ret = errno_to_status( errno );
+                if (spin_limit < LF_SYNC_SPIN_MAX)
+                {
+                    if (data->lockfree_spin_streak < 0) data->lockfree_spin_streak = 0;
+                    if (++data->lockfree_spin_streak >= 4)
+                    {
+                        data->lockfree_spin = min( spin_limit * 2, LF_SYNC_SPIN_MAX );
+                        data->lockfree_spin_streak = 0;
+                    }
+                }
+                else if (--data->lockfree_spin_streak > -4)
+                    data->lockfree_spin = LF_SYNC_SPIN_MAX;
+                else
+                {
+                    data->lockfree_spin = LF_SYNC_SPIN_FLOOR;
+                    data->lockfree_spin_streak = 0;
+                }
+            }
+            else
+            {
+                data->lockfree_spin = LF_SYNC_SPIN_FLOOR;
+                data->lockfree_spin_streak = 0;
+            }
+        }
+        if (park_ret < 0)
+        {
+            if (park_errno == ETIMEDOUT) lf_sync_wait_timeout( &lockfree_dispatcher, ticket );
+            else if (park_errno != EINTR && park_errno != EAGAIN)
+            {
+                ret = errno_to_status( park_errno );
                 goto done;
             }
         }

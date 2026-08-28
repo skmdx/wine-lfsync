@@ -1118,8 +1118,14 @@ enum lf_sync_result lf_sync_signal_and_wait_begin( const struct lf_sync_dispatch
 uint64_t lf_sync_wait_poll( const struct lf_sync_dispatcher *dispatcher,
                             const struct lf_sync_wait_ticket *ticket )
 {
+    uint64_t value;
+    uint32_t word;
+
     if (ticket->slot >= dispatcher->wait_count) return 0;
-    return lf_sync_load( &dispatcher->arena, dispatcher->status_word_base + ticket->slot );
+    word = dispatcher->status_word_base + ticket->slot;
+    value = load_u64( &dispatcher->arena.words[word].value );
+    if (!(value & LF_DESC_BIT)) return value;
+    return lf_sync_load( &dispatcher->arena, word );
 }
 
 int lf_sync_wait_park( const struct lf_sync_dispatcher *dispatcher,
