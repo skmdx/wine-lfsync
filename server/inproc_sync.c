@@ -157,8 +157,8 @@ static const struct fd_ops lockfree_lifetime_fd_ops =
 static void lockfree_lifetime_dump( struct object *obj, int verbose )
 {
     struct lockfree_lifetime *lifetime = (struct lockfree_lifetime *)obj;
-    fprintf( stderr, "Lock-free lifetime object=%u retired=%u hung_up=%u\n",
-             lifetime->object, lifetime->retired, lifetime->hung_up );
+    fprintf( stderr, "Lock-free lifetime object=%u active=%u retired=%u hung_up=%u\n",
+             lifetime->object, !!lifetime->fd, lifetime->retired, lifetime->hung_up );
 }
 
 static void lockfree_lifetime_destroy( struct object *obj )
@@ -174,7 +174,7 @@ static int reap_lockfree_lifetime( struct lockfree_lifetime *lifetime )
     if (!lifetime->retired || !lifetime->hung_up || lifetime->object == ~0u ||
         !lf_sync_free_object( &lockfree_dispatcher, lifetime->object )) return 0;
 
-    set_fd_events( lifetime->fd, -1 );
+    if (lifetime->fd) set_fd_events( lifetime->fd, -1 );
     lifetime->object = ~0u;
     list_remove( &lifetime->entry );
     list_init( &lifetime->entry );
@@ -204,49 +204,54 @@ static void lockfree_lifetime_poll_event( struct fd *fd, int event )
     release_object( lifetime );
 }
 
-static struct lockfree_lifetime *create_lockfree_lifetime( uint32_t object, int *client_fd )
+static struct lockfree_lifetime *create_lockfree_lifetime( uint32_t object )
 {
     struct lockfree_lifetime *lifetime;
-    int pipe_fd[2];
 
-    if (pipe( pipe_fd ) < 0) return NULL;
     if (!(lifetime = alloc_object( &lockfree_lifetime_ops )))
-    {
-        close( pipe_fd[0] );
-        close( pipe_fd[1] );
         return NULL;
-    }
     lifetime->fd = NULL;
     lifetime->object = object;
     lifetime->retired = 0;
-    lifetime->hung_up = 0;
+    lifetime->hung_up = 1; /* no client references until the pipe is activated */
     list_init( &lifetime->entry );
+    return lifetime;
+}
+
+static int activate_lockfree_lifetime( struct lockfree_lifetime *lifetime )
+{
+    int pipe_fd[2];
+
+    if (lifetime->fd) return -1;
+    if (pipe( pipe_fd ) < 0) return -1;
     creating_lockfree_lifetime = 1;
     lifetime->fd = create_anonymous_fd( &lockfree_lifetime_fd_ops, pipe_fd[0], &lifetime->obj, 0 );
     creating_lockfree_lifetime = 0;
     if (!lifetime->fd)
     {
         close( pipe_fd[1] );
-        release_object( lifetime );
-        return NULL;
+        return -1;
     }
     set_fd_events( lifetime->fd, POLLIN );
-    *client_fd = pipe_fd[1];
-    return lifetime;
+    lifetime->hung_up = 0;
+    return pipe_fd[1];
 }
 
 static int create_lockfree_sync( struct inproc_sync *sync, enum lf_sync_object_type type,
                                  uint32_t initial, uint32_t limit, uint32_t flags )
 {
+    struct lockfree_lifetime *lifetime;
+
     reap_lockfree_lifetimes();
+    if (!(lifetime = create_lockfree_lifetime( ~0u ))) return 0;
     if (!lf_sync_alloc_object( &lockfree_dispatcher, type, initial, limit, flags, &sync->shm_idx ))
-        return 0;
-    if (!(sync->lifetime = create_lockfree_lifetime( sync->shm_idx, &sync->fd )))
     {
-        lf_sync_free_object( &lockfree_dispatcher, sync->shm_idx );
-        sync->shm_idx = ~0u;
+        release_object( lifetime );
         return 0;
     }
+    lifetime->object = sync->shm_idx;
+    sync->lifetime = lifetime;
+    sync->fd = -1;
     return 1;
 }
 
@@ -266,6 +271,8 @@ static const struct object_ops inproc_sync_ops =
 int get_inproc_sync_fd( struct inproc_sync *sync )
 {
     if (!sync) return -1;
+    if (sync->shm_idx != ~0u && sync->fd < 0 && sync->lifetime)
+        sync->fd = activate_lockfree_lifetime( sync->lifetime );
     return sync->fd;
 }
 
@@ -474,11 +481,14 @@ static void inproc_sync_destroy( struct object *obj )
         lf_sync_free_object( &lockfree_dispatcher, sync->shm_idx );
     else if (sync->lifetime)
     {
-        close( sync->fd );
+        struct lockfree_lifetime *lifetime = sync->lifetime;
+
+        if (sync->fd >= 0) close( sync->fd );
         sync->fd = -1;
-        sync->lifetime->retired = 1;
-        list_add_tail( &retired_lifetimes, &sync->lifetime->entry );
+        lifetime->retired = 1;
+        list_add_tail( &retired_lifetimes, &lifetime->entry );
         sync->lifetime = NULL; /* transfer its reference to the retired list */
+        reap_lockfree_lifetime( lifetime );
     }
     else if (sync->fd >= 0) close( sync->fd );
 }
@@ -521,7 +531,7 @@ static int get_obj_inproc_sync( struct object *obj, int *type, unsigned int *shm
         struct inproc_sync *inproc = (struct inproc_sync *)sync;
         *type = inproc->type;
         *shm_idx = inproc->shm_idx;
-        fd = inproc->fd;
+        fd = get_inproc_sync_fd( inproc );
     }
 
     release_object( sync );
