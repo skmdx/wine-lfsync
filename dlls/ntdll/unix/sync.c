@@ -984,10 +984,8 @@ static NTSTATUS inproc_release_mutex( HANDLE handle, LONG *prev_count )
     if (get_lockfree_object( sync ))
     {
         uint32_t count;
-        lf_sync_query_mutex( &lockfree_dispatcher.arena, get_lockfree_object( sync ),
-                             GetCurrentThreadId(), &count, NULL, NULL );
         ret = lockfree_result_to_status( lf_sync_release_mutex( &lockfree_dispatcher.arena,
-                                    get_lockfree_object( sync ), GetCurrentThreadId(), NULL ) );
+                                    get_lockfree_object( sync ), GetCurrentThreadId(), &count ) );
         if (!ret)
         {
             if (prev_count) *prev_count = 1 - count;
