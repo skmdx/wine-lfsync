@@ -14,15 +14,15 @@
 
 #include <stdint.h>
 
-#define LF_SYNC_MCAS_MAX_WORDS 65
+#define LF_SYNC_MCAS_MAX_WORDS 66
 #define LF_SYNC_SHARED_MAGIC UINT64_C(0x57494e454c465359) /* WINELFSY */
-#define LF_SYNC_SHARED_VERSION 7
+#define LF_SYNC_SHARED_VERSION 8
 #define LF_SYNC_SHARED_OBJECTS 262144
 #define LF_SYNC_SHARED_WAITS 2048
 #define LF_SYNC_SHARED_DESCS 512
 #define LF_SYNC_SHARED_WAITER_BUCKETS 4096
-#define LF_SYNC_SHARED_OWNER_WORDS (LF_SYNC_SHARED_OBJECTS / 64)
-#define LF_SYNC_SHARED_WORDS (LF_SYNC_SHARED_OBJECTS + LF_SYNC_SHARED_WAITS)
+#define LF_SYNC_SHARED_OWNERS LF_SYNC_SHARED_OBJECTS
+#define LF_SYNC_SHARED_WORDS (LF_SYNC_SHARED_OBJECTS + LF_SYNC_SHARED_WAITS + LF_SYNC_SHARED_OWNERS)
 #define LF_SYNC_SHARED_WAITER_WORDS (LF_SYNC_SHARED_WAITS / 64)
 
 enum lf_sync_mcas_status
@@ -68,8 +68,8 @@ struct lf_sync_arena
     uint32_t word_count;
     struct lf_sync_mcas *descs;
     uint32_t desc_count;
-    uint64_t *dead_owners;
-    uint32_t dead_owner_count;
+    uint32_t owner_word_base;
+    uint32_t owner_count;
 };
 
 enum lf_sync_object_type
@@ -148,7 +148,6 @@ struct lf_sync_shared
     uint32_t pad;
     struct lf_sync_word words[LF_SYNC_SHARED_WORDS];
     struct lf_sync_mcas descs[LF_SYNC_SHARED_DESCS];
-    uint64_t dead_owners[LF_SYNC_SHARED_OWNER_WORDS];
     struct lf_sync_object objects[LF_SYNC_SHARED_OBJECTS];
     struct lf_sync_waiter_bucket waiter_buckets[LF_SYNC_SHARED_WAITER_BUCKETS];
     struct lf_sync_wait waits[LF_SYNC_SHARED_WAITS];

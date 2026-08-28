@@ -500,9 +500,12 @@ void abandon_inproc_mutexes( thread_id_t tid )
     if (lockfree_shared)
     {
         lf_sync_set_owner_alive( &lockfree_dispatcher, tid, 0 );
-        lf_sync_abandon_owned_mutexes( &lockfree_dispatcher, tid );
-        lf_sync_abandon_waits( &lockfree_dispatcher, tid );
         lf_sync_abandon_descriptors( &lockfree_dispatcher.arena, tid );
+        lf_sync_abandon_waits( &lockfree_dispatcher, tid );
+        /* Scan mutexes last. An ACTIVE transaction that linearized before
+         * owner death may have acquired another mutex while descriptors were
+         * being settled. */
+        lf_sync_abandon_owned_mutexes( &lockfree_dispatcher, tid );
         reap_lockfree_lifetimes();
         return;
     }

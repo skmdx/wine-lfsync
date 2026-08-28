@@ -25,6 +25,10 @@
 #define LF_LIFETIME_REF_MASK UINT64_C(0xffffffff)
 #define LF_LIFETIME_GEN_SHIFT 32
 
+#define LF_OWNER_DEAD UINT64_C(1)
+#define LF_OWNER_GEN_SHIFT 1
+#define LF_OWNER_GEN_MASK ((UINT64_C(1) << 62) - 1)
+
 static uint64_t load_u64( const uint64_t *ptr )
 {
     return __atomic_load_n( ptr, __ATOMIC_ACQUIRE );
@@ -35,14 +39,23 @@ static int cas_u64( uint64_t *ptr, uint64_t *expected, uint64_t desired )
     return __atomic_compare_exchange_n( ptr, expected, desired, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE );
 }
 
-static int arena_owner_dead( const struct lf_sync_arena *arena, uint32_t owner )
+static int arena_owner_word( const struct lf_sync_arena *arena, uint32_t owner, uint32_t *word )
 {
     uint32_t index;
 
-    if (!owner || !arena->dead_owners || (owner & 3)) return 0;
+    if (!owner || !arena->owner_count || (owner & 3)) return 0;
     index = owner >> 2;
-    if (index >= arena->dead_owner_count * 64) return 0;
-    return !!(load_u64( &arena->dead_owners[index / 64] ) & (UINT64_C(1) << (index % 64)));
+    if (index >= arena->owner_count || arena->owner_word_base + index >= arena->word_count) return 0;
+    *word = arena->owner_word_base + index;
+    return 1;
+}
+
+static int arena_owner_dead( const struct lf_sync_arena *arena, uint32_t owner )
+{
+    uint32_t word;
+
+    if (!arena_owner_word( arena, owner, &word )) return 0;
+    return !!(lf_sync_load( arena, word ) & LF_OWNER_DEAD);
 }
 
 static uint64_t desc_tag( uint32_t index, uint32_t generation )
@@ -260,9 +273,17 @@ static int alloc_desc( const struct lf_sync_arena *arena, uint32_t owner,
         if (i >= count) i -= count;
         desc = &arena->descs[i];
 
+        control = load_u64( &desc->control );
+        if ((control & LF_SYNC_MCAS_CONTROL_OWNER_REF) &&
+            (control_status( control ) == LF_SYNC_MCAS_ACTIVE ||
+             control_status( control ) == LF_SYNC_MCAS_PREPARING) &&
+            arena_owner_dead( arena, control_owner( control ) ))
+        {
+            lf_sync_abandon_descriptors( arena, control_owner( control ) );
+            control = load_u64( &desc->control );
+        }
         lifetime = load_u64( &desc->lifetime );
         if (lifetime & LF_LIFETIME_REF_MASK) continue;
-        control = load_u64( &desc->control );
         if (control & LF_SYNC_MCAS_CONTROL_OWNER_REF) continue;
         if (control_status( control ) == LF_SYNC_MCAS_ACTIVE ||
             control_status( control ) == LF_SYNC_MCAS_PREPARING) continue;
@@ -327,9 +348,12 @@ static void release_desc_owner( struct lf_sync_mcas *desc, uint32_t generation )
 int lf_sync_mcas_owned( const struct lf_sync_arena *arena,
                         const struct lf_sync_mcas_entry *entries, uint32_t count, uint32_t owner )
 {
+    struct lf_sync_mcas_entry owned_entries[LF_SYNC_MCAS_MAX_WORDS];
+    const struct lf_sync_mcas_entry *transaction_entries = entries;
     struct lf_sync_mcas *desc;
     enum lf_sync_mcas_status status;
-    uint32_t generation, i, index;
+    uint32_t generation, i, index, owner_word;
+    uint64_t owner_state;
 
     if (!count || count > LF_SYNC_MCAS_MAX_WORDS)
         return 0;
@@ -341,10 +365,32 @@ int lf_sync_mcas_owned( const struct lf_sync_arena *arena,
             return 0;
     }
 
+    /* Order thread death with every owned transaction. If death publishes
+     * DEAD first this read-only entry fails comparison; if the transaction
+     * tags the owner word first, the death-side CAS helps it to a decision. */
+    if (arena_owner_word( arena, owner, &owner_word ))
+    {
+        if (count == LF_SYNC_MCAS_MAX_WORDS) return 0;
+        owner_state = lf_sync_load( arena, owner_word );
+        if (owner_state & LF_OWNER_DEAD) return -1;
+        memcpy( owned_entries, entries, count * sizeof(*entries) );
+        i = count;
+        while (i && owned_entries[i - 1].word > owner_word)
+        {
+            owned_entries[i] = owned_entries[i - 1];
+            --i;
+        }
+        if ((i && owned_entries[i - 1].word == owner_word) ||
+            (i < count && owned_entries[i].word == owner_word)) return 0;
+        owned_entries[i] = (struct lf_sync_mcas_entry){owner_word, 0, owner_state, owner_state};
+        transaction_entries = owned_entries;
+        ++count;
+    }
+
     if (!alloc_desc( arena, owner, &index, &generation )) return -1;
     desc = &arena->descs[index];
 
-    memcpy( desc->entries, entries, count * sizeof(*entries) );
+    memcpy( desc->entries, transaction_entries, count * sizeof(*entries) );
     __atomic_store_n( &desc->count, count, __ATOMIC_RELAXED );
     {
         uint64_t preparing = make_control( owner, generation, LF_SYNC_MCAS_PREPARING, 1 );
@@ -1406,8 +1452,8 @@ int lf_sync_open_shared( struct lf_sync_dispatcher *dispatcher, struct lf_sync_s
     dispatcher->arena.word_count = LF_SYNC_SHARED_WORDS;
     dispatcher->arena.descs = shared->descs;
     dispatcher->arena.desc_count = LF_SYNC_SHARED_DESCS;
-    dispatcher->arena.dead_owners = shared->dead_owners;
-    dispatcher->arena.dead_owner_count = LF_SYNC_SHARED_OWNER_WORDS;
+    dispatcher->arena.owner_word_base = LF_SYNC_SHARED_OBJECTS + LF_SYNC_SHARED_WAITS;
+    dispatcher->arena.owner_count = LF_SYNC_SHARED_OWNERS;
     dispatcher->objects = shared->objects;
     dispatcher->object_count = LF_SYNC_SHARED_OBJECTS;
     dispatcher->waiter_buckets = shared->waiter_buckets;
@@ -1422,15 +1468,26 @@ int lf_sync_open_shared( struct lf_sync_dispatcher *dispatcher, struct lf_sync_s
 
 void lf_sync_set_owner_alive( const struct lf_sync_dispatcher *dispatcher, uint32_t owner, int alive )
 {
-    uint64_t mask;
-    uint32_t index;
+    uint64_t state, desired, generation;
+    uint32_t word;
 
-    if (!dispatcher->arena.dead_owners || !owner || (owner & 3)) return;
-    index = owner >> 2;
-    if (index >= dispatcher->arena.dead_owner_count * 64) return;
-    mask = UINT64_C(1) << (index % 64);
-    if (alive) __atomic_fetch_and( &dispatcher->arena.dead_owners[index / 64], ~mask, __ATOMIC_RELEASE );
-    else __atomic_fetch_or( &dispatcher->arena.dead_owners[index / 64], mask, __ATOMIC_RELEASE );
+    if (!arena_owner_word( &dispatcher->arena, owner, &word )) return;
+    for (;;)
+    {
+        state = lf_sync_load( &dispatcher->arena, word );
+        if (alive)
+        {
+            if (!(state & LF_OWNER_DEAD)) return;
+            generation = ((state >> LF_OWNER_GEN_SHIFT) + 1) & LF_OWNER_GEN_MASK;
+            desired = generation << LF_OWNER_GEN_SHIFT;
+        }
+        else
+        {
+            if (state & LF_OWNER_DEAD) return;
+            desired = state | LF_OWNER_DEAD;
+        }
+        if (lf_sync_compare_exchange( &dispatcher->arena, word, state, desired )) return;
+    }
 }
 
 int lf_sync_owner_alive( const struct lf_sync_dispatcher *dispatcher, uint32_t owner )

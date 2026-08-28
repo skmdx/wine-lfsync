@@ -157,6 +157,11 @@ static uint64_t test_mcas_control( uint32_t owner, uint32_t generation,
            (owner_ref ? LF_SYNC_MCAS_CONTROL_OWNER_REF : 0);
 }
 
+static uint64_t test_mcas_tag( uint32_t index, uint32_t generation )
+{
+    return (UINT64_C(1) << 63) | ((uint64_t)generation << 20) | index;
+}
+
 static void test_dead_descriptor_reclamation(void)
 {
     struct lf_sync_mcas_entry entry = {0, 0, 0, 1};
@@ -370,6 +375,71 @@ static void test_owned_mutex_arena_abandonment(void)
     mutex = &dispatcher.objects[other_idx];
     ok( lf_sync_try_wait( &dispatcher.arena, &mutex, 1, 0, 99, &index ) == LF_SYNC_UNSATISFIED,
         "arena abandonment changed another owner's mutex\n" );
+
+    free( shared );
+}
+
+static void test_owner_death_transaction_ordering(void)
+{
+    struct lf_sync_dispatcher dispatcher;
+    struct lf_sync_shared *shared;
+    struct lf_sync_mcas *desc;
+    uint32_t count, index, owned, owner = 84;
+    uint64_t tag;
+
+    shared = calloc( 1, sizeof(*shared) );
+    ok( !!shared, "failed to allocate owner-death fixture\n" );
+    if (!shared) return;
+
+    lf_sync_init_shared( shared );
+    ok( lf_sync_open_shared( &dispatcher, shared, NULL, NULL ),
+        "failed to open owner-death fixture\n" );
+    ok( lf_sync_alloc_object( &dispatcher, LF_SYNC_MUTEX, 0, 0, 0, &index ),
+        "failed to allocate owner-death mutex\n" );
+
+    /* Model an ACTIVE acquire which has not tagged the owner epoch yet. Once
+     * death linearizes, helping must abort instead of installing a dead owner. */
+    desc = &shared->descs[0];
+    desc->entries[0] = (struct lf_sync_mcas_entry){index, 0, 0, (UINT64_C(1) << 32) | owner};
+    desc->entries[1] = (struct lf_sync_mcas_entry){dispatcher.arena.owner_word_base + (owner >> 2), 0, 0, 0};
+    desc->count = 2;
+    desc->lifetime = (UINT64_C(1) << 32) | 1;
+    desc->control = test_mcas_control( owner, 1, LF_SYNC_MCAS_ACTIVE, 1 );
+    lf_sync_set_owner_alive( &dispatcher, owner, 0 );
+    ok( lf_sync_abandon_descriptors( &dispatcher.arena, owner ) == 1,
+        "death did not settle the active acquire\n" );
+    lf_sync_query_mutex( &dispatcher.arena, &dispatcher.objects[index], owner, &count, &owned, NULL );
+    ok( !count && !owned, "transaction ordered after death installed the dead mutex owner\n" );
+
+    /* A one-shot death scan can miss PREPARING publication. Allocation must
+     * reclaim such a dead-owner slot instead of leaking it permanently. */
+    desc->lifetime = (UINT64_C(2) << 32) | 1;
+    desc->control = test_mcas_control( owner, 2, LF_SYNC_MCAS_PREPARING, 1 );
+    dispatcher.arena.desc_count = 1;
+    {
+        struct lf_sync_mcas_entry entry = {index, 0, 0, 0};
+        ok( lf_sync_mcas_owned( &dispatcher.arena, &entry, 1, 88 ) == 1,
+            "allocator did not reclaim a missed dead-owner descriptor\n" );
+    }
+    dispatcher.arena.desc_count = LF_SYNC_SHARED_DESCS;
+
+    /* Conversely, if the transaction tags the epoch first, the death-side
+     * CAS helps it commit and the final mutex scan must abandon the result. */
+    lf_sync_set_owner_alive( &dispatcher, owner, 1 );
+    tag = test_mcas_tag( 0, 4 );
+    desc->entries[0] = (struct lf_sync_mcas_entry){index, 0, 0, (UINT64_C(1) << 32) | owner};
+    desc->entries[1] = (struct lf_sync_mcas_entry){dispatcher.arena.owner_word_base + (owner >> 2), 0, 2, 2};
+    desc->count = 2;
+    desc->lifetime = (UINT64_C(4) << 32) | 1;
+    desc->control = test_mcas_control( owner, 4, LF_SYNC_MCAS_ACTIVE, 1 );
+    shared->words[index].value = tag;
+    shared->words[desc->entries[1].word].value = tag;
+    lf_sync_set_owner_alive( &dispatcher, owner, 0 );
+    lf_sync_abandon_descriptors( &dispatcher.arena, owner );
+    ok( lf_sync_abandon_owned_mutexes( &dispatcher, owner ) == 1,
+        "transaction ordered before death was not abandoned by the final scan\n" );
+    lf_sync_query_mutex( &dispatcher.arena, &dispatcher.objects[index], owner, &count, &owned, NULL );
+    ok( !count && !owned, "owner-death cleanup left a mutex owned\n" );
 
     free( shared );
 }
@@ -990,6 +1060,7 @@ int main(void)
     test_dead_descriptor_reclamation();
     test_nt_object_transitions();
     test_owned_mutex_arena_abandonment();
+    test_owner_death_transaction_ordering();
     test_object_reuse();
     test_completion_timeout_race();
 #ifdef __linux__
