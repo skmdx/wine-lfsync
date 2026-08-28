@@ -1,0 +1,8 @@
+PROGRAMS = lockfree_sync_test
+EXTRAINCL = -I$(top_srcdir)/include
+PARENTSRC = ..
+UNIX_LIBS = $(PTHREAD_LIBS)
+
+SOURCES = \
+	lockfree_sync.c \
+	lockfree_sync_test.c

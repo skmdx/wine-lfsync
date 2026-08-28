@@ -1,0 +1,657 @@
+/* Native tests for the lock-free NT synchronization MCAS core. */
+
+#include <pthread.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#ifdef __linux__
+#include <errno.h>
+#include <limits.h>
+#include <linux/futex.h>
+#include <sys/mman.h>
+#include <sys/syscall.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#endif
+
+#include "wine/lockfree_sync.h"
+
+#define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
+
+static int failures;
+
+#define ok(condition, ...) do { if (!(condition)) { fprintf( stderr, __VA_ARGS__ ); failures++; } } while (0)
+
+struct fixture
+{
+    struct lf_sync_word words[5];
+    struct lf_sync_mcas descs[8];
+    struct lf_sync_arena arena;
+};
+
+static void init_fixture( struct fixture *f )
+{
+    memset( f, 0, sizeof(*f) );
+    f->arena.words = f->words;
+    f->arena.word_count = ARRAY_SIZE(f->words);
+    f->arena.descs = f->descs;
+    f->arena.desc_count = ARRAY_SIZE(f->descs);
+}
+
+struct completion_race
+{
+    struct fixture *fixture;
+    struct lf_sync_object *event;
+    uint64_t waiting;
+    int acquired;
+    int timed_out;
+};
+
+static void *run_completion( void *arg )
+{
+    struct completion_race *race = arg;
+    const struct lf_sync_object *object = race->event;
+
+    race->acquired = lf_sync_try_wait_status( &race->fixture->arena, &object, 1, 0, 10, 4,
+                                               race->waiting ) == LF_SYNC_SUCCESS;
+    return NULL;
+}
+
+static void *run_timeout( void *arg )
+{
+    struct completion_race *race = arg;
+    uint64_t generation = race->waiting >> 16;
+
+    race->timed_out = lf_sync_compare_exchange( &race->fixture->arena, 4, race->waiting,
+                                                 lf_sync_wait_value( generation, LF_SYNC_WAIT_TIMED_OUT, 0 ) );
+    return NULL;
+}
+
+static void test_completion_timeout_race(void)
+{
+    struct lf_sync_object event;
+    struct fixture f;
+    uint64_t generation;
+
+    init_fixture( &f );
+    lf_sync_init_event( &f.arena, &event, 0, 0, 1 );
+
+    for (generation = 1; generation <= 10000; ++generation)
+    {
+        struct completion_race race = {.fixture = &f, .event = &event,
+            .waiting = lf_sync_wait_value( generation, LF_SYNC_WAITING, 0 )};
+        pthread_t completion, timeout;
+        uint64_t status;
+
+        f.words[0].value = 1;
+        f.words[4].value = race.waiting;
+        pthread_create( &completion, NULL, run_completion, &race );
+        pthread_create( &timeout, NULL, run_timeout, &race );
+        pthread_join( completion, NULL );
+        pthread_join( timeout, NULL );
+
+        status = lf_sync_load( &f.arena, 4 );
+        ok( race.acquired + race.timed_out == 1, "completion/timeout race had %d winners\n",
+            race.acquired + race.timed_out );
+        if ((status & 0xff) == LF_SYNC_WAIT_COMPLETE)
+            ok( lf_sync_load( &f.arena, 0 ) == 0, "completed wait did not consume event\n" );
+        else
+        {
+            ok( (status & 0xff) == LF_SYNC_WAIT_TIMED_OUT, "invalid terminal wait status %llu\n",
+                (unsigned long long)(status & 0xff) );
+            ok( lf_sync_load( &f.arena, 0 ) == 1, "timed-out wait consumed event\n" );
+        }
+    }
+    ok( !(f.descs[0].lifetime & 0xffffffff), "descriptor reference leaked after timeout races\n" );
+}
+
+struct increment_race
+{
+    struct fixture *fixture;
+    unsigned int iterations;
+};
+
+static void *run_mcas_increment( void *arg )
+{
+    struct increment_race *race = arg;
+    unsigned int completed = 0;
+
+    while (completed < race->iterations)
+    {
+        struct lf_sync_mcas_entry entries[2];
+        uint64_t first = lf_sync_load( &race->fixture->arena, 0 );
+        uint64_t second = lf_sync_load( &race->fixture->arena, 1 );
+
+        if (first != second) continue;
+        entries[0] = (struct lf_sync_mcas_entry){0, 0, first, first + 1};
+        entries[1] = (struct lf_sync_mcas_entry){1, 0, second, second + 1};
+        if (lf_sync_mcas( &race->fixture->arena, entries, ARRAY_SIZE(entries) ) > 0) ++completed;
+    }
+    return NULL;
+}
+
+static void test_descriptor_reclamation_stress(void)
+{
+    struct fixture f;
+    struct increment_race race = {&f, 10000};
+    pthread_t threads[8];
+    unsigned int i;
+
+    init_fixture( &f );
+    f.arena.desc_count = 1;
+    for (i = 0; i < ARRAY_SIZE(threads); ++i) pthread_create( &threads[i], NULL, run_mcas_increment, &race );
+    for (i = 0; i < ARRAY_SIZE(threads); ++i) pthread_join( threads[i], NULL );
+
+    ok( lf_sync_load( &f.arena, 0 ) == 80000 && lf_sync_load( &f.arena, 1 ) == 80000,
+        "descriptor reuse stress lost an update\n" );
+    ok( !(f.descs[0].lifetime & 0xffffffff), "descriptor reference leaked after reuse stress\n" );
+}
+
+static void test_commit_and_abort(void)
+{
+    struct lf_sync_mcas_entry entries[] =
+    {
+        {0, 0, 10, 11},
+        {1, 0, 20, 21},
+        {2, 0, 30, 31},
+    };
+    struct fixture f;
+
+    init_fixture( &f );
+    f.words[0].value = 10;
+    f.words[1].value = 20;
+    f.words[2].value = 30;
+    ok( lf_sync_mcas( &f.arena, entries, ARRAY_SIZE(entries) ), "commit failed\n" );
+    ok( lf_sync_load( &f.arena, 0 ) == 11 && lf_sync_load( &f.arena, 1 ) == 21 &&
+        lf_sync_load( &f.arena, 2 ) == 31, "commit was not atomic\n" );
+
+    entries[0].expected = 11;
+    entries[0].desired = 12;
+    entries[1].expected = 21;
+    entries[1].desired = 22;
+    entries[2].expected = 31;
+    entries[2].desired = 32;
+    ok( lf_sync_mcas( &f.arena, entries, ARRAY_SIZE(entries) ), "reclaimed descriptor failed\n" );
+    ok( lf_sync_load( &f.arena, 0 ) == 12 && lf_sync_load( &f.arena, 1 ) == 22 &&
+        lf_sync_load( &f.arena, 2 ) == 32, "reclaimed descriptor produced wrong values\n" );
+
+    entries[0].expected = 12;
+    entries[0].desired = 13;
+    entries[1].expected = 999;
+    entries[2].expected = 32;
+    entries[2].desired = 33;
+    ok( !lf_sync_mcas( &f.arena, entries, ARRAY_SIZE(entries) ), "mismatched transaction committed\n" );
+    ok( lf_sync_load( &f.arena, 0 ) == 12 && lf_sync_load( &f.arena, 1 ) == 22 &&
+        lf_sync_load( &f.arena, 2 ) == 32, "abort left a partial update\n" );
+}
+
+struct race
+{
+    struct fixture *fixture;
+    int result;
+};
+
+static void *run_wait_all( void *arg )
+{
+    struct race *race = arg;
+    struct lf_sync_mcas_entry entries[] =
+    {
+        {0, 0, 100, 101}, /* auto-reset event: signaled -> nonsignaled + version */
+        {1, 0, 200, 201}, /* semaphore: count 1 -> 0 + version */
+    };
+
+    race->result = lf_sync_mcas( &race->fixture->arena, entries, ARRAY_SIZE(entries) );
+    return NULL;
+}
+
+static void test_competing_wait_all(void)
+{
+    struct fixture f;
+    struct race races[2] = {{&f, 0}, {&f, 0}};
+    pthread_t threads[2];
+
+    init_fixture( &f );
+    f.words[0].value = 100;
+    f.words[1].value = 200;
+    pthread_create( &threads[0], NULL, run_wait_all, &races[0] );
+    pthread_create( &threads[1], NULL, run_wait_all, &races[1] );
+    pthread_join( threads[0], NULL );
+    pthread_join( threads[1], NULL );
+
+    ok( races[0].result + races[1].result == 1, "expected exactly one WaitAll winner, got %d\n",
+        races[0].result + races[1].result );
+    ok( lf_sync_load( &f.arena, 0 ) == 101 && lf_sync_load( &f.arena, 1 ) == 201,
+        "winning WaitAll did not consume every object\n" );
+}
+
+static void test_nt_object_transitions(void)
+{
+    struct lf_sync_object auto_event, manual_event, semaphore, mutex;
+    const struct lf_sync_object *wait_objects[3];
+    struct fixture f;
+    uint32_t index, previous;
+
+    init_fixture( &f );
+    lf_sync_init_event( &f.arena, &auto_event, 0, 0, 1 );
+    lf_sync_init_event( &f.arena, &manual_event, 1, 1, 1 );
+    lf_sync_init_semaphore( &f.arena, &semaphore, 2, 1, 2 );
+    lf_sync_init_mutex( &f.arena, &mutex, 3, 0, 0 );
+
+    wait_objects[0] = &auto_event;
+    wait_objects[1] = &manual_event;
+    wait_objects[2] = &semaphore;
+    ok( lf_sync_try_wait( &f.arena, wait_objects, 3, 1, 10, &index ) == LF_SYNC_SUCCESS,
+        "WaitAll over event/event/semaphore failed\n" );
+    ok( lf_sync_load( &f.arena, 0 ) == 0, "auto-reset event was not consumed\n" );
+    ok( lf_sync_load( &f.arena, 1 ) == 1, "manual-reset event was consumed\n" );
+    ok( lf_sync_load( &f.arena, 2 ) == 0, "semaphore was not consumed\n" );
+    ok( lf_sync_try_wait( &f.arena, wait_objects, 3, 1, 10, &index ) == LF_SYNC_UNSATISFIED,
+        "unsignaled WaitAll succeeded\n" );
+    ok( lf_sync_load( &f.arena, 1 ) == 1, "failed WaitAll changed the manual event\n" );
+
+    ok( lf_sync_set_event( &f.arena, &auto_event, &previous ) == LF_SYNC_SUCCESS && !previous,
+        "setting event returned wrong previous state\n" );
+    ok( lf_sync_release_semaphore( &f.arena, &semaphore, 2, &previous ) == LF_SYNC_SUCCESS && !previous,
+        "semaphore release failed\n" );
+    ok( lf_sync_release_semaphore( &f.arena, &semaphore, 1, NULL ) == LF_SYNC_LIMIT_EXCEEDED,
+        "semaphore limit was not enforced\n" );
+
+    wait_objects[0] = &mutex;
+    ok( lf_sync_try_wait( &f.arena, wait_objects, 1, 0, 10, &index ) == LF_SYNC_SUCCESS,
+        "free mutex acquisition failed\n" );
+    ok( lf_sync_try_wait( &f.arena, wait_objects, 1, 0, 10, &index ) == LF_SYNC_SUCCESS,
+        "recursive mutex acquisition failed\n" );
+    ok( lf_sync_try_wait( &f.arena, wait_objects, 1, 0, 11, &index ) == LF_SYNC_UNSATISFIED,
+        "mutex was acquired by a non-owner\n" );
+    ok( lf_sync_release_mutex( &f.arena, &mutex, 11, NULL ) == LF_SYNC_NOT_OWNER,
+        "non-owner released mutex\n" );
+    ok( lf_sync_release_mutex( &f.arena, &mutex, 10, &previous ) == LF_SYNC_SUCCESS && previous == 2,
+        "recursive mutex release returned wrong count\n" );
+    ok( lf_sync_abandon_mutex( &f.arena, &mutex, 10 ) == LF_SYNC_SUCCESS, "mutex abandonment failed\n" );
+    ok( lf_sync_try_wait( &f.arena, wait_objects, 1, 0, 11, &index ) == LF_SYNC_ABANDONED,
+        "abandoned mutex was not reported\n" );
+    ok( lf_sync_try_wait( &f.arena, wait_objects, 1, 0, 11, &index ) == LF_SYNC_SUCCESS,
+        "new mutex owner could not recurse\n" );
+
+    lf_sync_init_mutex( &f.arena, &mutex, 3, 11, 0x7fffffff );
+    ok( lf_sync_try_wait( &f.arena, wait_objects, 1, 0, 11, &index ) == LF_SYNC_LIMIT_EXCEEDED,
+        "31-bit mutex recursion limit was not enforced\n" );
+}
+
+static void test_owned_mutex_arena_abandonment(void)
+{
+    struct lf_sync_dispatcher dispatcher;
+    struct lf_sync_shared *shared;
+    const struct lf_sync_object *mutex;
+    uint32_t event_idx, owned_idx, other_idx, second_idx, index;
+
+    shared = calloc( 1, sizeof(*shared) );
+    ok( !!shared, "failed to allocate shared arena fixture\n" );
+    if (!shared) return;
+
+    lf_sync_init_shared( shared );
+    ok( lf_sync_open_shared( &dispatcher, shared, NULL, NULL ), "failed to open shared arena fixture\n" );
+    ok( lf_sync_alloc_object( &dispatcher, LF_SYNC_EVENT, 0, 0, 0, &event_idx ),
+        "failed to allocate arena event\n" );
+    ok( lf_sync_alloc_object( &dispatcher, LF_SYNC_MUTEX, 1, 0, 77, &owned_idx ),
+        "failed to allocate first owned arena mutex\n" );
+    ok( lf_sync_alloc_object( &dispatcher, LF_SYNC_MUTEX, 1, 0, 88, &other_idx ),
+        "failed to allocate other owner's arena mutex\n" );
+    ok( lf_sync_alloc_object( &dispatcher, LF_SYNC_MUTEX, 1, 0, 77, &second_idx ),
+        "failed to allocate second owned arena mutex\n" );
+
+    ok( lf_sync_abandon_owned_mutexes( &dispatcher, 77 ) == 2,
+        "arena abandonment did not find both owned mutexes\n" );
+    mutex = &dispatcher.objects[owned_idx];
+    ok( lf_sync_try_wait( &dispatcher.arena, &mutex, 1, 0, 99, &index ) == LF_SYNC_ABANDONED,
+        "first arena mutex was not abandoned\n" );
+    mutex = &dispatcher.objects[second_idx];
+    ok( lf_sync_try_wait( &dispatcher.arena, &mutex, 1, 0, 99, &index ) == LF_SYNC_ABANDONED,
+        "second arena mutex was not abandoned\n" );
+    mutex = &dispatcher.objects[other_idx];
+    ok( lf_sync_try_wait( &dispatcher.arena, &mutex, 1, 0, 99, &index ) == LF_SYNC_UNSATISFIED,
+        "arena abandonment changed another owner's mutex\n" );
+
+    free( shared );
+}
+
+#ifdef __linux__
+
+struct shared_fixture
+{
+    struct lf_sync_word words[4];
+    struct lf_sync_mcas descs[8];
+    struct lf_sync_object objects[2];
+    struct lf_sync_wait waits[2];
+};
+
+static int futex_park( uint32_t *address, uint32_t expected, const void *timeout )
+{
+    return syscall( SYS_futex, address, FUTEX_WAIT, expected, timeout, NULL, 0 );
+}
+
+static void futex_wake( uint32_t *address )
+{
+    syscall( SYS_futex, address, FUTEX_WAKE, INT_MAX, NULL, NULL, 0 );
+}
+
+static void init_dispatcher( struct lf_sync_dispatcher *dispatcher, struct shared_fixture *shared )
+{
+    memset( dispatcher, 0, sizeof(*dispatcher) );
+    dispatcher->arena.words = shared->words;
+    dispatcher->arena.word_count = ARRAY_SIZE(shared->words);
+    dispatcher->arena.descs = shared->descs;
+    dispatcher->arena.desc_count = ARRAY_SIZE(shared->descs);
+    dispatcher->objects = shared->objects;
+    dispatcher->object_count = ARRAY_SIZE(shared->objects);
+    dispatcher->waits = shared->waits;
+    dispatcher->wait_count = ARRAY_SIZE(shared->waits);
+    dispatcher->status_word_base = 2;
+    dispatcher->park = futex_park;
+    dispatcher->wake = futex_wake;
+}
+
+static void test_shared_parking(void)
+{
+    struct lf_sync_dispatcher dispatcher;
+    struct shared_fixture *shared;
+    int ready[2], status;
+    pid_t child;
+    char byte;
+
+    shared = mmap( NULL, sizeof(*shared), PROT_READ | PROT_WRITE,
+                   MAP_SHARED | MAP_ANONYMOUS, -1, 0 );
+    ok( shared != MAP_FAILED, "failed to allocate shared dispatcher\n" );
+    if (shared == MAP_FAILED) return;
+    memset( shared, 0, sizeof(*shared) );
+    init_dispatcher( &dispatcher, shared );
+    lf_sync_init_event( &dispatcher.arena, &shared->objects[0], 0, 0, 0 );
+    ok( pipe( ready ) == 0, "failed to create readiness pipe\n" );
+
+    child = fork();
+    ok( child >= 0, "failed to fork parking test\n" );
+    if (!child)
+    {
+        struct lf_sync_dispatcher child_dispatcher;
+        struct lf_sync_wait_ticket ticket;
+        uint32_t object = 0;
+        uint64_t result;
+
+        close( ready[0] );
+        init_dispatcher( &child_dispatcher, shared );
+        if (!lf_sync_wait_begin( &child_dispatcher, &object, 1, 0, 77, &ticket )) _exit( 2 );
+        if (write( ready[1], "x", 1 ) != 1) _exit( 3 );
+        while ((result = lf_sync_wait_poll( &child_dispatcher, &ticket )) == ticket.waiting)
+            if (lf_sync_wait_park( &child_dispatcher, &ticket, NULL ) < 0 && errno != EINTR && errno != EAGAIN)
+                _exit( 4 );
+        lf_sync_wait_end( &child_dispatcher, &ticket );
+        _exit( (result & 0xff) == LF_SYNC_WAIT_COMPLETE ? 0 : 5 );
+    }
+
+    close( ready[1] );
+    if (child > 0)
+    {
+        if (read( ready[0], &byte, 1 ) != 1) failures++;
+        lf_sync_set_event( &dispatcher.arena, &shared->objects[0], NULL );
+        lf_sync_wake_waiters( &dispatcher );
+        waitpid( child, &status, 0 );
+        ok( WIFEXITED(status) && !WEXITSTATUS(status), "cross-process waiter failed with status %#x\n", status );
+        ok( lf_sync_load( &dispatcher.arena, 0 ) == 0, "cross-process wait did not consume event\n" );
+    }
+    close( ready[0] );
+    munmap( shared, sizeof(*shared) );
+}
+
+static void test_registered_timeout(void)
+{
+    struct lf_sync_dispatcher dispatcher;
+    struct shared_fixture shared = {0};
+    struct lf_sync_wait_ticket ticket;
+    uint32_t object = 0;
+    uint64_t result;
+
+    init_dispatcher( &dispatcher, &shared );
+    lf_sync_init_event( &dispatcher.arena, &shared.objects[0], 0, 0, 0 );
+    ok( lf_sync_wait_begin( &dispatcher, &object, 1, 0, 88, &ticket ), "wait registration failed\n" );
+    ok( lf_sync_wait_timeout( &dispatcher, &ticket ), "registered timeout lost without a signal\n" );
+    lf_sync_set_event( &dispatcher.arena, &shared.objects[0], NULL );
+    lf_sync_wake_waiters( &dispatcher );
+    result = lf_sync_wait_poll( &dispatcher, &ticket );
+    ok( (result & 0xff) == LF_SYNC_WAIT_TIMED_OUT, "signal overwrote terminal timeout status\n" );
+    ok( lf_sync_load( &dispatcher.arena, 0 ) == 1, "signal after timeout was incorrectly consumed\n" );
+    lf_sync_wait_end( &dispatcher, &ticket );
+}
+
+static void test_registered_mutex_limit(void)
+{
+    struct lf_sync_dispatcher dispatcher;
+    struct shared_fixture shared = {0};
+    struct lf_sync_wait_ticket ticket;
+    uint32_t object = 0;
+    uint64_t result;
+
+    init_dispatcher( &dispatcher, &shared );
+    lf_sync_init_mutex( &dispatcher.arena, &shared.objects[0], 0, 88, 0x7fffffff );
+    ok( lf_sync_wait_begin( &dispatcher, &object, 1, 0, 88, &ticket ),
+        "mutex-limit wait registration failed\n" );
+    result = lf_sync_wait_poll( &dispatcher, &ticket );
+    ok( (result & 0xff) == LF_SYNC_WAIT_LIMIT_EXCEEDED,
+        "registered mutex-limit wait did not terminate\n" );
+    lf_sync_wait_end( &dispatcher, &ticket );
+}
+
+static void test_pulse_snapshot(void)
+{
+    struct lf_sync_wait_ticket first, second;
+    struct lf_sync_dispatcher dispatcher;
+    struct shared_fixture shared = {0};
+    uint32_t objects[2] = {0, 1}, previous;
+    uint64_t first_result, second_result;
+
+    init_dispatcher( &dispatcher, &shared );
+    lf_sync_init_event( &dispatcher.arena, &shared.objects[0], 0, 0, 0 );
+    ok( lf_sync_wait_begin( &dispatcher, objects, 1, 0, 90, &first ), "first pulse wait failed\n" );
+    ok( lf_sync_wait_begin( &dispatcher, objects, 1, 0, 91, &second ), "second pulse wait failed\n" );
+    ok( lf_sync_pulse_event( &dispatcher, 0, &previous ) == LF_SYNC_SUCCESS && !previous,
+        "auto-event pulse failed\n" );
+    first_result = lf_sync_wait_poll( &dispatcher, &first );
+    second_result = lf_sync_wait_poll( &dispatcher, &second );
+    ok( ((first_result & 0xff) == LF_SYNC_WAIT_COMPLETE) +
+        ((second_result & 0xff) == LF_SYNC_WAIT_COMPLETE) == 1,
+        "auto-event pulse did not complete exactly one snapshot waiter\n" );
+    ok( !lf_sync_load( &dispatcher.arena, 0 ), "pulse left auto event signaled\n" );
+    lf_sync_wait_timeout( &dispatcher,
+        (first_result & 0xff) == LF_SYNC_WAITING ? &first : &second );
+    lf_sync_wait_end( &dispatcher, &first );
+    lf_sync_wait_end( &dispatcher, &second );
+
+    memset( &shared, 0, sizeof(shared) );
+    init_dispatcher( &dispatcher, &shared );
+    lf_sync_init_event( &dispatcher.arena, &shared.objects[0], 0, 1, 0 );
+    ok( lf_sync_wait_begin( &dispatcher, objects, 1, 0, 90, &first ), "first manual pulse wait failed\n" );
+    ok( lf_sync_wait_begin( &dispatcher, objects, 1, 0, 91, &second ), "second manual pulse wait failed\n" );
+    lf_sync_pulse_event( &dispatcher, 0, NULL );
+    ok( (lf_sync_wait_poll( &dispatcher, &first ) & 0xff) == LF_SYNC_WAIT_COMPLETE &&
+        (lf_sync_wait_poll( &dispatcher, &second ) & 0xff) == LF_SYNC_WAIT_COMPLETE,
+        "manual-event pulse did not complete every snapshot waiter\n" );
+    lf_sync_wait_end( &dispatcher, &first );
+    lf_sync_wait_end( &dispatcher, &second );
+
+    memset( &shared, 0, sizeof(shared) );
+    init_dispatcher( &dispatcher, &shared );
+    lf_sync_init_event( &dispatcher.arena, &shared.objects[0], 0, 0, 0 );
+    lf_sync_init_semaphore( &dispatcher.arena, &shared.objects[1], 1, 1, 1 );
+    ok( lf_sync_wait_begin( &dispatcher, objects, 2, 1, 90, &first ), "pulse WaitAll failed\n" );
+    lf_sync_pulse_event( &dispatcher, 0, NULL );
+    ok( (lf_sync_wait_poll( &dispatcher, &first ) & 0xff) == LF_SYNC_WAIT_COMPLETE,
+        "pulse did not atomically complete WaitAll\n" );
+    ok( !lf_sync_load( &dispatcher.arena, 1 ), "pulse WaitAll did not consume semaphore\n" );
+    lf_sync_wait_end( &dispatcher, &first );
+}
+
+static void test_dead_waiter_reclamation(void)
+{
+    struct lf_sync_wait_ticket dead, replacement;
+    struct lf_sync_dispatcher dispatcher;
+    struct shared_fixture shared = {0};
+    uint32_t object = 0;
+
+    init_dispatcher( &dispatcher, &shared );
+    lf_sync_init_event( &dispatcher.arena, &shared.objects[0], 0, 0, 0 );
+    ok( lf_sync_wait_begin( &dispatcher, &object, 1, 0, 99, &dead ),
+        "dead waiter registration failed\n" );
+    lf_sync_abandon_waits( &dispatcher, 99 );
+    ok( !shared.waits[dead.slot].published && !(shared.waits[dead.slot].lifetime & 0xffffffff),
+        "dead waiter registration reference leaked\n" );
+    ok( lf_sync_wait_begin( &dispatcher, &object, 1, 0, 100, &replacement ),
+        "reclaimed waiter slot could not be reused\n" );
+    ok( replacement.slot == dead.slot && replacement.generation != dead.generation,
+        "reclaimed waiter slot did not advance generation\n" );
+    lf_sync_wait_timeout( &dispatcher, &replacement );
+    lf_sync_wait_end( &dispatcher, &replacement );
+}
+
+struct pulse_race_context
+{
+    struct lf_sync_dispatcher *dispatcher;
+    struct lf_sync_wait_ticket ticket;
+    pthread_barrier_t barrier;
+    int registered;
+};
+
+static void *pulse_race_register(void *arg)
+{
+    struct pulse_race_context *context = arg;
+    uint32_t object = 0;
+
+    pthread_barrier_wait( &context->barrier );
+    context->registered = lf_sync_wait_begin( context->dispatcher, &object, 1, 0, 101,
+                                               &context->ticket );
+    return NULL;
+}
+
+static void *pulse_race_pulse(void *arg)
+{
+    struct pulse_race_context *context = arg;
+
+    pthread_barrier_wait( &context->barrier );
+    lf_sync_pulse_event( context->dispatcher, 0, NULL );
+    return NULL;
+}
+
+static void test_pulse_registration_race(void)
+{
+    unsigned int i;
+
+    for (i = 0; i < 1000; ++i)
+    {
+        struct pulse_race_context context;
+        struct lf_sync_dispatcher dispatcher;
+        struct shared_fixture shared = {0};
+        pthread_t registrar, pulser;
+        uint64_t result;
+
+        init_dispatcher( &dispatcher, &shared );
+        lf_sync_init_event( &dispatcher.arena, &shared.objects[0], 0, 0, 0 );
+        memset( &context, 0, sizeof(context) );
+        context.dispatcher = &dispatcher;
+        pthread_barrier_init( &context.barrier, NULL, 2 );
+        pthread_create( &registrar, NULL, pulse_race_register, &context );
+        pthread_create( &pulser, NULL, pulse_race_pulse, &context );
+        pthread_join( registrar, NULL );
+        pthread_join( pulser, NULL );
+        pthread_barrier_destroy( &context.barrier );
+
+        ok( context.registered, "pulse-race waiter registration failed at iteration %u\n", i );
+        if (!context.registered) continue;
+        result = lf_sync_wait_poll( &dispatcher, &context.ticket );
+        ok( (result & 0xff) == LF_SYNC_WAITING || (result & 0xff) == LF_SYNC_WAIT_COMPLETE,
+            "pulse-registration race produced invalid status %#llx at iteration %u\n",
+            (unsigned long long)result, i );
+        if ((result & 0xff) == LF_SYNC_WAITING) lf_sync_wait_timeout( &dispatcher, &context.ticket );
+        lf_sync_wait_end( &dispatcher, &context.ticket );
+        ok( !(shared.waits[context.ticket.slot].lifetime & 0xffffffff),
+            "pulse-registration race leaked waiter at iteration %u\n", i );
+    }
+}
+
+struct abandon_race_context
+{
+    struct lf_sync_dispatcher *dispatcher;
+    struct lf_sync_wait_ticket *ticket;
+    pthread_barrier_t barrier;
+};
+
+static void *abandon_race_end(void *arg)
+{
+    struct abandon_race_context *context = arg;
+
+    pthread_barrier_wait( &context->barrier );
+    lf_sync_wait_end( context->dispatcher, context->ticket );
+    return NULL;
+}
+
+static void *abandon_race_cleanup(void *arg)
+{
+    struct abandon_race_context *context = arg;
+
+    pthread_barrier_wait( &context->barrier );
+    lf_sync_abandon_waits( context->dispatcher, 102 );
+    return NULL;
+}
+
+static void test_wait_end_abandon_race(void)
+{
+    unsigned int i;
+
+    for (i = 0; i < 1000; ++i)
+    {
+        struct abandon_race_context context;
+        struct lf_sync_wait_ticket ticket;
+        struct lf_sync_dispatcher dispatcher;
+        struct shared_fixture shared = {0};
+        pthread_t ender, cleaner;
+        uint32_t object = 0;
+
+        init_dispatcher( &dispatcher, &shared );
+        lf_sync_init_event( &dispatcher.arena, &shared.objects[0], 0, 0, 0 );
+        ok( lf_sync_wait_begin( &dispatcher, &object, 1, 0, 102, &ticket ),
+            "abandon-race registration failed at iteration %u\n", i );
+        context.dispatcher = &dispatcher;
+        context.ticket = &ticket;
+        pthread_barrier_init( &context.barrier, NULL, 2 );
+        pthread_create( &ender, NULL, abandon_race_end, &context );
+        pthread_create( &cleaner, NULL, abandon_race_cleanup, &context );
+        pthread_join( ender, NULL );
+        pthread_join( cleaner, NULL );
+        pthread_barrier_destroy( &context.barrier );
+        ok( !(shared.waits[ticket.slot].lifetime & 0xffffffff),
+            "wait-end/abandon race leaked or underflowed at iteration %u\n", i );
+    }
+}
+
+#endif
+
+int main(void)
+{
+    ok( lf_sync_is_lock_free(), "64-bit atomics are not lock-free on this platform\n" );
+    test_commit_and_abort();
+    test_competing_wait_all();
+    test_descriptor_reclamation_stress();
+    test_nt_object_transitions();
+    test_owned_mutex_arena_abandonment();
+    test_completion_timeout_race();
+#ifdef __linux__
+    test_shared_parking();
+    test_registered_timeout();
+    test_registered_mutex_limit();
+    test_pulse_snapshot();
+    test_dead_waiter_reclamation();
+    test_pulse_registration_race();
+    test_wait_end_abandon_race();
+#endif
+    if (failures) fprintf( stderr, "%d lock-free synchronization tests failed\n", failures );
+    return failures != 0;
+}
