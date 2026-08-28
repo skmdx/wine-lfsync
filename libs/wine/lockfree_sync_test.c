@@ -451,6 +451,7 @@ struct shared_fixture
     struct lf_sync_word words[4];
     struct lf_sync_mcas descs[8];
     struct lf_sync_object objects[2];
+    struct lf_sync_waiter_bucket waiter_buckets[2];
     struct lf_sync_wait waits[2];
 };
 
@@ -473,6 +474,8 @@ static void init_dispatcher( struct lf_sync_dispatcher *dispatcher, struct share
     dispatcher->arena.desc_count = ARRAY_SIZE(shared->descs);
     dispatcher->objects = shared->objects;
     dispatcher->object_count = ARRAY_SIZE(shared->objects);
+    dispatcher->waiter_buckets = shared->waiter_buckets;
+    dispatcher->waiter_bucket_count = ARRAY_SIZE(shared->waiter_buckets);
     dispatcher->waits = shared->waits;
     dispatcher->wait_count = ARRAY_SIZE(shared->waits);
     dispatcher->status_word_base = 2;
@@ -542,7 +545,7 @@ static void test_registered_timeout(void)
     init_dispatcher( &dispatcher, &shared );
     lf_sync_init_event( &dispatcher.arena, &shared.objects[0], 0, 0, 0 );
     ok( lf_sync_wait_begin( &dispatcher, &object, 1, 0, 88, &ticket ), "wait registration failed\n" );
-    ok( shared.objects[0].waiters[0] & (UINT64_C(1) << ticket.slot),
+    ok( shared.waiter_buckets[0].waiters[0] & (UINT64_C(1) << ticket.slot),
         "waiter was not registered on its object\n" );
     ok( lf_sync_wait_timeout( &dispatcher, &ticket ), "registered timeout lost without a signal\n" );
     lf_sync_set_event( &dispatcher.arena, &shared.objects[0], NULL );
@@ -551,7 +554,7 @@ static void test_registered_timeout(void)
     ok( (result & 0xff) == LF_SYNC_WAIT_TIMED_OUT, "signal overwrote terminal timeout status\n" );
     ok( lf_sync_load( &dispatcher.arena, 0 ) == 1, "signal after timeout was incorrectly consumed\n" );
     lf_sync_wait_end( &dispatcher, &ticket );
-    ok( !(shared.objects[0].waiters[0] & (UINT64_C(1) << ticket.slot)),
+    ok( !(shared.waiter_buckets[0].waiters[0] & (UINT64_C(1) << ticket.slot)),
         "waiter was not removed from its object\n" );
 }
 
@@ -562,6 +565,7 @@ static void test_waiter_summary(void)
         struct lf_sync_word words[66];
         struct lf_sync_mcas descs[8];
         struct lf_sync_object object;
+        struct lf_sync_waiter_bucket waiter_bucket;
         struct lf_sync_wait waits[65];
     } shared = {0};
     struct lf_sync_wait_ticket tickets[65];
@@ -574,6 +578,8 @@ static void test_waiter_summary(void)
     dispatcher.arena.desc_count = ARRAY_SIZE(shared.descs);
     dispatcher.objects = &shared.object;
     dispatcher.object_count = 1;
+    dispatcher.waiter_buckets = &shared.waiter_bucket;
+    dispatcher.waiter_bucket_count = 1;
     dispatcher.waits = shared.waits;
     dispatcher.wait_count = ARRAY_SIZE(shared.waits);
     dispatcher.status_word_base = 1;
@@ -583,8 +589,8 @@ static void test_waiter_summary(void)
     for (i = 0; i < ARRAY_SIZE(tickets); ++i)
         ok( lf_sync_wait_begin( &dispatcher, &object, 1, 0, 200 + i, &tickets[i] ),
             "summary waiter %u registration failed\n", i );
-    ok( shared.object.waiter_summary == 3,
-        "waiter summary %#x did not cover both populated words\n", shared.object.waiter_summary );
+    ok( shared.waiter_bucket.summary == 3,
+        "waiter summary %#x did not cover both populated words\n", shared.waiter_bucket.summary );
 
     lf_sync_set_event( &dispatcher.arena, &shared.object, NULL );
     lf_sync_wake_object( &dispatcher, 0 );
@@ -594,7 +600,7 @@ static void test_waiter_summary(void)
             "summary waiter %u was not completed\n", i );
         lf_sync_wait_end( &dispatcher, &tickets[i] );
     }
-    ok( !shared.object.waiter_summary, "waiter summary was not cleared\n" );
+    ok( !shared.waiter_bucket.summary, "waiter summary was not cleared\n" );
 }
 
 struct waiter_summary_race
@@ -653,7 +659,7 @@ static void test_waiter_summary_race(void)
 
         ok( race.registered, "summary-race registration failed at iteration %u\n", i );
         if (!race.registered) continue;
-        ok( shared.objects[0].waiter_summary && shared.objects[0].waiters[0],
+        ok( shared.waiter_buckets[0].summary && shared.waiter_buckets[0].waiters[0],
             "summary-race lost the registered waiter at iteration %u\n", i );
         lf_sync_set_event( &dispatcher.arena, &shared.objects[0], NULL );
         lf_sync_wake_object( &dispatcher, 0 );
@@ -661,6 +667,45 @@ static void test_waiter_summary_race(void)
             "summary-race waiter was not completed at iteration %u\n", i );
         lf_sync_wait_end( &dispatcher, &race.new_ticket );
     }
+}
+
+static void test_waiter_bucket_collision(void)
+{
+    struct lf_sync_wait_ticket ticket;
+    struct lf_sync_dispatcher dispatcher;
+    struct lf_sync_shared *shared;
+    uint32_t first, second, object;
+
+    shared = calloc( 1, sizeof(*shared) );
+    ok( !!shared, "failed to allocate waiter bucket collision fixture\n" );
+    if (!shared) return;
+    lf_sync_init_shared( shared );
+    ok( lf_sync_open_shared( &dispatcher, shared, NULL, NULL ),
+        "failed to open waiter bucket collision fixture\n" );
+    dispatcher.waiter_bucket_count = 1;
+
+    ok( lf_sync_alloc_object( &dispatcher, LF_SYNC_EVENT, 0, 0, 0, &first ),
+        "failed to allocate first colliding event\n" );
+    ok( lf_sync_alloc_object( &dispatcher, LF_SYNC_EVENT, 0, 0, 0, &second ),
+        "failed to allocate second colliding event\n" );
+    object = second;
+    ok( lf_sync_wait_begin( &dispatcher, &object, 1, 0, 108, &ticket ),
+        "failed to register colliding waiter\n" );
+
+    lf_sync_wake_object( &dispatcher, first );
+    ok( lf_sync_wait_poll( &dispatcher, &ticket ) == ticket.waiting,
+        "hash collision spuriously completed a waiter\n" );
+    ok( lf_sync_free_object( &dispatcher, first ),
+        "unrelated hash collision prevented object reclamation\n" );
+
+    lf_sync_set_event( &dispatcher.arena, &dispatcher.objects[second], NULL );
+    lf_sync_wake_object( &dispatcher, second );
+    ok( (lf_sync_wait_poll( &dispatcher, &ticket ) & 0xff) == LF_SYNC_WAIT_COMPLETE,
+        "colliding waiter was not completed by its own object\n" );
+    lf_sync_wait_end( &dispatcher, &ticket );
+    ok( lf_sync_free_object( &dispatcher, second ),
+        "completed colliding wait prevented object reclamation\n" );
+    free( shared );
 }
 
 static void test_registered_mutex_limit(void)
@@ -952,6 +997,7 @@ int main(void)
     test_registered_timeout();
     test_waiter_summary();
     test_waiter_summary_race();
+    test_waiter_bucket_collision();
     test_registered_mutex_limit();
     test_atomic_signal_and_wait();
     test_pulse_snapshot();

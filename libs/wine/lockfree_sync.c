@@ -447,8 +447,6 @@ static void init_object( const struct lf_sync_arena *arena, struct lf_sync_objec
     object->limit = limit;
     object->flags = flags;
     object->next_free = UINT32_MAX;
-    __atomic_store_n( &object->waiter_summary, 0, __ATOMIC_RELEASE );
-    memset( object->waiters, 0, sizeof(object->waiters) );
     __atomic_store_n( &object->pulse, 0, __ATOMIC_RELEASE );
     __atomic_store_n( &arena->words[word].value, value, __ATOMIC_RELEASE );
 }
@@ -817,27 +815,40 @@ static void release_wait( struct lf_sync_wait *wait )
     assert( (previous & LF_LIFETIME_REF_MASK) != 0 );
 }
 
-static void register_object_wait( struct lf_sync_object *object, uint32_t slot )
+static struct lf_sync_waiter_bucket *get_waiter_bucket( const struct lf_sync_dispatcher *dispatcher,
+                                                        uint32_t object )
 {
-    uint32_t word = slot / 64;
-
-    __atomic_fetch_or( &object->waiters[word], UINT64_C(1) << (slot % 64), __ATOMIC_RELEASE );
-    __atomic_fetch_or( &object->waiter_summary, 1u << word, __ATOMIC_RELEASE );
+    if (!dispatcher->waiter_bucket_count) return NULL;
+    return &dispatcher->waiter_buckets[object % dispatcher->waiter_bucket_count];
 }
 
-static void unregister_object_wait( struct lf_sync_object *object, uint32_t slot )
+static void register_object_wait( const struct lf_sync_dispatcher *dispatcher,
+                                  uint32_t object, uint32_t slot )
 {
+    struct lf_sync_waiter_bucket *bucket = get_waiter_bucket( dispatcher, object );
+    uint32_t word = slot / 64;
+
+    if (!bucket) return;
+    __atomic_fetch_or( &bucket->waiters[word], UINT64_C(1) << (slot % 64), __ATOMIC_RELEASE );
+    __atomic_fetch_or( &bucket->summary, 1u << word, __ATOMIC_RELEASE );
+}
+
+static void unregister_object_wait( const struct lf_sync_dispatcher *dispatcher,
+                                    uint32_t object, uint32_t slot )
+{
+    struct lf_sync_waiter_bucket *bucket = get_waiter_bucket( dispatcher, object );
     uint32_t word = slot / 64, summary_bit = 1u << word;
     uint64_t bit = UINT64_C(1) << (slot % 64), previous;
 
-    previous = __atomic_fetch_and( &object->waiters[word], ~bit, __ATOMIC_RELEASE );
+    if (!bucket) return;
+    previous = __atomic_fetch_and( &bucket->waiters[word], ~bit, __ATOMIC_RELEASE );
     if (!(previous & ~bit))
     {
-        __atomic_fetch_and( &object->waiter_summary, ~summary_bit, __ATOMIC_ACQ_REL );
+        __atomic_fetch_and( &bucket->summary, ~summary_bit, __ATOMIC_ACQ_REL );
         /* Serialize the recheck with the registration RMW. A plain load could
          * legally observe an older value from a concurrent registration. */
-        if (__atomic_fetch_or( &object->waiters[word], 0, __ATOMIC_ACQUIRE ))
-            __atomic_fetch_or( &object->waiter_summary, summary_bit, __ATOMIC_RELEASE );
+        if (__atomic_fetch_or( &bucket->waiters[word], 0, __ATOMIC_ACQUIRE ))
+            __atomic_fetch_or( &bucket->summary, summary_bit, __ATOMIC_RELEASE );
     }
 }
 
@@ -848,9 +859,9 @@ static void unregister_wait( const struct lf_sync_dispatcher *dispatcher,
 
     for (i = 0; i < wait->count; ++i)
         if (wait->objects[i] < dispatcher->object_count)
-            unregister_object_wait( &dispatcher->objects[wait->objects[i]], slot );
+            unregister_object_wait( dispatcher, wait->objects[i], slot );
     if (wait->alert_object < dispatcher->object_count)
-        unregister_object_wait( &dispatcher->objects[wait->alert_object], slot );
+        unregister_object_wait( dispatcher, wait->alert_object, slot );
 }
 
 static int pulse_wait( const struct lf_sync_dispatcher *dispatcher, uint32_t slot,
@@ -975,9 +986,9 @@ static int register_wait( const struct lf_sync_dispatcher *dispatcher, const uin
     __atomic_store_n( &dispatcher->arena.words[dispatcher->status_word_base + slot].value,
                       lf_sync_wait_value( generation, initial_status, 0 ), __ATOMIC_RELEASE );
     __atomic_store_n( &wait->published, generation, __ATOMIC_RELEASE );
-    for (i = 0; i < count; ++i) register_object_wait( &dispatcher->objects[objects[i]], slot );
+    for (i = 0; i < count; ++i) register_object_wait( dispatcher, objects[i], slot );
     if (alert_object < dispatcher->object_count)
-        register_object_wait( &dispatcher->objects[alert_object], slot );
+        register_object_wait( dispatcher, alert_object, slot );
 
     if (!lf_sync_owner_alive( dispatcher, owner ) || load_u64( &wait->published ) != generation)
     {
@@ -1172,15 +1183,17 @@ void lf_sync_wait_end( const struct lf_sync_dispatcher *dispatcher,
 
 void lf_sync_wake_object( const struct lf_sync_dispatcher *dispatcher, uint32_t object )
 {
+    struct lf_sync_waiter_bucket *bucket;
     uint64_t bits;
     uint32_t bit, i, slot, summary;
 
     if (object >= dispatcher->object_count) return;
-    summary = __atomic_load_n( &dispatcher->objects[object].waiter_summary, __ATOMIC_ACQUIRE );
+    if (!(bucket = get_waiter_bucket( dispatcher, object ))) return;
+    summary = __atomic_load_n( &bucket->summary, __ATOMIC_ACQUIRE );
     while (summary)
     {
         i = __builtin_ctz( summary );
-        bits = load_u64( &dispatcher->objects[object].waiters[i] );
+        bits = load_u64( &bucket->waiters[i] );
         while (bits)
         {
             bit = __builtin_ctzll( bits );
@@ -1292,6 +1305,7 @@ failed:
 enum lf_sync_result lf_sync_pulse_event( const struct lf_sync_dispatcher *dispatcher,
                                          uint32_t object, uint32_t *previous )
 {
+    struct lf_sync_waiter_bucket *bucket;
     struct lf_sync_object *event;
     uint64_t pulse, desired;
     uint64_t generation;
@@ -1300,6 +1314,7 @@ enum lf_sync_result lf_sync_pulse_event( const struct lf_sync_dispatcher *dispat
     if (object >= dispatcher->object_count) return LF_SYNC_INVALID;
     event = &dispatcher->objects[object];
     if (event->type != LF_SYNC_EVENT) return LF_SYNC_INVALID;
+    if (!(bucket = get_waiter_bucket( dispatcher, object ))) return LF_SYNC_INVALID;
 
     /* Clear persistent state before advancing the pulse generation. A waiter
      * records that generation during registration and either the pulser or
@@ -1314,13 +1329,13 @@ enum lf_sync_result lf_sync_pulse_event( const struct lf_sync_dispatcher *dispat
         if (cas_u64( &event->pulse, &pulse, desired )) break;
     }
 
-    summary = __atomic_load_n( &event->waiter_summary, __ATOMIC_ACQUIRE );
+    summary = __atomic_load_n( &bucket->summary, __ATOMIC_ACQUIRE );
     while (summary)
     {
         uint64_t bits;
 
         i = __builtin_ctz( summary );
-        bits = load_u64( &event->waiters[i] );
+        bits = load_u64( &bucket->waiters[i] );
 
         while (bits)
         {
@@ -1395,6 +1410,8 @@ int lf_sync_open_shared( struct lf_sync_dispatcher *dispatcher, struct lf_sync_s
     dispatcher->arena.dead_owner_count = LF_SYNC_SHARED_OWNER_WORDS;
     dispatcher->objects = shared->objects;
     dispatcher->object_count = LF_SYNC_SHARED_OBJECTS;
+    dispatcher->waiter_buckets = shared->waiter_buckets;
+    dispatcher->waiter_bucket_count = LF_SYNC_SHARED_WAITER_BUCKETS;
     dispatcher->waits = shared->waits;
     dispatcher->wait_count = LF_SYNC_SHARED_WAITS;
     dispatcher->status_word_base = LF_SYNC_SHARED_OBJECTS;
@@ -1460,13 +1477,50 @@ int lf_sync_alloc_object( struct lf_sync_dispatcher *dispatcher, enum lf_sync_ob
 
 int lf_sync_free_object( struct lf_sync_dispatcher *dispatcher, uint32_t index )
 {
+    struct lf_sync_waiter_bucket *bucket;
     struct lf_sync_object *object;
     uint32_t i;
 
     if (!dispatcher->shared || index >= dispatcher->object_count) return 0;
     object = &dispatcher->objects[index];
-    for (i = 0; i < LF_SYNC_SHARED_WAITS / 64; ++i)
-        if (load_u64( &object->waiters[i] )) return 0;
+    if (!(bucket = get_waiter_bucket( dispatcher, index ))) return 0;
+    /* Do not use the summary here. unregister_object_wait() may temporarily
+     * clear a summary bit while it rechecks a concurrent registration. The
+     * underlying bitmap has no such false-empty window for a live slot. */
+    for (i = 0; i < LF_SYNC_SHARED_WAITER_WORDS; ++i)
+    {
+        uint64_t bits;
+
+        bits = load_u64( &bucket->waiters[i] );
+        while (bits)
+        {
+            struct lf_sync_wait *wait;
+            uint32_t count, generation, j, slot = i * 64 + __builtin_ctzll( bits );
+
+            if (slot < dispatcher->wait_count)
+            {
+                wait = &dispatcher->waits[slot];
+                generation = load_u64( &wait->published );
+                if (generation && acquire_wait( wait, generation ))
+                {
+                    if (load_u64( &wait->published ) == generation)
+                    {
+                        count = wait->count;
+                        if (count > LF_SYNC_MAX_WAIT_OBJECTS) count = LF_SYNC_MAX_WAIT_OBJECTS;
+                        for (j = 0; j < count; ++j)
+                            if (wait->objects[j] == index) break;
+                        if (j != count || wait->alert_object == index)
+                        {
+                            release_wait( wait );
+                            return 0;
+                        }
+                    }
+                    release_wait( wait );
+                }
+            }
+            bits &= bits - 1;
+        }
+    }
     if (object->type == LF_SYNC_MUTEX && mutex_count( lf_sync_load( &dispatcher->arena, object->word ) ))
         return 0;
 

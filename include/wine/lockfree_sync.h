@@ -16,12 +16,14 @@
 
 #define LF_SYNC_MCAS_MAX_WORDS 65
 #define LF_SYNC_SHARED_MAGIC UINT64_C(0x57494e454c465359) /* WINELFSY */
-#define LF_SYNC_SHARED_VERSION 6
+#define LF_SYNC_SHARED_VERSION 7
 #define LF_SYNC_SHARED_OBJECTS 262144
 #define LF_SYNC_SHARED_WAITS 2048
 #define LF_SYNC_SHARED_DESCS 512
+#define LF_SYNC_SHARED_WAITER_BUCKETS 4096
 #define LF_SYNC_SHARED_OWNER_WORDS (LF_SYNC_SHARED_OBJECTS / 64)
 #define LF_SYNC_SHARED_WORDS (LF_SYNC_SHARED_OBJECTS + LF_SYNC_SHARED_WAITS)
+#define LF_SYNC_SHARED_WAITER_WORDS (LF_SYNC_SHARED_WAITS / 64)
 
 enum lf_sync_mcas_status
 {
@@ -84,9 +86,15 @@ struct lf_sync_object
     uint32_t limit;
     uint32_t flags;
     uint32_t next_free;
-    uint32_t waiter_summary;
+    uint32_t pad;
     uint64_t pulse;
-    uint64_t waiters[LF_SYNC_SHARED_WAITS / 64];
+};
+
+struct lf_sync_waiter_bucket
+{
+    uint32_t summary;
+    uint32_t pad;
+    uint64_t waiters[LF_SYNC_SHARED_WAITER_WORDS];
 };
 
 #define LF_SYNC_MAX_WAIT_OBJECTS 64
@@ -115,6 +123,8 @@ struct lf_sync_dispatcher
     struct lf_sync_arena arena;
     struct lf_sync_object *objects;
     uint32_t object_count;
+    struct lf_sync_waiter_bucket *waiter_buckets;
+    uint32_t waiter_bucket_count;
     struct lf_sync_wait *waits;
     uint32_t wait_count;
     uint32_t status_word_base;
@@ -140,6 +150,7 @@ struct lf_sync_shared
     struct lf_sync_mcas descs[LF_SYNC_SHARED_DESCS];
     uint64_t dead_owners[LF_SYNC_SHARED_OWNER_WORDS];
     struct lf_sync_object objects[LF_SYNC_SHARED_OBJECTS];
+    struct lf_sync_waiter_bucket waiter_buckets[LF_SYNC_SHARED_WAITER_BUCKETS];
     struct lf_sync_wait waits[LF_SYNC_SHARED_WAITS];
 };
 
