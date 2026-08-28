@@ -81,8 +81,8 @@ int inproc_device_fd = -1;
 static struct lf_sync_shared *lockfree_shared;
 static struct lf_sync_dispatcher lockfree_dispatcher;
 
-#define LF_SYNC_SPIN_INITIAL 4096
-#define LF_SYNC_SPIN_FLOOR 96
+#define LF_SYNC_SPIN_INITIAL 128
+#define LF_SYNC_SPIN_FLOOR 64
 #define LF_SYNC_SPIN_MAX 4096
 #define LF_SYNC_QUICK_PARK_TICKS 500 /* 50 microseconds in Win32 ticks */
 
@@ -1082,14 +1082,18 @@ static NTSTATUS lockfree_finish_wait( struct lf_sync_wait_ticket *ticket, WAIT_T
                                       const LARGE_INTEGER *timeout )
 {
     struct thread_data *data = get_thread_data();
+    const struct lf_sync_wait *wait = &lockfree_dispatcher.waits[ticket->slot];
     struct lockfree_park_timeout park_timeout, *timeout_ptr;
     unsigned int spin_limit = data->lockfree_spin ? data->lockfree_spin : LF_SYNC_SPIN_INITIAL;
+    int simple_wait = wait->count == 1 && wait->alert_object >= lockfree_dispatcher.object_count;
     unsigned int spin = peb->NumberOfProcessors > 1 &&
                         (!timeout || timeout->QuadPart == TIMEOUT_INFINITE) ? spin_limit : 0;
     ULONGLONG deadline = 0, park_start;
     uint64_t value;
     NTSTATUS ret;
     int park_errno, park_ret, spun = 0, wait_ret;
+
+    if (!simple_wait) spin = min( spin, (unsigned int)LF_SYNC_SPIN_FLOOR );
 
     if (timeout && timeout->QuadPart != TIMEOUT_INFINITE)
     {
