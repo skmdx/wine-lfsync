@@ -240,16 +240,20 @@ static int activate_lockfree_lifetime( struct lockfree_lifetime *lifetime )
 static int create_lockfree_sync( struct inproc_sync *sync, enum lf_sync_object_type type,
                                  uint32_t initial, uint32_t limit, uint32_t flags )
 {
-    struct lockfree_lifetime *lifetime;
+    struct lockfree_lifetime *lifetime = NULL;
 
     reap_lockfree_lifetimes();
-    if (!(lifetime = create_lockfree_lifetime( ~0u ))) return 0;
+    /* An object that has never been sent to a client has no stale shared
+     * references to track, so defer the lifetime pipe and its server object
+     * until the first get_inproc_sync_fd request. An initially-owned mutex is
+     * the exception: it can outlive its last handle until its owner exits. */
+    if (type == LF_SYNC_MUTEX && initial && !(lifetime = create_lockfree_lifetime( ~0u ))) return 0;
     if (!lf_sync_alloc_object( &lockfree_dispatcher, type, initial, limit, flags, &sync->shm_idx ))
     {
-        release_object( lifetime );
+        if (lifetime) release_object( lifetime );
         return 0;
     }
-    lifetime->object = sync->shm_idx;
+    if (lifetime) lifetime->object = sync->shm_idx;
     sync->lifetime = lifetime;
     sync->fd = -1;
     return 1;
@@ -271,8 +275,11 @@ static const struct object_ops inproc_sync_ops =
 int get_inproc_sync_fd( struct inproc_sync *sync )
 {
     if (!sync) return -1;
-    if (sync->shm_idx != ~0u && sync->fd < 0 && sync->lifetime)
+    if (sync->shm_idx != ~0u && sync->fd < 0)
+    {
+        if (!sync->lifetime && !(sync->lifetime = create_lockfree_lifetime( sync->shm_idx ))) return -1;
         sync->fd = activate_lockfree_lifetime( sync->lifetime );
+    }
     return sync->fd;
 }
 
@@ -482,16 +489,27 @@ static void inproc_sync_destroy( struct object *obj )
     list_remove( &sync->entry );
     if (sync->ephemeral)
         lf_sync_free_object( &lockfree_dispatcher, sync->shm_idx );
-    else if (sync->lifetime)
+    else if (sync->shm_idx != ~0u)
     {
         struct lockfree_lifetime *lifetime = sync->lifetime;
 
-        if (sync->fd >= 0) close( sync->fd );
-        sync->fd = -1;
-        lifetime->retired = 1;
-        list_add_tail( &retired_lifetimes, &lifetime->entry );
-        sync->lifetime = NULL; /* transfer its reference to the retired list */
-        reap_lockfree_lifetime( lifetime );
+        if (lifetime)
+        {
+            if (sync->fd >= 0) close( sync->fd );
+            sync->fd = -1;
+            lifetime->retired = 1;
+            list_add_tail( &retired_lifetimes, &lifetime->entry );
+            sync->lifetime = NULL; /* transfer its reference to the retired list */
+            reap_lockfree_lifetime( lifetime );
+        }
+        else
+        {
+            /* No client could have registered a waiter without first
+             * activating the lifetime. Initially-owned mutexes also get a
+             * lifetime at creation, so an unpublished object is reusable now. */
+            int freed = lf_sync_free_object( &lockfree_dispatcher, sync->shm_idx );
+            assert( freed );
+        }
     }
     else if (sync->fd >= 0) close( sync->fd );
 }
