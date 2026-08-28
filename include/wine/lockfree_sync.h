@@ -103,6 +103,7 @@ struct lf_sync_wait
 {
     uint64_t lifetime;
     uint64_t published;
+    uint64_t owner_state;
     uint32_t park_seq;
     uint32_t parked;
     uint32_t count;

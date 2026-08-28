@@ -658,6 +658,83 @@ static void test_registered_timeout(void)
         "waiter was not removed from its object\n" );
 }
 
+static void test_prepared_regular_wait(void)
+{
+    struct lf_sync_wait_ticket first, second;
+    struct lf_sync_dispatcher dispatcher;
+    struct shared_fixture shared = {0};
+    uint32_t object = 0;
+
+    init_dispatcher( &dispatcher, &shared );
+    lf_sync_init_event( &dispatcher.arena, &shared.objects[0], 0, 0, 1 );
+    ok( lf_sync_wait_begin( &dispatcher, &object, 1, 0, 88, &first ),
+        "ready regular wait failed\n" );
+    ok( (lf_sync_wait_poll( &dispatcher, &first ) & 0xff) == LF_SYNC_WAIT_COMPLETE,
+        "ready regular wait did not complete from PREPARED\n" );
+    ok( !shared.waiter_buckets[0].summary && !shared.waiter_buckets[0].waiters[0],
+        "ready regular wait was unnecessarily registered\n" );
+    lf_sync_wait_end( &dispatcher, &first );
+
+    lf_sync_init_event( &dispatcher.arena, &shared.objects[0], 0, 0, 0 );
+    ok( lf_sync_wait_begin( &dispatcher, &object, 1, 0, 88, &first ),
+        "blocking regular wait failed\n" );
+    ok( lf_sync_wait_poll( &dispatcher, &first ) == first.waiting &&
+        shared.waiter_buckets[0].waiters[0] & (UINT64_C(1) << first.slot),
+        "blocking regular wait was not armed after PREPARED\n" );
+    ok( lf_sync_wait_begin( &dispatcher, &object, 1, 0, 92, &second ),
+        "second distributed wait failed\n" );
+    ok( first.slot != second.slot && first.slot == ((88 >> 2) % dispatcher.wait_count) &&
+        second.slot == ((92 >> 2) % dispatcher.wait_count),
+        "wait allocation did not use owner-distributed starting slots\n" );
+    lf_sync_wait_timeout( &dispatcher, &first );
+    lf_sync_wait_timeout( &dispatcher, &second );
+    lf_sync_wait_end( &dispatcher, &first );
+    lf_sync_wait_end( &dispatcher, &second );
+}
+
+static void test_missed_dead_wait_reclamation(void)
+{
+    struct lf_sync_wait_ticket stale, replacement;
+    struct lf_sync_dispatcher dispatcher;
+    struct lf_sync_shared *shared;
+    uint32_t index, owner = 84;
+
+    shared = calloc( 1, sizeof(*shared) );
+    ok( !!shared, "failed to allocate missed-wait fixture\n" );
+    if (!shared) return;
+    lf_sync_init_shared( shared );
+    ok( lf_sync_open_shared( &dispatcher, shared, NULL, NULL ),
+        "failed to open missed-wait fixture\n" );
+    ok( lf_sync_alloc_object( &dispatcher, LF_SYNC_EVENT, 0, 0, 0, &index ),
+        "failed to allocate missed-wait event\n" );
+    ok( lf_sync_wait_begin( &dispatcher, &index, 1, 0, owner, &stale ),
+        "failed to publish stale wait\n" );
+
+    lf_sync_set_owner_alive( &dispatcher, owner, 0 );
+    lf_sync_set_event( &dispatcher.arena, &dispatcher.objects[index], NULL );
+    lf_sync_wake_object( &dispatcher, index );
+    ok( !shared->waits[stale.slot].published &&
+        !(shared->waits[stale.slot].lifetime & UINT32_MAX),
+        "signal-side retry did not reclaim a dead-owner wait\n" );
+    lf_sync_set_owner_alive( &dispatcher, owner, 1 );
+    lf_sync_reset_event( &dispatcher.arena, &dispatcher.objects[index], NULL );
+    ok( lf_sync_wait_begin( &dispatcher, &index, 1, 0, owner, &stale ),
+        "failed to publish second stale wait\n" );
+
+    /* Model a death scan which ran just before publication, followed by TID
+     * reuse. The allocator must use the recorded epoch to reclaim only the
+     * stale generation. */
+    lf_sync_set_owner_alive( &dispatcher, owner, 0 );
+    lf_sync_set_owner_alive( &dispatcher, owner, 1 );
+    ok( lf_sync_wait_begin( &dispatcher, &index, 1, 0, owner, &replacement ),
+        "allocator did not reclaim a missed dead wait\n" );
+    ok( replacement.slot == stale.slot && replacement.generation != stale.generation,
+        "missed dead wait slot was not reused with a new generation\n" );
+    lf_sync_wait_timeout( &dispatcher, &replacement );
+    lf_sync_wait_end( &dispatcher, &replacement );
+    free( shared );
+}
+
 static void test_parked_handshake(void)
 {
     struct lf_sync_wait_ticket ticket;
@@ -979,6 +1056,7 @@ static void test_dead_waiter_reclamation(void)
     uint32_t object = 0;
 
     init_dispatcher( &dispatcher, &shared );
+    dispatcher.wait_count = 1;
     lf_sync_init_event( &dispatcher.arena, &shared.objects[0], 0, 0, 0 );
     ok( lf_sync_wait_begin( &dispatcher, &object, 1, 0, 99, &dead ),
         "dead waiter registration failed\n" );
@@ -1130,6 +1208,8 @@ int main(void)
 #ifdef __linux__
     test_shared_parking();
     test_registered_timeout();
+    test_prepared_regular_wait();
+    test_missed_dead_wait_reclamation();
     test_parked_handshake();
     test_waiter_summary();
     test_waiter_summary_race();

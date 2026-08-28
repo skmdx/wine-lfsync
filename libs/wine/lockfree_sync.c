@@ -58,6 +58,14 @@ static int arena_owner_dead( const struct lf_sync_arena *arena, uint32_t owner )
     return !!(lf_sync_load( arena, word ) & LF_OWNER_DEAD);
 }
 
+static uint64_t arena_owner_state( const struct lf_sync_arena *arena, uint32_t owner )
+{
+    uint32_t word;
+
+    if (!arena_owner_word( arena, owner, &word )) return 0;
+    return lf_sync_load( arena, word );
+}
+
 static uint64_t desc_tag( uint32_t index, uint32_t generation )
 {
     return LF_DESC_BIT | ((uint64_t)generation << LF_DESC_INDEX_BITS) | index;
@@ -834,7 +842,9 @@ enum lf_sync_result lf_sync_try_wait_status( const struct lf_sync_arena *arena,
                                              uint32_t count, int wait_all, uint32_t owner,
                                              uint32_t status_word, uint64_t waiting )
 {
-    if (status_word >= arena->word_count || (waiting & 0xff) != LF_SYNC_WAITING) return LF_SYNC_INVALID;
+    if (status_word >= arena->word_count ||
+        ((waiting & 0xff) != LF_SYNC_WAITING && (waiting & 0xff) != LF_SYNC_WAIT_PREPARED))
+        return LF_SYNC_INVALID;
     return try_wait( arena, objects, count, wait_all, owner, NULL,
                      status_word, waiting );
 }
@@ -920,17 +930,36 @@ static void wake_wait( const struct lf_sync_dispatcher *dispatcher, struct lf_sy
     if (dispatcher->wake) dispatcher->wake( &wait->park_seq );
 }
 
-static int alloc_wait( const struct lf_sync_dispatcher *dispatcher, uint32_t *slot, uint32_t *generation )
+static int alloc_wait( const struct lf_sync_dispatcher *dispatcher, uint32_t owner,
+                       uint32_t *slot, uint32_t *generation )
 {
-    uint32_t i;
+    uint32_t count = dispatcher->wait_count, i, n, start;
 
-    for (i = 0; i < dispatcher->wait_count; ++i)
+    if (!count) return 0;
+    start = owner ? (owner >> 2) % count : 0;
+    for (n = 0; n < count; ++n)
     {
-        struct lf_sync_wait *wait = &dispatcher->waits[i];
-        uint64_t lifetime = load_u64( &wait->lifetime ), desired;
+        struct lf_sync_wait *wait;
+        uint64_t lifetime, desired;
         uint32_t next_generation;
 
-        if (lifetime & LF_LIFETIME_REF_MASK) continue;
+        i = start + n;
+        if (i >= count) i -= count;
+        wait = &dispatcher->waits[i];
+        lifetime = load_u64( &wait->lifetime );
+        if (lifetime & LF_LIFETIME_REF_MASK)
+        {
+            uint32_t published = load_u64( &wait->published );
+
+            if (published && wait->owner &&
+                (wait->owner_state != arena_owner_state( &dispatcher->arena, wait->owner ) ||
+                 (wait->owner_state & LF_OWNER_DEAD)))
+            {
+                lf_sync_abandon_waits( dispatcher, wait->owner );
+                lifetime = load_u64( &wait->lifetime );
+            }
+            if (lifetime & LF_LIFETIME_REF_MASK) continue;
+        }
         next_generation = (lifetime >> LF_LIFETIME_GEN_SHIFT) + 1;
         if (!next_generation) next_generation = 1;
         desired = ((uint64_t)next_generation << LF_LIFETIME_GEN_SHIFT) | 1;
@@ -942,7 +971,8 @@ static int alloc_wait( const struct lf_sync_dispatcher *dispatcher, uint32_t *sl
     return 0;
 }
 
-static void retry_wait( const struct lf_sync_dispatcher *dispatcher, uint32_t slot, uint32_t generation )
+static void retry_wait_status( const struct lf_sync_dispatcher *dispatcher, uint32_t slot,
+                               uint32_t generation, enum lf_sync_wait_status expected_status )
 {
     const struct lf_sync_object *objects[LF_SYNC_MAX_WAIT_OBJECTS];
     struct lf_sync_mcas_entry alert_entries[2];
@@ -971,37 +1001,54 @@ static void retry_wait( const struct lf_sync_dispatcher *dispatcher, uint32_t sl
         {
             alert_entries[1].word = dispatcher->status_word_base + slot;
             alert_entries[1].pad = 0;
-            alert_entries[1].expected = lf_sync_wait_value( generation, LF_SYNC_WAITING, 0 );
+            alert_entries[1].expected = lf_sync_wait_value( generation, expected_status, 0 );
             alert_entries[1].desired = lf_sync_wait_value( generation, LF_SYNC_WAIT_ALERTED, 0 );
             sort_entries( alert_entries, indices, 2 );
             do { mcas = lf_sync_mcas_owned( &dispatcher->arena, alert_entries, 2, wait->owner ); }
-            while (mcas < 0 && load_u64( &wait->published ) == generation);
+            while (mcas < 0 && load_u64( &wait->published ) == generation &&
+                   wait->owner_state == arena_owner_state( &dispatcher->arena, wait->owner ) &&
+                   !(wait->owner_state & LF_OWNER_DEAD));
         }
     }
 
     while ((result = lf_sync_try_wait_status( &dispatcher->arena, objects, wait->count, wait->wait_all,
                                               wait->owner, dispatcher->status_word_base + slot,
-                                              lf_sync_wait_value( generation, LF_SYNC_WAITING, 0 ) )) == LF_SYNC_RETRY)
+                                              lf_sync_wait_value( generation, expected_status, 0 ) )) == LF_SYNC_RETRY)
+    {
+        uint64_t owner_state = arena_owner_state( &dispatcher->arena, wait->owner );
+
         if (load_u64( &wait->published ) != generation) break;
+        if ((owner_state & LF_OWNER_DEAD) || owner_state != wait->owner_state)
+        {
+            lf_sync_abandon_waits( dispatcher, wait->owner );
+            break;
+        }
+    }
 
     if (result == LF_SYNC_LIMIT_EXCEEDED || result == LF_SYNC_INVALID)
     {
-        uint64_t waiting = lf_sync_wait_value( generation, LF_SYNC_WAITING, 0 );
+        uint64_t waiting = lf_sync_wait_value( generation, expected_status, 0 );
         uint64_t failed = lf_sync_wait_value( generation,
             result == LF_SYNC_LIMIT_EXCEEDED ? LF_SYNC_WAIT_LIMIT_EXCEEDED : LF_SYNC_WAIT_INVALID, 0 );
         lf_sync_compare_exchange( &dispatcher->arena, dispatcher->status_word_base + slot,
                                   waiting, failed );
     }
 
-    if ((lf_sync_load( &dispatcher->arena, dispatcher->status_word_base + slot ) & 0xff) != LF_SYNC_WAITING)
+    if ((lf_sync_load( &dispatcher->arena, dispatcher->status_word_base + slot ) & 0xff) != expected_status)
         wake_wait( dispatcher, wait );
 done:
     release_wait( wait );
 }
 
+static void retry_wait( const struct lf_sync_dispatcher *dispatcher, uint32_t slot, uint32_t generation )
+{
+    retry_wait_status( dispatcher, slot, generation, LF_SYNC_WAITING );
+}
+
 static int register_wait( const struct lf_sync_dispatcher *dispatcher, const uint32_t *objects,
                           uint32_t count, int wait_all, uint32_t owner, uint32_t alert_object,
-                          enum lf_sync_wait_status initial_status, struct lf_sync_wait_ticket *ticket )
+                          enum lf_sync_wait_status initial_status, int register_objects,
+                          struct lf_sync_wait_ticket *ticket )
 {
     struct lf_sync_wait *wait;
     uint64_t expected, invalid;
@@ -1013,7 +1060,7 @@ static int register_wait( const struct lf_sync_dispatcher *dispatcher, const uin
         return 0;
     for (i = 0; i < count; ++i) if (objects[i] >= dispatcher->object_count) return 0;
     if (alert_object != ~0u && alert_object >= dispatcher->object_count) return 0;
-    if (!alloc_wait( dispatcher, &slot, &generation )) return 0;
+    if (!alloc_wait( dispatcher, owner, &slot, &generation )) return 0;
 
     wait = &dispatcher->waits[slot];
     if (!acquire_wait( wait, generation ))
@@ -1023,6 +1070,7 @@ static int register_wait( const struct lf_sync_dispatcher *dispatcher, const uin
     }
     wait->count = count;
     wait->owner = owner;
+    wait->owner_state = arena_owner_state( &dispatcher->arena, owner );
     wait->wait_all = !!wait_all;
     wait->alert_object = alert_object;
     for (i = 0; i < count; ++i)
@@ -1036,11 +1084,15 @@ static int register_wait( const struct lf_sync_dispatcher *dispatcher, const uin
     __atomic_store_n( &dispatcher->arena.words[dispatcher->status_word_base + slot].value,
                       lf_sync_wait_value( generation, initial_status, 0 ), __ATOMIC_RELEASE );
     __atomic_store_n( &wait->published, generation, __ATOMIC_RELEASE );
-    for (i = 0; i < count; ++i) register_object_wait( dispatcher, objects[i], slot );
-    if (alert_object < dispatcher->object_count)
-        register_object_wait( dispatcher, alert_object, slot );
+    if (register_objects)
+    {
+        for (i = 0; i < count; ++i) register_object_wait( dispatcher, objects[i], slot );
+        if (alert_object < dispatcher->object_count)
+            register_object_wait( dispatcher, alert_object, slot );
+    }
 
-    if (!lf_sync_owner_alive( dispatcher, owner ) || load_u64( &wait->published ) != generation)
+    if (wait->owner_state != arena_owner_state( &dispatcher->arena, owner ) ||
+        (wait->owner_state & LF_OWNER_DEAD) || load_u64( &wait->published ) != generation)
     {
         expected = generation;
         if (cas_u64( &wait->published, &expected, 0 ))
@@ -1048,10 +1100,10 @@ static int register_wait( const struct lf_sync_dispatcher *dispatcher, const uin
             invalid = lf_sync_wait_value( generation, LF_SYNC_WAIT_INVALID, 0 );
             lf_sync_compare_exchange( &dispatcher->arena, dispatcher->status_word_base + slot,
                                       lf_sync_wait_value( generation, initial_status, 0 ), invalid );
-            unregister_wait( dispatcher, wait, slot );
+            if (register_objects) unregister_wait( dispatcher, wait, slot );
             release_wait( wait ); /* registration reference */
         }
-        else unregister_wait( dispatcher, wait, slot );
+        else if (register_objects) unregister_wait( dispatcher, wait, slot );
         release_wait( wait ); /* temporary publication reference */
         return 0;
     }
@@ -1064,12 +1116,38 @@ int lf_sync_wait_begin_alert( const struct lf_sync_dispatcher *dispatcher, const
                               uint32_t count, int wait_all, uint32_t owner, uint32_t alert_object,
                               struct lf_sync_wait_ticket *ticket )
 {
+    struct lf_sync_mcas_entry entry;
     struct lf_sync_wait *wait;
+    uint64_t prepared;
     uint32_t i;
+    int mcas;
 
     if (!register_wait( dispatcher, objects, count, wait_all, owner, alert_object,
-                        LF_SYNC_WAITING, ticket )) return 0;
+                        LF_SYNC_WAIT_PREPARED, 0, ticket )) return 0;
     wait = &dispatcher->waits[ticket->slot];
+    prepared = lf_sync_wait_value( ticket->generation, LF_SYNC_WAIT_PREPARED, 0 );
+
+    /* Ready waits complete without ever publishing into a waiter bucket. */
+    retry_wait_status( dispatcher, ticket->slot, ticket->generation, LF_SYNC_WAIT_PREPARED );
+    if (lf_sync_wait_poll( dispatcher, ticket ) != prepared) return 1;
+
+    for (i = 0; i < count; ++i) register_object_wait( dispatcher, objects[i], ticket->slot );
+    if (alert_object < dispatcher->object_count)
+        register_object_wait( dispatcher, alert_object, ticket->slot );
+
+    entry.word = dispatcher->status_word_base + ticket->slot;
+    entry.pad = 0;
+    entry.expected = prepared;
+    entry.desired = ticket->waiting;
+    do { mcas = lf_sync_mcas_owned( &dispatcher->arena, &entry, 1, owner ); }
+    while (mcas < 0 && load_u64( &wait->published ) == ticket->generation &&
+           wait->owner_state == arena_owner_state( &dispatcher->arena, owner ) &&
+           !(wait->owner_state & LF_OWNER_DEAD));
+    if (mcas <= 0)
+    {
+        lf_sync_wait_end( dispatcher, ticket );
+        return 0;
+    }
 
     /* This retry pairs with signal-side scanning and closes the registration
      * window in which an object can become signaled before publication. */
@@ -1107,7 +1185,7 @@ enum lf_sync_result lf_sync_signal_and_wait_begin( const struct lf_sync_dispatch
     if (signal_object >= dispatcher->object_count || wait_object >= dispatcher->object_count ||
         !owner || owner == LF_MUTEX_ABANDONED_OWNER) return LF_SYNC_INVALID;
     if (!register_wait( dispatcher, &object, 1, 0, owner, alert_object,
-                        LF_SYNC_WAIT_PREPARED, ticket )) return LF_SYNC_RETRY;
+                        LF_SYNC_WAIT_PREPARED, 1, ticket )) return LF_SYNC_RETRY;
 
     signal = &dispatcher->objects[signal_object];
     wait = &dispatcher->objects[wait_object];
@@ -1158,6 +1236,12 @@ enum lf_sync_result lf_sync_signal_and_wait_begin( const struct lf_sync_dispatch
         sort_entries( entries, indices, count );
         mcas = lf_sync_mcas_owned( &dispatcher->arena, entries, count, owner );
         if (mcas > 0) break;
+        if (mcas < 0 && (registered->owner_state & LF_OWNER_DEAD ||
+            registered->owner_state != arena_owner_state( &dispatcher->arena, owner )))
+        {
+            lf_sync_wait_end( dispatcher, ticket );
+            return LF_SYNC_RETRY;
+        }
         if (lf_sync_load( &dispatcher->arena, dispatcher->status_word_base + ticket->slot ) != prepared)
         {
             lf_sync_wait_end( dispatcher, ticket );
@@ -1340,7 +1424,9 @@ static int pulse_wait( const struct lf_sync_dispatcher *dispatcher, uint32_t slo
         sort_entries( entries, indices, count );
         for (i = 1; i < count; ++i) if (entries[i - 1].word == entries[i].word) goto failed;
         do { mcas = lf_sync_mcas_owned( &dispatcher->arena, entries, count, wait->owner ); }
-        while (mcas < 0 && load_u64( &wait->published ) == generation);
+        while (mcas < 0 && load_u64( &wait->published ) == generation &&
+               wait->owner_state == arena_owner_state( &dispatcher->arena, wait->owner ) &&
+               !(wait->owner_state & LF_OWNER_DEAD));
     }
 
     if (mcas)
@@ -1413,9 +1499,11 @@ enum lf_sync_result lf_sync_pulse_event( const struct lf_sync_dispatcher *dispat
 
 void lf_sync_abandon_waits( const struct lf_sync_dispatcher *dispatcher, uint32_t owner )
 {
+    uint64_t owner_state;
     uint32_t i;
 
     if (!owner) return;
+    owner_state = arena_owner_state( &dispatcher->arena, owner );
     for (i = 0; i < dispatcher->wait_count; ++i)
     {
         struct lf_sync_wait *wait = &dispatcher->waits[i];
@@ -1423,7 +1511,9 @@ void lf_sync_abandon_waits( const struct lf_sync_dispatcher *dispatcher, uint32_
         uint64_t prepared, published, waiting, failed;
 
         if (!generation || !acquire_wait( wait, generation )) continue;
-        if (wait->owner != owner) goto done;
+        if (wait->owner != owner ||
+            (dispatcher->arena.owner_count && !(owner_state & LF_OWNER_DEAD) &&
+             wait->owner_state == owner_state)) goto done;
         published = generation;
         if (!cas_u64( &wait->published, &published, 0 )) goto done;
         unregister_wait( dispatcher, wait, i );
