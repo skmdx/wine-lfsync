@@ -116,11 +116,11 @@ static WCHAR *get_wine_inf_path(void)
     return name;
 }
 
-/* update the timestamp if different from the reference time */
-static BOOL update_timestamp( const WCHAR *config_dir, unsigned long timestamp )
+/* check whether the timestamp is different from the reference time */
+static BOOL timestamp_needs_update( const WCHAR *config_dir, unsigned long timestamp )
 {
-    BOOL ret = FALSE;
-    int fd, count;
+    BOOL ret = TRUE;
+    int fd, count = -1;
     char buffer[100];
     WCHAR *file = malloc( wcslen(config_dir) * sizeof(WCHAR) + sizeof(L"\\.update-timestamp") );
 
@@ -128,22 +128,43 @@ static BOOL update_timestamp( const WCHAR *config_dir, unsigned long timestamp )
     lstrcpyW( file, config_dir );
     lstrcatW( file, L"\\.update-timestamp" );
 
-    if ((fd = _wopen( file, O_RDWR )) != -1)
+    if ((fd = _wopen( file, O_RDONLY )) != -1)
+    {
+        if ((count = read( fd, buffer, sizeof(buffer) - 1 )) >= 0)
+        {
+            buffer[count] = 0;
+            if (!strncmp( buffer, "disable", sizeof("disable")-1 )) ret = FALSE;
+            else if (timestamp == strtoul( buffer, NULL, 10 )) ret = FALSE;
+        }
+    }
+    else if (errno != ENOENT) ret = FALSE;
+
+    if (fd != -1) close( fd );
+    free( file );
+    return ret;
+}
+
+/* write the prefix update timestamp, preserving the special "disable" value */
+static void write_update_timestamp( const WCHAR *config_dir, unsigned long timestamp )
+{
+    int fd, count;
+    char buffer[100];
+    WCHAR *file = malloc( wcslen(config_dir) * sizeof(WCHAR) + sizeof(L"\\.update-timestamp") );
+
+    if (!file) return;
+    lstrcpyW( file, config_dir );
+    lstrcatW( file, L"\\.update-timestamp" );
+
+    if ((fd = _wopen( file, O_RDONLY )) != -1)
     {
         if ((count = read( fd, buffer, sizeof(buffer) - 1 )) >= 0)
         {
             buffer[count] = 0;
             if (!strncmp( buffer, "disable", sizeof("disable")-1 )) goto done;
-            if (timestamp == strtoul( buffer, NULL, 10 )) goto done;
         }
-        lseek( fd, 0, SEEK_SET );
-        chsize( fd, 0 );
+        close( fd );
     }
-    else
-    {
-        if (errno != ENOENT) goto done;
-        if ((fd = _wopen( file, O_WRONLY | O_CREAT | O_TRUNC, 0666 )) == -1) goto done;
-    }
+    if ((fd = _wopen( file, O_WRONLY | O_CREAT | O_TRUNC, 0666 )) == -1) goto done;
 
     count = sprintf( buffer, "%lu\n", timestamp );
     if (write( fd, buffer, count ) != count)
@@ -151,12 +172,9 @@ static BOOL update_timestamp( const WCHAR *config_dir, unsigned long timestamp )
         WINE_WARN( "failed to update timestamp in %s\n", debugstr_w(file) );
         chsize( fd, 0 );
     }
-    else ret = TRUE;
-
 done:
     if (fd != -1) close( fd );
     free( file );
-    return ret;
 }
 
 /* print the config directory in a more Unix-ish way */
@@ -1694,10 +1712,15 @@ static void update_wineprefix( BOOL force )
     fstat( fd, &st );
     close( fd );
 
-    if (update_timestamp( config_dir, st.st_mtime ) || force)
+    if (timestamp_needs_update( config_dir, st.st_mtime ) || force)
     {
         HANDLE process;
+        BOOL required = TRUE;
+        BOOL success = TRUE;
         DWORD count = 0;
+
+        /* Leave an invalid timestamp behind if the update is interrupted. */
+        write_update_timestamp( config_dir, 0 );
 
         if ((process = start_rundll32( inf_path, L"PreInstall", IMAGE_FILE_MACHINE_TARGET_HOST )))
         {
@@ -1707,15 +1730,19 @@ static void update_wineprefix( BOOL force )
                 if (process)
                 {
                     MSG msg;
+                    DWORD exit_code;
                     DWORD res = MsgWaitForMultipleObjects( 1, &process, FALSE, INFINITE, QS_ALLINPUT );
                     if (res != WAIT_OBJECT_0)
                     {
                         while (PeekMessageW( &msg, 0, 0, 0, PM_REMOVE )) DispatchMessageW( &msg );
                         continue;
                     }
+                    if ((!GetExitCodeProcess( process, &exit_code ) || exit_code) && required) success = FALSE;
                     CloseHandle( process );
                 }
+                else if (required) success = FALSE;
                 if (!machines[count].Machine) break;
+                required = machines[count].Native;
                 if (machines[count].Native)
                     process = start_rundll32( inf_path, L"DefaultInstall", IMAGE_FILE_MACHINE_TARGET_HOST );
                 else
@@ -1724,10 +1751,16 @@ static void update_wineprefix( BOOL force )
             }
             DestroyWindow( hwnd );
         }
+        else success = FALSE;
         install_root_pnp_devices();
         update_user_profile();
 
-        TRACE( "wine: configuration in %s has been updated.\n", debugstr_w(prettyprint_configdir()) );
+        if (success)
+        {
+            write_update_timestamp( config_dir, st.st_mtime );
+            TRACE( "wine: configuration in %s has been updated.\n", debugstr_w(prettyprint_configdir()) );
+        }
+        else WARN( "wine: configuration in %s could not be updated.\n", debugstr_w(prettyprint_configdir()) );
     }
 
 done:
