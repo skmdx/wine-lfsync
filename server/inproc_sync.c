@@ -143,10 +143,18 @@ struct lockfree_lifetime
     struct list entry;
 };
 
+struct ntsync_lease
+{
+    uint64_t token;
+    struct inproc_sync *sync;
+    struct list process_entry;
+};
+
 static struct lockfree_lease **lockfree_leases;
 static uint32_t *free_lease_slots;
 static uint32_t next_lease_slot;
 static uint32_t free_lease_slot_count;
+static uint64_t next_ntsync_lease = 1;
 
 static int reap_lockfree_lifetime( struct lockfree_lifetime *lifetime );
 
@@ -277,6 +285,27 @@ static uint64_t create_lockfree_lease( struct lockfree_lifetime *lifetime, struc
         return 0;
     }
     return lease->token;
+}
+
+static uint64_t create_ntsync_lease( struct inproc_sync *sync, struct process *process )
+{
+    struct ntsync_lease *lease;
+
+    if (!(lease = mem_alloc( sizeof(*lease) ))) return 0;
+    if (!(lease->token = next_ntsync_lease++)) lease->token = next_ntsync_lease++;
+    grab_object( sync );
+    lease->sync = sync;
+    list_add_tail( &process->ntsync_leases, &lease->process_entry );
+    return lease->token;
+}
+
+static void destroy_ntsync_lease( struct ntsync_lease *lease )
+{
+    struct inproc_sync *sync = lease->sync;
+
+    list_remove( &lease->process_entry );
+    free( lease );
+    release_object( sync );
 }
 
 static int create_lockfree_sync( struct inproc_sync *sync, enum lf_sync_object_type type,
@@ -558,7 +587,7 @@ void set_inproc_sync_owner_alive( thread_id_t tid )
     if (lockfree_shared) lf_sync_set_owner_alive( &lockfree_dispatcher, tid, 1 );
 }
 
-void release_process_lockfree_leases( struct process *process )
+void release_process_inproc_sync_leases( struct process *process )
 {
     while (!list_empty( &process->lockfree_leases ))
     {
@@ -571,6 +600,26 @@ void release_process_lockfree_leases( struct process *process )
         destroy_lockfree_lease( lease );
         if (lifetime->retired) reap_lockfree_lifetime( lifetime );
     }
+
+    while (!list_empty( &process->ntsync_leases ))
+    {
+        struct ntsync_lease *lease = LIST_ENTRY( list_head( &process->ntsync_leases ),
+                                                 struct ntsync_lease, process_entry );
+        destroy_ntsync_lease( lease );
+    }
+}
+
+static int release_ntsync_lease( struct process *process, uint64_t token )
+{
+    struct ntsync_lease *lease;
+
+    LIST_FOR_EACH_ENTRY( lease, &process->ntsync_leases, struct ntsync_lease, process_entry )
+    {
+        if (lease->token != token) continue;
+        destroy_ntsync_lease( lease );
+        return 1;
+    }
+    return 0;
 }
 
 static int get_obj_inproc_sync( struct object *obj, int *type, unsigned int *shm_idx, uint64_t *lease )
@@ -589,7 +638,12 @@ static int get_obj_inproc_sync( struct object *obj, int *type, unsigned int *shm
             assert( inproc->lifetime );
             *lease = create_lockfree_lease( inproc->lifetime, current->process );
         }
-        else fd = get_inproc_sync_fd( inproc );
+        else
+        {
+            fd = get_inproc_sync_fd( inproc );
+            if (fd >= 0 && inproc->type == INPROC_SYNC_MUTEX)
+                *lease = create_ntsync_lease( inproc, current->process );
+        }
     }
 
     release_object( sync );
@@ -649,8 +703,13 @@ void set_inproc_sync_owner_alive( thread_id_t tid )
 {
 }
 
-void release_process_lockfree_leases( struct process *process )
+void release_process_inproc_sync_leases( struct process *process )
 {
+}
+
+static int release_ntsync_lease( struct process *process, uint64_t token )
+{
+    return 0;
 }
 
 static int get_obj_inproc_sync( struct object *obj, int *type, unsigned int *shm_idx, uint64_t *lease )
@@ -677,7 +736,14 @@ DECL_HANDLER(get_inproc_sync_fd)
         if (!reply->lease && !get_error()) set_error( STATUS_TOO_MANY_OPENED_FILES );
     }
     else if (fd < 0) set_error( STATUS_NOT_IMPLEMENTED );
+    else if (reply->type == INPROC_SYNC_MUTEX && !reply->lease)
+        set_error( STATUS_TOO_MANY_OPENED_FILES );
     else send_client_fd( current->process, fd, req->handle );
 
     release_object( obj );
+}
+
+DECL_HANDLER(release_inproc_sync_lease)
+{
+    if (!release_ntsync_lease( current->process, req->lease )) set_error( STATUS_INVALID_HANDLE );
 }

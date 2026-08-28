@@ -3416,6 +3416,11 @@ static void dump_get_inproc_sync_fd_reply( const struct get_inproc_sync_fd_reply
     dump_uint64( ", lease=", &req->lease );
 }
 
+static void dump_release_inproc_sync_lease_request( const struct release_inproc_sync_lease_request *req )
+{
+    dump_uint64( " lease=", &req->lease );
+}
+
 static void dump_get_inproc_alert_fd_request( const struct get_inproc_alert_fd_request *req )
 {
 }
@@ -3842,6 +3847,7 @@ static const dump_func req_dumpers[REQ_NB_REQUESTS] =
     (dump_func)dump_get_next_thread_request,
     (dump_func)dump_set_keyboard_repeat_request,
     (dump_func)dump_get_inproc_sync_fd_request,
+    (dump_func)dump_release_inproc_sync_lease_request,
     (dump_func)dump_get_inproc_alert_fd_request,
     (dump_func)dump_d3dkmt_object_create_request,
     (dump_func)dump_d3dkmt_object_update_request,
@@ -4154,6 +4160,7 @@ static const dump_func reply_dumpers[REQ_NB_REQUESTS] =
     (dump_func)dump_get_next_thread_reply,
     (dump_func)dump_set_keyboard_repeat_reply,
     (dump_func)dump_get_inproc_sync_fd_reply,
+    NULL,
     (dump_func)dump_get_inproc_alert_fd_reply,
     (dump_func)dump_d3dkmt_object_create_reply,
     NULL,
@@ -4466,6 +4473,7 @@ static const char * const req_names[REQ_NB_REQUESTS] =
     "get_next_thread",
     "set_keyboard_repeat",
     "get_inproc_sync_fd",
+    "release_inproc_sync_lease",
     "get_inproc_alert_fd",
     "d3dkmt_object_create",
     "d3dkmt_object_update",

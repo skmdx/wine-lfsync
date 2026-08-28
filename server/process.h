@@ -81,6 +81,7 @@ struct process
     struct token        *token;           /* security token associated with this process */
     struct list          views;           /* list of memory views */
     struct list          lockfree_leases; /* lock-free sync leases owned by this process */
+    struct list          ntsync_leases;   /* ntsync fd leases owned by this process */
     client_ptr_t         peb;             /* PEB address in client address space */
     struct dir_cache    *dir_cache;       /* map of client-side directory cache */
     unsigned int         trace_data;      /* opaque data used by the process tracing mechanism */

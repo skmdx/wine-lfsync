@@ -701,8 +701,20 @@ static void release_inproc_sync( struct inproc_sync *sync )
     assert( ref >= 0 );
     if (!ref)
     {
-        if (lease) lf_sync_release_lease( lockfree_shared, lease );
-        else if (fd >= 0) close( fd );
+        if (fd >= 0)
+        {
+            close( fd );
+            if (lease)
+            {
+                SERVER_START_REQ( release_inproc_sync_lease )
+                {
+                    req->lease = lease;
+                    wine_server_call( req );
+                }
+                SERVER_END_REQ;
+            }
+        }
+        else if (lease) lf_sync_release_lease( lockfree_shared, lease );
     }
 }
 
@@ -753,7 +765,6 @@ static NTSTATUS get_server_inproc_sync( HANDLE handle, struct inproc_sync *sync 
             }
             else
             {
-                sync->lease = 0;
                 sync->fd = wine_server_receive_fd( &fd_handle );
                 assert( wine_server_ptr_handle(fd_handle) == handle );
             }

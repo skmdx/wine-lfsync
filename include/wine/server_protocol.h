@@ -6074,6 +6074,19 @@ struct get_inproc_sync_fd_reply
 
 
 
+struct release_inproc_sync_lease_request
+{
+    struct request_header __header;
+    char __pad_12[4];
+    unsigned __int64 lease;
+};
+struct release_inproc_sync_lease_reply
+{
+    struct reply_header __header;
+};
+
+
+
 struct get_inproc_alert_fd_request
 {
     struct request_header __header;
@@ -6546,6 +6559,7 @@ enum request
     REQ_get_next_thread,
     REQ_set_keyboard_repeat,
     REQ_get_inproc_sync_fd,
+    REQ_release_inproc_sync_lease,
     REQ_get_inproc_alert_fd,
     REQ_d3dkmt_object_create,
     REQ_d3dkmt_object_update,
@@ -6861,6 +6875,7 @@ union generic_request
     struct get_next_thread_request get_next_thread_request;
     struct set_keyboard_repeat_request set_keyboard_repeat_request;
     struct get_inproc_sync_fd_request get_inproc_sync_fd_request;
+    struct release_inproc_sync_lease_request release_inproc_sync_lease_request;
     struct get_inproc_alert_fd_request get_inproc_alert_fd_request;
     struct d3dkmt_object_create_request d3dkmt_object_create_request;
     struct d3dkmt_object_update_request d3dkmt_object_update_request;
@@ -7174,6 +7189,7 @@ union generic_reply
     struct get_next_thread_reply get_next_thread_reply;
     struct set_keyboard_repeat_reply set_keyboard_repeat_reply;
     struct get_inproc_sync_fd_reply get_inproc_sync_fd_reply;
+    struct release_inproc_sync_lease_reply release_inproc_sync_lease_reply;
     struct get_inproc_alert_fd_reply get_inproc_alert_fd_reply;
     struct d3dkmt_object_create_reply d3dkmt_object_create_reply;
     struct d3dkmt_object_update_reply d3dkmt_object_update_reply;
@@ -7186,6 +7202,6 @@ union generic_reply
     struct alpc_create_port_reply alpc_create_port_reply;
 };
 
-#define SERVER_PROTOCOL_VERSION 963
+#define SERVER_PROTOCOL_VERSION 964
 
 #endif /* __WINE_WINE_SERVER_PROTOCOL_H */

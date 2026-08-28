@@ -649,6 +649,7 @@ struct process *create_process( int fd, struct process *parent, unsigned int fla
     list_init( &process->classes );
     list_init( &process->views );
     list_init( &process->lockfree_leases );
+    list_init( &process->ntsync_leases );
 
     process->end_time = 0;
 
@@ -725,7 +726,7 @@ static void process_destroy( struct object *obj )
 
     assert( !process->sigkill_timeout );  /* timeout should hold a reference to the process */
 
-    release_process_lockfree_leases( process );
+    release_process_inproc_sync_leases( process );
     close_process_handles( process );
     set_process_startup_state( process, STARTUP_ABORTED );
 

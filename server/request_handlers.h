@@ -305,6 +305,7 @@ DECL_HANDLER(get_next_process);
 DECL_HANDLER(get_next_thread);
 DECL_HANDLER(set_keyboard_repeat);
 DECL_HANDLER(get_inproc_sync_fd);
+DECL_HANDLER(release_inproc_sync_lease);
 DECL_HANDLER(get_inproc_alert_fd);
 DECL_HANDLER(d3dkmt_object_create);
 DECL_HANDLER(d3dkmt_object_update);
@@ -617,6 +618,7 @@ static const req_handler req_handlers[REQ_NB_REQUESTS] =
     (req_handler)req_get_next_thread,
     (req_handler)req_set_keyboard_repeat,
     (req_handler)req_get_inproc_sync_fd,
+    (req_handler)req_release_inproc_sync_lease,
     (req_handler)req_get_inproc_alert_fd,
     (req_handler)req_d3dkmt_object_create,
     (req_handler)req_d3dkmt_object_update,
@@ -2334,6 +2336,8 @@ C_ASSERT( offsetof(struct get_inproc_sync_fd_reply, shm_idx) == 16 );
 C_ASSERT( offsetof(struct get_inproc_sync_fd_reply, pad) == 20 );
 C_ASSERT( offsetof(struct get_inproc_sync_fd_reply, lease) == 24 );
 C_ASSERT( sizeof(struct get_inproc_sync_fd_reply) == 32 );
+C_ASSERT( offsetof(struct release_inproc_sync_lease_request, lease) == 16 );
+C_ASSERT( sizeof(struct release_inproc_sync_lease_request) == 24 );
 C_ASSERT( sizeof(struct get_inproc_alert_fd_request) == 16 );
 C_ASSERT( offsetof(struct get_inproc_alert_fd_reply, handle) == 8 );
 C_ASSERT( offsetof(struct get_inproc_alert_fd_reply, shm_idx) == 12 );
