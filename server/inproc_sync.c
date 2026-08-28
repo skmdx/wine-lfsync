@@ -432,8 +432,11 @@ void signal_inproc_sync( struct inproc_sync *sync )
 {
     if (sync->shm_idx != ~0u)
     {
-        lf_sync_set_event( &lockfree_dispatcher.arena, &lockfree_dispatcher.objects[sync->shm_idx], NULL );
-        lf_sync_wake_object( &lockfree_dispatcher, sync->shm_idx );
+        uint32_t previous;
+
+        lf_sync_set_event( &lockfree_dispatcher.arena,
+                           &lockfree_dispatcher.objects[sync->shm_idx], &previous );
+        if (!previous) lf_sync_wake_object( &lockfree_dispatcher, sync->shm_idx );
     }
     else
     {
