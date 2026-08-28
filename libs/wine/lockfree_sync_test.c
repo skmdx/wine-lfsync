@@ -514,6 +514,28 @@ static void test_object_reuse(void)
     free( shared );
 }
 
+static void test_shared_initialization_does_not_touch_payload(void)
+{
+    struct lf_sync_shared *shared;
+
+    shared = calloc( 1, sizeof(*shared) );
+    ok( !!shared, "failed to allocate initialization fixture\n" );
+    if (!shared) return;
+    shared->words[LF_SYNC_SHARED_WORDS - 1].value = UINT64_C(0x123456789abcdef0);
+    shared->waits[LF_SYNC_SHARED_WAITS - 1].published = UINT64_C(0xfedcba9876543210);
+    shared->next_object = 123;
+    shared->free_object = 456;
+
+    lf_sync_init_shared( shared );
+    ok( shared->magic == LF_SYNC_SHARED_MAGIC && shared->version == LF_SYNC_SHARED_VERSION &&
+        !shared->next_object && shared->free_object == UINT32_MAX,
+        "shared initialization did not initialize its header\n" );
+    ok( shared->words[LF_SYNC_SHARED_WORDS - 1].value == UINT64_C(0x123456789abcdef0) &&
+        shared->waits[LF_SYNC_SHARED_WAITS - 1].published == UINT64_C(0xfedcba9876543210),
+        "shared initialization touched zero-filled payload pages\n" );
+    free( shared );
+}
+
 #ifdef __linux__
 
 struct shared_fixture
@@ -1062,6 +1084,7 @@ int main(void)
     test_owned_mutex_arena_abandonment();
     test_owner_death_transaction_ordering();
     test_object_reuse();
+    test_shared_initialization_does_not_touch_payload();
     test_completion_timeout_race();
 #ifdef __linux__
     test_shared_parking();

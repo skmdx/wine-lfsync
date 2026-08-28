@@ -1434,9 +1434,14 @@ done:
 
 void lf_sync_init_shared( struct lf_sync_shared *shared )
 {
-    memset( shared, 0, sizeof(*shared) );
+    /* The backing memfd has just been extended and is already zero-filled.
+     * Touch only the header so initialization does not fault every arena page
+     * into the wineserver's RSS. */
+    __atomic_store_n( &shared->magic, 0, __ATOMIC_RELAXED );
     shared->version = LF_SYNC_SHARED_VERSION;
+    shared->next_object = 0;
     shared->free_object = UINT32_MAX;
+    shared->pad = 0;
     __atomic_store_n( &shared->magic, LF_SYNC_SHARED_MAGIC, __ATOMIC_RELEASE );
 }
 
