@@ -263,6 +263,7 @@ extern void abandon_d3dkmt_mutexes( struct thread *thread );
 struct inproc_sync;
 extern int get_inproc_device_fd(void);
 extern int get_inproc_sync_fd( struct inproc_sync *sync );
+extern unsigned int get_inproc_sync_idx( struct inproc_sync *sync );
 extern struct inproc_sync *create_inproc_internal_sync( int manual, int signaled );
 extern struct inproc_sync *create_inproc_event_sync( int manual, int signaled );
 extern struct inproc_sync *create_inproc_semaphore_sync( unsigned int initial, unsigned int max );

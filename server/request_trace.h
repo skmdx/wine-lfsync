@@ -3411,6 +3411,7 @@ static void dump_get_inproc_sync_fd_reply( const struct get_inproc_sync_fd_reply
 {
     fprintf( stderr, " type=%d", req->type );
     fprintf( stderr, ", access=%08x", req->access );
+    fprintf( stderr, ", shm_idx=%08x", req->shm_idx );
 }
 
 static void dump_get_inproc_alert_fd_request( const struct get_inproc_alert_fd_request *req )
@@ -3420,6 +3421,7 @@ static void dump_get_inproc_alert_fd_request( const struct get_inproc_alert_fd_r
 static void dump_get_inproc_alert_fd_reply( const struct get_inproc_alert_fd_reply *req )
 {
     fprintf( stderr, " handle=%04x", req->handle );
+    fprintf( stderr, ", shm_idx=%08x", req->shm_idx );
 }
 
 static void dump_d3dkmt_object_create_request( const struct d3dkmt_object_create_request *req )

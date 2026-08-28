@@ -6067,6 +6067,8 @@ struct get_inproc_sync_fd_reply
     struct reply_header __header;
     int           type;
     unsigned int access;
+    unsigned int shm_idx;
+    char __pad_20[4];
 };
 
 
@@ -6080,7 +6082,7 @@ struct get_inproc_alert_fd_reply
 {
     struct reply_header __header;
     obj_handle_t handle;
-    char __pad_12[4];
+    unsigned int shm_idx;
 };
 
 
@@ -7183,6 +7185,6 @@ union generic_reply
     struct alpc_create_port_reply alpc_create_port_reply;
 };
 
-#define SERVER_PROTOCOL_VERSION 961
+#define SERVER_PROTOCOL_VERSION 962
 
 #endif /* __WINE_WINE_SERVER_PROTOCOL_H */

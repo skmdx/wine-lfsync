@@ -2379,6 +2379,8 @@ DECL_HANDLER(get_inproc_alert_fd)
 {
     int fd;
 
+    reply->shm_idx = get_inproc_sync_idx( current->alert_sync );
+    if (reply->shm_idx != ~0u) return;
     if ((fd = get_inproc_sync_fd( current->alert_sync )) < 0) set_error( STATUS_INVALID_PARAMETER );
     else
     {
