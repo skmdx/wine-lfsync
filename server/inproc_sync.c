@@ -60,7 +60,7 @@ static struct lf_sync_dispatcher lockfree_dispatcher;
 static void lockfree_wake( uint32_t *address )
 {
 #ifdef __linux__
-    syscall( SYS_futex, address, FUTEX_WAKE, INT_MAX, NULL, NULL, 0 );
+    syscall( SYS_futex, address, FUTEX_WAKE, 1, NULL, NULL, 0 );
 #endif
 }
 

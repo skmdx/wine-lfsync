@@ -554,7 +554,15 @@ static int futex_park( uint32_t *address, uint32_t expected, const void *timeout
 
 static void futex_wake( uint32_t *address )
 {
-    syscall( SYS_futex, address, FUTEX_WAKE, INT_MAX, NULL, NULL, 0 );
+    syscall( SYS_futex, address, FUTEX_WAKE, 1, NULL, NULL, 0 );
+}
+
+static unsigned int wake_calls;
+
+static void count_wake( uint32_t *address )
+{
+    (void)address;
+    ++wake_calls;
 }
 
 static void init_dispatcher( struct lf_sync_dispatcher *dispatcher, struct shared_fixture *shared )
@@ -648,6 +656,39 @@ static void test_registered_timeout(void)
     lf_sync_wait_end( &dispatcher, &ticket );
     ok( !(shared.waiter_buckets[0].waiters[0] & (UINT64_C(1) << ticket.slot)),
         "waiter was not removed from its object\n" );
+}
+
+static void test_parked_handshake(void)
+{
+    struct lf_sync_wait_ticket ticket;
+    struct lf_sync_dispatcher dispatcher;
+    struct shared_fixture shared = {0};
+    uint32_t object = 0, sequence;
+
+    init_dispatcher( &dispatcher, &shared );
+    dispatcher.wake = count_wake;
+    lf_sync_init_event( &dispatcher.arena, &shared.objects[0], 0, 0, 0 );
+
+    wake_calls = 0;
+    ok( lf_sync_wait_begin( &dispatcher, &object, 1, 0, 88, &ticket ),
+        "spin-handoff wait registration failed\n" );
+    lf_sync_set_event( &dispatcher.arena, &shared.objects[0], NULL );
+    lf_sync_wake_object( &dispatcher, 0 );
+    ok( !wake_calls && !shared.waits[ticket.slot].park_seq,
+        "completion woke a waiter which had not parked\n" );
+    lf_sync_wait_end( &dispatcher, &ticket );
+
+    lf_sync_reset_event( &dispatcher.arena, &shared.objects[0], NULL );
+    ok( lf_sync_wait_begin( &dispatcher, &object, 1, 0, 88, &ticket ),
+        "parked-handoff wait registration failed\n" );
+    sequence = shared.waits[ticket.slot].park_seq;
+    shared.waits[ticket.slot].parked = 1;
+    lf_sync_set_event( &dispatcher.arena, &shared.objects[0], NULL );
+    lf_sync_wake_object( &dispatcher, 0 );
+    ok( wake_calls == 1 && shared.waits[ticket.slot].park_seq == sequence + 1 &&
+        !shared.waits[ticket.slot].parked,
+        "parked completion did not perform exactly one wake\n" );
+    lf_sync_wait_end( &dispatcher, &ticket );
 }
 
 static void test_waiter_summary(void)
@@ -1089,6 +1130,7 @@ int main(void)
 #ifdef __linux__
     test_shared_parking();
     test_registered_timeout();
+    test_parked_handshake();
     test_waiter_summary();
     test_waiter_summary_race();
     test_waiter_bucket_collision();

@@ -913,6 +913,13 @@ static void unregister_wait( const struct lf_sync_dispatcher *dispatcher,
 static int pulse_wait( const struct lf_sync_dispatcher *dispatcher, uint32_t slot,
                        uint32_t generation, uint32_t pulsed_object, uint64_t pulse_generation );
 
+static void wake_wait( const struct lf_sync_dispatcher *dispatcher, struct lf_sync_wait *wait )
+{
+    if (!__atomic_exchange_n( &wait->parked, 0, __ATOMIC_ACQ_REL )) return;
+    __atomic_add_fetch( &wait->park_seq, 1, __ATOMIC_RELEASE );
+    if (dispatcher->wake) dispatcher->wake( &wait->park_seq );
+}
+
 static int alloc_wait( const struct lf_sync_dispatcher *dispatcher, uint32_t *slot, uint32_t *generation )
 {
     uint32_t i;
@@ -987,10 +994,7 @@ static void retry_wait( const struct lf_sync_dispatcher *dispatcher, uint32_t sl
     }
 
     if ((lf_sync_load( &dispatcher->arena, dispatcher->status_word_base + slot ) & 0xff) != LF_SYNC_WAITING)
-    {
-        __atomic_add_fetch( &wait->park_seq, 1, __ATOMIC_RELEASE );
-        if (dispatcher->wake) dispatcher->wake( &wait->park_seq );
-    }
+        wake_wait( dispatcher, wait );
 done:
     release_wait( wait );
 }
@@ -1190,12 +1194,21 @@ int lf_sync_wait_park( const struct lf_sync_dispatcher *dispatcher,
 {
     struct lf_sync_wait *wait;
     uint32_t sequence;
+    int ret;
 
     if (ticket->slot >= dispatcher->wait_count || !dispatcher->park) return -1;
     wait = &dispatcher->waits[ticket->slot];
-    sequence = __atomic_load_n( &wait->park_seq, __ATOMIC_ACQUIRE );
     if (lf_sync_wait_poll( dispatcher, ticket ) != ticket->waiting) return 0;
-    return dispatcher->park( &wait->park_seq, sequence, timeout );
+    __atomic_store_n( &wait->parked, 1, __ATOMIC_RELEASE );
+    sequence = __atomic_load_n( &wait->park_seq, __ATOMIC_ACQUIRE );
+    if (lf_sync_wait_poll( dispatcher, ticket ) != ticket->waiting)
+    {
+        __atomic_store_n( &wait->parked, 0, __ATOMIC_RELEASE );
+        return 0;
+    }
+    ret = dispatcher->park( &wait->park_seq, sequence, timeout );
+    __atomic_store_n( &wait->parked, 0, __ATOMIC_RELEASE );
+    return ret;
 }
 
 int lf_sync_wait_timeout( const struct lf_sync_dispatcher *dispatcher,
@@ -1332,8 +1345,7 @@ static int pulse_wait( const struct lf_sync_dispatcher *dispatcher, uint32_t slo
 
     if (mcas)
     {
-        __atomic_add_fetch( &wait->park_seq, 1, __ATOMIC_RELEASE );
-        if (dispatcher->wake) dispatcher->wake( &wait->park_seq );
+        wake_wait( dispatcher, wait );
         release_wait( wait );
         return 1;
     }
@@ -1422,8 +1434,7 @@ void lf_sync_abandon_waits( const struct lf_sync_dispatcher *dispatcher, uint32_
         prepared = lf_sync_wait_value( generation, LF_SYNC_WAIT_PREPARED, 0 );
         lf_sync_compare_exchange( &dispatcher->arena, dispatcher->status_word_base + i,
                                   prepared, failed );
-        __atomic_add_fetch( &wait->park_seq, 1, __ATOMIC_RELEASE );
-        if (dispatcher->wake) dispatcher->wake( &wait->park_seq );
+        wake_wait( dispatcher, wait );
         /* Drop the registration reference owned by the dead thread. */
         lf_sync_load( &dispatcher->arena, dispatcher->status_word_base + i );
         release_wait( wait );

@@ -104,6 +104,7 @@ struct lf_sync_wait
     uint64_t lifetime;
     uint64_t published;
     uint32_t park_seq;
+    uint32_t parked;
     uint32_t count;
     uint32_t owner;
     uint32_t wait_all;
