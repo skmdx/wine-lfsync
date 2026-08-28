@@ -87,6 +87,7 @@ struct thread_apc
     struct object      *sync;     /* sync object for wait/signal */
     struct list         entry;    /* queue linked list */
     struct thread      *caller;   /* thread that queued this apc */
+    struct process     *executing; /* process owning the in-flight apc handle */
     struct object      *owner;    /* object that queued this apc */
     struct reserve     *reserve;  /* reserve object associated with apc object */
     int                 executed; /* has it been executed by the client? */
@@ -97,15 +98,17 @@ struct thread_apc
 static void thread_apc_dump( struct object *obj, int verbose );
 static struct object *thread_apc_get_sync( struct object *obj );
 static void thread_apc_destroy( struct object *obj );
+static int thread_apc_close_handle( struct object *obj, struct process *process, obj_handle_t handle );
 static void clear_apc_queue( struct list *queue );
 
 static const struct object_ops thread_apc_ops =
 {
-    .size     = sizeof(struct thread_apc),
-    .type     = &no_type,
-    .dump     = thread_apc_dump,
-    .get_sync = thread_apc_get_sync,
-    .destroy  = thread_apc_destroy,
+    .size         = sizeof(struct thread_apc),
+    .type         = &no_type,
+    .dump         = thread_apc_dump,
+    .get_sync     = thread_apc_get_sync,
+    .close_handle = thread_apc_close_handle,
+    .destroy      = thread_apc_destroy,
 };
 
 
@@ -671,6 +674,26 @@ static void thread_apc_destroy( struct object *obj )
     reserve_obj_unbind( apc->reserve );
 }
 
+static int thread_apc_close_handle( struct object *obj, struct process *process, obj_handle_t handle )
+{
+    struct thread_apc *apc = (struct thread_apc *)obj;
+    assert( obj->ops == &thread_apc_ops );
+
+    /* A system APC is removed from the target thread queue before it is
+     * executed. If the target exits after dequeueing it but before returning
+     * the result, queue cleanup can no longer find it. Cancel the in-flight
+     * APC when its target-side handle is closed so that the caller cannot wait
+     * forever for a result which will never arrive. */
+    if (process != apc->executing) return 1;
+    apc->executing = NULL;
+    if (!apc->executed)
+    {
+        apc->executed = 1;
+        signal_sync( apc->sync );
+    }
+    return 1;
+}
+
 /* queue an async procedure call */
 static struct thread_apc *create_apc( struct object *owner, const union apc_call *call_data )
 {
@@ -682,6 +705,7 @@ static struct thread_apc *create_apc( struct object *owner, const union apc_call
         if (call_data) apc->call = *call_data;
         else apc->call.type = APC_NONE;
         apc->caller      = NULL;
+        apc->executing   = NULL;
         apc->owner       = owner;
         apc->reserve     = NULL;
         apc->executed    = 0;
@@ -2000,6 +2024,8 @@ DECL_HANDLER(select)
         apc = thread_dequeue_apc( current, 1 );
         if ((reply->apc_handle = alloc_handle( current->process, apc, SYNCHRONIZE, 0 )))
         {
+            assert( !apc->executing );
+            apc->executing = current->process;
             set_reply_data( &apc->call, sizeof(apc->call) );
         }
         else
