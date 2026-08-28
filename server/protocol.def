@@ -4229,6 +4229,8 @@ enum inproc_sync_type
     int           type;         /* inproc sync type */
     unsigned int access;        /* handle access rights */
     unsigned int shm_idx;       /* lock-free shared object index, or ~0 */
+    unsigned int pad;
+    unsigned __int64 lease;     /* lock-free lifetime lease, or 0 */
 @END
 
 

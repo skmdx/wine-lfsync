@@ -598,6 +598,7 @@ struct inproc_sync
     LONG           refcount;  /* reference count of the sync object */
     int            fd;        /* unix file descriptor */
     unsigned int   shm_idx;   /* lock-free shared object index */
+    uint64_t       lease;     /* lock-free lifetime lease token */
     unsigned int   access;    /* handle access rights */
     unsigned short type;      /* enum inproc_sync_type as short to save space */
     unsigned short closed;    /* fd has been closed but sync is still referenced */
@@ -661,6 +662,7 @@ static struct inproc_sync *cache_inproc_sync( HANDLE handle, struct inproc_sync 
 
     cache->fd = sync->fd;
     cache->shm_idx = sync->shm_idx;
+    cache->lease = sync->lease;
     cache->access = sync->access;
     cache->type = sync->type;
     cache->closed = sync->closed;
@@ -690,13 +692,18 @@ static inline LONG interlocked_inc_if_nonzero( LONG *dest )
 
 static void release_inproc_sync( struct inproc_sync *sync )
 {
-    /* save the fd now; as soon as the refcount hits 0 we cannot
+    /* Save the lifetime resource now; as soon as the refcount hits 0 we cannot
      * access the cache anymore */
     int fd = sync->fd;
+    uint64_t lease = sync->lease;
     LONG ref = InterlockedDecrement( &sync->refcount );
 
     assert( ref >= 0 );
-    if (!ref && fd >= 0) close( fd );
+    if (!ref)
+    {
+        if (lease) lf_sync_release_lease( lockfree_shared, lease );
+        else if (fd >= 0) close( fd );
+    }
 }
 
 static struct inproc_sync *get_cached_inproc_sync( HANDLE handle )
@@ -738,17 +745,15 @@ static NTSTATUS get_server_inproc_sync( HANDLE handle, struct inproc_sync *sync 
             obj_handle_t fd_handle;
             sync->refcount = 1;
             sync->shm_idx = reply->shm_idx;
+            sync->lease = reply->lease;
             if (lockfree_shared)
             {
-                if (sync->shm_idx >= LF_SYNC_SHARED_OBJECTS) ret = STATUS_INVALID_HANDLE;
-                else
-                {
-                    sync->fd = wine_server_receive_fd( &fd_handle );
-                    assert( wine_server_ptr_handle(fd_handle) == handle );
-                }
+                sync->fd = -1;
+                if (sync->shm_idx >= LF_SYNC_SHARED_OBJECTS || !sync->lease) ret = STATUS_INVALID_HANDLE;
             }
             else
             {
+                sync->lease = 0;
                 sync->fd = wine_server_receive_fd( &fd_handle );
                 assert( wine_server_ptr_handle(fd_handle) == handle );
             }

@@ -31,6 +31,7 @@
 
 #include "file.h"
 #include "handle.h"
+#include "process.h"
 #include "request.h"
 #include "thread.h"
 #include "user.h"
@@ -118,67 +119,82 @@ struct inproc_sync
     enum inproc_sync_type  type;
     int                    fd;
     unsigned int           shm_idx;
-    int                    ephemeral;
     struct list            entry;
     struct lockfree_lifetime *lifetime;
 };
 
 static struct list inproc_mutexes = LIST_INIT( inproc_mutexes );
 static struct list retired_lifetimes = LIST_INIT( retired_lifetimes );
-static int creating_lockfree_lifetime;
+
+struct lockfree_lease
+{
+    uint64_t token;
+    struct process *process;
+    struct lockfree_lifetime *lifetime;
+    struct list process_entry;
+    struct list object_entry;
+};
 
 struct lockfree_lifetime
 {
-    struct object obj;
-    struct fd *fd;
     uint32_t object;
     int retired;
-    int hung_up;
+    struct list leases;
     struct list entry;
 };
 
-static void lockfree_lifetime_dump( struct object *obj, int verbose );
-static void lockfree_lifetime_destroy( struct object *obj );
-static void lockfree_lifetime_poll_event( struct fd *fd, int event );
+static struct lockfree_lease **lockfree_leases;
+static uint32_t *free_lease_slots;
+static uint32_t next_lease_slot;
+static uint32_t free_lease_slot_count;
 
-static const struct object_ops lockfree_lifetime_ops =
-{
-    .size = sizeof(struct lockfree_lifetime),
-    .type = &no_type,
-    .dump = lockfree_lifetime_dump,
-    .destroy = lockfree_lifetime_destroy,
-};
+static int reap_lockfree_lifetime( struct lockfree_lifetime *lifetime );
 
-static const struct fd_ops lockfree_lifetime_fd_ops =
+static int init_lockfree_leases(void)
 {
-    .poll_event = lockfree_lifetime_poll_event,
-};
-
-static void lockfree_lifetime_dump( struct object *obj, int verbose )
-{
-    struct lockfree_lifetime *lifetime = (struct lockfree_lifetime *)obj;
-    fprintf( stderr, "Lock-free lifetime object=%u active=%u retired=%u hung_up=%u\n",
-             lifetime->object, !!lifetime->fd, lifetime->retired, lifetime->hung_up );
+    if (lockfree_leases) return 1;
+    if (!(lockfree_leases = calloc( LF_SYNC_SHARED_LEASES, sizeof(*lockfree_leases) )) ||
+        !(free_lease_slots = malloc( LF_SYNC_SHARED_LEASES * sizeof(*free_lease_slots) )))
+    {
+        free( lockfree_leases );
+        free( free_lease_slots );
+        lockfree_leases = NULL;
+        free_lease_slots = NULL;
+        set_error( STATUS_NO_MEMORY );
+        return 0;
+    }
+    return 1;
 }
 
-static void lockfree_lifetime_destroy( struct object *obj )
+static void destroy_lockfree_lease( struct lockfree_lease *lease )
 {
-    struct lockfree_lifetime *lifetime = (struct lockfree_lifetime *)obj;
+    uint32_t slot = lease->token & LF_SYNC_LEASE_SLOT_MASK;
 
-    list_remove( &lifetime->entry );
-    if (lifetime->fd) release_object( lifetime->fd );
+    assert( lockfree_leases[slot] == lease );
+    assert( lf_sync_free_lease( lockfree_shared, lease->token ));
+    lockfree_leases[slot] = NULL;
+    free_lease_slots[free_lease_slot_count++] = slot;
+    list_remove( &lease->process_entry );
+    list_remove( &lease->object_entry );
+    free( lease );
+}
+
+static void sweep_lockfree_lifetime_leases( struct lockfree_lifetime *lifetime )
+{
+    struct lockfree_lease *lease, *next;
+
+    LIST_FOR_EACH_ENTRY_SAFE( lease, next, &lifetime->leases, struct lockfree_lease, object_entry )
+        if (lf_sync_lease_is_released( lockfree_shared, lease->token )) destroy_lockfree_lease( lease );
 }
 
 static int reap_lockfree_lifetime( struct lockfree_lifetime *lifetime )
 {
-    if (!lifetime->retired || !lifetime->hung_up || lifetime->object == ~0u ||
+    sweep_lockfree_lifetime_leases( lifetime );
+    if (!lifetime->retired || !list_empty( &lifetime->leases ) ||
         !lf_sync_free_object( &lockfree_dispatcher, lifetime->object )) return 0;
 
-    if (lifetime->fd) set_fd_events( lifetime->fd, -1 );
-    lifetime->object = ~0u;
     list_remove( &lifetime->entry );
-    list_init( &lifetime->entry );
-    release_object( lifetime ); /* persistent retirement reference */
+    free( lifetime );
     return 1;
 }
 
@@ -190,63 +206,85 @@ static void reap_lockfree_lifetimes(void)
         reap_lockfree_lifetime( lifetime );
 }
 
-static void lockfree_lifetime_poll_event( struct fd *fd, int event )
+static void drain_released_lockfree_leases(void)
 {
-    struct lockfree_lifetime *lifetime = get_fd_user( fd );
+    uint32_t word;
 
-    grab_object( lifetime );
-    if (event & (POLLERR | POLLHUP))
+    for (word = 0; word < LF_SYNC_SHARED_LEASE_WORDS; ++word)
     {
-        set_fd_events( fd, -1 );
-        lifetime->hung_up = 1;
-        reap_lockfree_lifetime( lifetime );
+        uint64_t bits = lf_sync_take_released_leases( lockfree_shared, word );
+
+        while (bits)
+        {
+            uint32_t bit = __builtin_ctzll( bits );
+            uint32_t slot = word * 64 + bit;
+            struct lockfree_lease *lease = lockfree_leases[slot];
+            struct lockfree_lifetime *lifetime;
+
+            bits &= bits - 1;
+            if (!lease || !lf_sync_lease_is_released( lockfree_shared, lease->token )) continue;
+            lifetime = lease->lifetime;
+            destroy_lockfree_lease( lease );
+            if (lifetime->retired) reap_lockfree_lifetime( lifetime );
+        }
     }
-    release_object( lifetime );
 }
 
 static struct lockfree_lifetime *create_lockfree_lifetime( uint32_t object )
 {
     struct lockfree_lifetime *lifetime;
 
-    if (!(lifetime = alloc_object( &lockfree_lifetime_ops )))
-        return NULL;
-    lifetime->fd = NULL;
+    if (!(lifetime = mem_alloc( sizeof(*lifetime) ))) return NULL;
     lifetime->object = object;
     lifetime->retired = 0;
-    lifetime->hung_up = 1; /* no client references until the pipe is activated */
+    list_init( &lifetime->leases );
     list_init( &lifetime->entry );
     return lifetime;
 }
 
-static int activate_lockfree_lifetime( struct lockfree_lifetime *lifetime )
+static uint64_t create_lockfree_lease( struct lockfree_lifetime *lifetime, struct process *process )
 {
-    int pipe_fd[2];
+    struct lockfree_lease *lease;
+    uint32_t slot;
 
-    if (lifetime->fd) return -1;
-    if (pipe( pipe_fd ) < 0) return -1;
-    creating_lockfree_lifetime = 1;
-    lifetime->fd = create_anonymous_fd( &lockfree_lifetime_fd_ops, pipe_fd[0], &lifetime->obj, 0 );
-    creating_lockfree_lifetime = 0;
-    if (!lifetime->fd)
+    if (!init_lockfree_leases() || !(lease = mem_alloc( sizeof(*lease) ))) return 0;
+    if (next_lease_slot < LF_SYNC_SHARED_LEASES) slot = next_lease_slot++;
+    else
     {
-        close( pipe_fd[1] );
-        return -1;
+        if (!free_lease_slot_count) drain_released_lockfree_leases();
+        if (!free_lease_slot_count)
+        {
+            free( lease );
+            set_error( STATUS_TOO_MANY_OPENED_FILES );
+            return 0;
+        }
+        slot = free_lease_slots[--free_lease_slot_count];
     }
-    set_fd_events( lifetime->fd, POLLIN );
-    lifetime->hung_up = 0;
-    return pipe_fd[1];
+
+    lease->process = process;
+    lease->lifetime = lifetime;
+    list_add_tail( &process->lockfree_leases, &lease->process_entry );
+    list_add_tail( &lifetime->leases, &lease->object_entry );
+    lockfree_leases[slot] = lease;
+    if (!lf_sync_activate_lease( lockfree_shared, slot, &lease->token ))
+    {
+        lockfree_leases[slot] = NULL;
+        list_remove( &lease->process_entry );
+        list_remove( &lease->object_entry );
+        free_lease_slots[free_lease_slot_count++] = slot;
+        free( lease );
+        set_error( STATUS_INTERNAL_ERROR );
+        return 0;
+    }
+    return lease->token;
 }
 
 static int create_lockfree_sync( struct inproc_sync *sync, enum lf_sync_object_type type,
                                  uint32_t initial, uint32_t limit, uint32_t flags )
 {
-    struct lockfree_lifetime *lifetime = NULL;
+    struct lockfree_lifetime *lifetime;
 
-    /* An object that has never been sent to a client has no stale shared
-     * references to track, so defer the lifetime pipe and its server object
-     * until the first get_inproc_sync_fd request. An initially-owned mutex is
-     * the exception: it can outlive its last handle until its owner exits. */
-    if (type == LF_SYNC_MUTEX && initial && !(lifetime = create_lockfree_lifetime( ~0u ))) return 0;
+    if (!(lifetime = create_lockfree_lifetime( ~0u ))) return 0;
     if (!lf_sync_alloc_object( &lockfree_dispatcher, type, initial, limit, flags, &sync->shm_idx ))
     {
         /* Hung-up lifetimes normally reap themselves, while thread teardown
@@ -255,7 +293,7 @@ static int create_lockfree_sync( struct inproc_sync *sync, enum lf_sync_object_t
         reap_lockfree_lifetimes();
         if (!lf_sync_alloc_object( &lockfree_dispatcher, type, initial, limit, flags, &sync->shm_idx ))
         {
-            if (lifetime) release_object( lifetime );
+            free( lifetime );
             return 0;
         }
     }
@@ -280,13 +318,7 @@ static const struct object_ops inproc_sync_ops =
 
 int get_inproc_sync_fd( struct inproc_sync *sync )
 {
-    if (!sync) return -1;
-    if (sync->shm_idx != ~0u && sync->fd < 0)
-    {
-        if (!sync->lifetime && !(sync->lifetime = create_lockfree_lifetime( sync->shm_idx ))) return -1;
-        sync->fd = activate_lockfree_lifetime( sync->lifetime );
-    }
-    return sync->fd;
+    return sync ? sync->fd : -1;
 }
 
 unsigned int get_inproc_sync_idx( struct inproc_sync *sync )
@@ -304,18 +336,11 @@ struct inproc_sync *create_inproc_internal_sync( int manual, int signaled )
     if (!(event = alloc_object( &inproc_sync_ops ))) return NULL;
     event->type = INPROC_SYNC_INTERNAL;
     event->shm_idx = ~0u;
-    event->ephemeral = creating_lockfree_lifetime;
     event->lifetime = NULL;
     if (lockfree_shared)
     {
-        if (event->ephemeral)
-        {
-            if (!lf_sync_alloc_object( &lockfree_dispatcher, LF_SYNC_EVENT, signaled, 0,
-                                       manual ? LF_SYNC_EVENT_MANUAL : 0, &event->shm_idx )) event->fd = -1;
-            else event->fd = -1;
-        }
-        else if (!create_lockfree_sync( event, LF_SYNC_EVENT, signaled, 0,
-                                        manual ? LF_SYNC_EVENT_MANUAL : 0 )) event->fd = -1;
+        if (!create_lockfree_sync( event, LF_SYNC_EVENT, signaled, 0,
+                                   manual ? LF_SYNC_EVENT_MANUAL : 0 )) event->fd = -1;
     }
     else
 #ifdef NTSYNC_IOC_EVENT_READ
@@ -344,7 +369,6 @@ struct inproc_sync *create_inproc_event_sync( int manual, int signaled )
     if (!(event = alloc_object( &inproc_sync_ops ))) return NULL;
     event->type = INPROC_SYNC_EVENT;
     event->shm_idx = ~0u;
-    event->ephemeral = 0;
     event->lifetime = NULL;
     if (lockfree_shared)
     {
@@ -378,7 +402,6 @@ struct inproc_sync *create_inproc_mutex_sync( thread_id_t owner, unsigned int co
     if (!(mutex = alloc_object( &inproc_sync_ops ))) return NULL;
     mutex->type = INPROC_SYNC_MUTEX;
     mutex->shm_idx = ~0u;
-    mutex->ephemeral = 0;
     mutex->lifetime = NULL;
     if (lockfree_shared)
     {
@@ -411,7 +434,6 @@ struct inproc_sync *create_inproc_semaphore_sync( unsigned int initial, unsigned
     if (!(sem = alloc_object( &inproc_sync_ops ))) return NULL;
     sem->type = INPROC_SYNC_SEMAPHORE;
     sem->shm_idx = ~0u;
-    sem->ephemeral = 0;
     sem->lifetime = NULL;
     if (lockfree_shared)
     {
@@ -493,29 +515,15 @@ static void inproc_sync_destroy( struct object *obj )
     struct inproc_sync *sync = (struct inproc_sync *)obj;
     assert( obj->ops == &inproc_sync_ops );
     list_remove( &sync->entry );
-    if (sync->ephemeral)
-        lf_sync_free_object( &lockfree_dispatcher, sync->shm_idx );
-    else if (sync->shm_idx != ~0u)
+    if (sync->shm_idx != ~0u)
     {
         struct lockfree_lifetime *lifetime = sync->lifetime;
 
-        if (lifetime)
-        {
-            if (sync->fd >= 0) close( sync->fd );
-            sync->fd = -1;
-            lifetime->retired = 1;
-            list_add_tail( &retired_lifetimes, &lifetime->entry );
-            sync->lifetime = NULL; /* transfer its reference to the retired list */
-            reap_lockfree_lifetime( lifetime );
-        }
-        else
-        {
-            /* No client could have registered a waiter without first
-             * activating the lifetime. Initially-owned mutexes also get a
-             * lifetime at creation, so an unpublished object is reusable now. */
-            int freed = lf_sync_free_object( &lockfree_dispatcher, sync->shm_idx );
-            assert( freed );
-        }
+        assert( lifetime );
+        lifetime->retired = 1;
+        list_add_tail( &retired_lifetimes, &lifetime->entry );
+        sync->lifetime = NULL;
+        reap_lockfree_lifetime( lifetime );
     }
     else if (sync->fd >= 0) close( sync->fd );
 }
@@ -550,7 +558,22 @@ void set_inproc_sync_owner_alive( thread_id_t tid )
     if (lockfree_shared) lf_sync_set_owner_alive( &lockfree_dispatcher, tid, 1 );
 }
 
-static int get_obj_inproc_sync( struct object *obj, int *type, unsigned int *shm_idx )
+void release_process_lockfree_leases( struct process *process )
+{
+    while (!list_empty( &process->lockfree_leases ))
+    {
+        struct lockfree_lease *lease = LIST_ENTRY( list_head( &process->lockfree_leases ),
+                                                   struct lockfree_lease, process_entry );
+        struct lockfree_lifetime *lifetime = lease->lifetime;
+
+        if (!lf_sync_lease_is_released( lockfree_shared, lease->token ))
+            assert( lf_sync_mark_lease_released( lockfree_shared, lease->token ));
+        destroy_lockfree_lease( lease );
+        if (lifetime->retired) reap_lockfree_lifetime( lifetime );
+    }
+}
+
+static int get_obj_inproc_sync( struct object *obj, int *type, unsigned int *shm_idx, uint64_t *lease )
 {
     struct object *sync;
     int fd = -1;
@@ -561,7 +584,12 @@ static int get_obj_inproc_sync( struct object *obj, int *type, unsigned int *shm
         struct inproc_sync *inproc = (struct inproc_sync *)sync;
         *type = inproc->type;
         *shm_idx = inproc->shm_idx;
-        fd = get_inproc_sync_fd( inproc );
+        if (inproc->shm_idx != ~0u)
+        {
+            assert( inproc->lifetime );
+            *lease = create_lockfree_lease( inproc->lifetime, current->process );
+        }
+        else fd = get_inproc_sync_fd( inproc );
     }
 
     release_object( sync );
@@ -621,7 +649,11 @@ void set_inproc_sync_owner_alive( thread_id_t tid )
 {
 }
 
-static int get_obj_inproc_sync( struct object *obj, int *type, unsigned int *shm_idx )
+void release_process_lockfree_leases( struct process *process )
+{
+}
+
+static int get_obj_inproc_sync( struct object *obj, int *type, unsigned int *shm_idx, uint64_t *lease )
 {
     return -1;
 }
@@ -638,8 +670,13 @@ DECL_HANDLER(get_inproc_sync_fd)
     reply->access = get_handle_access( current->process, req->handle );
 
     reply->shm_idx = ~0u;
-    fd = get_obj_inproc_sync( obj, &reply->type, &reply->shm_idx );
-    if (fd < 0) set_error( STATUS_NOT_IMPLEMENTED );
+    reply->lease = 0;
+    fd = get_obj_inproc_sync( obj, &reply->type, &reply->shm_idx, &reply->lease );
+    if (reply->shm_idx != ~0u)
+    {
+        if (!reply->lease && !get_error()) set_error( STATUS_TOO_MANY_OPENED_FILES );
+    }
+    else if (fd < 0) set_error( STATUS_NOT_IMPLEMENTED );
     else send_client_fd( current->process, fd, req->handle );
 
     release_object( obj );

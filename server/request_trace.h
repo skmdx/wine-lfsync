@@ -3412,6 +3412,8 @@ static void dump_get_inproc_sync_fd_reply( const struct get_inproc_sync_fd_reply
     fprintf( stderr, " type=%d", req->type );
     fprintf( stderr, ", access=%08x", req->access );
     fprintf( stderr, ", shm_idx=%08x", req->shm_idx );
+    fprintf( stderr, ", pad=%08x", req->pad );
+    dump_uint64( ", lease=", &req->lease );
 }
 
 static void dump_get_inproc_alert_fd_request( const struct get_inproc_alert_fd_request *req )
@@ -4531,6 +4533,7 @@ static const struct
     { "INFO_LENGTH_MISMATCH",        STATUS_INFO_LENGTH_MISMATCH },
     { "INSTANCE_NOT_AVAILABLE",      STATUS_INSTANCE_NOT_AVAILABLE },
     { "INSUFFICIENT_RESOURCES",      STATUS_INSUFFICIENT_RESOURCES },
+    { "INTERNAL_ERROR",              STATUS_INTERNAL_ERROR },
     { "INVALID_ACL",                 STATUS_INVALID_ACL },
     { "INVALID_ADDRESS",             STATUS_INVALID_ADDRESS },
     { "INVALID_ADDRESS_COMPONENT",   STATUS_INVALID_ADDRESS_COMPONENT },
