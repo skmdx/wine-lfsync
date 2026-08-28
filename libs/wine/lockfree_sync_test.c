@@ -552,6 +552,8 @@ static void test_shared_initialization_does_not_touch_payload(void)
     if (!shared) return;
     shared->words[LF_SYNC_SHARED_WORDS - 1].value = UINT64_C(0x123456789abcdef0);
     shared->waits[LF_SYNC_SHARED_WAITS - 1].published = UINT64_C(0xfedcba9876543210);
+    shared->leases[LF_SYNC_SHARED_LEASES - 1].control = UINT64_C(0x13579bdf2468ace0);
+    shared->released_leases[LF_SYNC_SHARED_LEASE_WORDS - 1] = UINT64_C(0x55aa55aa55aa55aa);
     shared->next_object = 123;
     shared->free_object = 456;
 
@@ -560,8 +562,47 @@ static void test_shared_initialization_does_not_touch_payload(void)
         !shared->next_object && shared->free_object == UINT32_MAX,
         "shared initialization did not initialize its header\n" );
     ok( shared->words[LF_SYNC_SHARED_WORDS - 1].value == UINT64_C(0x123456789abcdef0) &&
-        shared->waits[LF_SYNC_SHARED_WAITS - 1].published == UINT64_C(0xfedcba9876543210),
+        shared->waits[LF_SYNC_SHARED_WAITS - 1].published == UINT64_C(0xfedcba9876543210) &&
+        shared->leases[LF_SYNC_SHARED_LEASES - 1].control == UINT64_C(0x13579bdf2468ace0) &&
+        shared->released_leases[LF_SYNC_SHARED_LEASE_WORDS - 1] == UINT64_C(0x55aa55aa55aa55aa),
         "shared initialization touched zero-filled payload pages\n" );
+    free( shared );
+}
+
+static void test_lease_state_machine(void)
+{
+    struct lf_sync_shared *shared;
+    uint64_t first, second;
+    const uint32_t slot = 73;
+
+    shared = calloc( 1, sizeof(*shared) );
+    ok( !!shared, "failed to allocate lease fixture\n" );
+    if (!shared) return;
+    lf_sync_init_shared( shared );
+
+    ok( lf_sync_activate_lease( shared, slot, &first ), "failed to activate first lease\n" );
+    ok( (first & LF_SYNC_LEASE_SLOT_MASK) == slot && first >> LF_SYNC_LEASE_SLOT_BITS,
+        "first lease token has invalid slot or generation\n" );
+    ok( lf_sync_mark_lease_released( shared, first ), "failed to mark first lease released\n" );
+    ok( lf_sync_lease_is_released( shared, first ), "released lease state was not authoritative\n" );
+    ok( !lf_sync_take_released_leases( shared, slot / 64 ),
+        "mark-only release unexpectedly published a bitmap notification\n" );
+    lf_sync_notify_lease_release( shared, first );
+    ok( lf_sync_take_released_leases( shared, slot / 64 ) == (UINT64_C(1) << (slot % 64)),
+        "release bitmap did not report the released lease\n" );
+    ok( lf_sync_free_lease( shared, first ), "failed to free first lease\n" );
+
+    ok( lf_sync_activate_lease( shared, slot, &second ), "failed to reuse lease slot\n" );
+    ok( first != second, "reused lease slot did not advance its generation\n" );
+    ok( !lf_sync_mark_lease_released( shared, first ), "stale lease token released a new lease\n" );
+    lf_sync_notify_lease_release( shared, first );
+    ok( lf_sync_take_released_leases( shared, slot / 64 ) == (UINT64_C(1) << (slot % 64)),
+        "stale bitmap notification was not observable as a hint\n" );
+    ok( !lf_sync_lease_is_released( shared, second ), "stale bitmap changed the active lease\n" );
+    ok( lf_sync_release_lease( shared, second ), "normal final lease release failed\n" );
+    ok( lf_sync_lease_is_released( shared, second ), "normal release did not publish authoritative state\n" );
+    ok( lf_sync_free_lease( shared, second ), "failed to free reused lease\n" );
+
     free( shared );
 }
 
@@ -1234,6 +1275,7 @@ int main(void)
     test_mcas_cleanup_waits_for_active_helpers();
     test_object_reuse();
     test_shared_initialization_does_not_touch_payload();
+    test_lease_state_machine();
     test_completion_timeout_race();
 #ifdef __linux__
     test_shared_parking();

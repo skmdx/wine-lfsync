@@ -16,11 +16,18 @@
 
 #define LF_SYNC_MCAS_MAX_WORDS 66
 #define LF_SYNC_SHARED_MAGIC UINT64_C(0x57494e454c465359) /* WINELFSY */
-#define LF_SYNC_SHARED_VERSION 8
+#define LF_SYNC_SHARED_VERSION 9
 #define LF_SYNC_SHARED_OBJECTS 262144
 #define LF_SYNC_SHARED_WAITS 2048
 #define LF_SYNC_SHARED_DESCS 512
 #define LF_SYNC_SHARED_WAITER_BUCKETS 4096
+#define LF_SYNC_SHARED_LEASES (1u << 20)
+#define LF_SYNC_SHARED_LEASE_WORDS (LF_SYNC_SHARED_LEASES / 64)
+#define LF_SYNC_LEASE_SLOT_BITS 20
+#define LF_SYNC_LEASE_SLOT_MASK (LF_SYNC_SHARED_LEASES - 1)
+#define LF_SYNC_LEASE_STATE_MASK UINT64_C(0x3)
+#define LF_SYNC_LEASE_GENERATION_SHIFT 2
+#define LF_SYNC_LEASE_GENERATION_MASK ((UINT64_C(1) << (64 - LF_SYNC_LEASE_SLOT_BITS)) - 1)
 #define LF_SYNC_SHARED_OWNERS LF_SYNC_SHARED_OBJECTS
 #define LF_SYNC_SHARED_WORDS (LF_SYNC_SHARED_OBJECTS + LF_SYNC_SHARED_WAITS + LF_SYNC_SHARED_OWNERS)
 #define LF_SYNC_SHARED_WAITER_WORDS (LF_SYNC_SHARED_WAITS / 64)
@@ -141,6 +148,18 @@ struct lf_sync_wait_ticket
     uint64_t waiting;
 };
 
+enum lf_sync_lease_state
+{
+    LF_SYNC_LEASE_FREE,
+    LF_SYNC_LEASE_ACTIVE,
+    LF_SYNC_LEASE_RELEASED,
+};
+
+struct lf_sync_lease_slot
+{
+    uint64_t control;
+};
+
 struct lf_sync_shared
 {
     uint64_t magic;
@@ -153,6 +172,8 @@ struct lf_sync_shared
     struct lf_sync_object objects[LF_SYNC_SHARED_OBJECTS];
     struct lf_sync_waiter_bucket waiter_buckets[LF_SYNC_SHARED_WAITER_BUCKETS];
     struct lf_sync_wait waits[LF_SYNC_SHARED_WAITS];
+    struct lf_sync_lease_slot leases[LF_SYNC_SHARED_LEASES];
+    uint64_t released_leases[LF_SYNC_SHARED_LEASE_WORDS];
 };
 
 #define LF_SYNC_EVENT_MANUAL 0x1
@@ -274,6 +295,13 @@ void lf_sync_abandon_waits( const struct lf_sync_dispatcher *dispatcher, uint32_
 void lf_sync_init_shared( struct lf_sync_shared *shared );
 int lf_sync_open_shared( struct lf_sync_dispatcher *dispatcher, struct lf_sync_shared *shared,
                          lf_sync_park_func park, lf_sync_wake_func wake );
+int lf_sync_activate_lease( struct lf_sync_shared *shared, uint32_t slot, uint64_t *token );
+int lf_sync_mark_lease_released( struct lf_sync_shared *shared, uint64_t token );
+void lf_sync_notify_lease_release( struct lf_sync_shared *shared, uint64_t token );
+int lf_sync_release_lease( struct lf_sync_shared *shared, uint64_t token );
+int lf_sync_lease_is_released( const struct lf_sync_shared *shared, uint64_t token );
+int lf_sync_free_lease( struct lf_sync_shared *shared, uint64_t token );
+uint64_t lf_sync_take_released_leases( struct lf_sync_shared *shared, uint32_t word );
 void lf_sync_set_owner_alive( const struct lf_sync_dispatcher *dispatcher, uint32_t owner, int alive );
 int lf_sync_owner_alive( const struct lf_sync_dispatcher *dispatcher, uint32_t owner );
 int lf_sync_alloc_object( struct lf_sync_dispatcher *dispatcher, enum lf_sync_object_type type,

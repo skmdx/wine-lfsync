@@ -1593,6 +1593,86 @@ void lf_sync_init_shared( struct lf_sync_shared *shared )
     __atomic_store_n( &shared->magic, LF_SYNC_SHARED_MAGIC, __ATOMIC_RELEASE );
 }
 
+static uint64_t lease_control( uint64_t generation, enum lf_sync_lease_state state )
+{
+    return (generation << LF_SYNC_LEASE_GENERATION_SHIFT) | state;
+}
+
+static uint64_t lease_generation( uint64_t token )
+{
+    return token >> LF_SYNC_LEASE_SLOT_BITS;
+}
+
+int lf_sync_activate_lease( struct lf_sync_shared *shared, uint32_t slot, uint64_t *token )
+{
+    uint64_t control, generation, desired;
+
+    if (slot >= LF_SYNC_SHARED_LEASES || !token) return 0;
+    control = __atomic_load_n( &shared->leases[slot].control, __ATOMIC_ACQUIRE );
+    if ((control & LF_SYNC_LEASE_STATE_MASK) != LF_SYNC_LEASE_FREE) return 0;
+    generation = ((control >> LF_SYNC_LEASE_GENERATION_SHIFT) + 1) & LF_SYNC_LEASE_GENERATION_MASK;
+    if (!generation) generation = 1;
+    desired = lease_control( generation, LF_SYNC_LEASE_ACTIVE );
+    if (!__atomic_compare_exchange_n( &shared->leases[slot].control, &control, desired, 0,
+                                      __ATOMIC_RELEASE, __ATOMIC_ACQUIRE )) return 0;
+    *token = (generation << LF_SYNC_LEASE_SLOT_BITS) | slot;
+    return 1;
+}
+
+int lf_sync_mark_lease_released( struct lf_sync_shared *shared, uint64_t token )
+{
+    uint32_t slot = token & LF_SYNC_LEASE_SLOT_MASK;
+    uint64_t generation = lease_generation( token );
+    uint64_t expected, desired;
+
+    if (!generation) return 0;
+    expected = lease_control( generation, LF_SYNC_LEASE_ACTIVE );
+    desired = lease_control( generation, LF_SYNC_LEASE_RELEASED );
+    return __atomic_compare_exchange_n( &shared->leases[slot].control, &expected, desired, 0,
+                                        __ATOMIC_RELEASE, __ATOMIC_ACQUIRE );
+}
+
+void lf_sync_notify_lease_release( struct lf_sync_shared *shared, uint64_t token )
+{
+    uint32_t slot = token & LF_SYNC_LEASE_SLOT_MASK;
+    __atomic_fetch_or( &shared->released_leases[slot / 64], UINT64_C(1) << (slot % 64), __ATOMIC_RELEASE );
+}
+
+int lf_sync_release_lease( struct lf_sync_shared *shared, uint64_t token )
+{
+    if (!lf_sync_mark_lease_released( shared, token )) return 0;
+    lf_sync_notify_lease_release( shared, token );
+    return 1;
+}
+
+int lf_sync_lease_is_released( const struct lf_sync_shared *shared, uint64_t token )
+{
+    uint32_t slot = token & LF_SYNC_LEASE_SLOT_MASK;
+    uint64_t generation = lease_generation( token );
+
+    return generation && __atomic_load_n( &shared->leases[slot].control, __ATOMIC_ACQUIRE ) ==
+                         lease_control( generation, LF_SYNC_LEASE_RELEASED );
+}
+
+int lf_sync_free_lease( struct lf_sync_shared *shared, uint64_t token )
+{
+    uint32_t slot = token & LF_SYNC_LEASE_SLOT_MASK;
+    uint64_t generation = lease_generation( token );
+    uint64_t expected, desired;
+
+    if (!generation) return 0;
+    expected = lease_control( generation, LF_SYNC_LEASE_RELEASED );
+    desired = lease_control( generation, LF_SYNC_LEASE_FREE );
+    return __atomic_compare_exchange_n( &shared->leases[slot].control, &expected, desired, 0,
+                                        __ATOMIC_RELEASE, __ATOMIC_ACQUIRE );
+}
+
+uint64_t lf_sync_take_released_leases( struct lf_sync_shared *shared, uint32_t word )
+{
+    if (word >= LF_SYNC_SHARED_LEASE_WORDS) return 0;
+    return __atomic_exchange_n( &shared->released_leases[word], 0, __ATOMIC_ACQ_REL );
+}
+
 int lf_sync_open_shared( struct lf_sync_dispatcher *dispatcher, struct lf_sync_shared *shared,
                          lf_sync_park_func park, lf_sync_wake_func wake )
 {
