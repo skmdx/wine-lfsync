@@ -1700,6 +1700,7 @@ size_t server_init_process(void)
             {
                 inproc_device_fd = wine_server_receive_fd( &handle );
                 assert( handle == reply->inproc_device );
+                init_inproc_device( inproc_device_fd );
             }
         }
     }

@@ -3,7 +3,7 @@ MODULE    = ntdll.dll
 UNIXLIB   = ntdll.so
 IMPORTLIB = ntdll
 IMPORTS   = $(SYMCRYPT_PE_LIBS) $(ZLIB_PE_LIBS) $(MUSL_PE_LIBS)
-EXTRAINCL = $(SYMCRYPT_PE_CFLAGS) $(ZLIB_PE_CFLAGS)
+EXTRAINCL = $(SYMCRYPT_PE_CFLAGS) $(ZLIB_PE_CFLAGS) -I$(top_srcdir)/include
 UNIX_CFLAGS  = $(HWLOC_CFLAGS)
 UNIX_LIBS    = $(IOKIT_LIBS) $(COREFOUNDATION_LIBS) $(CORESERVICES_LIBS) $(RT_LIBS) $(PTHREAD_LIBS) $(I386_LIBS) $(PROCSTAT_LIBS) $(HWLOC_LIBS)
 
@@ -56,6 +56,7 @@ SOURCES = \
 	unix/file.c \
 	unix/loader.c \
 	unix/loadorder.c \
+	unix/lockfree_sync_core.c \
 	unix/process.c \
 	unix/registry.c \
 	unix/security.c \

@@ -36,6 +36,7 @@
 #include <sys/types.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #ifdef HAVE_SYS_SYSCALL_H
 #include <sys/syscall.h>
 #endif
@@ -70,12 +71,15 @@
 #include "ddk/wdm.h"
 #include "wine/server.h"
 #include "wine/debug.h"
+#include "wine/lockfree_sync.h"
 #include "unix_private.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(sync);
 
 HANDLE keyed_event = 0;
 int inproc_device_fd = -1;
+static struct lf_sync_shared *lockfree_shared;
+static struct lf_sync_dispatcher lockfree_dispatcher;
 
 static const char *debugstr_timeout( const LARGE_INTEGER *timeout )
 {
@@ -132,6 +136,16 @@ static inline int futex_wait( const LONG *addr, int val, struct timespec *timeou
 static inline int futex_wake_one( const LONG *addr )
 {
     return syscall( __NR_futex, addr, FUTEX_WAKE_PRIVATE, 1, NULL, 0, 0 );
+}
+
+static int lockfree_park( uint32_t *addr, uint32_t val, const void *timeout )
+{
+    return syscall( __NR_futex, addr, FUTEX_WAIT, val, timeout, 0, 0 );
+}
+
+static void lockfree_wake( uint32_t *addr )
+{
+    syscall( __NR_futex, addr, FUTEX_WAKE, INT_MAX, NULL, 0, 0 );
 }
 
 #elif defined(__APPLE__)
@@ -199,6 +213,23 @@ static inline int futex_wake_one( const LONG *addr )
 }
 
 #endif /* __APPLE__ */
+
+void init_inproc_device( int fd )
+{
+#ifdef __linux__
+    void *mapping;
+
+    mapping = mmap( NULL, sizeof(*lockfree_shared), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0 );
+    if (mapping == MAP_FAILED) return;
+    lockfree_shared = mapping;
+    if (!lf_sync_open_shared( &lockfree_dispatcher, lockfree_shared, lockfree_park, lockfree_wake ))
+    {
+        munmap( lockfree_shared, sizeof(*lockfree_shared) );
+        lockfree_shared = NULL;
+    }
+    else TRACE( "using shared lock-free synchronization arena\n" );
+#endif
+}
 
 /* create a struct security_descriptor and contained information in one contiguous piece of memory */
 unsigned int wine_server_alloc_object_attributes( const OBJECT_ATTRIBUTES *attr, struct object_attributes **ret,
@@ -537,6 +568,7 @@ struct inproc_sync
 {
     LONG           refcount;  /* reference count of the sync object */
     int            fd;        /* unix file descriptor */
+    unsigned int   shm_idx;   /* lock-free shared object index */
     unsigned int   access;    /* handle access rights */
     unsigned short type;      /* enum inproc_sync_type as short to save space */
     unsigned short closed;    /* fd has been closed but sync is still referenced */
@@ -599,6 +631,7 @@ static struct inproc_sync *cache_inproc_sync( HANDLE handle, struct inproc_sync 
     }
 
     cache->fd = sync->fd;
+    cache->shm_idx = sync->shm_idx;
     cache->access = sync->access;
     cache->type = sync->type;
     cache->closed = sync->closed;
@@ -634,7 +667,7 @@ static void release_inproc_sync( struct inproc_sync *sync )
     LONG ref = InterlockedDecrement( &sync->refcount );
 
     assert( ref >= 0 );
-    if (!ref) close( fd );
+    if (!ref && fd >= 0) close( fd );
 }
 
 static struct inproc_sync *get_cached_inproc_sync( HANDLE handle )
@@ -675,11 +708,23 @@ static NTSTATUS get_server_inproc_sync( HANDLE handle, struct inproc_sync *sync 
         {
             obj_handle_t fd_handle;
             sync->refcount = 1;
-            sync->fd = wine_server_receive_fd( &fd_handle );
-            assert( wine_server_ptr_handle(fd_handle) == handle );
-            sync->access = reply->access;
-            sync->type = reply->type;
-            sync->closed = 0;
+            sync->shm_idx = reply->shm_idx;
+            if (lockfree_shared)
+            {
+                if (sync->shm_idx >= LF_SYNC_SHARED_OBJECTS) ret = STATUS_INVALID_HANDLE;
+                else sync->fd = -1;
+            }
+            else
+            {
+                sync->fd = wine_server_receive_fd( &fd_handle );
+                assert( wine_server_ptr_handle(fd_handle) == handle );
+            }
+            if (!ret)
+            {
+                sync->access = reply->access;
+                sync->type = reply->type;
+                sync->closed = 0;
+            }
         }
     }
     SERVER_END_REQ;
@@ -773,6 +818,24 @@ void close_inproc_sync( HANDLE handle )
     }
 }
 
+static struct lf_sync_object *get_lockfree_object( const struct inproc_sync *sync )
+{
+    if (!lockfree_shared || sync->shm_idx >= LF_SYNC_SHARED_OBJECTS) return NULL;
+    return &lockfree_dispatcher.objects[sync->shm_idx];
+}
+
+static NTSTATUS lockfree_result_to_status( enum lf_sync_result result )
+{
+    switch (result)
+    {
+    case LF_SYNC_SUCCESS:        return STATUS_SUCCESS;
+    case LF_SYNC_LIMIT_EXCEEDED: return STATUS_SEMAPHORE_LIMIT_EXCEEDED;
+    case LF_SYNC_NOT_OWNER:      return STATUS_MUTANT_NOT_OWNED;
+    case LF_SYNC_INVALID:        return STATUS_OBJECT_TYPE_MISMATCH;
+    default:                     return STATUS_UNSUCCESSFUL;
+    }
+}
+
 static NTSTATUS inproc_release_semaphore( HANDLE handle, ULONG count, ULONG *prev_count )
 {
     struct inproc_sync stack, *sync;
@@ -780,7 +843,13 @@ static NTSTATUS inproc_release_semaphore( HANDLE handle, ULONG count, ULONG *pre
 
     if (inproc_device_fd < 0) return STATUS_NOT_IMPLEMENTED;
     if ((ret = get_inproc_sync( handle, INPROC_SYNC_SEMAPHORE, SEMAPHORE_MODIFY_STATE, &stack, &sync ))) return ret;
-    ret = linux_release_semaphore_obj( sync->fd, count, prev_count );
+    if (get_lockfree_object( sync ))
+    {
+        ret = lockfree_result_to_status( lf_sync_release_semaphore( &lockfree_dispatcher.arena,
+                                                get_lockfree_object( sync ), count, prev_count ) );
+        if (!ret) lf_sync_wake_waiters( &lockfree_dispatcher );
+    }
+    else ret = linux_release_semaphore_obj( sync->fd, count, prev_count );
     release_inproc_sync( sync );
     return ret;
 }
@@ -792,7 +861,10 @@ static NTSTATUS inproc_query_semaphore( HANDLE handle, SEMAPHORE_BASIC_INFORMATI
 
     if (inproc_device_fd < 0) return STATUS_NOT_IMPLEMENTED;
     if ((ret = get_inproc_sync( handle, INPROC_SYNC_SEMAPHORE, SEMAPHORE_QUERY_STATE, &stack, &sync ))) return ret;
-    ret = linux_query_semaphore_obj( sync->fd, info );
+    if (get_lockfree_object( sync ))
+        ret = lockfree_result_to_status( lf_sync_query_semaphore( &lockfree_dispatcher.arena,
+                    get_lockfree_object( sync ), (uint32_t *)&info->CurrentCount, (uint32_t *)&info->MaximumCount ) );
+    else ret = linux_query_semaphore_obj( sync->fd, info );
     release_inproc_sync( sync );
     return ret;
 }
@@ -804,7 +876,13 @@ static NTSTATUS inproc_set_event( HANDLE handle, LONG *prev_state )
 
     if (inproc_device_fd < 0) return STATUS_NOT_IMPLEMENTED;
     if ((ret = get_inproc_sync( handle, INPROC_SYNC_EVENT, EVENT_MODIFY_STATE, &stack, &sync ))) return ret;
-    ret = linux_set_event_obj( sync->fd, prev_state );
+    if (get_lockfree_object( sync ))
+    {
+        ret = lockfree_result_to_status( lf_sync_set_event( &lockfree_dispatcher.arena,
+                                    get_lockfree_object( sync ), (uint32_t *)prev_state ) );
+        if (!ret) lf_sync_wake_waiters( &lockfree_dispatcher );
+    }
+    else ret = linux_set_event_obj( sync->fd, prev_state );
     release_inproc_sync( sync );
     return ret;
 }
@@ -816,7 +894,10 @@ static NTSTATUS inproc_reset_event( HANDLE handle, LONG *prev_state )
 
     if (inproc_device_fd < 0) return STATUS_NOT_IMPLEMENTED;
     if ((ret = get_inproc_sync( handle, INPROC_SYNC_EVENT, EVENT_MODIFY_STATE, &stack, &sync ))) return ret;
-    ret = linux_reset_event_obj( sync->fd, prev_state );
+    if (get_lockfree_object( sync ))
+        ret = lockfree_result_to_status( lf_sync_reset_event( &lockfree_dispatcher.arena,
+                                    get_lockfree_object( sync ), (uint32_t *)prev_state ) );
+    else ret = linux_reset_event_obj( sync->fd, prev_state );
     release_inproc_sync( sync );
     return ret;
 }
@@ -828,7 +909,10 @@ static NTSTATUS inproc_pulse_event( HANDLE handle, LONG *prev_state )
 
     if (inproc_device_fd < 0) return STATUS_NOT_IMPLEMENTED;
     if ((ret = get_inproc_sync( handle, INPROC_SYNC_EVENT, EVENT_MODIFY_STATE, &stack, &sync ))) return ret;
-    ret = linux_pulse_event_obj( sync->fd, prev_state );
+    if (get_lockfree_object( sync ))
+        ret = lockfree_result_to_status( lf_sync_pulse_event( &lockfree_dispatcher,
+                                              sync->shm_idx, (uint32_t *)prev_state ) );
+    else ret = linux_pulse_event_obj( sync->fd, prev_state );
     release_inproc_sync( sync );
     return ret;
 }
@@ -840,7 +924,15 @@ static NTSTATUS inproc_query_event( HANDLE handle, EVENT_BASIC_INFORMATION *info
 
     if (inproc_device_fd < 0) return STATUS_NOT_IMPLEMENTED;
     if ((ret = get_inproc_sync( handle, INPROC_SYNC_EVENT, EVENT_QUERY_STATE, &stack, &sync ))) return ret;
-    ret = linux_query_event_obj( sync->fd, info );
+    if (get_lockfree_object( sync ))
+    {
+        uint32_t manual, signaled;
+        ret = lockfree_result_to_status( lf_sync_query_event( &lockfree_dispatcher.arena,
+                                    get_lockfree_object( sync ), &manual, &signaled ) );
+        info->EventType = manual ? NotificationEvent : SynchronizationEvent;
+        info->EventState = signaled;
+    }
+    else ret = linux_query_event_obj( sync->fd, info );
     release_inproc_sync( sync );
     return ret;
 }
@@ -852,7 +944,20 @@ static NTSTATUS inproc_release_mutex( HANDLE handle, LONG *prev_count )
 
     if (inproc_device_fd < 0) return STATUS_NOT_IMPLEMENTED;
     if ((ret = get_inproc_sync( handle, INPROC_SYNC_MUTEX, 0, &stack, &sync ))) return ret;
-    ret = linux_release_mutex_obj( sync->fd, prev_count );
+    if (get_lockfree_object( sync ))
+    {
+        uint32_t count;
+        lf_sync_query_mutex( &lockfree_dispatcher.arena, get_lockfree_object( sync ),
+                             GetCurrentThreadId(), &count, NULL, NULL );
+        ret = lockfree_result_to_status( lf_sync_release_mutex( &lockfree_dispatcher.arena,
+                                    get_lockfree_object( sync ), GetCurrentThreadId(), NULL ) );
+        if (!ret)
+        {
+            if (prev_count) *prev_count = 1 - count;
+            lf_sync_wake_waiters( &lockfree_dispatcher );
+        }
+    }
+    else ret = linux_release_mutex_obj( sync->fd, prev_count );
     release_inproc_sync( sync );
     return ret;
 }
@@ -864,7 +969,16 @@ static NTSTATUS inproc_query_mutex( HANDLE handle, MUTANT_BASIC_INFORMATION *inf
 
     if (inproc_device_fd < 0) return STATUS_NOT_IMPLEMENTED;
     if ((ret = get_inproc_sync( handle, INPROC_SYNC_MUTEX, MUTANT_QUERY_STATE, &stack, &sync ))) return ret;
-    ret = linux_query_mutex_obj( sync->fd, info );
+    if (get_lockfree_object( sync ))
+    {
+        uint32_t count, owned, abandoned;
+        ret = lockfree_result_to_status( lf_sync_query_mutex( &lockfree_dispatcher.arena,
+                    get_lockfree_object( sync ), GetCurrentThreadId(), &count, &owned, &abandoned ) );
+        info->AbandonedState = abandoned;
+        info->OwnedByCaller = owned;
+        info->CurrentCount = abandoned ? 1 : 1 - count;
+    }
+    else ret = linux_query_mutex_obj( sync->fd, info );
     release_inproc_sync( sync );
     return ret;
 }
@@ -884,8 +998,12 @@ static int get_inproc_alert_fd(void)
         {
             if (!server_call_unlocked( req ))
             {
-                data->alert_fd = fd = wine_server_receive_fd( &token );
-                assert( token == reply->handle );
+                if (lockfree_shared) data->alert_fd = fd = reply->shm_idx;
+                else
+                {
+                    data->alert_fd = fd = wine_server_receive_fd( &token );
+                    assert( token == reply->handle );
+                }
             }
         }
         SERVER_END_REQ;
@@ -896,11 +1014,102 @@ static int get_inproc_alert_fd(void)
     return fd;
 }
 
+static int get_lockfree_timeout( const LARGE_INTEGER *timeout, ULONGLONG deadline, struct timespec *timespec )
+{
+    LARGE_INTEGER system_time;
+    ULONGLONG now, ticks;
+
+    if (!timeout || timeout->QuadPart == TIMEOUT_INFINITE) return 0;
+    if (timeout->QuadPart <= 0) now = monotonic_counter();
+    else
+    {
+        NtQuerySystemTime( &system_time );
+        now = system_time.QuadPart;
+    }
+    if (now >= deadline) return -1;
+    ticks = deadline - now;
+    timespec->tv_sec = ticks / TICKSPERSEC;
+    timespec->tv_nsec = (ticks % TICKSPERSEC) * 100;
+    return 1;
+}
+
+static NTSTATUS lockfree_wait_objs( DWORD count, const uint32_t *objects, WAIT_TYPE type,
+                                    int alert_object, const LARGE_INTEGER *timeout )
+{
+    struct lf_sync_wait_ticket ticket;
+    struct timespec timespec, *timeout_ptr;
+    ULONGLONG deadline = 0;
+    uint64_t value;
+    NTSTATUS ret;
+    int wait_ret;
+
+    if (timeout && timeout->QuadPart != TIMEOUT_INFINITE)
+    {
+        if (timeout->QuadPart <= 0) deadline = monotonic_counter() - timeout->QuadPart;
+        else deadline = timeout->QuadPart;
+    }
+    if (!lf_sync_wait_begin_alert( &lockfree_dispatcher, objects, count, type == WaitAll,
+                                   GetCurrentThreadId(), alert_object < 0 ? ~0u : alert_object, &ticket ))
+        return STATUS_NO_MEMORY;
+
+    for (;;)
+    {
+        value = lf_sync_wait_poll( &lockfree_dispatcher, &ticket );
+        switch (value & 0xff)
+        {
+        case LF_SYNC_WAIT_COMPLETE:
+            ret = type == WaitAll ? 0 : (value >> 8) & 0xff;
+            goto done;
+        case LF_SYNC_WAIT_ABANDONED:
+            ret = STATUS_ABANDONED + (type == WaitAll ? 0 : ((value >> 8) & 0xff));
+            goto done;
+        case LF_SYNC_WAIT_ALERTED:
+        {
+            static const LARGE_INTEGER zero_timeout;
+            ret = server_wait( NULL, 0, SELECT_INTERRUPTIBLE | SELECT_ALERTABLE, &zero_timeout );
+            assert( ret == STATUS_USER_APC );
+            goto done;
+        }
+        case LF_SYNC_WAIT_TIMED_OUT:
+            ret = STATUS_TIMEOUT;
+            goto done;
+        case LF_SYNC_WAIT_LIMIT_EXCEEDED:
+            ret = STATUS_MUTANT_LIMIT_EXCEEDED;
+            goto done;
+        case LF_SYNC_WAIT_INVALID:
+            ret = STATUS_INVALID_PARAMETER;
+            goto done;
+        }
+
+        wait_ret = get_lockfree_timeout( timeout, deadline, &timespec );
+        if (wait_ret < 0)
+        {
+            lf_sync_wait_timeout( &lockfree_dispatcher, &ticket );
+            continue;
+        }
+        timeout_ptr = wait_ret ? &timespec : NULL;
+        if (lf_sync_wait_park( &lockfree_dispatcher, &ticket, timeout_ptr ) < 0)
+        {
+            if (errno == ETIMEDOUT) lf_sync_wait_timeout( &lockfree_dispatcher, &ticket );
+            else if (errno != EINTR && errno != EAGAIN)
+            {
+                ret = errno_to_status( errno );
+                goto done;
+            }
+        }
+    }
+
+done:
+    lf_sync_wait_end( &lockfree_dispatcher, &ticket );
+    return ret;
+}
+
 static NTSTATUS inproc_wait( DWORD count, const HANDLE *handles, WAIT_TYPE type,
                              BOOLEAN alertable, const LARGE_INTEGER *timeout )
 {
     struct inproc_sync *syncs[64], stack[ARRAY_SIZE(syncs)];
     int objs[ARRAY_SIZE(syncs)], alert_fd = 0;
+    uint32_t lockfree_objs[ARRAY_SIZE(syncs)];
     NTSTATUS ret;
 
     if (inproc_device_fd < 0) return STATUS_NOT_IMPLEMENTED;
@@ -915,10 +1124,12 @@ static NTSTATUS inproc_wait( DWORD count, const HANDLE *handles, WAIT_TYPE type,
             return ret;
         }
         objs[i] = syncs[i]->fd;
+        lockfree_objs[i] = syncs[i]->shm_idx;
     }
 
     if (alertable) alert_fd = get_inproc_alert_fd();
-    ret = linux_wait_objs( inproc_device_fd, count, objs, type, alert_fd, timeout );
+    if (lockfree_shared) ret = lockfree_wait_objs( count, lockfree_objs, type, alertable ? alert_fd : -1, timeout );
+    else ret = linux_wait_objs( inproc_device_fd, count, objs, type, alert_fd, timeout );
 
     while (count--) release_inproc_sync( syncs[count] );
     return ret;
@@ -938,18 +1149,43 @@ static NTSTATUS inproc_signal_and_wait( HANDLE signal, HANDLE wait,
 
     if ((ret = get_inproc_sync( wait, INPROC_SYNC_UNKNOWN, SYNCHRONIZE, &stack_wait, &wait_sync ))) goto done;
 
-    switch (signal_sync->type)
+    if (lockfree_shared)
     {
-    case INPROC_SYNC_EVENT:     ret = linux_set_event_obj( signal_sync->fd, NULL ); break;
-    case INPROC_SYNC_MUTEX:     ret = linux_release_mutex_obj( signal_sync->fd, NULL ); break;
-    case INPROC_SYNC_SEMAPHORE: ret = linux_release_semaphore_obj( signal_sync->fd, 1, NULL ); break;
-    default: assert( 0 ); break;
+        switch (signal_sync->type)
+        {
+        case INPROC_SYNC_EVENT:
+            ret = lockfree_result_to_status( lf_sync_set_event( &lockfree_dispatcher.arena,
+                                                get_lockfree_object( signal_sync ), NULL ) );
+            break;
+        case INPROC_SYNC_MUTEX:
+            ret = lockfree_result_to_status( lf_sync_release_mutex( &lockfree_dispatcher.arena,
+                                                get_lockfree_object( signal_sync ), GetCurrentThreadId(), NULL ) );
+            break;
+        case INPROC_SYNC_SEMAPHORE:
+            ret = lockfree_result_to_status( lf_sync_release_semaphore( &lockfree_dispatcher.arena,
+                                                get_lockfree_object( signal_sync ), 1, NULL ) );
+            break;
+        default: assert( 0 ); break;
+        }
+        if (!ret) lf_sync_wake_waiters( &lockfree_dispatcher );
+    }
+    else
+    {
+        switch (signal_sync->type)
+        {
+        case INPROC_SYNC_EVENT:     ret = linux_set_event_obj( signal_sync->fd, NULL ); break;
+        case INPROC_SYNC_MUTEX:     ret = linux_release_mutex_obj( signal_sync->fd, NULL ); break;
+        case INPROC_SYNC_SEMAPHORE: ret = linux_release_semaphore_obj( signal_sync->fd, 1, NULL ); break;
+        default: assert( 0 ); break;
+        }
     }
 
     if (!ret)
     {
         if (alertable) alert_fd = get_inproc_alert_fd();
-        ret = linux_wait_objs( inproc_device_fd, 1, &wait_sync->fd, WaitAny, alert_fd, timeout );
+        if (lockfree_shared)
+            ret = lockfree_wait_objs( 1, &wait_sync->shm_idx, WaitAny, alertable ? alert_fd : -1, timeout );
+        else ret = linux_wait_objs( inproc_device_fd, 1, &wait_sync->fd, WaitAny, alert_fd, timeout );
     }
 
     release_inproc_sync( wait_sync );
