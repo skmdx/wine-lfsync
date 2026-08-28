@@ -242,7 +242,6 @@ static int create_lockfree_sync( struct inproc_sync *sync, enum lf_sync_object_t
 {
     struct lockfree_lifetime *lifetime = NULL;
 
-    reap_lockfree_lifetimes();
     /* An object that has never been sent to a client has no stale shared
      * references to track, so defer the lifetime pipe and its server object
      * until the first get_inproc_sync_fd request. An initially-owned mutex is
@@ -250,8 +249,15 @@ static int create_lockfree_sync( struct inproc_sync *sync, enum lf_sync_object_t
     if (type == LF_SYNC_MUTEX && initial && !(lifetime = create_lockfree_lifetime( ~0u ))) return 0;
     if (!lf_sync_alloc_object( &lockfree_dispatcher, type, initial, limit, flags, &sync->shm_idx ))
     {
-        if (lifetime) release_object( lifetime );
-        return 0;
+        /* Hung-up lifetimes normally reap themselves, while thread teardown
+         * retries waits and owned mutexes that initially blocked reclamation.
+         * Scan the retired list here only as an arena-exhaustion fallback. */
+        reap_lockfree_lifetimes();
+        if (!lf_sync_alloc_object( &lockfree_dispatcher, type, initial, limit, flags, &sync->shm_idx ))
+        {
+            if (lifetime) release_object( lifetime );
+            return 0;
+        }
     }
     if (lifetime) lifetime->object = sync->shm_idx;
     sync->lifetime = lifetime;
