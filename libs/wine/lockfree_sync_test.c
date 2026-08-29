@@ -270,6 +270,60 @@ static void test_invalid_mcas_entries(void)
     ok( !lf_sync_mcas( &f.arena, entries, 2 ), "unordered transaction was accepted\n" );
     entries[1].word = 1;
     ok( !lf_sync_mcas( &f.arena, entries, 2 ), "duplicate transaction word was accepted\n" );
+    ok( !lf_sync_mcas( &f.arena, entries, LF_SYNC_MCAS_MAX_WORDS + 1 ),
+        "oversized transaction was accepted\n" );
+    ok( !lf_sync_compare_exchange( &f.arena, ARRAY_SIZE(f.words), 0, 1 ),
+        "out-of-range compare-exchange was accepted\n" );
+    ok( !lf_sync_compare_exchange( &f.arena, 0, UINT64_C(1) << 63, 1 ) &&
+        !lf_sync_compare_exchange( &f.arena, 0, 0, UINT64_C(1) << 63),
+        "descriptor-tag compare-exchange value was accepted\n" );
+
+    entries[0] = (struct lf_sync_mcas_entry){0, 0, 0, 1};
+    f.arena.desc_count = 0;
+    ok( lf_sync_mcas( &f.arena, entries, 1 ) < 0 && !f.words[0].value,
+        "descriptor exhaustion changed transaction state\n" );
+    f.arena.desc_count = ARRAY_SIZE(f.descs);
+    f.descs[0].control = (UINT64_C(0x0fffffff) << LF_SYNC_MCAS_CONTROL_GEN_SHIFT) |
+                         LF_SYNC_MCAS_ABORTED;
+    ok( lf_sync_mcas( &f.arena, entries, 1 ) == 1 && f.words[0].value == 1 &&
+        ((f.descs[0].control >> LF_SYNC_MCAS_CONTROL_GEN_SHIFT) & UINT64_C(0x0fffffff)) == 1,
+        "descriptor generation did not wrap past zero\n" );
+
+    f.descs[1].entries[0] = (struct lf_sync_mcas_entry){1, 0, 0, 5};
+    f.descs[1].count = 1;
+    f.descs[1].lifetime = (UINT64_C(2) << 32) | 1;
+    f.descs[1].control = test_mcas_control( 0, 2, LF_SYNC_MCAS_COMMITTED, 0 );
+    f.words[1].value = test_mcas_tag( 1, 2 );
+    ok( lf_sync_compare_exchange( &f.arena, 1, 5, 6 ) && f.words[1].value == 6,
+        "compare-exchange did not help a decided descriptor\n" );
+}
+
+static void test_owned_mcas_contracts(void)
+{
+    struct lf_sync_mcas_entry entries[LF_SYNC_MCAS_MAX_WORDS];
+    struct lf_sync_word words[LF_SYNC_MCAS_MAX_WORDS + 2] = {0};
+    struct lf_sync_mcas desc = {0};
+    struct lf_sync_arena arena = {words, ARRAY_SIZE(words), &desc, 1,
+                                  LF_SYNC_MCAS_MAX_WORDS, 2};
+    struct fixture f;
+    uint32_t i;
+
+    init_fixture( &f );
+    f.arena.owner_word_base = 2;
+    f.arena.owner_count = 2;
+    entries[0] = (struct lf_sync_mcas_entry){0, 0, 0, 10};
+    entries[1] = (struct lf_sync_mcas_entry){4, 0, 0, 20};
+    ok( lf_sync_mcas_owned( &f.arena, entries, 2, 4 ) == 1 &&
+        f.words[0].value == 10 && !f.words[3].value && f.words[4].value == 20,
+        "owner epoch was not inserted into an ordered transaction\n" );
+    entries[0] = (struct lf_sync_mcas_entry){3, 0, 0, 0};
+    ok( !lf_sync_mcas_owned( &f.arena, entries, 1, 4 ),
+        "transaction containing its owner epoch was accepted\n" );
+
+    for (i = 0; i < LF_SYNC_MCAS_MAX_WORDS; ++i)
+        entries[i] = (struct lf_sync_mcas_entry){i, 0, 0, 1};
+    ok( !lf_sync_mcas_owned( &arena, entries, LF_SYNC_MCAS_MAX_WORDS, 4 ),
+        "full transaction left no room for its owner epoch\n" );
 }
 
 struct race
@@ -392,6 +446,78 @@ static void test_nt_object_transitions(void)
     lf_sync_init_mutex( &f.arena, &mutex, 3, 11, 0x7fffffff );
     ok( lf_sync_try_wait( &f.arena, wait_objects, 1, 0, 11, &index ) == LF_SYNC_LIMIT_EXCEEDED,
         "31-bit mutex recursion limit was not enforced\n" );
+}
+
+static void test_object_api_contracts(void)
+{
+    const struct lf_sync_object *objects[LF_SYNC_MAX_WAIT_OBJECTS + 1];
+    struct lf_sync_object event, semaphore, mutex, invalid;
+    struct fixture f;
+    uint32_t abandoned, count, index, manual, maximum, owned, previous, signaled, i;
+
+    init_fixture( &f );
+    lf_sync_init_event( &f.arena, &event, 0, 1, 0 );
+    lf_sync_init_semaphore( &f.arena, &semaphore, 1, 1, 3 );
+    lf_sync_init_mutex( &f.arena, &mutex, 2, 12, 2 );
+    invalid = event;
+    invalid.state = (invalid.state & LF_SYNC_OBJECT_WORD_MASK) |
+                    (LF_SYNC_OBJECT_TYPE_MASK << LF_SYNC_OBJECT_TYPE_SHIFT);
+
+    ok( lf_sync_get_object_type( &event ) == LF_SYNC_EVENT &&
+        lf_sync_get_object_type( &semaphore ) == LF_SYNC_SEMAPHORE &&
+        lf_sync_get_object_type( &mutex ) == LF_SYNC_MUTEX,
+        "object type query lost packed type metadata\n" );
+    ok( lf_sync_query_event( &f.arena, &event, &manual, &signaled ) == LF_SYNC_SUCCESS &&
+        manual && !signaled, "event query returned incorrect state\n" );
+    ok( lf_sync_query_semaphore( &f.arena, &semaphore, &count, &maximum ) == LF_SYNC_SUCCESS &&
+        count == 1 && maximum == 3, "semaphore query returned incorrect state\n" );
+    ok( lf_sync_query_mutex( &f.arena, &mutex, 12, &count, &owned, &abandoned ) == LF_SYNC_SUCCESS &&
+        count == 2 && owned && !abandoned, "mutex query returned incorrect state\n" );
+
+    ok( lf_sync_set_event( &f.arena, &semaphore, NULL ) == LF_SYNC_INVALID &&
+        lf_sync_reset_event( &f.arena, &mutex, NULL ) == LF_SYNC_INVALID &&
+        lf_sync_release_semaphore( &f.arena, &event, 1, NULL ) == LF_SYNC_INVALID &&
+        lf_sync_release_semaphore( &f.arena, &semaphore, 0, NULL ) == LF_SYNC_INVALID &&
+        lf_sync_release_mutex( &f.arena, &event, 12, NULL ) == LF_SYNC_INVALID &&
+        lf_sync_release_mutex( &f.arena, &mutex, 0, NULL ) == LF_SYNC_INVALID &&
+        lf_sync_release_mutex( &f.arena, &mutex, UINT32_MAX, NULL ) == LF_SYNC_INVALID &&
+        lf_sync_abandon_mutex( &f.arena, &event, 12 ) == LF_SYNC_INVALID &&
+        lf_sync_abandon_mutex( &f.arena, &mutex, 0 ) == LF_SYNC_INVALID &&
+        lf_sync_abandon_mutex( &f.arena, &mutex, UINT32_MAX ) == LF_SYNC_INVALID,
+        "object mutation accepted an invalid type, count, or owner\n" );
+    ok( lf_sync_query_event( &f.arena, &semaphore, NULL, NULL ) == LF_SYNC_INVALID &&
+        lf_sync_query_semaphore( &f.arena, &mutex, NULL, NULL ) == LF_SYNC_INVALID &&
+        lf_sync_query_mutex( &f.arena, &event, 12, NULL, NULL, NULL ) == LF_SYNC_INVALID,
+        "object query accepted the wrong type\n" );
+
+    for (i = 0; i < ARRAY_SIZE(objects); ++i) objects[i] = &event;
+    ok( lf_sync_try_wait( &f.arena, objects, 0, 0, 12, &index ) == LF_SYNC_INVALID &&
+        lf_sync_try_wait( &f.arena, objects, ARRAY_SIZE(objects), 0, 12, &index ) == LF_SYNC_INVALID &&
+        lf_sync_try_wait( &f.arena, objects, 1, 0, 0, &index ) == LF_SYNC_INVALID &&
+        lf_sync_try_wait( &f.arena, objects, 1, 0, UINT32_MAX, &index ) == LF_SYNC_INVALID,
+        "wait accepted an invalid count or owner\n" );
+    objects[0] = &invalid;
+    ok( lf_sync_try_wait( &f.arena, objects, 1, 0, 12, &index ) == LF_SYNC_INVALID,
+        "wait accepted an invalid object type\n" );
+
+    objects[0] = &event;
+    ok( lf_sync_try_wait_status( &f.arena, objects, 1, 0, 12, ARRAY_SIZE(f.words),
+        lf_sync_wait_value( 1, LF_SYNC_WAITING, 0 ) ) == LF_SYNC_INVALID &&
+        lf_sync_try_wait_status( &f.arena, objects, 1, 0, 12, 4,
+        lf_sync_wait_value( 1, LF_SYNC_WAIT_COMPLETE, 0 ) ) == LF_SYNC_INVALID,
+        "status wait accepted an invalid word or initial state\n" );
+
+    lf_sync_init_event( &f.arena, &event, 0, 0, 1 );
+    lf_sync_init_event( &f.arena, &invalid, 3, 0, 1 );
+    objects[0] = &event;
+    objects[1] = &invalid;
+    index = UINT32_MAX;
+    ok( lf_sync_try_wait( &f.arena, objects, 2, 0, 12, &index ) == LF_SYNC_SUCCESS && !index &&
+        !f.words[0].value && f.words[3].value,
+        "WaitAny did not preserve input priority or report its input index\n" );
+    previous = 99;
+    ok( lf_sync_reset_event( &f.arena, &event, &previous ) == LF_SYNC_SUCCESS && !previous,
+        "idempotent event reset returned the wrong previous state\n" );
 }
 
 static void test_indexed_mutex_abandonment(void)
@@ -634,6 +760,68 @@ static void test_object_reuse(void)
     free( shared );
 }
 
+static void test_object_allocator_contracts(void)
+{
+    struct lf_sync_dispatcher dispatcher;
+    struct lf_sync_shared *shared;
+    uint32_t index, next_object;
+
+    shared = calloc( 1, sizeof(*shared) );
+    ok( !!shared, "failed to allocate object allocator fixture\n" );
+    if (!shared) return;
+    lf_sync_init_shared( shared );
+    ok( lf_sync_open_shared( &dispatcher, shared, NULL, NULL ),
+        "failed to open object allocator fixture\n" );
+    {
+        struct lf_sync_dispatcher invalid = {0};
+        ok( !lf_sync_alloc_object( &invalid, LF_SYNC_EVENT, 0, 0, 0, &index ) &&
+            !lf_sync_free_object( &invalid, 0 ),
+            "object allocator accepted a dispatcher without shared state\n" );
+    }
+
+    ok( !lf_sync_free_object( &dispatcher, 0 ) && !shared->next_object &&
+        shared->free_object == UINT32_MAX,
+        "never-allocated object entered the free list\n" );
+    ok( !lf_sync_alloc_object( &dispatcher, (enum lf_sync_object_type)-1, 0, 0, 0, &index ) &&
+        !lf_sync_alloc_object( &dispatcher, (enum lf_sync_object_type)LF_SYNC_OBJECT_TYPE_MASK,
+                              0, 0, 0, &index ) && !shared->next_object,
+        "invalid object type consumed an allocator slot\n" );
+    ok( !lf_sync_alloc_object( &dispatcher, LF_SYNC_EVENT, 0, 0, 0, NULL ) && !shared->next_object,
+        "null object result consumed an allocator slot\n" );
+    ok( !lf_sync_alloc_object( &dispatcher, LF_SYNC_SEMAPHORE, 1, 0, 0, &index ) &&
+        !lf_sync_alloc_object( &dispatcher, LF_SYNC_SEMAPHORE, 2, 1, 0, &index ) &&
+        !lf_sync_alloc_object( &dispatcher, LF_SYNC_MUTEX, UINT32_MAX, 0, 12, &index ) &&
+        !lf_sync_alloc_object( &dispatcher, LF_SYNC_MUTEX, 1, 0, 0, &index ) &&
+        !lf_sync_alloc_object( &dispatcher, LF_SYNC_MUTEX, 1, 0, UINT32_MAX, &index ) &&
+        !shared->next_object,
+        "invalid object initial state consumed an allocator slot\n" );
+
+    ok( lf_sync_alloc_object( &dispatcher, LF_SYNC_EVENT, 0, 0, 0, &index ) && !index,
+        "valid object allocation failed\n" );
+    ok( lf_sync_free_object( &dispatcher, index ), "valid object free failed\n" );
+    ok( !lf_sync_free_object( &dispatcher, index ) && shared->free_object == index &&
+        shared->objects[index].next_free == UINT32_MAX,
+        "double free corrupted the object free list\n" );
+    ok( lf_sync_alloc_object( &dispatcher, LF_SYNC_EVENT, 0, 0, 0, &index ) && !index,
+        "free-list object was not reusable\n" );
+
+    next_object = shared->next_object;
+    shared->free_object = next_object;
+    ok( !lf_sync_alloc_object( &dispatcher, LF_SYNC_EVENT, 0, 0, 0, &index ) &&
+        shared->next_object == next_object && shared->free_object == next_object,
+        "free-list head referenced an object outside the allocated prefix\n" );
+    shared->free_object = LF_SYNC_SHARED_OBJECTS;
+    ok( !lf_sync_alloc_object( &dispatcher, LF_SYNC_EVENT, 0, 0, 0, &index ) &&
+        shared->next_object == next_object && shared->free_object == LF_SYNC_SHARED_OBJECTS,
+        "corrupt free-list head caused an out-of-range allocation\n" );
+    shared->free_object = UINT32_MAX;
+    shared->next_object = LF_SYNC_SHARED_OBJECTS;
+    ok( !lf_sync_alloc_object( &dispatcher, LF_SYNC_EVENT, 0, 0, 0, &index ),
+        "exhausted object arena allocated past its boundary\n" );
+
+    free( shared );
+}
+
 static void test_shared_initialization_does_not_touch_payload(void)
 {
     struct lf_sync_shared *shared;
@@ -696,13 +884,23 @@ static void test_shared_cacheline_layout(void)
 
 static void test_open_shared_initializes_dispatcher(void)
 {
-    struct lf_sync_dispatcher dispatcher;
+    struct lf_sync_dispatcher dispatcher, poisoned;
     struct lf_sync_shared *shared;
 
     shared = calloc( 1, sizeof(*shared) );
     ok( !!shared, "failed to allocate dispatcher fixture\n" );
     if (!shared) return;
+    memset( &dispatcher, 0x5a, sizeof(dispatcher) );
+    poisoned = dispatcher;
+    ok( !lf_sync_open_shared( &dispatcher, shared, NULL, NULL ) &&
+        !memcmp( &dispatcher, &poisoned, sizeof(dispatcher) ),
+        "dispatcher accepted invalid shared magic or changed output on failure\n" );
     lf_sync_init_shared( shared );
+    shared->version++;
+    ok( !lf_sync_open_shared( &dispatcher, shared, NULL, NULL ) &&
+        !memcmp( &dispatcher, &poisoned, sizeof(dispatcher) ),
+        "dispatcher accepted an incompatible shared version\n" );
+    shared->version = LF_SYNC_SHARED_VERSION;
     memset( &dispatcher, 0xa5, sizeof(dispatcher) );
     ok( lf_sync_open_shared( &dispatcher, shared, NULL, NULL ),
         "failed to open poisoned dispatcher fixture\n" );
@@ -747,10 +945,30 @@ static void test_packed_object_boundary(void)
     free( shared );
 }
 
-static void test_lease_state_machine(void)
+struct lease_release_race
 {
     struct lf_sync_shared *shared;
-    uint64_t first, second;
+    uint64_t token;
+    int *start;
+    int released;
+};
+
+static void *run_lease_release(void *arg)
+{
+    struct lease_release_race *race = arg;
+
+    while (!__atomic_load_n( race->start, __ATOMIC_ACQUIRE )) {}
+    race->released = lf_sync_release_lease( race->shared, race->token );
+    return NULL;
+}
+
+static void test_lease_state_machine(void)
+{
+    struct lease_release_race races[2];
+    struct lf_sync_shared *shared;
+    uint64_t first, second, wrapped;
+    pthread_t threads[2];
+    int start = 0;
     const uint32_t slot = 73;
 
     shared = calloc( 1, sizeof(*shared) );
@@ -758,7 +976,16 @@ static void test_lease_state_machine(void)
     if (!shared) return;
     lf_sync_init_shared( shared );
 
+    ok( !lf_sync_activate_lease( shared, LF_SYNC_SHARED_LEASES, &first ) &&
+        !lf_sync_activate_lease( shared, slot, NULL ) &&
+        !lf_sync_mark_lease_released( shared, 0 ) && !lf_sync_lease_is_released( shared, 0 ) &&
+        !lf_sync_free_lease( shared, 0 ) && !lf_sync_release_lease( shared, 0 ),
+        "lease activation accepted an invalid slot or output\n" );
     ok( lf_sync_activate_lease( shared, slot, &first ), "failed to activate first lease\n" );
+    ok( !lf_sync_activate_lease( shared, slot, &second ) &&
+        !lf_sync_free_lease( shared, first ) && !lf_sync_mark_lease_released( shared, first + (1ull << 20) ) &&
+        !lf_sync_release_lease( shared, first + (1ull << 20) ),
+        "active lease accepted an invalid transition or stale generation\n" );
     ok( (first & LF_SYNC_LEASE_SLOT_MASK) == slot && first >> LF_SYNC_LEASE_SLOT_BITS,
         "first lease token has invalid slot or generation\n" );
     ok( lf_sync_mark_lease_released( shared, first ), "failed to mark first lease released\n" );
@@ -780,6 +1007,31 @@ static void test_lease_state_machine(void)
     ok( lf_sync_release_lease( shared, second ), "normal final lease release failed\n" );
     ok( lf_sync_lease_is_released( shared, second ), "normal release did not publish authoritative state\n" );
     ok( lf_sync_free_lease( shared, second ), "failed to free reused lease\n" );
+    ok( !lf_sync_free_lease( shared, second ) &&
+        !lf_sync_take_released_leases( shared, LF_SYNC_SHARED_LEASE_WORDS ),
+        "free lease accepted a duplicate transition or invalid bitmap word\n" );
+
+    shared->leases[slot].control = LF_SYNC_LEASE_GENERATION_MASK << LF_SYNC_LEASE_GENERATION_SHIFT;
+    ok( lf_sync_activate_lease( shared, slot, &wrapped ) &&
+        (wrapped >> LF_SYNC_LEASE_SLOT_BITS) == 1,
+        "lease generation did not wrap past zero\n" );
+    ok( lf_sync_release_lease( shared, wrapped ) && lf_sync_free_lease( shared, wrapped ),
+        "wrapped lease could not complete its state machine\n" );
+
+    ok( lf_sync_activate_lease( shared, slot, &first ), "failed to activate raced lease\n" );
+    races[0].shared = races[1].shared = shared;
+    races[0].token = races[1].token = first;
+    races[0].start = races[1].start = &start;
+    races[0].released = races[1].released = 0;
+    pthread_create( &threads[0], NULL, run_lease_release, &races[0] );
+    pthread_create( &threads[1], NULL, run_lease_release, &races[1] );
+    __atomic_store_n( &start, 1, __ATOMIC_RELEASE );
+    pthread_join( threads[0], NULL );
+    pthread_join( threads[1], NULL );
+    ok( races[0].released + races[1].released == 1 && lf_sync_lease_is_released( shared, first ) &&
+        lf_sync_take_released_leases( shared, slot / 64 ) == (UINT64_C(1) << (slot % 64)),
+        "concurrent lease release did not have exactly one authoritative winner\n" );
+    ok( lf_sync_free_lease( shared, first ), "failed to free raced lease\n" );
 
     free( shared );
 }
@@ -907,6 +1159,36 @@ static void test_registered_timeout(void)
         "waiter was not removed from its object\n" );
 }
 
+static void test_wait_end_helps_status_descriptor(void)
+{
+    struct lf_sync_wait_ticket ticket;
+    struct lf_sync_dispatcher dispatcher;
+    struct shared_fixture shared = {0};
+    struct lf_sync_mcas *desc = &shared.descs[0];
+    const uint32_t desc_generation = 17;
+    uint32_t object = 0;
+
+    init_dispatcher( &dispatcher, &shared );
+    lf_sync_init_event( &dispatcher.arena, &shared.objects[0], 0, 0, 0 );
+    ok( lf_sync_wait_begin( &dispatcher, &object, 1, 0, 88, &ticket ),
+        "status-descriptor wait registration failed\n" );
+    desc->entries[0] = (struct lf_sync_mcas_entry){dispatcher.status_word_base + ticket.slot, 0,
+        lf_sync_wait_value( ticket.generation, LF_SYNC_WAITING, 0 ),
+        lf_sync_wait_value( ticket.generation, LF_SYNC_WAIT_TIMED_OUT, 0 )};
+    desc->count = 1;
+    desc->lifetime = ((uint64_t)desc_generation << 32) | 1;
+    desc->control = test_mcas_control( 0, desc_generation, LF_SYNC_MCAS_COMMITTED, 0 );
+    shared.words[dispatcher.status_word_base + ticket.slot].value =
+        test_mcas_tag( 0, desc_generation );
+
+    lf_sync_wait_end( &dispatcher, &ticket );
+    ok( shared.words[dispatcher.status_word_base + ticket.slot].value ==
+        lf_sync_wait_value( ticket.generation, LF_SYNC_WAIT_TIMED_OUT, 0 ) &&
+        !shared.waits[ticket.slot].published && !(shared.waits[ticket.slot].lifetime & UINT32_MAX) &&
+        !shared.waiter_buckets[0].waiters[0],
+        "wait end reused a slot before resolving its status descriptor\n" );
+}
+
 static void test_prepared_regular_wait(void)
 {
     struct lf_sync_wait_ticket first, second;
@@ -940,6 +1222,161 @@ static void test_prepared_regular_wait(void)
     lf_sync_wait_timeout( &dispatcher, &second );
     lf_sync_wait_end( &dispatcher, &first );
     lf_sync_wait_end( &dispatcher, &second );
+}
+
+static void test_status_wait_contracts(void)
+{
+    const struct lf_sync_object *objects[2];
+    struct lf_sync_dispatcher dispatcher;
+    struct shared_fixture shared = {0};
+    uint64_t waiting;
+
+    init_dispatcher( &dispatcher, &shared );
+    objects[0] = &shared.objects[1];
+    objects[1] = &shared.objects[0];
+    lf_sync_init_event( &dispatcher.arena, &shared.objects[0], 0, 0, 1 );
+    lf_sync_init_semaphore( &dispatcher.arena, &shared.objects[1], 1, 1, 1 );
+    waiting = lf_sync_wait_value( 5, LF_SYNC_WAITING, 0 );
+    shared.words[2].value = waiting;
+    ok( lf_sync_try_wait_status( &dispatcher.arena, objects, 2, 1, 88, 2, waiting ) == LF_SYNC_SUCCESS &&
+        shared.words[2].value == lf_sync_wait_value( 5, LF_SYNC_WAIT_COMPLETE, 0 ) &&
+        !shared.words[0].value && !shared.words[1].value,
+        "WaitAll completion was not atomic with its status transition\n" );
+
+    lf_sync_init_mutex( &dispatcher.arena, &shared.objects[0], 0, 84, 1 );
+    ok( lf_sync_abandon_mutex( &dispatcher.arena, &shared.objects[0], 84 ) == LF_SYNC_SUCCESS,
+        "failed to prepare abandoned status wait\n" );
+    lf_sync_init_event( &dispatcher.arena, &shared.objects[1], 1, 1, 1 );
+    waiting = lf_sync_wait_value( 6, LF_SYNC_WAIT_PREPARED, 0 );
+    shared.words[2].value = waiting;
+    ok( lf_sync_try_wait_status( &dispatcher.arena, objects, 2, 1, 88, 2, waiting ) == LF_SYNC_ABANDONED &&
+        shared.words[2].value == lf_sync_wait_value( 6, LF_SYNC_WAIT_ABANDONED, 0 ) &&
+        shared.words[0].value == ((UINT64_C(1) << 32) | 88) && shared.words[1].value == 1,
+        "abandoned WaitAll did not atomically publish its terminal status\n" );
+
+    lf_sync_init_event( &dispatcher.arena, &shared.objects[0], 0, 0, 1 );
+    objects[0] = &shared.objects[0];
+    waiting = lf_sync_wait_value( 7, LF_SYNC_WAITING, 0 );
+    shared.words[2].value = lf_sync_wait_value( 7, LF_SYNC_WAIT_TIMED_OUT, 0 );
+    ok( lf_sync_try_wait_status( &dispatcher.arena, objects, 1, 0, 88, 2, waiting ) ==
+        LF_SYNC_UNSATISFIED && shared.words[0].value == 1 &&
+        shared.words[2].value == lf_sync_wait_value( 7, LF_SYNC_WAIT_TIMED_OUT, 0 ),
+        "lost status comparison consumed a wait object\n" );
+}
+
+static void test_alertable_waits(void)
+{
+    struct lf_sync_wait_ticket ticket;
+    struct lf_sync_dispatcher dispatcher;
+    struct shared_fixture shared = {0};
+    uint32_t object = 0;
+
+    init_dispatcher( &dispatcher, &shared );
+    lf_sync_init_event( &dispatcher.arena, &shared.objects[0], 0, 0, 0 );
+    lf_sync_init_event( &dispatcher.arena, &shared.objects[1], 1, 0, 1 );
+    ok( lf_sync_wait_begin_alert( &dispatcher, &object, 1, 0, 88, 1, &ticket ) &&
+        (lf_sync_wait_poll( &dispatcher, &ticket ) & 0xff) == LF_SYNC_WAIT_ALERTED &&
+        !shared.words[1].value && !(uint32_t)shared.waiter_buckets[0].word_state &&
+        !(uint32_t)shared.waiter_buckets[1].word_state,
+        "ready alert did not win before waiter publication\n" );
+    lf_sync_wait_end( &dispatcher, &ticket );
+
+    memset( &shared, 0, sizeof(shared) );
+    init_dispatcher( &dispatcher, &shared );
+    lf_sync_init_event( &dispatcher.arena, &shared.objects[0], 0, 0, 0 );
+    lf_sync_init_event( &dispatcher.arena, &shared.objects[1], 1, 0, 0 );
+    ok( lf_sync_wait_begin_alert( &dispatcher, &object, 1, 0, 88, 1, &ticket ) &&
+        shared.waiter_buckets[0].waiters[0] && shared.waiter_buckets[1].waiters[0],
+        "blocking alertable wait was not registered on both objects\n" );
+    lf_sync_set_event( &dispatcher.arena, &shared.objects[1], NULL );
+    lf_sync_wake_object( &dispatcher, 1 );
+    ok( (lf_sync_wait_poll( &dispatcher, &ticket ) & 0xff) == LF_SYNC_WAIT_ALERTED &&
+        !shared.words[1].value && !shared.words[0].value,
+        "late alert did not atomically complete the wait\n" );
+    lf_sync_wait_end( &dispatcher, &ticket );
+    ok( !shared.waiter_buckets[0].waiters[0] && !shared.waiter_buckets[1].waiters[0],
+        "alertable wait left waiter registrations behind\n" );
+
+    memset( &shared, 0, sizeof(shared) );
+    init_dispatcher( &dispatcher, &shared );
+    lf_sync_init_event( &dispatcher.arena, &shared.objects[0], 0, 0, 0 );
+    lf_sync_init_event( &dispatcher.arena, &shared.objects[1], 1, 0, 0 );
+    ok( lf_sync_wait_begin_alert( &dispatcher, &object, 1, 0, 88, 1, &ticket ),
+        "normal-completion alertable wait registration failed\n" );
+    lf_sync_set_event( &dispatcher.arena, &shared.objects[0], NULL );
+    lf_sync_wake_object( &dispatcher, 0 );
+    ok( (lf_sync_wait_poll( &dispatcher, &ticket ) & 0xff) == LF_SYNC_WAIT_COMPLETE &&
+        !shared.words[0].value && !shared.words[1].value,
+        "normal object did not complete an alertable wait\n" );
+    lf_sync_wait_end( &dispatcher, &ticket );
+}
+
+static void test_wait_api_validation(void)
+{
+    uint32_t objects[LF_SYNC_MAX_WAIT_OBJECTS + 1] = {0};
+    struct lf_sync_wait_ticket ticket = {UINT32_MAX, 1};
+    struct lf_sync_dispatcher dispatcher;
+    struct shared_fixture shared = {0};
+
+    init_dispatcher( &dispatcher, &shared );
+    lf_sync_init_event( &dispatcher.arena, &shared.objects[0], 0, 0, 0 );
+    ok( !lf_sync_wait_begin( &dispatcher, objects, 0, 0, 88, &ticket ) &&
+        !lf_sync_wait_begin( &dispatcher, objects, ARRAY_SIZE(objects), 0, 88, &ticket ) &&
+        !lf_sync_wait_begin( &dispatcher, objects, 1, 0, 0, &ticket ),
+        "wait registration accepted an invalid count or owner\n" );
+    objects[0] = ARRAY_SIZE(shared.objects);
+    ok( !lf_sync_wait_begin( &dispatcher, objects, 1, 0, 88, &ticket ),
+        "wait registration accepted an invalid object\n" );
+    objects[0] = 0;
+    ok( !lf_sync_wait_begin_alert( &dispatcher, objects, 1, 0, 88,
+                                   ARRAY_SIZE(shared.objects), &ticket ),
+        "wait registration accepted an invalid alert object\n" );
+    dispatcher.wait_count = 0;
+    ok( !lf_sync_wait_begin( &dispatcher, objects, 1, 0, 88, &ticket ),
+        "wait registration succeeded without wait slots\n" );
+    dispatcher.wait_count = ARRAY_SIZE(shared.waits);
+
+    ticket.slot = UINT32_MAX;
+    ok( !lf_sync_wait_poll( &dispatcher, &ticket ) &&
+        lf_sync_wait_park( &dispatcher, &ticket, NULL ) == -1 &&
+        !lf_sync_wait_timeout( &dispatcher, &ticket ),
+        "wait operations accepted an invalid ticket\n" );
+    lf_sync_wait_end( &dispatcher, &ticket );
+    ok( lf_sync_signal_and_wait_begin( &dispatcher, ARRAY_SIZE(shared.objects), 0, 88, ~0u,
+                                      &ticket ) == LF_SYNC_INVALID &&
+        lf_sync_signal_and_wait_begin( &dispatcher, 0, ARRAY_SIZE(shared.objects), 88, ~0u,
+                                      &ticket ) == LF_SYNC_INVALID &&
+        lf_sync_signal_and_wait_begin( &dispatcher, 0, 0, 0, ~0u, &ticket ) == LF_SYNC_INVALID &&
+        lf_sync_signal_and_wait_begin( &dispatcher, 0, 0, UINT32_MAX, ~0u, &ticket ) == LF_SYNC_INVALID,
+        "signal-and-wait accepted an invalid object or owner\n" );
+
+    ok( lf_sync_wait_begin( &dispatcher, objects, 1, 0, 88, &ticket ),
+        "terminal park fixture registration failed\n" );
+    ok( lf_sync_wait_timeout( &dispatcher, &ticket ) &&
+        !lf_sync_wait_park( &dispatcher, &ticket, NULL ),
+        "terminal wait attempted to park\n" );
+    lf_sync_wait_end( &dispatcher, &ticket );
+}
+
+static void test_owner_epoch_contracts(void)
+{
+    struct lf_sync_dispatcher dispatcher = {0};
+    struct fixture f;
+
+    init_fixture( &f );
+    dispatcher.arena = f.arena;
+    dispatcher.arena.owner_word_base = 0;
+    dispatcher.arena.owner_count = 2;
+    lf_sync_set_owner_alive( &dispatcher, 4, 1 );
+    ok( !f.words[1].value, "idempotent owner activation changed its epoch\n" );
+    lf_sync_set_owner_alive( &dispatcher, 4, 0 );
+    lf_sync_set_owner_alive( &dispatcher, 4, 0 );
+    ok( f.words[1].value == 1, "owner death was not idempotent\n" );
+    lf_sync_set_owner_alive( &dispatcher, 4, 1 );
+    lf_sync_set_owner_alive( &dispatcher, 4, 1 );
+    ok( f.words[1].value == 2, "owner reuse did not advance exactly one epoch\n" );
+    lf_sync_set_owner_alive( &dispatcher, 3, 0 );
+    ok( f.words[1].value == 2, "invalid owner changed a neighboring epoch\n" );
 }
 
 static void test_missed_dead_wait_reclamation(void)
@@ -1295,6 +1732,37 @@ static void test_atomic_signal_and_wait(void)
     ok( (lf_sync_wait_poll( &dispatcher, &ticket ) & 0xff) == LF_SYNC_WAIT_COMPLETE,
         "armed signal-and-wait did not complete later\n" );
     lf_sync_wait_end( &dispatcher, &ticket );
+
+    lf_sync_init_event( &dispatcher.arena, &shared.objects[0], 0, 0, 0 );
+    lf_sync_init_mutex( &dispatcher.arena, &shared.objects[1], 1, 91, 0x7fffffff );
+    ok( lf_sync_signal_and_wait_begin( &dispatcher, 0, 1, 91, ~0u, &ticket ) == LF_SYNC_SUCCESS &&
+        (lf_sync_wait_poll( &dispatcher, &ticket ) & 0xff) == LF_SYNC_WAIT_LIMIT_EXCEEDED &&
+        shared.words[0].value == 1,
+        "signal-and-wait did not atomically report the wait recursion limit\n" );
+    lf_sync_wait_end( &dispatcher, &ticket );
+
+    lf_sync_init_event( &dispatcher.arena, &shared.objects[0], 0, 0, 0 );
+    shared.objects[1].state = 1 | (LF_SYNC_OBJECT_TYPE_MASK << LF_SYNC_OBJECT_TYPE_SHIFT);
+    shared.words[1].value = 0;
+    ok( lf_sync_signal_and_wait_begin( &dispatcher, 0, 1, 91, ~0u, &ticket ) == LF_SYNC_SUCCESS &&
+        (lf_sync_wait_poll( &dispatcher, &ticket ) & 0xff) == LF_SYNC_WAIT_INVALID &&
+        shared.words[0].value == 1,
+        "signal-and-wait did not atomically report an invalid wait object\n" );
+    lf_sync_wait_end( &dispatcher, &ticket );
+
+    lf_sync_init_mutex( &dispatcher.arena, &shared.objects[0], 0, 92, 1 );
+    lf_sync_init_event( &dispatcher.arena, &shared.objects[1], 1, 0, 0 );
+    ok( lf_sync_signal_and_wait_begin( &dispatcher, 0, 1, 91, ~0u, &ticket ) == LF_SYNC_NOT_OWNER &&
+        !shared.waits[ticket.slot].published && !(shared.waits[ticket.slot].lifetime & UINT32_MAX),
+        "failed signal operation left a registered wait behind\n" );
+
+    lf_sync_init_event( &dispatcher.arena, &shared.objects[0], 0, 0, 0 );
+    lf_sync_init_event( &dispatcher.arena, &shared.objects[1], 1, 0, 0 );
+    ok( lf_sync_signal_and_wait_begin( &dispatcher, 0, 1, 91, 0, &ticket ) == LF_SYNC_SUCCESS &&
+        (lf_sync_wait_poll( &dispatcher, &ticket ) & 0xff) == LF_SYNC_WAIT_ALERTED &&
+        !shared.words[0].value && !shared.words[1].value,
+        "signal-and-wait alert registration missed the atomic signal\n" );
+    lf_sync_wait_end( &dispatcher, &ticket );
 }
 
 static void test_pulse_snapshot(void)
@@ -1344,6 +1812,32 @@ static void test_pulse_snapshot(void)
         "pulse did not atomically complete WaitAll\n" );
     ok( !lf_sync_load( &dispatcher.arena, 1 ), "pulse WaitAll did not consume semaphore\n" );
     lf_sync_wait_end( &dispatcher, &first );
+
+    memset( &shared, 0, sizeof(shared) );
+    init_dispatcher( &dispatcher, &shared );
+    lf_sync_init_event( &dispatcher.arena, &shared.objects[0], 0, 0, 0 );
+    lf_sync_init_event( &dispatcher.arena, &shared.objects[1], 1, 0, 0 );
+    ok( lf_sync_wait_begin( &dispatcher, objects, 2, 1, 8, &first ),
+        "unsatisfied pulse WaitAll registration failed\n" );
+    ok( lf_sync_wait_begin( &dispatcher, objects, 1, 0, 12, &second ),
+        "pulse fallback WaitAny registration failed\n" );
+    lf_sync_pulse_event( &dispatcher, 0, NULL );
+    ok( (lf_sync_wait_poll( &dispatcher, &first ) & 0xff) == LF_SYNC_WAITING &&
+        (lf_sync_wait_poll( &dispatcher, &second ) & 0xff) == LF_SYNC_WAIT_COMPLETE,
+        "failed WaitAll stole an auto-reset pulse from a satisfiable waiter\n" );
+    lf_sync_wait_timeout( &dispatcher, &first );
+    lf_sync_wait_end( &dispatcher, &first );
+    lf_sync_wait_end( &dispatcher, &second );
+
+    lf_sync_init_semaphore( &dispatcher.arena, &shared.objects[1], 1, 0, 1 );
+    ok( lf_sync_pulse_event( &dispatcher, 1, NULL ) == LF_SYNC_INVALID &&
+        lf_sync_pulse_event( &dispatcher, ARRAY_SIZE(shared.objects), NULL ) == LF_SYNC_INVALID,
+        "pulse accepted a non-event or out-of-range object\n" );
+    lf_sync_init_event( &dispatcher.arena, &shared.objects[0], 0, 0, 1 );
+    previous = 0;
+    ok( lf_sync_pulse_event( &dispatcher, 0, &previous ) == LF_SYNC_SUCCESS && previous &&
+        !shared.words[0].value,
+        "pulse did not report and clear persistent event state\n" );
 }
 
 static void test_dead_waiter_reclamation(void)
@@ -1495,6 +1989,7 @@ int main(void)
     ok( lf_sync_is_lock_free(), "64-bit atomics are not lock-free on this platform\n" );
     test_commit_and_abort();
     test_invalid_mcas_entries();
+    test_owned_mcas_contracts();
     test_competing_wait_all();
     test_large_unordered_wait_all();
     test_descriptor_reclamation_stress();
@@ -1505,6 +2000,8 @@ int main(void)
     test_mcas_cleanup_waits_for_active_helpers();
     test_active_mcas_resolves_decided_dependency();
     test_object_reuse();
+    test_object_allocator_contracts();
+    test_object_api_contracts();
     test_shared_initialization_does_not_touch_payload();
     test_shared_cacheline_layout();
     test_open_shared_initializes_dispatcher();
@@ -1514,7 +2011,12 @@ int main(void)
 #ifdef __linux__
     test_shared_parking();
     test_registered_timeout();
+    test_wait_end_helps_status_descriptor();
     test_prepared_regular_wait();
+    test_status_wait_contracts();
+    test_alertable_waits();
+    test_wait_api_validation();
+    test_owner_epoch_contracts();
     test_missed_dead_wait_reclamation();
     test_preparing_wait_reclamation();
     test_parked_handshake();

@@ -33,6 +33,8 @@
 #define LF_WAIT_LIFETIME_GEN_MASK UINT64_C(0x7fffffff)
 #define LF_WAIT_RECLAIMING_OWNER 0
 
+#define LF_OBJECT_FREE_TYPE LF_SYNC_OBJECT_TYPE_MASK
+
 #define LF_OWNER_DEAD UINT64_C(1)
 #define LF_OWNER_GEN_SHIFT 1
 #define LF_OWNER_GEN_MASK ((UINT64_C(1) << 62) - 1)
@@ -1854,11 +1856,17 @@ int lf_sync_alloc_object( struct lf_sync_dispatcher *dispatcher, enum lf_sync_ob
 {
     uint32_t object;
 
-    if (!dispatcher->shared) return 0;
-    if (type > LF_SYNC_MUTEX || (type == LF_SYNC_SEMAPHORE && (!limit || initial > limit))) return 0;
+    if (!dispatcher->shared || !index || (unsigned int)type > LF_SYNC_MUTEX) return 0;
+    if (type == LF_SYNC_SEMAPHORE && (!limit || initial > limit)) return 0;
+    if (type == LF_SYNC_MUTEX &&
+        (initial > LF_MUTEX_COUNT_MASK || (initial && (!flags || flags == LF_MUTEX_ABANDONED_OWNER)))) return 0;
     object = dispatcher->shared->free_object;
     if (object != UINT32_MAX)
+    {
+        if (object >= dispatcher->object_count || object >= dispatcher->shared->next_object ||
+            object_type( &dispatcher->objects[object] ) != LF_OBJECT_FREE_TYPE) return 0;
         dispatcher->shared->free_object = dispatcher->objects[object].next_free;
+    }
     else
     {
         object = dispatcher->shared->next_object;
@@ -1892,8 +1900,10 @@ int lf_sync_free_object( struct lf_sync_dispatcher *dispatcher, uint32_t index )
     struct lf_sync_object *object;
     uint32_t i, touched;
 
-    if (!dispatcher->shared || index >= dispatcher->object_count) return 0;
+    if (!dispatcher->shared || index >= dispatcher->object_count ||
+        index >= dispatcher->shared->next_object) return 0;
     object = &dispatcher->objects[index];
+    if (object_type( object ) == LF_OBJECT_FREE_TYPE) return 0;
     if (!(bucket = get_waiter_bucket( dispatcher, index ))) return 0;
     /* The live summary has a transient false-empty window while unregistering.
      * The upper half of word_state is a monotonic record of words that have
@@ -1939,6 +1949,9 @@ int lf_sync_free_object( struct lf_sync_dispatcher *dispatcher, uint32_t index )
         mutex_count( lf_sync_load( &dispatcher->arena, object_word( object ) ) ))
         return 0;
 
+    /* Mark the slot before linking it so allocation can reject a corrupt free
+     * list and a second free cannot turn the list into a cycle. */
+    object->state = index | (LF_OBJECT_FREE_TYPE << LF_SYNC_OBJECT_TYPE_SHIFT);
     object->next_free = dispatcher->shared->free_object;
     dispatcher->shared->free_object = index;
     return 1;
