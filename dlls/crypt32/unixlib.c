@@ -829,7 +829,7 @@ static BOOL base64_to_cert( const char *str )
     return TRUE;
 }
 
-/* Reads the file fd, and imports any certificates in it into store. */
+/* Takes ownership of fd, reads it, and imports any certificates into store. */
 static void import_certs_from_file( int fd )
 {
     FILE *fp = fdopen(fd, "r");
@@ -838,7 +838,11 @@ static void import_certs_from_file( int fd )
     struct DynamicBuffer saved_cert = { 0, 0, NULL };
     int num_certs = 0;
 
-    if (!fp) return;
+    if (!fp)
+    {
+        close(fd);
+        return;
+    }
     TRACE("\n");
     while (fgets(line, sizeof(line), fp))
     {
@@ -928,7 +932,10 @@ static void import_certs_from_path(LPCSTR path, BOOL allow_dir)
         if (fstat(fd, &st) == 0)
         {
             if (S_ISREG(st.st_mode))
+            {
                 import_certs_from_file(fd);
+                return;  /* import_certs_from_file() consumed fd */
+            }
             else if (S_ISDIR(st.st_mode))
             {
                 if (allow_dir)
