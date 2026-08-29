@@ -242,8 +242,6 @@ enum lf_sync_result lf_sync_release_mutex( const struct lf_sync_arena *arena,
                                            uint32_t *previous );
 enum lf_sync_result lf_sync_abandon_mutex( const struct lf_sync_arena *arena,
                                            const struct lf_sync_object *object, uint32_t owner );
-uint32_t lf_sync_abandon_owned_mutexes( const struct lf_sync_dispatcher *dispatcher,
-                                        uint32_t owner );
 enum lf_sync_result lf_sync_query_event( const struct lf_sync_arena *arena,
                                          const struct lf_sync_object *object,
                                          uint32_t *manual, uint32_t *signaled );

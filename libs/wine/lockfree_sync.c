@@ -664,29 +664,6 @@ enum lf_sync_result lf_sync_abandon_mutex( const struct lf_sync_arena *arena,
     }
 }
 
-uint32_t lf_sync_abandon_owned_mutexes( const struct lf_sync_dispatcher *dispatcher,
-                                        uint32_t owner )
-{
-    uint32_t count, i, abandoned = 0;
-
-    if (!dispatcher->shared || !owner || owner == LF_MUTEX_ABANDONED_OWNER) return 0;
-    count = __atomic_load_n( &dispatcher->shared->next_object, __ATOMIC_ACQUIRE );
-    if (count > dispatcher->object_count) count = dispatcher->object_count;
-
-    for (i = 0; i < count; ++i)
-    {
-        const struct lf_sync_object *object = &dispatcher->objects[i];
-
-        if (object->type == LF_SYNC_MUTEX &&
-            lf_sync_abandon_mutex( &dispatcher->arena, object, owner ) == LF_SYNC_SUCCESS)
-        {
-            ++abandoned;
-            lf_sync_wake_object( dispatcher, i );
-        }
-    }
-    return abandoned;
-}
-
 enum lf_sync_result lf_sync_query_event( const struct lf_sync_arena *arena,
                                          const struct lf_sync_object *object,
                                          uint32_t *manual, uint32_t *signaled )

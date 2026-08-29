@@ -371,7 +371,7 @@ static void test_nt_object_transitions(void)
         "31-bit mutex recursion limit was not enforced\n" );
 }
 
-static void test_owned_mutex_arena_abandonment(void)
+static void test_indexed_mutex_abandonment(void)
 {
     struct lf_sync_dispatcher dispatcher;
     struct lf_sync_shared *shared;
@@ -393,8 +393,12 @@ static void test_owned_mutex_arena_abandonment(void)
     ok( lf_sync_alloc_object( &dispatcher, LF_SYNC_MUTEX, 1, 0, 77, &second_idx ),
         "failed to allocate second owned arena mutex\n" );
 
-    ok( lf_sync_abandon_owned_mutexes( &dispatcher, 77 ) == 2,
-        "arena abandonment did not find both owned mutexes\n" );
+    ok( lf_sync_abandon_mutex( &dispatcher.arena, &dispatcher.objects[owned_idx], 77 ) ==
+        LF_SYNC_SUCCESS, "failed to abandon first indexed mutex\n" );
+    ok( lf_sync_abandon_mutex( &dispatcher.arena, &dispatcher.objects[second_idx], 77 ) ==
+        LF_SYNC_SUCCESS, "failed to abandon second indexed mutex\n" );
+    ok( lf_sync_abandon_mutex( &dispatcher.arena, &dispatcher.objects[other_idx], 77 ) ==
+        LF_SYNC_NOT_OWNER, "indexed cleanup changed another owner's mutex\n" );
     mutex = &dispatcher.objects[owned_idx];
     ok( lf_sync_try_wait( &dispatcher.arena, &mutex, 1, 0, 99, &index ) == LF_SYNC_ABANDONED,
         "first arena mutex was not abandoned\n" );
@@ -453,7 +457,7 @@ static void test_owner_death_transaction_ordering(void)
     dispatcher.arena.desc_count = LF_SYNC_SHARED_DESCS;
 
     /* Conversely, if the transaction tags the epoch first, the death-side
-     * CAS helps it commit and the final mutex scan must abandon the result. */
+     * CAS helps it commit and indexed cleanup must abandon the result. */
     lf_sync_set_owner_alive( &dispatcher, owner, 1 );
     tag = test_mcas_tag( 0, 4 );
     desc->entries[0] = (struct lf_sync_mcas_entry){index, 0, 0, (UINT64_C(1) << 32) | owner};
@@ -465,8 +469,8 @@ static void test_owner_death_transaction_ordering(void)
     shared->words[desc->entries[1].word].value = tag;
     lf_sync_set_owner_alive( &dispatcher, owner, 0 );
     lf_sync_abandon_descriptors( &dispatcher.arena, owner );
-    ok( lf_sync_abandon_owned_mutexes( &dispatcher, owner ) == 1,
-        "transaction ordered before death was not abandoned by the final scan\n" );
+    ok( lf_sync_abandon_mutex( &dispatcher.arena, &dispatcher.objects[index], owner ) == LF_SYNC_SUCCESS,
+        "transaction ordered before death was not abandoned by the indexed cleanup\n" );
     lf_sync_query_mutex( &dispatcher.arena, &dispatcher.objects[index], owner, &count, &owned, NULL );
     ok( !count && !owned, "owner-death cleanup left a mutex owned\n" );
 
@@ -1335,7 +1339,7 @@ int main(void)
     test_descriptor_reclamation_stress();
     test_dead_descriptor_reclamation();
     test_nt_object_transitions();
-    test_owned_mutex_arena_abandonment();
+    test_indexed_mutex_abandonment();
     test_owner_death_transaction_ordering();
     test_mcas_cleanup_waits_for_active_helpers();
     test_active_mcas_resolves_decided_dependency();
