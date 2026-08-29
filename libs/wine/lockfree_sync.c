@@ -817,13 +817,18 @@ static void sort_entries( struct lf_sync_mcas_entry *entries, uint32_t count )
 {
     uint32_t i;
 
-    if (count == 2)
+    if (count < 4)
     {
-        if (entries[0].word > entries[1].word) swap_entries( &entries[0], &entries[1] );
+        if (count > 1 && entries[0].word > entries[1].word)
+            swap_entries( &entries[0], &entries[1] );
+        if (count > 2 && entries[1].word > entries[2].word)
+            swap_entries( &entries[1], &entries[2] );
+        if (count > 2 && entries[0].word > entries[1].word)
+            swap_entries( &entries[0], &entries[1] );
         return;
     }
 
-    /* WaitAll accepts up to 64 objects. Keep the common two-entry path above
+    /* WaitAll accepts up to 64 objects. Keep the common small paths above
      * minimal, while bounding large unordered waits to O(n log n). */
     for (i = count / 2; i; --i) sift_entries( entries, i - 1, count );
     for (i = count; i > 1; --i)
