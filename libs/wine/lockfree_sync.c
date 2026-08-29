@@ -106,6 +106,16 @@ static uint32_t control_owner( uint64_t control )
 
 static void release_desc( const struct lf_sync_arena *arena, uint32_t index, uint32_t generation );
 
+static int control_can_be_helped( uint64_t control, uint32_t generation )
+{
+    enum lf_sync_mcas_status status;
+
+    if (control_generation( control ) != generation) return 0;
+    status = control_status( control );
+    if (status == LF_SYNC_MCAS_ACTIVE) return !!(control & LF_SYNC_MCAS_CONTROL_OWNER_REF);
+    return status == LF_SYNC_MCAS_COMMITTED || status == LF_SYNC_MCAS_ABORTED;
+}
+
 static int acquire_desc( const struct lf_sync_arena *arena, uint32_t index, uint32_t generation )
 {
     struct lf_sync_mcas *desc;
@@ -118,9 +128,7 @@ static int acquire_desc( const struct lf_sync_arena *arena, uint32_t index, uint
     {
         uint64_t control = load_u64( &desc->control );
 
-        if (control_generation( control ) != generation ||
-            control_status( control ) != LF_SYNC_MCAS_ACTIVE ||
-            !(control & LF_SYNC_MCAS_CONTROL_OWNER_REF)) return 0;
+        if (!control_can_be_helped( control, generation )) return 0;
         lifetime = load_u64( &desc->lifetime );
         if ((lifetime >> LF_LIFETIME_GEN_SHIFT) != generation) return 0;
         refs = lifetime & LF_LIFETIME_REF_MASK;
@@ -129,9 +137,7 @@ static int acquire_desc( const struct lf_sync_arena *arena, uint32_t index, uint
         if (cas_u64( &desc->lifetime, &lifetime, desired ))
         {
             control = load_u64( &desc->control );
-            if (control_generation( control ) == generation &&
-                control_status( control ) == LF_SYNC_MCAS_ACTIVE &&
-                (control & LF_SYNC_MCAS_CONTROL_OWNER_REF)) return 1;
+            if (control_can_be_helped( control, generation )) return 1;
             release_desc( arena, index, generation );
             return 0;
         }
@@ -202,7 +208,11 @@ static enum lf_sync_mcas_status help_mcas_acquired( const struct lf_sync_arena *
     control = load_u64( &desc->control );
     if (control_generation( control ) != generation)
         return LF_SYNC_MCAS_ABORTED;
-    if (control_status( control ) != LF_SYNC_MCAS_ACTIVE) return control_status( control );
+    if (control_status( control ) != LF_SYNC_MCAS_ACTIVE)
+    {
+        cleanup_mcas( arena, index, generation );
+        return control_status( control );
+    }
     active = control;
 
     count = __atomic_load_n( &desc->count, __ATOMIC_ACQUIRE );

@@ -473,6 +473,41 @@ static void test_mcas_cleanup_waits_for_active_helpers(void)
         "active helper reference was not preserved\n" );
 }
 
+static void test_active_mcas_resolves_decided_dependency(void)
+{
+    struct fixture f;
+    struct lf_sync_mcas *active, *decided;
+    const uint32_t active_generation = 8, decided_generation = 9;
+
+    init_fixture( &f );
+    active = &f.descs[0];
+    decided = &f.descs[1];
+
+    /* Model a helper which died after another thread decided the descriptor
+     * but before the helper dropped its lifetime reference and cleaned the
+     * tag.  A later active transaction must be able to acquire the decided
+     * generation long enough to remove that tag. */
+    decided->entries[0] = (struct lf_sync_mcas_entry){1, 0, 20, 21};
+    decided->count = 1;
+    decided->lifetime = ((uint64_t)decided_generation << 32) | 1;
+    decided->control = test_mcas_control( 77, decided_generation, LF_SYNC_MCAS_COMMITTED, 0 );
+    f.words[1].value = test_mcas_tag( 1, decided_generation );
+
+    active->entries[0] = (struct lf_sync_mcas_entry){0, 0, 10, 11};
+    active->entries[1] = (struct lf_sync_mcas_entry){1, 0, 21, 21};
+    active->count = 2;
+    active->lifetime = ((uint64_t)active_generation << 32) | 1;
+    active->control = test_mcas_control( 78, active_generation, LF_SYNC_MCAS_ACTIVE, 1 );
+    f.words[0].value = test_mcas_tag( 0, active_generation );
+
+    ok( lf_sync_load( &f.arena, 0 ) == 11,
+        "active descriptor did not resolve a decided dependency\n" );
+    ok( lf_sync_load( &f.arena, 1 ) == 21,
+        "decided dependency tag was not cleaned\n" );
+    ok( (active->control & LF_SYNC_MCAS_CONTROL_STATUS_MASK) == LF_SYNC_MCAS_COMMITTED,
+        "dependent descriptor did not commit\n" );
+}
+
 static void test_object_reuse(void)
 {
     struct lf_sync_mcas_entry entry;
@@ -1273,6 +1308,7 @@ int main(void)
     test_owned_mutex_arena_abandonment();
     test_owner_death_transaction_ordering();
     test_mcas_cleanup_waits_for_active_helpers();
+    test_active_mcas_resolves_decided_dependency();
     test_object_reuse();
     test_shared_initialization_does_not_touch_payload();
     test_lease_state_machine();
