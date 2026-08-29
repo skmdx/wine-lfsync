@@ -1007,13 +1007,13 @@ static void test_waiter_bucket_collision(void)
     ok( lf_sync_wait_begin( &dispatcher, &object, 1, 0, 108, &ticket ),
         "failed to register colliding waiter\n" );
 
+    lf_sync_set_event( &dispatcher.arena, &dispatcher.objects[second], NULL );
     lf_sync_wake_object( &dispatcher, first );
     ok( lf_sync_wait_poll( &dispatcher, &ticket ) == ticket.waiting,
-        "hash collision spuriously completed a waiter\n" );
+        "hash collision retried an unrelated waiter\n" );
     ok( lf_sync_free_object( &dispatcher, first ),
         "unrelated hash collision prevented object reclamation\n" );
 
-    lf_sync_set_event( &dispatcher.arena, &dispatcher.objects[second], NULL );
     lf_sync_wake_object( &dispatcher, second );
     ok( (lf_sync_wait_poll( &dispatcher, &ticket ) & 0xff) == LF_SYNC_WAIT_COMPLETE,
         "colliding waiter was not completed by its own object\n" );

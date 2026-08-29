@@ -931,8 +931,12 @@ static void release_wait( struct lf_sync_wait *wait )
 static struct lf_sync_waiter_bucket *get_waiter_bucket( const struct lf_sync_dispatcher *dispatcher,
                                                         uint32_t object )
 {
-    if (!dispatcher->waiter_bucket_count) return NULL;
-    return &dispatcher->waiter_buckets[object % dispatcher->waiter_bucket_count];
+    uint32_t count = dispatcher->waiter_bucket_count;
+
+    if (!count) return NULL;
+    if (!(count & (count - 1))) object &= count - 1;
+    else object %= count;
+    return &dispatcher->waiter_buckets[object];
 }
 
 static void register_object_wait( const struct lf_sync_dispatcher *dispatcher,
@@ -1029,7 +1033,8 @@ static int alloc_wait( const struct lf_sync_dispatcher *dispatcher, uint32_t own
 }
 
 static void retry_wait_status( const struct lf_sync_dispatcher *dispatcher, uint32_t slot,
-                               uint32_t generation, enum lf_sync_wait_status expected_status )
+                               uint32_t generation, enum lf_sync_wait_status expected_status,
+                               uint32_t trigger_object )
 {
     const struct lf_sync_object *objects[LF_SYNC_MAX_WAIT_OBJECTS];
     struct lf_sync_mcas_entry alert_entries[2];
@@ -1043,6 +1048,15 @@ static void retry_wait_status( const struct lf_sync_dispatcher *dispatcher, uint
     if (!acquire_wait( wait, generation )) return;
     if (load_u64( &wait->published ) != generation) goto done;
     if (!wait->count || wait->count > LF_SYNC_MAX_WAIT_OBJECTS) goto done;
+
+    /* Waiter buckets are hashed. Reject a primary-hash collision before
+     * loading object state or allocating an MCAS descriptor. */
+    if (trigger_object != ~0u && wait->alert_object != trigger_object)
+    {
+        for (i = 0; i < wait->count; ++i)
+            if (wait->objects[i] == trigger_object) break;
+        if (i == wait->count) goto done;
+    }
 
     for (i = 0; i < wait->count; ++i)
     {
@@ -1099,7 +1113,13 @@ done:
 
 static void retry_wait( const struct lf_sync_dispatcher *dispatcher, uint32_t slot, uint32_t generation )
 {
-    retry_wait_status( dispatcher, slot, generation, LF_SYNC_WAITING );
+    retry_wait_status( dispatcher, slot, generation, LF_SYNC_WAITING, ~0u );
+}
+
+static void retry_wait_for_object( const struct lf_sync_dispatcher *dispatcher, uint32_t slot,
+                                   uint32_t generation, uint32_t object )
+{
+    retry_wait_status( dispatcher, slot, generation, LF_SYNC_WAITING, object );
 }
 
 static int register_wait( const struct lf_sync_dispatcher *dispatcher, const uint32_t *objects,
@@ -1185,7 +1205,7 @@ int lf_sync_wait_begin_alert( const struct lf_sync_dispatcher *dispatcher, const
     prepared = lf_sync_wait_value( ticket->generation, LF_SYNC_WAIT_PREPARED, 0 );
 
     /* Ready waits complete without ever publishing into a waiter bucket. */
-    retry_wait_status( dispatcher, ticket->slot, ticket->generation, LF_SYNC_WAIT_PREPARED );
+    retry_wait_status( dispatcher, ticket->slot, ticket->generation, LF_SYNC_WAIT_PREPARED, ~0u );
     if (lf_sync_wait_poll( dispatcher, ticket ) != prepared) return 1;
 
     for (i = 0; i < count; ++i) register_object_wait( dispatcher, objects[i], ticket->slot );
@@ -1401,7 +1421,7 @@ void lf_sync_wake_object( const struct lf_sync_dispatcher *dispatcher, uint32_t 
             if (slot < dispatcher->wait_count)
             {
                 uint64_t generation = load_u64( &dispatcher->waits[slot].published );
-                if (generation) retry_wait( dispatcher, slot, generation );
+                if (generation) retry_wait_for_object( dispatcher, slot, generation, object );
             }
             bits &= bits - 1;
         }
@@ -1428,12 +1448,6 @@ static int pulse_wait( const struct lf_sync_dispatcher *dispatcher, uint32_t slo
     if (load_u64( &wait->published ) != generation) goto failed;
     waiting = lf_sync_wait_value( generation, LF_SYNC_WAITING, 0 );
 
-    /* Preserve WaitAny input priority for objects that are independently
-     * signaled before using the transient pulse. */
-    retry_wait( dispatcher, slot, generation );
-    if (lf_sync_load( &dispatcher->arena, dispatcher->status_word_base + slot ) != waiting)
-        goto failed;
-
     for (i = 0; i < wait->count; ++i)
         if (wait->objects[i] == pulsed_object)
         {
@@ -1441,6 +1455,13 @@ static int pulse_wait( const struct lf_sync_dispatcher *dispatcher, uint32_t slo
             break;
         }
     if (pulse_index == ~0u) goto failed;
+
+    /* Preserve WaitAny input priority for objects that are independently
+     * signaled before using the transient pulse. */
+    retry_wait( dispatcher, slot, generation );
+    if (lf_sync_load( &dispatcher->arena, dispatcher->status_word_base + slot ) != waiting)
+        goto failed;
+
     if (wait->object_generations[pulse_index] >= pulse_generation) goto failed;
 
     event = &dispatcher->objects[pulsed_object];
