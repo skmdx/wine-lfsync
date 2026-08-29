@@ -150,10 +150,15 @@ struct ntsync_lease
     struct list process_entry;
 };
 
-static struct lockfree_lease **lockfree_leases;
-static uint32_t *free_lease_slots;
+union lockfree_lease_entry
+{
+    struct lockfree_lease *lease;
+    uint32_t next_free;
+};
+
+static union lockfree_lease_entry *lockfree_leases;
 static uint32_t next_lease_slot;
-static uint32_t free_lease_slot_count;
+static uint32_t free_lease_slot = UINT32_MAX;
 static uint64_t next_ntsync_lease = 1;
 
 static int reap_lockfree_lifetime( struct lockfree_lifetime *lifetime );
@@ -161,13 +166,8 @@ static int reap_lockfree_lifetime( struct lockfree_lifetime *lifetime );
 static int init_lockfree_leases(void)
 {
     if (lockfree_leases) return 1;
-    if (!(lockfree_leases = calloc( LF_SYNC_SHARED_LEASES, sizeof(*lockfree_leases) )) ||
-        !(free_lease_slots = malloc( LF_SYNC_SHARED_LEASES * sizeof(*free_lease_slots) )))
+    if (!(lockfree_leases = calloc( LF_SYNC_SHARED_LEASES, sizeof(*lockfree_leases) )))
     {
-        free( lockfree_leases );
-        free( free_lease_slots );
-        lockfree_leases = NULL;
-        free_lease_slots = NULL;
         set_error( STATUS_NO_MEMORY );
         return 0;
     }
@@ -178,10 +178,10 @@ static void destroy_lockfree_lease( struct lockfree_lease *lease )
 {
     uint32_t slot = lease->token & LF_SYNC_LEASE_SLOT_MASK;
 
-    assert( lockfree_leases[slot] == lease );
+    assert( lockfree_leases[slot].lease == lease );
     if (!lf_sync_free_lease( lockfree_shared, lease->token )) assert( 0 );
-    lockfree_leases[slot] = NULL;
-    free_lease_slots[free_lease_slot_count++] = slot;
+    lockfree_leases[slot].next_free = free_lease_slot;
+    free_lease_slot = slot;
     list_remove( &lease->process_entry );
     list_remove( &lease->object_entry );
     free( lease );
@@ -249,7 +249,7 @@ static void drain_released_lockfree_leases(void)
         {
             uint32_t bit = __builtin_ctzll( bits );
             uint32_t slot = word * 64 + bit;
-            struct lockfree_lease *lease = lockfree_leases[slot];
+            struct lockfree_lease *lease = lockfree_leases[slot].lease;
             struct lockfree_lifetime *lifetime;
 
             bits &= bits - 1;
@@ -282,27 +282,28 @@ static uint64_t create_lockfree_lease( struct lockfree_lifetime *lifetime, struc
     if (next_lease_slot < LF_SYNC_SHARED_LEASES) slot = next_lease_slot++;
     else
     {
-        if (!free_lease_slot_count) drain_released_lockfree_leases();
-        if (!free_lease_slot_count)
+        if (free_lease_slot == UINT32_MAX) drain_released_lockfree_leases();
+        if (free_lease_slot == UINT32_MAX)
         {
             free( lease );
             set_error( STATUS_TOO_MANY_OPENED_FILES );
             return 0;
         }
-        slot = free_lease_slots[--free_lease_slot_count];
+        slot = free_lease_slot;
+        free_lease_slot = lockfree_leases[slot].next_free;
     }
 
     lease->process = process;
     lease->lifetime = lifetime;
     list_add_tail( &process->lockfree_leases, &lease->process_entry );
     list_add_tail( &lifetime->leases, &lease->object_entry );
-    lockfree_leases[slot] = lease;
+    lockfree_leases[slot].lease = lease;
     if (!lf_sync_activate_lease( lockfree_shared, slot, &lease->token ))
     {
-        lockfree_leases[slot] = NULL;
+        lockfree_leases[slot].next_free = free_lease_slot;
+        free_lease_slot = slot;
         list_remove( &lease->process_entry );
         list_remove( &lease->object_entry );
-        free_lease_slots[free_lease_slot_count++] = slot;
         free( lease );
         set_error( STATUS_INTERNAL_ERROR );
         return 0;

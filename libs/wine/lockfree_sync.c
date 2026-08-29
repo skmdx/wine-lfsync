@@ -557,7 +557,6 @@ static void init_object( const struct lf_sync_arena *arena, struct lf_sync_objec
     object->type = type;
     object->limit = limit;
     object->flags = flags;
-    object->next_free = UINT32_MAX;
     __atomic_store_n( &object->pulse, 0, __ATOMIC_RELEASE );
     __atomic_store_n( &arena->words[word].value, value, __ATOMIC_RELEASE );
 }
@@ -1624,7 +1623,7 @@ void lf_sync_init_shared( struct lf_sync_shared *shared )
     shared->version = LF_SYNC_SHARED_VERSION;
     shared->next_object = 0;
     shared->free_object = UINT32_MAX;
-    shared->pad = 0;
+    memset( shared->header_pad, 0, sizeof(shared->header_pad) );
     __atomic_store_n( &shared->magic, LF_SYNC_SHARED_MAGIC, __ATOMIC_RELEASE );
 }
 

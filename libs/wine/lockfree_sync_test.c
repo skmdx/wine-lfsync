@@ -1,6 +1,7 @@
 /* Native tests for the lock-free NT synchronization MCAS core. */
 
 #include <pthread.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -624,10 +625,12 @@ static void test_shared_initialization_does_not_touch_payload(void)
     shared->released_leases[LF_SYNC_SHARED_LEASE_WORDS - 1] = UINT64_C(0x55aa55aa55aa55aa);
     shared->next_object = 123;
     shared->free_object = 456;
+    memset( shared->header_pad, 0x7b, sizeof(shared->header_pad) );
 
     lf_sync_init_shared( shared );
     ok( shared->magic == LF_SYNC_SHARED_MAGIC && shared->version == LF_SYNC_SHARED_VERSION &&
-        !shared->next_object && shared->free_object == UINT32_MAX,
+        !shared->next_object && shared->free_object == UINT32_MAX && !shared->header_pad[0] &&
+        !shared->header_pad[sizeof(shared->header_pad) - 1],
         "shared initialization did not initialize its header\n" );
     ok( shared->words[LF_SYNC_SHARED_WORDS - 1].value == UINT64_C(0x123456789abcdef0) &&
         shared->waits[LF_SYNC_SHARED_WAITS - 1].published == UINT64_C(0xfedcba9876543210) &&
@@ -635,6 +638,34 @@ static void test_shared_initialization_does_not_touch_payload(void)
         shared->released_leases[LF_SYNC_SHARED_LEASE_WORDS - 1] == UINT64_C(0x55aa55aa55aa55aa),
         "shared initialization touched zero-filled payload pages\n" );
     free( shared );
+}
+
+static void test_shared_cacheline_layout(void)
+{
+    ok( sizeof(struct lf_sync_mcas) % LF_SYNC_CACHELINE_SIZE == 0,
+        "MCAS descriptor stride is not cache-line aligned\n" );
+    ok( sizeof(struct lf_sync_waiter_bucket) % LF_SYNC_CACHELINE_SIZE == 0,
+        "waiter bucket stride is not cache-line aligned\n" );
+    ok( sizeof(struct lf_sync_wait) % LF_SYNC_CACHELINE_SIZE == 0,
+        "wait slot stride is not cache-line aligned\n" );
+    ok( sizeof(struct lf_sync_object) == 24,
+        "shared object metadata is not compact\n" );
+    ok( offsetof(struct lf_sync_object, limit) == offsetof(struct lf_sync_object, next_free),
+        "allocated and free object metadata do not share storage\n" );
+    ok( offsetof(struct lf_sync_shared, words) % LF_SYNC_CACHELINE_SIZE == 0,
+        "shared words are not cache-line aligned\n" );
+    ok( offsetof(struct lf_sync_shared, descs) % LF_SYNC_CACHELINE_SIZE == 0,
+        "shared descriptors are not cache-line aligned\n" );
+    ok( offsetof(struct lf_sync_shared, objects) % LF_SYNC_CACHELINE_SIZE == 0,
+        "shared objects are not cache-line aligned\n" );
+    ok( offsetof(struct lf_sync_shared, waiter_buckets) % LF_SYNC_CACHELINE_SIZE == 0,
+        "shared waiter buckets are not cache-line aligned\n" );
+    ok( offsetof(struct lf_sync_shared, waits) % LF_SYNC_CACHELINE_SIZE == 0,
+        "shared waits are not cache-line aligned\n" );
+    ok( offsetof(struct lf_sync_shared, leases) % LF_SYNC_CACHELINE_SIZE == 0,
+        "shared leases are not cache-line aligned\n" );
+    ok( offsetof(struct lf_sync_shared, released_leases) % LF_SYNC_CACHELINE_SIZE == 0,
+        "released lease bitmap is not cache-line aligned\n" );
 }
 
 static void test_lease_state_machine(void)
@@ -1345,6 +1376,7 @@ int main(void)
     test_active_mcas_resolves_decided_dependency();
     test_object_reuse();
     test_shared_initialization_does_not_touch_payload();
+    test_shared_cacheline_layout();
     test_lease_state_machine();
     test_completion_timeout_race();
 #ifdef __linux__

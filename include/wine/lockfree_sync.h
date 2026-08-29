@@ -16,7 +16,8 @@
 
 #define LF_SYNC_MCAS_MAX_WORDS 66
 #define LF_SYNC_SHARED_MAGIC UINT64_C(0x57494e454c465359) /* WINELFSY */
-#define LF_SYNC_SHARED_VERSION 9
+#define LF_SYNC_SHARED_VERSION 10
+#define LF_SYNC_CACHELINE_SIZE 64
 #define LF_SYNC_SHARED_OBJECTS 262144
 #define LF_SYNC_SHARED_WAITS 2048
 #define LF_SYNC_SHARED_DESCS 512
@@ -67,6 +68,7 @@ struct lf_sync_mcas
     uint32_t count;
     uint32_t pad;
     struct lf_sync_mcas_entry entries[LF_SYNC_MCAS_MAX_WORDS];
+    uint8_t cacheline_pad[56];
 };
 
 struct lf_sync_arena
@@ -90,10 +92,13 @@ struct lf_sync_object
 {
     uint32_t word;
     uint32_t type;
-    uint32_t limit;
+    union
+    {
+        /* Allocated objects use limit; free objects use next_free. */
+        uint32_t limit;
+        uint32_t next_free;
+    };
     uint32_t flags;
-    uint32_t next_free;
-    uint32_t pad;
     uint64_t pulse;
 };
 
@@ -102,6 +107,7 @@ struct lf_sync_waiter_bucket
     uint32_t summary;
     uint32_t pad;
     uint64_t waiters[LF_SYNC_SHARED_WAITER_WORDS];
+    uint8_t cacheline_pad[56];
 };
 
 #define LF_SYNC_MAX_WAIT_OBJECTS 64
@@ -119,6 +125,7 @@ struct lf_sync_wait
     uint32_t alert_object;
     uint32_t objects[LF_SYNC_MAX_WAIT_OBJECTS];
     uint64_t object_generations[LF_SYNC_MAX_WAIT_OBJECTS];
+    uint8_t cacheline_pad[16];
 };
 
 typedef int (*lf_sync_park_func)( uint32_t *address, uint32_t expected, const void *timeout );
@@ -166,7 +173,7 @@ struct lf_sync_shared
     uint32_t version;
     uint32_t next_object;
     uint32_t free_object;
-    uint32_t pad;
+    uint8_t header_pad[44];
     struct lf_sync_word words[LF_SYNC_SHARED_WORDS];
     struct lf_sync_mcas descs[LF_SYNC_SHARED_DESCS];
     struct lf_sync_object objects[LF_SYNC_SHARED_OBJECTS];
