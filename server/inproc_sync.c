@@ -214,6 +214,29 @@ static void reap_lockfree_lifetimes(void)
         reap_lockfree_lifetime( lifetime );
 }
 
+static void abandon_lockfree_mutex( uint32_t object, thread_id_t tid )
+{
+    if (lf_sync_abandon_mutex( &lockfree_dispatcher.arena,
+                               &lockfree_dispatcher.objects[object], tid ) == LF_SYNC_SUCCESS)
+        lf_sync_wake_object( &lockfree_dispatcher, object );
+}
+
+static void abandon_lockfree_mutexes( thread_id_t tid )
+{
+    struct lockfree_lifetime *lifetime;
+    struct inproc_sync *mutex;
+
+    LIST_FOR_EACH_ENTRY( mutex, &inproc_mutexes, struct inproc_sync, entry )
+        abandon_lockfree_mutex( mutex->shm_idx, tid );
+
+    /* A destroyed handle can leave its shared mutex alive while a client
+     * lease, waiter, or owner still references it. Such objects have left
+     * inproc_mutexes, but remain uniquely represented by this list. */
+    LIST_FOR_EACH_ENTRY( lifetime, &retired_lifetimes, struct lockfree_lifetime, entry )
+        if (lockfree_dispatcher.objects[lifetime->object].type == LF_SYNC_MUTEX)
+            abandon_lockfree_mutex( lifetime->object, tid );
+}
+
 static void drain_released_lockfree_leases(void)
 {
     uint32_t word;
@@ -568,8 +591,9 @@ void abandon_inproc_mutexes( thread_id_t tid )
         lf_sync_abandon_waits( &lockfree_dispatcher, tid );
         /* Scan mutexes last. An ACTIVE transaction that linearized before
          * owner death may have acquired another mutex while descriptors were
-         * being settled. */
-        lf_sync_abandon_owned_mutexes( &lockfree_dispatcher, tid );
+         * being settled. Use the server's live and retired object indices
+         * instead of scanning the entire shared object high-water mark. */
+        abandon_lockfree_mutexes( tid );
         reap_lockfree_lifetimes();
         return;
     }
