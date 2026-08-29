@@ -673,7 +673,6 @@ static struct inproc_sync *cache_inproc_sync( HANDLE handle, struct inproc_sync 
     assert( !refcount );
 
     assert( sync->refcount == 1 );
-    memset( sync, 0, sizeof(*sync) );
 
     return cache;
 }
@@ -888,15 +887,16 @@ static NTSTATUS lockfree_result_to_status( enum lf_sync_result result )
 
 static NTSTATUS inproc_release_semaphore( HANDLE handle, ULONG count, ULONG *prev_count )
 {
+    struct lf_sync_object *object;
     struct inproc_sync stack, *sync;
     NTSTATUS ret;
 
     if (inproc_device_fd < 0) return STATUS_NOT_IMPLEMENTED;
     if ((ret = get_inproc_sync( handle, INPROC_SYNC_SEMAPHORE, SEMAPHORE_MODIFY_STATE, &stack, &sync ))) return ret;
-    if (get_lockfree_object( sync ))
+    if ((object = get_lockfree_object( sync )))
     {
         ret = lockfree_result_to_status( lf_sync_release_semaphore( &lockfree_dispatcher.arena,
-                                                get_lockfree_object( sync ), count, prev_count ) );
+                                                                    object, count, prev_count ) );
         if (!ret) lf_sync_wake_object( &lockfree_dispatcher, sync->shm_idx );
     }
     else ret = linux_release_semaphore_obj( sync->fd, count, prev_count );
@@ -906,14 +906,15 @@ static NTSTATUS inproc_release_semaphore( HANDLE handle, ULONG count, ULONG *pre
 
 static NTSTATUS inproc_query_semaphore( HANDLE handle, SEMAPHORE_BASIC_INFORMATION *info )
 {
+    struct lf_sync_object *object;
     struct inproc_sync stack, *sync;
     NTSTATUS ret;
 
     if (inproc_device_fd < 0) return STATUS_NOT_IMPLEMENTED;
     if ((ret = get_inproc_sync( handle, INPROC_SYNC_SEMAPHORE, SEMAPHORE_QUERY_STATE, &stack, &sync ))) return ret;
-    if (get_lockfree_object( sync ))
+    if ((object = get_lockfree_object( sync )))
         ret = lockfree_result_to_status( lf_sync_query_semaphore( &lockfree_dispatcher.arena,
-                    get_lockfree_object( sync ), (uint32_t *)&info->CurrentCount, (uint32_t *)&info->MaximumCount ) );
+                    object, (uint32_t *)&info->CurrentCount, (uint32_t *)&info->MaximumCount ) );
     else ret = linux_query_semaphore_obj( sync->fd, info );
     release_inproc_sync( sync );
     return ret;
@@ -921,17 +922,18 @@ static NTSTATUS inproc_query_semaphore( HANDLE handle, SEMAPHORE_BASIC_INFORMATI
 
 static NTSTATUS inproc_set_event( HANDLE handle, LONG *prev_state )
 {
+    struct lf_sync_object *object;
     struct inproc_sync stack, *sync;
     NTSTATUS ret;
 
     if (inproc_device_fd < 0) return STATUS_NOT_IMPLEMENTED;
     if ((ret = get_inproc_sync( handle, INPROC_SYNC_EVENT, EVENT_MODIFY_STATE, &stack, &sync ))) return ret;
-    if (get_lockfree_object( sync ))
+    if ((object = get_lockfree_object( sync )))
     {
         uint32_t previous;
 
         ret = lockfree_result_to_status( lf_sync_set_event( &lockfree_dispatcher.arena,
-                                    get_lockfree_object( sync ), &previous ) );
+                                                            object, &previous ) );
         if (prev_state) *prev_state = previous;
         if (!ret && !previous) lf_sync_wake_object( &lockfree_dispatcher, sync->shm_idx );
     }
@@ -942,14 +944,15 @@ static NTSTATUS inproc_set_event( HANDLE handle, LONG *prev_state )
 
 static NTSTATUS inproc_reset_event( HANDLE handle, LONG *prev_state )
 {
+    struct lf_sync_object *object;
     struct inproc_sync stack, *sync;
     NTSTATUS ret;
 
     if (inproc_device_fd < 0) return STATUS_NOT_IMPLEMENTED;
     if ((ret = get_inproc_sync( handle, INPROC_SYNC_EVENT, EVENT_MODIFY_STATE, &stack, &sync ))) return ret;
-    if (get_lockfree_object( sync ))
+    if ((object = get_lockfree_object( sync )))
         ret = lockfree_result_to_status( lf_sync_reset_event( &lockfree_dispatcher.arena,
-                                    get_lockfree_object( sync ), (uint32_t *)prev_state ) );
+                                                              object, (uint32_t *)prev_state ) );
     else ret = linux_reset_event_obj( sync->fd, prev_state );
     release_inproc_sync( sync );
     return ret;
@@ -972,16 +975,17 @@ static NTSTATUS inproc_pulse_event( HANDLE handle, LONG *prev_state )
 
 static NTSTATUS inproc_query_event( HANDLE handle, EVENT_BASIC_INFORMATION *info )
 {
+    struct lf_sync_object *object;
     struct inproc_sync stack, *sync;
     NTSTATUS ret;
 
     if (inproc_device_fd < 0) return STATUS_NOT_IMPLEMENTED;
     if ((ret = get_inproc_sync( handle, INPROC_SYNC_EVENT, EVENT_QUERY_STATE, &stack, &sync ))) return ret;
-    if (get_lockfree_object( sync ))
+    if ((object = get_lockfree_object( sync )))
     {
         uint32_t manual, signaled;
         ret = lockfree_result_to_status( lf_sync_query_event( &lockfree_dispatcher.arena,
-                                    get_lockfree_object( sync ), &manual, &signaled ) );
+                                                              object, &manual, &signaled ) );
         info->EventType = manual ? NotificationEvent : SynchronizationEvent;
         info->EventState = signaled;
     }
@@ -992,16 +996,17 @@ static NTSTATUS inproc_query_event( HANDLE handle, EVENT_BASIC_INFORMATION *info
 
 static NTSTATUS inproc_release_mutex( HANDLE handle, LONG *prev_count )
 {
+    struct lf_sync_object *object;
     struct inproc_sync stack, *sync;
     NTSTATUS ret;
 
     if (inproc_device_fd < 0) return STATUS_NOT_IMPLEMENTED;
     if ((ret = get_inproc_sync( handle, INPROC_SYNC_MUTEX, 0, &stack, &sync ))) return ret;
-    if (get_lockfree_object( sync ))
+    if ((object = get_lockfree_object( sync )))
     {
         uint32_t count;
         ret = lockfree_result_to_status( lf_sync_release_mutex( &lockfree_dispatcher.arena,
-                                    get_lockfree_object( sync ), GetCurrentThreadId(), &count ) );
+                                                                object, GetCurrentThreadId(), &count ) );
         if (!ret)
         {
             if (prev_count) *prev_count = 1 - count;
@@ -1015,16 +1020,17 @@ static NTSTATUS inproc_release_mutex( HANDLE handle, LONG *prev_count )
 
 static NTSTATUS inproc_query_mutex( HANDLE handle, MUTANT_BASIC_INFORMATION *info )
 {
+    struct lf_sync_object *object;
     struct inproc_sync stack, *sync;
     NTSTATUS ret;
 
     if (inproc_device_fd < 0) return STATUS_NOT_IMPLEMENTED;
     if ((ret = get_inproc_sync( handle, INPROC_SYNC_MUTEX, MUTANT_QUERY_STATE, &stack, &sync ))) return ret;
-    if (get_lockfree_object( sync ))
+    if ((object = get_lockfree_object( sync )))
     {
         uint32_t count, owned, abandoned;
         ret = lockfree_result_to_status( lf_sync_query_mutex( &lockfree_dispatcher.arena,
-                    get_lockfree_object( sync ), GetCurrentThreadId(), &count, &owned, &abandoned ) );
+                    object, GetCurrentThreadId(), &count, &owned, &abandoned ) );
         info->AbandonedState = abandoned;
         info->OwnedByCaller = owned;
         info->CurrentCount = abandoned ? 1 : 1 - count;

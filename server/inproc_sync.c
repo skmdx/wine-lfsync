@@ -50,19 +50,15 @@
 #include <sys/syscall.h>
 #include <sys/stat.h>
 #include <unistd.h>
-#ifdef __linux__
 # include <linux/futex.h>
 # include <linux/memfd.h>
-#endif
 
 static struct lf_sync_shared *lockfree_shared;
 static struct lf_sync_dispatcher lockfree_dispatcher;
 
 static void lockfree_wake( uint32_t *address )
 {
-#ifdef __linux__
     syscall( SYS_futex, address, FUTEX_WAKE, 1, NULL, NULL, 0 );
-#endif
 }
 
 static int create_lockfree_device(void)
@@ -103,7 +99,7 @@ int get_inproc_device_fd(void)
     if (fd == -2)
     {
         if (getenv( "WINELOCKFREE_SYNC" )) fd = create_lockfree_device();
-        if (fd < 0 && !lockfree_shared)
+        if (fd < 0)
 #ifdef NTSYNC_IOC_EVENT_READ
             fd = open( "/dev/ntsync", O_CLOEXEC | O_RDONLY );
 #else
@@ -129,7 +125,6 @@ static struct list retired_lifetimes = LIST_INIT( retired_lifetimes );
 struct lockfree_lease
 {
     uint64_t token;
-    struct process *process;
     struct lockfree_lifetime *lifetime;
     struct list process_entry;
     struct list object_entry;
@@ -261,15 +256,13 @@ static void drain_released_lockfree_leases(void)
     }
 }
 
-static struct lockfree_lifetime *create_lockfree_lifetime( uint32_t object )
+static struct lockfree_lifetime *create_lockfree_lifetime(void)
 {
     struct lockfree_lifetime *lifetime;
 
     if (!(lifetime = mem_alloc( sizeof(*lifetime) ))) return NULL;
-    lifetime->object = object;
     lifetime->retired = 0;
     list_init( &lifetime->leases );
-    list_init( &lifetime->entry );
     return lifetime;
 }
 
@@ -293,7 +286,6 @@ static uint64_t create_lockfree_lease( struct lockfree_lifetime *lifetime, struc
         free_lease_slot = lockfree_leases[slot].next_free;
     }
 
-    lease->process = process;
     lease->lifetime = lifetime;
     list_add_tail( &process->lockfree_leases, &lease->process_entry );
     list_add_tail( &lifetime->leases, &lease->object_entry );
@@ -337,7 +329,7 @@ static int create_lockfree_sync( struct inproc_sync *sync, enum lf_sync_object_t
 {
     struct lockfree_lifetime *lifetime;
 
-    if (!(lifetime = create_lockfree_lifetime( ~0u ))) return 0;
+    if (!(lifetime = create_lockfree_lifetime())) return 0;
     if (!lf_sync_alloc_object( &lockfree_dispatcher, type, initial, limit, flags, &sync->shm_idx ))
     {
         /* Hung-up lifetimes normally reap themselves, while thread teardown
@@ -350,7 +342,7 @@ static int create_lockfree_sync( struct inproc_sync *sync, enum lf_sync_object_t
             return 0;
         }
     }
-    if (lifetime) lifetime->object = sync->shm_idx;
+    lifetime->object = sync->shm_idx;
     sync->lifetime = lifetime;
     sync->fd = -1;
     return 1;

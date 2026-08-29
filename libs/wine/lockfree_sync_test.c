@@ -250,6 +250,28 @@ static void test_commit_and_abort(void)
         lf_sync_load( &f.arena, 2 ) == 32, "abort left a partial update\n" );
 }
 
+static void test_invalid_mcas_entries(void)
+{
+    struct lf_sync_mcas_entry entries[2] = {{0, 0, 0, 1}, {1, 0, 0, 1}};
+    struct fixture f;
+
+    init_fixture( &f );
+    ok( !lf_sync_mcas( &f.arena, entries, 0 ), "empty transaction was accepted\n" );
+    entries[0].word = ARRAY_SIZE(f.words);
+    ok( !lf_sync_mcas( &f.arena, entries, 1 ), "out-of-range transaction word was accepted\n" );
+    entries[0].word = 0;
+    entries[0].expected = UINT64_C(1) << 63;
+    ok( !lf_sync_mcas( &f.arena, entries, 1 ), "descriptor-tag expected value was accepted\n" );
+    entries[0].expected = 0;
+    entries[0].desired = UINT64_C(1) << 63;
+    ok( !lf_sync_mcas( &f.arena, entries, 1 ), "descriptor-tag desired value was accepted\n" );
+    entries[0] = (struct lf_sync_mcas_entry){1, 0, 0, 1};
+    entries[1] = (struct lf_sync_mcas_entry){0, 0, 0, 1};
+    ok( !lf_sync_mcas( &f.arena, entries, 2 ), "unordered transaction was accepted\n" );
+    entries[1].word = 1;
+    ok( !lf_sync_mcas( &f.arena, entries, 2 ), "duplicate transaction word was accepted\n" );
+}
+
 struct race
 {
     struct fixture *fixture;
@@ -559,7 +581,6 @@ static void test_object_reuse(void)
     ok( lf_sync_alloc_object( &dispatcher, LF_SYNC_EVENT, 0, 0, 0, &first ),
         "failed to allocate reusable event\n" );
     lf_sync_set_owner_alive( &dispatcher, 84, 0 );
-    ok( !lf_sync_owner_alive( &dispatcher, 84 ), "dead owner remained live\n" );
     object = first;
     ok( !lf_sync_wait_begin( &dispatcher, &object, 1, 0, 84, &ticket ),
         "dead owner published a wait\n" );
@@ -570,7 +591,6 @@ static void test_object_reuse(void)
     ok( lf_sync_mcas_owned( &dispatcher.arena, &entry, 1, 84 ) < 0,
         "dead owner published a descriptor\n" );
     lf_sync_set_owner_alive( &dispatcher, 84, 1 );
-    ok( lf_sync_owner_alive( &dispatcher, 84 ), "reused owner did not become live\n" );
     ok( lf_sync_mcas_owned( &dispatcher.arena, &entry, 1, 84 ) == 1,
         "live reused owner could not publish a descriptor\n" );
     ok( lf_sync_reset_event( &dispatcher.arena, &dispatcher.objects[first], NULL ) == LF_SYNC_SUCCESS,
@@ -578,6 +598,8 @@ static void test_object_reuse(void)
     object = first;
     ok( lf_sync_wait_begin( &dispatcher, &object, 1, 0, 80, &ticket ),
         "failed to register reuse-blocking waiter\n" );
+    ok( (dispatcher.waits[ticket.slot].lifetime & UINT32_MAX) == 1,
+        "published wait retained a temporary lifetime reference\n" );
     ok( !lf_sync_free_object( &dispatcher, first ), "object with a waiter was prematurely freed\n" );
     lf_sync_wait_timeout( &dispatcher, &ticket );
     lf_sync_wait_end( &dispatcher, &ticket );
@@ -650,6 +672,8 @@ static void test_shared_cacheline_layout(void)
         "wait slot stride is not cache-line aligned\n" );
     ok( sizeof(struct lf_sync_object) == 16,
         "shared object metadata is not compact\n" );
+    ok( sizeof(struct lf_sync_wait_ticket) == 8,
+        "wait ticket retained derived state\n" );
     ok( LF_SYNC_SHARED_OBJECTS <= LF_SYNC_OBJECT_WORD_MASK + 1,
         "shared object indices do not fit packed object metadata\n" );
     ok( offsetof(struct lf_sync_object, limit) == offsetof(struct lf_sync_object, next_free),
@@ -668,6 +692,33 @@ static void test_shared_cacheline_layout(void)
         "shared leases are not cache-line aligned\n" );
     ok( offsetof(struct lf_sync_shared, released_leases) % LF_SYNC_CACHELINE_SIZE == 0,
         "released lease bitmap is not cache-line aligned\n" );
+}
+
+static void test_open_shared_initializes_dispatcher(void)
+{
+    struct lf_sync_dispatcher dispatcher;
+    struct lf_sync_shared *shared;
+
+    shared = calloc( 1, sizeof(*shared) );
+    ok( !!shared, "failed to allocate dispatcher fixture\n" );
+    if (!shared) return;
+    lf_sync_init_shared( shared );
+    memset( &dispatcher, 0xa5, sizeof(dispatcher) );
+    ok( lf_sync_open_shared( &dispatcher, shared, NULL, NULL ),
+        "failed to open poisoned dispatcher fixture\n" );
+    ok( dispatcher.shared == shared && dispatcher.arena.words == shared->words &&
+        dispatcher.arena.word_count == LF_SYNC_SHARED_WORDS &&
+        dispatcher.arena.descs == shared->descs &&
+        dispatcher.arena.desc_count == LF_SYNC_SHARED_DESCS &&
+        dispatcher.arena.owner_word_base == LF_SYNC_SHARED_OBJECTS + LF_SYNC_SHARED_WAITS &&
+        dispatcher.arena.owner_count == LF_SYNC_SHARED_OWNERS &&
+        dispatcher.objects == shared->objects && dispatcher.object_count == LF_SYNC_SHARED_OBJECTS &&
+        dispatcher.waiter_buckets == shared->waiter_buckets &&
+        dispatcher.waiter_bucket_count == LF_SYNC_SHARED_WAITER_BUCKETS &&
+        dispatcher.waits == shared->waits && dispatcher.wait_count == LF_SYNC_SHARED_WAITS &&
+        dispatcher.status_word_base == LF_SYNC_SHARED_OBJECTS && !dispatcher.park && !dispatcher.wake,
+        "shared dispatcher retained poisoned fields\n" );
+    free( shared );
 }
 
 static void test_packed_object_boundary(void)
@@ -810,7 +861,8 @@ static void test_shared_parking(void)
         init_dispatcher( &child_dispatcher, shared );
         if (!lf_sync_wait_begin( &child_dispatcher, &object, 1, 0, 77, &ticket )) _exit( 2 );
         if (write( ready[1], "x", 1 ) != 1) _exit( 3 );
-        while ((result = lf_sync_wait_poll( &child_dispatcher, &ticket )) == ticket.waiting)
+        while ((result = lf_sync_wait_poll( &child_dispatcher, &ticket )) ==
+               lf_sync_wait_value( ticket.generation, LF_SYNC_WAITING, 0 ))
             if (lf_sync_wait_park( &child_dispatcher, &ticket, NULL ) < 0 && errno != EINTR && errno != EAGAIN)
                 _exit( 4 );
         lf_sync_wait_end( &child_dispatcher, &ticket );
@@ -875,7 +927,8 @@ static void test_prepared_regular_wait(void)
     lf_sync_init_event( &dispatcher.arena, &shared.objects[0], 0, 0, 0 );
     ok( lf_sync_wait_begin( &dispatcher, &object, 1, 0, 88, &first ),
         "blocking regular wait failed\n" );
-    ok( lf_sync_wait_poll( &dispatcher, &first ) == first.waiting &&
+    ok( lf_sync_wait_poll( &dispatcher, &first ) ==
+        lf_sync_wait_value( first.generation, LF_SYNC_WAITING, 0 ) &&
         shared.waiter_buckets[0].waiters[0] & (UINT64_C(1) << first.slot),
         "blocking regular wait was not armed after PREPARED\n" );
     ok( lf_sync_wait_begin( &dispatcher, &object, 1, 0, 92, &second ),
@@ -929,6 +982,50 @@ static void test_missed_dead_wait_reclamation(void)
         "missed dead wait slot was not reused with a new generation\n" );
     lf_sync_wait_timeout( &dispatcher, &replacement );
     lf_sync_wait_end( &dispatcher, &replacement );
+    free( shared );
+}
+
+static void test_preparing_wait_reclamation(void)
+{
+    struct lf_sync_wait_ticket ticket;
+    struct lf_sync_dispatcher dispatcher;
+    struct lf_sync_shared *shared;
+    uint32_t index, owner = 84;
+    uint64_t preparing;
+
+    shared = calloc( 1, sizeof(*shared) );
+    ok( !!shared, "failed to allocate preparing-wait fixture\n" );
+    if (!shared) return;
+    lf_sync_init_shared( shared );
+    ok( lf_sync_open_shared( &dispatcher, shared, NULL, NULL ),
+        "failed to open preparing-wait fixture\n" );
+    dispatcher.wait_count = 1;
+    ok( lf_sync_alloc_object( &dispatcher, LF_SYNC_EVENT, 0, 0, 0, &index ),
+        "failed to allocate preparing-wait event\n" );
+
+    preparing = (UINT64_C(1) << 63) | (UINT64_C(7) << 32) | owner;
+    shared->waits[0].lifetime = preparing;
+    lf_sync_abandon_waits( &dispatcher, owner );
+    ok( shared->waits[0].lifetime == preparing,
+        "death cleanup reclaimed a live owner's unpublished wait claim\n" );
+    lf_sync_set_owner_alive( &dispatcher, owner, 0 );
+    lf_sync_abandon_waits( &dispatcher, owner );
+    ok( shared->waits[0].lifetime == (UINT64_C(8) << 32) && !shared->waits[0].published,
+        "death cleanup did not reclaim an unpublished wait claim\n" );
+
+    preparing = (UINT64_C(1) << 63) | (UINT64_C(8) << 32) | owner;
+    shared->waits[0].lifetime = preparing;
+    ok( lf_sync_wait_begin( &dispatcher, &index, 1, 0, 88, &ticket ) &&
+        ticket.slot == 0 && ticket.generation == 10,
+        "allocator did not reclaim a missed unpublished wait claim\n" );
+    lf_sync_wait_timeout( &dispatcher, &ticket );
+    lf_sync_wait_end( &dispatcher, &ticket );
+
+    preparing = (UINT64_C(1) << 63) | (UINT64_C(0x7fffffff) << 32) | owner;
+    shared->waits[0].lifetime = preparing;
+    lf_sync_abandon_waits( &dispatcher, owner );
+    ok( shared->waits[0].lifetime == (UINT64_C(1) << 32),
+        "unpublished wait generation did not wrap past zero\n" );
     free( shared );
 }
 
@@ -1104,7 +1201,8 @@ static void test_waiter_bucket_collision(void)
 
     lf_sync_set_event( &dispatcher.arena, &dispatcher.objects[second], NULL );
     lf_sync_wake_object( &dispatcher, first );
-    ok( lf_sync_wait_poll( &dispatcher, &ticket ) == ticket.waiting,
+    ok( lf_sync_wait_poll( &dispatcher, &ticket ) ==
+        lf_sync_wait_value( ticket.generation, LF_SYNC_WAITING, 0 ),
         "hash collision retried an unrelated waiter\n" );
     ok( lf_sync_free_object( &dispatcher, first ),
         "unrelated hash collision prevented object reclamation\n" );
@@ -1396,6 +1494,7 @@ int main(void)
 {
     ok( lf_sync_is_lock_free(), "64-bit atomics are not lock-free on this platform\n" );
     test_commit_and_abort();
+    test_invalid_mcas_entries();
     test_competing_wait_all();
     test_large_unordered_wait_all();
     test_descriptor_reclamation_stress();
@@ -1408,6 +1507,7 @@ int main(void)
     test_object_reuse();
     test_shared_initialization_does_not_touch_payload();
     test_shared_cacheline_layout();
+    test_open_shared_initializes_dispatcher();
     test_packed_object_boundary();
     test_lease_state_machine();
     test_completion_timeout_race();
@@ -1416,6 +1516,7 @@ int main(void)
     test_registered_timeout();
     test_prepared_regular_wait();
     test_missed_dead_wait_reclamation();
+    test_preparing_wait_reclamation();
     test_parked_handshake();
     test_waiter_summary();
     test_waiter_summary_race();

@@ -16,7 +16,7 @@
 
 #define LF_SYNC_MCAS_MAX_WORDS 66
 #define LF_SYNC_SHARED_MAGIC UINT64_C(0x57494e454c465359) /* WINELFSY */
-#define LF_SYNC_SHARED_VERSION 11
+#define LF_SYNC_SHARED_VERSION 12
 #define LF_SYNC_CACHELINE_SIZE 64
 #define LF_SYNC_SHARED_OBJECTS 262144
 #define LF_SYNC_SHARED_WAITS 2048
@@ -157,7 +157,6 @@ struct lf_sync_wait_ticket
 {
     uint32_t slot;
     uint32_t generation;
-    uint64_t waiting;
 };
 
 enum lf_sync_lease_state
@@ -215,11 +214,10 @@ enum lf_sync_wait_status
     LF_SYNC_WAIT_PREPARED,
 };
 
-/* Normal values must keep bit 63 clear. The implementation reserves it for
- * descriptor references. */
-int lf_sync_value_is_valid( uint64_t value );
 int lf_sync_is_lock_free(void);
 
+/* Normal values must keep bit 63 clear. The implementation reserves it for
+ * descriptor references. */
 uint64_t lf_sync_load( const struct lf_sync_arena *arena, uint32_t word );
 int lf_sync_compare_exchange( const struct lf_sync_arena *arena, uint32_t word,
                               uint64_t expected, uint64_t desired );
@@ -314,7 +312,6 @@ int lf_sync_lease_is_released( const struct lf_sync_shared *shared, uint64_t tok
 int lf_sync_free_lease( struct lf_sync_shared *shared, uint64_t token );
 uint64_t lf_sync_take_released_leases( struct lf_sync_shared *shared, uint32_t word );
 void lf_sync_set_owner_alive( const struct lf_sync_dispatcher *dispatcher, uint32_t owner, int alive );
-int lf_sync_owner_alive( const struct lf_sync_dispatcher *dispatcher, uint32_t owner );
 int lf_sync_alloc_object( struct lf_sync_dispatcher *dispatcher, enum lf_sync_object_type type,
                           uint32_t initial, uint32_t limit, uint32_t flags, uint32_t *index );
 int lf_sync_free_object( struct lf_sync_dispatcher *dispatcher, uint32_t index );
