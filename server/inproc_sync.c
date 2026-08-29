@@ -179,7 +179,7 @@ static void destroy_lockfree_lease( struct lockfree_lease *lease )
     uint32_t slot = lease->token & LF_SYNC_LEASE_SLOT_MASK;
 
     assert( lockfree_leases[slot] == lease );
-    assert( lf_sync_free_lease( lockfree_shared, lease->token ));
+    if (!lf_sync_free_lease( lockfree_shared, lease->token )) assert( 0 );
     lockfree_leases[slot] = NULL;
     free_lease_slots[free_lease_slot_count++] = slot;
     list_remove( &lease->process_entry );
@@ -595,8 +595,8 @@ void release_process_inproc_sync_leases( struct process *process )
                                                    struct lockfree_lease, process_entry );
         struct lockfree_lifetime *lifetime = lease->lifetime;
 
-        if (!lf_sync_lease_is_released( lockfree_shared, lease->token ))
-            assert( lf_sync_mark_lease_released( lockfree_shared, lease->token ));
+        if (!lf_sync_lease_is_released( lockfree_shared, lease->token ) &&
+            !lf_sync_mark_lease_released( lockfree_shared, lease->token )) assert( 0 );
         destroy_lockfree_lease( lease );
         if (lifetime->retired) reap_lockfree_lifetime( lifetime );
     }
