@@ -288,6 +288,35 @@ static void test_competing_wait_all(void)
         "winning WaitAll did not consume every object\n" );
 }
 
+static void test_large_unordered_wait_all(void)
+{
+    struct lf_sync_mcas desc;
+    struct lf_sync_word words[LF_SYNC_MAX_WAIT_OBJECTS];
+    struct lf_sync_object objects[LF_SYNC_MAX_WAIT_OBJECTS];
+    const struct lf_sync_object *wait_objects[LF_SYNC_MAX_WAIT_OBJECTS];
+    struct lf_sync_arena arena = {words, ARRAY_SIZE(words), &desc, 1, 0, 0};
+    uint32_t i, index;
+
+    memset( &desc, 0, sizeof(desc) );
+    memset( words, 0, sizeof(words) );
+    for (i = 0; i < ARRAY_SIZE(objects); ++i)
+    {
+        lf_sync_init_event( &arena, &objects[i], ARRAY_SIZE(objects) - i - 1, 0, 1 );
+        wait_objects[i] = &objects[i];
+    }
+
+    ok( lf_sync_try_wait( &arena, wait_objects, ARRAY_SIZE(wait_objects), 1, 10, &index ) ==
+        LF_SYNC_SUCCESS, "large reverse-ordered WaitAll failed\n" );
+    for (i = 0; i < ARRAY_SIZE(words); ++i)
+        ok( !lf_sync_load( &arena, i ), "large WaitAll did not consume object %u\n", i );
+
+    for (i = 0; i < ARRAY_SIZE(objects); ++i)
+        lf_sync_set_event( &arena, &objects[i], NULL );
+    wait_objects[ARRAY_SIZE(wait_objects) - 1] = wait_objects[ARRAY_SIZE(wait_objects) - 2];
+    ok( lf_sync_try_wait( &arena, wait_objects, ARRAY_SIZE(wait_objects), 1, 10, &index ) ==
+        LF_SYNC_INVALID, "large WaitAll did not reject a duplicate object\n" );
+}
+
 static void test_nt_object_transitions(void)
 {
     struct lf_sync_object auto_event, manual_event, semaphore, mutex;
@@ -1302,6 +1331,7 @@ int main(void)
     ok( lf_sync_is_lock_free(), "64-bit atomics are not lock-free on this platform\n" );
     test_commit_and_abort();
     test_competing_wait_all();
+    test_large_unordered_wait_all();
     test_descriptor_reclamation_stress();
     test_dead_descriptor_reclamation();
     test_nt_object_transitions();

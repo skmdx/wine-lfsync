@@ -791,23 +791,45 @@ static enum lf_sync_result prepare_signal_value( const struct lf_sync_object *ob
     }
 }
 
-static void sort_entries( struct lf_sync_mcas_entry *entries, uint32_t *indices, uint32_t count )
+static void swap_entries( struct lf_sync_mcas_entry *left, struct lf_sync_mcas_entry *right )
+{
+    struct lf_sync_mcas_entry entry = *left;
+
+    *left = *right;
+    *right = entry;
+}
+
+static void sift_entries( struct lf_sync_mcas_entry *entries, uint32_t root, uint32_t count )
+{
+    for (;;)
+    {
+        uint32_t child = root * 2 + 1;
+
+        if (child >= count) return;
+        if (child + 1 < count && entries[child].word < entries[child + 1].word) ++child;
+        if (entries[root].word >= entries[child].word) return;
+        swap_entries( &entries[root], &entries[child] );
+        root = child;
+    }
+}
+
+static void sort_entries( struct lf_sync_mcas_entry *entries, uint32_t count )
 {
     uint32_t i;
 
-    for (i = 1; i < count; ++i)
+    if (count == 2)
     {
-        struct lf_sync_mcas_entry entry = entries[i];
-        uint32_t index = indices[i], j = i;
+        if (entries[0].word > entries[1].word) swap_entries( &entries[0], &entries[1] );
+        return;
+    }
 
-        while (j && entries[j - 1].word > entry.word)
-        {
-            entries[j] = entries[j - 1];
-            indices[j] = indices[j - 1];
-            --j;
-        }
-        entries[j] = entry;
-        indices[j] = index;
+    /* WaitAll accepts up to 64 objects. Keep the common two-entry path above
+     * minimal, while bounding large unordered waits to O(n log n). */
+    for (i = count / 2; i; --i) sift_entries( entries, i - 1, count );
+    for (i = count; i > 1; --i)
+    {
+        swap_entries( &entries[0], &entries[i - 1] );
+        sift_entries( entries, 0, i - 1 );
     }
 }
 
@@ -822,7 +844,6 @@ static enum lf_sync_result try_wait( const struct lf_sync_arena *arena,
                                      uint32_t status_word, uint64_t waiting )
 {
     struct lf_sync_mcas_entry entries[LF_SYNC_MCAS_MAX_WORDS];
-    uint32_t indices[LF_SYNC_MCAS_MAX_WORDS];
     enum lf_sync_result result, final_result;
     int mcas;
     uint32_t i;
@@ -844,9 +865,7 @@ static enum lf_sync_result try_wait( const struct lf_sync_arena *arena,
                 entries[1].expected = waiting;
                 entries[1].desired = lf_sync_wait_value( waiting >> LF_SYNC_WAIT_STATUS_BITS,
                     result == LF_SYNC_ABANDONED ? LF_SYNC_WAIT_ABANDONED : LF_SYNC_WAIT_COMPLETE, i );
-                indices[0] = i;
-                indices[1] = count;
-                sort_entries( entries, indices, 2 );
+                sort_entries( entries, 2 );
             }
             mcas = lf_sync_mcas_owned( arena, entries, status_word < arena->word_count ? 2 : 1, owner );
             if (mcas < 0) return LF_SYNC_RETRY;
@@ -862,7 +881,6 @@ static enum lf_sync_result try_wait( const struct lf_sync_arena *arena,
     final_result = LF_SYNC_SUCCESS;
     for (i = 0; i < count; ++i)
     {
-        indices[i] = i;
         result = prepare_acquire( arena, objects[i], owner, &entries[i] );
         if (result == LF_SYNC_ABANDONED) final_result = LF_SYNC_ABANDONED;
         else if (result != LF_SYNC_SUCCESS) return result;
@@ -874,10 +892,9 @@ static enum lf_sync_result try_wait( const struct lf_sync_arena *arena,
         entries[count].expected = waiting;
         entries[count].desired = lf_sync_wait_value( waiting >> LF_SYNC_WAIT_STATUS_BITS,
             final_result == LF_SYNC_ABANDONED ? LF_SYNC_WAIT_ABANDONED : LF_SYNC_WAIT_COMPLETE, 0 );
-        indices[count] = count;
         ++count;
     }
-    sort_entries( entries, indices, count );
+    sort_entries( entries, count );
     for (i = 1; i < count; ++i) if (entries[i - 1].word == entries[i].word) return LF_SYNC_INVALID;
     mcas = lf_sync_mcas_owned( arena, entries, count, owner );
     if (mcas < 0) return LF_SYNC_RETRY;
@@ -1039,7 +1056,7 @@ static void retry_wait_status( const struct lf_sync_dispatcher *dispatcher, uint
     const struct lf_sync_object *objects[LF_SYNC_MAX_WAIT_OBJECTS];
     struct lf_sync_mcas_entry alert_entries[2];
     struct lf_sync_wait *wait;
-    uint32_t indices[2] = {0, 1}, i;
+    uint32_t i;
     enum lf_sync_result result;
     int mcas;
 
@@ -1074,7 +1091,7 @@ static void retry_wait_status( const struct lf_sync_dispatcher *dispatcher, uint
             alert_entries[1].pad = 0;
             alert_entries[1].expected = lf_sync_wait_value( generation, expected_status, 0 );
             alert_entries[1].desired = lf_sync_wait_value( generation, LF_SYNC_WAIT_ALERTED, 0 );
-            sort_entries( alert_entries, indices, 2 );
+            sort_entries( alert_entries, 2 );
             do { mcas = lf_sync_mcas_owned( &dispatcher->arena, alert_entries, 2, wait->owner ); }
             while (mcas < 0 && load_u64( &wait->published ) == generation &&
                    wait->owner_state == arena_owner_state( &dispatcher->arena, wait->owner ) &&
@@ -1254,7 +1271,7 @@ enum lf_sync_result lf_sync_signal_and_wait_begin( const struct lf_sync_dispatch
     struct lf_sync_mcas_entry entries[3], wait_entry;
     struct lf_sync_wait *registered;
     enum lf_sync_result result, wait_result;
-    uint32_t indices[3] = {0, 1, 2}, count, object = wait_object;
+    uint32_t count, object = wait_object;
     uint64_t signal_value, prepared, pulse_generation;
     enum lf_sync_wait_status status;
     int mcas;
@@ -1310,7 +1327,7 @@ enum lf_sync_result lf_sync_signal_and_wait_begin( const struct lf_sync_dispatch
         entries[count].expected = prepared;
         entries[count].desired = lf_sync_wait_value( ticket->generation, status, 0 );
         ++count;
-        sort_entries( entries, indices, count );
+        sort_entries( entries, count );
         mcas = lf_sync_mcas_owned( &dispatcher->arena, entries, count, owner );
         if (mcas > 0) break;
         if (mcas < 0 && (registered->owner_state & LF_OWNER_DEAD ||
@@ -1441,7 +1458,7 @@ static int pulse_wait( const struct lf_sync_dispatcher *dispatcher, uint32_t slo
     struct lf_sync_wait *wait = &dispatcher->waits[slot];
     enum lf_sync_result result, final_result = LF_SYNC_SUCCESS;
     uint64_t pulse, unclaimed, claimed, waiting, value;
-    uint32_t indices[LF_SYNC_MCAS_MAX_WORDS], count = 0, pulse_index = ~0u, i;
+    uint32_t count = 0, pulse_index = ~0u, i;
     int auto_claimed = 0, mcas;
 
     if (!acquire_wait( wait, generation )) return 0;
@@ -1489,7 +1506,6 @@ static int pulse_wait( const struct lf_sync_dispatcher *dispatcher, uint32_t slo
             result = prepare_acquire( &dispatcher->arena, object, wait->owner, &entries[count] );
             if (result == LF_SYNC_ABANDONED) final_result = LF_SYNC_ABANDONED;
             else if (result != LF_SYNC_SUCCESS) goto failed;
-            indices[count] = count;
             ++count;
         }
         entries[count].word = dispatcher->status_word_base + slot;
@@ -1497,9 +1513,8 @@ static int pulse_wait( const struct lf_sync_dispatcher *dispatcher, uint32_t slo
         entries[count].expected = waiting;
         entries[count].desired = lf_sync_wait_value( generation,
             final_result == LF_SYNC_ABANDONED ? LF_SYNC_WAIT_ABANDONED : LF_SYNC_WAIT_COMPLETE, 0 );
-        indices[count] = count;
         ++count;
-        sort_entries( entries, indices, count );
+        sort_entries( entries, count );
         for (i = 1; i < count; ++i) if (entries[i - 1].word == entries[i].word) goto failed;
         do { mcas = lf_sync_mcas_owned( &dispatcher->arena, entries, count, wait->owner ); }
         while (mcas < 0 && load_u64( &wait->published ) == generation &&
