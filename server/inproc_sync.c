@@ -21,6 +21,7 @@
 #include "config.h"
 
 #include <assert.h>
+#include <errno.h>
 #include <limits.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -61,12 +62,23 @@ static void lockfree_wake( uint32_t *address )
     syscall( SYS_futex, address, FUTEX_WAKE, 1, NULL, NULL, 0 );
 }
 
-static int create_lockfree_device(void)
+static int create_lockfree_memfd(void)
 {
 #ifdef HAVE_MEMFD_CREATE
+    return memfd_create( "wine-lockfree-sync", MFD_CLOEXEC );
+#elif defined(SYS_memfd_create)
+    return syscall( SYS_memfd_create, "wine-lockfree-sync", MFD_CLOEXEC );
+#else
+    errno = ENOSYS;
+    return -1;
+#endif
+}
+
+static int create_lockfree_device(void)
+{
     int fd;
 
-    if ((fd = memfd_create( "wine-lockfree-sync", MFD_CLOEXEC )) < 0) return -1;
+    if ((fd = create_lockfree_memfd()) < 0) return -1;
     if (ftruncate( fd, sizeof(*lockfree_shared) ))
     {
         close( fd );
@@ -88,9 +100,6 @@ static int create_lockfree_device(void)
         return -1;
     }
     return fd;
-#else
-    return -1;
-#endif
 }
 
 int get_inproc_device_fd(void)
