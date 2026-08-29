@@ -423,8 +423,9 @@ static void test_nt_object_transitions(void)
         "setting event returned wrong previous state\n" );
     ok( lf_sync_release_semaphore( &f.arena, &semaphore, 2, &previous ) == LF_SYNC_SUCCESS && !previous,
         "semaphore release failed\n" );
-    ok( lf_sync_release_semaphore( &f.arena, &semaphore, 1, NULL ) == LF_SYNC_LIMIT_EXCEEDED,
-        "semaphore limit was not enforced\n" );
+    previous = 0xdeadbeef;
+    ok( lf_sync_release_semaphore( &f.arena, &semaphore, 1, &previous ) == LF_SYNC_LIMIT_EXCEEDED &&
+        previous == 0xdeadbeef, "semaphore limit was not enforced or modified previous count\n" );
 
     wait_objects[0] = &mutex;
     ok( lf_sync_try_wait( &f.arena, wait_objects, 1, 0, 10, &index ) == LF_SYNC_SUCCESS,

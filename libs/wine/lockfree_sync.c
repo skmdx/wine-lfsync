@@ -672,8 +672,11 @@ enum lf_sync_result lf_sync_release_semaphore( const struct lf_sync_arena *arena
     {
         value = lf_sync_load( arena, object_word( object ) );
         if (value > object->limit || count > object->limit - value) return LF_SYNC_LIMIT_EXCEEDED;
-        if (previous) *previous = value;
-        if (lf_sync_compare_exchange( arena, object_word( object ), value, value + count )) return LF_SYNC_SUCCESS;
+        if (lf_sync_compare_exchange( arena, object_word( object ), value, value + count ))
+        {
+            if (previous) *previous = value;
+            return LF_SYNC_SUCCESS;
+        }
     }
 }
 
