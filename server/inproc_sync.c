@@ -233,7 +233,7 @@ static void abandon_lockfree_mutexes( thread_id_t tid )
      * lease, waiter, or owner still references it. Such objects have left
      * inproc_mutexes, but remain uniquely represented by this list. */
     LIST_FOR_EACH_ENTRY( lifetime, &retired_lifetimes, struct lockfree_lifetime, entry )
-        if (lockfree_dispatcher.objects[lifetime->object].type == LF_SYNC_MUTEX)
+        if (lf_sync_get_object_type( &lockfree_dispatcher.objects[lifetime->object] ) == LF_SYNC_MUTEX)
             abandon_lockfree_mutex( lifetime->object, tid );
 }
 

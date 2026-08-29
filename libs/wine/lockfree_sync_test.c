@@ -563,7 +563,7 @@ static void test_object_reuse(void)
     object = first;
     ok( !lf_sync_wait_begin( &dispatcher, &object, 1, 0, 84, &ticket ),
         "dead owner published a wait\n" );
-    entry.word = dispatcher.objects[first].word;
+    entry.word = first; /* Shared object words are indexed one-to-one. */
     entry.pad = 0;
     entry.expected = 0;
     entry.desired = 1;
@@ -648,8 +648,10 @@ static void test_shared_cacheline_layout(void)
         "waiter bucket stride is not cache-line aligned\n" );
     ok( sizeof(struct lf_sync_wait) % LF_SYNC_CACHELINE_SIZE == 0,
         "wait slot stride is not cache-line aligned\n" );
-    ok( sizeof(struct lf_sync_object) == 24,
+    ok( sizeof(struct lf_sync_object) == 16,
         "shared object metadata is not compact\n" );
+    ok( LF_SYNC_SHARED_OBJECTS <= LF_SYNC_OBJECT_WORD_MASK + 1,
+        "shared object indices do not fit packed object metadata\n" );
     ok( offsetof(struct lf_sync_object, limit) == offsetof(struct lf_sync_object, next_free),
         "allocated and free object metadata do not share storage\n" );
     ok( offsetof(struct lf_sync_shared, words) % LF_SYNC_CACHELINE_SIZE == 0,
@@ -666,6 +668,32 @@ static void test_shared_cacheline_layout(void)
         "shared leases are not cache-line aligned\n" );
     ok( offsetof(struct lf_sync_shared, released_leases) % LF_SYNC_CACHELINE_SIZE == 0,
         "released lease bitmap is not cache-line aligned\n" );
+}
+
+static void test_packed_object_boundary(void)
+{
+    struct lf_sync_dispatcher dispatcher;
+    struct lf_sync_shared *shared;
+    uint32_t index, manual, signaled;
+
+    shared = calloc( 1, sizeof(*shared) );
+    ok( !!shared, "failed to allocate packed object fixture\n" );
+    if (!shared) return;
+    lf_sync_init_shared( shared );
+    ok( lf_sync_open_shared( &dispatcher, shared, NULL, NULL ),
+        "failed to open packed object fixture\n" );
+    shared->next_object = LF_SYNC_SHARED_OBJECTS - 1;
+    ok( lf_sync_alloc_object( &dispatcher, LF_SYNC_EVENT, 1, 0, LF_SYNC_EVENT_MANUAL, &index ) &&
+        index == LF_SYNC_SHARED_OBJECTS - 1,
+        "failed to allocate the highest packed object index\n" );
+    ok( lf_sync_query_event( &dispatcher.arena, &dispatcher.objects[index], &manual, &signaled ) ==
+        LF_SYNC_SUCCESS && manual && signaled,
+        "highest packed object index lost type, flags, or word bits\n" );
+    ok( lf_sync_reset_event( &dispatcher.arena, &dispatcher.objects[index], NULL ) == LF_SYNC_SUCCESS,
+        "highest packed object index addressed the wrong state word\n" );
+    ok( !lf_sync_load( &dispatcher.arena, index ),
+        "highest packed object index did not update its matching state word\n" );
+    free( shared );
 }
 
 static void test_lease_state_machine(void)
@@ -840,7 +868,7 @@ static void test_prepared_regular_wait(void)
         "ready regular wait failed\n" );
     ok( (lf_sync_wait_poll( &dispatcher, &first ) & 0xff) == LF_SYNC_WAIT_COMPLETE,
         "ready regular wait did not complete from PREPARED\n" );
-    ok( !shared.waiter_buckets[0].summary && !shared.waiter_buckets[0].waiters[0],
+    ok( !(uint32_t)shared.waiter_buckets[0].word_state && !shared.waiter_buckets[0].waiters[0],
         "ready regular wait was unnecessarily registered\n" );
     lf_sync_wait_end( &dispatcher, &first );
 
@@ -968,8 +996,9 @@ static void test_waiter_summary(void)
     for (i = 0; i < ARRAY_SIZE(tickets); ++i)
         ok( lf_sync_wait_begin( &dispatcher, &object, 1, 0, 200 + i, &tickets[i] ),
             "summary waiter %u registration failed\n", i );
-    ok( shared.waiter_bucket.summary == 3,
-        "waiter summary %#x did not cover both populated words\n", shared.waiter_bucket.summary );
+    ok( (uint32_t)shared.waiter_bucket.word_state == 3,
+        "waiter summary %#x did not cover both populated words\n",
+        (uint32_t)shared.waiter_bucket.word_state );
 
     lf_sync_set_event( &dispatcher.arena, &shared.object, NULL );
     lf_sync_wake_object( &dispatcher, 0 );
@@ -979,7 +1008,9 @@ static void test_waiter_summary(void)
             "summary waiter %u was not completed\n", i );
         lf_sync_wait_end( &dispatcher, &tickets[i] );
     }
-    ok( !shared.waiter_bucket.summary, "waiter summary was not cleared\n" );
+    ok( !(uint32_t)shared.waiter_bucket.word_state, "waiter summary was not cleared\n" );
+    ok( shared.waiter_bucket.word_state >> 32 == 3,
+        "waiter touched bitmap did not retain both populated words\n" );
 }
 
 struct waiter_summary_race
@@ -1038,7 +1069,7 @@ static void test_waiter_summary_race(void)
 
         ok( race.registered, "summary-race registration failed at iteration %u\n", i );
         if (!race.registered) continue;
-        ok( shared.waiter_buckets[0].summary && shared.waiter_buckets[0].waiters[0],
+        ok( (uint32_t)shared.waiter_buckets[0].word_state && shared.waiter_buckets[0].waiters[0],
             "summary-race lost the registered waiter at iteration %u\n", i );
         lf_sync_set_event( &dispatcher.arena, &shared.objects[0], NULL );
         lf_sync_wake_object( &dispatcher, 0 );
@@ -1377,6 +1408,7 @@ int main(void)
     test_object_reuse();
     test_shared_initialization_does_not_touch_payload();
     test_shared_cacheline_layout();
+    test_packed_object_boundary();
     test_lease_state_machine();
     test_completion_timeout_race();
 #ifdef __linux__

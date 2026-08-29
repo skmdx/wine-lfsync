@@ -29,6 +29,9 @@
 #define LF_OWNER_GEN_SHIFT 1
 #define LF_OWNER_GEN_MASK ((UINT64_C(1) << 62) - 1)
 
+#define LF_WAITER_SUMMARY_MASK UINT32_MAX
+#define LF_WAITER_TOUCHED_SHIFT 32
+
 static uint64_t load_u64( const uint64_t *ptr )
 {
     return __atomic_load_n( ptr, __ATOMIC_ACQUIRE );
@@ -37,6 +40,46 @@ static uint64_t load_u64( const uint64_t *ptr )
 static int cas_u64( uint64_t *ptr, uint64_t *expected, uint64_t desired )
 {
     return __atomic_compare_exchange_n( ptr, expected, desired, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE );
+}
+
+static uint32_t object_word( const struct lf_sync_object *object )
+{
+    return object->state & LF_SYNC_OBJECT_WORD_MASK;
+}
+
+static enum lf_sync_object_type object_type( const struct lf_sync_object *object )
+{
+    return (object->state >> LF_SYNC_OBJECT_TYPE_SHIFT) & LF_SYNC_OBJECT_TYPE_MASK;
+}
+
+enum lf_sync_object_type lf_sync_get_object_type( const struct lf_sync_object *object )
+{
+    return object_type( object );
+}
+
+static uint32_t object_flags( const struct lf_sync_object *object )
+{
+    return object->state >> LF_SYNC_OBJECT_FLAGS_SHIFT;
+}
+
+static uint32_t owner_slot_start( uint32_t owner, uint32_t count )
+{
+    uint32_t index;
+
+    if (!owner) return 0;
+    index = owner >> 2;
+    if (!(count & (count - 1))) return index & (count - 1);
+    return index % count;
+}
+
+static uint32_t waiter_summary( const struct lf_sync_waiter_bucket *bucket )
+{
+    return load_u64( &bucket->word_state ) & LF_WAITER_SUMMARY_MASK;
+}
+
+static uint32_t waiter_touched( const struct lf_sync_waiter_bucket *bucket )
+{
+    return load_u64( &bucket->word_state ) >> LF_WAITER_TOUCHED_SHIFT;
 }
 
 static int arena_owner_word( const struct lf_sync_arena *arena, uint32_t owner, uint32_t *word )
@@ -326,7 +369,7 @@ static int alloc_desc( const struct lf_sync_arena *arena, uint32_t owner,
     count = arena->desc_count;
     if (count > LF_DESC_INDEX_MASK + 1) count = LF_DESC_INDEX_MASK + 1;
     if (!count) return 0;
-    start = owner ? (owner >> 2) % count : 0;
+    start = owner_slot_start( owner, count );
     for (n = 0; n < count; ++n)
     {
         struct lf_sync_mcas *desc;
@@ -552,11 +595,11 @@ static void init_object( const struct lf_sync_arena *arena, struct lf_sync_objec
                          uint32_t word, enum lf_sync_object_type type, uint32_t limit,
                          uint32_t flags, uint64_t value )
 {
-    assert( word < arena->word_count );
-    object->word = word;
-    object->type = type;
+    assert( word < arena->word_count && word <= LF_SYNC_OBJECT_WORD_MASK );
+    assert( type <= LF_SYNC_OBJECT_TYPE_MASK && flags <= LF_SYNC_OBJECT_FLAGS_MASK );
+    object->state = word | ((uint32_t)type << LF_SYNC_OBJECT_TYPE_SHIFT) |
+                    (flags << LF_SYNC_OBJECT_FLAGS_SHIFT);
     object->limit = limit;
-    object->flags = flags;
     __atomic_store_n( &object->pulse, 0, __ATOMIC_RELEASE );
     __atomic_store_n( &arena->words[word].value, value, __ATOMIC_RELEASE );
 }
@@ -589,12 +632,12 @@ static enum lf_sync_result update_event( const struct lf_sync_arena *arena,
 {
     uint64_t value;
 
-    if (object->type != LF_SYNC_EVENT) return LF_SYNC_INVALID;
+    if (object_type( object ) != LF_SYNC_EVENT) return LF_SYNC_INVALID;
     for (;;)
     {
-        value = lf_sync_load( arena, object->word );
+        value = lf_sync_load( arena, object_word( object ) );
         if (previous) *previous = !!value;
-        if (value == !!signaled || lf_sync_compare_exchange( arena, object->word, value, !!signaled ))
+        if (value == !!signaled || lf_sync_compare_exchange( arena, object_word( object ), value, !!signaled ))
             return LF_SYNC_SUCCESS;
     }
 }
@@ -617,13 +660,13 @@ enum lf_sync_result lf_sync_release_semaphore( const struct lf_sync_arena *arena
 {
     uint64_t value;
 
-    if (object->type != LF_SYNC_SEMAPHORE || !count) return LF_SYNC_INVALID;
+    if (object_type( object ) != LF_SYNC_SEMAPHORE || !count) return LF_SYNC_INVALID;
     for (;;)
     {
-        value = lf_sync_load( arena, object->word );
+        value = lf_sync_load( arena, object_word( object ) );
         if (value > object->limit || count > object->limit - value) return LF_SYNC_LIMIT_EXCEEDED;
         if (previous) *previous = value;
-        if (lf_sync_compare_exchange( arena, object->word, value, value + count )) return LF_SYNC_SUCCESS;
+        if (lf_sync_compare_exchange( arena, object_word( object ), value, value + count )) return LF_SYNC_SUCCESS;
     }
 }
 
@@ -634,16 +677,16 @@ enum lf_sync_result lf_sync_release_mutex( const struct lf_sync_arena *arena,
     uint64_t value, desired;
     uint32_t count;
 
-    if (object->type != LF_SYNC_MUTEX || !owner || owner == LF_MUTEX_ABANDONED_OWNER)
+    if (object_type( object ) != LF_SYNC_MUTEX || !owner || owner == LF_MUTEX_ABANDONED_OWNER)
         return LF_SYNC_INVALID;
     for (;;)
     {
-        value = lf_sync_load( arena, object->word );
+        value = lf_sync_load( arena, object_word( object ) );
         count = mutex_count( value );
         if (!count || mutex_owner( value ) != owner) return LF_SYNC_NOT_OWNER;
         if (previous) *previous = count;
         desired = count == 1 ? 0 : mutex_value( owner, count - 1, 0 );
-        if (lf_sync_compare_exchange( arena, object->word, value, desired )) return LF_SYNC_SUCCESS;
+        if (lf_sync_compare_exchange( arena, object_word( object ), value, desired )) return LF_SYNC_SUCCESS;
     }
 }
 
@@ -652,13 +695,13 @@ enum lf_sync_result lf_sync_abandon_mutex( const struct lf_sync_arena *arena,
 {
     uint64_t value;
 
-    if (object->type != LF_SYNC_MUTEX || !owner || owner == LF_MUTEX_ABANDONED_OWNER)
+    if (object_type( object ) != LF_SYNC_MUTEX || !owner || owner == LF_MUTEX_ABANDONED_OWNER)
         return LF_SYNC_INVALID;
     for (;;)
     {
-        value = lf_sync_load( arena, object->word );
+        value = lf_sync_load( arena, object_word( object ) );
         if (!mutex_count( value ) || mutex_owner( value ) != owner) return LF_SYNC_NOT_OWNER;
-        if (lf_sync_compare_exchange( arena, object->word, value, mutex_value( 0, 0, 1 ) ))
+        if (lf_sync_compare_exchange( arena, object_word( object ), value, mutex_value( 0, 0, 1 ) ))
             return LF_SYNC_SUCCESS;
     }
 }
@@ -669,9 +712,9 @@ enum lf_sync_result lf_sync_query_event( const struct lf_sync_arena *arena,
 {
     uint64_t value;
 
-    if (object->type != LF_SYNC_EVENT) return LF_SYNC_INVALID;
-    value = lf_sync_load( arena, object->word );
-    if (manual) *manual = !!(object->flags & LF_SYNC_EVENT_MANUAL);
+    if (object_type( object ) != LF_SYNC_EVENT) return LF_SYNC_INVALID;
+    value = lf_sync_load( arena, object_word( object ) );
+    if (manual) *manual = !!(object_flags( object ) & LF_SYNC_EVENT_MANUAL);
     if (signaled) *signaled = !!value;
     return LF_SYNC_SUCCESS;
 }
@@ -680,8 +723,8 @@ enum lf_sync_result lf_sync_query_semaphore( const struct lf_sync_arena *arena,
                                              const struct lf_sync_object *object,
                                              uint32_t *count, uint32_t *maximum )
 {
-    if (object->type != LF_SYNC_SEMAPHORE) return LF_SYNC_INVALID;
-    if (count) *count = lf_sync_load( arena, object->word );
+    if (object_type( object ) != LF_SYNC_SEMAPHORE) return LF_SYNC_INVALID;
+    if (count) *count = lf_sync_load( arena, object_word( object ) );
     if (maximum) *maximum = object->limit;
     return LF_SYNC_SUCCESS;
 }
@@ -692,8 +735,8 @@ enum lf_sync_result lf_sync_query_mutex( const struct lf_sync_arena *arena,
 {
     uint64_t value;
 
-    if (object->type != LF_SYNC_MUTEX) return LF_SYNC_INVALID;
-    value = lf_sync_load( arena, object->word );
+    if (object_type( object ) != LF_SYNC_MUTEX) return LF_SYNC_INVALID;
+    value = lf_sync_load( arena, object_word( object ) );
     if (count) *count = mutex_count( value );
     if (owned) *owned = mutex_owner( value ) == owner && mutex_count( value );
     if (abandoned) *abandoned = mutex_abandoned( value );
@@ -706,15 +749,15 @@ static enum lf_sync_result prepare_acquire_value( const struct lf_sync_object *o
 {
     uint32_t count;
 
-    entry->word = object->word;
+    entry->word = object_word( object );
     entry->pad = 0;
     entry->expected = value;
 
-    switch (object->type)
+    switch (object_type( object ))
     {
     case LF_SYNC_EVENT:
         if (!value) return LF_SYNC_UNSATISFIED;
-        entry->desired = object->flags & LF_SYNC_EVENT_MANUAL ? value : 0;
+        entry->desired = object_flags( object ) & LF_SYNC_EVENT_MANUAL ? value : 0;
         return LF_SYNC_SUCCESS;
     case LF_SYNC_SEMAPHORE:
         if (!value) return LF_SYNC_UNSATISFIED;
@@ -735,7 +778,7 @@ static enum lf_sync_result prepare_acquire( const struct lf_sync_arena *arena,
                                             const struct lf_sync_object *object, uint32_t owner,
                                             struct lf_sync_mcas_entry *entry )
 {
-    return prepare_acquire_value( object, owner, lf_sync_load( arena, object->word ), entry );
+    return prepare_acquire_value( object, owner, lf_sync_load( arena, object_word( object ) ), entry );
 }
 
 static enum lf_sync_result prepare_signal_value( const struct lf_sync_object *object,
@@ -744,11 +787,11 @@ static enum lf_sync_result prepare_signal_value( const struct lf_sync_object *ob
 {
     uint32_t count;
 
-    entry->word = object->word;
+    entry->word = object_word( object );
     entry->pad = 0;
     entry->expected = value;
 
-    switch (object->type)
+    switch (object_type( object ))
     {
     case LF_SYNC_EVENT:
         entry->desired = 1;
@@ -949,28 +992,35 @@ static void register_object_wait( const struct lf_sync_dispatcher *dispatcher,
 {
     struct lf_sync_waiter_bucket *bucket = get_waiter_bucket( dispatcher, object );
     uint32_t word = slot / 64;
+    uint64_t summary_bit = UINT64_C(1) << word;
+    uint64_t touched_bit = summary_bit << LF_WAITER_TOUCHED_SHIFT;
 
     if (!bucket) return;
+    /* Publish the monotonic touched bit first. If this thread stops before
+     * registering the waiter, object reclamation merely scans an empty word. */
+    if (!(load_u64( &bucket->word_state ) & touched_bit))
+        __atomic_fetch_or( &bucket->word_state, touched_bit, __ATOMIC_RELEASE );
     __atomic_fetch_or( &bucket->waiters[word], UINT64_C(1) << (slot % 64), __ATOMIC_RELEASE );
-    __atomic_fetch_or( &bucket->summary, 1u << word, __ATOMIC_RELEASE );
+    __atomic_fetch_or( &bucket->word_state, summary_bit, __ATOMIC_RELEASE );
 }
 
 static void unregister_object_wait( const struct lf_sync_dispatcher *dispatcher,
                                     uint32_t object, uint32_t slot )
 {
     struct lf_sync_waiter_bucket *bucket = get_waiter_bucket( dispatcher, object );
-    uint32_t word = slot / 64, summary_bit = 1u << word;
+    uint32_t word = slot / 64;
+    uint64_t summary_bit = UINT64_C(1) << word;
     uint64_t bit = UINT64_C(1) << (slot % 64), previous;
 
     if (!bucket) return;
     previous = __atomic_fetch_and( &bucket->waiters[word], ~bit, __ATOMIC_RELEASE );
     if (!(previous & ~bit))
     {
-        __atomic_fetch_and( &bucket->summary, ~summary_bit, __ATOMIC_ACQ_REL );
+        __atomic_fetch_and( &bucket->word_state, ~summary_bit, __ATOMIC_ACQ_REL );
         /* Serialize the recheck with the registration RMW. A plain load could
          * legally observe an older value from a concurrent registration. */
         if (__atomic_fetch_or( &bucket->waiters[word], 0, __ATOMIC_ACQUIRE ))
-            __atomic_fetch_or( &bucket->summary, summary_bit, __ATOMIC_RELEASE );
+            __atomic_fetch_or( &bucket->word_state, summary_bit, __ATOMIC_RELEASE );
     }
 }
 
@@ -1002,7 +1052,7 @@ static int alloc_wait( const struct lf_sync_dispatcher *dispatcher, uint32_t own
     uint32_t count = dispatcher->wait_count, i, n, start;
 
     if (!count) return 0;
-    start = owner ? (owner >> 2) % count : 0;
+    start = owner_slot_start( owner, count );
     for (n = 0; n < count; ++n)
     {
         struct lf_sync_wait *wait;
@@ -1276,7 +1326,7 @@ enum lf_sync_result lf_sync_signal_and_wait_begin( const struct lf_sync_dispatch
 
     for (;;)
     {
-        signal_value = lf_sync_load( &dispatcher->arena, signal->word );
+        signal_value = lf_sync_load( &dispatcher->arena, object_word( signal ) );
         result = prepare_signal_value( signal, owner, signal_value, &entries[0] );
         if (result != LF_SYNC_SUCCESS)
         {
@@ -1414,7 +1464,7 @@ void lf_sync_wake_object( const struct lf_sync_dispatcher *dispatcher, uint32_t 
 
     if (object >= dispatcher->object_count) return;
     if (!(bucket = get_waiter_bucket( dispatcher, object ))) return;
-    summary = __atomic_load_n( &bucket->summary, __ATOMIC_ACQUIRE );
+    summary = waiter_summary( bucket );
     while (summary)
     {
         i = __builtin_ctz( summary );
@@ -1470,7 +1520,7 @@ static int pulse_wait( const struct lf_sync_dispatcher *dispatcher, uint32_t slo
     if (wait->object_generations[pulse_index] >= pulse_generation) goto failed;
 
     event = &dispatcher->objects[pulsed_object];
-    if (!(event->flags & LF_SYNC_EVENT_MANUAL))
+    if (!(object_flags( event ) & LF_SYNC_EVENT_MANUAL))
     {
         unclaimed = (uint64_t)pulse_generation << 1;
         claimed = unclaimed | 1;
@@ -1538,7 +1588,7 @@ enum lf_sync_result lf_sync_pulse_event( const struct lf_sync_dispatcher *dispat
 
     if (object >= dispatcher->object_count) return LF_SYNC_INVALID;
     event = &dispatcher->objects[object];
-    if (event->type != LF_SYNC_EVENT) return LF_SYNC_INVALID;
+    if (object_type( event ) != LF_SYNC_EVENT) return LF_SYNC_INVALID;
     if (!(bucket = get_waiter_bucket( dispatcher, object ))) return LF_SYNC_INVALID;
 
     /* Clear persistent state before advancing the pulse generation. A waiter
@@ -1554,7 +1604,7 @@ enum lf_sync_result lf_sync_pulse_event( const struct lf_sync_dispatcher *dispat
         if (cas_u64( &event->pulse, &pulse, desired )) break;
     }
 
-    summary = __atomic_load_n( &bucket->summary, __ATOMIC_ACQUIRE );
+    summary = waiter_summary( bucket );
     while (summary)
     {
         uint64_t bits;
@@ -1569,7 +1619,7 @@ enum lf_sync_result lf_sync_pulse_event( const struct lf_sync_dispatcher *dispat
                                        load_u64( &dispatcher->waits[slot].published ) : 0;
 
             if (wait_generation && pulse_wait( dispatcher, slot, wait_generation, object, generation ) &&
-                !(event->flags & LF_SYNC_EVENT_MANUAL))
+                !(object_flags( event ) & LF_SYNC_EVENT_MANUAL))
                 return LF_SYNC_SUCCESS;
             bits &= bits - 1;
         }
@@ -1803,18 +1853,20 @@ int lf_sync_free_object( struct lf_sync_dispatcher *dispatcher, uint32_t index )
 {
     struct lf_sync_waiter_bucket *bucket;
     struct lf_sync_object *object;
-    uint32_t i;
+    uint32_t i, touched;
 
     if (!dispatcher->shared || index >= dispatcher->object_count) return 0;
     object = &dispatcher->objects[index];
     if (!(bucket = get_waiter_bucket( dispatcher, index ))) return 0;
-    /* Do not use the summary here. unregister_object_wait() may temporarily
-     * clear a summary bit while it rechecks a concurrent registration. The
-     * underlying bitmap has no such false-empty window for a live slot. */
-    for (i = 0; i < LF_SYNC_SHARED_WAITER_WORDS; ++i)
+    /* The live summary has a transient false-empty window while unregistering.
+     * The upper half of word_state is a monotonic record of words that have
+     * ever contained waiters, so it safely skips untouched bitmap words. */
+    touched = waiter_touched( bucket );
+    while (touched)
     {
         uint64_t bits;
 
+        i = __builtin_ctz( touched );
         bits = load_u64( &bucket->waiters[i] );
         while (bits)
         {
@@ -1844,8 +1896,10 @@ int lf_sync_free_object( struct lf_sync_dispatcher *dispatcher, uint32_t index )
             }
             bits &= bits - 1;
         }
+        touched &= touched - 1;
     }
-    if (object->type == LF_SYNC_MUTEX && mutex_count( lf_sync_load( &dispatcher->arena, object->word ) ))
+    if (object_type( object ) == LF_SYNC_MUTEX &&
+        mutex_count( lf_sync_load( &dispatcher->arena, object_word( object ) ) ))
         return 0;
 
     object->next_free = dispatcher->shared->free_object;

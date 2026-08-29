@@ -16,7 +16,7 @@
 
 #define LF_SYNC_MCAS_MAX_WORDS 66
 #define LF_SYNC_SHARED_MAGIC UINT64_C(0x57494e454c465359) /* WINELFSY */
-#define LF_SYNC_SHARED_VERSION 10
+#define LF_SYNC_SHARED_VERSION 11
 #define LF_SYNC_CACHELINE_SIZE 64
 #define LF_SYNC_SHARED_OBJECTS 262144
 #define LF_SYNC_SHARED_WAITS 2048
@@ -32,6 +32,12 @@
 #define LF_SYNC_SHARED_OWNERS LF_SYNC_SHARED_OBJECTS
 #define LF_SYNC_SHARED_WORDS (LF_SYNC_SHARED_OBJECTS + LF_SYNC_SHARED_WAITS + LF_SYNC_SHARED_OWNERS)
 #define LF_SYNC_SHARED_WAITER_WORDS (LF_SYNC_SHARED_WAITS / 64)
+#define LF_SYNC_OBJECT_WORD_BITS 20
+#define LF_SYNC_OBJECT_WORD_MASK ((1u << LF_SYNC_OBJECT_WORD_BITS) - 1)
+#define LF_SYNC_OBJECT_TYPE_SHIFT LF_SYNC_OBJECT_WORD_BITS
+#define LF_SYNC_OBJECT_TYPE_MASK 0x3u
+#define LF_SYNC_OBJECT_FLAGS_SHIFT (LF_SYNC_OBJECT_TYPE_SHIFT + 2)
+#define LF_SYNC_OBJECT_FLAGS_MASK ((1u << (32 - LF_SYNC_OBJECT_FLAGS_SHIFT)) - 1)
 
 enum lf_sync_mcas_status
 {
@@ -90,22 +96,21 @@ enum lf_sync_object_type
 
 struct lf_sync_object
 {
-    uint32_t word;
-    uint32_t type;
+    /* word, type, and flags occupy 20, 2, and 10 bits respectively. */
+    uint32_t state;
     union
     {
         /* Allocated objects use limit; free objects use next_free. */
         uint32_t limit;
         uint32_t next_free;
     };
-    uint32_t flags;
     uint64_t pulse;
 };
 
 struct lf_sync_waiter_bucket
 {
-    uint32_t summary;
-    uint32_t pad;
+    /* Low 32 bits summarize live words; high 32 bits record touched words. */
+    uint64_t word_state;
     uint64_t waiters[LF_SYNC_SHARED_WAITER_WORDS];
     uint8_t cacheline_pad[56];
 };
@@ -236,6 +241,7 @@ void lf_sync_init_semaphore( const struct lf_sync_arena *arena, struct lf_sync_o
                              uint32_t word, uint32_t initial, uint32_t maximum );
 void lf_sync_init_mutex( const struct lf_sync_arena *arena, struct lf_sync_object *object,
                          uint32_t word, uint32_t owner, uint32_t count );
+enum lf_sync_object_type lf_sync_get_object_type( const struct lf_sync_object *object );
 
 enum lf_sync_result lf_sync_set_event( const struct lf_sync_arena *arena,
                                        const struct lf_sync_object *object, uint32_t *previous );
