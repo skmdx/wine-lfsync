@@ -619,6 +619,23 @@ static void init_visuals( Display *display, int screen )
            default_visual.visualid, default_visual.class, argb_visual.visualid );
 }
 
+static void detect_window_manager( Display *display )
+{
+    XWindowAttributes attr;
+
+    if (!managed_mode) return;
+    if (!XGetWindowAttributes( display, DefaultRootWindow( display ), &attr )) return;
+
+    /* ICCCM window managers must select SubstructureRedirectMask on the root
+     * window. Without one, managed windows would wait forever for WM_STATE
+     * transitions which no client can produce. */
+    if (!(attr.all_event_masks & SubstructureRedirectMask))
+    {
+        TRACE( "no window manager detected, disabling managed mode\n" );
+        managed_mode = FALSE;
+    }
+}
+
 /***********************************************************************
  *           X11DRV process initialisation routine
  */
@@ -649,6 +666,7 @@ NTSTATUS __wine_unix_lib_init(void)
     root_window = DefaultRootWindow( display );
     gdi_display = display;
     old_error_handler = XSetErrorHandler( error_handler );
+    detect_window_manager( display );
 
     pthread_key_create( &x11drv_thread_data_key, NULL );
     init_pixmap_formats( display );
