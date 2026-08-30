@@ -427,8 +427,62 @@ void client_surface_release( struct client_surface *surface )
     pthread_mutex_unlock( &surfaces_lock );
 }
 
+static BOOL client_surface_is_above( HWND hwnd, HWND other )
+{
+    HWND hwnd_ancestors[64], other_ancestors[64], sibling;
+    int hwnd_count = 0, other_count = 0, i, j;
+
+    if (hwnd == other) return FALSE;
+    while (hwnd && hwnd_count < ARRAY_SIZE(hwnd_ancestors))
+    {
+        hwnd_ancestors[hwnd_count++] = hwnd;
+        hwnd = NtUserGetAncestor( hwnd, GA_PARENT );
+    }
+    while (other && other_count < ARRAY_SIZE(other_ancestors))
+    {
+        other_ancestors[other_count++] = other;
+        other = NtUserGetAncestor( other, GA_PARENT );
+    }
+
+    i = hwnd_count - 1;
+    j = other_count - 1;
+    while (i >= 0 && j >= 0 && hwnd_ancestors[i] == other_ancestors[j]) i--, j--;
+    if (i < 0) return FALSE; /* hwnd is an ancestor of other */
+    if (j < 0) return TRUE;  /* hwnd is a descendant of other */
+
+    for (sibling = NtUserGetWindowRelative( other_ancestors[j], GW_HWNDPREV ); sibling;
+         sibling = NtUserGetWindowRelative( sibling, GW_HWNDPREV ))
+        if (sibling == hwnd_ancestors[i]) return TRUE;
+    return FALSE;
+}
+
+static HRGN get_client_surface_region_locked( struct client_surface *surface )
+{
+    struct client_surface *other;
+    HRGN region = 0, other_region;
+
+    LIST_FOR_EACH_ENTRY( other, &client_surfaces, struct client_surface, entry )
+    {
+        if (other == surface || other->toplevel != surface->toplevel) continue;
+        if (!NtUserIsWindowVisible( other->hwnd ) || !client_surface_is_above( other->hwnd, surface->hwnd )) continue;
+        if (IsRectEmpty( &other->monitor_rect )) continue;
+
+        if (!region && !(region = NtGdiCreateRectRgn( surface->monitor_rect.left, surface->monitor_rect.top,
+                                                       surface->monitor_rect.right, surface->monitor_rect.bottom )))
+            break;
+        if ((other_region = NtGdiCreateRectRgn( other->monitor_rect.left, other->monitor_rect.top,
+                                                other->monitor_rect.right, other->monitor_rect.bottom )))
+        {
+            NtGdiCombineRgn( region, region, other_region, RGN_DIFF );
+            NtGdiDeleteObjectApp( other_region );
+        }
+    }
+    return region;
+}
+
 void client_surface_present( struct client_surface *surface )
 {
+    HRGN surface_region = 0;
     HDC hdc = 0;
     HWND hwnd;
 
@@ -436,8 +490,14 @@ void client_surface_present( struct client_surface *surface )
     if ((hwnd = surface->hwnd))
     {
         client_surface_update_locked( surface );
-        if (surface->offscreen) hdc = NtUserGetDCEx( hwnd, 0, DCX_CACHE | DCX_USESTYLE );
-        surface->funcs->present( surface, hdc );
+        /* Surface presentation may run in a different process from the thread
+         * changing the window hierarchy.  Refresh the cached DCE so visibility
+         * and sibling clipping cannot lag behind a show, hide, or z-order change. */
+        if (surface->offscreen)
+            hdc = NtUserGetDCEx( hwnd, 0, DCX_CACHE | DCX_USESTYLE | WINE_DCX_FORCEUPDATE );
+        if (hdc) surface_region = get_client_surface_region_locked( surface );
+        surface->funcs->present( surface, hdc, surface_region );
+        if (surface_region) NtGdiDeleteObjectApp( surface_region );
         if (hdc) NtUserReleaseDC( hwnd, hdc );
     }
     pthread_mutex_unlock( &surfaces_lock );

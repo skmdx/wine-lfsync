@@ -34,6 +34,9 @@
 # endif
 #endif
 
+/* Wine-internal NtUserGetDCEx flag. */
+#define WINE_DCX_FORCEUPDATE 0x80000000
+
 /* avoid including shellscalingapi.h */
 typedef enum MONITOR_DPI_TYPE
 {

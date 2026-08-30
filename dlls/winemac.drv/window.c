@@ -1114,7 +1114,7 @@ static void macdrv_client_surface_update(struct client_surface *client)
     release_win_data(data);
 }
 
-static void macdrv_client_surface_present(struct client_surface *client, HDC hdc)
+static void macdrv_client_surface_present(struct client_surface *client, HDC hdc, HRGN surface_region)
 {
     struct macdrv_client_surface *surface = impl_from_client_surface(client);
     struct macdrv_win_data *data;

@@ -378,7 +378,7 @@ static void x11drv_client_surface_update( struct client_surface *client )
     client_surface_update_offscreen( hwnd, surface );
 }
 
-static void X11DRV_client_surface_present( struct client_surface *client, HDC hdc )
+static void X11DRV_client_surface_present( struct client_surface *client, HDC hdc, HRGN surface_region )
 {
     struct x11drv_client_surface *surface = impl_from_client_surface( client );
     HWND hwnd = client->hwnd, toplevel = client->toplevel;
@@ -392,6 +392,13 @@ static void X11DRV_client_surface_present( struct client_surface *client, HDC hd
     /* if window is exclusive fullscreen, ignore the window region clipping rules */
     if (hwnd == toplevel && NtUserGetPresentRect( toplevel, &rect, -1 /* raw dpi */ )) region = 0;
     else region = get_dc_monitor_region( hwnd, hdc );
+
+    if (surface_region)
+    {
+        if (region) NtGdiCombineRgn( region, region, surface_region, RGN_AND );
+        else if ((region = NtGdiCreateRectRgn( 0, 0, 0, 0 )))
+            NtGdiCombineRgn( region, surface_region, 0, RGN_COPY );
+    }
 
     rect_src = surface->client.raw ? surface->client.monitor_rect : surface->client.virtual_rect;
     TRACE( "hwnd %p %s to toplevel %p %s region %p\n", hwnd, wine_dbgstr_rect(&rect_src),

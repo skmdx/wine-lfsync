@@ -1260,6 +1260,7 @@ HDC WINAPI NtUserGetDCEx( HWND hwnd, HRGN clip_rgn, DWORD flags )
 {
     const DWORD clip_flags = DCX_PARENTCLIP | DCX_CLIPSIBLINGS | DCX_CLIPCHILDREN | DCX_WINDOW;
     const DWORD user_flags = clip_flags | DCX_NORESETATTRS; /* flags that can be set by user */
+    BOOL force_update = flags & WINE_DCX_FORCEUPDATE;
     BOOL update_vis_rgn = TRUE;
     struct dce *dce;
     HWND parent;
@@ -1269,6 +1270,8 @@ HDC WINAPI NtUserGetDCEx( HWND hwnd, HRGN clip_rgn, DWORD flags )
     else hwnd = get_full_window_handle( hwnd );
 
     TRACE( "hwnd %p, clip_rgn %p, flags %08x\n", hwnd, clip_rgn, flags );
+
+    flags &= ~WINE_DCX_FORCEUPDATE;
 
     if (!is_window(hwnd)) return 0;
 
@@ -1390,7 +1393,8 @@ HDC WINAPI NtUserGetDCEx( HWND hwnd, HRGN clip_rgn, DWORD flags )
     /* cross-process invalidation is not supported yet, so always update the vis rgn */
     if (!is_current_process_window( hwnd )) update_vis_rgn = TRUE;
 
-    if (set_dce_flags( dce->hdc, DCHF_VALIDATEVISRGN )) update_vis_rgn = TRUE;  /* DC was dirty */
+    if (set_dce_flags( dce->hdc, DCHF_VALIDATEVISRGN ) || force_update)
+        update_vis_rgn = TRUE;  /* DC was dirty or the caller needs a fresh visible region */
 
     if (update_vis_rgn) update_visible_region( dce );
 

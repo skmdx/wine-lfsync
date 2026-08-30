@@ -255,7 +255,7 @@ struct client_surface_funcs
     /* update the surface to match its window state */
     void (*update)( struct client_surface *surface );
     /* present the client surface if necessary, hdc != NULL when offscreen, called from render thread */
-    void (*present)( struct client_surface *surface, HDC hdc );
+    void (*present)( struct client_surface *surface, HDC hdc, HRGN surface_region );
 };
 
 struct client_surface
