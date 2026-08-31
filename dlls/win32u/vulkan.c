@@ -1974,9 +1974,9 @@ static VkResult win32u_vkAcquireNextImage2KHR( VkDevice client_device, const VkA
     if (!res && get_surface_rect( surface->hwnd, &client_rect, get_dpi_for_window( surface->hwnd ) ) &&
         !extents_equals( &swapchain->extents, &client_rect ))
     {
-        WARN( "Swapchain size %dx%d does not match client rect %s, returning VK_SUBOPTIMAL_KHR\n",
+        WARN( "Swapchain size %dx%d does not match client rect %s, returning VK_ERROR_OUT_OF_DATE_KHR\n",
               swapchain->extents.width, swapchain->extents.height, wine_dbgstr_rect( &client_rect ) );
-        return VK_SUBOPTIMAL_KHR;
+        return VK_ERROR_OUT_OF_DATE_KHR;
     }
     if ((res == VK_SUCCESS || res == VK_SUBOPTIMAL_KHR) && *image_index < swapchain->image_count)
         InterlockedExchange( &swapchain->image_generations[*image_index],
@@ -2003,9 +2003,9 @@ static VkResult win32u_vkAcquireNextImageKHR( VkDevice client_device, VkSwapchai
     if (!res && get_surface_rect( surface->hwnd, &client_rect, get_dpi_for_window( surface->hwnd ) ) &&
         !extents_equals( &swapchain->extents, &client_rect ))
     {
-        WARN( "Swapchain size %dx%d does not match client rect %s, returning VK_SUBOPTIMAL_KHR\n",
+        WARN( "Swapchain size %dx%d does not match client rect %s, returning VK_ERROR_OUT_OF_DATE_KHR\n",
               swapchain->extents.width, swapchain->extents.height, wine_dbgstr_rect( &client_rect ) );
-        return VK_SUBOPTIMAL_KHR;
+        return VK_ERROR_OUT_OF_DATE_KHR;
     }
     if ((res == VK_SUCCESS || res == VK_SUBOPTIMAL_KHR) && *image_index < swapchain->image_count)
         InterlockedExchange( &swapchain->image_generations[*image_index],
@@ -2100,11 +2100,11 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
             WARN( "Present returned status %d for swapchain %p\n", swapchain_res, swapchain );
         else if (swapchain_res >= VK_SUCCESS && !extents_equals( &swapchain->extents, &client_rect ))
         {
-            WARN( "Swapchain size %dx%d does not match client rect %s, returning VK_SUBOPTIMAL_KHR\n",
+            WARN( "Swapchain size %dx%d does not match client rect %s, returning VK_ERROR_OUT_OF_DATE_KHR\n",
                   swapchain->extents.width, swapchain->extents.height, wine_dbgstr_rect( &client_rect ) );
-            if (present_info->pResults) present_info->pResults[i] = VK_SUBOPTIMAL_KHR;
-            if (!res) res = VK_SUBOPTIMAL_KHR;
-            swapchain_res = VK_SUBOPTIMAL_KHR;
+            if (present_info->pResults) present_info->pResults[i] = VK_ERROR_OUT_OF_DATE_KHR;
+            if (res >= VK_SUCCESS) res = VK_ERROR_OUT_OF_DATE_KHR;
+            swapchain_res = VK_ERROR_OUT_OF_DATE_KHR;
         }
 
         if (swapchain_res >= VK_SUCCESS && surface->client->offscreen && device->internal_present_wait)
