@@ -316,6 +316,7 @@ DECL_HANDLER(d3dkmt_object_open_name);
 DECL_HANDLER(d3dkmt_mutex_acquire);
 DECL_HANDLER(d3dkmt_mutex_release);
 DECL_HANDLER(alpc_create_port);
+DECL_HANDLER(set_client_surface_state);
 
 typedef void (*req_handler)( const void *req, void *reply );
 static const req_handler req_handlers[REQ_NB_REQUESTS] =
@@ -629,6 +630,7 @@ static const req_handler req_handlers[REQ_NB_REQUESTS] =
     (req_handler)req_d3dkmt_mutex_acquire,
     (req_handler)req_d3dkmt_mutex_release,
     (req_handler)req_alpc_create_port,
+    (req_handler)req_set_client_surface_state,
 };
 
 C_ASSERT( sizeof(abstime_t) == 8 );
@@ -1592,6 +1594,7 @@ C_ASSERT( sizeof(struct set_window_pos_request) == 56 );
 C_ASSERT( offsetof(struct set_window_pos_reply, new_style) == 8 );
 C_ASSERT( offsetof(struct set_window_pos_reply, new_ex_style) == 12 );
 C_ASSERT( offsetof(struct set_window_pos_reply, surface_win) == 16 );
+C_ASSERT( offsetof(struct set_window_pos_reply, client_surface_pending) == 20 );
 C_ASSERT( sizeof(struct set_window_pos_reply) == 24 );
 C_ASSERT( offsetof(struct get_window_rectangles_request, handle) == 12 );
 C_ASSERT( offsetof(struct get_window_rectangles_request, relative) == 16 );
@@ -2400,3 +2403,12 @@ C_ASSERT( offsetof(struct alpc_create_port_request, max_msg_len) == 16 );
 C_ASSERT( sizeof(struct alpc_create_port_request) == 24 );
 C_ASSERT( offsetof(struct alpc_create_port_reply, handle) == 8 );
 C_ASSERT( sizeof(struct alpc_create_port_reply) == 16 );
+C_ASSERT( offsetof(struct set_client_surface_state_request, handle) == 12 );
+C_ASSERT( offsetof(struct set_client_surface_state_request, flags) == 16 );
+C_ASSERT( offsetof(struct set_client_surface_state_request, generation) == 20 );
+C_ASSERT( sizeof(struct set_client_surface_state_request) == 24 );
+C_ASSERT( offsetof(struct set_client_surface_state_reply, toplevel) == 8 );
+C_ASSERT( offsetof(struct set_client_surface_state_reply, wake) == 12 );
+C_ASSERT( offsetof(struct set_client_surface_state_reply, sync) == 16 );
+C_ASSERT( offsetof(struct set_client_surface_state_reply, generation) == 20 );
+C_ASSERT( sizeof(struct set_client_surface_state_reply) == 24 );

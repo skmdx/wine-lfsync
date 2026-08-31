@@ -1196,7 +1196,7 @@ static void wayland_client_surface_update(struct client_surface *client)
     wayland_win_data_release(data);
 }
 
-static void wayland_client_surface_present(struct client_surface *client, HDC hdc, HRGN surface_region)
+static void wayland_client_surface_present(struct client_surface *client, HDC hdc, HRGN surface_region, BOOL flush)
 {
     struct wayland_client_surface *surface = impl_from_client_surface(client);
     HWND hwnd = client->hwnd, toplevel = client->toplevel;

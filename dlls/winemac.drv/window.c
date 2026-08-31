@@ -1114,7 +1114,7 @@ static void macdrv_client_surface_update(struct client_surface *client)
     release_win_data(data);
 }
 
-static void macdrv_client_surface_present(struct client_surface *client, HDC hdc, HRGN surface_region)
+static void macdrv_client_surface_present(struct client_surface *client, HDC hdc, HRGN surface_region, BOOL flush)
 {
     struct macdrv_client_surface *surface = impl_from_client_surface(client);
     struct macdrv_win_data *data;
@@ -1156,7 +1156,7 @@ struct client_surface *macdrv_CreateClientSurface(HWND hwnd, int pixel_format, B
     if (surface)
     {
         macdrv_client_surface_update(&surface->client);
-        macdrv_client_surface_present(&surface->client, 0);
+        macdrv_client_surface_present(&surface->client, 0, 0, FALSE);
     }
 
     return &surface->client;

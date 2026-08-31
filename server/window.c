@@ -86,6 +86,10 @@ struct window
     WCHAR           *text;            /* window caption text */
     data_size_t      text_len;        /* length of window caption */
     unsigned int     paint_flags;     /* various painting flags */
+    unsigned int     client_surface_count; /* active client-rendered surfaces for this window */
+    unsigned int     client_surface_dirty; /* top-level composition changed while hidden */
+    unsigned int     client_surface_staged; /* host window is mapped into an unpublished composition */
+    unsigned int     client_surface_generation; /* current unpublished composition generation */
     int              prop_inuse;      /* number of in-use window properties */
     int              prop_alloc;      /* number of allocated window properties */
     struct property *properties;      /* window properties array */
@@ -96,6 +100,9 @@ C_ASSERT( sizeof(window_shm_t) == offsetof(window_shm_t, extra[0]) );
 
 static void window_dump( struct object *obj, int verbose );
 static void window_destroy( struct object *obj );
+static int is_visible( const struct window *win );
+static int has_active_client_surface( const struct window *win );
+static struct window *get_toplevel_window( struct window *win );
 
 static const struct object_ops window_ops =
 {
@@ -411,7 +418,8 @@ static void attach_parent_thread( struct window *win, bool attach )
 /* change the parent of a window (or unlink the window if the new parent is NULL) */
 static int set_parent_window( struct window *win, struct window *parent )
 {
-    struct window *ptr;
+    struct window *ptr, *old_top = get_toplevel_window( win ), *new_top;
+    int has_client_surface = has_active_client_surface( win );
 
     /* make sure parent is not a child of window */
     for (ptr = parent; ptr; ptr = ptr->parent)
@@ -441,6 +449,23 @@ static int set_parent_window( struct window *win, struct window *parent )
 
         if (win->paint_flags & (PAINT_HAS_PIXEL_FORMAT | PAINT_PIXEL_FORMAT_CHILD))
             update_pixel_format_flags( win );
+
+        if (has_client_surface)
+        {
+            new_top = get_toplevel_window( win );
+            if (old_top != new_top)
+            {
+                if (old_top == win || !has_active_client_surface( old_top ))
+                {
+                    old_top->client_surface_dirty = 0;
+                    old_top->client_surface_staged = 0;
+                }
+                new_top->client_surface_dirty = 1;
+                new_top->client_surface_staged = 0;
+                if (is_visible( new_top ))
+                    post_message( new_top->handle, WM_WINE_UPDATEWINDOWSTATE, 0, 0 );
+            }
+        }
     }
     else  /* move it to parent unlinked list */
     {
@@ -676,6 +701,10 @@ static struct window *create_window( struct window *parent, struct window *owner
     win->text           = NULL;
     win->text_len       = 0;
     win->paint_flags    = 0;
+    win->client_surface_count  = 0;
+    win->client_surface_dirty  = 0;
+    win->client_surface_staged = 0;
+    win->client_surface_generation = 0;
     win->prop_inuse     = 0;
     win->prop_alloc     = 0;
     win->properties     = NULL;
@@ -887,6 +916,24 @@ static int is_visible( const struct window *win )
         if (win && (win->style & WS_MINIMIZE)) return 0;
     }
     return 1;
+}
+
+static int has_active_client_surface( const struct window *win )
+{
+    const struct window *child;
+
+    if (win->client_surface_count) return 1;
+    LIST_FOR_EACH_ENTRY( child, &win->children, const struct window, entry )
+    {
+        if (has_active_client_surface( child )) return 1;
+    }
+    return 0;
+}
+
+static struct window *get_toplevel_window( struct window *win )
+{
+    while (win->parent && !is_desktop_window( win->parent )) win = win->parent;
+    return win;
 }
 
 /* same as is_visible but takes a window handle */
@@ -1938,6 +1985,7 @@ static void set_window_pos( struct window *win, struct window *previous,
     const struct rectangle old_window_rect = win->window_rect;
     const struct rectangle old_visible_rect = win->visible_rect;
     const struct rectangle old_client_rect = win->client_rect;
+    struct window *client_surface_top = NULL;
     struct rectangle rect;
     int client_changed, frame_changed;
     int visible = (win->style & WS_VISIBLE) || (swp_flags & SWP_SHOWWINDOW);
@@ -1949,6 +1997,9 @@ static void set_window_pos( struct window *win, struct window *previous,
 
     /* set the new window info before invalidating anything */
 
+    if (has_active_client_surface( win ))
+        client_surface_top = get_toplevel_window( win );
+
     win->window_rect  = *window_rect;
     win->visible_rect = *visible_rect;
     win->surface_rect = *surface_rect;
@@ -1956,6 +2007,14 @@ static void set_window_pos( struct window *win, struct window *previous,
     if (!(swp_flags & SWP_NOZORDER) && win->parent) zorder_changed |= link_window( win, previous );
     if (swp_flags & SWP_SHOWWINDOW) win->style |= WS_VISIBLE;
     else if (swp_flags & SWP_HIDEWINDOW) win->style &= ~WS_VISIBLE;
+    if (client_surface_top)
+    {
+        if (!is_visible( client_surface_top ))
+        {
+            client_surface_top->client_surface_dirty = 1;
+            client_surface_top->client_surface_staged = 0;
+        }
+    }
 
     /* update window monitor dpi for toplevel windows */
     if (is_toplevel( win )) set_window_monitor_dpi( win );
@@ -2778,6 +2837,74 @@ DECL_HANDLER(set_window_pos)
 
     top = get_top_clipping_window( win );
     if (is_visible( top ) && (top->paint_flags & PAINT_HAS_SURFACE)) reply->surface_win = top->handle;
+    reply->client_surface_pending = is_toplevel( win ) && is_visible( win ) && win->client_surface_dirty;
+}
+
+
+/* Track client-rendered content across process boundaries.  A presentation
+ * made while an ancestor is hidden invalidates the top-level composition. The
+ * first top-level composition copied in the next visible generation makes the
+ * entire host window publishable again. */
+DECL_HANDLER(set_client_surface_state)
+{
+    struct window *win, *top;
+    int was_pending;
+
+    reply->toplevel = 0;
+    reply->wake = 0;
+    reply->sync = 0;
+    reply->generation = 0;
+    if (!(win = get_window( req->handle ))) return;
+    top = get_toplevel_window( win );
+    was_pending = top->client_surface_dirty;
+
+    if (req->flags & CLIENT_SURFACE_STATE_REGISTER)
+    {
+        win->client_surface_count++;
+        if (!is_visible( top )) top->client_surface_dirty = 1;
+    }
+    if (req->flags & CLIENT_SURFACE_STATE_UNREGISTER)
+    {
+        if (win->client_surface_count) win->client_surface_count--;
+        if (!has_active_client_surface( top ))
+        {
+            top->client_surface_dirty = 0;
+            top->client_surface_staged = 0;
+        }
+    }
+    if (req->flags & CLIENT_SURFACE_STATE_STAGED)
+    {
+        top->client_surface_staged = top->client_surface_dirty && is_visible( top );
+        if (top->client_surface_staged && !++top->client_surface_generation)
+            top->client_surface_generation++;
+    }
+    if (req->flags & CLIENT_SURFACE_STATE_BYPASS)
+    {
+        top->client_surface_dirty = 0;
+        top->client_surface_staged = 0;
+    }
+    if ((req->flags & CLIENT_SURFACE_STATE_PRESENT_BEGIN) && win->client_surface_count)
+    {
+        if (!is_visible( top ))
+        {
+            top->client_surface_dirty = 1;
+            top->client_surface_staged = 0;
+        }
+        else if (is_visible( win ))
+        {
+            reply->sync = top->client_surface_dirty && top->client_surface_staged;
+            if (reply->sync) reply->generation = top->client_surface_generation;
+        }
+    }
+    if ((req->flags & CLIENT_SURFACE_STATE_PRESENT_COMMIT) && win->client_surface_count &&
+        top->client_surface_staged && req->generation == top->client_surface_generation)
+    {
+        top->client_surface_dirty = !is_visible( win );
+        top->client_surface_staged = 0;
+    }
+
+    reply->toplevel = top->handle;
+    reply->wake = was_pending && is_visible( top ) && !top->client_surface_dirty;
 }
 
 

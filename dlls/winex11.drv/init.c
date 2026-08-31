@@ -378,7 +378,7 @@ static void x11drv_client_surface_update( struct client_surface *client )
     client_surface_update_offscreen( hwnd, surface );
 }
 
-static void X11DRV_client_surface_present( struct client_surface *client, HDC hdc, HRGN surface_region )
+static void X11DRV_client_surface_present( struct client_surface *client, HDC hdc, HRGN surface_region, BOOL flush )
 {
     struct x11drv_client_surface *surface = impl_from_client_surface( client );
     HWND hwnd = client->hwnd, toplevel = client->toplevel;

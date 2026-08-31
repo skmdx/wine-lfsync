@@ -3770,7 +3770,7 @@ struct set_window_pos_reply
     unsigned int   new_style;
     unsigned int   new_ex_style;
     user_handle_t  surface_win;
-    char __pad_20[4];
+    unsigned int   client_surface_pending;
 };
 #define SET_WINPOS_PAINT_SURFACE    0x01
 #define SET_WINPOS_PIXEL_FORMAT     0x02
@@ -6259,6 +6259,30 @@ struct alpc_create_port_reply
 };
 
 
+
+struct set_client_surface_state_request
+{
+    struct request_header __header;
+    user_handle_t  handle;
+    unsigned int   flags;
+    unsigned int   generation;
+};
+struct set_client_surface_state_reply
+{
+    struct reply_header __header;
+    user_handle_t  toplevel;
+    unsigned int   wake;
+    unsigned int   sync;
+    unsigned int   generation;
+};
+#define CLIENT_SURFACE_STATE_REGISTER   0x01
+#define CLIENT_SURFACE_STATE_UNREGISTER 0x02
+#define CLIENT_SURFACE_STATE_PRESENT_BEGIN  0x04
+#define CLIENT_SURFACE_STATE_PRESENT_COMMIT 0x08
+#define CLIENT_SURFACE_STATE_STAGED         0x10
+#define CLIENT_SURFACE_STATE_BYPASS         0x20
+
+
 enum request
 {
     REQ_new_process,
@@ -6570,6 +6594,7 @@ enum request
     REQ_d3dkmt_mutex_acquire,
     REQ_d3dkmt_mutex_release,
     REQ_alpc_create_port,
+    REQ_set_client_surface_state,
     REQ_NB_REQUESTS
 };
 
@@ -6886,6 +6911,7 @@ union generic_request
     struct d3dkmt_mutex_acquire_request d3dkmt_mutex_acquire_request;
     struct d3dkmt_mutex_release_request d3dkmt_mutex_release_request;
     struct alpc_create_port_request alpc_create_port_request;
+    struct set_client_surface_state_request set_client_surface_state_request;
 };
 union generic_reply
 {
@@ -7200,8 +7226,9 @@ union generic_reply
     struct d3dkmt_mutex_acquire_reply d3dkmt_mutex_acquire_reply;
     struct d3dkmt_mutex_release_reply d3dkmt_mutex_release_reply;
     struct alpc_create_port_reply alpc_create_port_reply;
+    struct set_client_surface_state_reply set_client_surface_state_reply;
 };
 
-#define SERVER_PROTOCOL_VERSION 964
+#define SERVER_PROTOCOL_VERSION 965
 
 #endif /* __WINE_WINE_SERVER_PROTOCOL_H */

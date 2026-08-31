@@ -2817,6 +2817,7 @@ enum message_type
     unsigned int   new_style;     /* new window style */
     unsigned int   new_ex_style;  /* new window extended style */
     user_handle_t  surface_win;   /* parent window that holds the surface */
+    unsigned int   client_surface_pending; /* hidden client content needs a visible-generation present */
 @END
 #define SET_WINPOS_PAINT_SURFACE    0x01  /* window has a paintable surface */
 #define SET_WINPOS_PIXEL_FORMAT     0x02  /* window has a custom pixel format */
@@ -4348,3 +4349,22 @@ enum inproc_sync_type
 @REPLY
     obj_handle_t        handle;         /* handle to the ALPC port */
 @END
+
+
+/* Track whether a client-rendered window has changed while its hierarchy was hidden. */
+@REQ(set_client_surface_state)
+    user_handle_t  handle;        /* client surface window */
+    unsigned int   flags;         /* CLIENT_SURFACE_STATE_* */
+    unsigned int   generation;    /* publication generation being committed */
+@REPLY
+    user_handle_t  toplevel;      /* current top-level ancestor */
+    unsigned int   wake;          /* top-level may now be exposed */
+    unsigned int   sync;          /* presentation must reach the host before commit */
+    unsigned int   generation;    /* staged publication generation */
+@END
+#define CLIENT_SURFACE_STATE_REGISTER   0x01
+#define CLIENT_SURFACE_STATE_UNREGISTER 0x02
+#define CLIENT_SURFACE_STATE_PRESENT_BEGIN  0x04
+#define CLIENT_SURFACE_STATE_PRESENT_COMMIT 0x08
+#define CLIENT_SURFACE_STATE_STAGED         0x10
+#define CLIENT_SURFACE_STATE_BYPASS         0x20

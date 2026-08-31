@@ -1877,6 +1877,7 @@ static void dump_set_window_pos_reply( const struct set_window_pos_reply *req )
     fprintf( stderr, " new_style=%08x", req->new_style );
     fprintf( stderr, ", new_ex_style=%08x", req->new_ex_style );
     fprintf( stderr, ", surface_win=%08x", req->surface_win );
+    fprintf( stderr, ", client_surface_pending=%08x", req->client_surface_pending );
 }
 
 static void dump_get_window_rectangles_request( const struct get_window_rectangles_request *req )
@@ -3545,6 +3546,21 @@ static void dump_alpc_create_port_reply( const struct alpc_create_port_reply *re
     fprintf( stderr, " handle=%04x", req->handle );
 }
 
+static void dump_set_client_surface_state_request( const struct set_client_surface_state_request *req )
+{
+    fprintf( stderr, " handle=%08x", req->handle );
+    fprintf( stderr, ", flags=%08x", req->flags );
+    fprintf( stderr, ", generation=%08x", req->generation );
+}
+
+static void dump_set_client_surface_state_reply( const struct set_client_surface_state_reply *req )
+{
+    fprintf( stderr, " toplevel=%08x", req->toplevel );
+    fprintf( stderr, ", wake=%08x", req->wake );
+    fprintf( stderr, ", sync=%08x", req->sync );
+    fprintf( stderr, ", generation=%08x", req->generation );
+}
+
 typedef void (*dump_func)( const void *req );
 
 static const dump_func req_dumpers[REQ_NB_REQUESTS] =
@@ -3858,6 +3874,7 @@ static const dump_func req_dumpers[REQ_NB_REQUESTS] =
     (dump_func)dump_d3dkmt_mutex_acquire_request,
     (dump_func)dump_d3dkmt_mutex_release_request,
     (dump_func)dump_alpc_create_port_request,
+    (dump_func)dump_set_client_surface_state_request,
 };
 
 static const dump_func reply_dumpers[REQ_NB_REQUESTS] =
@@ -4171,6 +4188,7 @@ static const dump_func reply_dumpers[REQ_NB_REQUESTS] =
     (dump_func)dump_d3dkmt_mutex_acquire_reply,
     NULL,
     (dump_func)dump_alpc_create_port_reply,
+    (dump_func)dump_set_client_surface_state_reply,
 };
 
 static const char * const req_names[REQ_NB_REQUESTS] =
@@ -4484,6 +4502,7 @@ static const char * const req_names[REQ_NB_REQUESTS] =
     "d3dkmt_mutex_acquire",
     "d3dkmt_mutex_release",
     "alpc_create_port",
+    "set_client_surface_state",
 };
 
 static const struct

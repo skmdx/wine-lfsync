@@ -255,7 +255,7 @@ struct client_surface_funcs
     /* update the surface to match its window state */
     void (*update)( struct client_surface *surface );
     /* present the client surface if necessary, hdc != NULL when offscreen, called from render thread */
-    void (*present)( struct client_surface *surface, HDC hdc, HRGN surface_region );
+    void (*present)( struct client_surface *surface, HDC hdc, HRGN surface_region, BOOL flush );
 };
 
 struct client_surface
@@ -268,6 +268,7 @@ struct client_surface
     LONG                               updated;        /* has been moved / resized / reparented */
     HWND                               toplevel;       /* toplevel window of the surface */
     LONG                               offscreen;      /* client window is offscreen */
+    LONG                               active;         /* registered as active with the Wine server */
     RECT                               virtual_rect;   /* virtual size and position in the toplevel ancestor, relative to its visible rect */
     RECT                               monitor_rect;   /* raw physical size and position in the toplevel ancestor, relative to its visible rect */
     BOOL                               raw;            /* use the raw physical position and size for the host client surface */
@@ -277,6 +278,10 @@ W32KAPI void *client_surface_create( UINT size, const struct client_surface_func
 W32KAPI void client_surface_add_ref( struct client_surface *surface );
 W32KAPI void client_surface_release( struct client_surface *surface );
 W32KAPI void client_surface_present( struct client_surface *surface );
+W32KAPI UINT client_surface_begin_present( struct client_surface *surface );
+W32KAPI void client_surface_end_present( struct client_surface *surface, UINT generation );
+W32KAPI void client_surface_set_staged( HWND hwnd );
+W32KAPI void client_surface_bypass_staging( HWND hwnd );
 W32KAPI void update_client_surfaces( HWND hwnd );
 W32KAPI void detach_client_surfaces( HWND hwnd );
 
@@ -356,6 +361,7 @@ struct gdi_device_manager
 #define WINE_DM_UNSUPPORTED 0x80000000
 #define WINE_SWP_FULLSCREEN 0x80000000
 #define WINE_SWP_RESIZABLE  0x40000000
+#define WINE_SWP_CLIENT_SURFACE_PENDING 0x20000000
 
 struct vulkan_driver_funcs;
 struct opengl_driver_funcs;
