@@ -308,6 +308,12 @@ static void client_surface_update_geometry( HWND hwnd, struct x11drv_client_surf
     TRACE( "client window %p/%lx, requesting position %d,%d size %d,%d mask %#x\n", hwnd,
            surface->window, changes.x, changes.y, changes.width, changes.height, mask );
     XConfigureWindow( gdi_display, surface->window, mask, &changes );
+    /* Vulkan WSI can submit work through the XCB connection underlying this
+     * Display before Xlib flushes its buffered ConfigureWindow request.  A
+     * resize processed after that presentation replaces the backing pixmap
+     * and loses the completed frame.  Complete geometry changes before the
+     * caller is allowed to present to the client window. */
+    XSync( gdi_display, False );
 }
 
 static void client_surface_update_offscreen( HWND hwnd, struct x11drv_client_surface *surface )
@@ -386,7 +392,11 @@ static void X11DRV_client_surface_present( struct client_surface *client, HDC hd
     Drawable window;
     HRGN region;
 
-    if (!hdc) return;
+    if (!hdc)
+    {
+        if (flush) XSync( gdi_display, False );
+        return;
+    }
     window = X11DRV_get_whole_window( toplevel );
 
     /* if window is exclusive fullscreen, ignore the window region clipping rules */
@@ -410,7 +420,9 @@ static void X11DRV_client_surface_present( struct client_surface *client, HDC hd
 
     NtGdiStretchBlt( surface->hdc_dst, 0, 0, rect_dst.right - rect_dst.left, rect_dst.bottom - rect_dst.top,
                      surface->hdc_src, 0, 0, rect_src.right - rect_src.left, rect_src.bottom - rect_src.top, SRCCOPY, 0 );
-    XFlush( gdi_display );
+    if (flush)
+        XSync( gdi_display, False );
+    else XFlush( gdi_display );
 
     if (region) NtGdiDeleteObjectApp( region );
 }

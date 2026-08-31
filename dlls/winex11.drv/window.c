@@ -47,6 +47,7 @@
 #include "ntstatus.h"
 
 #include "x11drv.h"
+#include "xcomposite.h"
 #include "wingdi.h"
 #include "winuser.h"
 
@@ -567,6 +568,50 @@ static void sync_window_input_shape( struct x11drv_win_data *data )
                data->hwnd, data->whole_window );
     }
 #endif
+}
+
+static void set_empty_window_input_shape( struct x11drv_win_data *data )
+{
+#ifdef HAVE_LIBXSHAPE
+    static XRectangle empty_rect;
+
+    if (!data->whole_window) return;
+    XShapeCombineRectangles( data->display, data->whole_window, ShapeInput, 0, 0,
+                             &empty_rect, 1, ShapeSet, YXBanded );
+#endif
+}
+
+/* Keep a logically visible host window mapped and drawable while withholding
+ * it from the screen.  The render process can then commit into a real mapped
+ * drawable, and unredirecting publishes that completed composition at once. */
+static BOOL prepare_client_surface_staging( struct x11drv_win_data *data )
+{
+#ifdef SONAME_LIBXCOMPOSITE
+    if (!usexcomposite) return FALSE;
+
+    if (!data->client_surface_redirected)
+    {
+        pXCompositeRedirectWindow( data->display, data->whole_window, CompositeRedirectManual );
+        data->client_surface_redirected = TRUE;
+    }
+    set_empty_window_input_shape( data );
+    return TRUE;
+#else
+    return FALSE;
+#endif
+}
+
+static void finish_client_surface_staging( struct x11drv_win_data *data )
+{
+    TRACE( "win %p/%lx publishing staged client-surface composition\n",
+           data->hwnd, data->whole_window );
+#ifdef SONAME_LIBXCOMPOSITE
+    if (data->client_surface_redirected)
+        pXCompositeUnredirectWindow( data->display, data->whole_window, CompositeRedirectManual );
+#endif
+    data->client_surface_redirected = FALSE;
+    data->client_surface_staged = FALSE;
+    sync_window_input_shape( data );
 }
 
 /***********************************************************************
@@ -3268,7 +3313,9 @@ void X11DRV_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_hint, UIN
     struct x11drv_win_data *data;
     UINT ex_style = NtUserGetWindowLongW( hwnd, GWL_EXSTYLE ), new_style = NtUserGetWindowLongW( hwnd, GWL_STYLE );
     struct window_rects old_rects;
-    BOOL is_managed, was_fullscreen, activate = !(swp_flags & SWP_NOACTIVATE), fullscreen = !!(swp_flags & WINE_SWP_FULLSCREEN);
+    BOOL is_managed, was_fullscreen, client_surface_pending = FALSE;
+    BOOL win32_visible = !!(new_style & WS_VISIBLE);
+    BOOL activate = !(swp_flags & SWP_NOACTIVATE), fullscreen = !!(swp_flags & WINE_SWP_FULLSCREEN);
 
     if ((is_managed = is_window_managed( hwnd, swp_flags, fullscreen ))) make_owner_managed( hwnd );
 
@@ -3300,6 +3347,17 @@ void X11DRV_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_hint, UIN
         new_style &= ~WS_VISIBLE;
     }
 
+    /* A client-rendered descendant changed while this hierarchy was hidden.
+     * Map the host into a private XComposite buffer so the render process has
+     * a valid drawable, without publishing an incomplete composition. */
+    if ((swp_flags & WINE_SWP_CLIENT_SURFACE_PENDING) && (new_style & WS_VISIBLE))
+    {
+        client_surface_pending = prepare_client_surface_staging( data );
+        TRACE( "win %p/%lx has pending client-surface content, staging host mapping %u\n",
+               hwnd, data->whole_window, client_surface_pending );
+        if (!client_surface_pending) client_surface_bypass_staging( hwnd );
+    }
+
     XFlush( gdi_display );  /* make sure painting is done before we move the window */
 
     if (!data->whole_window)
@@ -3329,6 +3387,18 @@ void X11DRV_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_hint, UIN
     }
 
     window_set_wm_state( data, get_desired_wm_state( new_style, new_rects ), activate );
+    if (client_surface_pending && !data->client_surface_staged)
+    {
+        /* The redirect and map must reach the X server before another process
+         * is allowed to commit into this publication generation. */
+        XSync( data->display, False );
+        client_surface_set_staged( hwnd );
+        data->client_surface_staged = TRUE;
+    }
+    else if (win32_visible && !client_surface_pending && data->client_surface_redirected)
+    {
+        finish_client_surface_staging( data );
+    }
     if (!data->wm_state_serial && data->pending_state.wm_state != WithdrawnState)
     {
         if (swp_flags & (SWP_FRAMECHANGED | SWP_STATECHANGED)) set_wm_hints( data );
