@@ -155,6 +155,9 @@ struct swapchain
     struct vulkan_swapchain obj;
     struct surface *surface;
     VkExtent2D extents;
+    LONG *image_generations;
+    uint32_t image_count;
+    uint64_t next_present_id;
 };
 
 static struct swapchain *swapchain_from_handle( VkSwapchainKHR handle )
@@ -720,6 +723,50 @@ static VkResult convert_device_create_info( struct vulkan_physical_device *physi
     if (device->extensions.has_VK_KHR_swapchain && instance->extensions.has_VK_EXT_surface_maintenance1 &&
         physical_device->extensions.has_VK_EXT_swapchain_maintenance1)
         device->extensions.has_VK_EXT_swapchain_maintenance1 = 1;
+
+    /* An offscreen client surface is copied into its top-level window after
+     * QueuePresent.  Since QueuePresent is asynchronous, enable the host's
+     * presentation-completion primitives internally so that the copy reads
+     * the frame submitted by that call rather than the previous image. */
+    if (device->extensions.has_VK_KHR_swapchain &&
+        !device->extensions.has_VK_KHR_present_id && !device->extensions.has_VK_KHR_present_wait &&
+        physical_device->extensions.has_VK_KHR_present_id &&
+        physical_device->extensions.has_VK_KHR_present_wait)
+    {
+        VkPhysicalDevicePresentWaitFeaturesKHR wait_features =
+        {
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_WAIT_FEATURES_KHR,
+        };
+        VkPhysicalDevicePresentIdFeaturesKHR id_features =
+        {
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_FEATURES_KHR,
+            .pNext = &wait_features,
+        };
+        VkPhysicalDeviceFeatures2 features =
+        {
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
+            .pNext = &id_features,
+        };
+
+        instance->p_vkGetPhysicalDeviceFeatures2( physical_device->host.physical_device, &features );
+        if (id_features.presentId && wait_features.presentWait)
+        {
+            VkPhysicalDevicePresentWaitFeaturesKHR *enable_wait;
+            VkPhysicalDevicePresentIdFeaturesKHR *enable_id;
+
+            if (!(enable_id = mem_alloc( pool, sizeof(*enable_id) )) ||
+                !(enable_wait = mem_alloc( pool, sizeof(*enable_wait) )))
+                return VK_ERROR_OUT_OF_HOST_MEMORY;
+            *enable_wait = wait_features;
+            enable_wait->pNext = (void *)info->pNext;
+            *enable_id = id_features;
+            enable_id->pNext = enable_wait;
+            info->pNext = enable_id;
+            device->extensions.has_VK_KHR_present_id = 1;
+            device->extensions.has_VK_KHR_present_wait = 1;
+            device->internal_present_wait = TRUE;
+        }
+    }
 
     if (!(extensions = mem_alloc( pool, sizeof(device->extensions) * 8 * sizeof(*extensions) ))) return VK_ERROR_OUT_OF_HOST_MEMORY;
 #define USE_VK_EXT(x) if (device->extensions.has_ ## x) extensions[count++] = #x;
@@ -1871,6 +1918,15 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
         free( swapchain );
         return res;
     }
+    if ((res = device->p_vkGetSwapchainImagesKHR( device->host.device, host_swapchain,
+                                                   &swapchain->image_count, NULL )) < VK_SUCCESS ||
+        !(swapchain->image_generations = calloc( swapchain->image_count,
+                                                  sizeof(*swapchain->image_generations) )))
+    {
+        device->p_vkDestroySwapchainKHR( device->host.device, host_swapchain, NULL );
+        free( swapchain );
+        return res < VK_SUCCESS ? res : VK_ERROR_OUT_OF_HOST_MEMORY;
+    }
 
     vulkan_object_init( &swapchain->obj.obj, host_swapchain );
     swapchain->surface = surface;
@@ -1894,6 +1950,7 @@ static void win32u_vkDestroySwapchainKHR( VkDevice client_device, VkSwapchainKHR
     device->p_vkDestroySwapchainKHR( device->host.device, swapchain->obj.host.swapchain, NULL );
     instance->p_remove_object( instance, &swapchain->obj.obj );
 
+    free( swapchain->image_generations );
     free( swapchain );
 }
 
@@ -1921,6 +1978,9 @@ static VkResult win32u_vkAcquireNextImage2KHR( VkDevice client_device, const VkA
               swapchain->extents.width, swapchain->extents.height, wine_dbgstr_rect( &client_rect ) );
         return VK_SUBOPTIMAL_KHR;
     }
+    if ((res == VK_SUCCESS || res == VK_SUBOPTIMAL_KHR) && *image_index < swapchain->image_count)
+        InterlockedExchange( &swapchain->image_generations[*image_index],
+                             client_surface_begin_present( surface->client ) );
 
     return res;
 }
@@ -1947,6 +2007,9 @@ static VkResult win32u_vkAcquireNextImageKHR( VkDevice client_device, VkSwapchai
               swapchain->extents.width, swapchain->extents.height, wine_dbgstr_rect( &client_rect ) );
         return VK_SUBOPTIMAL_KHR;
     }
+    if ((res == VK_SUCCESS || res == VK_SUBOPTIMAL_KHR) && *image_index < swapchain->image_count)
+        InterlockedExchange( &swapchain->image_generations[*image_index],
+                             client_surface_begin_present( surface->client ) );
 
     return res;
 }
@@ -1956,6 +2019,9 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
     VkPresentInfoKHR *present_info = (VkPresentInfoKHR *)client_present_info; /* cast away const, it has been copied in the thunks */
     struct vulkan_queue *queue = vulkan_queue_from_handle( client_queue );
     VkSwapchainKHR swapchains_buffer[16], *swapchains = swapchains_buffer;
+    UINT generations_buffer[16], *generations = generations_buffer;
+    uint64_t present_ids_buffer[16], *present_ids = present_ids_buffer;
+    VkPresentIdKHR present_id_info = {VK_STRUCTURE_TYPE_PRESENT_ID_KHR};
     struct vulkan_device *device = queue->device;
     const VkSwapchainKHR *client_swapchains;
     VkResult res;
@@ -1965,6 +2031,19 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
     if (present_info->swapchainCount > ARRAY_SIZE(swapchains_buffer) &&
         !(swapchains = malloc( present_info->swapchainCount * sizeof(*swapchains) )))
         return VK_ERROR_OUT_OF_HOST_MEMORY;
+    if (present_info->swapchainCount > ARRAY_SIZE(generations_buffer) &&
+        !(generations = malloc( present_info->swapchainCount * sizeof(*generations) )))
+    {
+        if (swapchains != swapchains_buffer) free( swapchains );
+        return VK_ERROR_OUT_OF_HOST_MEMORY;
+    }
+    if (device->internal_present_wait && present_info->swapchainCount > ARRAY_SIZE(present_ids_buffer) &&
+        !(present_ids = malloc( present_info->swapchainCount * sizeof(*present_ids) )))
+    {
+        if (generations != generations_buffer) free( generations );
+        if (swapchains != swapchains_buffer) free( swapchains );
+        return VK_ERROR_OUT_OF_HOST_MEMORY;
+    }
 
     for (uint32_t i = 0; i < present_info->waitSemaphoreCount; i++)
     {
@@ -1977,16 +2056,27 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
     {
         struct swapchain *swapchain = swapchain_from_handle( present_info->pSwapchains[i] );
         swapchains[i] = swapchain->obj.host.swapchain;
+        if (device->internal_present_wait) present_ids[i] = ++swapchain->next_present_id;
     }
 
     client_swapchains = present_info->pSwapchains;
     present_info->pSwapchains = swapchains;
+    if (device->internal_present_wait)
+    {
+        present_id_info.pNext = present_info->pNext;
+        present_id_info.swapchainCount = present_info->swapchainCount;
+        present_id_info.pPresentIds = present_ids;
+        present_info->pNext = &present_id_info;
+    }
 
     for (uint32_t i = 0; i < present_info->swapchainCount; i++)
     {
         struct swapchain *swapchain = swapchain_from_handle( client_swapchains[i] );
         struct surface *surface = swapchain->surface;
+        uint32_t image_index = present_info->pImageIndices[i];
         client_surface_update( surface->client );
+        generations[i] = image_index < swapchain->image_count ?
+                         InterlockedExchange( &swapchain->image_generations[image_index], 0 ) : 0;
     }
 
     res = device->p_vkQueuePresentKHR( queue->host.queue, present_info );
@@ -1998,26 +2088,45 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
         struct surface *surface = swapchain->surface;
         RECT client_rect;
 
-        client_surface_present( surface->client );
-
-        if (swapchain_res < VK_SUCCESS) continue;
-        if (!get_surface_rect( surface->hwnd, &client_rect, get_dpi_for_window( surface->hwnd ) ))
+        if (swapchain_res >= VK_SUCCESS &&
+            !get_surface_rect( surface->hwnd, &client_rect, get_dpi_for_window( surface->hwnd ) ))
         {
             WARN( "Swapchain window %p is invalid, returning VK_ERROR_OUT_OF_DATE_KHR\n", surface->hwnd );
             if (present_info->pResults) present_info->pResults[i] = VK_ERROR_OUT_OF_DATE_KHR;
             if (res >= VK_SUCCESS) res = VK_ERROR_OUT_OF_DATE_KHR;
+            swapchain_res = VK_ERROR_OUT_OF_DATE_KHR;
         }
-        else if (swapchain_res)
+        else if (swapchain_res > VK_SUCCESS)
             WARN( "Present returned status %d for swapchain %p\n", swapchain_res, swapchain );
-        else if (!extents_equals( &swapchain->extents, &client_rect ))
+        else if (swapchain_res >= VK_SUCCESS && !extents_equals( &swapchain->extents, &client_rect ))
         {
             WARN( "Swapchain size %dx%d does not match client rect %s, returning VK_SUBOPTIMAL_KHR\n",
                   swapchain->extents.width, swapchain->extents.height, wine_dbgstr_rect( &client_rect ) );
             if (present_info->pResults) present_info->pResults[i] = VK_SUBOPTIMAL_KHR;
             if (!res) res = VK_SUBOPTIMAL_KHR;
+            swapchain_res = VK_SUBOPTIMAL_KHR;
         }
+
+        if (swapchain_res >= VK_SUCCESS && surface->client->offscreen && device->internal_present_wait)
+        {
+            VkResult wait_res = device->p_vkWaitForPresentKHR( device->host.device,
+                                                               swapchain->obj.host.swapchain,
+                                                               present_ids[i], UINT64_MAX );
+            if (wait_res < VK_SUCCESS)
+            {
+                WARN( "Failed waiting for present %s, status %d\n",
+                      debugstr_client_surface( surface->client ), wait_res );
+                swapchain_res = wait_res;
+                if (present_info->pResults) present_info->pResults[i] = wait_res;
+                if (res >= VK_SUCCESS) res = wait_res;
+            }
+        }
+
+        if (swapchain_res >= VK_SUCCESS) client_surface_end_present( surface->client, generations[i] );
     }
 
+    if (present_ids != present_ids_buffer) free( present_ids );
+    if (generations != generations_buffer) free( generations );
     if (swapchains != swapchains_buffer) free( swapchains );
 
     if (TRACE_ON( fps ))

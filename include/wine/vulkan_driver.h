@@ -208,6 +208,7 @@ struct vulkan_device
     VULKAN_OBJECT_HEADER( VkDevice, device );
     struct vulkan_physical_device *physical_device;
     struct vulkan_device_extensions extensions;
+    BOOL internal_present_wait;
 #define USE_VK_FUNC(x) PFN_ ## x p_ ## x;
     ALL_VK_DEVICE_FUNCS
 #undef USE_VK_FUNC
