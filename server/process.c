@@ -1887,6 +1887,7 @@ DECL_HANDLER(get_job_info)
 
     reply->total_processes = job->total_processes;
     reply->active_processes = job->num_processes;
+    reply->limit_flags = job->limit_flags;
 
     len = min( get_reply_max_size(), reply->active_processes * sizeof(*pids) );
     if (len && ((pids = set_reply_data_size( len ))))

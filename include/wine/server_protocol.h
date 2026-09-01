@@ -5955,7 +5955,9 @@ struct get_job_info_reply
     struct reply_header __header;
     int total_processes;
     int active_processes;
+    unsigned int limit_flags;
     /* VARARG(pids,uints); */
+    char __pad_20[4];
 };
 
 
@@ -7229,6 +7231,6 @@ union generic_reply
     struct set_client_surface_state_reply set_client_surface_state_reply;
 };
 
-#define SERVER_PROTOCOL_VERSION 965
+#define SERVER_PROTOCOL_VERSION 966
 
 #endif /* __WINE_WINE_SERVER_PROTOCOL_H */

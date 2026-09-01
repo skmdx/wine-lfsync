@@ -3345,6 +3345,7 @@ static void dump_get_job_info_reply( const struct get_job_info_reply *req )
 {
     fprintf( stderr, " total_processes=%d", req->total_processes );
     fprintf( stderr, ", active_processes=%d", req->active_processes );
+    fprintf( stderr, ", limit_flags=%08x", req->limit_flags );
     dump_varargs_uints( ", pids=", cur_size );
 }
 

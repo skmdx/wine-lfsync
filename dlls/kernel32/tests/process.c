@@ -3038,6 +3038,7 @@ static void test_CompletionPort(void)
 static void test_KillOnJobClose(void)
 {
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION limit_info;
+    JOBOBJECT_BASIC_LIMIT_INFORMATION basic_limit_info;
     PROCESS_INFORMATION pi;
     DWORD dwret;
     HANDLE job;
@@ -3063,6 +3064,29 @@ static void test_KillOnJobClose(void)
     ok(ret, "AssignProcessToJobObject error %lu\n", GetLastError());
     test_assigned_proc(job, 1, pi.dwProcessId);
     test_accounting(job, 1, 1, 0);
+
+    memset(&limit_info, 0, sizeof(limit_info));
+    ret = pQueryInformationJobObject(job, JobObjectExtendedLimitInformation,
+            &limit_info, sizeof(limit_info), NULL);
+    ok(ret, "QueryInformationJobObject error %lu\n", GetLastError());
+    ok(limit_info.BasicLimitInformation.LimitFlags == JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+            "Expected JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, got flags %#lx\n",
+            limit_info.BasicLimitInformation.LimitFlags);
+
+    memset(&basic_limit_info, 0, sizeof(basic_limit_info));
+    ret = pQueryInformationJobObject(job, JobObjectBasicLimitInformation,
+            &basic_limit_info, sizeof(basic_limit_info), NULL);
+    ok(ret, "QueryInformationJobObject error %lu\n", GetLastError());
+    ok(basic_limit_info.LimitFlags == JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+            "Expected JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, got flags %#lx\n", basic_limit_info.LimitFlags);
+
+    /* Chromium uses this read-modify-write sequence after creating a sandboxed
+     * child.  The existing flags must survive the active process limit update. */
+    limit_info.BasicLimitInformation.LimitFlags |= JOB_OBJECT_LIMIT_ACTIVE_PROCESS;
+    limit_info.BasicLimitInformation.ActiveProcessLimit = 0;
+    ret = pSetInformationJobObject(job, JobObjectExtendedLimitInformation,
+            &limit_info, sizeof(limit_info));
+    ok(ret, "SetInformationJobObject error %lu\n", GetLastError());
 
     CloseHandle(job);
 

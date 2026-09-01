@@ -1828,6 +1828,19 @@ NTSTATUS WINAPI NtTerminateJobObject( HANDLE handle, NTSTATUS status )
     return ret;
 }
 
+static NTSTATUS query_job_limit_flags( HANDLE handle, DWORD *limit_flags )
+{
+    unsigned int ret;
+
+    SERVER_START_REQ( get_job_info )
+    {
+        req->handle = wine_server_obj_handle( handle );
+        if (!(ret = wine_server_call( req ))) *limit_flags = reply->limit_flags;
+    }
+    SERVER_END_REQ;
+    return ret;
+}
+
 
 /**************************************************************************
  *		NtQueryInformationJobObject (NTDLL.@)
@@ -1906,8 +1919,9 @@ NTSTATUS WINAPI NtQueryInformationJobObject( HANDLE handle, JOBOBJECTINFOCLASS c
 
         if (len < sizeof(*extended_limit)) return STATUS_INFO_LENGTH_MISMATCH;
         memset( extended_limit, 0, sizeof(*extended_limit) );
+        ret = query_job_limit_flags( handle, &extended_limit->BasicLimitInformation.LimitFlags );
         if (ret_len) *ret_len = sizeof(*extended_limit);
-        return STATUS_SUCCESS;
+        return ret;
     }
     case JobObjectBasicLimitInformation:
     {
@@ -1915,8 +1929,9 @@ NTSTATUS WINAPI NtQueryInformationJobObject( HANDLE handle, JOBOBJECTINFOCLASS c
 
         if (len < sizeof(*basic_limit)) return STATUS_INFO_LENGTH_MISMATCH;
         memset( basic_limit, 0, sizeof(*basic_limit) );
+        ret = query_job_limit_flags( handle, &basic_limit->LimitFlags );
         if (ret_len) *ret_len = sizeof(*basic_limit);
-        return STATUS_SUCCESS;
+        return ret;
     }
     default:
         return STATUS_NOT_IMPLEMENTED;
