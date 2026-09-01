@@ -409,17 +409,76 @@ static void client_surface_update_locked( struct client_surface *surface )
                        !EqualRect( &surface->monitor_rect, &monitor_rect );
 }
 
+static BOOL client_surface_is_above( HWND hwnd, HWND other );
+
+static BOOL queue_client_surface_recompose_locked( struct client_surface *surface,
+                                                   struct client_surface ***surfaces,
+                                                   UINT *count, UINT *size )
+{
+    struct client_surface **new_surfaces;
+    UINT i;
+
+    for (i = 0; i < *count; i++)
+        if ((*surfaces)[i] == surface) return TRUE;
+
+    if (*count == *size)
+    {
+        UINT new_size = *size ? *size * 2 : 4;
+
+        if (!(new_surfaces = realloc( *surfaces, new_size * sizeof(**surfaces) ))) return FALSE;
+        *surfaces = new_surfaces;
+        *size = new_size;
+    }
+
+    client_surface_add_ref( surface );
+    (*surfaces)[(*count)++] = surface;
+    return TRUE;
+}
+
 void update_client_surfaces( HWND hwnd )
 {
-    struct client_surface *surface, *next;
-    UINT count = 0;
+    struct client_surface *surface, *other, *next;
+    struct client_surface **recompose_surfaces = NULL;
+    UINT count = 0, recompose_count = 0, recompose_size = 0, i;
 
     pthread_mutex_lock( &surfaces_lock );
 
     LIST_FOR_EACH_ENTRY_SAFE( surface, next, &client_surfaces, struct client_surface, entry )
     {
+        RECT monitor_rect;
+        HWND toplevel;
+
         if (NtUserGetAncestor( surface->hwnd, GA_ROOT ) != hwnd) continue;
+        monitor_rect = surface->monitor_rect;
+        toplevel = surface->toplevel;
         client_surface_update_locked( surface );
+        if (surface->toplevel == toplevel && !EqualRect( &surface->monitor_rect, &monitor_rect ))
+        {
+            RECT overlap;
+
+            /* A moving or shrinking upper surface exposes cached pixels in a
+             * lower surface without changing the lower surface's own geometry.
+             * Queue only lower surfaces which overlap the old coverage and are
+             * not still fully covered by the new rectangle.  The changed
+             * surface keeps its normal application-driven present path. */
+            LIST_FOR_EACH_ENTRY( other, &client_surfaces, struct client_surface, entry )
+            {
+                if (other == surface || other->toplevel != surface->toplevel) continue;
+                if (!NtUserIsWindowVisible( other->hwnd )) continue;
+                if (!client_surface_is_above( surface->hwnd, other->hwnd )) continue;
+                if (!intersect_rect( &overlap, &monitor_rect, &other->monitor_rect )) continue;
+                if (NtUserIsWindowVisible( surface->hwnd ) &&
+                    overlap.left >= surface->monitor_rect.left && overlap.top >= surface->monitor_rect.top &&
+                    overlap.right <= surface->monitor_rect.right && overlap.bottom <= surface->monitor_rect.bottom)
+                    continue;
+                if (!queue_client_surface_recompose_locked( other, &recompose_surfaces,
+                                                            &recompose_count, &recompose_size ))
+                {
+                    WARN( "failed to allocate exposed client surface list\n" );
+                    break;
+                }
+            }
+        }
     }
 
     /* discard extra unused surfaces when updating window */
@@ -427,6 +486,19 @@ void update_client_surfaces( HWND hwnd )
         if (surface->hwnd == hwnd && count++) client_surface_release_locked( surface );
 
     pthread_mutex_unlock( &surfaces_lock );
+
+    /* Publish cached content through the normal generation protocol.  A raw
+     * driver copy here can repair the pixels while leaving a staged menu
+     * publication out of sync with the server.  Present outside surfaces_lock
+     * because client_surface_present() acquires it itself. */
+    for (i = 0; i < recompose_count; ++i)
+    {
+        TRACE( "recomposing newly exposed %s from cached content\n",
+               debugstr_client_surface( recompose_surfaces[i] ) );
+        client_surface_present( recompose_surfaces[i] );
+        client_surface_release( recompose_surfaces[i] );
+    }
+    free( recompose_surfaces );
 }
 
 void *client_surface_create( UINT size, const struct client_surface_funcs *funcs, HWND hwnd, int format, BOOL raw )
@@ -515,6 +587,42 @@ static HRGN get_client_surface_region_locked( struct client_surface *surface )
     return region;
 }
 
+static BOOL client_surface_compose_locked( struct client_surface *surface, BOOL flush,
+                                           const SIZE *expected_size )
+{
+    HRGN surface_region = 0;
+    HDC hdc = 0;
+    HWND hwnd = surface->hwnd;
+
+    client_surface_update_locked( surface );
+    if (expected_size &&
+        (surface->virtual_rect.right - surface->virtual_rect.left != expected_size->cx ||
+         surface->virtual_rect.bottom - surface->virtual_rect.top != expected_size->cy))
+    {
+        WARN( "not composing %s size %dx%d for expected frame %dx%d\n",
+              debugstr_client_surface( surface ),
+              surface->virtual_rect.right - surface->virtual_rect.left,
+              surface->virtual_rect.bottom - surface->virtual_rect.top,
+              (int)expected_size->cx, (int)expected_size->cy );
+        return FALSE;
+    }
+    /* Surface presentation may run in a different process from the thread
+     * changing the window hierarchy.  Refresh the cached DCE so visibility
+     * and sibling clipping cannot lag behind a show, hide, or z-order change. */
+    if (surface->offscreen)
+        hdc = NtUserGetDCEx( hwnd, 0, DCX_CACHE | DCX_USESTYLE | WINE_DCX_FORCEUPDATE );
+    if (hdc) surface_region = get_client_surface_region_locked( surface );
+    if (!surface->funcs->present( surface, hdc, surface_region, flush ))
+    {
+        if (surface_region) NtGdiDeleteObjectApp( surface_region );
+        if (hdc) NtUserReleaseDC( hwnd, hdc );
+        return FALSE;
+    }
+    if (surface_region) NtGdiDeleteObjectApp( surface_region );
+    if (hdc) NtUserReleaseDC( hwnd, hdc );
+    return TRUE;
+}
+
 UINT client_surface_begin_present( struct client_surface *surface )
 {
     UINT generation = 0;
@@ -527,40 +635,68 @@ UINT client_surface_begin_present( struct client_surface *surface )
     return generation;
 }
 
-void client_surface_end_present( struct client_surface *surface, UINT generation )
+BOOL client_surface_end_present( struct client_surface *surface, UINT generation,
+                                 const SIZE *expected_size )
 {
-    HRGN surface_region = 0;
-    HDC hdc = 0;
     HWND hwnd, toplevel = 0;
-    BOOL sync = !!generation, wake = FALSE;
+    BOOL composed = FALSE, sync = !!generation, wake = FALSE;
 
     pthread_mutex_lock( &surfaces_lock );
     if ((hwnd = surface->hwnd))
     {
-        client_surface_update_locked( surface );
-        /* Surface presentation may run in a different process from the thread
-         * changing the window hierarchy.  Refresh the cached DCE so visibility
-         * and sibling clipping cannot lag behind a show, hide, or z-order change. */
-        if (surface->offscreen)
-            hdc = NtUserGetDCEx( hwnd, 0, DCX_CACHE | DCX_USESTYLE | WINE_DCX_FORCEUPDATE );
-        if (hdc) surface_region = get_client_surface_region_locked( surface );
         if (sync) TRACE( "client surface %p starts staged composition commit\n", hwnd );
-        surface->funcs->present( surface, hdc, surface_region, sync );
-        if (surface->active && sync)
+        composed = client_surface_compose_locked( surface, sync, expected_size );
+        if (composed && surface->active && sync)
             toplevel = set_client_surface_server_state( hwnd, CLIENT_SURFACE_STATE_PRESENT_COMMIT,
                                                         generation, &wake, NULL, NULL );
-        if (surface_region) NtGdiDeleteObjectApp( surface_region );
-        if (hdc) NtUserReleaseDC( hwnd, hdc );
+        if (wake && toplevel && surface->funcs->commit)
+            wake = !surface->funcs->commit( surface, toplevel );
     }
     pthread_mutex_unlock( &surfaces_lock );
 
     if (wake && toplevel) NtUserPostMessage( toplevel, WM_WINE_UPDATEWINDOWSTATE, 0, 0 );
+    return composed;
 }
 
 void client_surface_present( struct client_surface *surface )
 {
     UINT generation = client_surface_begin_present( surface );
-    client_surface_end_present( surface, generation );
+    client_surface_end_present( surface, generation, NULL );
+}
+
+void recompose_client_surfaces( HWND hwnd )
+{
+    struct client_surface *surface;
+    struct client_surface **surfaces = NULL;
+    HWND toplevel = NtUserGetAncestor( hwnd, GA_ROOT );
+    UINT count = 0, size = 0, i;
+
+    pthread_mutex_lock( &surfaces_lock );
+    LIST_FOR_EACH_ENTRY( surface, &client_surfaces, struct client_surface, entry )
+    {
+        if (surface->toplevel != toplevel || !NtUserIsWindowVisible( surface->hwnd )) continue;
+        if (!queue_client_surface_recompose_locked( surface, &surfaces, &count, &size ))
+        {
+            WARN( "failed to allocate geometry-ready client surface list\n" );
+            break;
+        }
+    }
+    pthread_mutex_unlock( &surfaces_lock );
+
+    for (i = 0; i < count; ++i)
+    {
+        TRACE( "recomposing geometry-ready %s from cached content\n",
+               debugstr_client_surface( surfaces[i] ) );
+        client_surface_present( surfaces[i] );
+        client_surface_release( surfaces[i] );
+    }
+    free( surfaces );
+}
+
+static void client_surface_geometry_ready( HWND hwnd )
+{
+    set_client_surface_server_state( hwnd, CLIENT_SURFACE_STATE_GEOMETRY_READY,
+                                     0, NULL, NULL, NULL );
 }
 
 void client_surface_set_staged( HWND hwnd )
@@ -2449,6 +2585,7 @@ static BOOL apply_window_pos( HWND hwnd, HWND insert_after, UINT swp_flags, stru
     HWND owner_hint, surface_win = 0, toplevel;
     struct ratio raw_dpi, dpi = get_thread_dpi();
     BOOL ret, is_layered, is_child, need_icons = FALSE, client_surface_pending = FALSE;
+    BOOL toplevel_size_changed;
     struct window_rects old_rects;
     RECT extra_rects[3];
     struct window_surface *old_surface;
@@ -2463,6 +2600,11 @@ static BOOL apply_window_pos( HWND hwnd, HWND insert_after, UINT swp_flags, stru
     else monitor_dpi_from_rect( new_rects->window, dpi, &raw_dpi );
 
     get_window_rects( hwnd, COORDS_PARENT, &old_rects, dpi );
+    toplevel_size_changed = !is_child &&
+        (old_rects.visible.right - old_rects.visible.left !=
+         new_rects->visible.right - new_rects->visible.left ||
+         old_rects.visible.bottom - old_rects.visible.top !=
+         new_rects->visible.bottom - new_rects->visible.top);
     if (IsRectEmpty( &valid_rects[0] ) || is_layered) valid_rects = NULL;
 
     if (!(win = get_win_ptr( hwnd )) || win == WND_DESKTOP || win == WND_OTHER_PROCESS) return FALSE;
@@ -2624,6 +2766,13 @@ static BOOL apply_window_pos( HWND hwnd, HWND insert_after, UINT swp_flags, stru
 
         user_driver->pWindowPosChanged( hwnd, insert_after, owner_hint, swp_flags, &monitor_rects,
                                         get_driver_window_surface( new_surface, raw_dpi ) );
+        /* The server publishes Win32 geometry before the host driver applies
+         * it.  A client surface in another process can therefore compose into
+         * the old host extent and lose the newly allocated pixels.  Once the
+         * driver has completed its resize/barrier, ask each process owning an
+         * active surface to copy its cached drawable again.  This is an
+         * ordering notification, not a timer-based retry. */
+        if (toplevel_size_changed) client_surface_geometry_ready( toplevel );
         update_client_surfaces( toplevel );
     }
 

@@ -324,6 +324,7 @@ extern void set_window_normal_placement( HWND hwnd, RECT rect );
 extern BOOL set_window_pos( WINDOWPOS *winpos, int parent_x, int parent_y );
 extern UINT set_window_style_bits( HWND hwnd, UINT set_bits, UINT clear_bits );
 extern void update_window_state( HWND hwnd );
+extern void recompose_client_surfaces( HWND hwnd );
 extern HWND window_from_point( HWND hwnd, POINT pt, INT *hittest, BOOL send_nchittest );
 extern HWND get_shell_window(void);
 extern HWND get_progman_window(void);

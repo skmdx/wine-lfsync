@@ -649,6 +649,9 @@ enum wine_internal_message
     WM_WINE_LAST_DRIVER_MSG = 0x80001fff
 };
 
+/* WM_WINE_UPDATEWINDOWSTATE wparam values. */
+#define WINE_UPDATE_CLIENT_SURFACES 1
+
 /* internal IME message */
 #define WM_IME_INTERNAL 0x287
 #define IME_INTERNAL_ACTIVATE   0x17

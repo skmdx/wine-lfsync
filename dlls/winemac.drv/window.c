@@ -1114,14 +1114,14 @@ static void macdrv_client_surface_update(struct client_surface *client)
     release_win_data(data);
 }
 
-static void macdrv_client_surface_present(struct client_surface *client, HDC hdc, HRGN surface_region, BOOL flush)
+static BOOL macdrv_client_surface_present(struct client_surface *client, HDC hdc, HRGN surface_region, BOOL flush)
 {
     struct macdrv_client_surface *surface = impl_from_client_surface(client);
     struct macdrv_win_data *data;
 
     TRACE("%s\n", debugstr_client_surface(client));
 
-    if (!(data = get_win_data(surface->client.hwnd))) return;
+    if (!(data = get_win_data(surface->client.hwnd))) return FALSE;
     if (data->client_view != surface->cocoa_view)
     {
         if (data->client_view) macdrv_set_view_hidden(data->client_view, TRUE);
@@ -1129,6 +1129,7 @@ static void macdrv_client_surface_present(struct client_surface *client, HDC hdc
         data->client_view = surface->cocoa_view;
     }
     release_win_data(data);
+    return TRUE;
 }
 
 static const struct client_surface_funcs macdrv_client_surface_funcs =

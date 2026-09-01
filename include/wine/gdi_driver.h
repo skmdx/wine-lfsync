@@ -255,7 +255,9 @@ struct client_surface_funcs
     /* update the surface to match its window state */
     void (*update)( struct client_surface *surface );
     /* present the client surface if necessary, hdc != NULL when offscreen, called from render thread */
-    void (*present)( struct client_surface *surface, HDC hdc, HRGN surface_region, BOOL flush );
+    BOOL (*present)( struct client_surface *surface, HDC hdc, HRGN surface_region, BOOL flush );
+    /* notify the window owner after a staged composition commit */
+    BOOL (*commit)( struct client_surface *surface, HWND toplevel );
 };
 
 struct client_surface
@@ -279,7 +281,8 @@ W32KAPI void client_surface_add_ref( struct client_surface *surface );
 W32KAPI void client_surface_release( struct client_surface *surface );
 W32KAPI void client_surface_present( struct client_surface *surface );
 W32KAPI UINT client_surface_begin_present( struct client_surface *surface );
-W32KAPI void client_surface_end_present( struct client_surface *surface, UINT generation );
+W32KAPI BOOL client_surface_end_present( struct client_surface *surface, UINT generation,
+                                         const SIZE *expected_size );
 W32KAPI void client_surface_set_staged( HWND hwnd );
 W32KAPI void client_surface_bypass_staging( HWND hwnd );
 W32KAPI void update_client_surfaces( HWND hwnd );

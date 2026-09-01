@@ -177,8 +177,9 @@ static void android_client_surface_update( struct client_surface *client )
 {
 }
 
-static void android_client_surface_present( struct client_surface *client, HDC hdc, HRGN surface_region, BOOL flush )
+static BOOL android_client_surface_present( struct client_surface *client, HDC hdc, HRGN surface_region, BOOL flush )
 {
+    return TRUE;
 }
 
 static const struct client_surface_funcs android_client_surface_funcs =

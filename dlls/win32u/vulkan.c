@@ -155,8 +155,6 @@ struct swapchain
     struct vulkan_swapchain obj;
     struct surface *surface;
     VkExtent2D extents;
-    LONG *image_generations;
-    uint32_t image_count;
     uint64_t next_present_id;
 };
 
@@ -1918,16 +1916,6 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
         free( swapchain );
         return res;
     }
-    if ((res = device->p_vkGetSwapchainImagesKHR( device->host.device, host_swapchain,
-                                                   &swapchain->image_count, NULL )) < VK_SUCCESS ||
-        !(swapchain->image_generations = calloc( swapchain->image_count,
-                                                  sizeof(*swapchain->image_generations) )))
-    {
-        device->p_vkDestroySwapchainKHR( device->host.device, host_swapchain, NULL );
-        free( swapchain );
-        return res < VK_SUCCESS ? res : VK_ERROR_OUT_OF_HOST_MEMORY;
-    }
-
     vulkan_object_init( &swapchain->obj.obj, host_swapchain );
     swapchain->surface = surface;
     swapchain->extents = create_info->imageExtent;
@@ -1950,7 +1938,6 @@ static void win32u_vkDestroySwapchainKHR( VkDevice client_device, VkSwapchainKHR
     device->p_vkDestroySwapchainKHR( device->host.device, swapchain->obj.host.swapchain, NULL );
     instance->p_remove_object( instance, &swapchain->obj.obj );
 
-    free( swapchain->image_generations );
     free( swapchain );
 }
 
@@ -1966,6 +1953,19 @@ static VkResult win32u_vkAcquireNextImage2KHR( VkDevice client_device, const VkA
     RECT client_rect;
     VkResult res;
 
+    /* Do not acquire an image from a swapchain whose drawable has already
+     * changed size.  Returning OUT_OF_DATE after the host acquire succeeds
+     * would leave the caller with an acquired image and a signalled semaphore
+     * which it believes do not exist.  Detect the normal resize path first so
+     * the application can recreate the swapchain without consuming either. */
+    if (get_surface_rect( surface->hwnd, &client_rect, get_dpi_for_window( surface->hwnd ) ) &&
+        !extents_equals( &swapchain->extents, &client_rect ))
+    {
+        WARN( "Swapchain size %dx%d does not match client rect %s before acquire, returning VK_ERROR_OUT_OF_DATE_KHR\n",
+              swapchain->extents.width, swapchain->extents.height, wine_dbgstr_rect( &client_rect ) );
+        return VK_ERROR_OUT_OF_DATE_KHR;
+    }
+
     acquire_info_host.swapchain = swapchain->obj.host.swapchain;
     acquire_info_host.semaphore = semaphore ? semaphore->host.semaphore : 0;
     acquire_info_host.fence = fence ? fence->host.fence : 0;
@@ -1974,14 +1974,10 @@ static VkResult win32u_vkAcquireNextImage2KHR( VkDevice client_device, const VkA
     if (!res && get_surface_rect( surface->hwnd, &client_rect, get_dpi_for_window( surface->hwnd ) ) &&
         !extents_equals( &swapchain->extents, &client_rect ))
     {
-        WARN( "Swapchain size %dx%d does not match client rect %s, returning VK_ERROR_OUT_OF_DATE_KHR\n",
+        WARN( "Swapchain size %dx%d does not match client rect %s, returning VK_SUBOPTIMAL_KHR\n",
               swapchain->extents.width, swapchain->extents.height, wine_dbgstr_rect( &client_rect ) );
-        return VK_ERROR_OUT_OF_DATE_KHR;
+        return VK_SUBOPTIMAL_KHR;
     }
-    if ((res == VK_SUCCESS || res == VK_SUBOPTIMAL_KHR) && *image_index < swapchain->image_count)
-        InterlockedExchange( &swapchain->image_generations[*image_index],
-                             client_surface_begin_present( surface->client ) );
-
     return res;
 }
 
@@ -1996,6 +1992,16 @@ static VkResult win32u_vkAcquireNextImageKHR( VkDevice client_device, VkSwapchai
     RECT client_rect;
     VkResult res;
 
+    /* See win32u_vkAcquireNextImage2KHR().  This check must precede the host
+     * acquire so an OUT_OF_DATE result cannot orphan acquired-image state. */
+    if (get_surface_rect( surface->hwnd, &client_rect, get_dpi_for_window( surface->hwnd ) ) &&
+        !extents_equals( &swapchain->extents, &client_rect ))
+    {
+        WARN( "Swapchain size %dx%d does not match client rect %s before acquire, returning VK_ERROR_OUT_OF_DATE_KHR\n",
+              swapchain->extents.width, swapchain->extents.height, wine_dbgstr_rect( &client_rect ) );
+        return VK_ERROR_OUT_OF_DATE_KHR;
+    }
+
     res = device->p_vkAcquireNextImageKHR( device->host.device, swapchain->obj.host.swapchain, timeout,
                                               semaphore ? semaphore->host.semaphore : 0, fence ? fence->host.fence : 0,
                                               image_index );
@@ -2003,14 +2009,10 @@ static VkResult win32u_vkAcquireNextImageKHR( VkDevice client_device, VkSwapchai
     if (!res && get_surface_rect( surface->hwnd, &client_rect, get_dpi_for_window( surface->hwnd ) ) &&
         !extents_equals( &swapchain->extents, &client_rect ))
     {
-        WARN( "Swapchain size %dx%d does not match client rect %s, returning VK_ERROR_OUT_OF_DATE_KHR\n",
+        WARN( "Swapchain size %dx%d does not match client rect %s, returning VK_SUBOPTIMAL_KHR\n",
               swapchain->extents.width, swapchain->extents.height, wine_dbgstr_rect( &client_rect ) );
-        return VK_ERROR_OUT_OF_DATE_KHR;
+        return VK_SUBOPTIMAL_KHR;
     }
-    if ((res == VK_SUCCESS || res == VK_SUBOPTIMAL_KHR) && *image_index < swapchain->image_count)
-        InterlockedExchange( &swapchain->image_generations[*image_index],
-                             client_surface_begin_present( surface->client ) );
-
     return res;
 }
 
@@ -2073,10 +2075,12 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
     {
         struct swapchain *swapchain = swapchain_from_handle( client_swapchains[i] );
         struct surface *surface = swapchain->surface;
-        uint32_t image_index = present_info->pImageIndices[i];
         client_surface_update( surface->client );
-        generations[i] = image_index < swapchain->image_count ?
-                         InterlockedExchange( &swapchain->image_generations[image_index], 0 ) : 0;
+        /* Acquisition may happen while a popup is hidden, before its staged
+         * publication generation exists.  Sample the generation immediately
+         * before the present which will populate the host, so a single-frame
+         * popup can publish without waiting for a second acquire/present. */
+        generations[i] = client_surface_begin_present( surface->client );
     }
 
     res = device->p_vkQueuePresentKHR( queue->host.queue, present_info );
@@ -2086,28 +2090,38 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
         struct swapchain *swapchain = swapchain_from_handle( client_swapchains[i] );
         VkResult swapchain_res = present_info->pResults ? present_info->pResults[i] : res;
         struct surface *surface = swapchain->surface;
+        SIZE expected_size = {swapchain->extents.width, swapchain->extents.height};
+        BOOL compose = swapchain_res >= VK_SUCCESS;
         RECT client_rect;
 
-        if (swapchain_res >= VK_SUCCESS &&
-            !get_surface_rect( surface->hwnd, &client_rect, get_dpi_for_window( surface->hwnd ) ))
+        if (compose && !get_surface_rect( surface->hwnd, &client_rect,
+                                          get_dpi_for_window( surface->hwnd ) ))
         {
             WARN( "Swapchain window %p is invalid, returning VK_ERROR_OUT_OF_DATE_KHR\n", surface->hwnd );
             if (present_info->pResults) present_info->pResults[i] = VK_ERROR_OUT_OF_DATE_KHR;
             if (res >= VK_SUCCESS) res = VK_ERROR_OUT_OF_DATE_KHR;
             swapchain_res = VK_ERROR_OUT_OF_DATE_KHR;
+            compose = FALSE;
         }
         else if (swapchain_res > VK_SUCCESS)
             WARN( "Present returned status %d for swapchain %p\n", swapchain_res, swapchain );
-        else if (swapchain_res >= VK_SUCCESS && !extents_equals( &swapchain->extents, &client_rect ))
+        if (compose && !extents_equals( &swapchain->extents, &client_rect ))
         {
-            WARN( "Swapchain size %dx%d does not match client rect %s, returning VK_ERROR_OUT_OF_DATE_KHR\n",
+            WARN( "Swapchain size %dx%d does not match client rect %s, returning VK_SUBOPTIMAL_KHR\n",
                   swapchain->extents.width, swapchain->extents.height, wine_dbgstr_rect( &client_rect ) );
-            if (present_info->pResults) present_info->pResults[i] = VK_ERROR_OUT_OF_DATE_KHR;
-            if (res >= VK_SUCCESS) res = VK_ERROR_OUT_OF_DATE_KHR;
-            swapchain_res = VK_ERROR_OUT_OF_DATE_KHR;
+            if (present_info->pResults) present_info->pResults[i] = VK_SUBOPTIMAL_KHR;
+            if (!res) res = VK_SUBOPTIMAL_KHR;
+            swapchain_res = VK_SUBOPTIMAL_KHR;
+            /* The host present has already been submitted.  Do not abandon
+             * its completion wait merely because the shared Win32 geometry
+             * is between resize states: this may be the application's only
+             * frame at the new extent.  The wait supplies the required image
+             * completion boundary, then client_surface_end_present() updates
+             * and checks the geometry again under surfaces_lock.  It copies
+             * only if that second check matches the presented extent. */
         }
 
-        if (swapchain_res >= VK_SUCCESS && surface->client->offscreen && device->internal_present_wait)
+        if (compose && surface->client->offscreen && device->internal_present_wait)
         {
             VkResult wait_res = device->p_vkWaitForPresentKHR( device->host.device,
                                                                swapchain->obj.host.swapchain,
@@ -2119,10 +2133,21 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
                 swapchain_res = wait_res;
                 if (present_info->pResults) present_info->pResults[i] = wait_res;
                 if (res >= VK_SUCCESS) res = wait_res;
+                compose = FALSE;
             }
         }
 
-        if (swapchain_res >= VK_SUCCESS) client_surface_end_present( surface->client, generations[i] );
+        if (compose && !client_surface_end_present( surface->client, generations[i], &expected_size ))
+        {
+            /* The window changed after the post-present check but before the
+             * composition lock was acquired.  Preserve the staged generation
+             * for a correctly sized frame instead of publishing a partial old
+             * swapchain image into the resized host. */
+            WARN( "Swapchain size %dx%d changed before composition, returning VK_SUBOPTIMAL_KHR\n",
+                  swapchain->extents.width, swapchain->extents.height );
+            if (present_info->pResults) present_info->pResults[i] = VK_SUBOPTIMAL_KHR;
+            if (!res) res = VK_SUBOPTIMAL_KHR;
+        }
     }
 
     if (present_ids != present_ids_buffer) free( present_ids );

@@ -930,6 +930,16 @@ static int has_active_client_surface( const struct window *win )
     return 0;
 }
 
+static void notify_client_surface_geometry_ready( struct window *win )
+{
+    struct window *child;
+
+    if (win->client_surface_count)
+        post_message( win->handle, WM_WINE_UPDATEWINDOWSTATE, WINE_UPDATE_CLIENT_SURFACES, 0 );
+    LIST_FOR_EACH_ENTRY( child, &win->children, struct window, entry )
+        notify_client_surface_geometry_ready( child );
+}
+
 static struct window *get_toplevel_window( struct window *win )
 {
     while (win->parent && !is_desktop_window( win->parent )) win = win->parent;
@@ -2883,6 +2893,8 @@ DECL_HANDLER(set_client_surface_state)
         top->client_surface_dirty = 0;
         top->client_surface_staged = 0;
     }
+    if (req->flags & CLIENT_SURFACE_STATE_GEOMETRY_READY)
+        notify_client_surface_geometry_ready( top );
     if ((req->flags & CLIENT_SURFACE_STATE_PRESENT_BEGIN) && win->client_surface_count)
     {
         if (!is_visible( top ))

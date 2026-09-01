@@ -1564,6 +1564,12 @@ static void handle_xdnd_leave_event( HWND hwnd, XClientMessageEvent *event )
     drag_drop_leave();
 }
 
+static void handle_client_surface_commit( HWND hwnd, XClientMessageEvent *event )
+{
+    TRACE( "window %p/%lx received ordered client-surface commit\n", hwnd, event->window );
+    NtUserPostMessage( hwnd, WM_WINE_UPDATEWINDOWSTATE, 0, 0 );
+}
+
 
 struct client_message_handler
 {
@@ -1575,6 +1581,7 @@ static const struct client_message_handler client_messages[] =
 {
     { XATOM_MANAGER,      handle_manager_message },
     { XATOM_WM_PROTOCOLS, handle_wm_protocols },
+    { XATOM__WINE_CLIENT_SURFACE_COMMIT, handle_client_surface_commit },
     { XATOM__XEMBED,      handle_xembed_protocol },
     { XATOM_DndProtocol,  handle_dnd_protocol },
     { XATOM_XdndEnter,    handle_xdnd_enter_event },

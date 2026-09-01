@@ -890,8 +890,9 @@ static void nulldrv_surface_update( struct client_surface *client )
 {
 }
 
-static void nulldrv_surface_present( struct client_surface *client, HDC hdc, HRGN surface_region, BOOL flush )
+static BOOL nulldrv_surface_present( struct client_surface *client, HDC hdc, HRGN surface_region, BOOL flush )
 {
+    return TRUE;
 }
 
 static const struct client_surface_funcs nulldrv_surface_funcs =

@@ -371,6 +371,7 @@ struct x11drv_client_surface
     XWindowChanges changes;
     Colormap colormap;
     Window window;
+    Window backing_window;  /* whole window with backing store enabled */
 
     HDC hdc_src;
     HDC hdc_dst;
@@ -519,6 +520,7 @@ enum x11drv_atoms
     XATOM_WM_NORMAL_HINTS,
     XATOM_WM_STATE,
     XATOM_WM_TAKE_FOCUS,
+    XATOM__WINE_CLIENT_SURFACE_COMMIT,
     XATOM_DndProtocol,
     XATOM_DndSelection,
     XATOM__ICC_PROFILE,

@@ -308,12 +308,14 @@ static void client_surface_update_geometry( HWND hwnd, struct x11drv_client_surf
     TRACE( "client window %p/%lx, requesting position %d,%d size %d,%d mask %#x\n", hwnd,
            surface->window, changes.x, changes.y, changes.width, changes.height, mask );
     XConfigureWindow( gdi_display, surface->window, mask, &changes );
-    /* Vulkan WSI can submit work through the XCB connection underlying this
-     * Display before Xlib flushes its buffered ConfigureWindow request.  A
-     * resize processed after that presentation replaces the backing pixmap
-     * and loses the completed frame.  Complete geometry changes before the
-     * caller is allowed to present to the client window. */
-    XSync( gdi_display, False );
+    /* The Vulkan WSI connection can submit a present before Xlib's geometry
+     * request has reached the server.  If the drawable is still at its old
+     * size, the following composition copies only that old extent and leaves
+     * the newly exposed area at the host's background pixel.  A size change
+     * therefore needs a server round trip before composition; position-only
+     * changes only need ordering on this Xlib connection. */
+    if (mask & (CWWidth | CWHeight)) XSync( gdi_display, False );
+    else XFlush( gdi_display );
 }
 
 static void client_surface_update_offscreen( HWND hwnd, struct x11drv_client_surface *surface )
@@ -384,22 +386,42 @@ static void x11drv_client_surface_update( struct client_surface *client )
     client_surface_update_offscreen( hwnd, surface );
 }
 
-static void X11DRV_client_surface_present( struct client_surface *client, HDC hdc, HRGN surface_region, BOOL flush )
+static void client_surface_enable_backing_store( struct x11drv_client_surface *surface, Window window )
+{
+    XSetWindowAttributes attributes;
+
+    if (!window || window == root_window || surface->backing_window == window) return;
+
+    /* Offscreen client surfaces can be owned and presented by another process
+     * than the thread which owns the top-level window.  An Expose event in the
+     * owner therefore cannot replay those pixels.  Ask the X server to retain
+     * them while the window is mapped so revealing a menu-covered region does
+     * not replace valid client content with the background pixel. */
+    attributes.backing_store = WhenMapped;
+    XChangeWindowAttributes( gdi_display, window, CWBackingStore, &attributes );
+    surface->backing_window = window;
+    TRACE( "%s enabled backing store for whole window %lx\n",
+           debugstr_client_surface( &surface->client ), window );
+}
+
+static BOOL X11DRV_client_surface_present( struct client_surface *client, HDC hdc, HRGN surface_region, BOOL flush )
 {
     struct x11drv_client_surface *surface = impl_from_client_surface( client );
     HWND hwnd = client->hwnd, toplevel = client->toplevel;
     RECT rect_dst = client->monitor_rect, rect_src, rect;
     Drawable window;
+    BOOL ret;
     HRGN region;
 
     if (!hdc)
     {
-        if (flush) XSync( gdi_display, False );
-        return;
+        if (flush) XFlush( gdi_display );
+        return TRUE;
     }
     window = X11DRV_get_whole_window( toplevel );
+    client_surface_enable_backing_store( surface, window );
 
-    /* if window is exclusive fullscreen, ignore the window region clipping rules */
+    /* Exclusive fullscreen ignores normal window clipping. */
     if (hwnd == toplevel && NtUserGetPresentRect( toplevel, &rect, -1 /* raw dpi */ )) region = 0;
     else region = get_dc_monitor_region( hwnd, hdc );
 
@@ -413,18 +435,38 @@ static void X11DRV_client_surface_present( struct client_surface *client, HDC hd
     rect_src = surface->client.raw ? surface->client.monitor_rect : surface->client.virtual_rect;
     TRACE( "hwnd %p %s to toplevel %p %s region %p\n", hwnd, wine_dbgstr_rect(&rect_src),
            toplevel, wine_dbgstr_rect(&rect_dst), region );
-
     if (get_dc_drawable( surface->hdc_dst, &rect ) != window || !EqualRect( &rect, &rect_dst ))
         set_dc_drawable( surface->hdc_dst, window, &rect_dst, IncludeInferiors );
-    if (region) NtGdiExtSelectClipRgn( surface->hdc_dst, region, RGN_COPY );
+    /* RGN_COPY with a null region clears a clip left by an earlier present. */
+    NtGdiExtSelectClipRgn( surface->hdc_dst, region, RGN_COPY );
 
-    NtGdiStretchBlt( surface->hdc_dst, 0, 0, rect_dst.right - rect_dst.left, rect_dst.bottom - rect_dst.top,
-                     surface->hdc_src, 0, 0, rect_src.right - rect_src.left, rect_src.bottom - rect_src.top, SRCCOPY, 0 );
-    if (flush)
-        XSync( gdi_display, False );
-    else XFlush( gdi_display );
+    ret = NtGdiStretchBlt( surface->hdc_dst, 0, 0, rect_dst.right - rect_dst.left, rect_dst.bottom - rect_dst.top,
+                           surface->hdc_src, 0, 0, rect_src.right - rect_src.left,
+                           rect_src.bottom - rect_src.top, SRCCOPY, 0 );
+    if (ret) XFlush( gdi_display );
 
     if (region) NtGdiDeleteObjectApp( region );
+    return ret;
+}
+
+static BOOL X11DRV_client_surface_commit( struct client_surface *client, HWND toplevel )
+{
+    Window window = X11DRV_get_whole_window( toplevel );
+    XEvent event = {0};
+
+    if (!window) return FALSE;
+    event.xclient.type = ClientMessage;
+    event.xclient.display = gdi_display;
+    event.xclient.window = window;
+    event.xclient.message_type = x11drv_atom(_WINE_CLIENT_SURFACE_COMMIT);
+    event.xclient.format = 32;
+    if (!XSendEvent( gdi_display, window, False, NoEventMask, &event )) return FALSE;
+
+    /* The copy and this event share one X connection.  Receiving the event
+     * therefore proves that the server processed the staged composition
+     * before the owner publishes it, without a WSI-blocking round trip. */
+    XFlush( gdi_display );
+    return TRUE;
 }
 
 static const struct client_surface_funcs x11drv_client_surface_funcs =
@@ -433,6 +475,7 @@ static const struct client_surface_funcs x11drv_client_surface_funcs =
     .detach = x11drv_client_surface_detach,
     .update = x11drv_client_surface_update,
     .present = X11DRV_client_surface_present,
+    .commit = X11DRV_client_surface_commit,
 };
 
 static int visual_class_alloc( int class )

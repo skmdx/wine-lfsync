@@ -544,12 +544,24 @@ static int get_window_attributes( struct x11drv_win_data *data, XSetWindowAttrib
  * This uses the ShapeInput extension to control which areas of the window
  * can receive input events.
  */
+static void set_empty_window_input_shape( struct x11drv_win_data *data );
+
 static void sync_window_input_shape( struct x11drv_win_data *data )
 {
 #ifdef HAVE_LIBXSHAPE
     DWORD ex_style = NtUserGetWindowLongW( data->hwnd, GWL_EXSTYLE );
 
     if (!data->whole_window) return;
+
+    /* A manually redirected staging window is mapped only to provide the
+     * render process with a drawable.  Style synchronization can run between
+     * redirect and commit; it must not make that unpublished window accept
+     * input before the completed composition is unredirected. */
+    if (data->client_surface_redirected)
+    {
+        set_empty_window_input_shape( data );
+        return;
+    }
 
     if (ex_style & WS_EX_TRANSPARENT)
     {
@@ -624,7 +636,10 @@ static void sync_window_style( struct x11drv_win_data *data )
     if (data->whole_window != root_window && !data->embedded)
     {
         XSetWindowAttributes attr;
-        int mask = get_window_attributes( data, &attr );
+        /* Backing store is a presentation property, not a Win32 style
+         * property.  In particular, preserve WhenMapped when an offscreen
+         * client surface enabled it through another X connection. */
+        int mask = get_window_attributes( data, &attr ) & ~CWBackingStore;
 
         TRACE( "window %p/%lx changing attributes mask %#x, serial %lu\n", data->hwnd,
                data->whole_window, mask, NextRequest( data->display ) );
@@ -3313,7 +3328,7 @@ void X11DRV_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_hint, UIN
     struct x11drv_win_data *data;
     UINT ex_style = NtUserGetWindowLongW( hwnd, GWL_EXSTYLE ), new_style = NtUserGetWindowLongW( hwnd, GWL_STYLE );
     struct window_rects old_rects;
-    BOOL is_managed, was_fullscreen, client_surface_pending = FALSE;
+    BOOL is_managed, was_fullscreen, client_surface_pending = FALSE, size_changed;
     BOOL win32_visible = !!(new_style & WS_VISIBLE);
     BOOL activate = !(swp_flags & SWP_NOACTIVATE), fullscreen = !!(swp_flags & WINE_SWP_FULLSCREEN);
 
@@ -3323,6 +3338,10 @@ void X11DRV_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_hint, UIN
     if (is_managed) window_set_managed( data, TRUE );
 
     old_rects = data->rects;
+    size_changed = old_rects.visible.right - old_rects.visible.left !=
+                   new_rects->visible.right - new_rects->visible.left ||
+                   old_rects.visible.bottom - old_rects.visible.top !=
+                   new_rects->visible.bottom - new_rects->visible.top;
     was_fullscreen = data->is_fullscreen;
     if (!(new_style & WS_MINIMIZE) || is_virtual_desktop()) data->rects = *new_rects;
     data->is_fullscreen = fullscreen;
@@ -3370,6 +3389,12 @@ void X11DRV_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_hint, UIN
     if (!(data->managed && (swp_flags & SWP_STATECHANGED) && (new_style & (WS_MINIMIZE|WS_MAXIMIZE))))
     {
         sync_window_position( data, swp_flags, &old_rects );
+        /* Client surfaces may be presented by another process.  Complete the
+         * top-level X resize before Win32 propagates its new geometry to the
+         * client-surface owners.  Their geometry update will recompose the
+         * cached content only after this ordering barrier has completed. */
+        if (size_changed && NtUserGetAncestor( hwnd, GA_ROOT ) == hwnd)
+            XSync( data->display, False );
 #ifdef HAVE_LIBXSHAPE
         if (IsRectEmpty( &old_rects.window ) != IsRectEmpty( &new_rects->window ))
             sync_empty_window_shape( data, surface );
@@ -3398,6 +3423,13 @@ void X11DRV_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_hint, UIN
     else if (win32_visible && !client_surface_pending && data->client_surface_redirected)
     {
         finish_client_surface_staging( data );
+    }
+    else if (!win32_visible)
+    {
+        /* A hide can cancel a staged generation before it commits.  Keep the
+         * host redirected, but allow the next show to establish a fresh
+         * server generation rather than waiting forever on the cancelled one. */
+        data->client_surface_staged = FALSE;
     }
     if (!data->wm_state_serial && data->pending_state.wm_state != WithdrawnState)
     {

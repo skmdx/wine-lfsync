@@ -1196,14 +1196,14 @@ static void wayland_client_surface_update(struct client_surface *client)
     wayland_win_data_release(data);
 }
 
-static void wayland_client_surface_present(struct client_surface *client, HDC hdc, HRGN surface_region, BOOL flush)
+static BOOL wayland_client_surface_present(struct client_surface *client, HDC hdc, HRGN surface_region, BOOL flush)
 {
     struct wayland_client_surface *surface = impl_from_client_surface(client);
     HWND hwnd = client->hwnd, toplevel = client->toplevel;
     struct wayland_surface *wayland_surface;
     struct wayland_win_data *data;
 
-    if (!(data = wayland_win_data_get(toplevel))) return;
+    if (!(data = wayland_win_data_get(toplevel))) return FALSE;
 
     if ((wayland_surface = data->wayland_surface))
     {
@@ -1222,6 +1222,7 @@ static void wayland_client_surface_present(struct client_surface *client, HDC hd
     wayland_win_data_release(data);
 
     set_client_surface(hwnd, surface);
+    return TRUE;
 }
 
 static const struct client_surface_funcs wayland_client_surface_funcs =
