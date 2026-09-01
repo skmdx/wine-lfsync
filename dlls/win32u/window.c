@@ -2025,14 +2025,32 @@ BOOL set_window_pixel_format( HWND hwnd, int format, BOOL internal )
 {
     WND *win = get_win_ptr( hwnd );
     BOOL changed = FALSE;
+    LONG_PTR oldval;
+    BOOL ansi = FALSE;
 
-    if (!win || win == WND_DESKTOP || win == WND_OTHER_PROCESS)
+    if (win == WND_OTHER_PROCESS)
     {
-        WARN( "setting format %d on win %p semi-stub!\n", format, hwnd );
-        NtUserPostMessage( hwnd, WM_WINE_SETPIXELFORMAT, format, internal );
+        if (!internal && !server_set_window_info( hwnd, GWLP_WINE_PIXEL_FORMAT, format, 0,
+                                                  &oldval, &ansi, TRUE ))
+            return FALSE;
+        NtUserPostMessage( hwnd, WM_WINE_SETPIXELFORMAT, format, TRUE );
+        return TRUE;
+    }
+    if (!win || win == WND_DESKTOP)
+    {
+        WARN( "setting format %d on invalid win %p\n", format, hwnd );
         return FALSE;
     }
-    if (!internal) win->pixel_format = format;
+    if (!internal)
+    {
+        if (!server_set_window_info( hwnd, GWLP_WINE_PIXEL_FORMAT, format, 0,
+                                     &oldval, &ansi, TRUE ))
+        {
+            release_win_ptr( win );
+            return FALSE;
+        }
+        win->pixel_format = format;
+    }
     if (format && !win->clip_clients) changed = win->clip_clients = TRUE;
     release_win_ptr( win );
 
@@ -2043,16 +2061,23 @@ BOOL set_window_pixel_format( HWND hwnd, int format, BOOL internal )
 int get_window_pixel_format( HWND hwnd )
 {
     WND *win = get_win_ptr( hwnd );
-    int ret;
+    int ret = -1;
 
-    if (!win || win == WND_DESKTOP || win == WND_OTHER_PROCESS)
+    if (!win || win == WND_DESKTOP)
     {
-        WARN( "getting format on win %p not supported\n", hwnd );
+        WARN( "getting format on invalid win %p\n", hwnd );
         return -1;
     }
+    if (win != WND_OTHER_PROCESS) release_win_ptr( win );
 
-    ret = win->pixel_format;
-    release_win_ptr( win );
+    SERVER_START_REQ( get_window_info )
+    {
+        req->handle = wine_server_user_handle( hwnd );
+        req->offset = GWLP_WINE_PIXEL_FORMAT;
+        req->size = 0;
+        if (!wine_server_call_err( req )) ret = reply->info;
+    }
+    SERVER_END_REQ;
 
     return ret;
 }

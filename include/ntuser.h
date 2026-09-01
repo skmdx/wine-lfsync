@@ -469,6 +469,9 @@ struct post_dde_message_call_params
 /* color index used to retrieve system 55aa brush */
 #define COLOR_55AA_BRUSH  0x100
 
+/* internal window info offsets */
+#define GWLP_WINE_PIXEL_FORMAT (-100)
+
 /* user object types */
 #define NTUSER_OBJ_WINDOW   0x01
 #define NTUSER_OBJ_MENU     0x02
