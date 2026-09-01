@@ -404,11 +404,12 @@ static void client_surface_enable_backing_store( struct x11drv_client_surface *s
            debugstr_client_surface( &surface->client ), window );
 }
 
-static BOOL X11DRV_client_surface_present( struct client_surface *client, HDC hdc, HRGN surface_region, BOOL flush )
+static BOOL X11DRV_client_surface_present( struct client_surface *client, HDC hdc,
+                                           HRGN surface_region, BOOL flush )
 {
     struct x11drv_client_surface *surface = impl_from_client_surface( client );
     HWND hwnd = client->hwnd, toplevel = client->toplevel;
-    RECT rect_dst = client->monitor_rect, rect_src, rect;
+    RECT rect_dst = client->monitor_rect, rect_src, rect_src_dc, rect;
     Drawable window;
     BOOL ret;
     HRGN region;
@@ -435,6 +436,17 @@ static BOOL X11DRV_client_surface_present( struct client_surface *client, HDC hd
     rect_src = surface->client.raw ? surface->client.monitor_rect : surface->client.virtual_rect;
     TRACE( "hwnd %p %s to toplevel %p %s region %p\n", hwnd, wine_dbgstr_rect(&rect_src),
            toplevel, wine_dbgstr_rect(&rect_dst), region );
+
+    /* The drawable can change size while this DC remains cached, notably when
+     * a hidden Chromium popup grows from its initial 64x64 surface.  Refresh
+     * both the drawable and its DC extent before every copy; otherwise GDI
+     * clips the source to the stale extent and publishes an unpainted tail. */
+    SetRect( &rect_src_dc, 0, 0, rect_src.right - rect_src.left,
+             rect_src.bottom - rect_src.top );
+    if (get_dc_drawable( surface->hdc_src, &rect ) != surface->window ||
+        !EqualRect( &rect, &rect_src_dc ))
+        set_dc_drawable( surface->hdc_src, surface->window, &rect_src_dc, IncludeInferiors );
+
     if (get_dc_drawable( surface->hdc_dst, &rect ) != window || !EqualRect( &rect, &rect_dst ))
         set_dc_drawable( surface->hdc_dst, window, &rect_dst, IncludeInferiors );
     /* RGN_COPY with a null region clears a clip left by an earlier present. */

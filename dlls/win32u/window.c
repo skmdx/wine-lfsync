@@ -396,9 +396,19 @@ static void client_surface_update_locked( struct client_surface *surface )
 {
     RECT virtual_rect = surface->virtual_rect, monitor_rect = surface->monitor_rect;
     HWND toplevel = surface->toplevel;
+    RECT old_source_rect = surface->raw ? monitor_rect : virtual_rect;
+    RECT new_source_rect;
 
     surface->toplevel = NtUserGetAncestor( surface->hwnd, GA_ROOT );
     surface->virtual_rect = get_client_surface_rects( surface->toplevel, surface->hwnd, &surface->monitor_rect );
+    new_source_rect = surface->raw ? surface->monitor_rect : surface->virtual_rect;
+
+    /* A larger drawable contains pixels for which no completed application
+     * frame exists yet.  Do not treat its old intersection as a complete
+     * frame merely because it can be copied by the host driver. */
+    if (new_source_rect.right - new_source_rect.left > old_source_rect.right - old_source_rect.left ||
+        new_source_rect.bottom - new_source_rect.top > old_source_rect.bottom - old_source_rect.top)
+        surface->content_valid = FALSE;
 
     TRACE( "updating %s, toplevel %p, virtual_rect %s, monitor_rect %s\n", debugstr_client_surface( surface ), surface->toplevel,
            wine_dbgstr_rect( &surface->virtual_rect ), wine_dbgstr_rect( &surface->monitor_rect ) );
@@ -410,6 +420,7 @@ static void client_surface_update_locked( struct client_surface *surface )
 }
 
 static BOOL client_surface_is_above( HWND hwnd, HWND other );
+static void client_surface_recompose( struct client_surface *surface );
 
 static BOOL queue_client_surface_recompose_locked( struct client_surface *surface,
                                                    struct client_surface ***surfaces,
@@ -490,12 +501,12 @@ void update_client_surfaces( HWND hwnd )
     /* Publish cached content through the normal generation protocol.  A raw
      * driver copy here can repair the pixels while leaving a staged menu
      * publication out of sync with the server.  Present outside surfaces_lock
-     * because client_surface_present() acquires it itself. */
+     * because client_surface_recompose() acquires it itself. */
     for (i = 0; i < recompose_count; ++i)
     {
         TRACE( "recomposing newly exposed %s from cached content\n",
                debugstr_client_surface( recompose_surfaces[i] ) );
-        client_surface_present( recompose_surfaces[i] );
+        client_surface_recompose( recompose_surfaces[i] );
         client_surface_release( recompose_surfaces[i] );
     }
     free( recompose_surfaces );
@@ -594,7 +605,6 @@ static BOOL client_surface_compose_locked( struct client_surface *surface, BOOL 
     HDC hdc = 0;
     HWND hwnd = surface->hwnd;
 
-    client_surface_update_locked( surface );
     if (expected_size &&
         (surface->virtual_rect.right - surface->virtual_rect.left != expected_size->cx ||
          surface->virtual_rect.bottom - surface->virtual_rect.top != expected_size->cy))
@@ -635,8 +645,8 @@ UINT client_surface_begin_present( struct client_surface *surface )
     return generation;
 }
 
-BOOL client_surface_end_present( struct client_surface *surface, UINT generation,
-                                 const SIZE *expected_size )
+static BOOL client_surface_end_present_internal( struct client_surface *surface, UINT generation,
+                                                 const SIZE *expected_size, BOOL new_content )
 {
     HWND hwnd, toplevel = 0;
     BOOL composed = FALSE, sync = !!generation, wake = FALSE;
@@ -645,7 +655,13 @@ BOOL client_surface_end_present( struct client_surface *surface, UINT generation
     if ((hwnd = surface->hwnd))
     {
         if (sync) TRACE( "client surface %p starts staged composition commit\n", hwnd );
-        composed = client_surface_compose_locked( surface, sync, expected_size );
+        client_surface_update_locked( surface );
+        if (new_content || surface->content_valid)
+            composed = client_surface_compose_locked( surface, sync, expected_size );
+        else
+            TRACE( "not recomposing incomplete cached content for %s\n",
+                   debugstr_client_surface( surface ) );
+        if (composed && new_content) surface->content_valid = TRUE;
         if (composed && surface->active && sync)
             toplevel = set_client_surface_server_state( hwnd, CLIENT_SURFACE_STATE_PRESENT_COMMIT,
                                                         generation, &wake, NULL, NULL );
@@ -658,10 +674,22 @@ BOOL client_surface_end_present( struct client_surface *surface, UINT generation
     return composed;
 }
 
+BOOL client_surface_end_present( struct client_surface *surface, UINT generation,
+                                 const SIZE *expected_size )
+{
+    return client_surface_end_present_internal( surface, generation, expected_size, TRUE );
+}
+
 void client_surface_present( struct client_surface *surface )
 {
     UINT generation = client_surface_begin_present( surface );
-    client_surface_end_present( surface, generation, NULL );
+    client_surface_end_present_internal( surface, generation, NULL, TRUE );
+}
+
+static void client_surface_recompose( struct client_surface *surface )
+{
+    UINT generation = client_surface_begin_present( surface );
+    client_surface_end_present_internal( surface, generation, NULL, FALSE );
 }
 
 void recompose_client_surfaces( HWND hwnd )
@@ -687,7 +715,7 @@ void recompose_client_surfaces( HWND hwnd )
     {
         TRACE( "recomposing geometry-ready %s from cached content\n",
                debugstr_client_surface( surfaces[i] ) );
-        client_surface_present( surfaces[i] );
+        client_surface_recompose( surfaces[i] );
         client_surface_release( surfaces[i] );
     }
     free( surfaces );

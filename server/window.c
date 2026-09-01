@@ -2887,6 +2887,15 @@ DECL_HANDLER(set_client_surface_state)
         top->client_surface_staged = top->client_surface_dirty && is_visible( top );
         if (top->client_surface_staged && !++top->client_surface_generation)
             top->client_surface_generation++;
+        /* The host driver has now mapped the top-level window into its private
+         * staging buffer.  A client surface may already contain a complete
+         * frame presented while the hierarchy was hidden and the application
+         * is not required to present another one merely because it became
+         * visible.  Notify each owning process to recompose that cached frame
+         * into this publication generation.  Incomplete cached surfaces are
+         * rejected by the client-side completeness check and remain staged
+         * until an application present completes them. */
+        if (top->client_surface_staged) notify_client_surface_geometry_ready( top );
     }
     if (req->flags & CLIENT_SURFACE_STATE_BYPASS)
     {

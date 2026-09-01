@@ -271,6 +271,7 @@ struct client_surface
     HWND                               toplevel;       /* toplevel window of the surface */
     LONG                               offscreen;      /* client window is offscreen */
     LONG                               active;         /* registered as active with the Wine server */
+    BOOL                               content_valid;  /* complete content exists at the current size */
     RECT                               virtual_rect;   /* virtual size and position in the toplevel ancestor, relative to its visible rect */
     RECT                               monitor_rect;   /* raw physical size and position in the toplevel ancestor, relative to its visible rect */
     BOOL                               raw;            /* use the raw physical position and size for the host client surface */
