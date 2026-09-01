@@ -2854,13 +2854,10 @@ void queue_cleanup_window( struct thread *thread, user_handle_t win )
     thread_input_cleanup_window( queue, win );
 }
 
-/* post a message to a window */
-void post_message( user_handle_t win, unsigned int message, lparam_t wparam, lparam_t lparam )
+static void post_thread_message( struct thread *thread, user_handle_t win, unsigned int message,
+                                 lparam_t wparam, lparam_t lparam )
 {
     struct message *msg;
-    struct thread *thread = get_window_thread( win );
-
-    if (!thread) return;
 
     if (thread->queue && (msg = mem_alloc( sizeof(*msg) )))
     {
@@ -2883,7 +2880,37 @@ void post_message( user_handle_t win, unsigned int message, lparam_t wparam, lpa
             thread->queue->hotkey_count++;
         }
     }
+}
+
+/* post a message to a window */
+void post_message( user_handle_t win, unsigned int message, lparam_t wparam, lparam_t lparam )
+{
+    struct thread *thread = get_window_thread( win );
+
+    if (!thread) return;
+    post_thread_message( thread, win, message, wparam, lparam );
     release_object( thread );
+}
+
+/* Post an internal message to the process queue which was accessed most
+ * recently.  Client-rendered surfaces are process-local, but the HWND they
+ * render may belong to a different process. */
+void post_process_message( struct process *process, user_handle_t win, unsigned int message,
+                           lparam_t wparam, lparam_t lparam )
+{
+    struct thread *thread, *target = NULL;
+    timeout_t access_time = 0;
+
+    LIST_FOR_EACH_ENTRY( thread, &process->thread_list, struct thread, proc_entry )
+    {
+        if (thread->is_system || thread->state != RUNNING || !thread->queue) continue;
+        if (!target || thread->queue->shared->access_time > access_time)
+        {
+            target = thread;
+            access_time = thread->queue->shared->access_time;
+        }
+    }
+    if (target) post_thread_message( target, win, message, wparam, lparam );
 }
 
 /* send a notify message to a window */

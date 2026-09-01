@@ -6284,6 +6284,8 @@ struct set_client_surface_state_reply
 #define CLIENT_SURFACE_STATE_STAGED         0x10
 #define CLIENT_SURFACE_STATE_BYPASS         0x20
 #define CLIENT_SURFACE_STATE_GEOMETRY_READY 0x40
+#define CLIENT_SURFACE_STATE_CACHE           0x80
+#define CLIENT_SURFACE_STATE_UNCACHE         0x100
 
 
 enum request

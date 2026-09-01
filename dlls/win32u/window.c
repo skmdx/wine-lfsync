@@ -324,14 +324,23 @@ static void client_surface_detach_locked( struct client_surface *surface )
 {
     HWND toplevel;
     BOOL wake;
+    UINT flags = 0;
 
     if (!surface->hwnd) return;
 
     if (surface->active)
     {
-        toplevel = set_client_surface_server_state( surface->hwnd, CLIENT_SURFACE_STATE_UNREGISTER,
-                                                    0, &wake, NULL, NULL );
+        flags |= CLIENT_SURFACE_STATE_UNREGISTER;
         surface->active = FALSE;
+    }
+    if (surface->server_cached)
+    {
+        flags |= CLIENT_SURFACE_STATE_UNCACHE;
+        surface->server_cached = FALSE;
+    }
+    if (flags)
+    {
+        toplevel = set_client_surface_server_state( surface->hwnd, flags, 0, &wake, NULL, NULL );
         if (wake && toplevel) NtUserPostMessage( toplevel, WM_WINE_UPDATEWINDOWSTATE, 0, 0 );
     }
     list_remove( &surface->entry );
@@ -574,27 +583,47 @@ static BOOL client_surface_is_above( HWND hwnd, HWND other )
     return FALSE;
 }
 
+static void subtract_client_surface_region_locked( struct client_surface *surface,
+                                                   struct client_surface *other, HRGN *region )
+{
+    RECT other_rect;
+    HRGN other_region;
+    HWND toplevel;
+
+    if (other == surface || (!other->active && !other->content_valid) ||
+        !(toplevel = NtUserGetAncestor( other->hwnd, GA_ROOT )) ||
+        toplevel != surface->toplevel || !NtUserIsWindowVisible( other->hwnd ) ||
+        !client_surface_is_above( other->hwnd, surface->hwnd ))
+        return;
+
+    /* An unused cached surface can remain visibly published after its WGL or
+     * Vulkan drawable is released.  Resolve its current window geometry here
+     * instead of relying on the geometry cached on the last presentation. */
+    get_client_surface_rects( toplevel, other->hwnd, &other_rect );
+    if (IsRectEmpty( &other_rect )) return;
+
+    if (!*region && !(*region = NtGdiCreateRectRgn( surface->monitor_rect.left,
+                                                    surface->monitor_rect.top,
+                                                    surface->monitor_rect.right,
+                                                    surface->monitor_rect.bottom )))
+        return;
+    if ((other_region = NtGdiCreateRectRgn( other_rect.left, other_rect.top,
+                                            other_rect.right, other_rect.bottom )))
+    {
+        NtGdiCombineRgn( *region, *region, other_region, RGN_DIFF );
+        NtGdiDeleteObjectApp( other_region );
+    }
+}
+
 static HRGN get_client_surface_region_locked( struct client_surface *surface )
 {
     struct client_surface *other;
-    HRGN region = 0, other_region;
+    HRGN region = 0;
 
     LIST_FOR_EACH_ENTRY( other, &client_surfaces, struct client_surface, entry )
-    {
-        if (other == surface || other->toplevel != surface->toplevel) continue;
-        if (!NtUserIsWindowVisible( other->hwnd ) || !client_surface_is_above( other->hwnd, surface->hwnd )) continue;
-        if (IsRectEmpty( &other->monitor_rect )) continue;
-
-        if (!region && !(region = NtGdiCreateRectRgn( surface->monitor_rect.left, surface->monitor_rect.top,
-                                                       surface->monitor_rect.right, surface->monitor_rect.bottom )))
-            break;
-        if ((other_region = NtGdiCreateRectRgn( other->monitor_rect.left, other->monitor_rect.top,
-                                                other->monitor_rect.right, other->monitor_rect.bottom )))
-        {
-            NtGdiCombineRgn( region, region, other_region, RGN_DIFF );
-            NtGdiDeleteObjectApp( other_region );
-        }
-    }
+        subtract_client_surface_region_locked( surface, other, &region );
+    LIST_FOR_EACH_ENTRY( other, &unused_surfaces, struct client_surface, entry )
+        subtract_client_surface_region_locked( surface, other, &region );
     return region;
 }
 
@@ -709,6 +738,17 @@ void recompose_client_surfaces( HWND hwnd )
             break;
         }
     }
+    LIST_FOR_EACH_ENTRY( surface, &unused_surfaces, struct client_surface, entry )
+    {
+        if (surface->toplevel != toplevel || !surface->content_valid ||
+            !NtUserIsWindowVisible( surface->hwnd ))
+            continue;
+        if (!queue_client_surface_recompose_locked( surface, &surfaces, &count, &size ))
+        {
+            WARN( "failed to allocate cached geometry-ready client surface list\n" );
+            break;
+        }
+    }
     pthread_mutex_unlock( &surfaces_lock );
 
     for (i = 0; i < count; ++i)
@@ -767,6 +807,7 @@ void use_window_client_surface( struct client_surface *surface, BOOL use )
 {
     HWND hwnd = 0, toplevel;
     BOOL wake = FALSE;
+    UINT flags;
 
     TRACE( "surface %s, use %u\n", debugstr_client_surface( surface ), use );
 
@@ -780,6 +821,12 @@ void use_window_client_surface( struct client_surface *surface, BOOL use )
         list_add_tail( &client_surfaces, &surface->entry );
         client_surface_update_locked( surface );
         surface->active = TRUE;
+        flags = CLIENT_SURFACE_STATE_REGISTER;
+        if (surface->server_cached)
+        {
+            flags |= CLIENT_SURFACE_STATE_UNCACHE;
+            surface->server_cached = FALSE;
+        }
         hwnd = surface->hwnd;
     }
     else
@@ -788,6 +835,12 @@ void use_window_client_surface( struct client_surface *surface, BOOL use )
         list_add_head( &unused_surfaces, &surface->entry ); /* add it to the head, so we discard older ones */
         client_surface_add_ref( surface );
         surface->active = FALSE;
+        flags = CLIENT_SURFACE_STATE_UNREGISTER;
+        if (surface->content_valid)
+        {
+            flags |= CLIENT_SURFACE_STATE_CACHE;
+            surface->server_cached = TRUE;
+        }
         hwnd = surface->hwnd;
     }
 
@@ -795,9 +848,7 @@ void use_window_client_surface( struct client_surface *surface, BOOL use )
 
     if (hwnd)
     {
-        toplevel = set_client_surface_server_state( hwnd, use ? CLIENT_SURFACE_STATE_REGISTER :
-                                                    CLIENT_SURFACE_STATE_UNREGISTER,
-                                                    0, &wake, NULL, NULL );
+        toplevel = set_client_surface_server_state( hwnd, flags, 0, &wake, NULL, NULL );
         if (wake && toplevel) NtUserPostMessage( toplevel, WM_WINE_UPDATEWINDOWSTATE, 0, 0 );
     }
 }

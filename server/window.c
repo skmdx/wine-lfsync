@@ -53,6 +53,14 @@ enum property_type
     PROP_TYPE_ATOM    /* plain atom */
 };
 
+struct client_surface_owner
+{
+    struct list     entry;
+    struct process *process;
+    unsigned int    active_count;
+    unsigned int    cached_count;
+};
+
 
 struct window
 {
@@ -87,7 +95,9 @@ struct window
     data_size_t      text_len;        /* length of window caption */
     unsigned int     paint_flags;     /* various painting flags */
     int              pixel_format;    /* pixel format selected for the window */
+    struct list      client_surface_owners; /* processes holding active or cached surfaces */
     unsigned int     client_surface_count; /* active client-rendered surfaces for this window */
+    unsigned int     client_surface_cached_count; /* cached client-rendered surfaces owned by this window */
     unsigned int     client_surface_dirty; /* top-level composition changed while hidden */
     unsigned int     client_surface_staged; /* host window is mapped into an unpublished composition */
     unsigned int     client_surface_generation; /* current unpublished composition generation */
@@ -151,6 +161,7 @@ static void window_dump( struct object *obj, int verbose )
 static void window_destroy( struct object *obj )
 {
     struct window *win = (struct window *)obj;
+    struct client_surface_owner *owner, *next;
 
     assert( !win->handle );
 
@@ -164,6 +175,14 @@ static void window_destroy( struct object *obj )
     if (win->update_region) free_region( win->update_region );
     if (win->class) release_class( win->class );
     free( win->text );
+
+    LIST_FOR_EACH_ENTRY_SAFE( owner, next, &win->client_surface_owners,
+                              struct client_surface_owner, entry )
+    {
+        list_remove( &owner->entry );
+        release_object( owner->process );
+        free( owner );
+    }
 
     if (win->shared) free_shared_object( win->shared );
 }
@@ -703,7 +722,9 @@ static struct window *create_window( struct window *parent, struct window *owner
     win->text_len       = 0;
     win->paint_flags    = 0;
     win->pixel_format   = 0;
+    list_init( &win->client_surface_owners );
     win->client_surface_count  = 0;
+    win->client_surface_cached_count = 0;
     win->client_surface_dirty  = 0;
     win->client_surface_staged = 0;
     win->client_surface_generation = 0;
@@ -932,14 +953,71 @@ static int has_active_client_surface( const struct window *win )
     return 0;
 }
 
-static void notify_client_surface_geometry_ready( struct window *win )
+static struct client_surface_owner *get_client_surface_owner( struct window *win,
+                                                              struct process *process, int create )
 {
-    struct window *child;
+    struct client_surface_owner *owner;
 
-    if (win->client_surface_count)
-        post_message( win->handle, WM_WINE_UPDATEWINDOWSTATE, WINE_UPDATE_CLIENT_SURFACES, 0 );
+    LIST_FOR_EACH_ENTRY( owner, &win->client_surface_owners, struct client_surface_owner, entry )
+        if (owner->process == process) return owner;
+    if (!create || !(owner = mem_alloc( sizeof(*owner) ))) return NULL;
+    owner->process = (struct process *)grab_object( process );
+    owner->active_count = 0;
+    owner->cached_count = 0;
+    list_add_tail( &win->client_surface_owners, &owner->entry );
+    return owner;
+}
+
+static void release_client_surface_owner( struct client_surface_owner *owner )
+{
+    if (owner->active_count || owner->cached_count) return;
+    list_remove( &owner->entry );
+    release_object( owner->process );
+    free( owner );
+}
+
+static void discard_client_surface_owner( struct window *win, struct client_surface_owner *owner )
+{
+    if (win->client_surface_count >= owner->active_count)
+        win->client_surface_count -= owner->active_count;
+    else win->client_surface_count = 0;
+    if (win->client_surface_cached_count >= owner->cached_count)
+        win->client_surface_cached_count -= owner->cached_count;
+    else win->client_surface_cached_count = 0;
+    owner->active_count = 0;
+    owner->cached_count = 0;
+    release_client_surface_owner( owner );
+}
+
+static int notify_client_surface_geometry_ready( struct window *win )
+{
+    struct client_surface_owner *owner, *next;
+    struct window *child;
+    int removed_active = 0;
+
+    LIST_FOR_EACH_ENTRY_SAFE( owner, next, &win->client_surface_owners,
+                              struct client_surface_owner, entry )
+    {
+        /* A renderer can terminate without detaching its process-local
+         * surfaces.  Do not retain its process object or stale counts for the
+         * lifetime of a foreign HWND. */
+        if (!owner->process->running_threads)
+        {
+            if (owner->active_count) removed_active = 1;
+            discard_client_surface_owner( win, owner );
+            continue;
+        }
+        post_process_message( owner->process, win->handle, WM_WINE_UPDATEWINDOWSTATE,
+                              WINE_UPDATE_CLIENT_SURFACES, 0 );
+    }
     LIST_FOR_EACH_ENTRY( child, &win->children, struct window, entry )
-        notify_client_surface_geometry_ready( child );
+        removed_active |= notify_client_surface_geometry_ready( child );
+    if (removed_active && !has_active_client_surface( win ))
+    {
+        win->client_surface_dirty = 0;
+        win->client_surface_staged = 0;
+    }
+    return removed_active;
 }
 
 static struct window *get_toplevel_window( struct window *win )
@@ -2871,6 +2949,7 @@ DECL_HANDLER(set_window_pos)
  * entire host window publishable again. */
 DECL_HANDLER(set_client_surface_state)
 {
+    struct client_surface_owner *owner;
     struct window *win, *top;
     int was_pending;
 
@@ -2881,21 +2960,39 @@ DECL_HANDLER(set_client_surface_state)
     if (!(win = get_window( req->handle ))) return;
     top = get_toplevel_window( win );
     was_pending = top->client_surface_dirty;
+    owner = get_client_surface_owner( win, current->process,
+                                      req->flags & (CLIENT_SURFACE_STATE_REGISTER |
+                                                    CLIENT_SURFACE_STATE_CACHE) );
+    if ((req->flags & (CLIENT_SURFACE_STATE_REGISTER | CLIENT_SURFACE_STATE_CACHE)) && !owner)
+        return;
 
+    if (req->flags & CLIENT_SURFACE_STATE_CACHE)
+    {
+        win->client_surface_cached_count++;
+        owner->cached_count++;
+    }
+    if (req->flags & CLIENT_SURFACE_STATE_UNCACHE)
+    {
+        if (win->client_surface_cached_count) win->client_surface_cached_count--;
+        if (owner && owner->cached_count) owner->cached_count--;
+    }
     if (req->flags & CLIENT_SURFACE_STATE_REGISTER)
     {
         win->client_surface_count++;
+        owner->active_count++;
         if (!is_visible( top )) top->client_surface_dirty = 1;
     }
     if (req->flags & CLIENT_SURFACE_STATE_UNREGISTER)
     {
         if (win->client_surface_count) win->client_surface_count--;
+        if (owner && owner->active_count) owner->active_count--;
         if (!has_active_client_surface( top ))
         {
             top->client_surface_dirty = 0;
             top->client_surface_staged = 0;
         }
     }
+    if (owner) release_client_surface_owner( owner );
     if (req->flags & CLIENT_SURFACE_STATE_STAGED)
     {
         top->client_surface_staged = top->client_surface_dirty && is_visible( top );
