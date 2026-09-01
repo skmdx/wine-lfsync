@@ -285,6 +285,7 @@ W32KAPI void client_surface_present( struct client_surface *surface );
 W32KAPI UINT client_surface_begin_present( struct client_surface *surface );
 W32KAPI BOOL client_surface_end_present( struct client_surface *surface, UINT generation,
                                          const SIZE *expected_size );
+W32KAPI void client_surface_geometry_ready( HWND hwnd );
 W32KAPI void client_surface_set_staged( HWND hwnd );
 W32KAPI void client_surface_bypass_staging( HWND hwnd );
 W32KAPI void update_client_surfaces( HWND hwnd );

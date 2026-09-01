@@ -761,7 +761,7 @@ void recompose_client_surfaces( HWND hwnd )
     free( surfaces );
 }
 
-static void client_surface_geometry_ready( HWND hwnd )
+void client_surface_geometry_ready( HWND hwnd )
 {
     set_client_surface_server_state( hwnd, CLIENT_SURFACE_STATE_GEOMETRY_READY,
                                      0, NULL, NULL, NULL );

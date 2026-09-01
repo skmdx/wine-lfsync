@@ -959,11 +959,14 @@ static BOOL X11DRV_ConfigureNotify( HWND hwnd, XEvent *xev )
     XConfigureEvent *event = &xev->xconfigure;
     SIZE size = {event->width, event->height};
     struct x11drv_win_data *data;
+    BOOL size_changed;
     RECT rect;
     POINT pos = {event->x, event->y};
 
     if (!hwnd) return FALSE;
     if (!(data = get_win_data( hwnd ))) return FALSE;
+    size_changed = data->current_state.rect.right - data->current_state.rect.left != size.cx ||
+                   data->current_state.rect.bottom - data->current_state.rect.top != size.cy;
 
     /* update our view of the window tree for mouse event coordinate mapping */
     if (data->whole_window && data->parent && !data->parent_invalid)
@@ -982,6 +985,13 @@ static BOOL X11DRV_ConfigureNotify( HWND hwnd, XEvent *xev )
     window_configure_notify( data, event->serial, &rect );
 
     release_win_data( data );
+
+    /* XSync after a managed resize only proves that the request reached the
+     * window manager.  ConfigureNotify is the first event which proves the
+     * host drawable has its new extent.  Recompose completed client surfaces
+     * now so an early present cannot leave the newly exposed tail black. */
+    if (size_changed && NtUserGetAncestor( hwnd, GA_ROOT ) == hwnd)
+        client_surface_geometry_ready( hwnd );
 
     return NtUserPostMessage( hwnd, WM_WINE_WINDOW_STATE_CHANGED, 0, 0 );
 }
