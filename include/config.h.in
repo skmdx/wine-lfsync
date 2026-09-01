@@ -678,6 +678,9 @@
 /* Define to 1 if you have the <X11/extensions/shape.h> header file. */
 #undef HAVE_X11_EXTENSIONS_SHAPE_H
 
+/* Define to 1 if you have the <X11/extensions/Xdamage.h> header file. */
+#undef HAVE_X11_EXTENSIONS_XDAMAGE_H
+
 /* Define to 1 if you have the <X11/extensions/xf86vmode.h> header file. */
 #undef HAVE_X11_EXTENSIONS_XF86VMODE_H
 
@@ -812,6 +815,9 @@
 
 /* Define to the soname of the libXcursor library. */
 #undef SONAME_LIBXCURSOR
+
+/* Define to the soname of the libXdamage library. */
+#undef SONAME_LIBXDAMAGE
 
 /* Define to the soname of the libXext library. */
 #undef SONAME_LIBXEXT

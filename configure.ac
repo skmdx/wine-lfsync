@@ -66,6 +66,8 @@ AC_ARG_WITH(xcomposite,AS_HELP_STRING([--without-xcomposite],[do not use the Xco
             [if test "x$withval" = "xno"; then ac_cv_header_X11_extensions_Xcomposite_h=no; fi])
 AC_ARG_WITH(xcursor,   AS_HELP_STRING([--without-xcursor],[do not use the Xcursor extension]),
             [if test "x$withval" = "xno"; then ac_cv_header_X11_Xcursor_Xcursor_h=no; fi])
+AC_ARG_WITH(xdamage,   AS_HELP_STRING([--without-xdamage],[do not use the Xdamage extension]),
+            [if test "x$withval" = "xno"; then ac_cv_header_X11_extensions_Xdamage_h=no; fi])
 AC_ARG_WITH(xfixes,  AS_HELP_STRING([--without-xfixes],[do not use Xfixes for clipboard change notifications]),
             [if test "x$withval" = "xno"; then ac_cv_header_X11_extensions_Xfixes_h=no; fi])
 AC_ARG_WITH(xinerama,  AS_HELP_STRING([--without-xinerama],[do not use Xinerama (legacy multi-monitor support)]),
@@ -1292,6 +1294,7 @@ then
 
     dnl *** All of the following tests require X11/Xlib.h
     AC_CHECK_HEADERS([X11/extensions/shape.h \
+                      X11/extensions/Xdamage.h \
                       X11/extensions/XInput2.h \
                       X11/extensions/XShm.h \
                       X11/extensions/Xfixes.h \
@@ -1378,6 +1381,16 @@ then
         fi
         WINE_NOTICE_WITH(xrandr,[test "x$ac_cv_lib_soname_Xrandr" = "x"],
                          [libxrandr ${notice_platform}development files not found, XRandr won't be supported.])
+
+        dnl *** Check for Xdamage extension
+        if test "$ac_cv_header_X11_extensions_Xdamage_h" = "yes"
+        then
+                AC_COMPILE_IFELSE([AC_LANG_PROGRAM([[#include <X11/Xlib.h>
+#include <X11/extensions/Xdamage.h>]], [[static typeof(XDamageQueryExtension) * func; if (func) return 0;]])],
+                  [WINE_CHECK_SONAME(Xdamage,XDamageQueryExtension,,,[$X_LIBS])])
+        fi
+        WINE_NOTICE_WITH(xdamage,[test "x$ac_cv_lib_soname_Xdamage" = "x"],
+                         [libxdamage ${notice_platform}development files not found, Xdamage won't be supported.])
 
         dnl *** Check for Xfixes extension
         if test "$ac_cv_header_X11_extensions_Xfixes_h" = "yes"
