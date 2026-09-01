@@ -320,8 +320,14 @@ static void client_surface_update_geometry( HWND hwnd, struct x11drv_client_surf
 
 static void client_surface_update_offscreen( HWND hwnd, struct x11drv_client_surface *surface )
 {
-    BOOL offscreen = needs_offscreen_rendering( hwnd, surface->client.raw );
+    BOOL offscreen;
     struct x11drv_win_data *data;
+
+    /* A hidden window needs the mapped dummy parent while it renders.  If it
+     * actually presents there, X11DRV_client_surface_present() makes this
+     * choice permanent so showing it cannot discard that completed frame. */
+    offscreen = !NtUserIsWindowVisible( hwnd ) || surface->keep_offscreen ||
+                needs_offscreen_rendering( hwnd, surface->client.raw );
 
     if (InterlockedExchange( &surface->client.offscreen, offscreen ) == offscreen)
     {
@@ -419,6 +425,12 @@ static BOOL X11DRV_client_surface_present( struct client_surface *client, HDC hd
         if (flush) XFlush( gdi_display );
         return TRUE;
     }
+
+    /* Reparenting or unredirecting this drawable after a hidden presentation
+     * destroys its native back buffer.  Keep only surfaces which really
+     * presented while hidden on the stable offscreen composition path. */
+    if (!NtUserIsWindowVisible( hwnd )) surface->keep_offscreen = TRUE;
+
     window = X11DRV_get_whole_window( toplevel );
     client_surface_enable_backing_store( surface, window );
 

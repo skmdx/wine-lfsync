@@ -372,6 +372,7 @@ struct x11drv_client_surface
     Colormap colormap;
     Window window;
     Window backing_window;  /* whole window with backing store enabled */
+    BOOL keep_offscreen;    /* preserve a drawable which was used while hidden */
 
     HDC hdc_src;
     HDC hdc_dst;
