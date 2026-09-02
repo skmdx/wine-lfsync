@@ -1520,33 +1520,44 @@ static BOOL x11drv_surface_swap( struct opengl_drawable *base )
 {
     GLXContext ctx = NtCurrentTeb()->glReserved2;
     struct gl_drawable *gl = impl_from_opengl_drawable( base );
-    INT64 ust, msc, sbc, target_sbc = 0;
-    BOOL offscreen;
+    INT64 ust, msc, sbc, target_sbc;
+    BOOL offscreen, use_damage_wait = FALSE, use_oml_wait;
 
     TRACE( "drawable %s\n", debugstr_opengl_drawable( base ) );
 
     offscreen = InterlockedCompareExchange( &base->client->offscreen, 0, 0 );
 #if defined(HAVE_X11_EXTENSIONS_XDAMAGE_H) && defined(SONAME_LIBXDAMAGE)
-    if (offscreen && gl->damage) x11drv_surface_prepare_swap( gl );
+    use_damage_wait = offscreen && gl->damage;
+    if (use_damage_wait) x11drv_surface_prepare_swap( gl );
 #endif
+    /* Damage observes the redirected pixmap which client_surface_present()
+     * copies, so it is the authoritative completion boundary when available.
+     * OML observes the GLX swap itself and is retained as the fallback. */
+    use_oml_wait = offscreen && !use_damage_wait && ctx &&
+                   pglXSwapBuffersMscOML && pglXWaitForSbcOML;
 
-    if (!offscreen ||
-        !ctx || !pglXSwapBuffersMscOML) pglXSwapBuffers( gdi_display, gl->drawable );
+    if (!use_oml_wait) pglXSwapBuffers( gdi_display, gl->drawable );
     else
     {
         funcs->p_glFlush();
         target_sbc = pglXSwapBuffersMscOML( gdi_display, gl->drawable, 0, 0, 0 );
-        if (pglXWaitForSbcOML) pglXWaitForSbcOML( gdi_display, gl->drawable, target_sbc, &ust, &msc, &sbc );
+        if (target_sbc < 0 ||
+            !pglXWaitForSbcOML( gdi_display, gl->drawable, target_sbc, &ust, &msc, &sbc ))
+        {
+            WARN( "Failed waiting for GLX swap completion for %s\n",
+                  debugstr_opengl_drawable( base ) );
+            return FALSE;
+        }
     }
 
 #if defined(HAVE_X11_EXTENSIONS_XDAMAGE_H) && defined(SONAME_LIBXDAMAGE)
-    if (offscreen && gl->damage)
+    if (use_damage_wait)
     {
         if (!x11drv_surface_wait_swap( gl )) return FALSE;
     }
-    else if (offscreen && !pglXWaitForSbcOML) XFlush( gdi_display );
+    else if (offscreen && !use_oml_wait) XFlush( gdi_display );
 #else
-    if (offscreen && !pglXWaitForSbcOML) XFlush( gdi_display );
+    if (offscreen && !use_oml_wait) XFlush( gdi_display );
 #endif
 
     client_surface_present( base->client );
@@ -1570,13 +1581,18 @@ static void x11drv_surface_prepare_swap( struct gl_drawable *gl )
     XEvent event;
 
     if (!gl->damage) return;
-    while (XPending( gl->damage_display )) XNextEvent( gl->damage_display, &event );
-    pXDamageSubtract( gl->damage_display, gl->damage, None, None );
-    /* The empty region must exist at the server before this swap is queued on
-     * the EGL connection.  The next transition to non-empty then identifies
-     * this swap rather than damage left by an earlier frame. */
-    XSync( gl->damage_display, False );
-    while (XPending( gl->damage_display )) XNextEvent( gl->damage_display, &event );
+    do
+    {
+        while (XPending( gl->damage_display )) XNextEvent( gl->damage_display, &event );
+        pXDamageSubtract( gl->damage_display, gl->damage, None, None );
+        /* The empty region must exist at the server before this swap is
+         * queued on the EGL connection.  Damage from another connection can
+         * race the subtract request and enqueue an event while leaving the
+         * region non-empty.  Drain and subtract again in that case; merely
+         * discarding the event would prevent the next non-empty transition
+         * and make the following swap wait time out. */
+        XSync( gl->damage_display, False );
+    } while (XPending( gl->damage_display ));
 }
 
 static BOOL x11drv_surface_wait_swap( struct gl_drawable *gl )
