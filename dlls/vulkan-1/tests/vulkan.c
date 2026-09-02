@@ -915,6 +915,163 @@ static void test_win32_surface_swapchain_hwnd(VkDevice device, VkSwapchainKHR sw
     free(images);
 }
 
+#define MULTI_SWAPCHAIN_COUNT 17
+#define MULTI_PRESENT_ROUNDS 4
+
+struct multi_swapchain
+{
+    HWND hwnd;
+    VkSurfaceKHR surface;
+    VkSwapchainKHR swapchain;
+    VkImage *images;
+    uint32_t image_count;
+    uint32_t image_index;
+};
+
+static void test_win32_surface_multi_swapchain(VkInstance instance, VkPhysicalDevice physical_device,
+        VkDevice device, VkQueue queue, VkCommandBuffer command_buffer)
+{
+    VkWin32SurfaceCreateInfoKHR surface_info = {.sType = VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR};
+    VkCommandBufferBeginInfo begin_info = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    VkFenceCreateInfo fence_info = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+    VkPresentInfoKHR present_info = {.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
+    VkSubmitInfo submit_info = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    VkImageMemoryBarrier barriers[MULTI_SWAPCHAIN_COUNT];
+    VkSwapchainKHR swapchains[MULTI_SWAPCHAIN_COUNT];
+    uint32_t image_indices[MULTI_SWAPCHAIN_COUNT];
+    VkResult results[MULTI_SWAPCHAIN_COUNT];
+    struct multi_swapchain data[MULTI_SWAPCHAIN_COUNT];
+    VkFence fence = VK_NULL_HANDLE;
+    unsigned int created = 0, acquired, i, round;
+    VkResult vr;
+
+    memset(data, 0, sizeof(data));
+    vr = vkCreateFence(device, &fence_info, NULL, &fence);
+    ok(vr == VK_SUCCESS, "Got unexpected vr %d.\n", vr);
+    if (vr != VK_SUCCESS) return;
+
+    for (i = 0; i < MULTI_SWAPCHAIN_COUNT; ++i)
+    {
+        data[i].hwnd = CreateWindowW(L"static", L"multi swapchain", WS_POPUP | WS_VISIBLE,
+                40 + i, 40 + i, 160, 120, 0, 0, 0, NULL);
+        ok(!!data[i].hwnd, "Failed to create window %u, error %lu.\n", i, GetLastError());
+        if (!data[i].hwnd) break;
+
+        surface_info.hwnd = data[i].hwnd;
+        vr = vkCreateWin32SurfaceKHR(instance, &surface_info, NULL, &data[i].surface);
+        ok(vr == VK_SUCCESS, "Failed to create surface %u, vr %d.\n", i, vr);
+        if (vr != VK_SUCCESS) break;
+        vr = create_swapchain(physical_device, data[i].surface, device,
+                data[i].hwnd, &data[i].swapchain);
+        ok(vr == VK_SUCCESS, "Failed to create swapchain %u, vr %d.\n", i, vr);
+        if (vr != VK_SUCCESS) break;
+        vr = vkGetSwapchainImagesKHR(device, data[i].swapchain, &data[i].image_count, NULL);
+        ok(vr == VK_SUCCESS && data[i].image_count,
+                "Failed to get image count %u, count %u, vr %d.\n", i, data[i].image_count, vr);
+        if (vr != VK_SUCCESS || !data[i].image_count) break;
+        data[i].images = malloc(data[i].image_count * sizeof(*data[i].images));
+        ok(!!data[i].images, "Failed to allocate images %u.\n", i);
+        if (!data[i].images) break;
+        vr = vkGetSwapchainImagesKHR(device, data[i].swapchain,
+                &data[i].image_count, data[i].images);
+        ok(vr == VK_SUCCESS, "Failed to get images %u, vr %d.\n", i, vr);
+        if (vr != VK_SUCCESS) break;
+        ShowWindow(data[i].hwnd, SW_HIDE);
+        created++;
+    }
+    if (created != MULTI_SWAPCHAIN_COUNT)
+    {
+        skip("Could not create all multi-present swapchains.\n");
+        goto done;
+    }
+
+    for (round = 0; round < MULTI_PRESENT_ROUNDS; ++round)
+    {
+        acquired = 0;
+        for (i = 0; i < MULTI_SWAPCHAIN_COUNT; ++i)
+        {
+            vr = vkResetFences(device, 1, &fence);
+            ok(vr == VK_SUCCESS, "Round %u reset fence %u failed, vr %d.\n", round, i, vr);
+            vr = vkAcquireNextImageKHR(device, data[i].swapchain, UINT64_MAX,
+                    VK_NULL_HANDLE, fence, &data[i].image_index);
+            ok(vr == VK_SUCCESS || vr == VK_SUBOPTIMAL_KHR,
+                    "Round %u acquire %u failed, vr %d.\n", round, i, vr);
+            if (vr < VK_SUCCESS) break;
+            ok(data[i].image_index < data[i].image_count,
+                    "Round %u image %u index %u, count %u.\n",
+                    round, i, data[i].image_index, data[i].image_count);
+            vr = vkWaitForFences(device, 1, &fence, VK_FALSE, UINT64_MAX);
+            ok(vr == VK_SUCCESS, "Round %u wait fence %u failed, vr %d.\n", round, i, vr);
+            acquired++;
+        }
+        if (acquired != MULTI_SWAPCHAIN_COUNT) break;
+
+        memset(barriers, 0, sizeof(barriers));
+        for (i = 0; i < MULTI_SWAPCHAIN_COUNT; ++i)
+        {
+            barriers[i].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            barriers[i].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            barriers[i].newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+            barriers[i].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            barriers[i].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            barriers[i].image = data[i].images[data[i].image_index];
+            barriers[i].subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            barriers[i].subresourceRange.levelCount = 1;
+            barriers[i].subresourceRange.layerCount = 1;
+        }
+
+        vr = vkResetCommandBuffer(command_buffer, 0);
+        ok(vr == VK_SUCCESS, "Round %u reset command buffer failed, vr %d.\n", round, vr);
+        vr = vkBeginCommandBuffer(command_buffer, &begin_info);
+        ok(vr == VK_SUCCESS, "Round %u begin command buffer failed, vr %d.\n", round, vr);
+        vkCmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, NULL, 0, NULL,
+                MULTI_SWAPCHAIN_COUNT, barriers);
+        vr = vkEndCommandBuffer(command_buffer);
+        ok(vr == VK_SUCCESS, "Round %u end command buffer failed, vr %d.\n", round, vr);
+
+        vr = vkResetFences(device, 1, &fence);
+        ok(vr == VK_SUCCESS, "Round %u reset submit fence failed, vr %d.\n", round, vr);
+        submit_info.commandBufferCount = 1;
+        submit_info.pCommandBuffers = &command_buffer;
+        vr = vkQueueSubmit(queue, 1, &submit_info, fence);
+        ok(vr == VK_SUCCESS, "Round %u submit failed, vr %d.\n", round, vr);
+        vr = vkWaitForFences(device, 1, &fence, VK_FALSE, UINT64_MAX);
+        ok(vr == VK_SUCCESS, "Round %u submit wait failed, vr %d.\n", round, vr);
+
+        for (i = 0; i < MULTI_SWAPCHAIN_COUNT; ++i)
+        {
+            unsigned int index = round & 1 ? MULTI_SWAPCHAIN_COUNT - 1 - i : i;
+
+            swapchains[i] = data[index].swapchain;
+            image_indices[i] = data[index].image_index;
+            results[i] = VK_ERROR_UNKNOWN;
+        }
+        present_info.swapchainCount = MULTI_SWAPCHAIN_COUNT;
+        present_info.pSwapchains = swapchains;
+        present_info.pImageIndices = image_indices;
+        present_info.pResults = results;
+        vr = vkQueuePresentKHR(queue, &present_info);
+        ok(vr == VK_SUCCESS, "Round %u multi-present failed, vr %d.\n", round, vr);
+        for (i = 0; i < MULTI_SWAPCHAIN_COUNT; ++i)
+            ok(results[i] == VK_SUCCESS,
+                    "Round %u swapchain %u present result %d.\n", round, i, results[i]);
+    }
+    ok(round == MULTI_PRESENT_ROUNDS, "Completed only %u multi-present rounds.\n", round);
+    vr = vkQueueWaitIdle(queue);
+    ok(vr == VK_SUCCESS, "Queue wait idle failed, vr %d.\n", vr);
+
+done:
+    vkDestroyFence(device, fence, NULL);
+    for (i = 0; i < MULTI_SWAPCHAIN_COUNT; ++i)
+    {
+        free(data[i].images);
+        if (data[i].swapchain) vkDestroySwapchainKHR(device, data[i].swapchain, NULL);
+        if (data[i].surface) vkDestroySurfaceKHR(instance, data[i].surface, NULL);
+        if (data[i].hwnd) DestroyWindow(data[i].hwnd);
+    }
+}
+
 static void test_win32_surface(VkInstance instance, VkPhysicalDevice physical_device)
 {
     static const char *const device_extensions[] = {"VK_KHR_swapchain", "VK_KHR_device_group"};
@@ -1195,6 +1352,10 @@ static void test_win32_surface(VkInstance instance, VkPhysicalDevice physical_de
         vkDestroySurfaceKHR(instance, surface, NULL);
         winetest_pop_context();
     }
+
+    winetest_push_context("multi-swapchain");
+    test_win32_surface_multi_swapchain(instance, physical_device, device, queue, command_buffer);
+    winetest_pop_context();
 
     vkDestroyCommandPool(device, command_pool, NULL);
     vkDestroyDevice(device, NULL);
