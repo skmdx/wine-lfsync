@@ -2757,8 +2757,18 @@ static BOOL win32u_wglSwapBuffers( HDC hdc )
     if (context) opengl_drawable_add_ref( (draw = context->draw) );
     else if (!(draw = get_window_current_drawable( hwnd ))) return FALSE;
 
+    /* EGL requires the surface passed to eglSwapBuffers() to be current.  Keep
+     * the last window drawable usable after the application context has been
+     * released, as required by SwapBuffers(). */
+    if (!context && !make_null_context_current( get_target( draw ) ))
+    {
+        opengl_drawable_release( draw );
+        return FALSE;
+    }
+
     opengl_drawable_flush( draw, interval, 0 );
     ret = opengl_drawable_swap( draw );
+    if (!context && !make_null_context_current( NULL )) ret = FALSE;
     opengl_drawable_release( draw );
 
     return ret;

@@ -1664,6 +1664,7 @@ static BOOL x11drv_egl_surface_swap( struct opengl_drawable *base )
 {
     struct gl_drawable *gl = impl_from_opengl_drawable( base );
     BOOL offscreen;
+    EGLint err;
     EGLBoolean ret;
 
     TRACE( "%s\n", debugstr_opengl_drawable( base ) );
@@ -1673,7 +1674,12 @@ static BOOL x11drv_egl_surface_swap( struct opengl_drawable *base )
     if (offscreen && gl->damage) x11drv_surface_prepare_swap( gl );
 #endif
     ret = funcs->p_eglSwapBuffers( egl->display, gl->base.surface );
-    if (!ret) return FALSE;
+    if (!ret)
+    {
+        err = funcs->p_eglGetError();
+        WARN( "Failed to swap EGL surface %s, error %#x\n", debugstr_opengl_drawable( base ), err );
+        return FALSE;
+    }
 
 #if defined(HAVE_X11_EXTENSIONS_XDAMAGE_H) && defined(SONAME_LIBXDAMAGE)
     if (offscreen && gl->damage)
