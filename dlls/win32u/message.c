@@ -2264,6 +2264,7 @@ static LRESULT handle_internal_message( HWND hwnd, UINT msg, WPARAM wparam, LPAR
     }
     case WM_WINE_UPDATEWINDOWSTATE:
         if (wparam == WINE_UPDATE_CLIENT_SURFACES) recompose_client_surfaces( hwnd );
+        else if (wparam == WINE_DESTROY_CLIENT_SURFACES) detach_client_surfaces( hwnd );
         else update_window_state( hwnd );
         return 0;
     case WM_WINE_SETPIXELFORMAT:
