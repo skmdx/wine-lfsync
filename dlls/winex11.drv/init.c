@@ -318,6 +318,17 @@ static void client_surface_update_geometry( HWND hwnd, struct x11drv_client_surf
     else XFlush( gdi_display );
 }
 
+#ifdef SONAME_LIBXCOMPOSITE
+static int client_surface_redirect_error( Display *display, XErrorEvent *event, void *arg )
+{
+    int *error = arg;
+
+    if (event->error_code != BadAccess && event->error_code != BadWindow) return FALSE;
+    *error = event->error_code;
+    return TRUE;
+}
+#endif
+
 static void client_surface_update_offscreen( HWND hwnd, struct x11drv_client_surface *surface )
 {
     BOOL offscreen;
@@ -346,7 +357,9 @@ static void client_surface_update_offscreen( HWND hwnd, struct x11drv_client_sur
     if (!offscreen)
     {
 #ifdef SONAME_LIBXCOMPOSITE
-        if (usexcomposite) pXCompositeUnredirectWindow( gdi_display, surface->window, CompositeRedirectManual );
+        if (surface->manual_redirect)
+            pXCompositeUnredirectWindow( gdi_display, surface->window, CompositeRedirectManual );
+        surface->manual_redirect = FALSE;
 #endif
         if (surface->hdc_dst)
         {
@@ -371,7 +384,21 @@ static void client_surface_update_offscreen( HWND hwnd, struct x11drv_client_sur
         set_dc_drawable( surface->hdc_src, surface->window, &rect, IncludeInferiors );
 
 #ifdef SONAME_LIBXCOMPOSITE
-        if (usexcomposite) pXCompositeRedirectWindow( gdi_display, surface->window, CompositeRedirectManual );
+        if (usexcomposite)
+        {
+            int error = 0;
+
+            X11DRV_expect_error( gdi_display, client_surface_redirect_error, &error );
+            pXCompositeRedirectWindow( gdi_display, surface->window, CompositeRedirectManual );
+            XSync( gdi_display, False );
+            X11DRV_check_error();
+            /* BadAccess means a compositing window manager already provides
+             * the backing pixmap. Do not later unredirect its ownership. */
+            if (!error) surface->manual_redirect = TRUE;
+            else if (error == BadAccess)
+                TRACE( "client window %p/%lx is compositor-redirected\n", hwnd, surface->window );
+            else WARN( "failed to redirect client window %lx, X error %d\n", surface->window, error );
+        }
 #endif
     }
 

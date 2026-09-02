@@ -545,6 +545,16 @@ static int get_window_attributes( struct x11drv_win_data *data, XSetWindowAttrib
  * can receive input events.
  */
 static void set_empty_window_input_shape( struct x11drv_win_data *data );
+static void sync_window_opacity( Display *display, Window win, BYTE alpha, DWORD flags );
+
+static int client_surface_redirect_error( Display *display, XErrorEvent *event, void *arg )
+{
+    int *error = arg;
+
+    if (event->error_code != BadAccess && event->error_code != BadWindow) return FALSE;
+    *error = event->error_code;
+    return TRUE;
+}
 
 static void sync_window_input_shape( struct x11drv_win_data *data )
 {
@@ -553,11 +563,11 @@ static void sync_window_input_shape( struct x11drv_win_data *data )
 
     if (!data->whole_window) return;
 
-    /* A manually redirected staging window is mapped only to provide the
-     * render process with a drawable.  Style synchronization can run between
-     * redirect and commit; it must not make that unpublished window accept
-     * input before the completed composition is unredirected. */
-    if (data->client_surface_redirected)
+    /* A staging window is mapped only to provide the render process with a
+     * drawable.  Style synchronization can run between staging and commit;
+     * it must not make that unpublished window accept input before the
+     * completed composition is published. */
+    if (data->client_surface_redirected || data->client_surface_opacity_staged)
     {
         set_empty_window_input_shape( data );
         return;
@@ -599,12 +609,28 @@ static void set_empty_window_input_shape( struct x11drv_win_data *data )
 static BOOL prepare_client_surface_staging( struct x11drv_win_data *data )
 {
 #ifdef SONAME_LIBXCOMPOSITE
+    int error = 0;
+
     if (!usexcomposite) return FALSE;
 
-    if (!data->client_surface_redirected)
+    if (!data->client_surface_redirected && !data->client_surface_opacity_staged)
     {
+        X11DRV_expect_error( data->display, client_surface_redirect_error, &error );
         pXCompositeRedirectWindow( data->display, data->whole_window, CompositeRedirectManual );
-        data->client_surface_redirected = TRUE;
+        XSync( data->display, False );
+        X11DRV_check_error();
+        if (!error) data->client_surface_redirected = TRUE;
+        else if (error == BadAccess)
+        {
+            /* A compositing window manager already owns automatic redirection
+             * for this window. Keep its drawable mapped but fully transparent
+             * until the staged generation is complete. */
+            TRACE( "window %p/%lx is compositor-redirected, using opacity staging\n",
+                   data->hwnd, data->whole_window );
+            sync_window_opacity( data->display, data->whole_window, 0, LWA_ALPHA );
+            data->client_surface_opacity_staged = TRUE;
+        }
+        else return FALSE;
     }
     set_empty_window_input_shape( data );
     return TRUE;
@@ -621,7 +647,18 @@ static void finish_client_surface_staging( struct x11drv_win_data *data )
     if (data->client_surface_redirected)
         pXCompositeUnredirectWindow( data->display, data->whole_window, CompositeRedirectManual );
 #endif
+    if (data->client_surface_opacity_staged)
+    {
+        if (data->client_surface_opacity_valid)
+            XChangeProperty( data->display, data->whole_window, x11drv_atom(_NET_WM_WINDOW_OPACITY),
+                             XA_CARDINAL, 32, PropModeReplace,
+                             (unsigned char *)&data->client_surface_opacity, 1 );
+        else
+            XDeleteProperty( data->display, data->whole_window,
+                             x11drv_atom(_NET_WM_WINDOW_OPACITY) );
+    }
     data->client_surface_redirected = FALSE;
+    data->client_surface_opacity_staged = FALSE;
     data->client_surface_staged = FALSE;
     sync_window_input_shape( data );
 }
@@ -731,6 +768,16 @@ static void sync_window_opacity( Display *display, Window win, BYTE alpha, DWORD
     else
         XChangeProperty( display, win, x11drv_atom(_NET_WM_WINDOW_OPACITY),
                          XA_CARDINAL, 32, PropModeReplace, (unsigned char *)&opacity, 1 );
+}
+
+static void set_window_opacity( struct x11drv_win_data *data, BYTE alpha, DWORD flags )
+{
+    data->client_surface_opacity_valid = !!(flags & LWA_ALPHA) && alpha != 0xff;
+    if (data->client_surface_opacity_valid)
+        data->client_surface_opacity = (0xffffffff / 0xff) * alpha;
+    if (data->client_surface_opacity_staged)
+        sync_window_opacity( data->display, data->whole_window, 0, LWA_ALPHA );
+    else sync_window_opacity( data->display, data->whole_window, alpha, flags );
 }
 
 
@@ -2533,7 +2580,7 @@ static void create_whole_window( struct x11drv_win_data *data )
 
     /* set the window opacity */
     if (!NtUserGetLayeredWindowAttributes( data->hwnd, &key, &alpha, &layered_flags )) layered_flags = 0;
-    sync_window_opacity( data->display, data->whole_window, alpha, layered_flags );
+    set_window_opacity( data, alpha, layered_flags );
     sync_window_input_shape( data );
 
     XFlush( data->display );  /* make sure the window exists before we start painting to it */
@@ -2675,7 +2722,7 @@ void X11DRV_SetWindowStyle( HWND hwnd, INT offset, STYLESTRUCT *style )
         {
             data->layered = FALSE;
             set_window_visual( data, &default_visual, FALSE );
-            sync_window_opacity( data->display, data->whole_window, 0, 0 );
+            set_window_opacity( data, 0, 0 );
         }
         if (changed & WS_EX_TRANSPARENT) sync_window_style( data );
         flush = TRUE;
@@ -3420,7 +3467,8 @@ void X11DRV_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_hint, UIN
         client_surface_set_staged( hwnd );
         data->client_surface_staged = TRUE;
     }
-    else if (win32_visible && !client_surface_pending && data->client_surface_redirected)
+    else if (win32_visible && !client_surface_pending &&
+             (data->client_surface_redirected || data->client_surface_opacity_staged))
     {
         finish_client_surface_staging( data );
     }
@@ -3563,7 +3611,7 @@ void X11DRV_SetLayeredWindowAttributes( HWND hwnd, COLORREF key, BYTE alpha, DWO
 
         if (data->whole_window)
         {
-            sync_window_opacity( data->display, data->whole_window, alpha, flags );
+            set_window_opacity( data, alpha, flags );
             XFlush( data->display );
         }
 
@@ -3595,7 +3643,7 @@ void X11DRV_UpdateLayeredWindow( HWND hwnd, BYTE alpha, UINT flags )
 
     if (data->whole_window)
     {
-        sync_window_opacity( data->display, data->whole_window, alpha, flags );
+        set_window_opacity( data, alpha, flags );
         XFlush( data->display );
     }
 

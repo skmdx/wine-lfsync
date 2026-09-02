@@ -373,6 +373,7 @@ struct x11drv_client_surface
     Window window;
     Window backing_window;  /* whole window with backing store enabled */
     BOOL keep_offscreen;    /* preserve a drawable which was used while hidden */
+    BOOL manual_redirect;   /* client drawable is manually XComposite redirected */
 
     HDC hdc_src;
     HDC hdc_dst;
@@ -697,7 +698,9 @@ struct x11drv_win_data
     UINT        reparenting : 1; /* window is being reparented, likely from a decoration change */
     UINT        is_resizable : 1; /* window is allowed to be resized by the window manager */
     UINT        client_surface_redirected : 1; /* mapped into an unpublished XComposite buffer */
+    UINT        client_surface_opacity_staged : 1; /* compositor-owned window hidden with opacity */
     UINT        client_surface_staged : 1; /* server may accept a visible-generation commit */
+    UINT        client_surface_opacity_valid : 1; /* desired opacity property is present */
     Window      embedder;       /* window id of embedder */
     Pixmap         icon_pixmap;
     Pixmap         icon_mask;
@@ -713,6 +716,7 @@ struct x11drv_win_data
     unsigned long wm_hints_serial;     /* serial of last pending WM_HINTS request */
     unsigned long mwm_hints_serial;    /* serial of last pending _MOTIF_WM_HINTS request */
     unsigned long wm_normal_hints_serial;/* serial of last pending WM_NORMAL_HINTS request */
+    unsigned long client_surface_opacity; /* desired _NET_WM_WINDOW_OPACITY value */
     unsigned long configure_serial;    /* serial of last pending configure request */
     unsigned long net_wm_icon_serial;  /* serial of last pending _NET_WM_ICON request */
     unsigned long state_locks;         /* X11 state requests lock while updating win32 state */
