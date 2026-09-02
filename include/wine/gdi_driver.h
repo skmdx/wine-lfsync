@@ -274,9 +274,9 @@ struct client_surface
     LONG                               active;         /* registered as active with the Wine server */
     LONG                               content_valid;  /* complete content exists at the current size */
     LONG                               server_cached;  /* registered as a cached owner with the Wine server */
-    LONG                               geometry_seq;   /* seqlock for the published geometry */
+    LONG64                             geometry_seq;   /* seqlock for the published geometry */
     LONG                               lifecycle_seq;  /* seqlock for detach and destruction */
-    LONG                               recompose_requested; /* latest requested recomposition generation */
+    LONG64                             recompose_requested; /* latest requested recomposition generation */
     LONG                               recompose_scheduled; /* a recomposition consumer owns a reference */
     RECT                               virtual_rect;   /* virtual size and position in the toplevel ancestor, relative to its visible rect */
     RECT                               monitor_rect;   /* raw physical size and position in the toplevel ancestor, relative to its visible rect */

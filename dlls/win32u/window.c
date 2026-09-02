@@ -318,6 +318,17 @@ static HWND set_client_surface_server_state( HWND hwnd, const struct client_surf
     return toplevel;
 }
 
+static void client_surface_uncache_present_locked( struct client_surface *surface )
+{
+    HWND toplevel;
+    BOOL wake;
+
+    if (InterlockedCompareExchange( &surface->server_cached, FALSE, TRUE ) != TRUE) return;
+    toplevel = set_client_surface_server_state( surface->hwnd, surface,
+                                                CLIENT_SURFACE_STATE_UNCACHE, 0, &wake );
+    if (wake && toplevel) NtUserPostMessage( toplevel, WM_WINE_UPDATEWINDOWSTATE, 0, 0 );
+}
+
 static void client_surface_detach_locked( struct client_surface *surface )
 {
     HWND toplevel;
@@ -349,9 +360,9 @@ static void client_surface_detach_locked( struct client_surface *surface )
     }
     list_remove( &surface->entry );
     surface->funcs->detach( surface );
-    InterlockedIncrement( &surface->geometry_seq );
+    InterlockedIncrement64( &surface->geometry_seq );
     surface->toplevel = NULL;
-    InterlockedIncrement( &surface->geometry_seq );
+    InterlockedIncrement64( &surface->geometry_seq );
     InterlockedExchangePointer( (void **)&surface->hwnd, NULL );
     InterlockedIncrement( &surface->lifecycle_seq );
     pthread_mutex_unlock( &surface->present_lock );
@@ -424,17 +435,17 @@ struct client_surface_geometry
 static void get_client_surface_geometry( const struct client_surface *surface,
                                          struct client_surface_geometry *geometry )
 {
-    LONG seq;
+    LONG64 seq;
 
     do
     {
-        while ((seq = ReadNoFence( &surface->geometry_seq )) & 1) YieldProcessor();
+        while ((seq = ReadNoFence64( &surface->geometry_seq )) & 1) YieldProcessor();
         __SHARED_READ_FENCE;
         geometry->toplevel = surface->toplevel;
         geometry->virtual_rect = surface->virtual_rect;
         geometry->monitor_rect = surface->monitor_rect;
         __SHARED_READ_FENCE;
-    } while (seq != ReadNoFence( &surface->geometry_seq ));
+    } while (seq != ReadNoFence64( &surface->geometry_seq ));
 }
 
 static void client_surface_update_present_locked( struct client_surface *surface )
@@ -453,18 +464,25 @@ static void client_surface_update_present_locked( struct client_surface *surface
     changed = new_toplevel != toplevel || !EqualRect( &new_virtual_rect, &virtual_rect ) ||
               !EqualRect( &new_monitor_rect, &monitor_rect );
 
-    InterlockedIncrement( &surface->geometry_seq );
+    InterlockedIncrement64( &surface->geometry_seq );
     surface->toplevel = new_toplevel;
     surface->virtual_rect = new_virtual_rect;
     surface->monitor_rect = new_monitor_rect;
-    InterlockedIncrement( &surface->geometry_seq );
+    InterlockedIncrement64( &surface->geometry_seq );
 
     /* A larger drawable contains pixels for which no completed application
      * frame exists yet.  Do not treat its old intersection as a complete
      * frame merely because it can be copied by the host driver. */
     if (new_source_rect.right - new_source_rect.left > old_source_rect.right - old_source_rect.left ||
         new_source_rect.bottom - new_source_rect.top > old_source_rect.bottom - old_source_rect.top)
+    {
         InterlockedExchange( &surface->content_valid, FALSE );
+        /* An unused cached drawable has no renderer left to fill the newly
+         * exposed extent.  Keeping it registered would leave every staged
+         * generation waiting for a frame which cannot arrive. */
+        if (!InterlockedCompareExchange( &surface->active, 0, 0 ))
+            client_surface_uncache_present_locked( surface );
+    }
 
     TRACE( "updating %s, toplevel %p, virtual_rect %s, monitor_rect %s\n", debugstr_client_surface( surface ), surface->toplevel,
            wine_dbgstr_rect( &surface->virtual_rect ), wine_dbgstr_rect( &surface->monitor_rect ) );
@@ -523,7 +541,7 @@ static BOOL queue_client_surface_recompose_locked( struct client_surface *surfac
 {
     struct client_surface **new_surfaces;
 
-    InterlockedIncrement( &surface->recompose_requested );
+    InterlockedIncrement64( &surface->recompose_requested );
     if (InterlockedCompareExchange( &surface->recompose_scheduled, TRUE, FALSE )) return TRUE;
 
     if (*count == *size)
@@ -963,7 +981,9 @@ static BOOL client_surface_end_present_internal( struct client_surface *surface,
         pthread_mutex_lock( &surface->present_lock );
         if (InterlockedCompareExchangePointer( (void **)&surface->hwnd, NULL, NULL ) == hwnd)
             wake = !surface->funcs->commit( surface, toplevel );
-        else wake = FALSE;
+        /* Detach may win after the server completes the generation.  The
+         * surface-specific host event is then unsafe, but the top-level still
+         * needs the fallback message to publish its completed staging state. */
         pthread_mutex_unlock( &surface->present_lock );
     }
     if (wake && toplevel) NtUserPostMessage( toplevel, WM_WINE_UPDATEWINDOWSTATE, 0, 0 );
@@ -990,16 +1010,16 @@ static void client_surface_recompose( struct client_surface *surface )
 
 static void drain_client_surface_recompose( struct client_surface *surface )
 {
-    LONG requested;
+    LONG64 requested;
 
     for (;;)
     {
-        requested = ReadAcquire( &surface->recompose_requested );
+        requested = ReadAcquire64( &surface->recompose_requested );
         client_surface_recompose( surface );
-        if (requested != ReadAcquire( &surface->recompose_requested )) continue;
+        if (requested != ReadAcquire64( &surface->recompose_requested )) continue;
 
         InterlockedExchange( &surface->recompose_scheduled, FALSE );
-        if (requested == ReadAcquire( &surface->recompose_requested )) break;
+        if (requested == ReadAcquire64( &surface->recompose_requested )) break;
 
         /* A producer which observes the cleared flag owns the next queue
          * entry.  Otherwise retain this entry's reference and consume the
@@ -1104,13 +1124,14 @@ BOOL client_surface_get_size( struct client_surface *surface, SIZE *virtual_size
 void use_window_client_surface( struct client_surface *surface, BOOL use )
 {
     HWND hwnd = 0, toplevel;
-    BOOL wake = FALSE;
+    BOOL invalid = FALSE, wake = FALSE;
     UINT flags;
 
     TRACE( "surface %s, use %u\n", debugstr_client_surface( surface ), use );
     if (use) client_surface_update_now( surface );
 
     pthread_mutex_lock( &surfaces_lock );
+    pthread_mutex_lock( &surface->present_lock );
 
     if (!surface->hwnd)
         WARN( "surface %s has been detached already, ignoring.\n", debugstr_client_surface( surface ) );
@@ -1132,13 +1153,26 @@ void use_window_client_surface( struct client_surface *surface, BOOL use )
         list_remove( &surface->entry ); /* remove it from client_surfaces, if it was used */
         list_add_head( &unused_surfaces, &surface->entry ); /* add it to the head, so we discard older ones */
         client_surface_add_ref( surface );
-        InterlockedExchange( &surface->active, FALSE );
         flags = CLIENT_SURFACE_STATE_UNREGISTER;
         if (InterlockedCompareExchange( &surface->content_valid, 0, 0 ))
         {
             flags |= CLIENT_SURFACE_STATE_CACHE;
             InterlockedExchange( &surface->server_cached, TRUE );
         }
+        else if (InterlockedCompareExchange( &surface->server_cached, 0, 0 ))
+        {
+            /* Reusing a cached surface invalidates its old drawable before a
+             * replacement is created.  If creation fails and the surface is
+             * returned unused, it must no longer participate in staged
+             * generations because there is no complete frame to recompose. */
+            flags |= CLIENT_SURFACE_STATE_UNCACHE;
+            InterlockedExchange( &surface->server_cached, FALSE );
+        }
+        /* Publish the cached ownership before retiring the active ownership.
+         * Lock-free begin_present() must not observe a gap between the two;
+         * end_present() waits on present_lock until the server transition has
+         * completed before it can acknowledge the sampled generation. */
+        InterlockedExchange( &surface->active, FALSE );
         hwnd = surface->hwnd;
     }
 
@@ -1148,29 +1182,46 @@ void use_window_client_surface( struct client_surface *surface, BOOL use )
     {
         toplevel = set_client_surface_server_state( hwnd, surface, flags, 0, &wake );
         if (wake && toplevel) NtUserPostMessage( toplevel, WM_WINE_UPDATEWINDOWSTATE, 0, 0 );
+        /* A renderer process does not receive the owning process's local
+         * destroy callback for a foreign HWND.  If the server no longer has
+         * that window, do not leave its owning unused-list reference cached
+         * forever.  Check validity separately because a zero reply can also
+         * be caused by an allocation failure while the HWND is still alive. */
+        if (!toplevel && !NtUserIsWindow( hwnd )) invalid = TRUE;
     }
+    pthread_mutex_unlock( &surface->present_lock );
+
+    if (invalid) detach_client_surfaces( hwnd );
 }
 
 struct client_surface *get_unused_client_surface( HWND hwnd, int format, BOOL raw )
 {
-    struct client_surface *surface;
+    struct client_surface *surface = NULL, *candidate;
 
     pthread_mutex_lock( &surfaces_lock );
 
-    LIST_FOR_EACH_ENTRY( surface, &unused_surfaces, struct client_surface, entry )
+    LIST_FOR_EACH_ENTRY( candidate, &unused_surfaces, struct client_surface, entry )
     {
-        if (surface->hwnd != hwnd || surface->format != format || surface->raw != raw) continue;
+        if (candidate->hwnd != hwnd || candidate->format != format || candidate->raw != raw) continue;
+        surface = candidate;
+        pthread_mutex_lock( &surface->present_lock );
         list_remove( &surface->entry ); /* take over its reference */
         list_init( &surface->entry );
+        /* A queued cached recomposition may still hold a reference after the
+         * list entry is removed.  Invalidate its old frame while serialized
+         * with presentation so it cannot copy from the replacement drawable. */
+        InterlockedExchange( &surface->content_valid, FALSE );
         break;
     }
-    if (&surface->entry == &unused_surfaces) surface = NULL;
 
     pthread_mutex_unlock( &surfaces_lock );
 
     if (surface)
     {
-        client_surface_update_now( surface ); /* refresh it before creating GL/VK drawable */
+        client_surface_uncache_present_locked( surface );
+        if (InterlockedCompareExchangePointer( (void **)&surface->hwnd, NULL, NULL ))
+            client_surface_update_present_locked( surface ); /* refresh before creating GL/VK drawable */
+        pthread_mutex_unlock( &surface->present_lock );
         TRACE( "Reusing surface %s\n", debugstr_client_surface( surface ) );
     }
     return surface ? surface : user_driver->pCreateClientSurface( hwnd, format, raw );
