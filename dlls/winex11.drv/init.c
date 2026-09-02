@@ -467,7 +467,15 @@ static BOOL X11DRV_client_surface_present( struct client_surface *client, HDC hd
     ret = NtGdiStretchBlt( surface->hdc_dst, 0, 0, rect_dst.right - rect_dst.left, rect_dst.bottom - rect_dst.top,
                            surface->hdc_src, 0, 0, rect_src.right - rect_src.left,
                            rect_src.bottom - rect_src.top, SRCCOPY, 0 );
-    if (ret) XFlush( gdi_display );
+    if (ret)
+    {
+        /* A staged generation may aggregate surfaces from several renderer
+         * processes.  Complete this connection's copy before acknowledging
+         * its generation to the server; ordering only the last renderer's
+         * commit event cannot order work submitted on the other connections. */
+        if (flush) XSync( gdi_display, False );
+        else XFlush( gdi_display );
+    }
 
     if (region) NtGdiDeleteObjectApp( region );
     return ret;

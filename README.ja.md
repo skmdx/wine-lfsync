@@ -69,7 +69,7 @@ win32u と wineserver は、トップレベルおよび子ウィンドウに属�
 
 winex11 の EGL backend は、ウィンドウ寸法の更新を表す `GL_FLUSH_UPDATED` を受けた時に `eglQuerySurface()` で width と height を再取得します。Mesa の X11 EGL 実装はこの照会時に X geometry の変化を検出して古い drawable buffer を invalidate するため、64x64 から実寸へ拡大した直後の描画が旧 extent に clip されません。この処理は EGL 固有であり、GLX、Wine Vulkan、DXVK の内部へ直接作用するものではありません。
 
-EGL と GLX の offscreen swap は、XDamage が対応する pixmap の更新を通知するまで待機してから client surface を完成済みとして公開します。描画完了待機の対象は swap 対象の drawable に限定し、タイムアウト時は診断を残して従来経路へ進みます。これにより、swap API の復帰だけを完成の証拠として扱っていた競合を除去します。
+EGL と GLX の offscreen swap は、XDamage が対応する pixmap の更新を通知するまで待機してから client surface を完成済みとして公開します。描画完了待機の対象は swap 対象の drawable に限定し、5秒以内に通知されなければ診断を残してそのフレームの公開を中止します。これにより、swap API の復帰だけを完成の証拠として扱っていた競合を除去します。
 
 WGL の pixel format はプロセス内の `WND` だけでなく wineserver のウィンドウ状態として保持します。別プロセスが所有する HWND を描画する場合にも同じ形式を取得できます。また、active と cached の client surface 所有者を描画プロセス単位で追跡し、geometry-ready 通知を実際に再合成できるプロセスのキューへ送ります。終了済み描画プロセスの所有情報は自動的に破棄します。
 

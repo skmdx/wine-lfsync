@@ -1096,8 +1096,12 @@ typedef volatile struct
     data_size_t          private_size;     /* length of private extra bytes range */
     data_size_t          extra_size;       /* size of the extra info */
     struct window_info   info;             /* window info (GWLP_*) */
+    unsigned int         client_surface_generation; /* unpublished client-surface generation */
+    unsigned int         client_surface_flags;      /* WINDOW_SHM_CLIENT_SURFACE_* */
     char                 extra[];          /* extra bytes storage */
 } window_shm_t;
+
+#define WINDOW_SHM_CLIENT_SURFACE_STAGED 0x01
 
 typedef volatile union
 {
@@ -4355,17 +4359,15 @@ enum inproc_sync_type
 /* Track whether a client-rendered window has changed while its hierarchy was hidden. */
 @REQ(set_client_surface_state)
     user_handle_t  handle;        /* client surface window */
+    client_ptr_t   surface;       /* process-local client surface identity */
     unsigned int   flags;         /* CLIENT_SURFACE_STATE_* */
     unsigned int   generation;    /* publication generation being committed */
 @REPLY
     user_handle_t  toplevel;      /* current top-level ancestor */
     unsigned int   wake;          /* top-level may now be exposed */
-    unsigned int   sync;          /* presentation must reach the host before commit */
-    unsigned int   generation;    /* staged publication generation */
 @END
 #define CLIENT_SURFACE_STATE_REGISTER   0x01
 #define CLIENT_SURFACE_STATE_UNREGISTER 0x02
-#define CLIENT_SURFACE_STATE_PRESENT_BEGIN  0x04
 #define CLIENT_SURFACE_STATE_PRESENT_COMMIT 0x08
 #define CLIENT_SURFACE_STATE_STAGED         0x10
 #define CLIENT_SURFACE_STATE_BYPASS         0x20

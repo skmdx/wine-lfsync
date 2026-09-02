@@ -295,25 +295,23 @@ static pthread_mutex_t surfaces_lock = PTHREAD_MUTEX_INITIALIZER;
 static struct list client_surfaces = LIST_INIT( client_surfaces ); /* non-owning used client surfaces */
 static struct list unused_surfaces = LIST_INIT( unused_surfaces ); /* owning unused client surfaces */
 
-static HWND set_client_surface_server_state( HWND hwnd, UINT flags, UINT generation,
-                                             BOOL *wake, BOOL *sync, UINT *next_generation )
+static HWND set_client_surface_server_state( HWND hwnd, const struct client_surface *surface,
+                                             UINT flags, UINT generation,
+                                             BOOL *wake )
 {
     HWND toplevel = 0;
 
     if (wake) *wake = FALSE;
-    if (sync) *sync = FALSE;
-    if (next_generation) *next_generation = 0;
     SERVER_START_REQ( set_client_surface_state )
     {
         req->handle = wine_server_user_handle( hwnd );
+        req->surface = wine_server_client_ptr( surface );
         req->flags = flags;
         req->generation = generation;
         if (!wine_server_call( req ))
         {
             toplevel = wine_server_ptr_handle( reply->toplevel );
             if (wake) *wake = reply->wake;
-            if (sync) *sync = reply->sync;
-            if (next_generation) *next_generation = reply->generation;
         }
     }
     SERVER_END_REQ;
@@ -340,7 +338,7 @@ static void client_surface_detach_locked( struct client_surface *surface )
     }
     if (flags)
     {
-        toplevel = set_client_surface_server_state( surface->hwnd, flags, 0, &wake, NULL, NULL );
+        toplevel = set_client_surface_server_state( surface->hwnd, surface, flags, 0, &wake );
         if (wake && toplevel) NtUserPostMessage( toplevel, WM_WINE_UPDATEWINDOWSTATE, 0, 0 );
     }
     list_remove( &surface->entry );
@@ -664,13 +662,24 @@ static BOOL client_surface_compose_locked( struct client_surface *surface, BOOL 
 
 UINT client_surface_begin_present( struct client_surface *surface )
 {
+    struct object_lock lock = OBJECT_LOCK_INIT;
+    const window_shm_t *window_shm = NULL;
+    HWND hwnd = 0, toplevel;
+    NTSTATUS status;
     UINT generation = 0;
 
     pthread_mutex_lock( &surfaces_lock );
-    if (surface->hwnd && surface->active)
-        set_client_surface_server_state( surface->hwnd, CLIENT_SURFACE_STATE_PRESENT_BEGIN,
-                                         0, NULL, NULL, &generation );
+    if (surface->hwnd && (surface->active || surface->server_cached))
+        hwnd = surface->hwnd;
     pthread_mutex_unlock( &surfaces_lock );
+
+    if (!hwnd || !(toplevel = NtUserGetAncestor( hwnd, GA_ROOT ))) return 0;
+    while ((status = get_shared_window( toplevel, &lock, &window_shm )) == STATUS_PENDING)
+    {
+        generation = (window_shm->client_surface_flags & WINDOW_SHM_CLIENT_SURFACE_STAGED) ?
+                     window_shm->client_surface_generation : 0;
+    }
+    if (status) generation = 0;
     return generation;
 }
 
@@ -691,9 +700,9 @@ static BOOL client_surface_end_present_internal( struct client_surface *surface,
             TRACE( "not recomposing incomplete cached content for %s\n",
                    debugstr_client_surface( surface ) );
         if (composed && new_content) surface->content_valid = TRUE;
-        if (composed && surface->active && sync)
-            toplevel = set_client_surface_server_state( hwnd, CLIENT_SURFACE_STATE_PRESENT_COMMIT,
-                                                        generation, &wake, NULL, NULL );
+        if (composed && (surface->active || surface->server_cached) && sync)
+            toplevel = set_client_surface_server_state( hwnd, surface, CLIENT_SURFACE_STATE_PRESENT_COMMIT,
+                                                        generation, &wake );
         if (wake && toplevel && surface->funcs->commit)
             wake = !surface->funcs->commit( surface, toplevel );
     }
@@ -763,19 +772,22 @@ void recompose_client_surfaces( HWND hwnd )
 
 void client_surface_geometry_ready( HWND hwnd )
 {
-    set_client_surface_server_state( hwnd, CLIENT_SURFACE_STATE_GEOMETRY_READY,
-                                     0, NULL, NULL, NULL );
+    set_client_surface_server_state( hwnd, NULL, CLIENT_SURFACE_STATE_GEOMETRY_READY, 0, NULL );
 }
 
 void client_surface_set_staged( HWND hwnd )
 {
+    HWND toplevel;
+    BOOL wake;
+
     TRACE( "client surface composition for %p is staged\n", hwnd );
-    set_client_surface_server_state( hwnd, CLIENT_SURFACE_STATE_STAGED, 0, NULL, NULL, NULL );
+    toplevel = set_client_surface_server_state( hwnd, NULL, CLIENT_SURFACE_STATE_STAGED, 0, &wake );
+    if (wake && toplevel) NtUserPostMessage( toplevel, WM_WINE_UPDATEWINDOWSTATE, 0, 0 );
 }
 
 void client_surface_bypass_staging( HWND hwnd )
 {
-    set_client_surface_server_state( hwnd, CLIENT_SURFACE_STATE_BYPASS, 0, NULL, NULL, NULL );
+    set_client_surface_server_state( hwnd, NULL, CLIENT_SURFACE_STATE_BYPASS, 0, NULL );
 }
 
 void client_surface_update( struct client_surface *surface )
@@ -848,7 +860,7 @@ void use_window_client_surface( struct client_surface *surface, BOOL use )
 
     if (hwnd)
     {
-        toplevel = set_client_surface_server_state( hwnd, flags, 0, &wake, NULL, NULL );
+        toplevel = set_client_surface_server_state( hwnd, surface, flags, 0, &wake );
         if (wake && toplevel) NtUserPostMessage( toplevel, WM_WINE_UPDATEWINDOWSTATE, 0, 0 );
     }
 }

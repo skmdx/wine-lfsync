@@ -2125,15 +2125,22 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
         {
             VkResult wait_res = device->p_vkWaitForPresentKHR( device->host.device,
                                                                swapchain->obj.host.swapchain,
-                                                               present_ids[i], UINT64_MAX );
-            if (wait_res < VK_SUCCESS)
+                                                               present_ids[i], 5000000000ULL );
+            if (wait_res != VK_SUCCESS)
             {
                 WARN( "Failed waiting for present %s, status %d\n",
                       debugstr_client_surface( surface->client ), wait_res );
-                swapchain_res = wait_res;
-                if (present_info->pResults) present_info->pResults[i] = wait_res;
-                if (res >= VK_SUCCESS) res = wait_res;
                 compose = FALSE;
+                /* A timeout belongs to Wine's internal completion wait, not
+                 * to vkQueuePresentKHR.  Preserve the host present result so
+                 * the application does not receive an unsupported status for
+                 * an operation which was submitted successfully. */
+                if (wait_res < VK_SUCCESS)
+                {
+                    swapchain_res = wait_res;
+                    if (present_info->pResults) present_info->pResults[i] = wait_res;
+                    if (res >= VK_SUCCESS) res = wait_res;
+                }
             }
         }
 

@@ -1080,8 +1080,12 @@ typedef volatile struct
     data_size_t          private_size;
     data_size_t          extra_size;
     struct window_info   info;
+    unsigned int         client_surface_generation;
+    unsigned int         client_surface_flags;
     char                 extra[];
 } window_shm_t;
+
+#define WINDOW_SHM_CLIENT_SURFACE_STAGED 0x01
 
 typedef volatile union
 {
@@ -6266,6 +6270,7 @@ struct set_client_surface_state_request
 {
     struct request_header __header;
     user_handle_t  handle;
+    client_ptr_t   surface;
     unsigned int   flags;
     unsigned int   generation;
 };
@@ -6274,12 +6279,9 @@ struct set_client_surface_state_reply
     struct reply_header __header;
     user_handle_t  toplevel;
     unsigned int   wake;
-    unsigned int   sync;
-    unsigned int   generation;
 };
 #define CLIENT_SURFACE_STATE_REGISTER   0x01
 #define CLIENT_SURFACE_STATE_UNREGISTER 0x02
-#define CLIENT_SURFACE_STATE_PRESENT_BEGIN  0x04
 #define CLIENT_SURFACE_STATE_PRESENT_COMMIT 0x08
 #define CLIENT_SURFACE_STATE_STAGED         0x10
 #define CLIENT_SURFACE_STATE_BYPASS         0x20
@@ -7234,6 +7236,6 @@ union generic_reply
     struct set_client_surface_state_reply set_client_surface_state_reply;
 };
 
-#define SERVER_PROTOCOL_VERSION 966
+#define SERVER_PROTOCOL_VERSION 968
 
 #endif /* __WINE_WINE_SERVER_PROTOCOL_H */

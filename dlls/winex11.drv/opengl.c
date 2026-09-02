@@ -1597,12 +1597,16 @@ static BOOL x11drv_surface_wait_swap( struct gl_drawable *gl )
         for (;;)
         {
             struct pollfd pollfd = {ConnectionNumber( gl->damage_display ), POLLIN, 0};
-            int ret = poll( &pollfd, 1, -1 );
+            int ret = poll( &pollfd, 1, 5000 );
 
             if (ret > 0 && pollfd.revents & POLLIN) break;
             if (ret < 0 && errno == EINTR) continue;
-            WARN( "Failed waiting for window damage for %s, ret %d, revents %#x\n",
-                  debugstr_opengl_drawable( &gl->base ), ret, pollfd.revents );
+            if (!ret)
+                WARN( "Timed out waiting for window damage for %s\n",
+                      debugstr_opengl_drawable( &gl->base ) );
+            else
+                WARN( "Failed waiting for window damage for %s, ret %d, revents %#x\n",
+                      debugstr_opengl_drawable( &gl->base ), ret, pollfd.revents );
             return FALSE;
         }
     }

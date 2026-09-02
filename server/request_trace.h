@@ -3550,6 +3550,7 @@ static void dump_alpc_create_port_reply( const struct alpc_create_port_reply *re
 static void dump_set_client_surface_state_request( const struct set_client_surface_state_request *req )
 {
     fprintf( stderr, " handle=%08x", req->handle );
+    dump_uint64( ", surface=", &req->surface );
     fprintf( stderr, ", flags=%08x", req->flags );
     fprintf( stderr, ", generation=%08x", req->generation );
 }
@@ -3558,8 +3559,6 @@ static void dump_set_client_surface_state_reply( const struct set_client_surface
 {
     fprintf( stderr, " toplevel=%08x", req->toplevel );
     fprintf( stderr, ", wake=%08x", req->wake );
-    fprintf( stderr, ", sync=%08x", req->sync );
-    fprintf( stderr, ", generation=%08x", req->generation );
 }
 
 typedef void (*dump_func)( const void *req );
