@@ -296,7 +296,7 @@ static struct list client_surfaces = LIST_INIT( client_surfaces ); /* non-owning
 static struct list unused_surfaces = LIST_INIT( unused_surfaces ); /* owning unused client surfaces */
 
 static HWND set_client_surface_server_state( HWND hwnd, const struct client_surface *surface,
-                                             UINT flags, UINT generation,
+                                             UINT flags, UINT64 generation,
                                              BOOL *wake )
 {
     HWND toplevel = 0;
@@ -881,13 +881,13 @@ static BOOL client_surface_validate_size_locked( struct client_surface *surface,
     return TRUE;
 }
 
-UINT client_surface_begin_present( struct client_surface *surface )
+UINT64 client_surface_begin_present( struct client_surface *surface )
 {
     struct object_lock lock = OBJECT_LOCK_INIT;
     const window_shm_t *window_shm = NULL;
     HWND hwnd, toplevel;
     NTSTATUS status;
-    UINT generation = 0;
+    UINT64 generation = 0;
 
     hwnd = InterlockedCompareExchangePointer( (void **)&surface->hwnd, NULL, NULL );
     if (!hwnd || (!InterlockedCompareExchange( &surface->active, 0, 0 ) &&
@@ -904,7 +904,7 @@ UINT client_surface_begin_present( struct client_surface *surface )
     return generation;
 }
 
-static BOOL client_surface_end_present_internal( struct client_surface *surface, UINT generation,
+static BOOL client_surface_end_present_internal( struct client_surface *surface, UINT64 generation,
                                                  const SIZE *expected_size, BOOL new_content )
 {
     struct client_surface_clip_snapshot clip_snapshot = {0};
@@ -990,7 +990,7 @@ static BOOL client_surface_end_present_internal( struct client_surface *surface,
     return composed;
 }
 
-BOOL client_surface_end_present( struct client_surface *surface, UINT generation,
+BOOL client_surface_end_present( struct client_surface *surface, UINT64 generation,
                                  const SIZE *expected_size )
 {
     return client_surface_end_present_internal( surface, generation, expected_size, TRUE );
@@ -998,13 +998,13 @@ BOOL client_surface_end_present( struct client_surface *surface, UINT generation
 
 void client_surface_present( struct client_surface *surface )
 {
-    UINT generation = client_surface_begin_present( surface );
+    UINT64 generation = client_surface_begin_present( surface );
     client_surface_end_present_internal( surface, generation, NULL, TRUE );
 }
 
 static void client_surface_recompose( struct client_surface *surface )
 {
-    UINT generation = client_surface_begin_present( surface );
+    UINT64 generation = client_surface_begin_present( surface );
     client_surface_end_present_internal( surface, generation, NULL, FALSE );
 }
 

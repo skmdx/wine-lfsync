@@ -66,7 +66,7 @@ struct client_surface_ref
 {
     struct list     entry;
     client_ptr_t    id;
-    unsigned int    generation;
+    unsigned long long generation;
     unsigned int    active : 1;
     unsigned int    cached : 1;
 };
@@ -110,7 +110,7 @@ struct window
     unsigned int     client_surface_cached_count; /* cached client-rendered surfaces owned by this window */
     unsigned int     client_surface_dirty; /* top-level composition changed while hidden */
     unsigned int     client_surface_staged; /* host window is mapped into an unpublished composition */
-    unsigned int     client_surface_generation; /* current unpublished composition generation */
+    unsigned long long client_surface_generation; /* current unpublished composition generation */
     unsigned int     client_surface_pending_count; /* surfaces still missing from staged generation */
     int              prop_inuse;      /* number of in-use window properties */
     int              prop_alloc;      /* number of allocated window properties */
@@ -1043,7 +1043,7 @@ static void release_client_surface_owner( struct client_surface_owner *owner )
 }
 
 static int complete_client_surface_generation( struct window *top, struct client_surface_ref *surface,
-                                               unsigned int generation )
+                                               unsigned long long generation )
 {
     if (!top->client_surface_staged || generation != top->client_surface_generation ||
         surface->generation != generation)
@@ -1081,7 +1081,7 @@ static void discard_client_surface_owner( struct window *win, struct client_surf
     release_client_surface_owner( owner );
 }
 
-static unsigned int prepare_client_surface_generation( struct window *win, unsigned int generation )
+static unsigned int prepare_client_surface_generation( struct window *win, unsigned long long generation )
 {
     struct client_surface_owner *owner;
     struct client_surface_ref *surface;
@@ -1103,6 +1103,7 @@ static unsigned int prepare_client_surface_generation( struct window *win, unsig
     return count;
 }
 
+static unsigned long long client_surface_generation;
 static unsigned long long client_surface_notification;
 
 static int notify_client_surface_geometry_ready_recursive( struct window *win, struct window *top,
@@ -3149,8 +3150,11 @@ DECL_HANDLER(set_client_surface_state)
     if (req->flags & CLIENT_SURFACE_STATE_STAGED)
     {
         top->client_surface_staged = top->client_surface_dirty && is_visible( top );
-        if (top->client_surface_staged && !++top->client_surface_generation)
-            top->client_surface_generation++;
+        if (top->client_surface_staged)
+        {
+            if (!++client_surface_generation) ++client_surface_generation;
+            top->client_surface_generation = client_surface_generation;
+        }
         top->client_surface_pending_count = top->client_surface_staged ?
             prepare_client_surface_generation( top, top->client_surface_generation ) : 0;
         if (top->client_surface_staged && !top->client_surface_pending_count)

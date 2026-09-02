@@ -3552,7 +3552,7 @@ static void dump_set_client_surface_state_request( const struct set_client_surfa
     fprintf( stderr, " handle=%08x", req->handle );
     dump_uint64( ", surface=", &req->surface );
     fprintf( stderr, ", flags=%08x", req->flags );
-    fprintf( stderr, ", generation=%08x", req->generation );
+    dump_uint64( ", generation=", &req->generation );
 }
 
 static void dump_set_client_surface_state_reply( const struct set_client_surface_state_reply *req )

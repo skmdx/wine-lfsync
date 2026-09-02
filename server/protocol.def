@@ -1096,8 +1096,9 @@ typedef volatile struct
     data_size_t          private_size;     /* length of private extra bytes range */
     data_size_t          extra_size;       /* size of the extra info */
     struct window_info   info;             /* window info (GWLP_*) */
-    unsigned int         client_surface_generation; /* unpublished client-surface generation */
+    unsigned __int64     client_surface_generation; /* unpublished client-surface generation */
     unsigned int         client_surface_flags;      /* WINDOW_SHM_CLIENT_SURFACE_* */
+    int                  __pad2;
     char                 extra[];          /* extra bytes storage */
 } window_shm_t;
 
@@ -4361,7 +4362,7 @@ enum inproc_sync_type
     user_handle_t  handle;        /* client surface window */
     client_ptr_t   surface;       /* process-local client surface identity */
     unsigned int   flags;         /* CLIENT_SURFACE_STATE_* */
-    unsigned int   generation;    /* publication generation being committed */
+    unsigned __int64 generation;  /* publication generation being committed */
 @REPLY
     user_handle_t  toplevel;      /* current top-level ancestor */
     unsigned int   wake;          /* top-level may now be exposed */

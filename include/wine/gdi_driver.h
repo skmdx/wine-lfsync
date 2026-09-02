@@ -287,8 +287,8 @@ W32KAPI void *client_surface_create( UINT size, const struct client_surface_func
 W32KAPI void client_surface_add_ref( struct client_surface *surface );
 W32KAPI void client_surface_release( struct client_surface *surface );
 W32KAPI void client_surface_present( struct client_surface *surface );
-W32KAPI UINT client_surface_begin_present( struct client_surface *surface );
-W32KAPI BOOL client_surface_end_present( struct client_surface *surface, UINT generation,
+W32KAPI UINT64 client_surface_begin_present( struct client_surface *surface );
+W32KAPI BOOL client_surface_end_present( struct client_surface *surface, UINT64 generation,
                                          const SIZE *expected_size );
 W32KAPI void client_surface_geometry_ready( HWND hwnd );
 W32KAPI void client_surface_set_staged( HWND hwnd );
