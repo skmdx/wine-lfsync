@@ -1103,7 +1103,10 @@ static unsigned int prepare_client_surface_generation( struct window *win, unsig
     return count;
 }
 
-static int notify_client_surface_geometry_ready( struct window *win, struct window *top )
+static unsigned long long client_surface_notification;
+
+static int notify_client_surface_geometry_ready_recursive( struct window *win, struct window *top,
+                                                           unsigned long long notification )
 {
     struct client_surface_owner *owner, *next;
     struct window *child;
@@ -1121,11 +1124,15 @@ static int notify_client_surface_geometry_ready( struct window *win, struct wind
             discard_client_surface_owner( win, owner, top );
             continue;
         }
-        post_process_message( owner->process, win->handle, WM_WINE_UPDATEWINDOWSTATE,
-                              WINE_UPDATE_CLIENT_SURFACES, 0 );
+        if (owner->process->client_surface_notification != notification)
+        {
+            owner->process->client_surface_notification = notification;
+            post_process_message( owner->process, top->handle, WM_WINE_UPDATEWINDOWSTATE,
+                                  WINE_UPDATE_CLIENT_SURFACES, 0 );
+        }
     }
     LIST_FOR_EACH_ENTRY( child, &win->children, struct window, entry )
-        removed_active |= notify_client_surface_geometry_ready( child, top );
+        removed_active |= notify_client_surface_geometry_ready_recursive( child, top, notification );
     if (removed_active && !has_client_surface( top ))
     {
         top->client_surface_dirty = 0;
@@ -1134,6 +1141,12 @@ static int notify_client_surface_geometry_ready( struct window *win, struct wind
         update_client_surface_publication( top );
     }
     return removed_active;
+}
+
+static void notify_client_surface_geometry_ready( struct window *top )
+{
+    if (!++client_surface_notification) ++client_surface_notification;
+    notify_client_surface_geometry_ready_recursive( top, top, client_surface_notification );
 }
 
 static struct window *get_toplevel_window( struct window *win )
@@ -3154,7 +3167,7 @@ DECL_HANDLER(set_client_surface_state)
          * into this publication generation.  Incomplete cached surfaces are
          * rejected by the client-side completeness check and remain staged
          * until an application present completes them. */
-        if (top->client_surface_staged) notify_client_surface_geometry_ready( top, top );
+        if (top->client_surface_staged) notify_client_surface_geometry_ready( top );
     }
     if (req->flags & CLIENT_SURFACE_STATE_BYPASS)
     {
@@ -3164,7 +3177,7 @@ DECL_HANDLER(set_client_surface_state)
         update_client_surface_publication( top );
     }
     if (req->flags & CLIENT_SURFACE_STATE_GEOMETRY_READY)
-        notify_client_surface_geometry_ready( top, top );
+        notify_client_surface_geometry_ready( top );
     if ((req->flags & CLIENT_SURFACE_STATE_PRESENT_COMMIT) && surface &&
         (surface->active || surface->cached) && is_visible( win ))
     {

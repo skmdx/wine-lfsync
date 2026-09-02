@@ -264,6 +264,7 @@ struct client_surface
 {
     const struct client_surface_funcs *funcs;
     struct list                        entry;          /* entry in win32u managed list */
+    pthread_mutex_t                    present_lock;   /* serializes driver operations for this surface */
     LONG                               ref;            /* reference count */
     HWND                               hwnd;           /* window the surface was created for */
     int                                format;         /* pixel format of the surface */
@@ -271,8 +272,12 @@ struct client_surface
     HWND                               toplevel;       /* toplevel window of the surface */
     LONG                               offscreen;      /* client window is offscreen */
     LONG                               active;         /* registered as active with the Wine server */
-    BOOL                               content_valid;  /* complete content exists at the current size */
-    BOOL                               server_cached;  /* registered as a cached owner with the Wine server */
+    LONG                               content_valid;  /* complete content exists at the current size */
+    LONG                               server_cached;  /* registered as a cached owner with the Wine server */
+    LONG                               geometry_seq;   /* seqlock for the published geometry */
+    LONG                               lifecycle_seq;  /* seqlock for detach and destruction */
+    LONG                               recompose_requested; /* latest requested recomposition generation */
+    LONG                               recompose_scheduled; /* a recomposition consumer owns a reference */
     RECT                               virtual_rect;   /* virtual size and position in the toplevel ancestor, relative to its visible rect */
     RECT                               monitor_rect;   /* raw physical size and position in the toplevel ancestor, relative to its visible rect */
     BOOL                               raw;            /* use the raw physical position and size for the host client surface */
