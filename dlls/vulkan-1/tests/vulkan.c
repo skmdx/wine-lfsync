@@ -801,11 +801,21 @@ static void test_win32_surface_swapchain_hwnd(VkDevice device, VkSwapchainKHR sw
     if (expect_suboptimal)
     {
         todo_wine_if(vr == VK_SUCCESS)
-        ok(vr == VK_SUBOPTIMAL_KHR || broken(vr == VK_SUCCESS) /* Nvidia */, "Got unexpected vr %d.\n", vr);
+        ok(vr == VK_SUBOPTIMAL_KHR || vr == VK_ERROR_OUT_OF_DATE_KHR ||
+                broken(vr == VK_SUCCESS) /* Nvidia */, "Got unexpected vr %d.\n", vr);
     }
     else
         ok(vr == VK_SUCCESS, "Got unexpected vr %d.\n", vr);
-    ok(image_index != 0xdeadbeef, "Got image_index %d.\n", image_index);
+    if (vr == VK_ERROR_OUT_OF_DATE_KHR)
+    {
+        ok(image_index == 0xdeadbeef, "Got image_index %u.\n", image_index);
+        vr = vkGetFenceStatus(device, fence);
+        ok(vr == VK_NOT_READY, "Out-of-date acquire signalled its fence, vr %d.\n", vr);
+        vkDestroyFence(device, fence, NULL);
+        free(images);
+        return;
+    }
+    ok(image_index < image_count, "Got image_index %u, image count %u.\n", image_index, image_count);
 
     vr = vkWaitForFences(device, 1, &fence, VK_FALSE, -1);
     ok(vr == VK_SUCCESS, "Got unexpected vr %d.\n", vr);
@@ -849,11 +859,12 @@ static void test_win32_surface_swapchain_hwnd(VkDevice device, VkSwapchainKHR sw
     present_info.swapchainCount = 1;
     present_info.pSwapchains = &swapchain;
     present_info.pImageIndices = &image_index;
+    present_result = VK_ERROR_UNKNOWN;
     present_info.pResults = &present_result;
 
     vr = vkQueuePresentKHR(queue, &present_info);
     if (expect_suboptimal)
-        ok(vr == VK_SUBOPTIMAL_KHR || broken(vr == VK_ERROR_OUT_OF_DATE_KHR) /* Nvidia */,
+        ok(vr == VK_SUBOPTIMAL_KHR || vr == VK_ERROR_OUT_OF_DATE_KHR,
                 "Got unexpected vr %d.\n", vr);
     else if (IsWindow(hwnd))
         ok(vr == VK_SUCCESS, "Got unexpected vr %d.\n", vr);
@@ -863,6 +874,11 @@ static void test_win32_surface_swapchain_hwnd(VkDevice device, VkSwapchainKHR sw
                         vr == VK_ERROR_OUT_OF_DATE_KHR /* Nvidia */,
                 "Got unexpected vr %d.\n", vr);
     }
+    if (expect_suboptimal)
+        ok(present_result == VK_SUBOPTIMAL_KHR || present_result == VK_ERROR_OUT_OF_DATE_KHR,
+                "Got unexpected present result %d.\n", present_result);
+    else if (IsWindow(hwnd))
+        ok(present_result == VK_SUCCESS, "Got unexpected present result %d.\n", present_result);
 
     image_index = 0xdeadbeef;
     acquire_info.swapchain = swapchain;
@@ -873,7 +889,7 @@ static void test_win32_surface_swapchain_hwnd(VkDevice device, VkSwapchainKHR sw
     if (expect_suboptimal)
     {
         todo_wine_if(vr == VK_SUCCESS)
-        ok(vr == VK_SUBOPTIMAL_KHR || broken(vr == VK_ERROR_OUT_OF_DATE_KHR) /* Nvidia */,
+        ok(vr == VK_SUBOPTIMAL_KHR || vr == VK_ERROR_OUT_OF_DATE_KHR,
                 "Got unexpected vr %d.\n", vr);
     }
     else if (IsWindow(hwnd))
@@ -882,7 +898,13 @@ static void test_win32_surface_swapchain_hwnd(VkDevice device, VkSwapchainKHR sw
         ok(vr == VK_SUCCESS /* AMD */ || vr == VK_ERROR_OUT_OF_DATE_KHR /* Nvidia */,
                 "Got unexpected vr %d.\n", vr);
 
-    if (vr >= VK_SUCCESS)
+    if (vr == VK_ERROR_OUT_OF_DATE_KHR)
+    {
+        ok(image_index == 0xdeadbeef, "Got image_index %u.\n", image_index);
+        vr = vkGetFenceStatus(device, fence);
+        ok(vr == VK_NOT_READY, "Out-of-date acquire2 signalled its fence, vr %d.\n", vr);
+    }
+    else if (vr >= VK_SUCCESS)
     {
         vr = vkWaitForFences(device, 1, &fence, VK_FALSE, -1);
         ok(vr == VK_SUCCESS, "Got unexpected vr %d.\n", vr);
