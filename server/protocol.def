@@ -4366,6 +4366,11 @@ enum inproc_sync_type
 @REPLY
     user_handle_t  toplevel;      /* current top-level ancestor */
     unsigned int   wake;          /* top-level may now be exposed */
+    unsigned __int64 generation;  /* current unpublished generation */
+    unsigned int   pending;       /* surfaces pending in that generation */
+    unsigned int   staged;        /* whether the generation is unpublished */
+    unsigned int   active;        /* active surfaces on the requested window */
+    unsigned int   cached;        /* cached surfaces on the requested window */
 @END
 #define CLIENT_SURFACE_STATE_REGISTER   0x01
 #define CLIENT_SURFACE_STATE_UNREGISTER 0x02

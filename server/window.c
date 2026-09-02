@@ -3232,6 +3232,11 @@ DECL_HANDLER(set_client_surface_state)
 
     reply->toplevel = 0;
     reply->wake = 0;
+    reply->generation = 0;
+    reply->pending = 0;
+    reply->staged = 0;
+    reply->active = 0;
+    reply->cached = 0;
     if (!(win = get_window( req->handle ))) return;
     top = get_toplevel_window( win );
     was_pending = top->client_surface_dirty;
@@ -3344,6 +3349,11 @@ DECL_HANDLER(set_client_surface_state)
 
     reply->toplevel = top->handle;
     reply->wake = was_pending && is_visible( top ) && !top->client_surface_dirty;
+    reply->generation = top->client_surface_generation;
+    reply->pending = top->client_surface_pending_count;
+    reply->staged = top->client_surface_staged;
+    reply->active = win->client_surface_count;
+    reply->cached = win->client_surface_cached_count;
 }
 
 

@@ -3559,6 +3559,11 @@ static void dump_set_client_surface_state_reply( const struct set_client_surface
 {
     fprintf( stderr, " toplevel=%08x", req->toplevel );
     fprintf( stderr, ", wake=%08x", req->wake );
+    dump_uint64( ", generation=", &req->generation );
+    fprintf( stderr, ", pending=%08x", req->pending );
+    fprintf( stderr, ", staged=%08x", req->staged );
+    fprintf( stderr, ", active=%08x", req->active );
+    fprintf( stderr, ", cached=%08x", req->cached );
 }
 
 typedef void (*dump_func)( const void *req );

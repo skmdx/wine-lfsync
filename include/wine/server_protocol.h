@@ -6281,6 +6281,11 @@ struct set_client_surface_state_reply
     struct reply_header __header;
     user_handle_t  toplevel;
     unsigned int   wake;
+    unsigned __int64 generation;
+    unsigned int   pending;
+    unsigned int   staged;
+    unsigned int   active;
+    unsigned int   cached;
 };
 #define CLIENT_SURFACE_STATE_REGISTER   0x01
 #define CLIENT_SURFACE_STATE_UNREGISTER 0x02
@@ -7238,6 +7243,6 @@ union generic_reply
     struct set_client_surface_state_reply set_client_surface_state_reply;
 };
 
-#define SERVER_PROTOCOL_VERSION 970
+#define SERVER_PROTOCOL_VERSION 971
 
 #endif /* __WINE_WINE_SERVER_PROTOCOL_H */
