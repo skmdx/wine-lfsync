@@ -247,9 +247,15 @@ static inline void push_dc_driver( PHYSDEV *dev, PHYSDEV physdev, const struct g
 /* support for client surfaces */
 
 struct client_surface;
-struct client_surface_funcs
+enum client_surface_backend_caps
 {
-    BOOL scene_backing; /* owner can atomically publish a composed scene */
+    CLIENT_SURFACE_BACKEND_SCENE_PUBLICATION = 0x01,
+    CLIENT_SURFACE_BACKEND_NATIVE_WRITE_LEASE = 0x02,
+};
+
+struct client_surface_backend
+{
+    unsigned int caps;
     void (*destroy)( struct client_surface *surface );
     /* detach the surface from its window, called from window owner thread */
     void (*detach)( struct client_surface *surface );
@@ -293,7 +299,7 @@ typedef void (*client_surface_completion_release_func)( void *context );
 
 struct client_surface
 {
-    const struct client_surface_funcs *funcs;
+    const struct client_surface_backend *backend;
     struct list                        entry;          /* entry in win32u managed list */
     UINT_PTR                           identity;       /* opaque server notification token */
     struct client_surface             *identity_next; /* process-local identity hash chain */
@@ -349,7 +355,14 @@ struct client_surface
     BOOL                               raw;            /* use the raw physical position and size for the host client surface */
 };
 
-W32KAPI void *client_surface_create( UINT size, const struct client_surface_funcs *funcs, HWND hwnd, int format, BOOL raw );
+static inline BOOL client_surface_backend_has_cap( const struct client_surface *surface,
+                                                   enum client_surface_backend_caps cap )
+{
+    return !!(surface->backend->caps & cap);
+}
+
+W32KAPI void *client_surface_create( UINT size, const struct client_surface_backend *backend,
+                                    HWND hwnd, int format, BOOL raw );
 W32KAPI void client_surface_add_ref( struct client_surface *surface );
 W32KAPI void client_surface_release( struct client_surface *surface );
 W32KAPI void client_surface_present( struct client_surface *surface );

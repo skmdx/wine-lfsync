@@ -896,8 +896,9 @@ static BOOL nulldrv_surface_present( struct client_surface *client, HDC hdc, HRG
     return TRUE;
 }
 
-static const struct client_surface_funcs nulldrv_surface_funcs =
+static const struct client_surface_backend nulldrv_surface_backend =
 {
+    .caps = 0,
     .destroy = nulldrv_surface_destroy,
     .detach = nulldrv_surface_detach,
     .update = nulldrv_surface_update,
@@ -906,7 +907,7 @@ static const struct client_surface_funcs nulldrv_surface_funcs =
 
 static struct client_surface *nulldrv_CreateClientSurface( HWND hwnd, int pixel_format, BOOL raw )
 {
-    return client_surface_create( sizeof(struct client_surface), &nulldrv_surface_funcs, hwnd, pixel_format, raw );
+    return client_surface_create( sizeof(struct client_surface), &nulldrv_surface_backend, hwnd, pixel_format, raw );
 }
 
 static BOOL nulldrv_CreateWindowSurface( HWND hwnd, BOOL layered, const RECT *surface_rect, struct window_surface **surface )

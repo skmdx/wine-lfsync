@@ -1133,8 +1133,9 @@ static BOOL macdrv_client_surface_present(struct client_surface *client, HDC hdc
     return TRUE;
 }
 
-static const struct client_surface_funcs macdrv_client_surface_funcs =
+static const struct client_surface_backend macdrv_client_surface_backend =
 {
+    .caps = 0,
     .destroy = macdrv_client_surface_destroy,
     .detach = macdrv_client_surface_detach,
     .update = macdrv_client_surface_update,
@@ -1143,7 +1144,7 @@ static const struct client_surface_funcs macdrv_client_surface_funcs =
 
 struct macdrv_client_surface *impl_from_client_surface(struct client_surface *client)
 {
-    assert(client->funcs == &macdrv_client_surface_funcs);
+    assert(client->backend == &macdrv_client_surface_backend);
     return CONTAINING_RECORD(client, struct macdrv_client_surface, client);
 }
 
@@ -1151,7 +1152,7 @@ struct client_surface *macdrv_CreateClientSurface(HWND hwnd, int pixel_format, B
 {
     struct macdrv_client_surface *surface;
 
-    surface = client_surface_create(sizeof(*surface), &macdrv_client_surface_funcs, hwnd, pixel_format, raw);
+    surface = client_surface_create(sizeof(*surface), &macdrv_client_surface_backend, hwnd, pixel_format, raw);
     surface->cocoa_view = macdrv_create_view(cgrect_from_rect(surface->client.monitor_rect));
     macdrv_set_view_hidden(surface->cocoa_view, TRUE);
 

@@ -68,20 +68,21 @@ struct client_surface_ref
     struct client_surface_ref *index_next;
     struct client_surface_owner *owner;
     struct process *process; /* queue callback keeps this valid for a retired tombstone */
-    struct thread *writer_thread; /* grabbed thread owning the backing write lease */
-    struct window  *writer_top; /* grabbed top-level owning the backing write lease */
+    struct thread *writer_thread; /* grabbed thread owning the native-target write lease */
+    struct window  *writer_top; /* grabbed top-level owning the native-target write lease */
     client_ptr_t    id;
     unsigned long long generation;
     unsigned long long sequence;
     unsigned int    active : 1;
     unsigned int    cached : 1;
     unsigned int    claimed : 1; /* an active surface which completed a host present */
-    unsigned int    scene_backing : 1; /* renderer supports owner scene publication */
+    unsigned int    scene_publication : 1; /* renderer supports owner scene publication */
+    unsigned int    native_write_lease : 1; /* renderer supports native-target write exclusion */
     unsigned int    retired : 1; /* detached identity waiting for its queued message */
     unsigned int    notification_pending : 1; /* an update for this identity is queued */
     unsigned int    destroy_pending : 1; /* destroy must reach a live process queue */
     unsigned int    destroy_notification_pending : 1;
-    unsigned int    writing : 1; /* renderer owns a scene-backing write lease */
+    unsigned int    writing : 1; /* renderer owns a native-target write lease */
     unsigned int    notification_count; /* queued update and destroy identity owners */
 };
 
@@ -194,7 +195,7 @@ struct window
     unsigned int     client_surface_prepared; /* one owner snapshot may start a live generation */
     unsigned int     client_surface_composing; /* live or staged composition generation is active */
     unsigned int     client_surface_publishing; /* owner is exposing a ready staged generation */
-    unsigned int     client_surface_backed; /* current live generation uses owner scene backing */
+    unsigned int     client_surface_scene_published; /* current generation uses owner publication */
     unsigned int     client_surface_writer_count; /* writes which started before a scene cut-over */
     client_ptr_t     client_surface_native_barrier; /* owner token sealing native target replacement */
     unsigned int     client_surface_staged_prepare; /* staged backing needs a post-writer snapshot */
@@ -908,7 +909,7 @@ static struct window *create_window( struct window *parent, struct window *owner
     win->client_surface_prepared = 0;
     win->client_surface_composing = 0;
     win->client_surface_publishing = 0;
-    win->client_surface_backed = 0;
+    win->client_surface_scene_published = 0;
     win->client_surface_writer_count = 0;
     win->client_surface_native_barrier = 0;
     win->client_surface_staged_prepare = 0;
@@ -1237,7 +1238,8 @@ static struct client_surface_ref *get_client_surface_ref( struct client_surface_
     surface->active = 0;
     surface->cached = 0;
     surface->claimed = 0;
-    surface->scene_backing = 0;
+    surface->scene_publication = 0;
+    surface->native_write_lease = 0;
     surface->retired = 0;
     surface->notification_pending = 0;
     surface->destroy_pending = 0;
@@ -1287,8 +1289,14 @@ static struct client_surface_ref *select_client_surface_producer( struct window 
     return selected;
 }
 
-static int client_surface_scene_backed_recursive( struct window *win,
-                                                  unsigned int *selected_count )
+static unsigned int get_client_surface_backend_caps( const struct client_surface_ref *surface )
+{
+    return surface->scene_publication |
+           surface->native_write_lease << 1;
+}
+
+static int client_surface_scene_published_recursive( struct window *win,
+                                                     unsigned int *selected_count )
 {
     struct client_surface_owner *owner;
     struct client_surface_ref *selected;
@@ -1299,18 +1307,18 @@ static int client_surface_scene_backed_recursive( struct window *win,
     if (selected && is_visible( win ))
     {
         (*selected_count)++;
-        if (!selected->scene_backing) return 0;
+        if (!selected->scene_publication) return 0;
     }
     LIST_FOR_EACH_ENTRY( child, &win->children, struct window, entry )
-        if (!client_surface_scene_backed_recursive( child, selected_count )) return 0;
+        if (!client_surface_scene_published_recursive( child, selected_count )) return 0;
     return 1;
 }
 
-static int client_surface_scene_backed( struct window *top )
+static int client_surface_scene_published( struct window *top )
 {
     unsigned int selected_count = 0;
 
-    return client_surface_scene_backed_recursive( top, &selected_count ) && selected_count;
+    return client_surface_scene_published_recursive( top, &selected_count ) && selected_count;
 }
 
 static void update_client_surface_producer( struct window *win )
@@ -1343,7 +1351,7 @@ static void finish_client_surface_generation( struct window *top )
     cancel_client_surface_timeout( top );
     top->client_surface_deadline = 0;
     top->client_surface_composing = 0;
-    top->client_surface_backed = 0;
+    top->client_surface_scene_published = 0;
     top->client_surface_generation = 0;
     top->client_surface_pending_count = 0;
     top->client_surface_ready = 0;
@@ -1374,7 +1382,7 @@ static int mark_client_surface_generation_ready( struct window *top )
     /* Backends without an owner-managed scene target keep the legacy live
      * behavior: their driver presentation is already visible, so an empty
      * owner prepare/publish round trip cannot add atomicity. */
-    if (!top->client_surface_staged && !top->client_surface_backed)
+    if (!top->client_surface_staged && !top->client_surface_scene_published)
     {
         finish_client_surface_generation( top );
         return 0;
@@ -1923,7 +1931,7 @@ void retry_process_client_surface_notifications( struct process *process, user_h
  * HWND so both live repair and staged publication use a single scene epoch. */
 static void restart_client_surface_generation( struct window *top )
 {
-    int scene_backed;
+    int scene_published;
     int prepare_restart;
 
     if (!top->client_surface_staged &&
@@ -1958,12 +1966,12 @@ static void restart_client_surface_generation( struct window *top )
         top->client_surface_restart_pending = 1;
         return;
     }
-    scene_backed = client_surface_scene_backed( top );
+    scene_published = client_surface_scene_published( top );
 
-    /* A live generation is composed into an owner-managed scene backing.
-     * Snapshot the visible host before renderer processes write that backing,
+    /* A live generation is composed into an owner-managed publication target.
+     * Snapshot the visible host before renderer processes write that target,
      * so a full-scene commit never resurrects stale non-client or GDI pixels. */
-    if (scene_backed && (!top->client_surface_staged || top->client_surface_staged_prepare) &&
+    if (scene_published && (!top->client_surface_staged || top->client_surface_staged_prepare) &&
         !top->client_surface_prepared)
     {
         if (top->client_surface_composing)
@@ -1992,7 +2000,7 @@ static void restart_client_surface_generation( struct window *top )
     {
         top->client_surface_restart_pending = 0;
         top->client_surface_composing = 1;
-        top->client_surface_backed = client_surface_scene_backed( top );
+        top->client_surface_scene_published = client_surface_scene_published( top );
         top->client_surface_ready = 0;
         top->client_surface_ready_scene_generation = 0;
         if (!++client_surface_generation) ++client_surface_generation;
@@ -4125,7 +4133,8 @@ DECL_HANDLER(set_client_surface_state)
     struct client_surface_owner *owner, *selected_owner;
     struct client_surface_ref *surface, *selected_before, *selected_after;
     struct window *win, *top, *writer_top = NULL;
-    int scene_change, selected_backing_before, was_pending;
+    unsigned int selected_caps_before;
+    int scene_change, was_pending;
 
     reply->toplevel = 0;
     reply->wake = 0;
@@ -4210,10 +4219,13 @@ DECL_HANDLER(set_client_surface_state)
     }
 
     selected_before = select_client_surface_producer( win, &selected_owner );
-    selected_backing_before = selected_before ? selected_before->scene_backing : 0;
+    selected_caps_before = selected_before ? get_client_surface_backend_caps( selected_before ) : 0;
 
     if ((req->flags & (CLIENT_SURFACE_STATE_REGISTER | CLIENT_SURFACE_STATE_CACHE)) && surface)
-        surface->scene_backing = !!(req->flags & CLIENT_SURFACE_STATE_SCENE_BACKING);
+    {
+        surface->scene_publication = !!(req->flags & CLIENT_SURFACE_STATE_SCENE_PUBLICATION);
+        surface->native_write_lease = !!(req->flags & CLIENT_SURFACE_STATE_NATIVE_WRITE_LEASE);
+    }
 
     if ((req->flags & CLIENT_SURFACE_STATE_CACHE) && !surface->cached)
     {
@@ -4257,7 +4269,8 @@ DECL_HANDLER(set_client_surface_state)
     }
     selected_after = select_client_surface_producer( win, &selected_owner );
     scene_change = selected_before != selected_after ||
-                   (selected_after && selected_backing_before != selected_after->scene_backing);
+                   (selected_after && selected_caps_before !=
+                    get_client_surface_backend_caps( selected_after ));
     if (scene_change)
     {
         /* Membership is private server state.  Publish the changed producer
@@ -4355,13 +4368,13 @@ DECL_HANDLER(set_client_surface_state)
                 top->client_surface_publish_invalidated = 1;
             }
         }
-        else if (surface->scene_backing && !req->generation &&
+        else if (surface->scene_publication && !req->generation &&
                  !top->client_surface_staged && !top->client_surface_preparing &&
                  !top->client_surface_publishing)
             compose = 1;
 
-        if (compose && surface->scene_backing &&
-            (req->flags & CLIENT_SURFACE_STATE_PRESENT_LEASE))
+        if (compose && surface->native_write_lease &&
+            (req->flags & CLIENT_SURFACE_STATE_PRESENT_WRITE_LEASE))
         {
             if (surface->writing) compose = 0;
             else

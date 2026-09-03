@@ -231,7 +231,7 @@ static BOOL begin_client_surface_composition( HWND hwnd, const struct client_sur
         req->handle = wine_server_user_handle( hwnd );
         req->surface = surface->identity;
         req->flags = CLIENT_SURFACE_STATE_PRESENT_BEGIN |
-                     (lease ? CLIENT_SURFACE_STATE_PRESENT_LEASE : 0);
+                     (lease ? CLIENT_SURFACE_STATE_PRESENT_WRITE_LEASE : 0);
         req->generation = present->generation;
         req->scene_generation = present->scene_generation;
         if (!wine_server_call( req ))
@@ -301,7 +301,7 @@ static void client_surface_detach_locked( struct client_surface *surface )
         if (wake && toplevel) NtUserPostMessage( toplevel, WM_WINE_UPDATEWINDOWSTATE, 0, 0 );
     }
     list_remove( &surface->entry );
-    surface->funcs->detach( surface );
+    surface->backend->detach( surface );
     surface->toplevel = NULL;
     InterlockedIncrement64( &surface->target_epoch );
     publish_client_surface_geometry( surface, NULL, NULL, NULL );
@@ -334,7 +334,7 @@ static void client_surface_release_locked( struct client_surface *surface )
         assert( !surface->external_completion_count );
         assert( !surface->driver_completion_count );
         assert( !surface->driver_completion_waiters );
-        surface->funcs->destroy( surface );
+        surface->backend->destroy( surface );
         pthread_mutex_destroy( &surface->completion_queue_lock );
         pthread_cond_destroy( &surface->completion_cond );
         pthread_mutex_destroy( &surface->completion_lock );
@@ -512,7 +512,7 @@ static BOOL client_surface_update_present_locked( struct client_surface *surface
 
     TRACE( "updating %s, toplevel %p, virtual_rect %s, monitor_rect %s\n", debugstr_client_surface( surface ), surface->toplevel,
            wine_dbgstr_rect( &surface->virtual_rect ), wine_dbgstr_rect( &surface->monitor_rect ) );
-    ready = surface->funcs->update( surface );
+    ready = surface->backend->update( surface );
 
     if (publish_changed || offscreen != InterlockedCompareExchange( &surface->offscreen, 0, 0 ) ||
         ready != InterlockedCompareExchange( &surface->target_ready, 0, 0 ))
@@ -785,7 +785,7 @@ void update_client_surfaces( HWND hwnd )
     free( recompose_surfaces );
 }
 
-void *client_surface_create( UINT size, const struct client_surface_funcs *funcs, HWND hwnd, int format, BOOL raw )
+void *client_surface_create( UINT size, const struct client_surface_backend *backend, HWND hwnd, int format, BOOL raw )
 {
     HWND toplevel = NtUserGetAncestor( hwnd, GA_ROOT );
     struct client_surface *surface;
@@ -817,7 +817,7 @@ void *client_surface_create( UINT size, const struct client_surface_funcs *funcs
         free( surface );
         return NULL;
     }
-    surface->funcs = funcs;
+    surface->backend = backend;
     surface->ref = 1;
     surface->hwnd = hwnd;
     surface->format = format;
@@ -1157,7 +1157,8 @@ static BOOL client_surface_end_present_internal( struct client_surface *surface,
     }
     source_valid = compose && new_content;
     if (compose && present && !present->scene_valid) compose = FALSE;
-    guarded = compose && offscreen && surface->funcs->scene_backing;
+    guarded = compose && offscreen &&
+              client_surface_backend_has_cap( surface, CLIENT_SURFACE_BACKEND_NATIVE_WRITE_LEASE );
     if (compose && (sync || guarded))
     {
         authorized = begin_client_surface_composition( hwnd, surface, present,
@@ -1224,11 +1225,11 @@ static BOOL client_surface_end_present_internal( struct client_surface *surface,
     {
         surface->composition_scene_generation = present->scene_generation;
         surface->composition_toplevel = present->scene_toplevel;
-        /* A backing writer lease protects execution on the native server,
+        /* A native-target writer lease protects execution on the host server,
          * not merely submission from this process.  Complete the backend
          * copy before returning the lease so the owner cannot publish or
          * replace the shared target ahead of work queued on this connection. */
-        copied = surface->funcs->present( surface, hdc, surface_region, sync || leased );
+        copied = surface->backend->present( surface, hdc, surface_region, sync || leased );
         composed = copied;
     }
     if (copied && offscreen && !client_surface_publication_matches( present ))
@@ -1260,7 +1261,7 @@ static BOOL client_surface_end_present_internal( struct client_surface *surface,
                                                     generation, present->scene_generation, &wake );
     if (wake && toplevel) NtUserPostMessage( toplevel, WM_WINE_UPDATEWINDOWSTATE, 0, 0 );
 
-    /* Release a scene-backing writer before requesting repair.  The server
+    /* Release a native-target writer before requesting repair.  The server
      * can then linearize the fresh owner snapshot immediately after the last
      * stale writer instead of creating a second deferred restart. */
     if ((scene_retry || composition_retry) && present->scene_toplevel &&
@@ -1345,8 +1346,8 @@ void client_surface_prepare_present_locked( struct client_surface *surface,
     present->offscreen = InterlockedCompareExchange( &surface->offscreen, 0, 0 );
     present->external_completion = present->target_ready && present->offscreen && external_completion;
     if (present->target_ready && present->offscreen && !present->external_completion &&
-        surface->funcs->prepare_completion)
-        present->driver_completion = surface->funcs->prepare_completion( surface );
+        surface->backend->prepare_completion)
+        present->driver_completion = surface->backend->prepare_completion( surface );
     pthread_mutex_unlock( &surface->present_lock );
 }
 
@@ -1411,16 +1412,16 @@ BOOL client_surface_complete_present_locked( struct client_surface *surface,
         /* A failed WSI call does not prove that no native request escaped.
          * Retire the armed boundary so a delayed request cannot satisfy the
          * next transaction's completion wait. */
-        if (surface->funcs->abandon_completion)
-            surface->funcs->abandon_completion( surface );
+        if (surface->backend->abandon_completion)
+            surface->backend->abandon_completion( surface );
         present->completion_failed = TRUE;
     }
     if (completed && present->offscreen)
     {
         if (present->external_completion)
             completed = external_completed;
-        else if (present->driver_completion && surface->funcs->wait_completion)
-            completed = surface->funcs->wait_completion( surface, timeout );
+        else if (present->driver_completion && surface->backend->wait_completion)
+            completed = surface->backend->wait_completion( surface, timeout );
         else
             completed = FALSE;
         present->completion_failed = !completed;
@@ -1483,7 +1484,7 @@ static BOOL wait_deferred_driver_completion( void *context, DWORD timeout )
 {
     struct client_surface *surface = context;
 
-    return surface->funcs->wait_completion( surface, timeout );
+    return surface->backend->wait_completion( surface, timeout );
 }
 
 static void release_deferred_driver_completion( void *context )
@@ -1502,7 +1503,7 @@ BOOL client_surface_complete_present( struct client_surface *surface,
      * completion_lock.  Transfer that ownership to the same bounded queue as
      * explicit GLX/EGL/Vulkan completion IDs instead of blocking the caller. */
     if (submitted && present->driver_completion && present->offscreen &&
-        surface->funcs->wait_completion && timeout)
+        surface->backend->wait_completion && timeout)
     {
         present->external_completion = TRUE;
         client_surface_add_ref( surface );
@@ -1993,7 +1994,10 @@ void use_window_client_surface( struct client_surface *surface, BOOL use )
         list_add_tail( &client_surfaces, &surface->entry );
         InterlockedExchange( &surface->active, TRUE );
         flags = CLIENT_SURFACE_STATE_REGISTER;
-        if (surface->funcs->scene_backing) flags |= CLIENT_SURFACE_STATE_SCENE_BACKING;
+        if (client_surface_backend_has_cap( surface, CLIENT_SURFACE_BACKEND_SCENE_PUBLICATION ))
+            flags |= CLIENT_SURFACE_STATE_SCENE_PUBLICATION;
+        if (client_surface_backend_has_cap( surface, CLIENT_SURFACE_BACKEND_NATIVE_WRITE_LEASE ))
+            flags |= CLIENT_SURFACE_STATE_NATIVE_WRITE_LEASE;
         if (surface->server_cached)
         {
             flags |= CLIENT_SURFACE_STATE_UNCACHE;
@@ -2016,7 +2020,10 @@ void use_window_client_surface( struct client_surface *surface, BOOL use )
         if (cache && InterlockedCompareExchange( &surface->content_valid, 0, 0 ))
         {
             flags |= CLIENT_SURFACE_STATE_CACHE;
-            if (surface->funcs->scene_backing) flags |= CLIENT_SURFACE_STATE_SCENE_BACKING;
+            if (client_surface_backend_has_cap( surface, CLIENT_SURFACE_BACKEND_SCENE_PUBLICATION ))
+                flags |= CLIENT_SURFACE_STATE_SCENE_PUBLICATION;
+            if (client_surface_backend_has_cap( surface, CLIENT_SURFACE_BACKEND_NATIVE_WRITE_LEASE ))
+                flags |= CLIENT_SURFACE_STATE_NATIVE_WRITE_LEASE;
             InterlockedExchange( &surface->server_cached, TRUE );
         }
         else if (InterlockedCompareExchange( &surface->server_cached, 0, 0 ))

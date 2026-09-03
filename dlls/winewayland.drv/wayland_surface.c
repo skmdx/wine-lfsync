@@ -1226,8 +1226,9 @@ static BOOL wayland_client_surface_present(struct client_surface *client, HDC hd
     return TRUE;
 }
 
-static const struct client_surface_funcs wayland_client_surface_funcs =
+static const struct client_surface_backend wayland_client_surface_backend =
 {
+    .caps = 0,
     .destroy = wayland_client_surface_destroy,
     .detach = wayland_client_surface_detach,
     .update = wayland_client_surface_update,
@@ -1236,7 +1237,7 @@ static const struct client_surface_funcs wayland_client_surface_funcs =
 
 struct wayland_client_surface *impl_from_client_surface(struct client_surface *client)
 {
-    assert(client->funcs == &wayland_client_surface_funcs);
+    assert(client->backend == &wayland_client_surface_backend);
     return CONTAINING_RECORD(client, struct wayland_client_surface, client);
 }
 
@@ -1245,7 +1246,7 @@ struct client_surface *WAYLAND_CreateClientSurface(HWND hwnd, int pixel_format, 
     struct wayland_client_surface *client;
     struct wl_region *empty_region;
 
-    if (!(client = client_surface_create(sizeof(*client), &wayland_client_surface_funcs, hwnd, pixel_format, raw))) return NULL;
+    if (!(client = client_surface_create(sizeof(*client), &wayland_client_surface_backend, hwnd, pixel_format, raw))) return NULL;
 
     client->wl_surface =
         wl_compositor_create_surface(process_wayland.wl_compositor);

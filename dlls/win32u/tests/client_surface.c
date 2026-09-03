@@ -109,7 +109,7 @@ static unsigned int begin_surface_state( HWND hwnd, UINT_PTR surface,
                                          struct surface_state *state )
 {
     return set_surface_state_scene( hwnd, surface, CLIENT_SURFACE_STATE_PRESENT_BEGIN |
-                                    CLIENT_SURFACE_STATE_PRESENT_LEASE,
+                                    CLIENT_SURFACE_STATE_PRESENT_WRITE_LEASE,
                                     generation->generation, generation->scene_generation, state );
 }
 
@@ -606,7 +606,7 @@ static void test_publish_transaction(void)
     if (!hwnd) return;
 
     set_surface_state( hwnd, surface, CLIENT_SURFACE_STATE_REGISTER |
-                       CLIENT_SURFACE_STATE_SCENE_BACKING, 0, NULL );
+                       CLIENT_SURFACE_STATE_SCENE_PUBLICATION, 0, NULL );
     claim_surface_state( hwnd, surface, NULL );
     ShowWindow( hwnd, SW_SHOW );
     status = set_surface_state( hwnd, 0, CLIENT_SURFACE_STATE_STAGED, 0, &staged );
@@ -671,7 +671,7 @@ static void test_live_prepare_transaction(void)
     if (!hwnd) return;
 
     status = set_surface_state( hwnd, surface, CLIENT_SURFACE_STATE_REGISTER |
-                                CLIENT_SURFACE_STATE_SCENE_BACKING, 0, NULL );
+                                CLIENT_SURFACE_STATE_SCENE_PUBLICATION, 0, NULL );
     ok( !status, "live prepare register failed, status %#x\n", status );
     status = claim_surface_state( hwnd, surface, &preparing );
     ok( !status && !preparing.generation && !preparing.pending,
@@ -758,7 +758,8 @@ static void test_scene_writer_barrier(void)
     if (!hwnd) return;
 
     status = set_surface_state( hwnd, surface, CLIENT_SURFACE_STATE_REGISTER |
-                                CLIENT_SURFACE_STATE_SCENE_BACKING, 0, NULL );
+                                CLIENT_SURFACE_STATE_SCENE_PUBLICATION |
+                                CLIENT_SURFACE_STATE_NATIVE_WRITE_LEASE, 0, NULL );
     ok( !status, "writer barrier register failed, status %#x\n", status );
     status = claim_surface_state( hwnd, surface, &state );
     ok( !status && !state.generation, "writer barrier claim started before prepare, status %#x\n", status );
@@ -805,6 +806,52 @@ static void test_scene_writer_barrier(void)
     DestroyWindow( hwnd );
 }
 
+static void test_backend_capability_isolation(void)
+{
+    const UINT_PTR surface = 0x123b8000, barrier = 0x45668000;
+    struct surface_state state, composing, ready, steady, sealed;
+    HWND hwnd;
+    unsigned int status;
+
+    hwnd = create_test_window( TRUE );
+    ok( !!hwnd, "failed to create capability isolation window, error %lu\n", GetLastError() );
+    if (!hwnd) return;
+
+    status = set_surface_state( hwnd, surface, CLIENT_SURFACE_STATE_REGISTER |
+                                CLIENT_SURFACE_STATE_SCENE_PUBLICATION, 0, NULL );
+    ok( !status, "capability isolation register failed, status %#x\n", status );
+    claim_surface_state( hwnd, surface, &state );
+    status = prepare_surface_state( hwnd, &composing );
+    ok( !status && composing.generation && composing.pending == 1,
+        "capability isolation prepare failed: status %#x generation %s pending %u\n",
+        status, wine_dbgstr_longlong( composing.generation ), composing.pending );
+    status = commit_surface_state( hwnd, surface, &composing, &ready );
+    ok( !status && ready.ready, "capability isolation composition failed, status %#x ready %u\n",
+        status, ready.ready );
+    status = publish_surface_state( hwnd, &state );
+    ok( !status && !state.generation,
+        "capability isolation publication failed, status %#x generation %s\n",
+        status, wine_dbgstr_longlong( state.generation ) );
+
+    status = begin_surface_state( hwnd, surface, &state, &steady );
+    ok( !status && steady.compose,
+        "scene publication backend was not admitted, status %#x compose %u\n",
+        status, steady.compose );
+    status = set_surface_state( hwnd, barrier, CLIENT_SURFACE_STATE_NATIVE_BARRIER_BEGIN,
+                                0, &sealed );
+    ok( !status && !sealed.pending && (sealed.scene_generation & 1),
+        "publication-only backend acquired a write lease: status %#x pending %u scene %s\n",
+        status, sealed.pending, wine_dbgstr_longlong( sealed.scene_generation ) );
+    status = set_surface_state( hwnd, barrier, CLIENT_SURFACE_STATE_NATIVE_BARRIER_END,
+                                0, &sealed );
+    ok( !status && !(sealed.scene_generation & 1),
+        "capability isolation barrier did not reopen: status %#x scene %s\n",
+        status, wine_dbgstr_longlong( sealed.scene_generation ) );
+    set_surface_state( hwnd, surface, CLIENT_SURFACE_STATE_PRESENT_END, 0, NULL );
+    set_surface_state( hwnd, surface, CLIENT_SURFACE_STATE_UNREGISTER, 0, NULL );
+    DestroyWindow( hwnd );
+}
+
 static void test_native_backing_barrier(void)
 {
     const UINT_PTR surface = 0x123d0000, barrier = 0x45670000;
@@ -817,7 +864,8 @@ static void test_native_backing_barrier(void)
     if (!hwnd) return;
 
     status = set_surface_state( hwnd, surface, CLIENT_SURFACE_STATE_REGISTER |
-                                CLIENT_SURFACE_STATE_SCENE_BACKING, 0, NULL );
+                                CLIENT_SURFACE_STATE_SCENE_PUBLICATION |
+                                CLIENT_SURFACE_STATE_NATIVE_WRITE_LEASE, 0, NULL );
     ok( !status, "native barrier register failed, status %#x\n", status );
     claim_surface_state( hwnd, surface, &state );
     status = prepare_surface_state( hwnd, &composing );
@@ -875,7 +923,7 @@ static void test_late_present_cutover(void)
     if (!hwnd) return;
 
     set_surface_state( hwnd, surface, CLIENT_SURFACE_STATE_REGISTER |
-                       CLIENT_SURFACE_STATE_SCENE_BACKING, 0, NULL );
+                       CLIENT_SURFACE_STATE_SCENE_PUBLICATION, 0, NULL );
     claim_surface_state( hwnd, surface, NULL );
     ShowWindow( hwnd, SW_SHOW );
     status = set_surface_state( hwnd, 0, CLIENT_SURFACE_STATE_STAGED, 0, &staged );
@@ -1455,6 +1503,8 @@ START_TEST(client_surface)
     test_live_prepare_transaction();
     trace( "testing unbacked live client surface publication\n" );
     test_unbacked_live_generation();
+    trace( "testing client surface backend capability isolation\n" );
+    test_backend_capability_isolation();
     trace( "testing client surface scene writer barrier\n" );
     test_scene_writer_barrier();
     trace( "testing native backing destruction barrier\n" );

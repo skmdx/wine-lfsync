@@ -874,9 +874,10 @@ static BOOL X11DRV_client_surface_present( struct client_surface *client, HDC hd
     return ret;
 }
 
-static const struct client_surface_funcs x11drv_client_surface_funcs =
+static const struct client_surface_backend x11drv_client_surface_backend =
 {
-    .scene_backing = TRUE,
+    .caps = CLIENT_SURFACE_BACKEND_SCENE_PUBLICATION |
+            CLIENT_SURFACE_BACKEND_NATIVE_WRITE_LEASE,
     .destroy = x11drv_client_surface_destroy,
     .detach = x11drv_client_surface_detach,
     .update = x11drv_client_surface_update,
@@ -893,7 +894,7 @@ static int visual_class_alloc( int class )
 
 struct x11drv_client_surface *impl_from_client_surface( struct client_surface *client )
 {
-    assert( client->funcs == &x11drv_client_surface_funcs );
+    assert( client->backend == &x11drv_client_surface_backend );
     return CONTAINING_RECORD( client, struct x11drv_client_surface, client );
 }
 
@@ -910,7 +911,7 @@ struct client_surface *X11DRV_CreateClientSurface( HWND hwnd, int format, BOOL r
     else colormap = XCreateColormap( gdi_display, get_dummy_parent(), visual.visual, visual_class_alloc( visual.class ) );
     if (!colormap) return NULL;
 
-    if (!(surface = client_surface_create( sizeof(*surface), &x11drv_client_surface_funcs, hwnd, format, raw ))) goto failed;
+    if (!(surface = client_surface_create( sizeof(*surface), &x11drv_client_surface_backend, hwnd, format, raw ))) goto failed;
     surface->colormap = colormap;
     list_init( &surface->damage_wait_entry );
     if (pthread_cond_init( &surface->damage_cond, NULL )) goto failed;
