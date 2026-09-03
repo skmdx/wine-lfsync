@@ -317,6 +317,7 @@ struct client_surface
     pthread_mutex_t                    completion_lock; /* serializes host presentation completion tracking */
     pthread_cond_t                     completion_cond; /* completion-mode handoff */
     pthread_mutex_t                    completion_queue_lock; /* protects deferred completion FIFO */
+    pthread_cond_t                     completion_queue_cond; /* wakes the surface-local completion worker */
     struct list                        completion_queue;
     BOOL                               completion_worker_active;
     LONG                               ref;            /* reference count */

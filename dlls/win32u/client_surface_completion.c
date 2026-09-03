@@ -14,6 +14,7 @@
 #endif
 
 #include <assert.h>
+#include <time.h>
 
 #include "ntstatus.h"
 #include "client_surface.h"
@@ -36,6 +37,7 @@ struct client_surface_completion_job
 
 #define CLIENT_SURFACE_MAX_DEFERRED_PRESENTS 64
 #define CLIENT_SURFACE_MAX_PROCESS_DEFERRED_PRESENTS 1024
+#define CLIENT_SURFACE_COMPLETION_WORKER_IDLE_TIMEOUT_MS 100
 static LONG client_surface_deferred_present_count;
 
 void client_surface_begin_inline_completion( struct client_surface *surface,
@@ -55,9 +57,24 @@ void client_surface_begin_inline_completion( struct client_surface *surface,
     client_surface_unlock_present( surface );
 }
 
-static void CALLBACK client_surface_completion_worker( void *context )
+static BOOL wait_for_completion_job_locked( struct client_surface *surface )
 {
-    struct client_surface *surface = context;
+    struct timespec abstime;
+    int ret = 0;
+
+    if (clock_gettime( CLOCK_REALTIME, &abstime )) return FALSE;
+    abstime.tv_nsec += CLIENT_SURFACE_COMPLETION_WORKER_IDLE_TIMEOUT_MS * 1000000;
+    abstime.tv_sec += abstime.tv_nsec / 1000000000;
+    abstime.tv_nsec %= 1000000000;
+
+    while (list_empty( &surface->completion_queue ) && !ret)
+        ret = pthread_cond_timedwait( &surface->completion_queue_cond,
+                                     &surface->completion_queue_lock, &abstime );
+    return !list_empty( &surface->completion_queue );
+}
+
+static void client_surface_completion_worker( struct client_surface *surface, BOOL linger )
+{
     struct client_surface_completion_job *job;
 
     for (;;)
@@ -66,7 +83,11 @@ static void CALLBACK client_surface_completion_worker( void *context )
         BOOL completed;
 
         pthread_mutex_lock( &surface->completion_queue_lock );
-        if (list_empty( &surface->completion_queue ))
+        /* Backend completion callbacks may depend on per-thread state.  Reuse
+         * this worker only for its own surface and only across short frame
+         * gaps, preserving both affinity and the original concurrency bound. */
+        if (list_empty( &surface->completion_queue ) &&
+            (!linger || !wait_for_completion_job_locked( surface )))
         {
             surface->completion_worker_active = FALSE;
             pthread_mutex_unlock( &surface->completion_queue_lock );
@@ -114,7 +135,7 @@ static void __attribute__((stdcall)) client_surface_completion_thread( void *con
 static void client_surface_completion_thread( void *context )
 #endif
 {
-    client_surface_completion_worker( context );
+    client_surface_completion_worker( context, TRUE );
 }
 
 void client_surface_defer_present( struct client_surface *surface,
@@ -201,6 +222,7 @@ void client_surface_defer_present( struct client_surface *surface,
         client_surface_add_ref( surface );
         start_worker = TRUE;
     }
+    else pthread_cond_signal( &surface->completion_queue_cond );
     pthread_mutex_unlock( &surface->completion_queue_lock );
     present->completion_locked = FALSE;
     client_surface_unlock_present( surface );
@@ -219,7 +241,7 @@ void client_surface_defer_present( struct client_surface *surface,
              * every external completion token still has exactly one owner. */
             WARN( "Failed to create client-surface completion worker, status %#lx\n",
                   (unsigned long)status );
-            client_surface_completion_worker( surface );
+            client_surface_completion_worker( surface, FALSE );
         }
         else NtClose( thread );
     }
