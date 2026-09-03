@@ -283,6 +283,8 @@ extern void destroy_thread_windows(void);
 extern LRESULT destroy_window( HWND hwnd );
 extern BOOL get_client_rect( HWND hwnd, RECT *rect, struct ratio dpi );
 extern BOOL get_present_rect( HWND hwnd, RECT *rect, struct ratio dpi );
+extern NTSTATUS get_shared_window( HANDLE handle, struct object_lock *lock,
+                                   const window_shm_t **window_shm );
 extern HWND get_desktop_window(void);
 extern struct ratio get_dpi_for_window( HWND hwnd );
 extern HWND get_full_window_handle( HWND hwnd );
