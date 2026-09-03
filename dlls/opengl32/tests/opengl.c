@@ -4138,7 +4138,8 @@ static void test_window_dc(void)
 
     GetClientRect(window, &r);
     glGetIntegerv(GL_VIEWPORT, (GLint *)&vp);
-    ok(EqualRect(&r, &vp), "Viewport not equal to client rect.\n");
+    ok( EqualRect( &r, &vp ), "got viewport %s, expected client rect %s\n",
+        wine_dbgstr_rect( &vp ), wine_dbgstr_rect( &r ) );
 
     ret = wglMakeCurrent(NULL, NULL);
     ok(ret, "Failed to clear current context, last error %#lx.\n", GetLastError());
@@ -4314,7 +4315,8 @@ static void test_message_window(void)
 
     GetClientRect(window, &r);
     glGetIntegerv(GL_VIEWPORT, (GLint *)&vp);
-    ok(EqualRect(&r, &vp), "Viewport not equal to client rect.\n");
+    ok( EqualRect( &r, &vp ), "got viewport %s, expected client rect %s\n",
+        wine_dbgstr_rect( &vp ), wine_dbgstr_rect( &r ) );
 
     glClear(GL_COLOR_BUFFER_BIT);
     glFinish();
