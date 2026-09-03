@@ -53,13 +53,21 @@ X11 ルートウィンドウの `SubstructureRedirectMask` を調べ、ICCCM 対
 
 ### サーフェスの段階的な公開
 
-win32u と wineserver は、トップレベルおよび子ウィンドウに属するクライアントサーフェスについて、表示状態、Z オーダー、dirty/staged 状態、および公開世代を追跡します。X11 側では XComposite を用いて準備途中のサーフェスをリダイレクトし、対応する世代の描画が完了してから表示側へ反映します。
+win32u と wineserver は、トップレベルおよび子ウィンドウに属するクライアントサーフェスについて、表示状態、Z オーダー、dirty/staged/ready 状態、および公開世代を追跡します。X11 側では XComposite を用いて準備途中のサーフェスをリダイレクトします。全ウィンドウの合成完了後も直ちには公開せず、トップレベル所有スレッドへ publish 通知を送り、その ACK で初めて staged 状態を解除します。
+
+描画 backend は共通の presentation transaction を使用します。win32u は native target の更新後に target/lifecycle token、公開世代、および scene generation を取得し、backend が host present の完了を証明した後だけ、同じ token の surface を合成して世代を commit します。wineserver は geometry、可視性、Z オーダー、および client-surface membership の変更中に scene generation を奇数、安定時に偶数として公開します。変更が staged generation と重なった場合は、未完了surfaceだけでなくコピー済みsurfaceも含む全可視ウィンドウを新しい generation へ再登録します。このため、1回の公開に異なるsceneから得たピクセルが混在しません。
+
+合成用 clip は renderer ごとの process-local 一覧から組み立てず、wineserver が同じ scene snapshot 内で、対象より上にある全プロセスの client-surface window を一括列挙します。得られたclip regionは scene generation、native-target epoch、monitor DPIをキーとしてsurfaceごとに保持し、sceneが変化しない通常のpresentでは同期RPC、可変長配列の確保、HRGNの再構築を省きます。サーバー側は subtree の surface 数を集計しているため、surface の存在確認に window tree 全体の再帰走査も不要です。
+
+同一HWNDに現行のactive surfaceと以前のcached surfaceが共存する場合、wineserverは最新のactive surface（activeがなければ最新のcache）をそのgenerationの唯一のproducerとして選択します。rendererはコピー前に generation/scene/identity の組を照合し、選択されていない古いsurfaceはstaging bufferへ触れません。待機数もsurface identity数ではなく可視なclient-surface window数になるため、古いcacheによる最終フレームの上書きと重複コピーを同時に避けます。
+
+renderer の終了、通知先 message queue の不在、通知用メッセージの割り当て失敗、および応答停止によって公開が永久に待たされないよう、wineserver の staged generation には6秒の期限があります。これは backend の5秒の完了待機より長く、正常な transaction がまだcommit可能な間にserverだけが先にfail-openしません。期限切れの世代は subtree 全体から retire され、後着の commit は 64 bit generation と scene generation の不一致として無視されます。再合成側は進行中producerのcompletion lockを待たず、取得できない場合は再通知の責任をproducer完了側へ移すため、window-owner threadがGPU/WSI待機で停止しません。選択済みproducerのclip/DC/native copyが一時的に失敗した場合はgenerationごとに1回だけ再合成を通知し、回復機会を確保しながら失敗ループを防ぎます。
 
 ドライバ境界の `CreateClientSurface` インターフェースも更新されており、X11 だけでなく Android、macOS、Wayland の各ドライバで整合するようになっています。
 
 ### Vulkan の present とリサイズ
 
-各 swapchain image は acquire 時点のクライアントサーフェス世代を記録します。ホストが `VK_KHR_present_id` と `VK_KHR_present_wait` の拡張および機能を提供する場合、Wine 内部で present の完了を待ってからオフスクリーンサーフェスを公開し、前フレームや異なる世代の内容をコピーすることを防ぎます。対応していない環境では従来の経路を使用します。
+各 QueuePresent transaction は host present の直前にクライアントサーフェス世代と native-target token を記録します。ホストが `VK_KHR_present_id` と `VK_KHR_present_wait` の拡張および機能を提供する場合、Wine 内部で swapchain ごとに単調増加する present ID を割り当て、present の完了を待ってからオフスクリーンサーフェスを公開します。exact present ID の待機中は client-surface lock を保持せず、最終copyだけを直列化します。完了順が逆転した場合はsurface単位のsubmission serialにより古いcopyを破棄します。producerが待機中のcached replayは古いframeを先にcommitしないよう延期し、producer失敗時に再通知します。複数 swapchain の完了待機には呼び出し全体で共有する期限を用い、swapchain 数に比例して最大待機時間が伸びないようにしています。
 
 クライアント領域の大きさと swapchain の大きさが一致しなくなった場合は `VK_ERROR_OUT_OF_DATE_KHR` を返し、リサイズ後の swapchain 再作成を促します。
 
@@ -69,7 +77,9 @@ win32u と wineserver は、トップレベルおよび子ウィンドウに属�
 
 winex11 の EGL backend は、ウィンドウ寸法の更新を表す `GL_FLUSH_UPDATED` を受けた時に `eglQuerySurface()` で width と height を再取得します。Mesa の X11 EGL 実装はこの照会時に X geometry の変化を検出して古い drawable buffer を invalidate するため、64x64 から実寸へ拡大した直後の描画が旧 extent に clip されません。この処理は EGL 固有であり、GLX、Wine Vulkan、DXVK の内部へ直接作用するものではありません。
 
-EGL と GLX の offscreen swap は、XDamage が対応する pixmap の更新を通知するまで待機してから client surface を完成済みとして公開します。描画完了待機の対象は swap 対象の drawable に限定し、5秒以内に通知されなければ診断を残してそのフレームの公開を中止します。これにより、swap API の復帰だけを完成の証拠として扱っていた競合を除去します。
+GLX は `GLX_OML_sync_control` が利用できる場合に swap buffer count、EGL は `EGL_ANDROID_get_frame_timestamps` が利用できる場合に frame ID と display-present timestamp を使い、そのpresent固有の完了を確認します。Vulkan は上記のpresent IDを使います。exact tokenを利用できない経路だけが、期限付きのXDamage monitorへfallbackします。XDamageにはpresent serialがないため、失敗したhost callや期限切れの遅延eventを次フレームの証拠として再利用せず、monitorとそのnative surfaceを再利用不能にします。
+
+使用を終えた client surface は、最後の完成フレームを再利用できるよう process-local LRU に残しますが、native drawable、DC、および server の cached membership を無制限に保持しないよう最大64 surfaceかつ推定256MiBに制限します。4K surfaceを個数上限まで保持して数GiBへ増えることはありません。追い出し時には server membership を先に retireし、残っている再合成参照が解放された時点でnative resourceを破棄します。完了monitorが因果性を失ったsurfaceはLRUへ戻さず、そのdrawableの解放時に破棄します。
 
 WGL の pixel format はプロセス内の `WND` だけでなく wineserver のウィンドウ状態として保持します。別プロセスが所有する HWND を描画する場合にも同じ形式を取得できます。また、active と cached の client surface 所有者を描画プロセス単位で追跡し、geometry-ready 通知を実際に再合成できるプロセスのキューへ送ります。終了済み描画プロセスの所有情報は自動的に破棄します。
 
