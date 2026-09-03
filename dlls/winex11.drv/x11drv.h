@@ -524,7 +524,6 @@ enum x11drv_atoms
     XATOM_WM_NORMAL_HINTS,
     XATOM_WM_STATE,
     XATOM_WM_TAKE_FOCUS,
-    XATOM__WINE_CLIENT_SURFACE_COMMIT,
     XATOM_DndProtocol,
     XATOM_DndSelection,
     XATOM__ICC_PROFILE,

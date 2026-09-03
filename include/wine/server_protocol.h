@@ -6282,6 +6282,7 @@ struct set_client_surface_state_request
     unsigned int   flags;
     char __pad_28[4];
     unsigned __int64 generation;
+    unsigned __int64 scene_generation;
 };
 struct set_client_surface_state_reply
 {
@@ -6289,8 +6290,11 @@ struct set_client_surface_state_reply
     user_handle_t  toplevel;
     unsigned int   wake;
     unsigned __int64 generation;
+    unsigned __int64 scene_generation;
     unsigned int   pending;
     unsigned int   staged;
+    unsigned int   ready;
+    unsigned int   compose;
     unsigned int   active;
     unsigned int   cached;
 };
@@ -6302,6 +6306,8 @@ struct set_client_surface_state_reply
 #define CLIENT_SURFACE_STATE_GEOMETRY_READY 0x40
 #define CLIENT_SURFACE_STATE_CACHE           0x80
 #define CLIENT_SURFACE_STATE_UNCACHE         0x100
+#define CLIENT_SURFACE_STATE_PUBLISH         0x200
+#define CLIENT_SURFACE_STATE_PRESENT_BEGIN   0x400
 
 
 
@@ -7271,6 +7277,6 @@ union generic_reply
     struct get_client_surface_clip_windows_reply get_client_surface_clip_windows_reply;
 };
 
-#define SERVER_PROTOCOL_VERSION 974
+#define SERVER_PROTOCOL_VERSION 976
 
 #endif /* __WINE_WINE_SERVER_PROTOCOL_H */

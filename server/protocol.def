@@ -4370,12 +4370,16 @@ enum inproc_sync_type
     client_ptr_t   surface;       /* process-local client surface identity */
     unsigned int   flags;         /* CLIENT_SURFACE_STATE_* */
     unsigned __int64 generation;  /* publication generation being committed */
+    unsigned __int64 scene_generation; /* scene snapshot being committed */
 @REPLY
     user_handle_t  toplevel;      /* current top-level ancestor */
     unsigned int   wake;          /* top-level may now be exposed */
     unsigned __int64 generation;  /* current unpublished generation */
-    unsigned int   pending;       /* surfaces pending in that generation */
+    unsigned __int64 scene_generation; /* current stable scene sequence */
+    unsigned int   pending;       /* window producers pending in that generation */
     unsigned int   staged;        /* whether the generation is unpublished */
+    unsigned int   ready;         /* generation is composed and awaits owner publish */
+    unsigned int   compose;       /* this surface is the selected producer */
     unsigned int   active;        /* active surfaces on the requested window */
     unsigned int   cached;        /* cached surfaces on the requested window */
 @END
@@ -4387,6 +4391,8 @@ enum inproc_sync_type
 #define CLIENT_SURFACE_STATE_GEOMETRY_READY 0x40
 #define CLIENT_SURFACE_STATE_CACHE           0x80
 #define CLIENT_SURFACE_STATE_UNCACHE         0x100
+#define CLIENT_SURFACE_STATE_PUBLISH         0x200
+#define CLIENT_SURFACE_STATE_PRESENT_BEGIN   0x400
 
 
 /* Get visible client-surface windows above a target in one stable scene. */

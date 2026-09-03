@@ -67,6 +67,7 @@ struct client_surface_ref
     struct list     entry;
     client_ptr_t    id;
     unsigned long long generation;
+    unsigned long long sequence;
     unsigned int    active : 1;
     unsigned int    cached : 1;
 };
@@ -114,7 +115,11 @@ struct window
     unsigned long long client_surface_generation; /* current unpublished composition generation */
     unsigned long long client_surface_scene_generation; /* even when the scene is stable */
     unsigned int     client_surface_scene_change_depth;
-    unsigned int     client_surface_pending_count; /* surfaces still missing from staged generation */
+    unsigned int     client_surface_pending_count; /* window producers still missing from staged generation */
+    unsigned int     client_surface_ready; /* composed generation awaits owner publication */
+    unsigned long long client_surface_ready_scene_generation;
+    unsigned int     client_surface_restarting;
+    unsigned int     client_surface_restart_pending;
     struct timeout_user *client_surface_timeout; /* deadline for an unpublished generation */
     unsigned long long client_surface_timeout_generation;
     int              prop_inuse;      /* number of in-use window properties */
@@ -148,6 +153,8 @@ static unsigned int clear_client_surface_subtree_generation( struct window *win,
                                                              unsigned long long generation );
 static void cancel_client_surface_timeout( struct window *top );
 static void finish_client_surface_publication( struct window *top );
+static void restart_client_surface_generation( struct window *top );
+static unsigned long long client_surface_ref_sequence;
 
 static const struct object_ops window_ops =
 {
@@ -534,6 +541,8 @@ static int set_parent_window( struct window *win, struct window *parent )
                 cancel_client_surface_timeout( old_top );
                 old_top->client_surface_staged = 0;
                 old_top->client_surface_pending_count = 0;
+                old_top->client_surface_ready = 0;
+                old_top->client_surface_ready_scene_generation = 0;
                 if (old_top == win || !has_client_surface( old_top ))
                     old_top->client_surface_dirty = 0;
                 update_client_surface_publication( old_top );
@@ -544,6 +553,8 @@ static int set_parent_window( struct window *win, struct window *parent )
                 cancel_client_surface_timeout( new_top );
                 new_top->client_surface_staged = 0;
                 new_top->client_surface_pending_count = 0;
+                new_top->client_surface_ready = 0;
+                new_top->client_surface_ready_scene_generation = 0;
                 update_client_surface_publication( new_top );
                 if (is_visible( new_top ))
                     post_message( new_top->handle, WM_WINE_UPDATEWINDOWSTATE, 0, 0 );
@@ -797,6 +808,10 @@ static struct window *create_window( struct window *parent, struct window *owner
     win->client_surface_scene_generation = 0;
     win->client_surface_scene_change_depth = 0;
     win->client_surface_pending_count = 0;
+    win->client_surface_ready = 0;
+    win->client_surface_ready_scene_generation = 0;
+    win->client_surface_restarting = 0;
+    win->client_surface_restart_pending = 0;
     win->client_surface_timeout = NULL;
     win->client_surface_timeout_generation = 0;
     win->prop_inuse     = 0;
@@ -1048,6 +1063,7 @@ static void end_client_surface_scene_change( struct window *top )
     assert( top->client_surface_scene_generation & 1 );
     top->client_surface_scene_generation++;
     update_client_surface_publication( top );
+    if (top->client_surface_staged) restart_client_surface_generation( top );
 }
 
 static struct client_surface_owner *get_client_surface_owner( struct window *win,
@@ -1077,6 +1093,7 @@ static struct client_surface_ref *get_client_surface_ref( struct client_surface_
     if (!create || !(surface = mem_alloc( sizeof(*surface) ))) return NULL;
     surface->id = id;
     surface->generation = 0;
+    surface->sequence = 0;
     surface->active = 0;
     surface->cached = 0;
     list_add_tail( &owner->surfaces, &surface->entry );
@@ -1109,7 +1126,25 @@ static void finish_client_surface_publication( struct window *top )
     top->client_surface_dirty = 0;
     top->client_surface_staged = 0;
     top->client_surface_pending_count = 0;
+    top->client_surface_ready = 0;
+    top->client_surface_ready_scene_generation = 0;
     update_client_surface_publication( top );
+}
+
+static int mark_client_surface_generation_ready( struct window *top )
+{
+    if (!top->client_surface_staged || top->client_surface_pending_count ||
+        (top->client_surface_scene_generation & 1))
+        return 0;
+    if (top->client_surface_ready &&
+        top->client_surface_ready_scene_generation == top->client_surface_scene_generation)
+        return 0;
+
+    top->client_surface_ready = 1;
+    top->client_surface_ready_scene_generation = top->client_surface_scene_generation;
+    post_message( top->handle, WM_WINE_UPDATEWINDOWSTATE,
+                  WINE_PUBLISH_CLIENT_SURFACES, 0 );
+    return 1;
 }
 
 static void client_surface_publication_timeout( void *private )
@@ -1153,36 +1188,7 @@ static int complete_client_surface_generation( struct window *top, struct client
     assert( top->client_surface_pending_count );
     if (--top->client_surface_pending_count) return 0;
 
-    finish_client_surface_publication( top );
-    return 1;
-}
-
-static int complete_client_surface_window_generation( struct window *top, struct window *win,
-                                                      unsigned long long generation )
-{
-    struct client_surface_owner *owner;
-    struct client_surface_ref *surface;
-    unsigned int count = 0;
-
-    if (!top->client_surface_staged || generation != top->client_surface_generation) return 0;
-
-    LIST_FOR_EACH_ENTRY( owner, &win->client_surface_owners, struct client_surface_owner, entry )
-    {
-        LIST_FOR_EACH_ENTRY( surface, &owner->surfaces, struct client_surface_ref, entry )
-        {
-            if (surface->generation != generation) continue;
-            surface->generation = 0;
-            count++;
-        }
-    }
-    if (!count) return 0;
-
-    assert( top->client_surface_pending_count >= count );
-    top->client_surface_pending_count -= count;
-    if (top->client_surface_pending_count) return 0;
-
-    finish_client_surface_publication( top );
-    return 1;
+    return mark_client_surface_generation_ready( top );
 }
 
 static unsigned int clear_client_surface_subtree_generation( struct window *win,
@@ -1237,8 +1243,7 @@ static int retire_client_surface_owner_generation( struct window *top,
     top->client_surface_pending_count -= count;
     if (top->client_surface_pending_count) return 0;
 
-    finish_client_surface_publication( top );
-    return 1;
+    return mark_client_surface_generation_ready( top );
 }
 
 static int retire_client_surface_subtree_generation( struct window *top, struct window *win,
@@ -1254,8 +1259,7 @@ static int retire_client_surface_subtree_generation( struct window *top, struct 
     top->client_surface_pending_count -= count;
     if (top->client_surface_pending_count) return 0;
 
-    finish_client_surface_publication( top );
-    return 1;
+    return mark_client_surface_generation_ready( top );
 }
 
 static void discard_client_surface_owner( struct window *win, struct client_surface_owner *owner,
@@ -1334,8 +1338,9 @@ void cleanup_process_client_surfaces( struct process *process )
 static unsigned int prepare_client_surface_generation( struct window *win, unsigned long long generation )
 {
     struct client_surface_owner *owner;
-    struct client_surface_ref *surface;
+    struct client_surface_ref *surface, *selected = NULL;
     struct window *child;
+    int selected_active = 0;
     unsigned int count = 0;
 
     if (!is_visible( win )) return 0;
@@ -1343,10 +1348,22 @@ static unsigned int prepare_client_surface_generation( struct window *win, unsig
     {
         LIST_FOR_EACH_ENTRY( surface, &owner->surfaces, struct client_surface_ref, entry )
         {
-            if (!surface->active && !surface->cached) continue;
-            surface->generation = generation;
-            count++;
+            surface->generation = 0;
+            if (surface->active && (!selected_active || !selected ||
+                                    surface->sequence > selected->sequence))
+            {
+                selected = surface;
+                selected_active = 1;
+            }
+            else if (!selected_active && surface->cached &&
+                     (!selected || surface->sequence > selected->sequence))
+                selected = surface;
         }
+    }
+    if (selected)
+    {
+        selected->generation = generation;
+        count = 1;
     }
     LIST_FOR_EACH_ENTRY( child, &win->children, struct window, entry )
         count += prepare_client_surface_generation( child, generation );
@@ -1355,6 +1372,16 @@ static unsigned int prepare_client_surface_generation( struct window *win, unsig
 
 static unsigned long long client_surface_generation;
 static unsigned long long client_surface_notification;
+
+static int client_surface_owner_has_generation( struct client_surface_owner *owner,
+                                                unsigned long long generation )
+{
+    struct client_surface_ref *surface;
+
+    LIST_FOR_EACH_ENTRY( surface, &owner->surfaces, struct client_surface_ref, entry )
+        if (surface->generation == generation) return 1;
+    return 0;
+}
 
 static int notify_client_surface_geometry_ready_recursive( struct window *win, struct window *top,
                                                            unsigned long long notification )
@@ -1375,6 +1402,9 @@ static int notify_client_surface_geometry_ready_recursive( struct window *win, s
             discard_client_surface_owner( win, owner, top );
             continue;
         }
+        if (top->client_surface_staged &&
+            !client_surface_owner_has_generation( owner, top->client_surface_generation ))
+            continue;
         if (owner->process->client_surface_notification != notification)
         {
             if (post_process_message( owner->process, top->handle, WM_WINE_UPDATEWINDOWSTATE,
@@ -1402,6 +1432,42 @@ static void notify_client_surface_geometry_ready( struct window *top )
 {
     if (!++client_surface_notification) ++client_surface_notification;
     notify_client_surface_geometry_ready_recursive( top, top, client_surface_notification );
+}
+
+/* Any scene mutation invalidates the complete staged image, not only the
+ * surfaces which have not committed yet.  Reassign every visible surface to
+ * a fresh generation so one publication can never contain copies produced
+ * from different scene snapshots. */
+static void restart_client_surface_generation( struct window *top )
+{
+    if (!top->client_surface_staged) return;
+    if (top->client_surface_restarting)
+    {
+        top->client_surface_restart_pending = 1;
+        return;
+    }
+
+    top->client_surface_restarting = 1;
+    do
+    {
+        top->client_surface_restart_pending = 0;
+        cancel_client_surface_timeout( top );
+        top->client_surface_ready = 0;
+        top->client_surface_ready_scene_generation = 0;
+        if (!++client_surface_generation) ++client_surface_generation;
+        top->client_surface_generation = client_surface_generation;
+        top->client_surface_pending_count =
+            prepare_client_surface_generation( top, top->client_surface_generation );
+        update_client_surface_publication( top );
+
+        if (top->client_surface_pending_count)
+            notify_client_surface_geometry_ready( top );
+        else
+            mark_client_surface_generation_ready( top );
+    } while (top->client_surface_staged && top->client_surface_restart_pending);
+    top->client_surface_restarting = 0;
+
+    if (top->client_surface_staged) arm_client_surface_timeout( top );
 }
 
 static struct window *get_toplevel_window( struct window *win )
@@ -2508,6 +2574,8 @@ static void set_window_pos( struct window *win, struct window *previous,
             cancel_client_surface_timeout( client_surface_top );
             client_surface_top->client_surface_staged = 0;
             client_surface_top->client_surface_pending_count = 0;
+            client_surface_top->client_surface_ready = 0;
+            client_surface_top->client_surface_ready_scene_generation = 0;
             update_client_surface_publication( client_surface_top );
         }
         else if (!is_visible( win ) &&
@@ -3462,9 +3530,9 @@ DECL_HANDLER(get_client_surface_clip_windows)
 
 
 /* Track client-rendered content across process boundaries.  A presentation
- * made while an ancestor is hidden invalidates the top-level composition. The
- * first top-level composition copied in the next visible generation makes the
- * entire host window publishable again. */
+ * made while an ancestor is hidden invalidates the top-level composition.
+ * Every visible surface must commit the same scene generation before the
+ * owner is allowed to publish the staged host window. */
 DECL_HANDLER(set_client_surface_state)
 {
     struct client_surface_owner *owner;
@@ -3475,8 +3543,11 @@ DECL_HANDLER(set_client_surface_state)
     reply->toplevel = 0;
     reply->wake = 0;
     reply->generation = 0;
+    reply->scene_generation = 0;
     reply->pending = 0;
     reply->staged = 0;
+    reply->ready = 0;
+    reply->compose = 0;
     reply->active = 0;
     reply->cached = 0;
     if (!(win = get_window( req->handle ))) return;
@@ -3496,13 +3567,18 @@ DECL_HANDLER(set_client_surface_state)
         return;
     }
 
-    scene_change = req->flags & (CLIENT_SURFACE_STATE_REGISTER | CLIENT_SURFACE_STATE_UNREGISTER |
-                                 CLIENT_SURFACE_STATE_CACHE | CLIENT_SURFACE_STATE_UNCACHE);
+    scene_change = surface &&
+        (((req->flags & CLIENT_SURFACE_STATE_REGISTER) && !surface->active) ||
+         ((req->flags & CLIENT_SURFACE_STATE_UNREGISTER) && surface->active) ||
+         ((req->flags & CLIENT_SURFACE_STATE_CACHE) && !surface->cached) ||
+         ((req->flags & CLIENT_SURFACE_STATE_UNCACHE) && surface->cached));
     if (scene_change) begin_client_surface_scene_change( top );
 
     if ((req->flags & CLIENT_SURFACE_STATE_CACHE) && !surface->cached)
     {
         surface->cached = 1;
+        if (!++client_surface_ref_sequence) ++client_surface_ref_sequence;
+        surface->sequence = client_surface_ref_sequence;
         win->client_surface_cached_count++;
         owner->cached_count++;
         adjust_client_surface_subtree_count( win, 1 );
@@ -3518,6 +3594,8 @@ DECL_HANDLER(set_client_surface_state)
     if ((req->flags & CLIENT_SURFACE_STATE_REGISTER) && !surface->active)
     {
         surface->active = 1;
+        if (!++client_surface_ref_sequence) ++client_surface_ref_sequence;
+        surface->sequence = client_surface_ref_sequence;
         win->client_surface_count++;
         owner->active_count++;
         adjust_client_surface_subtree_count( win, 1 );
@@ -3547,15 +3625,9 @@ DECL_HANDLER(set_client_surface_state)
         cancel_client_surface_timeout( top );
         top->client_surface_staged = top->client_surface_dirty && is_visible( top );
         if (top->client_surface_staged)
-        {
-            if (!++client_surface_generation) ++client_surface_generation;
-            top->client_surface_generation = client_surface_generation;
-        }
-        top->client_surface_pending_count = top->client_surface_staged ?
-            prepare_client_surface_generation( top, top->client_surface_generation ) : 0;
-        if (top->client_surface_staged && !top->client_surface_pending_count)
+            restart_client_surface_generation( top );
+        else
             finish_client_surface_publication( top );
-        update_client_surface_publication( top );
         /* The host driver has now mapped the top-level window into its private
          * staging buffer.  A client surface may already contain a complete
          * frame presented while the hierarchy was hidden and the application
@@ -3564,35 +3636,41 @@ DECL_HANDLER(set_client_surface_state)
          * into this publication generation.  Incomplete cached surfaces are
          * rejected by the client-side completeness check and remain staged
          * until an application present completes them. */
-        if (top->client_surface_staged) notify_client_surface_geometry_ready( top );
-        if (top->client_surface_staged) arm_client_surface_timeout( top );
     }
     if (req->flags & CLIENT_SURFACE_STATE_BYPASS)
         finish_client_surface_publication( top );
     if (req->flags & CLIENT_SURFACE_STATE_GEOMETRY_READY)
         notify_client_surface_geometry_ready( top );
+    if ((req->flags & CLIENT_SURFACE_STATE_PRESENT_BEGIN) && surface &&
+        top->client_surface_staged && !(top->client_surface_scene_generation & 1) &&
+        req->generation == top->client_surface_generation &&
+        req->scene_generation == top->client_surface_scene_generation &&
+        surface->generation == req->generation)
+        reply->compose = 1;
     if ((req->flags & CLIENT_SURFACE_STATE_PRESENT_COMMIT) && surface &&
         (surface->active || surface->cached) && is_visible( win ))
     {
-        /* A surface can become visible or register after a generation was
-         * prepared.  Let its first commit join and immediately complete that
-         * generation without requiring a separate begin request. */
-        if (top->client_surface_staged && req->generation == top->client_surface_generation &&
-            surface->generation != req->generation)
-        {
-            surface->generation = req->generation;
-            top->client_surface_pending_count++;
-        }
-        complete_client_surface_window_generation( top, win, req->generation );
+        if (req->scene_generation == top->client_surface_scene_generation)
+            complete_client_surface_generation( top, surface, req->generation );
     }
 
     if (scene_change) end_client_surface_scene_change( top );
 
+    /* Copy completion and host exposure are separate phases.  Only the
+     * top-level owner may acknowledge a fully composed, still-current scene. */
+    if ((req->flags & CLIENT_SURFACE_STATE_PUBLISH) && top->thread == current &&
+        top->client_surface_staged && top->client_surface_ready &&
+        !(top->client_surface_scene_generation & 1) &&
+        top->client_surface_ready_scene_generation == top->client_surface_scene_generation)
+        finish_client_surface_publication( top );
+
     reply->toplevel = top->handle;
     reply->wake = was_pending && is_visible( top ) && !top->client_surface_dirty;
     reply->generation = top->client_surface_generation;
+    reply->scene_generation = top->client_surface_scene_generation;
     reply->pending = top->client_surface_pending_count;
     reply->staged = top->client_surface_staged;
+    reply->ready = top->client_surface_ready;
     reply->active = win->client_surface_count;
     reply->cached = win->client_surface_cached_count;
 }

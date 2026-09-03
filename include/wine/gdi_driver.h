@@ -256,8 +256,6 @@ struct client_surface_funcs
     BOOL (*update)( struct client_surface *surface );
     /* present the client surface if necessary, hdc != NULL when offscreen, called from render thread */
     BOOL (*present)( struct client_surface *surface, HDC hdc, HRGN surface_region, BOOL flush );
-    /* notify the window owner after a staged composition commit */
-    BOOL (*commit)( struct client_surface *surface, HWND toplevel );
     /* arm and wait for a host presentation completion boundary */
     BOOL (*prepare_completion)( struct client_surface *surface );
     BOOL (*wait_completion)( struct client_surface *surface, DWORD timeout );
@@ -312,7 +310,16 @@ struct client_surface
     LONG                               lifecycle_seq;  /* seqlock for detach and destruction */
     LONG                               target_ready;   /* driver successfully prepared the current target */
     LONG64                             recompose_requested; /* latest requested recomposition generation */
+    LONG64                             recompose_retry_generation; /* newest generation granted one retry */
     LONG                               recompose_scheduled; /* a recomposition consumer owns a reference */
+    LONG                               recompose_deferred; /* completion owner must reschedule replay */
+    UINT64                             clip_scene_generation; /* scene owning the cached cross-process clip */
+    LONG64                             clip_target_epoch;
+    RECT                               clip_monitor_rect;
+    UINT                               clip_dpi_num;
+    UINT                               clip_dpi_den;
+    HRGN                               clip_region;
+    BOOL                               clip_region_valid;
     RECT                               virtual_rect;   /* virtual size and position in the toplevel ancestor, relative to its visible rect */
     RECT                               monitor_rect;   /* raw physical size and position in the toplevel ancestor, relative to its visible rect */
     HWND                               ready_toplevel; /* toplevel whose driver update has completed */
@@ -344,6 +351,7 @@ W32KAPI BOOL client_surface_complete_present_locked( struct client_surface *surf
 W32KAPI void client_surface_geometry_ready( HWND hwnd );
 W32KAPI void client_surface_set_staged( HWND hwnd );
 W32KAPI void client_surface_bypass_staging( HWND hwnd );
+W32KAPI BOOL client_surface_publish( HWND hwnd );
 W32KAPI void update_client_surfaces( HWND hwnd );
 W32KAPI void detach_client_surfaces( HWND hwnd );
 

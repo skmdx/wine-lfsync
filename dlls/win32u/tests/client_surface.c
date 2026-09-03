@@ -28,8 +28,11 @@ struct surface_state
 {
     HWND toplevel;
     UINT64 generation;
+    UINT64 scene_generation;
     UINT pending;
     UINT staged;
+    UINT ready;
+    UINT compose;
     UINT active;
     UINT cached;
     BOOL wake;
@@ -45,8 +48,9 @@ struct clip_state
 
 static unsigned int (CDECL *p_wine_server_call)(void *);
 
-static unsigned int set_surface_state( HWND hwnd, UINT_PTR surface, UINT flags,
-                                       UINT64 generation, struct surface_state *state )
+static unsigned int set_surface_state_scene( HWND hwnd, UINT_PTR surface, UINT flags,
+                                             UINT64 generation, UINT64 scene_generation,
+                                             struct surface_state *state )
 {
     struct __server_request_info info;
     struct set_client_surface_state_request *req = &info.u.req.set_client_surface_state_request;
@@ -59,18 +63,49 @@ static unsigned int set_surface_state( HWND hwnd, UINT_PTR surface, UINT flags,
     req->surface = surface;
     req->flags = flags;
     req->generation = generation;
+    req->scene_generation = scene_generation;
     status = p_wine_server_call( &info );
     if (!status && state)
     {
         state->toplevel = wine_server_ptr_handle( reply->toplevel );
         state->generation = reply->generation;
+        state->scene_generation = reply->scene_generation;
         state->pending = reply->pending;
         state->staged = reply->staged;
+        state->ready = reply->ready;
+        state->compose = reply->compose;
         state->active = reply->active;
         state->cached = reply->cached;
         state->wake = reply->wake;
     }
     return status;
+}
+
+static unsigned int set_surface_state( HWND hwnd, UINT_PTR surface, UINT flags,
+                                       UINT64 generation, struct surface_state *state )
+{
+    return set_surface_state_scene( hwnd, surface, flags, generation, 0, state );
+}
+
+static unsigned int commit_surface_state( HWND hwnd, UINT_PTR surface,
+                                          const struct surface_state *generation,
+                                          struct surface_state *state )
+{
+    return set_surface_state_scene( hwnd, surface, CLIENT_SURFACE_STATE_PRESENT_COMMIT,
+                                    generation->generation, generation->scene_generation, state );
+}
+
+static unsigned int begin_surface_state( HWND hwnd, UINT_PTR surface,
+                                         const struct surface_state *generation,
+                                         struct surface_state *state )
+{
+    return set_surface_state_scene( hwnd, surface, CLIENT_SURFACE_STATE_PRESENT_BEGIN,
+                                    generation->generation, generation->scene_generation, state );
+}
+
+static unsigned int publish_surface_state( HWND hwnd, struct surface_state *state )
+{
+    return set_surface_state( hwnd, 0, CLIENT_SURFACE_STATE_PUBLISH, 0, state );
 }
 
 static unsigned int get_clip_state( HWND hwnd, struct clip_state *state )
@@ -164,16 +199,32 @@ static void test_generation_membership(void)
     ShowWindow( hwnd, SW_SHOW );
     status = set_surface_state( hwnd, 0, CLIENT_SURFACE_STATE_STAGED, 0, &staged );
     ok( !status, "membership stage failed, status %#x\n", status );
-    ok( staged.staged && staged.generation && staged.pending == 2,
+    ok( staged.staged && staged.generation && staged.pending == 1,
         "unexpected staged state: staged %u generation %s pending %u\n",
         staged.staged, wine_dbgstr_longlong( staged.generation ), staged.pending );
 
-    status = set_surface_state( hwnd, first_surface, CLIENT_SURFACE_STATE_PRESENT_COMMIT,
-                                staged.generation, &committed );
+    status = begin_surface_state( hwnd, first_surface, &staged, &committed );
+    ok( !status && !committed.compose,
+        "older same-window producer was selected, compose %u status %#x\n",
+        committed.compose, status );
+    status = commit_surface_state( hwnd, first_surface, &staged, &committed );
     ok( !status, "membership commit failed, status %#x\n", status );
-    ok( !committed.staged && !committed.pending && committed.wake,
-        "same-window commit did not complete all surfaces: staged %u pending %u wake %u\n",
-        committed.staged, committed.pending, committed.wake );
+    ok( committed.staged && !committed.ready && committed.pending == 1,
+        "non-selected producer completed generation: staged %u ready %u pending %u\n",
+        committed.staged, committed.ready, committed.pending );
+    status = begin_surface_state( hwnd, second_surface, &staged, &committed );
+    ok( !status && committed.compose,
+        "newest active producer was not selected, compose %u status %#x\n",
+        committed.compose, status );
+    status = commit_surface_state( hwnd, second_surface, &staged, &committed );
+    ok( !status, "selected membership commit failed, status %#x\n", status );
+    ok( committed.staged && committed.ready && !committed.pending && !committed.wake,
+        "same-window commit was exposed before owner publish: staged %u ready %u pending %u wake %u\n",
+        committed.staged, committed.ready, committed.pending, committed.wake );
+    status = publish_surface_state( hwnd, &committed );
+    ok( !status && !committed.staged && !committed.ready && committed.wake,
+        "owner publish failed: staged %u ready %u wake %u status %#x\n",
+        committed.staged, committed.ready, committed.wake, status );
 
     status = set_surface_state( hwnd, first_surface, CLIENT_SURFACE_STATE_UNREGISTER, 0, &state );
     ok( !status, "first unregister failed, status %#x\n", status );
@@ -184,14 +235,17 @@ static void test_generation_membership(void)
     ShowWindow( hwnd, SW_SHOW );
     status = set_surface_state( hwnd, 0, CLIENT_SURFACE_STATE_STAGED, 0, &staged );
     ok( !status, "cached stage failed, status %#x\n", status );
-    ok( staged.staged && staged.pending == 2,
-        "active and cached surfaces not included once: staged %u pending %u\n",
+    ok( staged.staged && staged.pending == 1,
+        "window producer was not normalized: staged %u pending %u\n",
         staged.staged, staged.pending );
     status = set_surface_state( hwnd, first_surface, CLIENT_SURFACE_STATE_UNCACHE, 0, &state );
     ok( !status, "uncache failed, status %#x\n", status );
     ok( state.active == 1 && !state.cached && state.pending == 1 && state.staged && !state.wake,
         "uncache did not retire one surface: active %u cached %u pending %u staged %u wake %u\n",
         state.active, state.cached, state.pending, state.staged, state.wake );
+    ok( state.generation != staged.generation,
+        "membership change did not restart generation %s\n",
+        wine_dbgstr_longlong( state.generation ) );
     status = set_surface_state( hwnd, first_surface,
                                 CLIENT_SURFACE_STATE_UNREGISTER | CLIENT_SURFACE_STATE_UNCACHE,
                                 0, &state );
@@ -199,12 +253,15 @@ static void test_generation_membership(void)
     ok( state.active == 1 && !state.cached && state.pending == 1 && state.staged,
         "duplicate removal underflowed state: active %u cached %u pending %u staged %u\n",
         state.active, state.cached, state.pending, state.staged );
-    status = set_surface_state( hwnd, second_surface, CLIENT_SURFACE_STATE_PRESENT_COMMIT,
-                                staged.generation, &state );
+    status = commit_surface_state( hwnd, second_surface, &state, &state );
     ok( !status, "remaining commit failed, status %#x\n", status );
-    ok( !state.pending && !state.staged && state.wake,
-        "remaining commit did not publish: pending %u staged %u wake %u\n",
-        state.pending, state.staged, state.wake );
+    ok( !state.pending && state.staged && state.ready && !state.wake,
+        "remaining commit did not become ready: pending %u staged %u ready %u wake %u\n",
+        state.pending, state.staged, state.ready, state.wake );
+    status = publish_surface_state( hwnd, &state );
+    ok( !status && !state.pending && !state.staged && state.wake,
+        "remaining generation did not publish: pending %u staged %u wake %u status %#x\n",
+        state.pending, state.staged, state.wake, status );
     status = set_surface_state( hwnd, second_surface, CLIENT_SURFACE_STATE_UNREGISTER, 0, &state );
     ok( !status, "second unregister failed, status %#x\n", status );
     ok( !state.active && !state.cached && !state.pending,
@@ -303,14 +360,12 @@ static void test_subtree_generation_retirement(void)
     ok( !status, "subtree stage failed, status %#x\n", status );
     ok( staged.staged && staged.pending == 2,
         "visible subtree pending count %u staged %u\n", staged.pending, staged.staged );
-    status = set_surface_state( first, first_surface, CLIENT_SURFACE_STATE_PRESENT_COMMIT,
-                                staged.generation, &partial );
+    status = commit_surface_state( first, first_surface, &staged, &partial );
     ok( !status, "first child commit failed, status %#x\n", status );
     ok( partial.staged && partial.pending == 1 && !partial.wake,
         "partial commit state: staged %u pending %u wake %u\n",
         partial.staged, partial.pending, partial.wake );
-    status = set_surface_state( first, first_surface, CLIENT_SURFACE_STATE_PRESENT_COMMIT,
-                                staged.generation, &partial );
+    status = commit_surface_state( first, first_surface, &staged, &partial );
     ok( !status, "duplicate child commit failed, status %#x\n", status );
     ok( partial.staged && partial.pending == 1 && !partial.wake,
         "duplicate commit changed pending state: staged %u pending %u wake %u\n",
@@ -319,8 +374,17 @@ static void test_subtree_generation_retirement(void)
     ShowWindow( second, SW_HIDE );
     status = set_surface_state( parent, 0, 0, 0, &state );
     ok( !status, "state query after child hide failed, status %#x\n", status );
-    ok( !state.staged && !state.pending,
-        "hidden subtree was not retired: staged %u pending %u\n", state.staged, state.pending );
+    ok( state.staged && state.pending == 1 && state.generation != staged.generation,
+        "scene change did not restart visible subtree: staged %u pending %u generation %s\n",
+        state.staged, state.pending, wine_dbgstr_longlong( state.generation ) );
+    status = commit_surface_state( first, first_surface, &state, &partial );
+    ok( !status && partial.ready && !partial.pending,
+        "restarted subtree did not become ready: ready %u pending %u status %#x\n",
+        partial.ready, partial.pending, status );
+    status = publish_surface_state( parent, &partial );
+    ok( !status && !partial.staged && partial.wake,
+        "restarted subtree did not publish: staged %u wake %u status %#x\n",
+        partial.staged, partial.wake, status );
 
     ShowWindow( parent, SW_HIDE );
     ShowWindow( parent, SW_SHOW );
@@ -329,18 +393,24 @@ static void test_subtree_generation_retirement(void)
     ok( staged.staged && staged.pending == 1,
         "hidden child joined generation: staged %u pending %u\n", staged.staged, staged.pending );
     ShowWindow( second, SW_SHOW );
-    status = set_surface_state( second, second_surface, CLIENT_SURFACE_STATE_PRESENT_COMMIT,
-                                staged.generation, &state );
+    status = set_surface_state( parent, 0, 0, 0, &state );
+    ok( !status && state.generation != staged.generation && state.pending == 2,
+        "shown child did not restart full generation: generation %s pending %u status %#x\n",
+        wine_dbgstr_longlong( state.generation ), state.pending, status );
+    status = commit_surface_state( second, second_surface, &state, &partial );
     ok( !status, "late child commit failed, status %#x\n", status );
-    ok( state.staged && state.pending == 1 && !state.wake,
+    ok( partial.staged && partial.pending == 1 && !partial.wake,
         "late child changed existing wait: staged %u pending %u wake %u\n",
-        state.staged, state.pending, state.wake );
-    status = set_surface_state( first, first_surface, CLIENT_SURFACE_STATE_PRESENT_COMMIT,
-                                staged.generation, &state );
+        partial.staged, partial.pending, partial.wake );
+    status = commit_surface_state( first, first_surface, &state, &state );
     ok( !status, "remaining child commit failed, status %#x\n", status );
-    ok( !state.staged && !state.pending && state.wake,
-        "remaining child did not publish: staged %u pending %u wake %u\n",
-        state.staged, state.pending, state.wake );
+    ok( state.staged && state.ready && !state.pending && !state.wake,
+        "remaining child did not complete: staged %u ready %u pending %u wake %u\n",
+        state.staged, state.ready, state.pending, state.wake );
+    status = publish_surface_state( parent, &state );
+    ok( !status && !state.staged && state.wake,
+        "remaining child generation did not publish: staged %u wake %u status %#x\n",
+        state.staged, state.wake, status );
 
     ShowWindow( parent, SW_HIDE );
     ShowWindow( parent, SW_SHOW );
@@ -348,8 +418,7 @@ static void test_subtree_generation_retirement(void)
     ok( !status, "destroy subtree stage failed, status %#x\n", status );
     ok( staged.staged && staged.pending == 2,
         "destroy subtree pending count %u staged %u\n", staged.pending, staged.staged );
-    status = set_surface_state( first, first_surface, CLIENT_SURFACE_STATE_PRESENT_COMMIT,
-                                staged.generation, &state );
+    status = commit_surface_state( first, first_surface, &staged, &state );
     ok( !status, "pre-destroy child commit failed, status %#x\n", status );
     ok( state.staged && state.pending == 1 && !state.wake,
         "pre-destroy state: staged %u pending %u wake %u\n",
@@ -357,8 +426,17 @@ static void test_subtree_generation_retirement(void)
     ok( DestroyWindow( second ), "failed to destroy pending child, error %lu\n", GetLastError() );
     status = set_surface_state( parent, 0, 0, 0, &state );
     ok( !status, "state query after child destroy failed, status %#x\n", status );
-    ok( !state.staged && !state.pending,
-        "destroyed subtree was not retired: staged %u pending %u\n", state.staged, state.pending );
+    ok( state.staged && state.pending == 1 && state.generation != staged.generation,
+        "destroyed subtree did not restart remaining scene: staged %u pending %u generation %s\n",
+        state.staged, state.pending, wine_dbgstr_longlong( state.generation ) );
+    status = commit_surface_state( first, first_surface, &state, &state );
+    ok( !status && state.ready && !state.pending,
+        "remaining subtree did not become ready: ready %u pending %u status %#x\n",
+        state.ready, state.pending, status );
+    status = publish_surface_state( parent, &state );
+    ok( !status && !state.staged && state.wake,
+        "remaining subtree did not publish: staged %u wake %u status %#x\n",
+        state.staged, state.wake, status );
     set_surface_state( first, first_surface, CLIENT_SURFACE_STATE_UNREGISTER, 0, NULL );
     DestroyWindow( parent );
 }
@@ -392,21 +470,40 @@ static void test_generation_aba(void)
         wine_dbgstr_longlong( first.generation ), wine_dbgstr_longlong( second.generation ) );
     ok( second.pending == 1, "second pending count %u\n", second.pending );
 
-    status = set_surface_state( hwnd, surface, CLIENT_SURFACE_STATE_PRESENT_COMMIT,
-                                first.generation, &stale );
+    status = commit_surface_state( hwnd, surface, &first, &stale );
     ok( !status, "stale commit failed, status %#x\n", status );
     ok( stale.staged && stale.generation == second.generation && stale.pending == 1,
         "stale commit changed generation state: staged %u generation %s pending %u\n",
         stale.staged, wine_dbgstr_longlong( stale.generation ), stale.pending );
     ok( !stale.wake, "stale commit woke the top-level window\n" );
 
-    status = set_surface_state( hwnd, surface, CLIENT_SURFACE_STATE_PRESENT_COMMIT,
-                                second.generation, &current );
+    status = commit_surface_state( hwnd, surface, &second, &current );
     ok( !status, "current commit failed, status %#x\n", status );
-    ok( !current.staged && !current.pending,
-        "current commit did not complete: staged %u pending %u\n",
-        current.staged, current.pending );
-    ok( current.wake, "current commit did not wake the top-level window\n" );
+    ok( current.staged && current.ready && !current.pending,
+        "current commit did not become ready: staged %u ready %u pending %u\n",
+        current.staged, current.ready, current.pending );
+    ok( !current.wake, "current commit exposed the top-level before publish\n" );
+
+    SetWindowPos( hwnd, NULL, 20, 20, 160, 120, SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOSIZE );
+    status = set_surface_state( hwnd, 0, 0, 0, &stale );
+    ok( !status && stale.staged && !stale.ready && stale.pending == 1 &&
+        stale.generation != current.generation &&
+        stale.scene_generation != current.scene_generation,
+        "ready scene was not invalidated: staged %u ready %u pending %u generation %s scene %s\n",
+        stale.staged, stale.ready, stale.pending, wine_dbgstr_longlong( stale.generation ),
+        wine_dbgstr_longlong( stale.scene_generation ) );
+    status = publish_surface_state( hwnd, &current );
+    ok( !status && current.staged && !current.ready && current.pending == 1 && !current.wake,
+        "stale publish exposed restarted scene: staged %u ready %u pending %u wake %u status %#x\n",
+        current.staged, current.ready, current.pending, current.wake, status );
+    status = commit_surface_state( hwnd, surface, &stale, &current );
+    ok( !status && current.staged && current.ready && !current.pending,
+        "restarted generation did not become ready: staged %u ready %u pending %u status %#x\n",
+        current.staged, current.ready, current.pending, status );
+    status = publish_surface_state( hwnd, &current );
+    ok( !status && !current.staged && current.wake,
+        "restarted generation did not publish: staged %u wake %u status %#x\n",
+        current.staged, current.wake, status );
 
     status = set_surface_state( hwnd, surface, CLIENT_SURFACE_STATE_UNREGISTER, 0, &empty );
     ok( !status, "unregister failed, status %#x\n", status );
@@ -581,12 +678,18 @@ static BOOL run_child( char **argv, const char *mode, HWND hwnd, DWORD delay )
         status = set_surface_state( hwnd, 0, CLIENT_SURFACE_STATE_STAGED, 0, &state );
         ok( !status, "owner exit stage failed, status %#x\n", status );
         if (strcmp( mode, "owner_no_queue" ))
-            ok( state.staged && state.pending == OWNER_SURFACES,
+            ok( state.staged && state.pending == 1,
                 "owner generation staged %u pending %u\n", state.staged, state.pending );
         else
-            ok( !state.staged && !state.pending && state.wake,
-                "queue-less owner blocked publication: staged %u pending %u wake %u\n",
-                state.staged, state.pending, state.wake );
+        {
+            ok( state.staged && state.ready && !state.pending && !state.wake,
+                "queue-less renderer did not reach owner publish: staged %u ready %u pending %u wake %u\n",
+                state.staged, state.ready, state.pending, state.wake );
+            status = publish_surface_state( hwnd, &state );
+            ok( !status && !state.staged && state.wake,
+                "queue-less generation did not publish: staged %u wake %u status %#x\n",
+                state.staged, state.wake, status );
+        }
         if (!strcmp( mode, "owner_stalled" ))
         {
             Sleep( 6500 );

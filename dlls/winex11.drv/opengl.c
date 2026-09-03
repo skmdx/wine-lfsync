@@ -1450,7 +1450,8 @@ static void x11drv_init_extensions( struct opengl_funcs *funcs, BOOLEAN extensio
 
 static BOOL wait_glx_swap_serial( struct gl_drawable *gl, INT64 target_sbc, DWORD timeout )
 {
-    LARGE_INTEGER delay = {.QuadPart = -10000}; /* one millisecond */
+    LARGE_INTEGER delay;
+    DWORD delay_ms = 1;
     DWORD start = NtGetTickCount();
     INT64 ust, msc, sbc;
 
@@ -1459,7 +1460,9 @@ static BOOL wait_glx_swap_serial( struct gl_drawable *gl, INT64 target_sbc, DWOR
         if (!pglXGetSyncValuesOML( gdi_display, gl->drawable, &ust, &msc, &sbc )) return FALSE;
         if (sbc >= target_sbc) return TRUE;
         if (NtGetTickCount() - start >= timeout) return FALSE;
+        delay.QuadPart = -(LONGLONG)delay_ms * 10000;
         NtDelayExecution( FALSE, &delay );
+        delay_ms = min( delay_ms * 2, (DWORD)4 );
     }
 }
 
@@ -1567,7 +1570,8 @@ static BOOL x11drv_egl_surface_swap( struct opengl_drawable *base )
 
     if (present.external_completion && frame_id)
     {
-        LARGE_INTEGER delay = {.QuadPart = -10000}; /* one millisecond */
+        LARGE_INTEGER delay;
+        DWORD delay_ms = 1;
         EGLint timestamp_name = EGL_DISPLAY_PRESENT_TIME_ANDROID;
         DWORD start = NtGetTickCount();
         EGLnsecsANDROID timestamp = EGL_TIMESTAMP_PENDING_ANDROID;
@@ -1577,10 +1581,10 @@ static BOOL x11drv_egl_surface_swap( struct opengl_drawable *base )
             if (!funcs->p_eglGetFrameTimestampsANDROID( egl->display, gl->base.surface,
                                                         frame_id, 1, &timestamp_name, &timestamp ))
                 break;
-            if (timestamp != EGL_TIMESTAMP_PENDING_ANDROID &&
-                timestamp != EGL_TIMESTAMP_INVALID_ANDROID)
-                break;
+            if (timestamp != EGL_TIMESTAMP_PENDING_ANDROID) break;
+            delay.QuadPart = -(LONGLONG)delay_ms * 10000;
             NtDelayExecution( FALSE, &delay );
+            delay_ms = min( delay_ms * 2, (DWORD)4 );
         } while (NtGetTickCount() - start < CLIENT_SURFACE_PRESENT_TIMEOUT);
         timestamp_completion = timestamp != EGL_TIMESTAMP_PENDING_ANDROID &&
                                timestamp != EGL_TIMESTAMP_INVALID_ANDROID;

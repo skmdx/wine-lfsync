@@ -727,33 +727,12 @@ static BOOL X11DRV_client_surface_present( struct client_surface *client, HDC hd
     return ret;
 }
 
-static BOOL X11DRV_client_surface_commit( struct client_surface *client, HWND toplevel )
-{
-    Window window = X11DRV_get_whole_window( toplevel );
-    XEvent event = {0};
-
-    if (!window) return FALSE;
-    event.xclient.type = ClientMessage;
-    event.xclient.display = gdi_display;
-    event.xclient.window = window;
-    event.xclient.message_type = x11drv_atom(_WINE_CLIENT_SURFACE_COMMIT);
-    event.xclient.format = 32;
-    if (!XSendEvent( gdi_display, window, False, NoEventMask, &event )) return FALSE;
-
-    /* The copy and this event share one X connection.  Receiving the event
-     * therefore proves that the server processed the staged composition
-     * before the owner publishes it, without a WSI-blocking round trip. */
-    XFlush( gdi_display );
-    return TRUE;
-}
-
 static const struct client_surface_funcs x11drv_client_surface_funcs =
 {
     .destroy = x11drv_client_surface_destroy,
     .detach = x11drv_client_surface_detach,
     .update = x11drv_client_surface_update,
     .present = X11DRV_client_surface_present,
-    .commit = X11DRV_client_surface_commit,
     .prepare_completion = x11drv_client_surface_prepare_completion,
     .wait_completion = x11drv_client_surface_wait_completion,
     .abandon_completion = x11drv_client_surface_abandon_completion,

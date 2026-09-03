@@ -124,7 +124,6 @@ const char * const X11DRV_atom_names[NB_XATOMS - FIRST_XATOM] =
     "WM_NORMAL_HINTS",
     "WM_STATE",
     "WM_TAKE_FOCUS",
-    "_WINE_CLIENT_SURFACE_COMMIT",
     "DndProtocol",
     "DndSelection",
     "_ICC_PROFILE",

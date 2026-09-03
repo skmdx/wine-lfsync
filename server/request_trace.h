@@ -3553,6 +3553,7 @@ static void dump_set_client_surface_state_request( const struct set_client_surfa
     dump_uint64( ", surface=", &req->surface );
     fprintf( stderr, ", flags=%08x", req->flags );
     dump_uint64( ", generation=", &req->generation );
+    dump_uint64( ", scene_generation=", &req->scene_generation );
 }
 
 static void dump_set_client_surface_state_reply( const struct set_client_surface_state_reply *req )
@@ -3560,8 +3561,11 @@ static void dump_set_client_surface_state_reply( const struct set_client_surface
     fprintf( stderr, " toplevel=%08x", req->toplevel );
     fprintf( stderr, ", wake=%08x", req->wake );
     dump_uint64( ", generation=", &req->generation );
+    dump_uint64( ", scene_generation=", &req->scene_generation );
     fprintf( stderr, ", pending=%08x", req->pending );
     fprintf( stderr, ", staged=%08x", req->staged );
+    fprintf( stderr, ", ready=%08x", req->ready );
+    fprintf( stderr, ", compose=%08x", req->compose );
     fprintf( stderr, ", active=%08x", req->active );
     fprintf( stderr, ", cached=%08x", req->cached );
 }
