@@ -1189,6 +1189,7 @@ static void x11drv_surface_flush( struct opengl_drawable *base, UINT flags )
     if (!(flags & GL_FLUSH_PRESENT)) return;
 
     client_surface_prepare_present( base->client, &present, TRUE );
+    client_surface_begin_present( base->client, &present );
     if (InterlockedCompareExchange( &base->client->offscreen, 0, 0 ))
     {
         if (!(flags & GL_FLUSH_FINISHED)) funcs->p_glFinish();
@@ -1501,6 +1502,7 @@ static BOOL x11drv_surface_swap( struct opengl_drawable *base )
 
     use_oml = ctx && pglXGetSyncValuesOML && pglXSwapBuffersMscOML;
     client_surface_prepare_present( base->client, &present, use_oml );
+    client_surface_begin_present( base->client, &present );
     if (present.external_completion)
     {
         /* The swap buffer count identifies this exact GLX presentation.  Poll
@@ -1572,6 +1574,7 @@ static void x11drv_egl_surface_flush( struct opengl_drawable *base, UINT flags )
     if (!(flags & GL_FLUSH_PRESENT)) return;
 
     client_surface_prepare_present( base->client, &present, TRUE );
+    client_surface_begin_present( base->client, &present );
     if (InterlockedCompareExchange( &base->client->offscreen, 0, 0 ))
     {
         if (!(flags & GL_FLUSH_FINISHED)) funcs->p_glFinish();
@@ -1644,6 +1647,7 @@ static BOOL x11drv_egl_surface_swap( struct opengl_drawable *base )
               debugstr_opengl_drawable( base ) );
         frame_id = 0;
     }
+    client_surface_begin_present( base->client, &present );
     ret = funcs->p_eglSwapBuffers( egl->display, gl->base.surface );
     client_surface_submit_present( base->client, &present );
     if (!ret)

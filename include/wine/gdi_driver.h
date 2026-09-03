@@ -286,6 +286,7 @@ struct client_surface_present
     BOOL offscreen;
     BOOL target_ready;
     BOOL completion_locked;
+    BOOL native_present_registered;
     BOOL external_completion;
     BOOL external_completion_registered;
     BOOL driver_completion;
@@ -336,6 +337,8 @@ struct client_surface
     LONG                               external_completion_count; /* causal tokens currently in flight */
     LONG                               driver_completion_count; /* shared native monitor tokens in flight */
     LONG                               driver_completion_waiters; /* pending shared-monitor mode transitions */
+    LONG                               native_present_count; /* native presentation calls currently in flight */
+    LONG                               target_update_waiters; /* pending native target mutations */
     LONG                               lifecycle_seq;  /* seqlock for detach and destruction */
     LONG                               target_ready;   /* driver successfully prepared the current target */
     LONG64                             recompose_requested; /* latest requested recomposition generation */
@@ -371,6 +374,8 @@ W32KAPI void client_surface_present( struct client_surface *surface );
 W32KAPI void client_surface_prepare_present( struct client_surface *surface,
                                              struct client_surface_present *present,
                                              BOOL external_completion );
+W32KAPI void client_surface_begin_present( struct client_surface *surface,
+                                           struct client_surface_present *present );
 W32KAPI void client_surface_submit_present( struct client_surface *surface,
                                              struct client_surface_present *present );
 W32KAPI void client_surface_submit_present_locked( struct client_surface *surface,

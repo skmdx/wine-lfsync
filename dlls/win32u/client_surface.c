@@ -294,6 +294,25 @@ static void client_surface_wait_driver_completion_locked( struct client_surface 
         pthread_cond_wait( &surface->completion_cond, &surface->completion_lock );
 }
 
+static void client_surface_lock_target( struct client_surface *surface )
+{
+    /* Publish target-writer intent before contending for completion_lock.
+     * Otherwise a producer woken by the preceding completion can repeatedly
+     * win the mutex and submit another blocking swap ahead of the window
+     * thread which must resize or detach that drawable. */
+    InterlockedIncrement( &surface->target_update_waiters );
+    client_surface_lock_present( surface );
+    client_surface_wait_driver_completion_locked( surface );
+}
+
+static void client_surface_unlock_target( struct client_surface *surface )
+{
+    assert( InterlockedCompareExchange( &surface->target_update_waiters, 0, 0 ) > 0 );
+    if (!InterlockedDecrement( &surface->target_update_waiters ))
+        pthread_cond_broadcast( &surface->completion_cond );
+    client_surface_unlock_present( surface );
+}
+
 static void client_surface_wait_all_completions_locked( struct client_surface *surface )
 {
     while (InterlockedCompareExchange( &surface->external_completion_count, 0, 0 ))
@@ -306,16 +325,16 @@ static void client_surface_detach_locked( struct client_surface *surface )
     BOOL wake;
     UINT flags = 0;
 
-    client_surface_lock_present( surface );
-    client_surface_wait_driver_completion_locked( surface );
+    client_surface_lock_target( surface );
     pthread_mutex_lock( &surface->present_lock );
     if (!surface->hwnd)
     {
         pthread_mutex_unlock( &surface->present_lock );
-        client_surface_unlock_present( surface );
+        client_surface_unlock_target( surface );
         return;
     }
     InterlockedIncrement( &surface->lifecycle_seq );
+    InterlockedExchange( &surface->target_ready, FALSE );
 
     if (surface->active)
     {
@@ -341,7 +360,7 @@ static void client_surface_detach_locked( struct client_surface *surface )
     InterlockedExchangePointer( (void **)&surface->hwnd, NULL );
     InterlockedIncrement( &surface->lifecycle_seq );
     pthread_mutex_unlock( &surface->present_lock );
-    client_surface_unlock_present( surface );
+    client_surface_unlock_target( surface );
 }
 
 static void client_surface_release_locked( struct client_surface *surface )
@@ -367,6 +386,8 @@ static void client_surface_release_locked( struct client_surface *surface )
         assert( !surface->external_completion_count );
         assert( !surface->driver_completion_count );
         assert( !surface->driver_completion_waiters );
+        assert( !surface->native_present_count );
+        assert( !surface->target_update_waiters );
         client_surface_backend_destroy( surface );
         pthread_mutex_destroy( &surface->completion_queue_lock );
         pthread_cond_destroy( &surface->completion_cond );
@@ -587,10 +608,9 @@ static BOOL client_surface_update_now( struct client_surface *surface )
 {
     BOOL ret;
 
-    client_surface_lock_present( surface );
-    client_surface_wait_driver_completion_locked( surface );
+    client_surface_lock_target( surface );
     ret = client_surface_update_now_locked( surface );
-    client_surface_unlock_present( surface );
+    client_surface_unlock_target( surface );
     return ret;
 }
 
@@ -740,14 +760,13 @@ void update_client_surfaces( HWND hwnd )
         BOOL visible;
 
         surface = update_surfaces[i];
-        client_surface_lock_present( surface );
-        client_surface_wait_driver_completion_locked( surface );
+        client_surface_lock_target( surface );
         pthread_mutex_lock( &surface->present_lock );
         surface_hwnd = InterlockedCompareExchangePointer( (void **)&surface->hwnd, NULL, NULL );
         if (!surface_hwnd || NtUserGetAncestor( surface_hwnd, GA_ROOT ) != hwnd)
         {
             pthread_mutex_unlock( &surface->present_lock );
-            client_surface_unlock_present( surface );
+            client_surface_unlock_target( surface );
             continue;
         }
         monitor_rect = surface->monitor_rect;
@@ -757,7 +776,7 @@ void update_client_surfaces( HWND hwnd )
         new_toplevel = surface->toplevel;
         visible = NtUserIsWindowVisible( surface_hwnd );
         pthread_mutex_unlock( &surface->present_lock );
-        client_surface_unlock_present( surface );
+        client_surface_unlock_target( surface );
 
         if (new_toplevel == toplevel && !EqualRect( &new_monitor_rect, &monitor_rect ) &&
             !add_exposed_client_surface_region( &exposed_region, &monitor_rect,
@@ -1332,6 +1351,10 @@ void client_surface_prepare_present_locked( struct client_surface *surface,
                                             struct client_surface_present *present,
                                             BOOL external_completion )
 {
+    while (InterlockedCompareExchange( &surface->target_update_waiters, 0, 0 ) ||
+           surface->native_present_count)
+        pthread_cond_wait( &surface->completion_cond, &surface->completion_lock );
+
     /* Exact IDs may overlap each other, but a shared driver monitor has no
      * per-frame identity.  Drain exact work before arming that monitor, and
      * do not submit any new frame until an armed monitor has been consumed. */
@@ -1395,6 +1418,23 @@ void client_surface_prepare_present( struct client_surface *surface,
     client_surface_prepare_present_locked( surface, present, external_completion );
 }
 
+static void client_surface_begin_present_locked( struct client_surface *surface,
+                                                 struct client_surface_present *present )
+{
+    assert( present->completion_locked );
+    assert( !present->native_present_registered );
+    surface->native_present_count++;
+    present->native_present_registered = TRUE;
+}
+
+void client_surface_begin_present( struct client_surface *surface,
+                                   struct client_surface_present *present )
+{
+    client_surface_begin_present_locked( surface, present );
+    present->completion_locked = FALSE;
+    client_surface_unlock_present( surface );
+}
+
 static void register_external_completion_locked( struct client_surface *surface,
                                                  struct client_surface_present *present )
 {
@@ -1420,11 +1460,23 @@ void client_surface_submit_present_locked( struct client_surface *surface,
      * request escaped but before its deferred job increments the count. */
     if (present->external_completion)
         register_external_completion_locked( surface, present );
+    if (present->native_present_registered)
+    {
+        assert( surface->native_present_count > 0 );
+        present->native_present_registered = FALSE;
+        if (!--surface->native_present_count)
+            pthread_cond_broadcast( &surface->completion_cond );
+    }
 }
 
 void client_surface_submit_present( struct client_surface *surface,
                                     struct client_surface_present *present )
 {
+    if (!present->completion_locked)
+    {
+        client_surface_lock_present( surface );
+        present->completion_locked = TRUE;
+    }
     client_surface_submit_present_locked( surface, present );
     if (present->completion_locked && present->external_completion)
     {
@@ -1621,7 +1673,14 @@ static void CALLBACK client_surface_completion_worker( void *context )
         elapsed = NtGetTickCount() - job->submission_time;
         remaining = elapsed < CLIENT_SURFACE_PRESENT_TIMEOUT ?
                     CLIENT_SURFACE_PRESENT_TIMEOUT - elapsed : 0;
-        completed = job->submitted && job->wait( job->context, remaining );
+        /* A detached or retargeted surface cannot consume this completion.
+         * Its job-owned references still protect the native source while the
+         * queued request retires, but waiting for an unmapped drawable may
+         * otherwise run to the full timeout for every queued frame. */
+        completed = job->submitted && job->present.target_ready &&
+                    job->present.target_epoch == ReadAcquire64( &surface->target_epoch ) &&
+                    job->present.lifecycle_seq == ReadAcquire( &surface->lifecycle_seq ) &&
+                    job->wait( job->context, remaining );
         if (!client_surface_complete_present( surface, &job->present, job->submitted,
                                               completed,
                                               job->has_expected_size ? &job->expected_size : NULL,
@@ -1985,8 +2044,7 @@ BOOL client_surface_update( struct client_surface *surface )
     HWND scene_toplevel;
     BOOL scene_valid, ret = FALSE;
 
-    client_surface_lock_present( surface );
-    client_surface_wait_driver_completion_locked( surface );
+    client_surface_lock_target( surface );
     pthread_mutex_lock( &surface->present_lock );
     scene_valid = get_client_surface_publication( surface, NULL, &scene_generation,
                                                   &scene_toplevel, NULL );
@@ -2006,7 +2064,7 @@ BOOL client_surface_update( struct client_surface *surface )
         }
     }
     pthread_mutex_unlock( &surface->present_lock );
-    client_surface_unlock_present( surface );
+    client_surface_unlock_target( surface );
     return ret;
 }
 
