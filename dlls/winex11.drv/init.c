@@ -66,6 +66,7 @@ static Display *xdamage_display;
 static int xdamage_event_base;
 #define XDAMAGE_SURFACE_BUCKETS 256
 static struct x11drv_client_surface *xdamage_surfaces[XDAMAGE_SURFACE_BUCKETS];
+static struct list xdamage_waiters = LIST_INIT( xdamage_waiters );
 static BOOL xdamage_dispatching;
 static void insert_xdamage_surface_locked( struct x11drv_client_surface *surface );
 
@@ -267,6 +268,14 @@ static BOOL needs_client_window_clipping( HWND hwnd )
 
 static BOOL needs_offscreen_rendering( HWND hwnd, BOOL raw )
 {
+    HWND toplevel = NtUserGetAncestor( hwnd, GA_ROOT );
+
+    /* Owner-managed publication makes the backing Pixmap authoritative for
+     * both Expose repair and multi-surface cut-over.  A directly attached
+     * client window would update only the visible host after the generation
+     * completed, leaving that backing stale.  Keep every participating X11
+     * surface on the composition path while the owner advertises a backing. */
+    if (toplevel && X11DRV_get_client_surface_backing( toplevel )) return TRUE;
     if (!raw && NtUserGetDpiForWindow( hwnd ) != NtUserGetWinMonitorDpi( hwnd, MDT_RAW_DPI )) return TRUE; /* needs DPI scaling */
     if (NtUserGetAncestor( hwnd, GA_PARENT ) != NtUserGetDesktopWindow()) return TRUE; /* child window, needs compositing */
     if (NtUserGetWindowRelative( hwnd, GW_CHILD )) return needs_client_window_clipping( hwnd ); /* window has children, needs compositing */
@@ -410,22 +419,27 @@ static void dispatch_xdamage_events_locked(void)
         surface = find_xdamage_surface_locked( ((XDamageNotifyEvent *)&event)->damage );
         if (!surface) continue;
         surface->completion_ready = TRUE;
-        pthread_cond_broadcast( &surface->damage_cond );
+        if (surface->completion_waiting)
+        {
+            list_remove( &surface->damage_wait_entry );
+            list_init( &surface->damage_wait_entry );
+            surface->completion_waiting = FALSE;
+            pthread_cond_signal( &surface->damage_cond );
+        }
     }
 }
 
 static void wake_xdamage_dispatcher_locked(void)
 {
+    struct list *entry;
     struct x11drv_client_surface *surface;
-    unsigned int i;
 
-    for (i = 0; i < ARRAY_SIZE(xdamage_surfaces); ++i)
-        for (surface = xdamage_surfaces[i]; surface; surface = surface->damage_next)
-            if (surface->completion_waiting && !surface->completion_ready)
-            {
-                pthread_cond_signal( &surface->damage_cond );
-                return;
-            }
+    if (!(entry = list_head( &xdamage_waiters ))) return;
+    surface = LIST_ENTRY( entry, struct x11drv_client_surface, damage_wait_entry );
+    list_remove( entry );
+    list_init( entry );
+    surface->completion_waiting = FALSE;
+    pthread_cond_signal( &surface->damage_cond );
 }
 
 static BOOL take_client_surface_damage_locked( struct x11drv_client_surface *surface )
@@ -447,10 +461,12 @@ static BOOL x11drv_client_surface_prepare_completion( struct client_surface *cli
     {
         /* The caller will still submit the host present.  Retrying with a new
          * monitor could then mistake that unobserved operation for a future
-         * presentation. */
+         * presentation.  Keep the shared monitor disabled, but return a
+         * completion token whose wait path supplies an ordered XSync fallback
+         * for servers without usable XDamage. */
         surface->completion_broken = TRUE;
         InterlockedExchange( &client->cacheable, FALSE );
-        return FALSE;
+        return TRUE;
     }
     do
     {
@@ -469,7 +485,7 @@ static BOOL x11drv_client_surface_prepare_completion( struct client_surface *cli
     } while (1);
     return TRUE;
 #else
-    return FALSE;
+    return TRUE;
 #endif
 }
 
@@ -487,6 +503,7 @@ static void x11drv_client_surface_abandon_completion( struct client_surface *cli
     if (!surface->damage) return;
 
     pthread_mutex_lock( &xdamage_lock );
+    assert( !surface->completion_waiting );
     remove_xdamage_surface_locked( surface );
     /* Synchronize and drain before freeing the ID so a queued event cannot be
      * confused with a later Damage object if Xlib recycles the XID. */
@@ -507,6 +524,11 @@ static BOOL x11drv_client_surface_wait_completion( struct client_surface *client
     struct x11drv_client_surface *surface = impl_from_client_surface( client );
     DWORD start = NtGetTickCount();
 
+    if (!surface->damage)
+    {
+        XSync( gdi_display, False );
+        return TRUE;
+    }
     for (;;)
     {
         DWORD elapsed, remaining;
@@ -564,13 +586,20 @@ static BOOL x11drv_client_surface_wait_completion( struct client_surface *client
             abstime.tv_sec += remaining / 1000 + abstime.tv_nsec / 1000000000;
             abstime.tv_nsec %= 1000000000;
             surface->completion_waiting = TRUE;
+            list_add_tail( &xdamage_waiters, &surface->damage_wait_entry );
             pthread_cond_timedwait( &surface->damage_cond, &xdamage_lock, &abstime );
-            surface->completion_waiting = FALSE;
+            if (surface->completion_waiting)
+            {
+                list_remove( &surface->damage_wait_entry );
+                list_init( &surface->damage_wait_entry );
+                surface->completion_waiting = FALSE;
+            }
             pthread_mutex_unlock( &xdamage_lock );
         }
     }
 #else
-    return FALSE;
+    XSync( gdi_display, False );
+    return TRUE;
 #endif
 }
 
@@ -847,6 +876,7 @@ static BOOL X11DRV_client_surface_present( struct client_surface *client, HDC hd
 
 static const struct client_surface_funcs x11drv_client_surface_funcs =
 {
+    .scene_backing = TRUE,
     .destroy = x11drv_client_surface_destroy,
     .detach = x11drv_client_surface_detach,
     .update = x11drv_client_surface_update,
@@ -882,6 +912,7 @@ struct client_surface *X11DRV_CreateClientSurface( HWND hwnd, int format, BOOL r
 
     if (!(surface = client_surface_create( sizeof(*surface), &x11drv_client_surface_funcs, hwnd, format, raw ))) goto failed;
     surface->colormap = colormap;
+    list_init( &surface->damage_wait_entry );
     if (pthread_cond_init( &surface->damage_cond, NULL )) goto failed;
     surface->damage_cond_initialized = TRUE;
     rect = raw ? surface->client.monitor_rect : surface->client.virtual_rect;

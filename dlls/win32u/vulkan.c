@@ -2233,10 +2233,7 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
         struct swapchain *swapchain = swapchain_from_handle( client_swapchains[i] );
 
         if (use_internal_present_wait)
-        {
-            presents[i].serial = InterlockedIncrement64( &swapchain->surface->client->present_serial );
-            presents[i].submission_time = NtGetTickCount();
-        }
+            client_surface_submit_present_locked( swapchain->surface->client, &presents[i] );
         else
             client_surface_submit_present( swapchain->surface->client, &presents[i] );
     }
@@ -2287,8 +2284,7 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
              * extent. */
         }
 
-        if (compose && InterlockedCompareExchange( &surface->client->offscreen, 0, 0 ) &&
-            use_internal_present_wait)
+        if (compose && presents[i].external_completion && use_internal_present_wait)
         {
             struct vulkan_present_completion *completion;
 
@@ -2313,7 +2309,7 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
             DWORD remaining = elapsed < CLIENT_SURFACE_PRESENT_TIMEOUT ?
                               CLIENT_SURFACE_PRESENT_TIMEOUT - elapsed : 0;
 
-            if (compose && presents[i].offscreen && use_internal_present_wait)
+            if (compose && presents[i].external_completion && use_internal_present_wait)
             {
                 struct vulkan_present_completion fallback = {device, swapchain, present_ids[i]};
                 client_surface_begin_inline_completion( surface->client, &presents[i] );

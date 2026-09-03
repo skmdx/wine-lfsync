@@ -616,6 +616,7 @@ struct process *create_process( int fd, struct process *parent, unsigned int fla
     process->exit_code       = STILL_ACTIVE;
     process->running_threads = 0;
     process->user_threads    = 0;
+    process->client_surface_destroy_count = 0;
     process->priority        = PROCESS_PRIOCLASS_NORMAL;
     process->base_priority   = 8;
     process->disable_boost   = 0;

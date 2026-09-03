@@ -4402,6 +4402,7 @@ enum inproc_sync_type
 #define CLIENT_SURFACE_STATE_CLAIM           0x1000
 #define CLIENT_SURFACE_STATE_PREPARE_BEGIN   0x2000
 #define CLIENT_SURFACE_STATE_PREPARE_COMMIT  0x4000
+#define CLIENT_SURFACE_STATE_SCENE_BACKING   0x8000
 
 
 /* Get visible client-surface windows above a target in one stable scene. */

@@ -651,6 +651,31 @@ void detach_client_surfaces( HWND hwnd )
     pthread_mutex_unlock( &surfaces_lock );
 }
 
+void detach_client_surface_identity( UINT_PTR identity )
+{
+    struct client_surface *surface, *next;
+
+    pthread_mutex_lock( &surfaces_lock );
+
+    LIST_FOR_EACH_ENTRY_SAFE( surface, next, &client_surfaces, struct client_surface, entry )
+    {
+        if (surface->identity != identity) continue;
+        client_surface_detach_locked( surface );
+        goto done;
+    }
+    LIST_FOR_EACH_ENTRY_SAFE( surface, next, &unused_surfaces, struct client_surface, entry )
+    {
+        if (surface->identity != identity) continue;
+        remove_unused_client_surface_locked( surface );
+        client_surface_detach_locked( surface );
+        client_surface_release_locked( surface ); /* unused-list ownership */
+        break;
+    }
+
+done:
+    pthread_mutex_unlock( &surfaces_lock );
+}
+
 static BOOL get_client_surface_rects( HWND toplevel, HWND hwnd, RECT *virtual_rect,
                                       RECT *monitor_rect )
 {
@@ -1590,9 +1615,19 @@ void client_surface_prepare_present( struct client_surface *surface,
     client_surface_prepare_present_locked( surface, present, external_completion );
 }
 
-void client_surface_submit_present( struct client_surface *surface,
-                                    struct client_surface_present *present )
+static void register_external_completion_locked( struct client_surface *surface,
+                                                 struct client_surface_present *present )
 {
+    if (present->external_completion_registered) return;
+    InterlockedIncrement( &surface->external_completion_count );
+    if (present->driver_completion) surface->driver_completion_count++;
+    present->external_completion_registered = TRUE;
+}
+
+void client_surface_submit_present_locked( struct client_surface *surface,
+                                           struct client_surface_present *present )
+{
+    assert( present->completion_locked );
     /* Submission serials, unlike preparation serials, preserve the native
      * order observed by concurrent producer queues. */
     if (!present->serial)
@@ -1600,6 +1635,17 @@ void client_surface_submit_present( struct client_surface *surface,
         present->serial = InterlockedIncrement64( &surface->present_serial );
         present->submission_time = NtGetTickCount();
     }
+    /* Register exact completion ownership before releasing submission
+     * serialization.  Otherwise cached replay can enter after the native
+     * request escaped but before its deferred job increments the count. */
+    if (present->external_completion)
+        register_external_completion_locked( surface, present );
+}
+
+void client_surface_submit_present( struct client_surface *surface,
+                                    struct client_surface_present *present )
+{
+    client_surface_submit_present_locked( surface, present );
     if (present->completion_locked && present->external_completion)
     {
         present->completion_locked = FALSE;
@@ -1759,15 +1805,12 @@ void client_surface_begin_inline_completion( struct client_surface *surface,
      * ownership under completion_lock so cached replay and a shared driver
      * monitor cannot pass it merely because no FIFO node was allocated. */
     assert( present->external_completion );
-    assert( !present->external_completion_registered );
     if (!present->completion_locked)
     {
         client_surface_lock_present( surface );
         present->completion_locked = TRUE;
     }
-    InterlockedIncrement( &surface->external_completion_count );
-    if (present->driver_completion) surface->driver_completion_count++;
-    present->external_completion_registered = TRUE;
+    register_external_completion_locked( surface, present );
     present->completion_locked = FALSE;
     client_surface_unlock_present( surface );
 }
@@ -1853,7 +1896,6 @@ void client_surface_defer_present( struct client_surface *surface,
         release( context );
         return;
     }
-    job->present = *present;
     job->wait = wait;
     job->release = release;
     job->context = context;
@@ -1870,6 +1912,8 @@ void client_surface_defer_present( struct client_surface *surface,
         client_surface_lock_present( surface );
         present->completion_locked = TRUE;
     }
+    register_external_completion_locked( surface, present );
+    job->present = *present;
     pthread_mutex_lock( &surface->completion_queue_lock );
     if (InterlockedCompareExchange( &surface->external_completion_count, 0, 0 ) >=
         CLIENT_SURFACE_MAX_DEFERRED_PRESENTS)
@@ -1887,9 +1931,6 @@ void client_surface_defer_present( struct client_surface *surface,
         free( job );
         return;
     }
-    InterlockedIncrement( &surface->external_completion_count );
-    if (job->present.driver_completion) surface->driver_completion_count++;
-    job->present.external_completion_registered = TRUE;
     job->present.completion_locked = FALSE;
     list_add_tail( &surface->completion_queue, &job->entry );
     if (!surface->completion_worker_active)
@@ -2170,6 +2211,7 @@ void use_window_client_surface( struct client_surface *surface, BOOL use )
         list_add_tail( &client_surfaces, &surface->entry );
         InterlockedExchange( &surface->active, TRUE );
         flags = CLIENT_SURFACE_STATE_REGISTER;
+        if (surface->funcs->scene_backing) flags |= CLIENT_SURFACE_STATE_SCENE_BACKING;
         if (surface->server_cached)
         {
             flags |= CLIENT_SURFACE_STATE_UNCACHE;
@@ -2192,6 +2234,7 @@ void use_window_client_surface( struct client_surface *surface, BOOL use )
         if (cache && InterlockedCompareExchange( &surface->content_valid, 0, 0 ))
         {
             flags |= CLIENT_SURFACE_STATE_CACHE;
+            if (surface->funcs->scene_backing) flags |= CLIENT_SURFACE_STATE_SCENE_BACKING;
             InterlockedExchange( &surface->server_cached, TRUE );
         }
         else if (InterlockedCompareExchange( &surface->server_cached, 0, 0 ))

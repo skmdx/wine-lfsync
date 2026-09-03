@@ -249,6 +249,7 @@ static inline void push_dc_driver( PHYSDEV *dev, PHYSDEV physdev, const struct g
 struct client_surface;
 struct client_surface_funcs
 {
+    BOOL scene_backing; /* owner can atomically publish a composed scene */
     void (*destroy)( struct client_surface *surface );
     /* detach the surface from its window, called from window owner thread */
     void (*detach)( struct client_surface *surface );
@@ -356,7 +357,9 @@ W32KAPI void client_surface_prepare_present( struct client_surface *surface,
                                              struct client_surface_present *present,
                                              BOOL external_completion );
 W32KAPI void client_surface_submit_present( struct client_surface *surface,
-                                            struct client_surface_present *present );
+                                             struct client_surface_present *present );
+W32KAPI void client_surface_submit_present_locked( struct client_surface *surface,
+                                                    struct client_surface_present *present );
 W32KAPI BOOL client_surface_complete_present( struct client_surface *surface,
                                               struct client_surface_present *present,
                                               BOOL submitted, BOOL external_completed,

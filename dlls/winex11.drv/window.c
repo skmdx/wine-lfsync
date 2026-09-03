@@ -673,7 +673,7 @@ static BOOL ensure_client_surface_backing( struct x11drv_win_data *data )
 {
     struct x11drv_retired_pixmap *retired = NULL;
     unsigned int width, height, window_width, window_height;
-    BOOL new_gc;
+    BOOL new_gc, old_valid;
     int error = 0;
     Pixmap pixmap;
     GC gc;
@@ -685,6 +685,19 @@ static BOOL ensure_client_surface_backing( struct x11drv_win_data *data )
     if (data->client_surface_backing && data->client_surface_backing_width >= width &&
         data->client_surface_backing_height >= height)
         return TRUE;
+
+    /* Grow both axes monotonically.  If alternating wide and tall windows
+     * replaced one undersized axis while shrinking the other, each resize
+     * would retire another Pixmap of the opposite aspect ratio forever.
+     * Monotonic extents make every replacement at least double in area and
+     * bound all retired allocations by a geometric series. */
+    width = max( width, data->client_surface_backing_width );
+    height = max( height, data->client_surface_backing_height );
+    old_valid = data->client_surface_backing_valid;
+
+    /* Until a larger capability has been committed, the old Pixmap no longer
+     * represents the complete host extent and must not satisfy Expose. */
+    data->client_surface_backing_valid = FALSE;
 
     if (data->client_surface_backing && !(retired = malloc( sizeof(*retired) ))) return FALSE;
     pixmap = XCreatePixmap( data->display, data->whole_window, width, height, data->vis.depth );
@@ -700,7 +713,7 @@ static BOOL ensure_client_surface_backing( struct x11drv_win_data *data )
     X11DRV_expect_error( data->display, client_surface_backing_error, &error );
     XCopyArea( data->display, data->whole_window, pixmap, gc, 0, 0,
                min( window_width, width ), min( window_height, height ), 0, 0 );
-    if (data->client_surface_backing)
+    if (data->client_surface_backing && old_valid)
     {
         XCopyArea( data->display, data->client_surface_backing, pixmap, gc, 0, 0,
                    data->client_surface_backing_width, data->client_surface_backing_height, 0, 0 );
@@ -749,6 +762,7 @@ static BOOL snapshot_client_surface_backing( struct x11drv_win_data *data, BOOL 
     if (!get_client_surface_window_extent( data, &window_width, &window_height )) return FALSE;
     width = min( data->client_surface_backing_width, window_width );
     height = min( data->client_surface_backing_height, window_height );
+    data->client_surface_backing_valid = FALSE;
     X11DRV_expect_error( data->display, client_surface_backing_error, &error );
     XCopyArea( data->display, data->whole_window, data->client_surface_backing,
                data->client_surface_gc,
@@ -786,6 +800,10 @@ BOOL X11DRV_restore_client_surface_backing( struct x11drv_win_data *data,
 {
     if (window != data->whole_window || !data->client_surface_backing ||
         !data->client_surface_gc || !data->client_surface_backing_valid || IsRectEmpty( rect ))
+        return FALSE;
+    if (rect->left < 0 || rect->top < 0 ||
+        (unsigned int)rect->right > data->client_surface_backing_width ||
+        (unsigned int)rect->bottom > data->client_surface_backing_height)
         return FALSE;
     XCopyArea( data->display, data->client_surface_backing, data->whole_window,
                data->client_surface_gc,

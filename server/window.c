@@ -74,8 +74,12 @@ struct client_surface_ref
     unsigned int    active : 1;
     unsigned int    cached : 1;
     unsigned int    claimed : 1; /* an active surface which completed a host present */
+    unsigned int    scene_backing : 1; /* renderer supports owner scene publication */
     unsigned int    retired : 1; /* detached identity waiting for its queued message */
-    unsigned int    notification_pending : 1; /* one process queue entry owns this identity */
+    unsigned int    notification_pending : 1; /* an update for this identity is queued */
+    unsigned int    destroy_pending : 1; /* destroy must reach a live process queue */
+    unsigned int    destroy_notification_pending : 1;
+    unsigned int    notification_count; /* queued update and destroy identity owners */
 };
 
 #define CLIENT_SURFACE_REF_BUCKETS 256
@@ -132,7 +136,7 @@ static void retire_client_surface_ref( struct client_surface_ref *surface )
 {
     list_remove( &surface->entry );
     surface->active = surface->cached = surface->claimed = 0;
-    if (surface->notification_pending)
+    if (surface->notification_count || surface->destroy_pending)
     {
         surface->retired = 1;
         surface->owner = NULL;
@@ -186,6 +190,7 @@ struct window
     unsigned int     client_surface_prepared; /* one owner snapshot may start a live generation */
     unsigned int     client_surface_composing; /* live or staged composition generation is active */
     unsigned int     client_surface_publishing; /* owner is exposing a ready staged generation */
+    unsigned int     client_surface_backed; /* current live generation uses owner scene backing */
     unsigned int     client_surface_publish_invalidated; /* scene changed after publish begin */
     unsigned long long client_surface_generation; /* current composition generation */
     unsigned long long client_surface_scene_generation; /* even when the scene is stable */
@@ -896,6 +901,7 @@ static struct window *create_window( struct window *parent, struct window *owner
     win->client_surface_prepared = 0;
     win->client_surface_composing = 0;
     win->client_surface_publishing = 0;
+    win->client_surface_backed = 0;
     win->client_surface_publish_invalidated = 0;
     win->client_surface_generation = 0;
     win->client_surface_scene_generation = 0;
@@ -1213,8 +1219,12 @@ static struct client_surface_ref *get_client_surface_ref( struct client_surface_
     surface->active = 0;
     surface->cached = 0;
     surface->claimed = 0;
+    surface->scene_backing = 0;
     surface->retired = 0;
     surface->notification_pending = 0;
+    surface->destroy_pending = 0;
+    surface->destroy_notification_pending = 0;
+    surface->notification_count = 0;
     list_add_tail( &owner->surfaces, &surface->entry );
     insert_client_surface_ref_index( surface );
     return surface;
@@ -1258,6 +1268,32 @@ static struct client_surface_ref *select_client_surface_producer( struct window 
     return selected;
 }
 
+static int client_surface_scene_backed_recursive( struct window *win,
+                                                  unsigned int *selected_count )
+{
+    struct client_surface_owner *owner;
+    struct client_surface_ref *selected;
+    struct window *child;
+
+    if (!win->client_surface_subtree_count) return 1;
+    selected = select_client_surface_producer( win, &owner );
+    if (selected && is_visible( win ))
+    {
+        (*selected_count)++;
+        if (!selected->scene_backing) return 0;
+    }
+    LIST_FOR_EACH_ENTRY( child, &win->children, struct window, entry )
+        if (!client_surface_scene_backed_recursive( child, selected_count )) return 0;
+    return 1;
+}
+
+static int client_surface_scene_backed( struct window *top )
+{
+    unsigned int selected_count = 0;
+
+    return client_surface_scene_backed_recursive( top, &selected_count ) && selected_count;
+}
+
 static void update_client_surface_producer( struct window *win )
 {
     struct client_surface_owner *owner;
@@ -1288,6 +1324,7 @@ static void finish_client_surface_generation( struct window *top )
     cancel_client_surface_timeout( top );
     top->client_surface_deadline = 0;
     top->client_surface_composing = 0;
+    top->client_surface_backed = 0;
     top->client_surface_generation = 0;
     top->client_surface_pending_count = 0;
     top->client_surface_ready = 0;
@@ -1313,6 +1350,15 @@ static int mark_client_surface_generation_ready( struct window *top )
     if (!top->client_surface_composing || top->client_surface_pending_count ||
         (top->client_surface_scene_generation & 1))
         return 0;
+
+    /* Backends without an owner-managed scene target keep the legacy live
+     * behavior: their driver presentation is already visible, so an empty
+     * owner prepare/publish round trip cannot add atomicity. */
+    if (!top->client_surface_staged && !top->client_surface_backed)
+    {
+        finish_client_surface_generation( top );
+        return 0;
+    }
 
     if (top->client_surface_ready &&
         top->client_surface_ready_scene_generation == top->client_surface_scene_generation)
@@ -1527,17 +1573,29 @@ static void discard_client_surface_owner( struct window *win, struct client_surf
 static int discard_client_surface_owners( struct window *win, struct window *top )
 {
     struct client_surface_owner *owner, *next;
+    struct client_surface_ref *surface;
     int was_pending = top->client_surface_dirty;
 
     LIST_FOR_EACH_ENTRY_SAFE( owner, next, &win->client_surface_owners,
                               struct client_surface_owner, entry )
     {
-        /* The HWND may belong to another process than the renderer.  Its
-         * local destroy path cannot release that renderer's active or cached
-         * surface, so explicitly retire the process-local object before the
-         * server drops its ownership record. */
-        post_process_message( owner->process, win->handle, WM_WINE_UPDATEWINDOWSTATE,
-                              WINE_DESTROY_CLIENT_SURFACES, 0 );
+        /* The HWND may be reused before this cross-process message is
+         * dispatched.  Address each process-local object by the same opaque
+         * identity used for recomposition; an HWND-only destroy could detach
+         * surfaces already created for the new window lifecycle. */
+        LIST_FOR_EACH_ENTRY( surface, &owner->surfaces, struct client_surface_ref, entry )
+        {
+            assert( !surface->destroy_pending );
+            surface->destroy_pending = 1;
+            owner->process->client_surface_destroy_count++;
+            if (post_process_message( owner->process, 0, WM_WINE_UPDATEWINDOWSTATE,
+                                      WINE_DESTROY_CLIENT_SURFACES, surface->id ))
+            {
+                surface->destroy_notification_pending = 1;
+                surface->notification_count++;
+            }
+            else clear_error();
+        }
         discard_client_surface_owner( win, owner, top );
     }
 
@@ -1548,9 +1606,11 @@ static int discard_client_surface_owners( struct window *win, struct window *top
 
 void cleanup_process_client_surfaces( struct process *process )
 {
+    struct client_surface_ref **cursor, *surface;
     user_handle_t handle = 0;
     struct client_surface_owner *owner;
     struct window *win, *top;
+    unsigned int bucket;
     int was_pending;
 
     /* Client surfaces may render a foreign process's HWND and therefore
@@ -1568,6 +1628,32 @@ void cleanup_process_client_surfaces( struct process *process )
         if (was_pending && is_visible( top ) && !top->client_surface_dirty)
             post_message( top->handle, WM_WINE_UPDATEWINDOWSTATE, 0, 0 );
     }
+
+    /* All process queues have been destroyed before the final thread leaves.
+     * Drop undeliverable destroy tombstones now; no queue callback can still
+     * address them, and retaining their raw process key would outlive it. */
+    for (bucket = 0; bucket < CLIENT_SURFACE_REF_BUCKETS; bucket++)
+    {
+        cursor = &client_surface_ref_index[bucket];
+        while ((surface = *cursor))
+        {
+            if (surface->process != process)
+            {
+                cursor = &surface->index_next;
+                continue;
+            }
+            assert( surface->retired && !surface->owner && !surface->notification_count &&
+                    !surface->notification_pending && !surface->destroy_notification_pending );
+            *cursor = surface->index_next;
+            if (surface->destroy_pending)
+            {
+                assert( process->client_surface_destroy_count );
+                process->client_surface_destroy_count--;
+            }
+            free( surface );
+        }
+    }
+    assert( !process->client_surface_destroy_count );
 }
 
 static unsigned int prepare_client_surface_generation( struct window *win, unsigned long long generation )
@@ -1626,6 +1712,7 @@ static int notify_client_surface_geometry_ready_recursive( struct window *win, s
                                       WINE_UPDATE_CLIENT_SURFACES, surface->id ))
             {
                 surface->notification_pending = 1;
+                surface->notification_count++;
                 continue;
             }
             else
@@ -1652,22 +1739,67 @@ static void notify_client_surface_geometry_ready( struct window *top )
     notify_client_surface_geometry_ready_recursive( top, top );
 }
 
-/* notification_pending owns one queue entry, not an unbounded promise from a
- * particular thread.  Release it whenever that entry is removed so a later
- * generation barrier can route work to the renderer's current message pump. */
-void client_surface_notification_removed( struct process *process, client_ptr_t id )
+/* A queued update or destroy owns the identity until message removal.  Update
+ * delivery additionally releases its coalescing bit so a later generation can
+ * route work to the renderer's current message pump. */
+void client_surface_notification_removed( struct process *process, client_ptr_t id,
+                                          lparam_t type, int delivered )
 {
     struct client_surface_ref *surface = find_indexed_client_surface_ref( process, id );
 
     if (!surface) return;
-    if (!surface->retired)
+    if (type == WINE_UPDATE_CLIENT_SURFACES)
     {
+        assert( surface->notification_pending );
         surface->notification_pending = 0;
-        return;
     }
-    assert( surface->notification_pending && !surface->owner );
+    else
+    {
+        assert( type == WINE_DESTROY_CLIENT_SURFACES );
+        assert( surface->destroy_pending && surface->destroy_notification_pending );
+        surface->destroy_notification_pending = 0;
+        if (delivered)
+        {
+            surface->destroy_pending = 0;
+            assert( process->client_surface_destroy_count );
+            process->client_surface_destroy_count--;
+        }
+    }
+    assert( surface->notification_count );
+    surface->notification_count--;
+    if (!surface->retired || surface->notification_count || surface->destroy_pending) return;
+    assert( !surface->notification_pending && !surface->destroy_notification_pending &&
+            !surface->owner );
     remove_client_surface_ref_index( surface );
     free( surface );
+}
+
+/* Window destruction can race a renderer moving or creating its message
+ * pump.  Keep an unqueued tombstone and retry the exact destroy identity on
+ * the next live process queue instead of leaking its client-side drawable. */
+void retry_process_client_surface_destroys( struct process *process )
+{
+    struct client_surface_ref *surface;
+    unsigned int bucket;
+
+    if (!process->client_surface_destroy_count) return;
+    for (bucket = 0; bucket < CLIENT_SURFACE_REF_BUCKETS; bucket++)
+    {
+        for (surface = client_surface_ref_index[bucket]; surface; surface = surface->index_next)
+        {
+            if (surface->process != process || !surface->retired || !surface->destroy_pending ||
+                surface->destroy_notification_pending)
+                continue;
+            if (post_process_message( process, 0,
+                                      WM_WINE_UPDATEWINDOWSTATE,
+                                      WINE_DESTROY_CLIENT_SURFACES, surface->id ))
+            {
+                surface->destroy_notification_pending = 1;
+                surface->notification_count++;
+            }
+            else clear_error();
+        }
+    }
 }
 
 /* A process may move its pump to another thread while a notification is
@@ -1692,7 +1824,11 @@ void retry_process_client_surface_notifications( struct process *process, user_h
                 continue;
             if (post_process_message( process, top->handle, WM_WINE_UPDATEWINDOWSTATE,
                                       WINE_UPDATE_CLIENT_SURFACES, surface->id ))
+            {
                 surface->notification_pending = 1;
+                surface->notification_count++;
+            }
+            else clear_error();
         }
     }
 }
@@ -1702,6 +1838,7 @@ void retry_process_client_surface_notifications( struct process *process, user_h
  * HWND so both live repair and staged publication use a single scene epoch. */
 static void restart_client_surface_generation( struct window *top )
 {
+    int scene_backed;
     int prepare_restart;
 
     if (!top->client_surface_staged &&
@@ -1730,11 +1867,12 @@ static void restart_client_surface_generation( struct window *top )
         top->client_surface_restart_pending = 1;
         return;
     }
+    scene_backed = client_surface_scene_backed( top );
 
     /* A live generation is composed into an owner-managed scene backing.
      * Snapshot the visible host before renderer processes write that backing,
      * so a full-scene commit never resurrects stale non-client or GDI pixels. */
-    if (!top->client_surface_staged && !top->client_surface_prepared)
+    if (!top->client_surface_staged && scene_backed && !top->client_surface_prepared)
     {
         if (top->client_surface_composing)
         {
@@ -1748,6 +1886,11 @@ static void restart_client_surface_generation( struct window *top )
         arm_client_surface_timeout( top );
         return;
     }
+    if (top->client_surface_preparing)
+    {
+        cancel_client_surface_timeout( top );
+        top->client_surface_deadline = 0;
+    }
     top->client_surface_preparing = 0;
     top->client_surface_prepared = 0;
 
@@ -1756,6 +1899,7 @@ static void restart_client_surface_generation( struct window *top )
     {
         top->client_surface_restart_pending = 0;
         top->client_surface_composing = 1;
+        top->client_surface_backed = client_surface_scene_backed( top );
         top->client_surface_ready = 0;
         top->client_surface_ready_scene_generation = 0;
         if (!++client_surface_generation) ++client_surface_generation;
@@ -3888,7 +4032,7 @@ DECL_HANDLER(set_client_surface_state)
     struct client_surface_owner *owner, *selected_owner;
     struct client_surface_ref *surface, *selected_before, *selected_after;
     struct window *win, *top;
-    int scene_change, was_pending;
+    int scene_change, selected_backing_before, was_pending;
 
     reply->toplevel = 0;
     reply->wake = 0;
@@ -3919,6 +4063,10 @@ DECL_HANDLER(set_client_surface_state)
     }
 
     selected_before = select_client_surface_producer( win, &selected_owner );
+    selected_backing_before = selected_before ? selected_before->scene_backing : 0;
+
+    if ((req->flags & (CLIENT_SURFACE_STATE_REGISTER | CLIENT_SURFACE_STATE_CACHE)) && surface)
+        surface->scene_backing = !!(req->flags & CLIENT_SURFACE_STATE_SCENE_BACKING);
 
     if ((req->flags & CLIENT_SURFACE_STATE_CACHE) && !surface->cached)
     {
@@ -3961,7 +4109,8 @@ DECL_HANDLER(set_client_surface_state)
         surface->sequence = client_surface_ref_sequence;
     }
     selected_after = select_client_surface_producer( win, &selected_owner );
-    scene_change = selected_before != selected_after;
+    scene_change = selected_before != selected_after ||
+                   (selected_after && selected_backing_before != selected_after->scene_backing);
     if (scene_change)
     {
         /* Membership is private server state.  Publish the changed producer

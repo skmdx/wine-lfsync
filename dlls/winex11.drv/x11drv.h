@@ -376,6 +376,7 @@ struct x11drv_client_surface
     UINT64 composition_scene_generation;
     HWND composition_toplevel;
     struct x11drv_client_surface *damage_next;
+    struct list damage_wait_entry;
     pthread_cond_t damage_cond;
     BOOL keep_offscreen;    /* preserve a drawable which was used while hidden */
     BOOL manual_redirect;   /* client drawable is manually XComposite redirected */

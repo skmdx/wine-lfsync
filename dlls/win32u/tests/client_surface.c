@@ -603,7 +603,8 @@ static void test_publish_transaction(void)
     ok( !!hwnd, "failed to create publish transaction window, error %lu\n", GetLastError() );
     if (!hwnd) return;
 
-    set_surface_state( hwnd, surface, CLIENT_SURFACE_STATE_REGISTER, 0, NULL );
+    set_surface_state( hwnd, surface, CLIENT_SURFACE_STATE_REGISTER |
+                       CLIENT_SURFACE_STATE_SCENE_BACKING, 0, NULL );
     claim_surface_state( hwnd, surface, NULL );
     ShowWindow( hwnd, SW_SHOW );
     status = set_surface_state( hwnd, 0, CLIENT_SURFACE_STATE_STAGED, 0, &staged );
@@ -656,6 +657,93 @@ static void test_publish_transaction(void)
     DestroyWindow( hwnd );
 }
 
+static void test_live_prepare_transaction(void)
+{
+    const UINT_PTR surface = 0x123a0000;
+    struct surface_state preparing, stale, current, ready;
+    HWND hwnd;
+    unsigned int status;
+
+    hwnd = create_test_window( TRUE );
+    ok( !!hwnd, "failed to create live prepare window, error %lu\n", GetLastError() );
+    if (!hwnd) return;
+
+    status = set_surface_state( hwnd, surface, CLIENT_SURFACE_STATE_REGISTER |
+                                CLIENT_SURFACE_STATE_SCENE_BACKING, 0, NULL );
+    ok( !status, "live prepare register failed, status %#x\n", status );
+    status = claim_surface_state( hwnd, surface, &preparing );
+    ok( !status && !preparing.generation && !preparing.pending,
+        "live scene started before owner snapshot: status %#x generation %s pending %u\n",
+        status, wine_dbgstr_longlong( preparing.generation ), preparing.pending );
+
+    status = set_surface_state( hwnd, 0, CLIENT_SURFACE_STATE_PREPARE_BEGIN, 0, &preparing );
+    ok( !status && preparing.publish && !preparing.generation,
+        "live prepare begin failed: status %#x prepare %u generation %s\n",
+        status, preparing.publish, wine_dbgstr_longlong( preparing.generation ) );
+
+    SetWindowPos( hwnd, NULL, 11, 10, 0, 0,
+                  SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE );
+    status = set_surface_state_scene( hwnd, 0, CLIENT_SURFACE_STATE_PREPARE_COMMIT,
+                                      0, preparing.scene_generation, &stale );
+    ok( !status && !stale.generation && stale.scene_generation != preparing.scene_generation,
+        "stale prepare started a live scene: status %#x generation %s old scene %s new scene %s\n",
+        status, wine_dbgstr_longlong( stale.generation ),
+        wine_dbgstr_longlong( preparing.scene_generation ),
+        wine_dbgstr_longlong( stale.scene_generation ) );
+
+    status = set_surface_state( hwnd, 0, CLIENT_SURFACE_STATE_PREPARE_BEGIN, 0, &current );
+    ok( !status && current.publish,
+        "restarted live prepare begin failed: status %#x prepare %u\n", status, current.publish );
+    status = set_surface_state_scene( hwnd, 0, CLIENT_SURFACE_STATE_PREPARE_COMMIT,
+                                      0, current.scene_generation, &current );
+    ok( !status && current.generation && current.pending == 1,
+        "live prepare commit did not start composition: status %#x generation %s pending %u\n",
+        status, wine_dbgstr_longlong( current.generation ), current.pending );
+
+    status = commit_surface_state( hwnd, surface, &current, &ready );
+    ok( !status && ready.ready && !ready.pending && ready.generation,
+        "live composition did not become ready: status %#x ready %u pending %u generation %s\n",
+        status, ready.ready, ready.pending, wine_dbgstr_longlong( ready.generation ) );
+    status = publish_surface_state( hwnd, &ready );
+    ok( !status && !ready.ready && !ready.generation,
+        "live composition did not publish: status %#x ready %u generation %s\n",
+        status, ready.ready, wine_dbgstr_longlong( ready.generation ) );
+
+    set_surface_state( hwnd, surface, CLIENT_SURFACE_STATE_UNREGISTER, 0, NULL );
+    DestroyWindow( hwnd );
+}
+
+static void test_unbacked_live_generation(void)
+{
+    const UINT_PTR surface = 0x123b0000;
+    struct surface_state composing, completed, prepare;
+    HWND hwnd;
+    unsigned int status;
+
+    hwnd = create_test_window( TRUE );
+    ok( !!hwnd, "failed to create unbacked live window, error %lu\n", GetLastError() );
+    if (!hwnd) return;
+
+    status = set_surface_state( hwnd, surface, CLIENT_SURFACE_STATE_REGISTER, 0, NULL );
+    ok( !status, "unbacked live register failed, status %#x\n", status );
+    status = claim_surface_state( hwnd, surface, &composing );
+    ok( !status && composing.generation && composing.pending == 1 && !composing.ready,
+        "unbacked live scene did not start directly: status %#x generation %s pending %u ready %u\n",
+        status, wine_dbgstr_longlong( composing.generation ), composing.pending, composing.ready );
+
+    status = set_surface_state( hwnd, 0, CLIENT_SURFACE_STATE_PREPARE_BEGIN, 0, &prepare );
+    ok( !status && !prepare.publish,
+        "unbacked live scene requested an owner snapshot: status %#x prepare %u\n",
+        status, prepare.publish );
+    status = commit_surface_state( hwnd, surface, &composing, &completed );
+    ok( !status && !completed.generation && !completed.pending && !completed.ready,
+        "unbacked live scene waited for owner publication: status %#x generation %s pending %u ready %u\n",
+        status, wine_dbgstr_longlong( completed.generation ), completed.pending, completed.ready );
+
+    set_surface_state( hwnd, surface, CLIENT_SURFACE_STATE_UNREGISTER, 0, NULL );
+    DestroyWindow( hwnd );
+}
+
 static void test_late_present_cutover(void)
 {
     const UINT_PTR surface = 0x12390000;
@@ -667,7 +755,8 @@ static void test_late_present_cutover(void)
     ok( !!hwnd, "failed to create late-present window, error %lu\n", GetLastError() );
     if (!hwnd) return;
 
-    set_surface_state( hwnd, surface, CLIENT_SURFACE_STATE_REGISTER, 0, NULL );
+    set_surface_state( hwnd, surface, CLIENT_SURFACE_STATE_REGISTER |
+                       CLIENT_SURFACE_STATE_SCENE_BACKING, 0, NULL );
     claim_surface_state( hwnd, surface, NULL );
     ShowWindow( hwnd, SW_SHOW );
     status = set_surface_state( hwnd, 0, CLIENT_SURFACE_STATE_STAGED, 0, &staged );
@@ -1243,6 +1332,10 @@ START_TEST(client_surface)
     test_generation_aba();
     trace( "testing client surface host publication transaction\n" );
     test_publish_transaction();
+    trace( "testing live client surface prepare transaction\n" );
+    test_live_prepare_transaction();
+    trace( "testing unbacked live client surface publication\n" );
+    test_unbacked_live_generation();
     trace( "testing late client surface publication cut-over\n" );
     test_late_present_cutover();
     trace( "testing client surface generation membership\n" );

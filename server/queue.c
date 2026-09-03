@@ -314,6 +314,8 @@ static struct msg_queue *create_msg_queue( struct thread *thread, struct thread_
 
         thread->queue = queue;
         add_desktop_hook_count( desktop, thread, 1 );
+        if (thread->process->client_surface_destroy_count)
+            retry_process_client_surface_destroys( thread->process );
     }
 
     if (new_input) release_object( new_input );
@@ -339,7 +341,11 @@ void free_msg_queue( struct thread *thread )
     retry = remove_client_surface_notifications( queue );
     thread->queue = NULL;
     release_object( queue );
-    if (retry) retry_process_client_surface_notifications( thread->process, 0 );
+    if (retry)
+    {
+        retry_process_client_surface_notifications( thread->process, 0 );
+        retry_process_client_surface_destroys( thread->process );
+    }
 }
 
 /* synchronize thread input keystate with the desktop */
@@ -1003,7 +1009,7 @@ static void free_message( struct message *msg )
 
 /* remove (and free) a message from a message list */
 static void remove_queue_message( struct msg_queue *queue, struct message *msg,
-                                  enum message_kind kind )
+                                  enum message_kind kind, int delivered )
 {
     list_remove( &msg->entry );
     switch(kind)
@@ -1013,8 +1019,10 @@ static void remove_queue_message( struct msg_queue *queue, struct message *msg,
         break;
     case POST_MESSAGE:
         if (msg->msg == WM_WINE_UPDATEWINDOWSTATE &&
-            msg->wparam == WINE_UPDATE_CLIENT_SURFACES)
-            client_surface_notification_removed( queue->process, msg->lparam );
+            (msg->wparam == WINE_UPDATE_CLIENT_SURFACES ||
+             msg->wparam == WINE_DESTROY_CLIENT_SURFACES))
+            client_surface_notification_removed( queue->process, msg->lparam,
+                                                 msg->wparam, delivered );
         if (list_empty( &queue->msg_list[kind] ) && !queue->quit_message)
             clear_queue_bits( queue, QS_POSTMESSAGE|QS_ALLPOSTMESSAGE );
         if (msg->msg == WM_HOTKEY && --queue->hotkey_count == 0)
@@ -1033,9 +1041,10 @@ static int remove_client_surface_notifications( struct msg_queue *queue )
                               struct message, entry )
     {
         if (msg->msg != WM_WINE_UPDATEWINDOWSTATE ||
-            msg->wparam != WINE_UPDATE_CLIENT_SURFACES)
+            (msg->wparam != WINE_UPDATE_CLIENT_SURFACES &&
+             msg->wparam != WINE_DESTROY_CLIENT_SURFACES))
             continue;
-        remove_queue_message( queue, msg, POST_MESSAGE );
+        remove_queue_message( queue, msg, POST_MESSAGE, 0 );
         removed = 1;
     }
     return removed;
@@ -1056,7 +1065,7 @@ static void result_timeout( void *private )
 
         result->msg = NULL;
         msg->result = NULL;
-        remove_queue_message( result->receiver, msg, SEND_MESSAGE );
+        remove_queue_message( result->receiver, msg, SEND_MESSAGE, 0 );
         result->receiver = NULL;
     }
     store_message_result( result, 0, STATUS_TIMEOUT );
@@ -1225,7 +1234,7 @@ found:
             msg->data = NULL;
             msg->data_size = 0;
         }
-        remove_queue_message( queue, msg, POST_MESSAGE );
+        remove_queue_message( queue, msg, POST_MESSAGE, 1 );
     }
     else if (msg->data) set_reply_data( msg->data, msg->data_size );
 
@@ -1278,7 +1287,7 @@ static void empty_queue_msg_list( struct msg_queue *queue, enum message_kind kin
     struct list *ptr;
 
     while ((ptr = list_head( &queue->msg_list[kind] )) != NULL)
-        remove_queue_message( queue, LIST_ENTRY( ptr, struct message, entry ), kind );
+        remove_queue_message( queue, LIST_ENTRY( ptr, struct message, entry ), kind, 0 );
 }
 
 /* cleanup all pending results when deleting a queue */
@@ -2883,19 +2892,24 @@ void queue_cleanup_window( struct thread *thread, user_handle_t win )
             if (msg->win == win)
             {
                 if (i == POST_MESSAGE && msg->msg == WM_WINE_UPDATEWINDOWSTATE &&
-                    msg->wparam == WINE_UPDATE_CLIENT_SURFACES)
+                    (msg->wparam == WINE_UPDATE_CLIENT_SURFACES ||
+                     msg->wparam == WINE_DESTROY_CLIENT_SURFACES))
                     retry = 1;
                 if (msg->msg == WM_QUIT && !queue->quit_message)
                 {
                     queue->quit_message = 1;
                     queue->exit_code = msg->wparam;
                 }
-                remove_queue_message( queue, msg, i );
+                remove_queue_message( queue, msg, i, 0 );
             }
         }
     }
 
-    if (retry) retry_process_client_surface_notifications( queue->process, win );
+    if (retry)
+    {
+        retry_process_client_surface_notifications( queue->process, win );
+        retry_process_client_surface_destroys( queue->process );
+    }
 
     thread_input_cleanup_window( queue, win );
 }
