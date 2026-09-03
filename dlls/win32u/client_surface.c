@@ -1635,6 +1635,21 @@ static void CALLBACK client_surface_completion_worker( void *context )
     }
 }
 
+/* NtCreateThreadEx enters its start routine with the Windows ABI, while this
+ * Unix library normally uses the host ABI.  Keep the actual worker in the
+ * host ABI and use a narrow bridge on architectures where the argument
+ * registers differ. */
+#if defined(__x86_64__)
+static void __attribute__((ms_abi)) client_surface_completion_thread( void *context )
+#elif defined(__i386__)
+static void __attribute__((stdcall)) client_surface_completion_thread( void *context )
+#else
+static void client_surface_completion_thread( void *context )
+#endif
+{
+    client_surface_completion_worker( context );
+}
+
 void client_surface_defer_present( struct client_surface *surface,
                                    struct client_surface_present *present,
                                    BOOL submitted, const SIZE *expected_size,
@@ -1729,7 +1744,8 @@ void client_surface_defer_present( struct client_surface *surface,
         NTSTATUS status;
 
         status = NtCreateThreadEx( &thread, THREAD_ALL_ACCESS, NULL, NtCurrentProcess(),
-                                   client_surface_completion_worker, surface, 0, 0, 0, 0, NULL );
+                                   (PRTL_THREAD_START_ROUTINE)client_surface_completion_thread,
+                                   surface, 0, 0, 0, 0, NULL );
         if (status)
         {
             /* Thread allocation failure is rare.  Drain this FIFO inline so
