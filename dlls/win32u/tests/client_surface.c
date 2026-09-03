@@ -923,6 +923,147 @@ static void test_native_backing_barrier(void)
     DestroyWindow( hwnd );
 }
 
+static void test_notification_identity_aba(void)
+{
+    const UINT_PTR surface = 0x123d8000;
+    MSG message;
+    HWND first, second;
+    unsigned int status;
+
+    first = create_test_window( FALSE );
+    second = create_test_window( FALSE );
+    ok( !!first && !!second, "failed to create notification ABA windows, error %lu\n",
+        GetLastError() );
+    if (!first || !second)
+    {
+        if (first) DestroyWindow( first );
+        if (second) DestroyWindow( second );
+        return;
+    }
+
+    /* Ensure that window destruction can queue the process-local identity
+     * notification, but leave it undispatched across the first registration
+     * attempt.  The retired index entry is the ABA exclusion boundary. */
+    PeekMessageA( &message, NULL, 0, 0, PM_NOREMOVE );
+    status = set_surface_state( first, surface, CLIENT_SURFACE_STATE_REGISTER, 0, NULL );
+    ok( !status, "notification ABA register failed, status %#x\n", status );
+    ok( DestroyWindow( first ), "failed to destroy notification ABA window, error %lu\n",
+        GetLastError() );
+
+    status = set_surface_state( second, surface, CLIENT_SURFACE_STATE_REGISTER, 0, NULL );
+    ok( status == STATUS_INVALID_PARAMETER,
+        "retired identity was reused before notification removal, status %#x\n", status );
+
+    while (PeekMessageA( &message, NULL, 0, 0, PM_REMOVE ))
+    {
+        TranslateMessage( &message );
+        DispatchMessageA( &message );
+    }
+    status = set_surface_state( second, surface, CLIENT_SURFACE_STATE_REGISTER, 0, NULL );
+    ok( !status, "removed notification retained identity tombstone, status %#x\n", status );
+    set_surface_state( second, surface, CLIENT_SURFACE_STATE_UNREGISTER, 0, NULL );
+    DestroyWindow( second );
+}
+
+struct writer_exit_context
+{
+    HWND hwnd;
+    UINT_PTR surface;
+    struct surface_state scene;
+    HANDLE ready;
+    HANDLE release;
+    unsigned int status;
+    BOOL compose;
+};
+
+static DWORD WINAPI writer_exit_thread( void *arg )
+{
+    struct writer_exit_context *context = arg;
+    struct surface_state state = {0};
+
+    context->status = begin_surface_write_state( context->hwnd, context->surface,
+                                                 &context->scene, &state );
+    context->compose = state.compose;
+    SetEvent( context->ready );
+    WaitForSingleObject( context->release, 10000 );
+    return 0; /* deliberately omit PRESENT_END */
+}
+
+static void test_writer_thread_exit(void)
+{
+    const UINT_PTR surface = 0x123e0000, barrier = 0x45678000;
+    struct writer_exit_context context = {0};
+    struct surface_state state = {0}, composing = {0}, ready = {0}, sealed = {0};
+    HANDLE thread = NULL;
+    HWND hwnd;
+    unsigned int status;
+
+    hwnd = create_test_window( TRUE );
+    ok( !!hwnd, "failed to create writer-exit window, error %lu\n", GetLastError() );
+    if (!hwnd) return;
+
+    status = set_surface_state( hwnd, surface, CLIENT_SURFACE_STATE_REGISTER |
+                                CLIENT_SURFACE_STATE_SCENE_PUBLICATION |
+                                CLIENT_SURFACE_STATE_NATIVE_WRITE_LEASE, 0, NULL );
+    ok( !status, "writer-exit register failed, status %#x\n", status );
+    claim_surface_state( hwnd, surface, &state );
+    status = prepare_surface_state( hwnd, &composing );
+    ok( !status && composing.generation && composing.pending == 1,
+        "writer-exit prepare failed: status %#x generation %s pending %u\n",
+        status, wine_dbgstr_longlong( composing.generation ), composing.pending );
+    status = commit_surface_state( hwnd, surface, &composing, &ready );
+    ok( !status && ready.ready, "writer-exit composition failed, status %#x ready %u\n",
+        status, ready.ready );
+    status = publish_surface_state( hwnd, &state );
+    ok( !status && !state.generation, "writer-exit publication failed, status %#x\n", status );
+
+    context.hwnd = hwnd;
+    context.surface = surface;
+    context.scene = state;
+    context.ready = CreateEventA( NULL, TRUE, FALSE, NULL );
+    context.release = CreateEventA( NULL, TRUE, FALSE, NULL );
+    if (context.ready && context.release)
+        thread = CreateThread( NULL, 0, writer_exit_thread, &context, 0, NULL );
+    ok( !!context.ready && !!context.release && !!thread,
+        "failed to create writer-exit synchronization, error %lu\n", GetLastError() );
+    if (thread && WaitForSingleObject( context.ready, 10000 ) == WAIT_OBJECT_0)
+    {
+        ok( !context.status && context.compose,
+            "writer-exit lease failed: status %#x compose %u\n",
+            context.status, context.compose );
+        status = set_surface_state( hwnd, barrier, CLIENT_SURFACE_STATE_NATIVE_BARRIER_BEGIN,
+                                    0, &sealed );
+        ok( !status && sealed.pending == 1 && (sealed.scene_generation & 1),
+            "writer-exit barrier missed lease: status %#x pending %u scene %s\n",
+            status, sealed.pending, wine_dbgstr_longlong( sealed.scene_generation ) );
+        SetEvent( context.release );
+        ok( WaitForSingleObject( thread, 10000 ) == WAIT_OBJECT_0,
+            "writer-exit thread did not terminate\n" );
+        status = set_surface_state( hwnd, barrier, CLIENT_SURFACE_STATE_NATIVE_BARRIER_BEGIN,
+                                    0, &sealed );
+        ok( !status && !sealed.pending && (sealed.scene_generation & 1),
+            "dead writer retained lease: status %#x pending %u scene %s\n",
+            status, sealed.pending, wine_dbgstr_longlong( sealed.scene_generation ) );
+        status = set_surface_state( hwnd, barrier, CLIENT_SURFACE_STATE_NATIVE_BARRIER_END,
+                                    0, &sealed );
+        ok( !status && !(sealed.scene_generation & 1),
+            "writer-exit barrier did not reopen scene: status %#x scene %s\n",
+            status, wine_dbgstr_longlong( sealed.scene_generation ) );
+    }
+    else
+    {
+        ok( 0, "writer-exit thread did not acquire lease\n" );
+        if (context.release) SetEvent( context.release );
+        if (thread) WaitForSingleObject( thread, 10000 );
+    }
+    if (thread) CloseHandle( thread );
+    if (context.release) CloseHandle( context.release );
+    if (context.ready) CloseHandle( context.ready );
+
+    set_surface_state( hwnd, surface, CLIENT_SURFACE_STATE_UNREGISTER, 0, NULL );
+    DestroyWindow( hwnd );
+}
+
 static void test_late_present_cutover(void)
 {
     const UINT_PTR surface = 0x12390000;
@@ -1601,6 +1742,10 @@ START_TEST(client_surface)
     test_scene_writer_barrier();
     trace( "testing native backing destruction barrier\n" );
     test_native_backing_barrier();
+    trace( "testing client surface notification identity ABA\n" );
+    test_notification_identity_aba();
+    trace( "testing writer thread exit lease cleanup\n" );
+    test_writer_thread_exit();
     trace( "testing late client surface publication cut-over\n" );
     test_late_present_cutover();
     trace( "testing client surface generation membership\n" );
