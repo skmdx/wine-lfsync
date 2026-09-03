@@ -816,7 +816,7 @@ static BOOL X11DRV_client_surface_present( struct client_surface *client, HDC hd
      * presented while hidden on the stable offscreen composition path. */
     if (!NtUserIsWindowVisible( hwnd )) surface->keep_offscreen = TRUE;
 
-    window = X11DRV_get_whole_window( toplevel );
+    window = X11DRV_get_whole_window_property( toplevel );
     if (!window || !surface->hdc_src || !surface->hdc_dst) return FALSE;
     if (!surface->composition_backing ||
         surface->composition_toplevel != client->composition_toplevel ||
@@ -824,7 +824,7 @@ static BOOL X11DRV_client_surface_present( struct client_surface *client, HDC hd
     {
         surface->composition_toplevel = client->composition_toplevel;
         surface->composition_scene_generation = client->composition_scene_generation;
-        surface->composition_backing = X11DRV_get_client_surface_backing( toplevel );
+        surface->composition_backing = X11DRV_get_client_surface_backing_property( toplevel );
     }
     backing = surface->composition_backing;
 

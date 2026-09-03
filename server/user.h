@@ -185,6 +185,7 @@ extern void post_desktop_message( struct desktop *desktop, unsigned int message,
                                   lparam_t wparam, lparam_t lparam );
 extern void free_window_handle( struct window *win );
 extern void destroy_thread_windows( struct thread *thread );
+extern void cleanup_thread_client_surface_writers( struct thread *thread );
 extern void cleanup_process_client_surfaces( struct process *process );
 extern int is_child_window( user_handle_t parent, user_handle_t child );
 extern struct thread *make_window_foreground( struct desktop *desktop, user_handle_t window,

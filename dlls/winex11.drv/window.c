@@ -2807,12 +2807,36 @@ done:
  */
 static void destroy_whole_window( struct x11drv_win_data *data, BOOL already_destroyed )
 {
+    LARGE_INTEGER delay = {.QuadPart = -10000};
+    UINT writers = 0;
+    BOOL barrier = FALSE;
+
     TRACE( "win %p xwin %lx/%lx\n", data->hwnd, data->whole_window, data->client_window );
 
+    /* Foreign renderer connections may still be copying into an owner-owned
+     * backing Pixmap.  Seal the server scene first, then wait until every
+     * admitted writer has synchronized its X connection and returned its
+     * lease.  This makes freeing the Pixmap an XID lifetime boundary instead
+     * of an ABA race with a queued cross-client XCopyArea. */
+    if (data->client_surface_backing || data->client_surface_retired)
+    {
+        barrier = client_surface_begin_native_barrier( data->hwnd, (UINT_PTR)data, &writers );
+        while (barrier && writers)
+        {
+            NtDelayExecution( FALSE, &delay );
+            if (!client_surface_begin_native_barrier( data->hwnd, (UINT_PTR)data, &writers ))
+            {
+                ERR( "failed to query client-surface backing barrier for window %p\n", data->hwnd );
+                break;
+            }
+        }
+        if (!barrier)
+            ERR( "failed to seal client-surface backing for window %p\n", data->hwnd );
+    }
     destroy_client_surface_backing( data );
     if (!data->whole_window)
     {
-        if (data->embedded) return;
+        if (data->embedded) goto done;
     }
     else
     {
@@ -2862,6 +2886,9 @@ static void destroy_whole_window( struct x11drv_win_data *data, BOOL already_des
         host_window_release( data->parent );
         data->parent = NULL;
     }
+done:
+    if (barrier && !client_surface_end_native_barrier( data->hwnd, (UINT_PTR)data ))
+        ERR( "failed to release client-surface backing barrier for window %p\n", data->hwnd );
 }
 
 
@@ -3345,6 +3372,16 @@ Window X11DRV_get_whole_window( HWND hwnd )
     return ret;
 }
 
+/* Renderer-side composition can run while the owner holds win_data across a
+ * native backing barrier.  Read the owner-published capability directly so a
+ * granted writer never needs the lock which teardown is holding while it
+ * waits for that writer. */
+Window X11DRV_get_whole_window_property( HWND hwnd )
+{
+    if (hwnd == NtUserGetDesktopWindow()) return root_window;
+    return (Window)NtUserGetProp( hwnd, whole_window_prop );
+}
+
 Pixmap X11DRV_get_client_surface_backing( HWND hwnd )
 {
     struct x11drv_win_data *data = get_win_data( hwnd );
@@ -3354,6 +3391,11 @@ Pixmap X11DRV_get_client_surface_backing( HWND hwnd )
     ret = data->client_surface_backing;
     release_win_data( data );
     return ret;
+}
+
+Pixmap X11DRV_get_client_surface_backing_property( HWND hwnd )
+{
+    return (Pixmap)NtUserGetProp( hwnd, client_surface_backing_prop );
 }
 
 

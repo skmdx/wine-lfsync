@@ -743,7 +743,9 @@ extern struct x11drv_win_data *get_win_data( HWND hwnd );
 extern void release_win_data( struct x11drv_win_data *data );
 extern void set_window_parent( struct x11drv_win_data *data, Window parent );
 extern Window X11DRV_get_whole_window( HWND hwnd );
+extern Window X11DRV_get_whole_window_property( HWND hwnd );
 extern Pixmap X11DRV_get_client_surface_backing( HWND hwnd );
+extern Pixmap X11DRV_get_client_surface_backing_property( HWND hwnd );
 extern BOOL X11DRV_restore_client_surface_backing( struct x11drv_win_data *data,
                                                    Window window, const RECT *rect );
 extern Window get_dummy_parent(void);

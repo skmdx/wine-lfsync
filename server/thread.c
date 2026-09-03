@@ -580,6 +580,7 @@ static void cleanup_thread( struct thread *thread )
     if (thread->reply_fd) release_object( thread->reply_fd );
     if (thread->wait_fd) release_object( thread->wait_fd );
     cleanup_clipboard_thread(thread);
+    cleanup_thread_client_surface_writers( thread );
     destroy_thread_windows( thread );
     free_msg_queue( thread );
     release_thread_desktop( thread, 1 );

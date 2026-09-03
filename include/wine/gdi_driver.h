@@ -384,6 +384,8 @@ W32KAPI BOOL client_surface_complete_present_locked( struct client_surface *surf
 W32KAPI void client_surface_geometry_ready( HWND hwnd );
 W32KAPI void client_surface_set_staged( HWND hwnd );
 W32KAPI void client_surface_bypass_staging( HWND hwnd );
+W32KAPI BOOL client_surface_begin_native_barrier( HWND hwnd, UINT_PTR token, UINT *writers );
+W32KAPI BOOL client_surface_end_native_barrier( HWND hwnd, UINT_PTR token );
 W32KAPI BOOL client_surface_begin_publish( HWND hwnd, UINT64 *generation, UINT64 *scene_generation );
 W32KAPI void client_surface_end_publish( HWND hwnd, UINT64 generation, UINT64 scene_generation );
 W32KAPI BOOL client_surface_begin_prepare( HWND hwnd, UINT64 *scene_generation );

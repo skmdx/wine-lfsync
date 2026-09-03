@@ -489,7 +489,7 @@ static HWND set_client_surface_server_state( HWND hwnd, const struct client_surf
 
 static BOOL begin_client_surface_composition( HWND hwnd, const struct client_surface *surface,
                                               const struct client_surface_present *present,
-                                              BOOL *valid )
+                                              BOOL lease, BOOL *valid )
 {
     BOOL compose = FALSE;
 
@@ -498,7 +498,8 @@ static BOOL begin_client_surface_composition( HWND hwnd, const struct client_sur
     {
         req->handle = wine_server_user_handle( hwnd );
         req->surface = surface->identity;
-        req->flags = CLIENT_SURFACE_STATE_PRESENT_BEGIN;
+        req->flags = CLIENT_SURFACE_STATE_PRESENT_BEGIN |
+                     (lease ? CLIENT_SURFACE_STATE_PRESENT_LEASE : 0);
         req->generation = present->generation;
         req->scene_generation = present->scene_generation;
         if (!wine_server_call( req ))
@@ -1381,8 +1382,9 @@ static BOOL client_surface_end_present_internal( struct client_surface *surface,
     BOOL commit = FALSE, compose = FALSE, composed = FALSE, copied = FALSE, offscreen = FALSE;
     BOOL region_valid = TRUE, sync = !!generation, wake = FALSE;
     BOOL authorized = present && present->authoritative;
-    BOOL begin_valid = TRUE, composition_retry = FALSE;
+    BOOL begin_valid = TRUE, composition_retry = FALSE, guarded = FALSE, leased = FALSE;
     BOOL scene_retry = FALSE, source_valid = FALSE;
+    UINT server_flags = 0;
     HDC hdc = 0;
 
     /* The caller owns a surface reference and completion_lock.  present_lock
@@ -1423,9 +1425,12 @@ static BOOL client_surface_end_present_internal( struct client_surface *surface,
     }
     source_valid = compose && new_content;
     if (compose && present && !present->scene_valid) compose = FALSE;
-    if (compose && sync)
+    guarded = compose && offscreen && surface->funcs->scene_backing;
+    if (compose && (sync || guarded))
     {
-        authorized = begin_client_surface_composition( hwnd, surface, present, &begin_valid );
+        authorized = begin_client_surface_composition( hwnd, surface, present,
+                                                       guarded, &begin_valid );
+        leased = guarded && authorized;
         if (!authorized)
         {
             /* Only the authoritative producer for an HWND may touch its
@@ -1487,7 +1492,11 @@ static BOOL client_surface_end_present_internal( struct client_surface *surface,
     {
         surface->composition_scene_generation = present->scene_generation;
         surface->composition_toplevel = present->scene_toplevel;
-        copied = surface->funcs->present( surface, hdc, surface_region, sync );
+        /* A backing writer lease protects execution on the native server,
+         * not merely submission from this process.  Complete the backend
+         * copy before returning the lease so the owner cannot publish or
+         * replace the shared target ahead of work queued on this connection. */
+        copied = surface->funcs->present( surface, hdc, surface_region, sync || leased );
         composed = copied;
     }
     if (copied && offscreen && !client_surface_publication_matches( present ))
@@ -1510,19 +1519,21 @@ static BOOL client_surface_end_present_internal( struct client_surface *surface,
     composition_retry = sync && authorized && !composed && !scene_retry;
     pthread_mutex_unlock( &surface->present_lock );
 
-    /* A failed optimistic read may have copied into an already-visible host
-     * drawable.  Ask every renderer for the top-level to replay the latest
-     * complete content; staged generations remain unpublished meanwhile. */
+    /* wineserver can block behind unrelated requests.  Do not serialize all
+     * process-local surfaces while acknowledging one composition epoch. */
+    if (leased) server_flags |= CLIENT_SURFACE_STATE_PRESENT_END;
+    if (commit) server_flags |= CLIENT_SURFACE_STATE_PRESENT_COMMIT;
+    if (server_flags)
+        toplevel = set_client_surface_server_state( hwnd, surface, server_flags,
+                                                    generation, present->scene_generation, &wake );
+    if (wake && toplevel) NtUserPostMessage( toplevel, WM_WINE_UPDATEWINDOWSTATE, 0, 0 );
+
+    /* Release a scene-backing writer before requesting repair.  The server
+     * can then linearize the fresh owner snapshot immediately after the last
+     * stale writer instead of creating a second deferred restart. */
     if ((scene_retry || composition_retry) && present->scene_toplevel &&
         claim_client_surface_retry( surface, generation ))
         client_surface_geometry_ready( present->scene_toplevel );
-
-    /* wineserver can block behind unrelated requests.  Do not serialize all
-     * process-local surfaces while acknowledging one composition epoch. */
-    if (commit)
-        toplevel = set_client_surface_server_state( hwnd, surface, CLIENT_SURFACE_STATE_PRESENT_COMMIT,
-                                                    generation, present->scene_generation, &wake );
-    if (wake && toplevel) NtUserPostMessage( toplevel, WM_WINE_UPDATEWINDOWSTATE, 0, 0 );
     return composed;
 }
 
@@ -2084,6 +2095,45 @@ void client_surface_set_staged( HWND hwnd )
 void client_surface_bypass_staging( HWND hwnd )
 {
     set_client_surface_server_state( hwnd, NULL, CLIENT_SURFACE_STATE_BYPASS, 0, 0, NULL );
+}
+
+BOOL client_surface_begin_native_barrier( HWND hwnd, UINT_PTR token, UINT *writers )
+{
+    BOOL ret = FALSE;
+
+    *writers = 0;
+    SERVER_START_REQ( set_client_surface_state )
+    {
+        req->handle = wine_server_user_handle( hwnd );
+        req->surface = token;
+        req->flags = CLIENT_SURFACE_STATE_NATIVE_BARRIER_BEGIN;
+        req->generation = 0;
+        req->scene_generation = 0;
+        if (!wine_server_call( req ))
+        {
+            *writers = reply->pending;
+            ret = TRUE;
+        }
+    }
+    SERVER_END_REQ;
+    return ret;
+}
+
+BOOL client_surface_end_native_barrier( HWND hwnd, UINT_PTR token )
+{
+    BOOL ret = FALSE;
+
+    SERVER_START_REQ( set_client_surface_state )
+    {
+        req->handle = wine_server_user_handle( hwnd );
+        req->surface = token;
+        req->flags = CLIENT_SURFACE_STATE_NATIVE_BARRIER_END;
+        req->generation = 0;
+        req->scene_generation = 0;
+        ret = !wine_server_call( req );
+    }
+    SERVER_END_REQ;
+    return ret;
 }
 
 BOOL client_surface_begin_publish( HWND hwnd, UINT64 *generation, UINT64 *scene_generation )
