@@ -1192,7 +1192,7 @@ static BOOL client_surface_end_present_internal( struct client_surface *surface,
                    debugstr_client_surface( surface ) );
     }
     source_valid = compose && new_content;
-    if (compose && present && !present->scene_valid) compose = FALSE;
+    if (compose && offscreen && present && !present->scene_valid) compose = FALSE;
     guarded = compose && offscreen &&
               client_surface_backend_has_cap( surface, CLIENT_SURFACE_BACKEND_NATIVE_WRITE_LEASE );
     if (compose && (sync || guarded))
