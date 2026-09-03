@@ -24,6 +24,7 @@
 
 #include "config.h"
 
+#include <assert.h>
 #include <dlfcn.h>
 #include <pthread.h>
 #include <unistd.h>
@@ -156,6 +157,8 @@ struct swapchain
     struct surface *surface;
     VkExtent2D extents;
     pthread_mutex_t present_lock;
+    pthread_cond_t completion_cond;
+    unsigned int completion_refs;
     uint64_t next_present_id;
 };
 
@@ -163,6 +166,46 @@ static struct swapchain *swapchain_from_handle( VkSwapchainKHR handle )
 {
     struct vulkan_swapchain *obj = vulkan_swapchain_from_handle( handle );
     return CONTAINING_RECORD( obj, struct swapchain, obj );
+}
+
+struct vulkan_present_completion
+{
+    struct vulkan_device *device;
+    struct swapchain *swapchain;
+    uint64_t present_id;
+};
+
+static BOOL wait_vulkan_present_completion( void *context, DWORD timeout )
+{
+    struct vulkan_present_completion *completion = context;
+    VkResult res;
+
+    res = completion->device->p_vkWaitForPresentKHR(
+        completion->device->host.device, completion->swapchain->obj.host.swapchain,
+        completion->present_id, (uint64_t)timeout * 1000000 );
+    if (res != VK_SUCCESS)
+        WARN( "Failed waiting for present %s, status %d\n",
+              debugstr_client_surface( completion->swapchain->surface->client ), res );
+    return res == VK_SUCCESS;
+}
+
+static void release_vulkan_present_completion( void *context )
+{
+    struct vulkan_present_completion *completion = context;
+    struct swapchain *swapchain = completion->swapchain;
+
+    pthread_mutex_lock( &swapchain->present_lock );
+    assert( swapchain->completion_refs );
+    if (!--swapchain->completion_refs) pthread_cond_signal( &swapchain->completion_cond );
+    pthread_mutex_unlock( &swapchain->present_lock );
+    free( completion );
+}
+
+static void retain_swapchain_completion( struct swapchain *swapchain )
+{
+    pthread_mutex_lock( &swapchain->present_lock );
+    swapchain->completion_refs++;
+    pthread_mutex_unlock( &swapchain->present_lock );
 }
 
 struct semaphore
@@ -1932,9 +1975,16 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
         free( swapchain );
         return VK_ERROR_OUT_OF_HOST_MEMORY;
     }
+    if (pthread_cond_init( &swapchain->completion_cond, NULL ))
+    {
+        pthread_mutex_destroy( &swapchain->present_lock );
+        free( swapchain );
+        return VK_ERROR_OUT_OF_HOST_MEMORY;
+    }
 
     if ((res = device->p_vkCreateSwapchainKHR( device->host.device, &create_info_host, NULL, &host_swapchain )))
     {
+        pthread_cond_destroy( &swapchain->completion_cond );
         pthread_mutex_destroy( &swapchain->present_lock );
         free( swapchain );
         return res;
@@ -1958,9 +2008,15 @@ static void win32u_vkDestroySwapchainKHR( VkDevice client_device, VkSwapchainKHR
     if (allocator) FIXME( "Support for allocation callbacks not implemented yet\n" );
     if (!swapchain) return;
 
+    pthread_mutex_lock( &swapchain->present_lock );
+    while (swapchain->completion_refs)
+        pthread_cond_wait( &swapchain->completion_cond, &swapchain->present_lock );
+    pthread_mutex_unlock( &swapchain->present_lock );
+
     device->p_vkDestroySwapchainKHR( device->host.device, swapchain->obj.host.swapchain, NULL );
     instance->p_remove_object( instance, &swapchain->obj.obj );
 
+    pthread_cond_destroy( &swapchain->completion_cond );
     pthread_mutex_destroy( &swapchain->present_lock );
     free( swapchain );
 }
@@ -2053,10 +2109,16 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
     struct vulkan_device *device = queue->device;
     const VkSwapchainKHR *client_swapchains;
     uint32_t locked_count = 0, surface_locked_count = 0;
-    DWORD completion_start;
+    BOOL use_internal_present_wait;
     VkResult res;
 
     TRACE( "queue %p, present_info %p\n", queue, present_info );
+
+    /* A pNext chain must not contain two VkPresentIdKHR structures.  Keep an
+     * application's IDs untouched (vkWaitForPresentKHR observes that exact
+     * namespace) and use the driver completion fallback for this call. */
+    use_internal_present_wait = device->internal_present_wait &&
+        !find_next_struct( present_info->pNext, VK_STRUCTURE_TYPE_PRESENT_ID_KHR );
 
     if (present_info->swapchainCount > ARRAY_SIZE(swapchains_buffer) &&
         !(swapchains = malloc( present_info->swapchainCount * sizeof(*swapchains) )))
@@ -2074,7 +2136,7 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
         if (swapchains != swapchains_buffer) free( swapchains );
         return VK_ERROR_OUT_OF_HOST_MEMORY;
     }
-    if (device->internal_present_wait && present_info->swapchainCount > ARRAY_SIZE(present_ids_buffer) &&
+    if (use_internal_present_wait && present_info->swapchainCount > ARRAY_SIZE(present_ids_buffer) &&
         !(present_ids = malloc( present_info->swapchainCount * sizeof(*present_ids) )))
     {
         if (present_surfaces != present_surfaces_buffer) free( present_surfaces );
@@ -2082,7 +2144,7 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
         if (swapchains != swapchains_buffer) free( swapchains );
         return VK_ERROR_OUT_OF_HOST_MEMORY;
     }
-    if (device->internal_present_wait && present_info->swapchainCount > ARRAY_SIZE(present_swapchains_buffer) &&
+    if (use_internal_present_wait && present_info->swapchainCount > ARRAY_SIZE(present_swapchains_buffer) &&
         !(present_swapchains = malloc( present_info->swapchainCount * sizeof(*present_swapchains) )))
     {
         if (present_ids != present_ids_buffer) free( present_ids );
@@ -2104,12 +2166,12 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
         struct swapchain *swapchain = swapchain_from_handle( present_info->pSwapchains[i] );
         swapchains[i] = swapchain->obj.host.swapchain;
         present_surfaces[i] = swapchain->surface->client;
-        if (device->internal_present_wait) present_swapchains[i] = swapchain;
+        if (use_internal_present_wait) present_swapchains[i] = swapchain;
     }
 
     client_swapchains = present_info->pSwapchains;
     present_info->pSwapchains = swapchains;
-    if (device->internal_present_wait)
+    if (use_internal_present_wait)
     {
         present_id_info.pNext = present_info->pNext;
         present_id_info.swapchainCount = present_info->swapchainCount;
@@ -2117,10 +2179,10 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
         present_info->pNext = &present_id_info;
     }
 
-    /* Completion monitors are per client surface.  Acquire them in a stable
-     * order across queues, then keep them reserved through submission, host
-     * completion and composition.  This prevents one present from clearing
-     * another present's native completion event. */
+    /* Completion ordering is per client surface.  Acquire locks in a stable
+     * order across queues; exact external IDs release them after submission,
+     * while fallback monitors keep them through composition so events cannot
+     * be stolen. */
     if (present_info->swapchainCount > 1)
         qsort( present_surfaces, present_info->swapchainCount,
                sizeof(*present_surfaces), compare_client_surface_ptrs );
@@ -2136,10 +2198,10 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
         struct swapchain *swapchain = swapchain_from_handle( client_swapchains[i] );
 
         client_surface_prepare_present_locked( swapchain->surface->client, &presents[i],
-                                               device->internal_present_wait );
+                                               use_internal_present_wait );
     }
 
-    if (device->internal_present_wait)
+    if (use_internal_present_wait)
     {
         /* Queue synchronization does not serialize the same swapchain across
          * distinct queues.  Lock every referenced swapchain in a stable order
@@ -2162,15 +2224,25 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
     }
 
     res = device->p_vkQueuePresentKHR( queue->host.queue, present_info );
-    completion_start = NtGetTickCount();
 
+    /* Allocate producer serials before releasing either ordering domain.
+     * This records host submission order even when another queue targets the
+     * same client surface through a different swapchain. */
+    for (uint32_t i = 0; i < present_info->swapchainCount; i++)
+    {
+        struct swapchain *swapchain = swapchain_from_handle( client_swapchains[i] );
+
+        if (use_internal_present_wait)
+        {
+            presents[i].serial = InterlockedIncrement64( &swapchain->surface->client->present_serial );
+            presents[i].submission_time = NtGetTickCount();
+        }
+        else
+            client_surface_submit_present( swapchain->surface->client, &presents[i] );
+    }
     while (locked_count)
         pthread_mutex_unlock( &present_swapchains[--locked_count]->present_lock );
-
-    /* Present serial allocation and host submission share completion_lock.
-     * Present IDs provide the later completion boundary, so release the locks
-     * immediately after submission and allow unrelated GPU work to continue. */
-    if (device->internal_present_wait)
+    if (use_internal_present_wait)
     {
         while (surface_locked_count)
             client_surface_unlock_present( present_surfaces[--surface_locked_count] );
@@ -2216,47 +2288,43 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
         }
 
         if (compose && InterlockedCompareExchange( &surface->client->offscreen, 0, 0 ) &&
-            device->internal_present_wait)
+            use_internal_present_wait)
         {
-            DWORD elapsed = NtGetTickCount() - completion_start;
-            DWORD remaining = elapsed < CLIENT_SURFACE_PRESENT_TIMEOUT ?
-                              CLIENT_SURFACE_PRESENT_TIMEOUT - elapsed : 0;
-            VkResult wait_res = device->p_vkWaitForPresentKHR( device->host.device,
-                                                               swapchain->obj.host.swapchain,
-                                                               present_ids[i],
-                                                               (uint64_t)remaining * 1000000 );
-            if (wait_res != VK_SUCCESS)
+            struct vulkan_present_completion *completion;
+
+            if ((completion = malloc( sizeof(*completion) )))
             {
-                WARN( "Failed waiting for present %s, status %d\n",
-                      debugstr_client_surface( surface->client ), wait_res );
-                compose = FALSE;
-                /* A timeout belongs to Wine's internal completion wait, not
-                 * to vkQueuePresentKHR.  Preserve the host present result so
-                 * the application does not receive an unsupported status for
-                 * an operation which was submitted successfully. */
-                if (wait_res < VK_SUCCESS)
-                {
-                    swapchain_res = wait_res;
-                    if (present_info->pResults) present_info->pResults[i] = wait_res;
-                    if (res >= VK_SUCCESS) res = wait_res;
-                }
+                completion->device = device;
+                completion->swapchain = swapchain;
+                completion->present_id = present_ids[i];
+                retain_swapchain_completion( swapchain );
+                client_surface_defer_present( surface->client, &presents[i], TRUE,
+                                              &expected_size,
+                                              wait_vulkan_present_completion,
+                                              release_vulkan_present_completion, completion );
+                continue;
             }
         }
 
         {
-            DWORD elapsed = NtGetTickCount() - completion_start;
-            DWORD remaining = elapsed < CLIENT_SURFACE_PRESENT_TIMEOUT ?
-                              CLIENT_SURFACE_PRESENT_TIMEOUT - elapsed : 0;
-
             BOOL completed;
+            BOOL external_completed = FALSE;
 
-            if (device->internal_present_wait)
+            if (compose && use_internal_present_wait)
+            {
+                struct vulkan_present_completion fallback = {device, swapchain, present_ids[i]};
+                client_surface_begin_inline_completion( surface->client, &presents[i] );
+                external_completed = wait_vulkan_present_completion(
+                    &fallback, CLIENT_SURFACE_PRESENT_TIMEOUT );
+            }
+
+            if (use_internal_present_wait)
                 completed = client_surface_complete_present( surface->client, &presents[i], compose,
-                                                             compose, &expected_size, remaining );
+                                                             external_completed, &expected_size, 0 );
             else
                 completed = client_surface_complete_present_locked( surface->client, &presents[i],
                                                                     compose, FALSE, &expected_size,
-                                                                    remaining );
+                                                                    CLIENT_SURFACE_PRESENT_TIMEOUT );
             if (!completed && compose)
             {
                 /* The window changed after the post-present check, or the

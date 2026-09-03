@@ -631,24 +631,6 @@ static BOOL x11drv_client_surface_update( struct client_surface *client )
     return client_surface_update_offscreen( hwnd, surface );
 }
 
-static void client_surface_enable_backing_store( struct x11drv_client_surface *surface, Window window )
-{
-    XSetWindowAttributes attributes;
-
-    if (!window || window == root_window || surface->backing_window == window) return;
-
-    /* Offscreen client surfaces can be owned and presented by another process
-     * than the thread which owns the top-level window.  An Expose event in the
-     * owner therefore cannot replay those pixels.  Ask the X server to retain
-     * them while the window is mapped so revealing a menu-covered region does
-     * not replace valid client content with the background pixel. */
-    attributes.backing_store = WhenMapped;
-    XChangeWindowAttributes( gdi_display, window, CWBackingStore, &attributes );
-    surface->backing_window = window;
-    TRACE( "%s enabled backing store for whole window %lx\n",
-           debugstr_client_surface( &surface->client ), window );
-}
-
 static BOOL X11DRV_client_surface_present( struct client_surface *client, HDC hdc,
                                            HRGN surface_region, BOOL flush )
 {
@@ -672,7 +654,6 @@ static BOOL X11DRV_client_surface_present( struct client_surface *client, HDC hd
 
     window = X11DRV_get_whole_window( toplevel );
     if (!window || !surface->hdc_src || !surface->hdc_dst) return FALSE;
-    client_surface_enable_backing_store( surface, window );
 
     /* Exclusive fullscreen ignores normal window clipping. */
     if (hwnd == toplevel && NtUserGetPresentRect( toplevel, &rect, -1 /* raw dpi */ )) region = 0;

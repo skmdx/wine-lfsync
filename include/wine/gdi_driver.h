@@ -268,6 +268,7 @@ struct client_surface_present
     UINT64 generation;
     UINT64 scene_generation;
     LONG64 serial;
+    DWORD submission_time;
     LONG64 target_epoch;
     LONG lifecycle_seq;
     HWND scene_toplevel;
@@ -279,9 +280,13 @@ struct client_surface_present
     BOOL external_completion;
     BOOL external_completion_registered;
     BOOL driver_completion;
+    BOOL completion_coalesced;
     BOOL completion_failed;
     BOOL superseded;
 };
+
+typedef BOOL (*client_surface_completion_wait_func)( void *context, DWORD timeout );
+typedef void (*client_surface_completion_release_func)( void *context );
 
 /* Backend completion and publication must share one bounded wait contract. */
 #define CLIENT_SURFACE_PRESENT_TIMEOUT 5000
@@ -290,8 +295,15 @@ struct client_surface
 {
     const struct client_surface_funcs *funcs;
     struct list                        entry;          /* entry in win32u managed list */
+    UINT_PTR                           identity;       /* opaque server notification token */
+    struct client_surface             *identity_next; /* process-local identity hash chain */
+    struct client_surface             *toplevel_next; /* driver-ready top-level hash chain */
+    HWND                               indexed_toplevel;
     pthread_mutex_t                    present_lock;   /* serializes driver operations for this surface */
     pthread_mutex_t                    completion_lock; /* serializes host presentation completion tracking */
+    pthread_mutex_t                    completion_queue_lock; /* protects deferred completion FIFO */
+    struct list                        completion_queue;
+    BOOL                               completion_worker_active;
     LONG                               ref;            /* reference count */
     HWND                               hwnd;           /* window the surface was created for */
     int                                format;         /* pixel format of the surface */
@@ -342,6 +354,14 @@ W32KAPI BOOL client_surface_complete_present( struct client_surface *surface,
                                               struct client_surface_present *present,
                                               BOOL submitted, BOOL external_completed,
                                               const SIZE *expected_size, DWORD timeout );
+W32KAPI void client_surface_begin_inline_completion( struct client_surface *surface,
+                                                      struct client_surface_present *present );
+W32KAPI void client_surface_defer_present( struct client_surface *surface,
+                                           struct client_surface_present *present,
+                                           BOOL submitted, const SIZE *expected_size,
+                                           client_surface_completion_wait_func wait,
+                                           client_surface_completion_release_func release,
+                                           void *context );
 W32KAPI void client_surface_lock_present( struct client_surface *surface );
 W32KAPI void client_surface_unlock_present( struct client_surface *surface );
 W32KAPI void client_surface_prepare_present_locked( struct client_surface *surface,
@@ -437,6 +457,8 @@ struct gdi_device_manager
 #define WINE_SWP_RESIZABLE  0x40000000
 #define WINE_SWP_CLIENT_SURFACE_PENDING 0x20000000
 #define WINE_SWP_CLIENT_SURFACE_PUBLISH 0x10000000
+#define WINE_SWP_CLIENT_SURFACE_BACKING_ENABLE 0x08000000
+#define WINE_SWP_CLIENT_SURFACE_BACKING_DISABLE 0x04000000
 
 struct vulkan_driver_funcs;
 struct opengl_driver_funcs;

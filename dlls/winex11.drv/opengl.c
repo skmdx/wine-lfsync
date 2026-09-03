@@ -1467,6 +1467,28 @@ static BOOL wait_glx_swap_serial( struct gl_drawable *gl, INT64 target_sbc, DWOR
     }
 }
 
+struct glx_present_completion
+{
+    struct opengl_drawable *drawable;
+    INT64 target_sbc;
+};
+
+static BOOL wait_glx_present_completion( void *context, DWORD timeout )
+{
+    struct glx_present_completion *completion = context;
+
+    return wait_glx_swap_serial( impl_from_opengl_drawable( completion->drawable ),
+                                 completion->target_sbc, timeout );
+}
+
+static void release_glx_present_completion( void *context )
+{
+    struct glx_present_completion *completion = context;
+
+    opengl_drawable_release( completion->drawable );
+    free( completion );
+}
+
 static BOOL x11drv_surface_swap( struct opengl_drawable *base )
 {
     GLXContext ctx = NtCurrentTeb()->glReserved2;
@@ -1488,8 +1510,24 @@ static BOOL x11drv_surface_swap( struct opengl_drawable *base )
         target_sbc = pglXSwapBuffersMscOML( gdi_display, gl->drawable, 0, 0, 0 );
         submitted = target_sbc >= 0;
         client_surface_submit_present( base->client, &present );
-        if (submitted) completed = wait_glx_swap_serial( gl, target_sbc,
-                                                         CLIENT_SURFACE_PRESENT_TIMEOUT );
+        if (submitted)
+        {
+            struct glx_present_completion *completion;
+
+            if ((completion = malloc( sizeof(*completion) )))
+            {
+                completion->drawable = base;
+                completion->target_sbc = target_sbc;
+                opengl_drawable_add_ref( base );
+                client_surface_defer_present( base->client, &present, TRUE, NULL,
+                                              wait_glx_present_completion,
+                                              release_glx_present_completion, completion );
+                return TRUE;
+            }
+            client_surface_begin_inline_completion( base->client, &present );
+            completed = wait_glx_swap_serial( gl, target_sbc,
+                                               CLIENT_SURFACE_PRESENT_TIMEOUT );
+        }
     }
     else
     {
@@ -1544,6 +1582,46 @@ static void x11drv_egl_surface_flush( struct opengl_drawable *base, UINT flags )
     client_surface_complete_present( base->client, &present, TRUE, TRUE, NULL, 0 );
 }
 
+struct egl_present_completion
+{
+    struct opengl_drawable *drawable;
+    EGLuint64KHR frame_id;
+};
+
+static BOOL wait_egl_present_completion( void *context, DWORD timeout )
+{
+    struct egl_present_completion *completion = context;
+    struct opengl_drawable *base = completion->drawable;
+    LARGE_INTEGER delay;
+    DWORD delay_ms = 1;
+    EGLint timestamp_name = EGL_DISPLAY_PRESENT_TIME_ANDROID;
+    DWORD start = NtGetTickCount();
+    EGLnsecsANDROID timestamp = EGL_TIMESTAMP_PENDING_ANDROID;
+
+    do
+    {
+        if (!funcs->p_eglGetFrameTimestampsANDROID( egl->display, base->surface,
+                                                    completion->frame_id, 1,
+                                                    &timestamp_name, &timestamp ))
+            break;
+        if (timestamp != EGL_TIMESTAMP_PENDING_ANDROID) break;
+        if (NtGetTickCount() - start >= timeout) break;
+        delay.QuadPart = -(LONGLONG)delay_ms * 10000;
+        NtDelayExecution( FALSE, &delay );
+        delay_ms = min( delay_ms * 2, (DWORD)4 );
+    } while (NtGetTickCount() - start < timeout);
+    return timestamp != EGL_TIMESTAMP_PENDING_ANDROID &&
+           timestamp != EGL_TIMESTAMP_INVALID_ANDROID;
+}
+
+static void release_egl_present_completion( void *context )
+{
+    struct egl_present_completion *completion = context;
+
+    opengl_drawable_release( completion->drawable );
+    free( completion );
+}
+
 static BOOL x11drv_egl_surface_swap( struct opengl_drawable *base )
 {
     struct gl_drawable *gl = impl_from_opengl_drawable( base );
@@ -1578,24 +1656,25 @@ static BOOL x11drv_egl_surface_swap( struct opengl_drawable *base )
 
     if (present.external_completion && frame_id)
     {
-        LARGE_INTEGER delay;
-        DWORD delay_ms = 1;
-        EGLint timestamp_name = EGL_DISPLAY_PRESENT_TIME_ANDROID;
-        DWORD start = NtGetTickCount();
-        EGLnsecsANDROID timestamp = EGL_TIMESTAMP_PENDING_ANDROID;
+        struct egl_present_completion *completion;
 
-        do
+        if ((completion = malloc( sizeof(*completion) )))
         {
-            if (!funcs->p_eglGetFrameTimestampsANDROID( egl->display, gl->base.surface,
-                                                        frame_id, 1, &timestamp_name, &timestamp ))
-                break;
-            if (timestamp != EGL_TIMESTAMP_PENDING_ANDROID) break;
-            delay.QuadPart = -(LONGLONG)delay_ms * 10000;
-            NtDelayExecution( FALSE, &delay );
-            delay_ms = min( delay_ms * 2, (DWORD)4 );
-        } while (NtGetTickCount() - start < CLIENT_SURFACE_PRESENT_TIMEOUT);
-        timestamp_completion = timestamp != EGL_TIMESTAMP_PENDING_ANDROID &&
-                               timestamp != EGL_TIMESTAMP_INVALID_ANDROID;
+            completion->drawable = base;
+            completion->frame_id = frame_id;
+            opengl_drawable_add_ref( base );
+            client_surface_defer_present( base->client, &present, TRUE, NULL,
+                                          wait_egl_present_completion,
+                                          release_egl_present_completion, completion );
+            return TRUE;
+        }
+
+        {
+            struct egl_present_completion fallback = {base, frame_id};
+            client_surface_begin_inline_completion( base->client, &present );
+            timestamp_completion = wait_egl_present_completion( &fallback,
+                                                                CLIENT_SURFACE_PRESENT_TIMEOUT );
+        }
     }
     else timestamp_completion = FALSE;
 

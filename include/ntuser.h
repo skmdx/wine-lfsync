@@ -656,6 +656,7 @@ enum wine_internal_message
 #define WINE_UPDATE_CLIENT_SURFACES 1
 #define WINE_DESTROY_CLIENT_SURFACES 2
 #define WINE_PUBLISH_CLIENT_SURFACES 3
+#define WINE_UPDATE_CLIENT_SURFACE_BACKING 4
 
 /* internal IME message */
 #define WM_IME_INTERNAL 0x287

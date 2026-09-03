@@ -371,7 +371,6 @@ struct x11drv_client_surface
     XWindowChanges changes;
     Colormap colormap;
     Window window;
-    Window backing_window;  /* whole window with backing store enabled */
     XID damage;
     BOOL keep_offscreen;    /* preserve a drawable which was used while hidden */
     BOOL manual_redirect;   /* client drawable is manually XComposite redirected */

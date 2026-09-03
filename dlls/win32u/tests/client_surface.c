@@ -612,6 +612,62 @@ static void test_publish_transaction(void)
     DestroyWindow( hwnd );
 }
 
+static void test_late_present_cutover(void)
+{
+    const UINT_PTR surface = 0x12390000;
+    struct surface_state staged, ready, reopened, publishing, late, published, repaired;
+    HWND hwnd;
+    unsigned int status;
+
+    hwnd = create_test_window( FALSE );
+    ok( !!hwnd, "failed to create late-present window, error %lu\n", GetLastError() );
+    if (!hwnd) return;
+
+    set_surface_state( hwnd, surface, CLIENT_SURFACE_STATE_REGISTER, 0, NULL );
+    ShowWindow( hwnd, SW_SHOW );
+    status = set_surface_state( hwnd, 0, CLIENT_SURFACE_STATE_STAGED, 0, &staged );
+    ok( !status && staged.staged && staged.pending == 1,
+        "failed to stage late-present window: status %#x staged %u pending %u\n",
+        status, staged.staged, staged.pending );
+    status = commit_surface_state( hwnd, surface, &staged, &ready );
+    ok( !status && ready.ready && !ready.pending,
+        "initial frame did not become ready: status %#x ready %u pending %u\n",
+        status, ready.ready, ready.pending );
+
+    status = begin_surface_state( hwnd, surface, &ready, &reopened );
+    ok( !status && reopened.compose && !reopened.ready && reopened.pending == 1 &&
+        reopened.generation == ready.generation,
+        "late frame did not reopen generation: status %#x compose %u ready %u pending %u generation %s\n",
+        status, reopened.compose, reopened.ready, reopened.pending,
+        wine_dbgstr_longlong( reopened.generation ) );
+    status = commit_surface_state( hwnd, surface, &reopened, &ready );
+    ok( !status && ready.ready && !ready.pending,
+        "reopened frame did not become ready: status %#x ready %u pending %u\n",
+        status, ready.ready, ready.pending );
+
+    status = set_surface_state( hwnd, 0, CLIENT_SURFACE_STATE_PUBLISH_BEGIN, 0, &publishing );
+    ok( !status && publishing.publish && publishing.ready,
+        "publish begin failed: status %#x publish %u ready %u\n",
+        status, publishing.publish, publishing.ready );
+    status = begin_surface_state( hwnd, surface, &publishing, &late );
+    ok( !status && !late.compose && late.ready && !late.pending,
+        "present crossed an active host publication: status %#x compose %u ready %u pending %u\n",
+        status, late.compose, late.ready, late.pending );
+    status = set_surface_state_scene( hwnd, 0, CLIENT_SURFACE_STATE_PUBLISH_COMMIT,
+                                      publishing.generation, publishing.scene_generation, &published );
+    ok( !status && !published.staged && published.pending == 1 &&
+        published.generation != publishing.generation,
+        "late frame did not schedule live repair: status %#x staged %u pending %u generation %s\n",
+        status, published.staged, published.pending, wine_dbgstr_longlong( published.generation ) );
+    status = commit_surface_state( hwnd, surface, &published, &repaired );
+    ok( !status && !repaired.pending && !repaired.generation,
+        "late-frame repair did not finish: status %#x pending %u generation %s\n",
+        status, repaired.pending, wine_dbgstr_longlong( repaired.generation ) );
+
+    set_surface_state( hwnd, surface, CLIENT_SURFACE_STATE_UNREGISTER, 0, NULL );
+    DestroyWindow( hwnd );
+}
+
 struct race_context
 {
     HWND hwnd;
@@ -1135,6 +1191,8 @@ START_TEST(client_surface)
     test_generation_aba();
     trace( "testing client surface host publication transaction\n" );
     test_publish_transaction();
+    trace( "testing late client surface publication cut-over\n" );
+    test_late_present_cutover();
     trace( "testing client surface generation membership\n" );
     test_generation_membership();
     trace( "testing client surface clip scene snapshots\n" );

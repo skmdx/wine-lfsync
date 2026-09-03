@@ -144,6 +144,7 @@ struct msg_queue
     struct timeout_user   *timeout;         /* timeout for next timer to expire */
     struct thread_input   *input;           /* thread input descriptor */
     struct hook_table     *hooks;           /* hook table */
+    struct process        *process;         /* process owning internal notifications */
     int                    keystate_lock;   /* owns an input keystate lock */
     queue_shm_t           *shared;          /* queue in session shared memory */
 };
@@ -284,6 +285,7 @@ static struct msg_queue *create_msg_queue( struct thread *thread, struct thread_
         queue->timeout         = NULL;
         queue->input           = (struct thread_input *)grab_object( input );
         queue->hooks           = NULL;
+        queue->process         = (struct process *)grab_object( thread->process );
         queue->keystate_lock   = 0;
         list_init( &queue->send_result );
         list_init( &queue->callback_result );
@@ -323,13 +325,21 @@ error:
     return NULL;
 }
 
+static int remove_client_surface_notifications( struct msg_queue *queue );
+
 /* free the message queue of a thread at thread exit */
 void free_msg_queue( struct thread *thread )
 {
+    struct msg_queue *queue;
+    int retry;
+
     remove_thread_hooks( thread );
     if (!thread->queue) return;
-    release_object( thread->queue );
+    queue = thread->queue;
+    retry = remove_client_surface_notifications( queue );
     thread->queue = NULL;
+    release_object( queue );
+    if (retry) retry_process_client_surface_notifications( thread->process );
 }
 
 /* synchronize thread input keystate with the desktop */
@@ -1002,6 +1012,9 @@ static void remove_queue_message( struct msg_queue *queue, struct message *msg,
         if (list_empty( &queue->msg_list[kind] )) clear_queue_bits( queue, QS_SENDMESSAGE );
         break;
     case POST_MESSAGE:
+        if (msg->msg == WM_WINE_UPDATEWINDOWSTATE &&
+            msg->wparam == WINE_UPDATE_CLIENT_SURFACES)
+            client_surface_notification_removed( queue->process, msg->win, msg->lparam );
         if (list_empty( &queue->msg_list[kind] ) && !queue->quit_message)
             clear_queue_bits( queue, QS_POSTMESSAGE|QS_ALLPOSTMESSAGE );
         if (msg->msg == WM_HOTKEY && --queue->hotkey_count == 0)
@@ -1009,6 +1022,23 @@ static void remove_queue_message( struct msg_queue *queue, struct message *msg,
         break;
     }
     free_message( msg );
+}
+
+static int remove_client_surface_notifications( struct msg_queue *queue )
+{
+    struct message *msg, *next;
+    int removed = 0;
+
+    LIST_FOR_EACH_ENTRY_SAFE( msg, next, &queue->msg_list[POST_MESSAGE],
+                              struct message, entry )
+    {
+        if (msg->msg != WM_WINE_UPDATEWINDOWSTATE ||
+            msg->wparam != WINE_UPDATE_CLIENT_SURFACES)
+            continue;
+        remove_queue_message( queue, msg, POST_MESSAGE );
+        removed = 1;
+    }
+    return removed;
 }
 
 /* message timed out without getting a reply */
@@ -1241,6 +1271,16 @@ static void empty_msg_list( struct list *list )
     }
 }
 
+/* Empty a queue-owned list through the normal removal path so server-side
+ * notification ownership is released together with the message. */
+static void empty_queue_msg_list( struct msg_queue *queue, enum message_kind kind )
+{
+    struct list *ptr;
+
+    while ((ptr = list_head( &queue->msg_list[kind] )) != NULL)
+        remove_queue_message( queue, LIST_ENTRY( ptr, struct message, entry ), kind );
+}
+
 /* cleanup all pending results when deleting a queue */
 static void cleanup_results( struct msg_queue *queue )
 {
@@ -1292,7 +1332,7 @@ static void msg_queue_destroy( struct object *obj )
     int i;
 
     cleanup_results( queue );
-    for (i = 0; i < NB_MSG_KINDS; i++) empty_msg_list( &queue->msg_list[i] );
+    for (i = 0; i < NB_MSG_KINDS; i++) empty_queue_msg_list( queue, i );
 
     LIST_FOR_EACH_ENTRY_SAFE( hotkey, hotkey2, &queue->input->desktop->hotkeys, struct hotkey, entry )
     {
@@ -1331,6 +1371,7 @@ static void msg_queue_destroy( struct object *obj )
     if (queue->keystate_lock) unlock_input_keystate( queue->input );
     release_object( queue->input );
     if (queue->hooks) release_object( queue->hooks );
+    release_object( queue->process );
     if (queue->fd) release_object( queue->fd );
     if (queue->shared) free_shared_object( queue->shared );
     if (queue->sync) release_object( queue->sync );
@@ -2936,33 +2977,6 @@ int post_process_message( struct process *process, user_handle_t win, unsigned i
 /* Post at most one copy of an idempotent internal process notification.  The
  * renderer may move its message pump between threads, so search every queue
  * before choosing the most recently active one for a new notification. */
-int post_process_message_coalesced( struct process *process, user_handle_t win,
-                                    unsigned int message, lparam_t wparam, lparam_t lparam )
-{
-    const user_handle_t full_win = get_user_full_handle( win );
-    struct thread *thread, *target = NULL;
-    struct message *msg;
-    timeout_t access_time = 0;
-
-    LIST_FOR_EACH_ENTRY( thread, &process->thread_list, struct thread, proc_entry )
-    {
-        if (thread->is_system || thread->state != RUNNING || !thread->queue) continue;
-
-        LIST_FOR_EACH_ENTRY( msg, &thread->queue->msg_list[POST_MESSAGE], struct message, entry )
-        {
-            if (msg->type == MSG_POSTED && msg->win == full_win && msg->msg == message &&
-                msg->wparam == wparam && msg->lparam == lparam)
-                return 1;
-        }
-        if (!target || thread->queue->shared->access_time > access_time)
-        {
-            target = thread;
-            access_time = thread->queue->shared->access_time;
-        }
-    }
-    return target && post_thread_message( target, win, message, wparam, lparam );
-}
-
 /* send a notify message to a window */
 void send_notify_message( user_handle_t win, unsigned int message, lparam_t wparam, lparam_t lparam )
 {

@@ -3379,6 +3379,8 @@ void X11DRV_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_hint, UIN
     BOOL win32_visible = !!(new_style & WS_VISIBLE);
     BOOL activate = !(swp_flags & SWP_NOACTIVATE), fullscreen = !!(swp_flags & WINE_SWP_FULLSCREEN);
     BOOL publish_client_surface = !!(swp_flags & WINE_SWP_CLIENT_SURFACE_PUBLISH);
+    BOOL enable_client_surface_backing = !!(swp_flags & WINE_SWP_CLIENT_SURFACE_BACKING_ENABLE);
+    BOOL disable_client_surface_backing = !!(swp_flags & WINE_SWP_CLIENT_SURFACE_BACKING_DISABLE);
 
     if ((is_managed = is_window_managed( hwnd, swp_flags, fullscreen ))) make_owner_managed( hwnd );
 
@@ -3431,6 +3433,17 @@ void X11DRV_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_hint, UIN
     {
         release_win_data( data );
         return;
+    }
+
+    if (enable_client_surface_backing || disable_client_surface_backing)
+    {
+        XSetWindowAttributes attributes;
+
+        /* The server owns the cross-process subtree lifetime.  Toggle backing
+         * store only at its zero/nonzero boundaries instead of leaking
+         * WhenMapped after the last renderer or issuing a request per frame. */
+        attributes.backing_store = enable_client_surface_backing ? WhenMapped : NotUseful;
+        XChangeWindowAttributes( data->display, data->whole_window, CWBackingStore, &attributes );
     }
 
     /* don't change position if we are about to minimize or maximize a managed window */
