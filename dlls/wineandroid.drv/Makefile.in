@@ -5,6 +5,7 @@ UNIX_LIBS = -lwin32u $(PTHREAD_LIBS)
 
 SOURCES = \
 	build.gradle.in \
+	client_surface.c \
 	device.c \
 	dllmain.c \
 	init.c \

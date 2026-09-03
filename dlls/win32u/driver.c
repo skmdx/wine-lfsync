@@ -878,31 +878,9 @@ static BOOL nulldrv_GetWindowStateUpdates( HWND hwnd, UINT *state_cmd, UINT *swp
     return FALSE;
 }
 
-static void nulldrv_surface_destroy( struct client_surface *client )
-{
-}
-
-static void nulldrv_surface_detach( struct client_surface *client )
-{
-}
-
-static BOOL nulldrv_surface_update( struct client_surface *client )
-{
-    return TRUE;
-}
-
-static BOOL nulldrv_surface_present( struct client_surface *client, HDC hdc, HRGN surface_region, BOOL flush )
-{
-    return TRUE;
-}
-
 static const struct client_surface_backend nulldrv_surface_backend =
 {
     .caps = 0,
-    .destroy = nulldrv_surface_destroy,
-    .detach = nulldrv_surface_detach,
-    .update = nulldrv_surface_update,
-    .present = nulldrv_surface_present,
 };
 
 static struct client_surface *nulldrv_CreateClientSurface( HWND hwnd, int pixel_format, BOOL raw )

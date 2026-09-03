@@ -18,6 +18,7 @@ VER_FILEDESCRIPTION_STR = "Wine Mac driver"
 
 SOURCES = \
 	clipboard.c \
+	client_surface.c \
 	cocoa_app.m \
 	cocoa_clipboard.m \
 	cocoa_cursorclipping.m \

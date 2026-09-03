@@ -164,39 +164,6 @@ static struct opengl_driver_funcs android_driver_funcs =
     .p_surface_create = android_surface_create,
 };
 
-static void android_client_surface_destroy( struct client_surface *client )
-{
-    TRACE( "%s\n", debugstr_client_surface( client ) );
-}
-
-static void android_client_surface_detach( struct client_surface *client )
-{
-}
-
-static BOOL android_client_surface_update( struct client_surface *client )
-{
-    return TRUE;
-}
-
-static BOOL android_client_surface_present( struct client_surface *client, HDC hdc, HRGN surface_region, BOOL flush )
-{
-    return TRUE;
-}
-
-static const struct client_surface_backend android_client_surface_backend =
-{
-    .caps = 0,
-    .destroy = android_client_surface_destroy,
-    .detach = android_client_surface_detach,
-    .update = android_client_surface_update,
-    .present = android_client_surface_present,
-};
-
-struct client_surface *ANDROID_CreateClientSurface( HWND hwnd, int pixel_format, BOOL raw )
-{
-    return client_surface_create( sizeof(struct client_surface), &android_client_surface_backend, hwnd, pixel_format, raw );
-}
-
 static const struct opengl_drawable_funcs android_drawable_funcs =
 {
     .destroy = android_drawable_destroy,

@@ -35,6 +35,28 @@ static struct client_surface *client_surface_identity_index[CLIENT_SURFACE_INDEX
 static struct client_surface *client_surface_toplevel_index[CLIENT_SURFACE_INDEX_BUCKETS];
 static UINT_PTR client_surface_identity;
 
+static void client_surface_backend_destroy( struct client_surface *surface )
+{
+    if (surface->backend->destroy) surface->backend->destroy( surface );
+}
+
+static void client_surface_backend_detach( struct client_surface *surface )
+{
+    if (surface->backend->detach) surface->backend->detach( surface );
+}
+
+static BOOL client_surface_backend_update( struct client_surface *surface )
+{
+    return !surface->backend->update || surface->backend->update( surface );
+}
+
+static BOOL client_surface_backend_present( struct client_surface *surface, HDC hdc,
+                                            HRGN surface_region, BOOL flush )
+{
+    return !surface->backend->present ||
+           surface->backend->present( surface, hdc, surface_region, flush );
+}
+
 static void remove_client_surface_chain( struct client_surface **head,
                                          struct client_surface *surface, BOOL identity );
 
@@ -301,7 +323,7 @@ static void client_surface_detach_locked( struct client_surface *surface )
         if (wake && toplevel) NtUserPostMessage( toplevel, WM_WINE_UPDATEWINDOWSTATE, 0, 0 );
     }
     list_remove( &surface->entry );
-    surface->backend->detach( surface );
+    client_surface_backend_detach( surface );
     surface->toplevel = NULL;
     InterlockedIncrement64( &surface->target_epoch );
     publish_client_surface_geometry( surface, NULL, NULL, NULL );
@@ -334,7 +356,7 @@ static void client_surface_release_locked( struct client_surface *surface )
         assert( !surface->external_completion_count );
         assert( !surface->driver_completion_count );
         assert( !surface->driver_completion_waiters );
-        surface->backend->destroy( surface );
+        client_surface_backend_destroy( surface );
         pthread_mutex_destroy( &surface->completion_queue_lock );
         pthread_cond_destroy( &surface->completion_cond );
         pthread_mutex_destroy( &surface->completion_lock );
@@ -512,7 +534,7 @@ static BOOL client_surface_update_present_locked( struct client_surface *surface
 
     TRACE( "updating %s, toplevel %p, virtual_rect %s, monitor_rect %s\n", debugstr_client_surface( surface ), surface->toplevel,
            wine_dbgstr_rect( &surface->virtual_rect ), wine_dbgstr_rect( &surface->monitor_rect ) );
-    ready = surface->backend->update( surface );
+    ready = client_surface_backend_update( surface );
 
     if (publish_changed || offscreen != InterlockedCompareExchange( &surface->offscreen, 0, 0 ) ||
         ready != InterlockedCompareExchange( &surface->target_ready, 0, 0 ))
@@ -1229,7 +1251,7 @@ static BOOL client_surface_end_present_internal( struct client_surface *surface,
          * not merely submission from this process.  Complete the backend
          * copy before returning the lease so the owner cannot publish or
          * replace the shared target ahead of work queued on this connection. */
-        copied = surface->backend->present( surface, hdc, surface_region, sync || leased );
+        copied = client_surface_backend_present( surface, hdc, surface_region, sync || leased );
         composed = copied;
     }
     if (copied && offscreen && !client_surface_publication_matches( present ))

@@ -9,6 +9,7 @@ SOURCES = \
 	bitblt.c \
 	brush.c \
 	clipboard.c \
+	client_surface.c \
 	desktop.c \
 	display.c \
 	dllmain.c \
