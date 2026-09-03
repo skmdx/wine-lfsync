@@ -317,6 +317,7 @@ DECL_HANDLER(d3dkmt_mutex_acquire);
 DECL_HANDLER(d3dkmt_mutex_release);
 DECL_HANDLER(alpc_create_port);
 DECL_HANDLER(set_client_surface_state);
+DECL_HANDLER(get_client_surface_clip_windows);
 
 typedef void (*req_handler)( const void *req, void *reply );
 static const req_handler req_handlers[REQ_NB_REQUESTS] =
@@ -631,6 +632,7 @@ static const req_handler req_handlers[REQ_NB_REQUESTS] =
     (req_handler)req_d3dkmt_mutex_release,
     (req_handler)req_alpc_create_port,
     (req_handler)req_set_client_surface_state,
+    (req_handler)req_get_client_surface_clip_windows,
 };
 
 C_ASSERT( sizeof(abstime_t) == 8 );
@@ -2417,3 +2419,10 @@ C_ASSERT( offsetof(struct set_client_surface_state_reply, staged) == 28 );
 C_ASSERT( offsetof(struct set_client_surface_state_reply, active) == 32 );
 C_ASSERT( offsetof(struct set_client_surface_state_reply, cached) == 36 );
 C_ASSERT( sizeof(struct set_client_surface_state_reply) == 40 );
+C_ASSERT( offsetof(struct get_client_surface_clip_windows_request, handle) == 12 );
+C_ASSERT( offsetof(struct get_client_surface_clip_windows_request, dpi) == 16 );
+C_ASSERT( sizeof(struct get_client_surface_clip_windows_request) == 24 );
+C_ASSERT( offsetof(struct get_client_surface_clip_windows_reply, toplevel) == 8 );
+C_ASSERT( offsetof(struct get_client_surface_clip_windows_reply, count) == 12 );
+C_ASSERT( offsetof(struct get_client_surface_clip_windows_reply, scene_generation) == 16 );
+C_ASSERT( sizeof(struct get_client_surface_clip_windows_reply) == 24 );

@@ -3566,6 +3566,20 @@ static void dump_set_client_surface_state_reply( const struct set_client_surface
     fprintf( stderr, ", cached=%08x", req->cached );
 }
 
+static void dump_get_client_surface_clip_windows_request( const struct get_client_surface_clip_windows_request *req )
+{
+    fprintf( stderr, " handle=%08x", req->handle );
+    dump_ratio( ", dpi=", &req->dpi );
+}
+
+static void dump_get_client_surface_clip_windows_reply( const struct get_client_surface_clip_windows_reply *req )
+{
+    fprintf( stderr, " toplevel=%08x", req->toplevel );
+    fprintf( stderr, ", count=%d", req->count );
+    dump_uint64( ", scene_generation=", &req->scene_generation );
+    dump_varargs_bytes( ", windows=", cur_size );
+}
+
 typedef void (*dump_func)( const void *req );
 
 static const dump_func req_dumpers[REQ_NB_REQUESTS] =
@@ -3880,6 +3894,7 @@ static const dump_func req_dumpers[REQ_NB_REQUESTS] =
     (dump_func)dump_d3dkmt_mutex_release_request,
     (dump_func)dump_alpc_create_port_request,
     (dump_func)dump_set_client_surface_state_request,
+    (dump_func)dump_get_client_surface_clip_windows_request,
 };
 
 static const dump_func reply_dumpers[REQ_NB_REQUESTS] =
@@ -4194,6 +4209,7 @@ static const dump_func reply_dumpers[REQ_NB_REQUESTS] =
     NULL,
     (dump_func)dump_alpc_create_port_reply,
     (dump_func)dump_set_client_surface_state_reply,
+    (dump_func)dump_get_client_surface_clip_windows_reply,
 };
 
 static const char * const req_names[REQ_NB_REQUESTS] =
@@ -4508,6 +4524,7 @@ static const char * const req_names[REQ_NB_REQUESTS] =
     "d3dkmt_mutex_release",
     "alpc_create_port",
     "set_client_surface_state",
+    "get_client_surface_clip_windows",
 };
 
 static const struct

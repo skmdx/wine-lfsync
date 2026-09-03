@@ -202,6 +202,7 @@ struct egl_platform
     EGLConfig           *configs;
     BOOL                 has_EGL_EXT_present_opaque;
     BOOL                 has_EGL_EXT_pixel_format_float;
+    BOOL                 has_EGL_ANDROID_get_frame_timestamps;
 
     /* WGL_WINE_query_renderer info */
     UINT                 device_id;

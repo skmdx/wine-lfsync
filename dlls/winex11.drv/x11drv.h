@@ -372,9 +372,7 @@ struct x11drv_client_surface
     Colormap colormap;
     Window window;
     Window backing_window;  /* whole window with backing store enabled */
-    Display *damage_display; /* private completion event connection */
     XID damage;
-    int damage_event_base;
     BOOL keep_offscreen;    /* preserve a drawable which was used while hidden */
     BOOL manual_redirect;   /* client drawable is manually XComposite redirected */
     BOOL completion_broken; /* an unbounded old present can no longer be distinguished */

@@ -1374,6 +1374,8 @@ static BOOL init_egl_platform( struct egl_platform *egl, const struct opengl_fun
 
     egl->has_EGL_EXT_present_opaque = has_extension( extensions, "EGL_EXT_present_opaque" );
     egl->has_EGL_EXT_pixel_format_float = has_extension( extensions, "EGL_EXT_pixel_format_float" );
+    egl->has_EGL_ANDROID_get_frame_timestamps =
+        has_extension( extensions, "EGL_ANDROID_get_frame_timestamps" );
     return TRUE;
 }
 

@@ -173,8 +173,9 @@ static void android_client_surface_detach( struct client_surface *client )
 {
 }
 
-static void android_client_surface_update( struct client_surface *client )
+static BOOL android_client_surface_update( struct client_surface *client )
 {
+    return TRUE;
 }
 
 static BOOL android_client_surface_present( struct client_surface *client, HDC hdc, HRGN surface_region, BOOL flush )

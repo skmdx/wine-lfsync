@@ -1177,7 +1177,7 @@ static void wayland_client_surface_detach(struct client_surface *client)
     }
 }
 
-static void wayland_client_surface_update(struct client_surface *client)
+static BOOL wayland_client_surface_update(struct client_surface *client)
 {
     struct wayland_client_surface *surface = impl_from_client_surface(client);
     HWND hwnd = client->hwnd, toplevel = client->toplevel;
@@ -1186,7 +1186,7 @@ static void wayland_client_surface_update(struct client_surface *client)
 
     TRACE("%s\n", debugstr_client_surface(client));
     if(toplevel) visible = NtUserIsWindowVisible(hwnd);
-    if (!(data = wayland_win_data_get(hwnd))) return;
+    if (!(data = wayland_win_data_get(hwnd))) return FALSE;
 
     if (toplevel && visible)
         wayland_client_surface_attach(surface, toplevel, &client->monitor_rect);
@@ -1194,6 +1194,7 @@ static void wayland_client_surface_update(struct client_surface *client)
         wayland_client_surface_attach(surface, NULL, NULL);
 
     wayland_win_data_release(data);
+    return TRUE;
 }
 
 static BOOL wayland_client_surface_present(struct client_surface *client, HDC hdc, HRGN surface_region, BOOL flush)

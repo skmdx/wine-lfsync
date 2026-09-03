@@ -2117,13 +2117,6 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
         present_info->pNext = &present_id_info;
     }
 
-    for (uint32_t i = 0; i < present_info->swapchainCount; i++)
-    {
-        struct swapchain *swapchain = swapchain_from_handle( client_swapchains[i] );
-        struct surface *surface = swapchain->surface;
-        client_surface_update( surface->client );
-    }
-
     /* Completion monitors are per client surface.  Acquire them in a stable
      * order across queues, then keep them reserved through submission, host
      * completion and composition.  This prevents one present from clearing
@@ -2144,6 +2137,18 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
 
         client_surface_prepare_present_locked( swapchain->surface->client, &presents[i],
                                                device->internal_present_wait );
+    }
+
+    /* Present IDs are causal completion tokens, so they do not need the
+     * fallback monitor reservation while the GPU/WSI is working.  Release all
+     * client surfaces before host submission; per-surface serials suppress an
+     * older completion if a newer queue overtakes it. */
+    if (device->internal_present_wait)
+    {
+        while (surface_locked_count)
+            client_surface_unlock_present( present_surfaces[--surface_locked_count] );
+        for (uint32_t i = 0; i < present_info->swapchainCount; i++)
+            presents[i].completion_locked = FALSE;
     }
 
     if (device->internal_present_wait)
@@ -2215,7 +2220,8 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
             device->internal_present_wait)
         {
             DWORD elapsed = NtGetTickCount() - completion_start;
-            DWORD remaining = elapsed < 5000 ? 5000 - elapsed : 0;
+            DWORD remaining = elapsed < CLIENT_SURFACE_PRESENT_TIMEOUT ?
+                              CLIENT_SURFACE_PRESENT_TIMEOUT - elapsed : 0;
             VkResult wait_res = device->p_vkWaitForPresentKHR( device->host.device,
                                                                swapchain->obj.host.swapchain,
                                                                present_ids[i],
@@ -2240,18 +2246,26 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
 
         {
             DWORD elapsed = NtGetTickCount() - completion_start;
-            DWORD remaining = elapsed < 5000 ? 5000 - elapsed : 0;
+            DWORD remaining = elapsed < CLIENT_SURFACE_PRESENT_TIMEOUT ?
+                              CLIENT_SURFACE_PRESENT_TIMEOUT - elapsed : 0;
 
-            if (!client_surface_complete_present_locked( surface->client, &presents[i], compose,
-                                                         device->internal_present_wait && compose,
-                                                         &expected_size, remaining ) && compose)
+            BOOL completed;
+
+            if (device->internal_present_wait)
+                completed = client_surface_complete_present( surface->client, &presents[i], compose,
+                                                             compose, &expected_size, remaining );
+            else
+                completed = client_surface_complete_present_locked( surface->client, &presents[i],
+                                                                    compose, FALSE, &expected_size,
+                                                                    remaining );
+            if (!completed && compose)
             {
                 /* The window changed after the post-present check, or the
                  * native completion source failed.  Preserve the staged
                  * generation for a correctly completed frame. */
                 WARN( "Swapchain size %dx%d changed or did not complete before composition\n",
                       swapchain->extents.width, swapchain->extents.height );
-                if (!presents[i].completion_failed)
+                if (!presents[i].completion_failed && !presents[i].superseded)
                 {
                     if (present_info->pResults) present_info->pResults[i] = VK_SUBOPTIMAL_KHR;
                     if (!res) res = VK_SUBOPTIMAL_KHR;

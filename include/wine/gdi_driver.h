@@ -252,8 +252,8 @@ struct client_surface_funcs
     void (*destroy)( struct client_surface *surface );
     /* detach the surface from its window, called from window owner thread */
     void (*detach)( struct client_surface *surface );
-    /* update the surface to match its window state */
-    void (*update)( struct client_surface *surface );
+    /* update the surface to match its window state; return whether the native target is usable */
+    BOOL (*update)( struct client_surface *surface );
     /* present the client surface if necessary, hdc != NULL when offscreen, called from render thread */
     BOOL (*present)( struct client_surface *surface, HDC hdc, HRGN surface_region, BOOL flush );
     /* notify the window owner after a staged composition commit */
@@ -268,13 +268,24 @@ struct client_surface_funcs
 struct client_surface_present
 {
     UINT64 generation;
-    LONG64 geometry_seq;
+    UINT64 scene_generation;
+    LONG64 serial;
+    LONG64 target_epoch;
     LONG lifecycle_seq;
+    HWND scene_toplevel;
+    BOOL scene_valid;
     BOOL offscreen;
+    BOOL target_ready;
+    BOOL completion_locked;
     BOOL external_completion;
+    BOOL external_completion_registered;
     BOOL driver_completion;
     BOOL completion_failed;
+    BOOL superseded;
 };
+
+/* Backend completion and publication must share one bounded wait contract. */
+#define CLIENT_SURFACE_PRESENT_TIMEOUT 5000
 
 struct client_surface
 {
@@ -290,9 +301,16 @@ struct client_surface
     LONG                               offscreen;      /* client window is offscreen */
     LONG                               active;         /* registered as active with the Wine server */
     LONG                               content_valid;  /* complete content exists at the current size */
+    LONG                               cacheable;      /* native completion state is safe to reuse */
     LONG                               server_cached;  /* registered as a cached owner with the Wine server */
+    UINT64                             cache_cost;     /* estimated bytes while on the unused list */
     LONG64                             geometry_seq;   /* seqlock for the driver-ready geometry */
+    LONG64                             target_epoch;   /* native target identity, incremented after target changes */
+    LONG64                             present_serial; /* producer submission order */
+    LONG64                             composed_serial; /* newest producer copied into the host target */
+    LONG                               external_completion_count; /* causal tokens currently in flight */
     LONG                               lifecycle_seq;  /* seqlock for detach and destruction */
+    LONG                               target_ready;   /* driver successfully prepared the current target */
     LONG64                             recompose_requested; /* latest requested recomposition generation */
     LONG                               recompose_scheduled; /* a recomposition consumer owns a reference */
     RECT                               virtual_rect;   /* virtual size and position in the toplevel ancestor, relative to its visible rect */

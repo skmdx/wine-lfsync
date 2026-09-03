@@ -35,6 +35,14 @@ struct surface_state
     BOOL wake;
 };
 
+struct clip_state
+{
+    HWND toplevel;
+    UINT64 scene_generation;
+    UINT count;
+    struct client_surface_clip_window windows[8];
+};
+
 static unsigned int (CDECL *p_wine_server_call)(void *);
 
 static unsigned int set_surface_state( HWND hwnd, UINT_PTR surface, UINT flags,
@@ -63,6 +71,41 @@ static unsigned int set_surface_state( HWND hwnd, UINT_PTR surface, UINT flags,
         state->wake = reply->wake;
     }
     return status;
+}
+
+static unsigned int get_clip_state( HWND hwnd, struct clip_state *state )
+{
+    struct __server_request_info info;
+    struct get_client_surface_clip_windows_request *req =
+        &info.u.req.get_client_surface_clip_windows_request;
+    const struct get_client_surface_clip_windows_reply *reply =
+        &info.u.reply.get_client_surface_clip_windows_reply;
+    unsigned int status;
+
+    memset( &info, 0, sizeof(info) );
+    memset( state, 0, sizeof(*state) );
+    req->__header.req = REQ_get_client_surface_clip_windows;
+    req->handle = wine_server_user_handle( hwnd );
+    req->dpi.num = 96;
+    req->dpi.den = 1;
+    wine_server_set_reply( &info, state->windows, sizeof(state->windows) );
+    status = p_wine_server_call( &info );
+    if (!status)
+    {
+        state->toplevel = wine_server_ptr_handle( reply->toplevel );
+        state->scene_generation = reply->scene_generation;
+        state->count = reply->count;
+    }
+    return status;
+}
+
+static BOOL clip_state_contains( const struct clip_state *state, HWND hwnd )
+{
+    UINT i;
+
+    for (i = 0; i < state->count && i < ARRAY_SIZE(state->windows); ++i)
+        if (wine_server_ptr_handle( state->windows[i].handle ) == hwnd) return TRUE;
+    return FALSE;
 }
 
 static LRESULT CALLBACK client_surface_proc( HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam )
@@ -168,6 +211,63 @@ static void test_generation_membership(void)
         "unexpected final counts: active %u cached %u pending %u\n",
         state.active, state.cached, state.pending );
     DestroyWindow( hwnd );
+}
+
+static void test_clip_scene_snapshot(void)
+{
+    const UINT_PTR first_surface = 0x12370000, second_surface = 0x12370001;
+    const UINT_PTR descendant_surface = 0x12370002, duplicate_surface = 0x12370003;
+    struct clip_state before, after;
+    HWND parent, first, second, descendant;
+    unsigned int status;
+
+    parent = create_test_window( TRUE );
+    ok( !!parent, "failed to create clip parent, error %lu\n", GetLastError() );
+    if (!parent) return;
+    first = create_test_child( parent, 10 );
+    second = create_test_child( parent, 20 );
+    descendant = first ? create_test_child( first, 5 ) : NULL;
+    ok( !!first && !!second && !!descendant, "failed to create clip hierarchy, error %lu\n",
+        GetLastError() );
+    if (!first || !second || !descendant) goto done;
+
+    SetWindowPos( first, HWND_BOTTOM, 10, 10, 50, 40, SWP_NOACTIVATE );
+    SetWindowPos( second, HWND_TOP, 20, 10, 50, 40, SWP_NOACTIVATE );
+    set_surface_state( first, first_surface, CLIENT_SURFACE_STATE_REGISTER, 0, NULL );
+    set_surface_state( second, second_surface, CLIENT_SURFACE_STATE_REGISTER, 0, NULL );
+    set_surface_state( descendant, descendant_surface, CLIENT_SURFACE_STATE_REGISTER, 0, NULL );
+    set_surface_state( second, duplicate_surface, CLIENT_SURFACE_STATE_CACHE, 0, NULL );
+
+    status = get_clip_state( first, &before );
+    ok( !status, "clip snapshot failed, status %#x\n", status );
+    ok( before.toplevel == parent, "clip top %p, expected %p\n", before.toplevel, parent );
+    ok( !(before.scene_generation & 1), "unstable scene generation %s\n",
+        wine_dbgstr_longlong( before.scene_generation ) );
+    ok( before.count == 2, "clip count %u, expected two distinct windows\n", before.count );
+    ok( clip_state_contains( &before, second ), "upper sibling missing from clip snapshot\n" );
+    ok( clip_state_contains( &before, descendant ), "descendant missing from clip snapshot\n" );
+
+    SetWindowPos( first, HWND_TOP, 10, 10, 50, 40, SWP_NOACTIVATE );
+    status = get_clip_state( first, &after );
+    ok( !status, "post-zorder clip snapshot failed, status %#x\n", status );
+    ok( after.scene_generation != before.scene_generation,
+        "z-order change did not advance scene generation %s\n",
+        wine_dbgstr_longlong( after.scene_generation ) );
+    ok( after.count == 1 && clip_state_contains( &after, descendant ),
+        "post-zorder clip count %u, descendant %u, sibling %u\n", after.count,
+        clip_state_contains( &after, descendant ), clip_state_contains( &after, second ) );
+
+    ShowWindow( descendant, SW_HIDE );
+    status = get_clip_state( first, &after );
+    ok( !status, "post-hide clip snapshot failed, status %#x\n", status );
+    ok( !after.count, "hidden descendant remained in clip snapshot, count %u\n", after.count );
+
+    set_surface_state( descendant, descendant_surface, CLIENT_SURFACE_STATE_UNREGISTER, 0, NULL );
+    set_surface_state( second, duplicate_surface, CLIENT_SURFACE_STATE_UNCACHE, 0, NULL );
+    set_surface_state( second, second_surface, CLIENT_SURFACE_STATE_UNREGISTER, 0, NULL );
+    set_surface_state( first, first_surface, CLIENT_SURFACE_STATE_UNREGISTER, 0, NULL );
+done:
+    DestroyWindow( parent );
 }
 
 static void test_subtree_generation_retirement(void)
@@ -489,7 +589,7 @@ static BOOL run_child( char **argv, const char *mode, HWND hwnd, DWORD delay )
                 state.staged, state.pending, state.wake );
         if (!strcmp( mode, "owner_stalled" ))
         {
-            Sleep( 1500 );
+            Sleep( 6500 );
             status = set_surface_state( hwnd, 0, 0, 0, &state );
             ok( !status, "stalled owner state query failed, status %#x\n", status );
             ok( !state.staged && !state.pending,
@@ -822,6 +922,8 @@ START_TEST(client_surface)
     test_generation_aba();
     trace( "testing client surface generation membership\n" );
     test_generation_membership();
+    trace( "testing client surface clip scene snapshots\n" );
+    test_clip_scene_snapshot();
     trace( "testing client surface subtree retirement\n" );
     test_subtree_generation_retirement();
     trace( "testing concurrent client surface state changes\n" );

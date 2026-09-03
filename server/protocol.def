@@ -287,6 +287,12 @@ struct rectangle
     int  bottom;
 };
 
+struct client_surface_clip_window
+{
+    user_handle_t   handle;
+    struct rectangle rect;
+};
+
 /* structure for parameters of async I/O calls */
 struct async_data
 {
@@ -1097,6 +1103,7 @@ typedef volatile struct
     data_size_t          extra_size;       /* size of the extra info */
     struct window_info   info;             /* window info (GWLP_*) */
     unsigned __int64     client_surface_generation; /* unpublished client-surface generation */
+    unsigned __int64     client_surface_scene_generation; /* stable scene snapshot sequence */
     unsigned int         client_surface_flags;      /* WINDOW_SHM_CLIENT_SURFACE_* */
     int                  __pad2;
     char                 extra[];          /* extra bytes storage */
@@ -4380,3 +4387,15 @@ enum inproc_sync_type
 #define CLIENT_SURFACE_STATE_GEOMETRY_READY 0x40
 #define CLIENT_SURFACE_STATE_CACHE           0x80
 #define CLIENT_SURFACE_STATE_UNCACHE         0x100
+
+
+/* Get visible client-surface windows above a target in one stable scene. */
+@REQ(get_client_surface_clip_windows)
+    user_handle_t  handle;        /* target client-surface window */
+    struct ratio   dpi;           /* common monitor coordinate DPI */
+@REPLY
+    user_handle_t  toplevel;      /* target top-level ancestor */
+    int            count;         /* total count of clip windows */
+    unsigned __int64 scene_generation; /* stable scene sequence */
+    VARARG(windows,bytes);        /* client_surface_clip_window entries */
+@END

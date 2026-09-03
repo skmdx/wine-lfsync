@@ -305,10 +305,10 @@ static Bool (*pglXQueryRendererIntegerMESA)(Display *dpy, int screen, int render
 static const char *(*pglXQueryRendererStringMESA)(Display *dpy, int screen, int renderer, int attribute);
 
 /* OpenML GLX Extensions */
-static Bool (*pglXWaitForSbcOML)( Display *dpy, GLXDrawable drawable,
-        INT64 target_sbc, INT64 *ust, INT64 *msc, INT64 *sbc );
+static Bool (*pglXGetSyncValuesOML)( Display *dpy, GLXDrawable drawable,
+                                    INT64 *ust, INT64 *msc, INT64 *sbc );
 static INT64 (*pglXSwapBuffersMscOML)( Display *dpy, GLXDrawable drawable,
-        INT64 target_msc, INT64 divisor, INT64 remainder );
+                                      INT64 target_msc, INT64 divisor, INT64 remainder );
 
 /* Standard OpenGL */
 static const GLubyte *(*pglGetString)(GLenum name);
@@ -726,7 +726,7 @@ UINT X11DRV_OpenGLInit( UINT version, const struct opengl_funcs *opengl_funcs, c
 
     if (has_extension( glxExtensions, "GLX_OML_sync_control" ))
     {
-        pglXWaitForSbcOML = pglXGetProcAddressARB( (const GLubyte *)"glXWaitForSbcOML" );
+        pglXGetSyncValuesOML = pglXGetProcAddressARB( (const GLubyte *)"glXGetSyncValuesOML" );
         pglXSwapBuffersMscOML = pglXGetProcAddressARB( (const GLubyte *)"glXSwapBuffersMscOML" );
     }
 
@@ -1448,42 +1448,51 @@ static void x11drv_init_extensions( struct opengl_funcs *funcs, BOOLEAN extensio
     }
 }
 
+static BOOL wait_glx_swap_serial( struct gl_drawable *gl, INT64 target_sbc, DWORD timeout )
+{
+    LARGE_INTEGER delay = {.QuadPart = -10000}; /* one millisecond */
+    DWORD start = NtGetTickCount();
+    INT64 ust, msc, sbc;
+
+    for (;;)
+    {
+        if (!pglXGetSyncValuesOML( gdi_display, gl->drawable, &ust, &msc, &sbc )) return FALSE;
+        if (sbc >= target_sbc) return TRUE;
+        if (NtGetTickCount() - start >= timeout) return FALSE;
+        NtDelayExecution( FALSE, &delay );
+    }
+}
+
 static BOOL x11drv_surface_swap( struct opengl_drawable *base )
 {
     GLXContext ctx = NtCurrentTeb()->glReserved2;
     struct gl_drawable *gl = impl_from_opengl_drawable( base );
     struct client_surface_present present;
-    INT64 ust, msc, sbc, target_sbc;
-    BOOL offscreen, use_oml_wait;
+    BOOL completed = FALSE, submitted = TRUE, use_oml;
+    INT64 target_sbc = 0;
 
     TRACE( "drawable %s\n", debugstr_opengl_drawable( base ) );
 
-    /* OML is a WSI completion boundary.  Otherwise the client-surface driver
-     * arms its native completion source before this swap is submitted. */
-    offscreen = InterlockedCompareExchange( &base->client->offscreen, 0, 0 );
-    use_oml_wait = offscreen && ctx && pglXSwapBuffersMscOML && pglXWaitForSbcOML;
-    client_surface_prepare_present( base->client, &present, use_oml_wait );
-
-    if (!use_oml_wait) pglXSwapBuffers( gdi_display, gl->drawable );
-    else
+    use_oml = ctx && pglXGetSyncValuesOML && pglXSwapBuffersMscOML;
+    client_surface_prepare_present( base->client, &present, use_oml );
+    if (present.external_completion)
     {
+        /* The swap buffer count identifies this exact GLX presentation.  Poll
+         * it with a deadline instead of using the unbounded WaitForSbc call or
+         * accepting unrelated XDamage on the drawable as completion proof. */
         funcs->p_glFlush();
         target_sbc = pglXSwapBuffersMscOML( gdi_display, gl->drawable, 0, 0, 0 );
-        if (target_sbc < 0 ||
-            !pglXWaitForSbcOML( gdi_display, gl->drawable, target_sbc, &ust, &msc, &sbc ))
-        {
-            WARN( "Failed waiting for GLX swap completion for %s\n",
-                  debugstr_opengl_drawable( base ) );
-            client_surface_complete_present( base->client, &present, FALSE, FALSE, NULL, 0 );
-            return FALSE;
-        }
+        submitted = target_sbc >= 0;
+        if (submitted) completed = wait_glx_swap_serial( gl, target_sbc,
+                                                         CLIENT_SURFACE_PRESENT_TIMEOUT );
     }
+    else pglXSwapBuffers( gdi_display, gl->drawable );
 
-    if (!client_surface_complete_present( base->client, &present, TRUE,
-                                          use_oml_wait, NULL, 5000 ))
+    if (!client_surface_complete_present( base->client, &present, submitted, completed, NULL,
+                                          CLIENT_SURFACE_PRESENT_TIMEOUT ))
         WARN( "client-surface composition did not complete for %s\n",
               debugstr_opengl_drawable( base ) );
-    return TRUE;
+    return submitted;
 }
 
 static void x11drv_egl_surface_destroy( struct opengl_drawable *base )
@@ -1529,12 +1538,24 @@ static BOOL x11drv_egl_surface_swap( struct opengl_drawable *base )
 {
     struct gl_drawable *gl = impl_from_opengl_drawable( base );
     struct client_surface_present present;
+    EGLuint64KHR frame_id = 0;
+    BOOL timestamp_completion;
     EGLint err;
     EGLBoolean ret;
 
     TRACE( "%s\n", debugstr_opengl_drawable( base ) );
 
-    client_surface_prepare_present( base->client, &present, FALSE );
+    timestamp_completion = egl->has_EGL_ANDROID_get_frame_timestamps &&
+        funcs->p_eglGetFrameTimestampSupportedANDROID( egl->display, gl->base.surface,
+                                                       EGL_DISPLAY_PRESENT_TIME_ANDROID );
+    client_surface_prepare_present( base->client, &present, timestamp_completion );
+    if (present.external_completion &&
+        !funcs->p_eglGetNextFrameIdANDROID( egl->display, gl->base.surface, &frame_id ))
+    {
+        WARN( "Failed to allocate EGL presentation frame ID for %s\n",
+              debugstr_opengl_drawable( base ) );
+        frame_id = 0;
+    }
     ret = funcs->p_eglSwapBuffers( egl->display, gl->base.surface );
     if (!ret)
     {
@@ -1544,7 +1565,31 @@ static BOOL x11drv_egl_surface_swap( struct opengl_drawable *base )
         return FALSE;
     }
 
-    if (!client_surface_complete_present( base->client, &present, TRUE, FALSE, NULL, 5000 ))
+    if (present.external_completion && frame_id)
+    {
+        LARGE_INTEGER delay = {.QuadPart = -10000}; /* one millisecond */
+        EGLint timestamp_name = EGL_DISPLAY_PRESENT_TIME_ANDROID;
+        DWORD start = NtGetTickCount();
+        EGLnsecsANDROID timestamp = EGL_TIMESTAMP_PENDING_ANDROID;
+
+        do
+        {
+            if (!funcs->p_eglGetFrameTimestampsANDROID( egl->display, gl->base.surface,
+                                                        frame_id, 1, &timestamp_name, &timestamp ))
+                break;
+            if (timestamp != EGL_TIMESTAMP_PENDING_ANDROID &&
+                timestamp != EGL_TIMESTAMP_INVALID_ANDROID)
+                break;
+            NtDelayExecution( FALSE, &delay );
+        } while (NtGetTickCount() - start < CLIENT_SURFACE_PRESENT_TIMEOUT);
+        timestamp_completion = timestamp != EGL_TIMESTAMP_PENDING_ANDROID &&
+                               timestamp != EGL_TIMESTAMP_INVALID_ANDROID;
+    }
+    else timestamp_completion = FALSE;
+
+    if (!client_surface_complete_present( base->client, &present, TRUE,
+                                          timestamp_completion, NULL,
+                                          CLIENT_SURFACE_PRESENT_TIMEOUT ))
         WARN( "client-surface composition did not complete for %s\n",
               debugstr_opengl_drawable( base ) );
     return TRUE;

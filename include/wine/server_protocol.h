@@ -271,6 +271,12 @@ struct rectangle
     int  bottom;
 };
 
+struct client_surface_clip_window
+{
+    user_handle_t   handle;
+    struct rectangle rect;
+};
+
 
 struct async_data
 {
@@ -1081,6 +1087,7 @@ typedef volatile struct
     data_size_t          extra_size;
     struct window_info   info;
     unsigned __int64     client_surface_generation;
+    unsigned __int64     client_surface_scene_generation;
     unsigned int         client_surface_flags;
     int                  __pad2;
     char                 extra[];
@@ -6297,6 +6304,24 @@ struct set_client_surface_state_reply
 #define CLIENT_SURFACE_STATE_UNCACHE         0x100
 
 
+
+struct get_client_surface_clip_windows_request
+{
+    struct request_header __header;
+    user_handle_t  handle;
+    struct ratio   dpi;
+    char __pad_20[4];
+};
+struct get_client_surface_clip_windows_reply
+{
+    struct reply_header __header;
+    user_handle_t  toplevel;
+    int            count;
+    unsigned __int64 scene_generation;
+    /* VARARG(windows,bytes); */
+};
+
+
 enum request
 {
     REQ_new_process,
@@ -6609,6 +6634,7 @@ enum request
     REQ_d3dkmt_mutex_release,
     REQ_alpc_create_port,
     REQ_set_client_surface_state,
+    REQ_get_client_surface_clip_windows,
     REQ_NB_REQUESTS
 };
 
@@ -6926,6 +6952,7 @@ union generic_request
     struct d3dkmt_mutex_release_request d3dkmt_mutex_release_request;
     struct alpc_create_port_request alpc_create_port_request;
     struct set_client_surface_state_request set_client_surface_state_request;
+    struct get_client_surface_clip_windows_request get_client_surface_clip_windows_request;
 };
 union generic_reply
 {
@@ -7241,8 +7268,9 @@ union generic_reply
     struct d3dkmt_mutex_release_reply d3dkmt_mutex_release_reply;
     struct alpc_create_port_reply alpc_create_port_reply;
     struct set_client_surface_state_reply set_client_surface_state_reply;
+    struct get_client_surface_clip_windows_reply get_client_surface_clip_windows_reply;
 };
 
-#define SERVER_PROTOCOL_VERSION 971
+#define SERVER_PROTOCOL_VERSION 974
 
 #endif /* __WINE_WINE_SERVER_PROTOCOL_H */
