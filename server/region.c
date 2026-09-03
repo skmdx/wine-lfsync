@@ -676,6 +676,15 @@ struct rectangle *get_region_data_and_free( struct region *region, data_size_t m
     return ret;
 }
 
+/* Return a borrowed view for server-internal consumers which can keep the
+ * region alive while copying.  This avoids duplicating complex shaped regions
+ * merely to serialize a bounded reply. */
+const struct rectangle *get_region_rectangles( const struct region *region, unsigned int *count )
+{
+    *count = region->num_rects;
+    return region->rects;
+}
+
 /* check if a given region is empty */
 int is_region_empty( const struct region *region )
 {

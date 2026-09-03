@@ -89,7 +89,6 @@ struct process
     unsigned int         rawinput_device_count;   /* number of registered rawinput devices */
     const struct rawinput_device *rawinput_mouse; /* rawinput mouse device, if any */
     const struct rawinput_device *rawinput_kbd;   /* rawinput keyboard device, if any */
-    unsigned long long   client_surface_notification; /* last client-surface traversal notified */
     struct list          rawinput_entry;  /* entry in the rawinput process list */
     struct list          kernel_object;   /* list of kernel object pointers */
     struct pe_image_info image_info;      /* main exe image info */

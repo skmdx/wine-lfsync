@@ -272,6 +272,7 @@ struct client_surface_present
     LONG lifecycle_seq;
     HWND scene_toplevel;
     BOOL scene_valid;
+    BOOL authoritative;
     BOOL offscreen;
     BOOL target_ready;
     BOOL completion_locked;
@@ -335,6 +336,8 @@ W32KAPI void client_surface_present( struct client_surface *surface );
 W32KAPI void client_surface_prepare_present( struct client_surface *surface,
                                              struct client_surface_present *present,
                                              BOOL external_completion );
+W32KAPI void client_surface_submit_present( struct client_surface *surface,
+                                            struct client_surface_present *present );
 W32KAPI BOOL client_surface_complete_present( struct client_surface *surface,
                                               struct client_surface_present *present,
                                               BOOL submitted, BOOL external_completed,
@@ -351,7 +354,8 @@ W32KAPI BOOL client_surface_complete_present_locked( struct client_surface *surf
 W32KAPI void client_surface_geometry_ready( HWND hwnd );
 W32KAPI void client_surface_set_staged( HWND hwnd );
 W32KAPI void client_surface_bypass_staging( HWND hwnd );
-W32KAPI BOOL client_surface_publish( HWND hwnd );
+W32KAPI BOOL client_surface_begin_publish( HWND hwnd, UINT64 *generation, UINT64 *scene_generation );
+W32KAPI void client_surface_end_publish( HWND hwnd, UINT64 generation, UINT64 scene_generation );
 W32KAPI void update_client_surfaces( HWND hwnd );
 W32KAPI void detach_client_surfaces( HWND hwnd );
 
@@ -432,6 +436,7 @@ struct gdi_device_manager
 #define WINE_SWP_FULLSCREEN 0x80000000
 #define WINE_SWP_RESIZABLE  0x40000000
 #define WINE_SWP_CLIENT_SURFACE_PENDING 0x20000000
+#define WINE_SWP_CLIENT_SURFACE_PUBLISH 0x10000000
 
 struct vulkan_driver_funcs;
 struct opengl_driver_funcs;

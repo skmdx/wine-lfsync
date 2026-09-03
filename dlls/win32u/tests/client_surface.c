@@ -32,6 +32,7 @@ struct surface_state
     UINT pending;
     UINT staged;
     UINT ready;
+    UINT publish;
     UINT compose;
     UINT active;
     UINT cached;
@@ -73,6 +74,7 @@ static unsigned int set_surface_state_scene( HWND hwnd, UINT_PTR surface, UINT f
         state->pending = reply->pending;
         state->staged = reply->staged;
         state->ready = reply->ready;
+        state->publish = reply->publish;
         state->compose = reply->compose;
         state->active = reply->active;
         state->cached = reply->cached;
@@ -105,7 +107,18 @@ static unsigned int begin_surface_state( HWND hwnd, UINT_PTR surface,
 
 static unsigned int publish_surface_state( HWND hwnd, struct surface_state *state )
 {
-    return set_surface_state( hwnd, 0, CLIENT_SURFACE_STATE_PUBLISH, 0, state );
+    struct surface_state begin;
+    unsigned int status;
+
+    memset( &begin, 0, sizeof(begin) );
+    status = set_surface_state( hwnd, 0, CLIENT_SURFACE_STATE_PUBLISH_BEGIN, 0, &begin );
+    if (status || !begin.publish)
+    {
+        if (state) *state = begin;
+        return status;
+    }
+    return set_surface_state_scene( hwnd, 0, CLIENT_SURFACE_STATE_PUBLISH_COMMIT,
+                                    begin.generation, begin.scene_generation, state );
 }
 
 static unsigned int get_clip_state( HWND hwnd, struct clip_state *state )
@@ -141,6 +154,15 @@ static BOOL clip_state_contains( const struct clip_state *state, HWND hwnd )
     for (i = 0; i < state->count && i < ARRAY_SIZE(state->windows); ++i)
         if (wine_server_ptr_handle( state->windows[i].handle ) == hwnd) return TRUE;
     return FALSE;
+}
+
+static UINT clip_state_count( const struct clip_state *state, HWND hwnd )
+{
+    UINT count = 0, i;
+
+    for (i = 0; i < state->count && i < ARRAY_SIZE(state->windows); ++i)
+        if (wine_server_ptr_handle( state->windows[i].handle ) == hwnd) count++;
+    return count;
 }
 
 static LRESULT CALLBACK client_surface_proc( HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam )
@@ -275,6 +297,7 @@ static void test_clip_scene_snapshot(void)
     const UINT_PTR first_surface = 0x12370000, second_surface = 0x12370001;
     const UINT_PTR descendant_surface = 0x12370002, duplicate_surface = 0x12370003;
     struct clip_state before, after;
+    HRGN shape, shape_part;
     HWND parent, first, second, descendant;
     unsigned int status;
 
@@ -303,6 +326,28 @@ static void test_clip_scene_snapshot(void)
     ok( before.count == 2, "clip count %u, expected two distinct windows\n", before.count );
     ok( clip_state_contains( &before, second ), "upper sibling missing from clip snapshot\n" );
     ok( clip_state_contains( &before, descendant ), "descendant missing from clip snapshot\n" );
+
+    shape = CreateRectRgn( 0, 0, 20, 15 );
+    shape_part = CreateRectRgn( 30, 25, 50, 40 );
+    ok( !!shape && !!shape_part, "failed to create shaped clip regions\n" );
+    if (shape && shape_part)
+    {
+        CombineRgn( shape, shape, shape_part, RGN_OR );
+        DeleteObject( shape_part );
+        if (!SetWindowRgn( second, shape, TRUE )) DeleteObject( shape );
+        status = get_clip_state( first, &after );
+        ok( !status, "shaped clip snapshot failed, status %#x\n", status );
+        ok( after.count == 3 && clip_state_count( &after, second ) == 2 &&
+            clip_state_contains( &after, descendant ),
+            "shaped clip was reduced to its bounds: count %u sibling rects %u descendant %u\n",
+            after.count, clip_state_count( &after, second ),
+            clip_state_contains( &after, descendant ) );
+    }
+    else
+    {
+        if (shape) DeleteObject( shape );
+        if (shape_part) DeleteObject( shape_part );
+    }
 
     SetWindowPos( first, HWND_TOP, 10, 10, 50, 40, SWP_NOACTIVATE );
     status = get_clip_state( first, &after );
@@ -513,6 +558,60 @@ static void test_generation_aba(void)
     DestroyWindow( hwnd );
 }
 
+static void test_publish_transaction(void)
+{
+    const UINT_PTR surface = 0x12380000;
+    struct surface_state staged, ready, publishing, changed, committed, repaired;
+    HWND hwnd;
+    unsigned int status;
+
+    hwnd = create_test_window( FALSE );
+    ok( !!hwnd, "failed to create publish transaction window, error %lu\n", GetLastError() );
+    if (!hwnd) return;
+
+    set_surface_state( hwnd, surface, CLIENT_SURFACE_STATE_REGISTER, 0, NULL );
+    ShowWindow( hwnd, SW_SHOW );
+    status = set_surface_state( hwnd, 0, CLIENT_SURFACE_STATE_STAGED, 0, &staged );
+    ok( !status && staged.staged && staged.pending == 1,
+        "failed to stage publish transaction: status %#x staged %u pending %u\n",
+        status, staged.staged, staged.pending );
+    status = commit_surface_state( hwnd, surface, &staged, &ready );
+    ok( !status && ready.ready && !ready.pending,
+        "publish transaction did not become ready: status %#x ready %u pending %u\n",
+        status, ready.ready, ready.pending );
+
+    status = set_surface_state( hwnd, 0, CLIENT_SURFACE_STATE_PUBLISH_BEGIN, 0, &publishing );
+    ok( !status && publishing.publish && publishing.staged && publishing.ready,
+        "publish begin was rejected: status %#x publish %u staged %u ready %u\n",
+        status, publishing.publish, publishing.staged, publishing.ready );
+
+    SetWindowPos( hwnd, NULL, 30, 30, 0, 0,
+                  SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE );
+    status = set_surface_state( hwnd, 0, 0, 0, &changed );
+    ok( !status && changed.staged && changed.ready &&
+        changed.generation == publishing.generation &&
+        changed.scene_generation != publishing.scene_generation,
+        "publish token was restarted before host ACK: status %#x staged %u ready %u generation %s scene %s\n",
+        status, changed.staged, changed.ready, wine_dbgstr_longlong( changed.generation ),
+        wine_dbgstr_longlong( changed.scene_generation ) );
+
+    status = set_surface_state_scene( hwnd, 0, CLIENT_SURFACE_STATE_PUBLISH_COMMIT,
+                                      publishing.generation, publishing.scene_generation, &committed );
+    ok( !status && !committed.staged && committed.wake && committed.pending == 1 &&
+        committed.generation != publishing.generation,
+        "publish ACK did not start live repair: status %#x staged %u wake %u pending %u generation %s\n",
+        status, committed.staged, committed.wake, committed.pending,
+        wine_dbgstr_longlong( committed.generation ) );
+
+    status = commit_surface_state( hwnd, surface, &committed, &repaired );
+    ok( !status && !repaired.staged && !repaired.pending && !repaired.generation,
+        "live repair did not retire its epoch: status %#x staged %u pending %u generation %s\n",
+        status, repaired.staged, repaired.pending, wine_dbgstr_longlong( repaired.generation ) );
+
+    set_surface_state( hwnd, surface, CLIENT_SURFACE_STATE_UNREGISTER, 0, NULL );
+    DestroyWindow( hwnd );
+}
+
 struct race_context
 {
     HWND hwnd;
@@ -692,7 +791,18 @@ static BOOL run_child( char **argv, const char *mode, HWND hwnd, DWORD delay )
         }
         if (!strcmp( mode, "owner_stalled" ))
         {
-            Sleep( 6500 );
+            DWORD start = GetTickCount();
+            unsigned int move = 0;
+
+            /* Scene churn must not rearm the six-second publication deadline
+             * or enqueue one renderer notification per intermediate epoch. */
+            while (GetTickCount() - start < 5500)
+            {
+                SetWindowPos( hwnd, NULL, 10 + (move++ & 1), 10, 0, 0,
+                              SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE );
+                Sleep( 50 );
+            }
+            Sleep( 1200 );
             status = set_surface_state( hwnd, 0, 0, 0, &state );
             ok( !status, "stalled owner state query failed, status %#x\n", status );
             ok( !state.staged && !state.pending,
@@ -1023,6 +1133,8 @@ START_TEST(client_surface)
     GetDesktopWindow();
     trace( "testing client surface generations\n" );
     test_generation_aba();
+    trace( "testing client surface host publication transaction\n" );
+    test_publish_transaction();
     trace( "testing client surface generation membership\n" );
     test_generation_membership();
     trace( "testing client surface clip scene snapshots\n" );

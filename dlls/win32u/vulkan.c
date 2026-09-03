@@ -2139,18 +2139,6 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
                                                device->internal_present_wait );
     }
 
-    /* Present IDs are causal completion tokens, so they do not need the
-     * fallback monitor reservation while the GPU/WSI is working.  Release all
-     * client surfaces before host submission; per-surface serials suppress an
-     * older completion if a newer queue overtakes it. */
-    if (device->internal_present_wait)
-    {
-        while (surface_locked_count)
-            client_surface_unlock_present( present_surfaces[--surface_locked_count] );
-        for (uint32_t i = 0; i < present_info->swapchainCount; i++)
-            presents[i].completion_locked = FALSE;
-    }
-
     if (device->internal_present_wait)
     {
         /* Queue synchronization does not serialize the same swapchain across
@@ -2178,6 +2166,17 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
 
     while (locked_count)
         pthread_mutex_unlock( &present_swapchains[--locked_count]->present_lock );
+
+    /* Present serial allocation and host submission share completion_lock.
+     * Present IDs provide the later completion boundary, so release the locks
+     * immediately after submission and allow unrelated GPU work to continue. */
+    if (device->internal_present_wait)
+    {
+        while (surface_locked_count)
+            client_surface_unlock_present( present_surfaces[--surface_locked_count] );
+        for (uint32_t i = 0; i < present_info->swapchainCount; i++)
+            presents[i].completion_locked = FALSE;
+    }
 
     for (uint32_t i = 0; i < present_info->swapchainCount; i++)
     {

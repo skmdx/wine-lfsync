@@ -2419,10 +2419,11 @@ C_ASSERT( offsetof(struct set_client_surface_state_reply, scene_generation) == 2
 C_ASSERT( offsetof(struct set_client_surface_state_reply, pending) == 32 );
 C_ASSERT( offsetof(struct set_client_surface_state_reply, staged) == 36 );
 C_ASSERT( offsetof(struct set_client_surface_state_reply, ready) == 40 );
-C_ASSERT( offsetof(struct set_client_surface_state_reply, compose) == 44 );
-C_ASSERT( offsetof(struct set_client_surface_state_reply, active) == 48 );
-C_ASSERT( offsetof(struct set_client_surface_state_reply, cached) == 52 );
-C_ASSERT( sizeof(struct set_client_surface_state_reply) == 56 );
+C_ASSERT( offsetof(struct set_client_surface_state_reply, publish) == 44 );
+C_ASSERT( offsetof(struct set_client_surface_state_reply, compose) == 48 );
+C_ASSERT( offsetof(struct set_client_surface_state_reply, active) == 52 );
+C_ASSERT( offsetof(struct set_client_surface_state_reply, cached) == 56 );
+C_ASSERT( sizeof(struct set_client_surface_state_reply) == 64 );
 C_ASSERT( offsetof(struct get_client_surface_clip_windows_request, handle) == 12 );
 C_ASSERT( offsetof(struct get_client_surface_clip_windows_request, dpi) == 16 );
 C_ASSERT( sizeof(struct get_client_surface_clip_windows_request) == 24 );

@@ -1089,11 +1089,14 @@ typedef volatile struct
     unsigned __int64     client_surface_generation;
     unsigned __int64     client_surface_scene_generation;
     unsigned int         client_surface_flags;
-    int                  __pad2;
+    process_id_t         client_surface_process;
+    client_ptr_t         client_surface_id;
     char                 extra[];
 } window_shm_t;
 
 #define WINDOW_SHM_CLIENT_SURFACE_STAGED 0x01
+#define WINDOW_SHM_CLIENT_SURFACE_COMPOSING 0x02
+#define WINDOW_SHM_CLIENT_SURFACE_PUBLISHING 0x04
 
 typedef volatile union
 {
@@ -6294,9 +6297,11 @@ struct set_client_surface_state_reply
     unsigned int   pending;
     unsigned int   staged;
     unsigned int   ready;
+    unsigned int   publish;
     unsigned int   compose;
     unsigned int   active;
     unsigned int   cached;
+    char __pad_60[4];
 };
 #define CLIENT_SURFACE_STATE_REGISTER   0x01
 #define CLIENT_SURFACE_STATE_UNREGISTER 0x02
@@ -6306,8 +6311,9 @@ struct set_client_surface_state_reply
 #define CLIENT_SURFACE_STATE_GEOMETRY_READY 0x40
 #define CLIENT_SURFACE_STATE_CACHE           0x80
 #define CLIENT_SURFACE_STATE_UNCACHE         0x100
-#define CLIENT_SURFACE_STATE_PUBLISH         0x200
+#define CLIENT_SURFACE_STATE_PUBLISH_BEGIN   0x200
 #define CLIENT_SURFACE_STATE_PRESENT_BEGIN   0x400
+#define CLIENT_SURFACE_STATE_PUBLISH_COMMIT  0x800
 
 
 
@@ -7277,6 +7283,6 @@ union generic_reply
     struct get_client_surface_clip_windows_reply get_client_surface_clip_windows_reply;
 };
 
-#define SERVER_PROTOCOL_VERSION 976
+#define SERVER_PROTOCOL_VERSION 978
 
 #endif /* __WINE_WINE_SERVER_PROTOCOL_H */

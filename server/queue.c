@@ -2892,6 +2892,26 @@ void post_message( user_handle_t win, unsigned int message, lparam_t wparam, lpa
     release_object( thread );
 }
 
+void post_message_coalesced( user_handle_t win, unsigned int message,
+                             lparam_t wparam, lparam_t lparam )
+{
+    const user_handle_t full_win = get_user_full_handle( win );
+    struct thread *thread = get_window_thread( win );
+    struct message *msg;
+
+    if (!thread) return;
+    if (thread->queue) LIST_FOR_EACH_ENTRY( msg, &thread->queue->msg_list[POST_MESSAGE],
+                                           struct message, entry )
+    {
+        if (msg->type == MSG_POSTED && msg->win == full_win && msg->msg == message &&
+            msg->wparam == wparam && msg->lparam == lparam)
+            goto done;
+    }
+    post_thread_message( thread, win, message, wparam, lparam );
+done:
+    release_object( thread );
+}
+
 /* Post an internal message to the process queue which was accessed most
  * recently.  Client-rendered surfaces are process-local, but the HWND they
  * render may belong to a different process. */
@@ -2904,6 +2924,36 @@ int post_process_message( struct process *process, user_handle_t win, unsigned i
     LIST_FOR_EACH_ENTRY( thread, &process->thread_list, struct thread, proc_entry )
     {
         if (thread->is_system || thread->state != RUNNING || !thread->queue) continue;
+        if (!target || thread->queue->shared->access_time > access_time)
+        {
+            target = thread;
+            access_time = thread->queue->shared->access_time;
+        }
+    }
+    return target && post_thread_message( target, win, message, wparam, lparam );
+}
+
+/* Post at most one copy of an idempotent internal process notification.  The
+ * renderer may move its message pump between threads, so search every queue
+ * before choosing the most recently active one for a new notification. */
+int post_process_message_coalesced( struct process *process, user_handle_t win,
+                                    unsigned int message, lparam_t wparam, lparam_t lparam )
+{
+    const user_handle_t full_win = get_user_full_handle( win );
+    struct thread *thread, *target = NULL;
+    struct message *msg;
+    timeout_t access_time = 0;
+
+    LIST_FOR_EACH_ENTRY( thread, &process->thread_list, struct thread, proc_entry )
+    {
+        if (thread->is_system || thread->state != RUNNING || !thread->queue) continue;
+
+        LIST_FOR_EACH_ENTRY( msg, &thread->queue->msg_list[POST_MESSAGE], struct message, entry )
+        {
+            if (msg->type == MSG_POSTED && msg->win == full_win && msg->msg == message &&
+                msg->wparam == wparam && msg->lparam == lparam)
+                return 1;
+        }
         if (!target || thread->queue->shared->access_time > access_time)
         {
             target = thread;

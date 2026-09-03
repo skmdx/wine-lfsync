@@ -1102,14 +1102,17 @@ typedef volatile struct
     data_size_t          private_size;     /* length of private extra bytes range */
     data_size_t          extra_size;       /* size of the extra info */
     struct window_info   info;             /* window info (GWLP_*) */
-    unsigned __int64     client_surface_generation; /* unpublished client-surface generation */
+    unsigned __int64     client_surface_generation; /* active client-surface composition generation */
     unsigned __int64     client_surface_scene_generation; /* stable scene snapshot sequence */
     unsigned int         client_surface_flags;      /* WINDOW_SHM_CLIENT_SURFACE_* */
-    int                  __pad2;
+    process_id_t         client_surface_process;    /* authoritative producer process */
+    client_ptr_t         client_surface_id;         /* authoritative process-local surface */
     char                 extra[];          /* extra bytes storage */
 } window_shm_t;
 
 #define WINDOW_SHM_CLIENT_SURFACE_STAGED 0x01
+#define WINDOW_SHM_CLIENT_SURFACE_COMPOSING 0x02
+#define WINDOW_SHM_CLIENT_SURFACE_PUBLISHING 0x04
 
 typedef volatile union
 {
@@ -4369,16 +4372,17 @@ enum inproc_sync_type
     user_handle_t  handle;        /* client surface window */
     client_ptr_t   surface;       /* process-local client surface identity */
     unsigned int   flags;         /* CLIENT_SURFACE_STATE_* */
-    unsigned __int64 generation;  /* publication generation being committed */
+    unsigned __int64 generation;  /* composition generation being committed */
     unsigned __int64 scene_generation; /* scene snapshot being committed */
 @REPLY
     user_handle_t  toplevel;      /* current top-level ancestor */
     unsigned int   wake;          /* top-level may now be exposed */
-    unsigned __int64 generation;  /* current unpublished generation */
+    unsigned __int64 generation;  /* current composition generation */
     unsigned __int64 scene_generation; /* current stable scene sequence */
     unsigned int   pending;       /* window producers pending in that generation */
     unsigned int   staged;        /* whether the generation is unpublished */
     unsigned int   ready;         /* generation is composed and awaits owner publish */
+    unsigned int   publish;       /* owner may expose the returned publication token */
     unsigned int   compose;       /* this surface is the selected producer */
     unsigned int   active;        /* active surfaces on the requested window */
     unsigned int   cached;        /* cached surfaces on the requested window */
@@ -4391,8 +4395,9 @@ enum inproc_sync_type
 #define CLIENT_SURFACE_STATE_GEOMETRY_READY 0x40
 #define CLIENT_SURFACE_STATE_CACHE           0x80
 #define CLIENT_SURFACE_STATE_UNCACHE         0x100
-#define CLIENT_SURFACE_STATE_PUBLISH         0x200
+#define CLIENT_SURFACE_STATE_PUBLISH_BEGIN   0x200
 #define CLIENT_SURFACE_STATE_PRESENT_BEGIN   0x400
+#define CLIENT_SURFACE_STATE_PUBLISH_COMMIT  0x800
 
 
 /* Get visible client-surface windows above a target in one stable scene. */

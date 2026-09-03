@@ -3378,6 +3378,7 @@ void X11DRV_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_hint, UIN
     BOOL is_managed, was_fullscreen, client_surface_pending = FALSE, size_changed;
     BOOL win32_visible = !!(new_style & WS_VISIBLE);
     BOOL activate = !(swp_flags & SWP_NOACTIVATE), fullscreen = !!(swp_flags & WINE_SWP_FULLSCREEN);
+    BOOL publish_client_surface = !!(swp_flags & WINE_SWP_CLIENT_SURFACE_PUBLISH);
 
     if ((is_managed = is_window_managed( hwnd, swp_flags, fullscreen ))) make_owner_managed( hwnd );
 
@@ -3459,7 +3460,15 @@ void X11DRV_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_hint, UIN
     }
 
     window_set_wm_state( data, get_desired_wm_state( new_style, new_rects ), activate );
-    if (client_surface_pending && !data->client_surface_staged)
+    if (publish_client_surface)
+    {
+        /* The server keeps the staged token active until this X request has
+         * completed.  This is the native linearization point for publication. */
+        if (data->client_surface_redirected || data->client_surface_opacity_staged)
+            finish_client_surface_staging( data );
+        XSync( data->display, False );
+    }
+    else if (client_surface_pending && !data->client_surface_staged)
     {
         /* The redirect and map must reach the X server before another process
          * is allowed to commit into this publication generation. */

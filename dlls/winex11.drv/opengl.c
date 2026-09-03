@@ -1194,6 +1194,7 @@ static void x11drv_surface_flush( struct opengl_drawable *base, UINT flags )
         if (!(flags & GL_FLUSH_FINISHED)) funcs->p_glFinish();
         XFlush( gdi_display );
     }
+    client_surface_submit_present( base->client, &present );
     client_surface_complete_present( base->client, &present, TRUE, TRUE, NULL, 0 );
 }
 
@@ -1486,10 +1487,15 @@ static BOOL x11drv_surface_swap( struct opengl_drawable *base )
         funcs->p_glFlush();
         target_sbc = pglXSwapBuffersMscOML( gdi_display, gl->drawable, 0, 0, 0 );
         submitted = target_sbc >= 0;
+        client_surface_submit_present( base->client, &present );
         if (submitted) completed = wait_glx_swap_serial( gl, target_sbc,
                                                          CLIENT_SURFACE_PRESENT_TIMEOUT );
     }
-    else pglXSwapBuffers( gdi_display, gl->drawable );
+    else
+    {
+        pglXSwapBuffers( gdi_display, gl->drawable );
+        client_surface_submit_present( base->client, &present );
+    }
 
     if (!client_surface_complete_present( base->client, &present, submitted, completed, NULL,
                                           CLIENT_SURFACE_PRESENT_TIMEOUT ))
@@ -1534,6 +1540,7 @@ static void x11drv_egl_surface_flush( struct opengl_drawable *base, UINT flags )
         XFlush( gdi_display );
     }
 
+    client_surface_submit_present( base->client, &present );
     client_surface_complete_present( base->client, &present, TRUE, TRUE, NULL, 0 );
 }
 
@@ -1560,6 +1567,7 @@ static BOOL x11drv_egl_surface_swap( struct opengl_drawable *base )
         frame_id = 0;
     }
     ret = funcs->p_eglSwapBuffers( egl->display, gl->base.surface );
+    client_surface_submit_present( base->client, &present );
     if (!ret)
     {
         err = funcs->p_eglGetError();

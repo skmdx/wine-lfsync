@@ -3565,6 +3565,7 @@ static void dump_set_client_surface_state_reply( const struct set_client_surface
     fprintf( stderr, ", pending=%08x", req->pending );
     fprintf( stderr, ", staged=%08x", req->staged );
     fprintf( stderr, ", ready=%08x", req->ready );
+    fprintf( stderr, ", publish=%08x", req->publish );
     fprintf( stderr, ", compose=%08x", req->compose );
     fprintf( stderr, ", active=%08x", req->active );
     fprintf( stderr, ", cached=%08x", req->cached );
@@ -4586,6 +4587,7 @@ static const struct
     { "INFO_LENGTH_MISMATCH",        STATUS_INFO_LENGTH_MISMATCH },
     { "INSTANCE_NOT_AVAILABLE",      STATUS_INSTANCE_NOT_AVAILABLE },
     { "INSUFFICIENT_RESOURCES",      STATUS_INSUFFICIENT_RESOURCES },
+    { "INTEGER_OVERFLOW",            STATUS_INTEGER_OVERFLOW },
     { "INTERNAL_ERROR",              STATUS_INTERNAL_ERROR },
     { "INVALID_ACL",                 STATUS_INVALID_ACL },
     { "INVALID_ADDRESS",             STATUS_INVALID_ADDRESS },
