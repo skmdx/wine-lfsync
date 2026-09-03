@@ -360,6 +360,7 @@ static void client_surface_release_locked( struct client_surface *surface )
         client_surface_backend_destroy( surface );
         pthread_cond_destroy( &surface->completion_queue_cond );
         pthread_mutex_destroy( &surface->completion_queue_lock );
+        pthread_mutex_destroy( &surface->completion_wait_lock );
         pthread_cond_destroy( &surface->completion_cond );
         pthread_mutex_destroy( &surface->completion_lock );
         pthread_mutex_destroy( &surface->present_lock );
@@ -883,8 +884,17 @@ void *client_surface_create( UINT size, const struct client_surface_backend *bac
         free( surface );
         return NULL;
     }
+    if (pthread_mutex_init( &surface->completion_wait_lock, NULL ))
+    {
+        pthread_cond_destroy( &surface->completion_cond );
+        pthread_mutex_destroy( &surface->completion_lock );
+        pthread_mutex_destroy( &surface->present_lock );
+        free( surface );
+        return NULL;
+    }
     if (pthread_mutex_init( &surface->completion_queue_lock, NULL ))
     {
+        pthread_mutex_destroy( &surface->completion_wait_lock );
         pthread_cond_destroy( &surface->completion_cond );
         pthread_mutex_destroy( &surface->completion_lock );
         pthread_mutex_destroy( &surface->present_lock );
@@ -894,6 +904,7 @@ void *client_surface_create( UINT size, const struct client_surface_backend *bac
     if (pthread_cond_init( &surface->completion_queue_cond, NULL ))
     {
         pthread_mutex_destroy( &surface->completion_queue_lock );
+        pthread_mutex_destroy( &surface->completion_wait_lock );
         pthread_cond_destroy( &surface->completion_cond );
         pthread_mutex_destroy( &surface->completion_lock );
         pthread_mutex_destroy( &surface->present_lock );

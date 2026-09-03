@@ -285,15 +285,16 @@ BOOL client_surface_end_present_internal( struct client_surface *surface, UINT64
     UINT server_flags = 0;
     HDC hdc = 0;
 
+    assert( present );
     /* The caller owns a surface reference and completion_lock.  present_lock
      * serializes detach, membership transitions and native target changes, so
      * the process-wide registry lock is neither needed for lifetime nor for
      * target validation on the per-frame path. */
     pthread_mutex_lock( &surface->present_lock );
-    if (present && (!present->target_ready ||
+    if (!present->target_ready ||
         present->target_epoch != ReadAcquire64( &surface->target_epoch ) ||
         present->lifecycle_seq != ReadAcquire( &surface->lifecycle_seq ) ||
-        present->scene_toplevel != surface->ready_toplevel))
+        present->scene_toplevel != surface->ready_toplevel)
     {
         TRACE( "discarding %s presentation across target state change\n",
                debugstr_client_surface( surface ) );

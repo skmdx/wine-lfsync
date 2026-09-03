@@ -318,6 +318,7 @@ struct client_surface
     pthread_cond_t                     completion_cond; /* completion-mode handoff */
     pthread_mutex_t                    completion_queue_lock; /* protects deferred completion FIFO */
     pthread_cond_t                     completion_queue_cond; /* wakes the surface-local completion worker */
+    pthread_mutex_t                    completion_wait_lock; /* serializes backend waits, including inline fallback */
     struct list                        completion_queue;
     BOOL                               completion_worker_active;
     LONG                               ref;            /* reference count */
@@ -392,6 +393,11 @@ W32KAPI BOOL client_surface_complete_present( struct client_surface *surface,
                                               const SIZE *expected_size, DWORD timeout );
 W32KAPI void client_surface_begin_inline_completion( struct client_surface *surface,
                                                       struct client_surface_present *present );
+W32KAPI BOOL client_surface_wait_present_completion( struct client_surface *surface,
+                                                      const struct client_surface_present *present,
+                                                      BOOL submitted,
+                                                      client_surface_completion_wait_func wait,
+                                                      void *context, DWORD timeout );
 W32KAPI void client_surface_defer_present( struct client_surface *surface,
                                            struct client_surface_present *present,
                                            BOOL submitted, const SIZE *expected_size,

@@ -57,6 +57,33 @@ void client_surface_begin_inline_completion( struct client_surface *surface,
     client_surface_unlock_present( surface );
 }
 
+BOOL client_surface_wait_present_completion( struct client_surface *surface,
+                                             const struct client_surface_present *present,
+                                             BOOL submitted,
+                                             client_surface_completion_wait_func wait,
+                                             void *context, DWORD timeout )
+{
+    DWORD elapsed, start = NtGetTickCount();
+    BOOL completed;
+
+    assert( wait );
+    pthread_mutex_lock( &surface->completion_wait_lock );
+    /* Queue saturation and allocation failure execute the wait on the producer
+     * thread.  Serialize that rare fallback with the surface worker: some host
+     * APIs, notably vkWaitForPresentKHR, require external synchronization for
+     * concurrent access to the same presentation object.  Recheck the target
+     * after acquiring the lock so stale inline work does not wait five seconds
+     * behind a completion which already observed the detach. */
+    elapsed = NtGetTickCount() - start;
+    timeout = elapsed < timeout ? timeout - elapsed : 0;
+    completed = submitted && present->target_ready &&
+                present->target_epoch == ReadAcquire64( &surface->target_epoch ) &&
+                present->lifecycle_seq == ReadAcquire( &surface->lifecycle_seq ) &&
+                wait( context, timeout );
+    pthread_mutex_unlock( &surface->completion_wait_lock );
+    return completed;
+}
+
 static BOOL wait_for_completion_job_locked( struct client_surface *surface )
 {
     struct timespec abstime;
@@ -106,10 +133,9 @@ static void client_surface_completion_worker( struct client_surface *surface, BO
          * Its job-owned references still protect the native source while the
          * queued request retires, but waiting for an unmapped drawable may
          * otherwise run to the full timeout for every queued frame. */
-        completed = job->submitted && job->present.target_ready &&
-                    job->present.target_epoch == ReadAcquire64( &surface->target_epoch ) &&
-                    job->present.lifecycle_seq == ReadAcquire( &surface->lifecycle_seq ) &&
-                    job->wait( job->context, remaining );
+        completed = client_surface_wait_present_completion( surface, &job->present,
+                                                            job->submitted, job->wait,
+                                                            job->context, remaining );
         if (!client_surface_complete_present( surface, &job->present, job->submitted,
                                               completed,
                                               job->has_expected_size ? &job->expected_size : NULL,
@@ -158,7 +184,8 @@ void client_surface_defer_present( struct client_surface *surface,
         elapsed = NtGetTickCount() - present->submission_time;
         remaining = elapsed < CLIENT_SURFACE_PRESENT_TIMEOUT ?
                     CLIENT_SURFACE_PRESENT_TIMEOUT - elapsed : 0;
-        completed = submitted && wait( context, remaining );
+        completed = client_surface_wait_present_completion( surface, present, submitted,
+                                                            wait, context, remaining );
         client_surface_complete_present( surface, present, submitted, completed,
                                          expected_size, 0 );
         release( context );
@@ -173,7 +200,8 @@ void client_surface_defer_present( struct client_surface *surface,
         elapsed = NtGetTickCount() - present->submission_time;
         remaining = elapsed < CLIENT_SURFACE_PRESENT_TIMEOUT ?
                     CLIENT_SURFACE_PRESENT_TIMEOUT - elapsed : 0;
-        completed = submitted && wait( context, remaining );
+        completed = client_surface_wait_present_completion( surface, present, submitted,
+                                                            wait, context, remaining );
         client_surface_complete_present( surface, present, submitted, completed,
                                          expected_size, 0 );
         release( context );
@@ -206,7 +234,8 @@ void client_surface_defer_present( struct client_surface *surface,
         elapsed = NtGetTickCount() - present->submission_time;
         remaining = elapsed < CLIENT_SURFACE_PRESENT_TIMEOUT ?
                     CLIENT_SURFACE_PRESENT_TIMEOUT - elapsed : 0;
-        completed = submitted && wait( context, remaining );
+        completed = client_surface_wait_present_completion( surface, present, submitted,
+                                                            wait, context, remaining );
         client_surface_complete_present( surface, present, submitted, completed,
                                          expected_size, 0 );
         release( context );

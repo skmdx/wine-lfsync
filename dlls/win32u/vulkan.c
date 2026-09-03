@@ -2262,7 +2262,6 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
             WARN( "Swapchain window %p is invalid, returning VK_ERROR_OUT_OF_DATE_KHR\n", surface->hwnd );
             if (present_info->pResults) present_info->pResults[i] = VK_ERROR_OUT_OF_DATE_KHR;
             if (res >= VK_SUCCESS) res = VK_ERROR_OUT_OF_DATE_KHR;
-            swapchain_res = VK_ERROR_OUT_OF_DATE_KHR;
             compose = FALSE;
         }
         else if (swapchain_res > VK_SUCCESS)
@@ -2273,7 +2272,6 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
                   swapchain->extents.width, swapchain->extents.height, wine_dbgstr_rect( &client_rect ) );
             if (present_info->pResults) present_info->pResults[i] = VK_SUBOPTIMAL_KHR;
             if (!res) res = VK_SUBOPTIMAL_KHR;
-            swapchain_res = VK_SUBOPTIMAL_KHR;
             /* The host present has already been submitted.  Do not abandon
              * its completion wait merely because the shared Win32 geometry
              * is between resize states: this may be the application's only
@@ -2313,7 +2311,9 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
             {
                 struct vulkan_present_completion fallback = {device, swapchain, present_ids[i]};
                 client_surface_begin_inline_completion( surface->client, &presents[i] );
-                external_completed = wait_vulkan_present_completion( &fallback, remaining );
+                external_completed = client_surface_wait_present_completion(
+                    surface->client, &presents[i], TRUE, wait_vulkan_present_completion,
+                    &fallback, remaining );
             }
 
             if (use_internal_present_wait)

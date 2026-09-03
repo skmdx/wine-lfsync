@@ -1527,8 +1527,13 @@ static BOOL x11drv_surface_swap( struct opengl_drawable *base )
                 return TRUE;
             }
             client_surface_begin_inline_completion( base->client, &present );
-            completed = wait_glx_swap_serial( gl, target_sbc,
-                                               CLIENT_SURFACE_PRESENT_TIMEOUT );
+            {
+                struct glx_present_completion fallback = {base, target_sbc};
+
+                completed = client_surface_wait_present_completion(
+                    base->client, &present, TRUE, wait_glx_present_completion,
+                    &fallback, CLIENT_SURFACE_PRESENT_TIMEOUT );
+            }
         }
     }
     else
@@ -1676,8 +1681,9 @@ static BOOL x11drv_egl_surface_swap( struct opengl_drawable *base )
         {
             struct egl_present_completion fallback = {base, frame_id};
             client_surface_begin_inline_completion( base->client, &present );
-            timestamp_completion = wait_egl_present_completion( &fallback,
-                                                                CLIENT_SURFACE_PRESENT_TIMEOUT );
+            timestamp_completion = client_surface_wait_present_completion(
+                base->client, &present, TRUE, wait_egl_present_completion, &fallback,
+                CLIENT_SURFACE_PRESENT_TIMEOUT );
         }
     }
     else timestamp_completion = FALSE;
