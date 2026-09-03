@@ -103,15 +103,18 @@ struct client_surface *macdrv_CreateClientSurface(HWND hwnd, int pixel_format, B
 {
     struct macdrv_client_surface *surface;
 
-    surface = client_surface_create(sizeof(*surface), &macdrv_client_surface_backend, hwnd, pixel_format, raw);
-    surface->cocoa_view = macdrv_create_view(cgrect_from_rect(surface->client.monitor_rect));
+    if (!(surface = client_surface_create(sizeof(*surface), &macdrv_client_surface_backend,
+                                          hwnd, pixel_format, raw)))
+        return NULL;
+    if (!(surface->cocoa_view = macdrv_create_view(cgrect_from_rect(surface->client.monitor_rect))))
+    {
+        client_surface_release(&surface->client);
+        return NULL;
+    }
     macdrv_set_view_hidden(surface->cocoa_view, TRUE);
 
-    if (surface)
-    {
-        macdrv_client_surface_update(&surface->client);
-        macdrv_client_surface_present(&surface->client, 0, 0, FALSE);
-    }
+    macdrv_client_surface_update(&surface->client);
+    macdrv_client_surface_present(&surface->client, 0, 0, FALSE);
 
     return &surface->client;
 }
