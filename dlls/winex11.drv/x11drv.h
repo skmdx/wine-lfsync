@@ -372,9 +372,17 @@ struct x11drv_client_surface
     Colormap colormap;
     Window window;
     XID damage;
+    Pixmap composition_backing;
+    UINT64 composition_scene_generation;
+    HWND composition_toplevel;
+    struct x11drv_client_surface *damage_next;
+    pthread_cond_t damage_cond;
     BOOL keep_offscreen;    /* preserve a drawable which was used while hidden */
     BOOL manual_redirect;   /* client drawable is manually XComposite redirected */
-    BOOL completion_broken; /* an unbounded old present can no longer be distinguished */
+    BOOL completion_broken; /* shared monitor is tainted until this drawable is destroyed */
+    BOOL completion_ready;
+    BOOL completion_waiting;
+    BOOL damage_cond_initialized;
 
     HDC hdc_src;
     HDC hdc_dst;
@@ -702,6 +710,8 @@ struct x11drv_win_data
     UINT        client_surface_opacity_staged : 1; /* compositor-owned window hidden with opacity */
     UINT        client_surface_staged : 1; /* server may accept a visible-generation commit */
     UINT        client_surface_opacity_valid : 1; /* desired opacity property is present */
+    UINT        client_surface_backing_enabled : 1;
+    UINT        client_surface_backing_valid : 1;
     Window      embedder;       /* window id of embedder */
     Pixmap         icon_pixmap;
     Pixmap         icon_mask;
@@ -718,6 +728,11 @@ struct x11drv_win_data
     unsigned long mwm_hints_serial;    /* serial of last pending _MOTIF_WM_HINTS request */
     unsigned long wm_normal_hints_serial;/* serial of last pending WM_NORMAL_HINTS request */
     unsigned long client_surface_opacity; /* desired _NET_WM_WINDOW_OPACITY value */
+    Pixmap         client_surface_backing;
+    GC             client_surface_gc;
+    unsigned int   client_surface_backing_width;
+    unsigned int   client_surface_backing_height;
+    struct x11drv_retired_pixmap *client_surface_retired;
     unsigned long configure_serial;    /* serial of last pending configure request */
     unsigned long net_wm_icon_serial;  /* serial of last pending _NET_WM_ICON request */
     unsigned long state_locks;         /* X11 state requests lock while updating win32 state */
@@ -727,6 +742,9 @@ extern struct x11drv_win_data *get_win_data( HWND hwnd );
 extern void release_win_data( struct x11drv_win_data *data );
 extern void set_window_parent( struct x11drv_win_data *data, Window parent );
 extern Window X11DRV_get_whole_window( HWND hwnd );
+extern Pixmap X11DRV_get_client_surface_backing( HWND hwnd );
+extern BOOL X11DRV_restore_client_surface_backing( struct x11drv_win_data *data,
+                                                   Window window, const RECT *rect );
 extern Window get_dummy_parent(void);
 
 extern BOOL window_is_reparenting( HWND hwnd );

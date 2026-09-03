@@ -280,7 +280,6 @@ struct client_surface_present
     BOOL external_completion;
     BOOL external_completion_registered;
     BOOL driver_completion;
-    BOOL completion_coalesced;
     BOOL completion_failed;
     BOOL superseded;
 };
@@ -301,6 +300,7 @@ struct client_surface
     HWND                               indexed_toplevel;
     pthread_mutex_t                    present_lock;   /* serializes driver operations for this surface */
     pthread_mutex_t                    completion_lock; /* serializes host presentation completion tracking */
+    pthread_cond_t                     completion_cond; /* completion-mode handoff */
     pthread_mutex_t                    completion_queue_lock; /* protects deferred completion FIFO */
     struct list                        completion_queue;
     BOOL                               completion_worker_active;
@@ -311,15 +311,22 @@ struct client_surface
     HWND                               toplevel;       /* toplevel window of the surface */
     LONG                               offscreen;      /* client window is offscreen */
     LONG                               active;         /* registered as active with the Wine server */
+    LONG                               producer_claimed; /* active registration has claimed a completed frame */
     LONG                               content_valid;  /* complete content exists at the current size */
     LONG                               cacheable;      /* native completion state is safe to reuse */
     LONG                               server_cached;  /* registered as a cached owner with the Wine server */
     UINT64                             cache_cost;     /* estimated bytes while on the unused list */
     LONG64                             geometry_seq;   /* seqlock for the driver-ready geometry */
     LONG64                             target_epoch;   /* native target identity, incremented after target changes */
+    UINT64                             target_scene_generation; /* last server scene applied to native target */
+    HWND                               target_scene_toplevel;
+    UINT64                             composition_scene_generation; /* scene passed to driver composition */
+    HWND                               composition_toplevel;
     LONG64                             present_serial; /* producer submission order */
     LONG64                             composed_serial; /* newest producer copied into the host target */
     LONG                               external_completion_count; /* causal tokens currently in flight */
+    LONG                               driver_completion_count; /* shared native monitor tokens in flight */
+    LONG                               driver_completion_waiters; /* pending shared-monitor mode transitions */
     LONG                               lifecycle_seq;  /* seqlock for detach and destruction */
     LONG                               target_ready;   /* driver successfully prepared the current target */
     LONG64                             recompose_requested; /* latest requested recomposition generation */
@@ -376,6 +383,8 @@ W32KAPI void client_surface_set_staged( HWND hwnd );
 W32KAPI void client_surface_bypass_staging( HWND hwnd );
 W32KAPI BOOL client_surface_begin_publish( HWND hwnd, UINT64 *generation, UINT64 *scene_generation );
 W32KAPI void client_surface_end_publish( HWND hwnd, UINT64 generation, UINT64 scene_generation );
+W32KAPI BOOL client_surface_begin_prepare( HWND hwnd, UINT64 *scene_generation );
+W32KAPI void client_surface_end_prepare( HWND hwnd, UINT64 scene_generation );
 W32KAPI void update_client_surfaces( HWND hwnd );
 W32KAPI void detach_client_surfaces( HWND hwnd );
 
@@ -459,6 +468,7 @@ struct gdi_device_manager
 #define WINE_SWP_CLIENT_SURFACE_PUBLISH 0x10000000
 #define WINE_SWP_CLIENT_SURFACE_BACKING_ENABLE 0x08000000
 #define WINE_SWP_CLIENT_SURFACE_BACKING_DISABLE 0x04000000
+#define WINE_SWP_CLIENT_SURFACE_PREPARE 0x02000000
 
 struct vulkan_driver_funcs;
 struct opengl_driver_funcs;

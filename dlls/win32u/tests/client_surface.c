@@ -97,6 +97,12 @@ static unsigned int commit_surface_state( HWND hwnd, UINT_PTR surface,
                                     generation->generation, generation->scene_generation, state );
 }
 
+static unsigned int claim_surface_state( HWND hwnd, UINT_PTR surface,
+                                         struct surface_state *state )
+{
+    return set_surface_state( hwnd, surface, CLIENT_SURFACE_STATE_CLAIM, 0, state );
+}
+
 static unsigned int begin_surface_state( HWND hwnd, UINT_PTR surface,
                                          const struct surface_state *generation,
                                          struct surface_state *state )
@@ -119,6 +125,22 @@ static unsigned int publish_surface_state( HWND hwnd, struct surface_state *stat
     }
     return set_surface_state_scene( hwnd, 0, CLIENT_SURFACE_STATE_PUBLISH_COMMIT,
                                     begin.generation, begin.scene_generation, state );
+}
+
+static unsigned int prepare_surface_state( HWND hwnd, struct surface_state *state )
+{
+    struct surface_state begin;
+    unsigned int status;
+
+    memset( &begin, 0, sizeof(begin) );
+    status = set_surface_state( hwnd, 0, CLIENT_SURFACE_STATE_PREPARE_BEGIN, 0, &begin );
+    if (status || !begin.publish)
+    {
+        if (state) *state = begin;
+        return status;
+    }
+    return set_surface_state_scene( hwnd, 0, CLIENT_SURFACE_STATE_PREPARE_COMMIT,
+                                    0, begin.scene_generation, state );
 }
 
 static unsigned int get_clip_state( HWND hwnd, struct clip_state *state )
@@ -226,14 +248,20 @@ static void test_generation_membership(void)
         staged.staged, wine_dbgstr_longlong( staged.generation ), staged.pending );
 
     status = begin_surface_state( hwnd, first_surface, &staged, &committed );
-    ok( !status && !committed.compose,
-        "older same-window producer was selected, compose %u status %#x\n",
+    ok( !status && committed.compose,
+        "cached producer was displaced by dormant active surface, compose %u status %#x\n",
         committed.compose, status );
-    status = commit_surface_state( hwnd, first_surface, &staged, &committed );
-    ok( !status, "membership commit failed, status %#x\n", status );
-    ok( committed.staged && !committed.ready && committed.pending == 1,
-        "non-selected producer completed generation: staged %u ready %u pending %u\n",
-        committed.staged, committed.ready, committed.pending );
+
+    status = claim_surface_state( hwnd, second_surface, &committed );
+    ok( !status && committed.generation != staged.generation && committed.pending == 1,
+        "active producer claim did not restart generation: old %s new %s pending %u status %#x\n",
+        wine_dbgstr_longlong( staged.generation ),
+        wine_dbgstr_longlong( committed.generation ), committed.pending, status );
+    staged = committed;
+    status = begin_surface_state( hwnd, first_surface, &staged, &committed );
+    ok( !status && !committed.compose,
+        "displaced cached producer remained selected, compose %u status %#x\n",
+        committed.compose, status );
     status = begin_surface_state( hwnd, second_surface, &staged, &committed );
     ok( !status && committed.compose,
         "newest active producer was not selected, compose %u status %#x\n",
@@ -395,10 +423,14 @@ static void test_subtree_generation_retirement(void)
     ok( !status, "first child register failed, status %#x\n", status );
     ok( state.toplevel == parent && state.active == 1,
         "first child top %p active %u\n", state.toplevel, state.active );
+    status = claim_surface_state( first, first_surface, &state );
+    ok( !status, "first child claim failed, status %#x\n", status );
     status = set_surface_state( second, second_surface, CLIENT_SURFACE_STATE_REGISTER, 0, &state );
     ok( !status, "second child register failed, status %#x\n", status );
     ok( state.toplevel == parent && state.active == 1,
         "second child top %p active %u\n", state.toplevel, state.active );
+    status = claim_surface_state( second, second_surface, &state );
+    ok( !status, "second child claim failed, status %#x\n", status );
 
     ShowWindow( parent, SW_SHOW );
     status = set_surface_state( parent, 0, CLIENT_SURFACE_STATE_STAGED, 0, &staged );
@@ -499,6 +531,8 @@ static void test_generation_aba(void)
 
     status = set_surface_state( hwnd, surface, CLIENT_SURFACE_STATE_REGISTER, 0, NULL );
     ok( !status, "register failed, status %#x\n", status );
+    status = claim_surface_state( hwnd, surface, NULL );
+    ok( !status, "claim failed, status %#x\n", status );
     ShowWindow( hwnd, SW_SHOW );
 
     status = set_surface_state( hwnd, 0, CLIENT_SURFACE_STATE_STAGED, 0, &first );
@@ -570,6 +604,7 @@ static void test_publish_transaction(void)
     if (!hwnd) return;
 
     set_surface_state( hwnd, surface, CLIENT_SURFACE_STATE_REGISTER, 0, NULL );
+    claim_surface_state( hwnd, surface, NULL );
     ShowWindow( hwnd, SW_SHOW );
     status = set_surface_state( hwnd, 0, CLIENT_SURFACE_STATE_STAGED, 0, &staged );
     ok( !status && staged.staged && staged.pending == 1,
@@ -597,15 +632,24 @@ static void test_publish_transaction(void)
 
     status = set_surface_state_scene( hwnd, 0, CLIENT_SURFACE_STATE_PUBLISH_COMMIT,
                                       publishing.generation, publishing.scene_generation, &committed );
-    ok( !status && !committed.staged && committed.wake && committed.pending == 1 &&
-        committed.generation != publishing.generation,
-        "publish ACK did not start live repair: status %#x staged %u wake %u pending %u generation %s\n",
+    ok( !status && !committed.staged && committed.wake && !committed.pending &&
+        !committed.generation,
+        "publish ACK did not wait for owner snapshot: status %#x staged %u wake %u pending %u generation %s\n",
         status, committed.staged, committed.wake, committed.pending,
         wine_dbgstr_longlong( committed.generation ) );
+    status = prepare_surface_state( hwnd, &committed );
+    ok( !status && committed.pending == 1 && committed.generation != publishing.generation,
+        "owner snapshot did not start live repair: status %#x pending %u generation %s\n",
+        status, committed.pending, wine_dbgstr_longlong( committed.generation ) );
 
     status = commit_surface_state( hwnd, surface, &committed, &repaired );
+    ok( !status && !repaired.staged && repaired.ready && !repaired.pending && repaired.generation,
+        "live repair did not reach publication: status %#x staged %u ready %u pending %u generation %s\n",
+        status, repaired.staged, repaired.ready, repaired.pending,
+        wine_dbgstr_longlong( repaired.generation ) );
+    status = publish_surface_state( hwnd, &repaired );
     ok( !status && !repaired.staged && !repaired.pending && !repaired.generation,
-        "live repair did not retire its epoch: status %#x staged %u pending %u generation %s\n",
+        "live repair publication did not retire its epoch: status %#x staged %u pending %u generation %s\n",
         status, repaired.staged, repaired.pending, wine_dbgstr_longlong( repaired.generation ) );
 
     set_surface_state( hwnd, surface, CLIENT_SURFACE_STATE_UNREGISTER, 0, NULL );
@@ -624,6 +668,7 @@ static void test_late_present_cutover(void)
     if (!hwnd) return;
 
     set_surface_state( hwnd, surface, CLIENT_SURFACE_STATE_REGISTER, 0, NULL );
+    claim_surface_state( hwnd, surface, NULL );
     ShowWindow( hwnd, SW_SHOW );
     status = set_surface_state( hwnd, 0, CLIENT_SURFACE_STATE_STAGED, 0, &staged );
     ok( !status && staged.staged && staged.pending == 1,
@@ -655,13 +700,20 @@ static void test_late_present_cutover(void)
         status, late.compose, late.ready, late.pending );
     status = set_surface_state_scene( hwnd, 0, CLIENT_SURFACE_STATE_PUBLISH_COMMIT,
                                       publishing.generation, publishing.scene_generation, &published );
-    ok( !status && !published.staged && published.pending == 1 &&
-        published.generation != publishing.generation,
-        "late frame did not schedule live repair: status %#x staged %u pending %u generation %s\n",
+    ok( !status && !published.staged && !published.pending && !published.generation,
+        "late frame repair skipped owner snapshot: status %#x staged %u pending %u generation %s\n",
         status, published.staged, published.pending, wine_dbgstr_longlong( published.generation ) );
+    status = prepare_surface_state( hwnd, &published );
+    ok( !status && published.pending == 1 && published.generation != publishing.generation,
+        "late frame snapshot did not start repair: status %#x pending %u generation %s\n",
+        status, published.pending, wine_dbgstr_longlong( published.generation ) );
     status = commit_surface_state( hwnd, surface, &published, &repaired );
+    ok( !status && repaired.ready && !repaired.pending && repaired.generation,
+        "late-frame repair did not reach publication: status %#x ready %u pending %u generation %s\n",
+        status, repaired.ready, repaired.pending, wine_dbgstr_longlong( repaired.generation ) );
+    status = publish_surface_state( hwnd, &repaired );
     ok( !status && !repaired.pending && !repaired.generation,
-        "late-frame repair did not finish: status %#x pending %u generation %s\n",
+        "late-frame publication did not finish: status %#x pending %u generation %s\n",
         status, repaired.pending, wine_dbgstr_longlong( repaired.generation ) );
 
     set_surface_state( hwnd, surface, CLIENT_SURFACE_STATE_UNREGISTER, 0, NULL );

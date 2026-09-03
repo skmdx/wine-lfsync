@@ -827,6 +827,7 @@ static BOOL X11DRV_Expose( HWND hwnd, XEvent *xev )
     POINT pos;
     struct x11drv_win_data *data;
     UINT flags = RDW_INVALIDATE | RDW_FRAME | RDW_ALLCHILDREN;
+    BOOL restored, repair;
 
     TRACE( "win %p (%lx) %d,%d %dx%d\n",
            hwnd, event->window, event->x, event->y, event->width, event->height );
@@ -844,6 +845,9 @@ static BOOL X11DRV_Expose( HWND hwnd, XEvent *xev )
     rect.top    = pos.y;
     rect.right  = pos.x + event->width;
     rect.bottom = pos.y + event->height;
+    restored = X11DRV_restore_client_surface_backing( data, event->window, &rect );
+    repair = event->window == data->whole_window && data->client_surface_backing &&
+             !data->client_surface_backing_valid;
 
     if (event->window != data->client_window)
         OffsetRect( &rect, data->rects.visible.left - data->rects.client.left,
@@ -866,7 +870,8 @@ static BOOL X11DRV_Expose( HWND hwnd, XEvent *xev )
 
     release_win_data( data );
 
-    NtUserExposeWindowSurface( hwnd, flags, &rect );
+    if (repair) client_surface_geometry_ready( hwnd );
+    if (!restored) NtUserExposeWindowSurface( hwnd, flags, &rect );
     return TRUE;
 }
 

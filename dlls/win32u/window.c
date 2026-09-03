@@ -303,6 +303,9 @@ static struct client_surface *client_surface_identity_index[CLIENT_SURFACE_INDEX
 static struct client_surface *client_surface_toplevel_index[CLIENT_SURFACE_INDEX_BUCKETS];
 static UINT_PTR client_surface_identity;
 
+static void remove_client_surface_chain( struct client_surface **head,
+                                         struct client_surface *surface, BOOL identity );
+
 static unsigned int client_surface_index_hash( UINT_PTR value )
 {
     value ^= value >> 17;
@@ -310,12 +313,11 @@ static unsigned int client_surface_index_hash( UINT_PTR value )
     return value & (CLIENT_SURFACE_INDEX_BUCKETS - 1);
 }
 
-static void insert_client_surface_index( struct client_surface *surface )
+static void assign_client_surface_identity_locked( struct client_surface *surface )
 {
     struct client_surface *cursor;
     unsigned int identity_bucket;
 
-    pthread_mutex_lock( &surface_index_lock );
     /* The server returns this token through a queued message.  A pointer
      * identity lets a delayed message address an unrelated allocation after
      * malloc reuses the old surface, so allocate an opaque live-unique token
@@ -332,6 +334,12 @@ static void insert_client_surface_index( struct client_surface *surface )
     surface->identity = client_surface_identity;
     surface->identity_next = client_surface_identity_index[identity_bucket];
     client_surface_identity_index[identity_bucket] = surface;
+}
+
+static void insert_client_surface_index( struct client_surface *surface )
+{
+    pthread_mutex_lock( &surface_index_lock );
+    assign_client_surface_identity_locked( surface );
     surface->indexed_toplevel = surface->ready_toplevel;
     if (surface->ready_toplevel)
     {
@@ -339,6 +347,22 @@ static void insert_client_surface_index( struct client_surface *surface )
         surface->toplevel_next = client_surface_toplevel_index[bucket];
         client_surface_toplevel_index[bucket] = surface;
     }
+    pthread_mutex_unlock( &surface_index_lock );
+}
+
+/* A non-cached unregister ends the server lifetime of the token even when the
+ * client object itself is reused.  Move it to a fresh identity before another
+ * registration so a delayed queue entry can only miss, never target the new
+ * lifecycle.  present_lock excludes registration while the index changes. */
+static void renew_client_surface_identity( struct client_surface *surface )
+{
+    unsigned int bucket;
+
+    pthread_mutex_lock( &surface_index_lock );
+    bucket = client_surface_index_hash( surface->identity );
+    remove_client_surface_chain( &client_surface_identity_index[bucket], surface, TRUE );
+    surface->identity_next = NULL;
+    assign_client_surface_identity_locked( surface );
     pthread_mutex_unlock( &surface_index_lock );
 }
 
@@ -498,16 +522,31 @@ static void client_surface_uncache_present_locked( struct client_surface *surfac
     if (wake && toplevel) NtUserPostMessage( toplevel, WM_WINE_UPDATEWINDOWSTATE, 0, 0 );
 }
 
+static void client_surface_wait_driver_completion_locked( struct client_surface *surface )
+{
+    while (surface->driver_completion_count)
+        pthread_cond_wait( &surface->completion_cond, &surface->completion_lock );
+}
+
+static void client_surface_wait_all_completions_locked( struct client_surface *surface )
+{
+    while (InterlockedCompareExchange( &surface->external_completion_count, 0, 0 ))
+        pthread_cond_wait( &surface->completion_cond, &surface->completion_lock );
+}
+
 static void client_surface_detach_locked( struct client_surface *surface )
 {
     HWND toplevel;
     BOOL wake;
     UINT flags = 0;
 
+    client_surface_lock_present( surface );
+    client_surface_wait_driver_completion_locked( surface );
     pthread_mutex_lock( &surface->present_lock );
     if (!surface->hwnd)
     {
         pthread_mutex_unlock( &surface->present_lock );
+        client_surface_unlock_present( surface );
         return;
     }
     InterlockedIncrement( &surface->lifecycle_seq );
@@ -516,6 +555,7 @@ static void client_surface_detach_locked( struct client_surface *surface )
     {
         flags |= CLIENT_SURFACE_STATE_UNREGISTER;
         InterlockedExchange( &surface->active, FALSE );
+        InterlockedExchange( &surface->producer_claimed, FALSE );
     }
     if (surface->server_cached)
     {
@@ -535,6 +575,7 @@ static void client_surface_detach_locked( struct client_surface *surface )
     InterlockedExchangePointer( (void **)&surface->hwnd, NULL );
     InterlockedIncrement( &surface->lifecycle_seq );
     pthread_mutex_unlock( &surface->present_lock );
+    client_surface_unlock_present( surface );
 }
 
 static void client_surface_release_locked( struct client_surface *surface )
@@ -557,8 +598,12 @@ static void client_surface_release_locked( struct client_surface *surface )
         if (surface->clip_region) NtGdiDeleteObjectApp( surface->clip_region );
         assert( list_empty( &surface->completion_queue ) );
         assert( !surface->completion_worker_active );
+        assert( !surface->external_completion_count );
+        assert( !surface->driver_completion_count );
+        assert( !surface->driver_completion_waiters );
         surface->funcs->destroy( surface );
         pthread_mutex_destroy( &surface->completion_queue_lock );
+        pthread_cond_destroy( &surface->completion_cond );
         pthread_mutex_destroy( &surface->completion_lock );
         pthread_mutex_destroy( &surface->present_lock );
         free( surface );
@@ -734,7 +779,9 @@ static BOOL client_surface_update_present_locked( struct client_surface *surface
     return TRUE;
 }
 
-static BOOL client_surface_update_now( struct client_surface *surface )
+/* completion_lock is held.  A completed driver wait calls this before
+ * retiring its own token, so only external target mutators wait below. */
+static BOOL client_surface_update_now_locked( struct client_surface *surface )
 {
     BOOL ret = FALSE;
 
@@ -742,6 +789,17 @@ static BOOL client_surface_update_now( struct client_surface *surface )
     if (InterlockedCompareExchangePointer( (void **)&surface->hwnd, NULL, NULL ))
         ret = client_surface_update_present_locked( surface );
     pthread_mutex_unlock( &surface->present_lock );
+    return ret;
+}
+
+static BOOL client_surface_update_now( struct client_surface *surface )
+{
+    BOOL ret;
+
+    client_surface_lock_present( surface );
+    client_surface_wait_driver_completion_locked( surface );
+    ret = client_surface_update_now_locked( surface );
+    client_surface_unlock_present( surface );
     return ret;
 }
 
@@ -891,11 +949,14 @@ void update_client_surfaces( HWND hwnd )
         BOOL visible;
 
         surface = update_surfaces[i];
+        client_surface_lock_present( surface );
+        client_surface_wait_driver_completion_locked( surface );
         pthread_mutex_lock( &surface->present_lock );
         surface_hwnd = InterlockedCompareExchangePointer( (void **)&surface->hwnd, NULL, NULL );
         if (!surface_hwnd || NtUserGetAncestor( surface_hwnd, GA_ROOT ) != hwnd)
         {
             pthread_mutex_unlock( &surface->present_lock );
+            client_surface_unlock_present( surface );
             continue;
         }
         monitor_rect = surface->monitor_rect;
@@ -905,6 +966,7 @@ void update_client_surfaces( HWND hwnd )
         new_toplevel = surface->toplevel;
         visible = NtUserIsWindowVisible( surface_hwnd );
         pthread_mutex_unlock( &surface->present_lock );
+        client_surface_unlock_present( surface );
 
         if (new_toplevel == toplevel && !EqualRect( &new_monitor_rect, &monitor_rect ) &&
             !add_exposed_client_surface_region( &exposed_region, &monitor_rect,
@@ -982,8 +1044,16 @@ void *client_surface_create( UINT size, const struct client_surface_funcs *funcs
         free( surface );
         return NULL;
     }
+    if (pthread_cond_init( &surface->completion_cond, NULL ))
+    {
+        pthread_mutex_destroy( &surface->completion_lock );
+        pthread_mutex_destroy( &surface->present_lock );
+        free( surface );
+        return NULL;
+    }
     if (pthread_mutex_init( &surface->completion_queue_lock, NULL ))
     {
+        pthread_cond_destroy( &surface->completion_cond );
         pthread_mutex_destroy( &surface->completion_lock );
         pthread_mutex_destroy( &surface->present_lock );
         free( surface );
@@ -1197,11 +1267,12 @@ static BOOL get_client_surface_publication( struct client_surface *surface, UINT
     HWND hwnd, toplevel;
     NTSTATUS status;
     UINT64 current_generation = 0, current_scene_generation = 0;
+    BOOL preparing = FALSE;
 
-    *generation = 0;
-    *scene_generation = 0;
-    *scene_toplevel = 0;
-    *authoritative = FALSE;
+    if (generation) *generation = 0;
+    if (scene_generation) *scene_generation = 0;
+    if (scene_toplevel) *scene_toplevel = 0;
+    if (authoritative) *authoritative = FALSE;
 
     hwnd = InterlockedCompareExchangePointer( (void **)&surface->hwnd, NULL, NULL );
     if (!hwnd || (!InterlockedCompareExchange( &surface->active, 0, 0 ) &&
@@ -1214,6 +1285,7 @@ static BOOL get_client_surface_publication( struct client_surface *surface, UINT
         current_generation = (top_shm->client_surface_flags & WINDOW_SHM_CLIENT_SURFACE_COMPOSING) ?
                              top_shm->client_surface_generation : 0;
         current_scene_generation = top_shm->client_surface_scene_generation;
+        preparing = !!(top_shm->client_surface_flags & WINDOW_SHM_CLIENT_SURFACE_PREPARING);
         if (hwnd == toplevel)
         {
             producer_process = top_shm->client_surface_process;
@@ -1230,12 +1302,13 @@ static BOOL get_client_surface_publication( struct client_surface *surface, UINT
     }
     if (status) return FALSE;
 
-    *generation = current_generation;
-    *scene_generation = current_scene_generation;
-    *scene_toplevel = toplevel;
-    *authoritative = producer_process == HandleToULong( NtCurrentTeb()->ClientId.UniqueProcess ) &&
-                     producer_id == surface->identity;
-    return TRUE;
+    if (generation) *generation = current_generation;
+    if (scene_generation) *scene_generation = current_scene_generation;
+    if (scene_toplevel) *scene_toplevel = toplevel;
+    if (authoritative)
+        *authoritative = producer_process == HandleToULong( NtCurrentTeb()->ClientId.UniqueProcess ) &&
+                         producer_id == surface->identity;
+    return !preparing;
 }
 
 static BOOL client_surface_publication_matches( const struct client_surface_present *present )
@@ -1243,6 +1316,7 @@ static BOOL client_surface_publication_matches( const struct client_surface_pres
     struct object_lock lock = OBJECT_LOCK_INIT;
     const window_shm_t *window_shm = NULL;
     UINT64 generation = 0, scene_generation = 0;
+    BOOL preparing = FALSE;
     NTSTATUS status;
 
     if (!present->scene_valid || !present->scene_toplevel) return FALSE;
@@ -1251,8 +1325,9 @@ static BOOL client_surface_publication_matches( const struct client_surface_pres
         generation = (window_shm->client_surface_flags & WINDOW_SHM_CLIENT_SURFACE_COMPOSING) ?
                      window_shm->client_surface_generation : 0;
         scene_generation = window_shm->client_surface_scene_generation;
+        preparing = !!(window_shm->client_surface_flags & WINDOW_SHM_CLIENT_SURFACE_PREPARING);
     }
-    return !status && generation == present->generation && !(scene_generation & 1) &&
+    return !status && !preparing && generation == present->generation && !(scene_generation & 1) &&
            scene_generation == present->scene_generation;
 }
 
@@ -1285,16 +1360,12 @@ static BOOL client_surface_end_present_internal( struct client_surface *surface,
     BOOL scene_retry = FALSE, source_valid = FALSE;
     HDC hdc = 0;
 
-    /* Host resize barriers belong to the surface.  Complete them before
-     * validating the presentation snapshot below. */
-    client_surface_update_now( surface );
-
     /* The caller owns a surface reference and completion_lock.  present_lock
      * serializes detach, membership transitions and native target changes, so
      * the process-wide registry lock is neither needed for lifetime nor for
      * target validation on the per-frame path. */
     pthread_mutex_lock( &surface->present_lock );
-    if (present && (!present->target_ready || !present->scene_valid ||
+    if (present && (!present->target_ready ||
         present->target_epoch != ReadAcquire64( &surface->target_epoch ) ||
         present->lifecycle_seq != ReadAcquire( &surface->lifecycle_seq ) ||
         present->scene_toplevel != surface->ready_toplevel))
@@ -1310,7 +1381,9 @@ static BOOL client_surface_end_present_internal( struct client_surface *surface,
                wine_dbgstr_longlong( surface->composed_serial ) );
     }
     else if ((hwnd = surface->hwnd) &&
-             InterlockedCompareExchange( &surface->target_ready, 0, 0 ))
+             InterlockedCompareExchange( &surface->target_ready, 0, 0 ) &&
+             (InterlockedCompareExchange( &surface->active, 0, 0 ) ||
+              InterlockedCompareExchange( &surface->server_cached, 0, 0 )))
     {
         if (sync) TRACE( "client surface %p starts composition epoch commit\n", hwnd );
         if (new_content || InterlockedCompareExchange( &surface->content_valid, 0, 0 ))
@@ -1324,6 +1397,7 @@ static BOOL client_surface_end_present_internal( struct client_surface *surface,
                    debugstr_client_surface( surface ) );
     }
     source_valid = compose && new_content;
+    if (compose && present && !present->scene_valid) compose = FALSE;
     if (compose && sync)
     {
         authorized = begin_client_surface_composition( hwnd, surface, present, &begin_valid );
@@ -1386,6 +1460,8 @@ static BOOL client_surface_end_present_internal( struct client_surface *surface,
      * surface while it runs, allowing independent surfaces to keep moving. */
     if (compose)
     {
+        surface->composition_scene_generation = present->scene_generation;
+        surface->composition_toplevel = present->scene_toplevel;
         copied = surface->funcs->present( surface, hdc, surface_region, sync );
         composed = copied;
     }
@@ -1451,31 +1527,58 @@ void client_surface_prepare_present_locked( struct client_surface *surface,
                                             struct client_surface_present *present,
                                             BOOL external_completion )
 {
+    /* Exact IDs may overlap each other, but a shared driver monitor has no
+     * per-frame identity.  Drain exact work before arming that monitor, and
+     * do not submit any new frame until an armed monitor has been consumed. */
+    if (!external_completion)
+    {
+        surface->driver_completion_waiters++;
+        while (InterlockedCompareExchange( &surface->external_completion_count, 0, 0 ))
+            pthread_cond_wait( &surface->completion_cond, &surface->completion_lock );
+        if (!--surface->driver_completion_waiters)
+            pthread_cond_broadcast( &surface->completion_cond );
+    }
+    else
+    {
+        while (surface->driver_completion_count || surface->driver_completion_waiters)
+            pthread_cond_wait( &surface->completion_cond, &surface->completion_lock );
+    }
+
     memset( present, 0, sizeof(*present) );
     present->completion_locked = TRUE;
 
-    /* Bring the native target and the published geometry to one boundary
-     * before arming backend completion tracking.  A later geometry sequence
-     * change invalidates this transaction instead of pairing a new target
-     * with an older host presentation. */
+    /* A server scene sequence is also the invalidation token for native
+     * geometry.  Reapplying an unchanged scene on every GL/Vulkan frame made
+     * resize queries and X11 target setup part of the steady-state hot path. */
     pthread_mutex_lock( &surface->present_lock );
-    if (surface->hwnd) client_surface_update_present_locked( surface );
     present->scene_valid = get_client_surface_publication( surface, &present->generation,
                                                            &present->scene_generation,
                                                            &present->scene_toplevel,
                                                            &present->authoritative );
+    if (surface->hwnd &&
+        (!present->scene_valid || !surface->target_ready ||
+         surface->target_scene_toplevel != present->scene_toplevel ||
+         surface->target_scene_generation != present->scene_generation))
+    {
+        client_surface_update_present_locked( surface );
+        present->scene_valid = get_client_surface_publication( surface, &present->generation,
+                                                               &present->scene_generation,
+                                                               &present->scene_toplevel,
+                                                               &present->authoritative );
+    }
+    if (present->scene_valid && surface->target_ready)
+    {
+        surface->target_scene_toplevel = present->scene_toplevel;
+        surface->target_scene_generation = present->scene_generation;
+    }
     present->target_epoch = ReadAcquire64( &surface->target_epoch );
     present->lifecycle_seq = ReadAcquire( &surface->lifecycle_seq );
     present->target_ready = InterlockedCompareExchange( &surface->target_ready, 0, 0 );
     present->offscreen = InterlockedCompareExchange( &surface->offscreen, 0, 0 );
     present->external_completion = present->target_ready && present->offscreen && external_completion;
     if (present->target_ready && present->offscreen && !present->external_completion &&
-        !InterlockedCompareExchange( &surface->external_completion_count, 0, 0 ) &&
         surface->funcs->prepare_completion)
         present->driver_completion = surface->funcs->prepare_completion( surface );
-    else if (present->target_ready && present->offscreen && !present->external_completion &&
-             InterlockedCompareExchange( &surface->external_completion_count, 0, 0 ))
-        present->completion_coalesced = TRUE;
     pthread_mutex_unlock( &surface->present_lock );
 }
 
@@ -1511,11 +1614,6 @@ BOOL client_surface_complete_present_locked( struct client_surface *surface,
 {
     BOOL completed = submitted && present->target_ready;
 
-    /* A queued driver boundary owns the drawable.  Additional submissions
-     * are deliberately coalesced until that exact boundary is consumed; they
-     * must not manufacture a failure or acknowledge a publication epoch. */
-    if (submitted && present->completion_coalesced) return TRUE;
-
     if (!submitted && present->external_completion)
         present->completion_failed = TRUE;
 
@@ -1538,14 +1636,56 @@ BOOL client_surface_complete_present_locked( struct client_surface *surface,
             completed = FALSE;
         present->completion_failed = !completed;
     }
+    if (completed && InterlockedCompareExchange( &surface->active, 0, 0 ) &&
+        (!present->authoritative ||
+         !InterlockedCompareExchange( &surface->producer_claimed, 0, 0 )))
+    {
+        BOOL wake = FALSE;
+        HWND hwnd;
+        HWND toplevel;
+
+        /* Registration only advertises lifetime.  A surface becomes the
+         * producer after a real host presentation has completed, so an
+         * unused VkSurfaceKHR or drawable cannot take publication ownership
+         * merely by being created later.  Serialize the identity read and
+         * server transition with unregister/reuse; otherwise the latter can
+         * renew the token between the active test and this request. */
+        pthread_mutex_lock( &surface->present_lock );
+        hwnd = surface->hwnd;
+        if (!InterlockedCompareExchange( &surface->active, 0, 0 )) hwnd = NULL;
+        if (hwnd)
+        {
+            toplevel = set_client_surface_server_state( hwnd, surface,
+                                                        CLIENT_SURFACE_STATE_CLAIM,
+                                                        0, 0, &wake );
+            if (wake && toplevel)
+                NtUserPostMessage( toplevel, WM_WINE_UPDATEWINDOWSTATE, 0, 0 );
+            present->scene_valid = get_client_surface_publication( surface,
+                                                    &present->generation,
+                                                    &present->scene_generation,
+                                                    &present->scene_toplevel,
+                                                    &present->authoritative );
+            InterlockedExchange( &surface->producer_claimed,
+                                 present->authoritative );
+        }
+        pthread_mutex_unlock( &surface->present_lock );
+    }
     if (completed)
         completed = client_surface_end_present_internal( surface, present->generation,
                                                          expected_size, TRUE, present );
     if (present->external_completion_registered)
     {
+        BOOL wake = FALSE;
+
         assert( InterlockedCompareExchange( &surface->external_completion_count, 0, 0 ) > 0 );
-        InterlockedDecrement( &surface->external_completion_count );
+        if (present->driver_completion)
+        {
+            assert( surface->driver_completion_count > 0 );
+            if (!--surface->driver_completion_count) wake = TRUE;
+        }
+        if (!InterlockedDecrement( &surface->external_completion_count )) wake = TRUE;
         present->external_completion_registered = FALSE;
+        if (wake) pthread_cond_broadcast( &surface->completion_cond );
     }
     return completed;
 }
@@ -1567,7 +1707,6 @@ BOOL client_surface_complete_present( struct client_surface *surface,
                                       BOOL submitted, BOOL external_completed,
                                       const SIZE *expected_size, DWORD timeout )
 {
-    HWND retry_toplevel;
     BOOL ret;
 
     /* An armed driver monitor has exclusive ownership through
@@ -1576,7 +1715,6 @@ BOOL client_surface_complete_present( struct client_surface *surface,
     if (submitted && present->driver_completion && present->offscreen &&
         surface->funcs->wait_completion && timeout)
     {
-        present->driver_completion = FALSE;
         present->external_completion = TRUE;
         client_surface_add_ref( surface );
         client_surface_defer_present( surface, present, TRUE, expected_size,
@@ -1594,8 +1732,6 @@ BOOL client_surface_complete_present( struct client_surface *surface,
                                                   external_completed, expected_size, timeout );
     client_surface_unlock_present( surface );
     present->completion_locked = FALSE;
-    retry_toplevel = present->completion_failed ? present->scene_toplevel : 0;
-    if (retry_toplevel) client_surface_geometry_ready( retry_toplevel );
     return ret;
 }
 
@@ -1613,6 +1749,8 @@ struct client_surface_completion_job
 };
 
 #define CLIENT_SURFACE_MAX_DEFERRED_PRESENTS 64
+#define CLIENT_SURFACE_MAX_PROCESS_DEFERRED_PRESENTS 1024
+static LONG client_surface_deferred_present_count;
 
 void client_surface_begin_inline_completion( struct client_surface *surface,
                                              struct client_surface_present *present )
@@ -1628,6 +1766,7 @@ void client_surface_begin_inline_completion( struct client_surface *surface,
         present->completion_locked = TRUE;
     }
     InterlockedIncrement( &surface->external_completion_count );
+    if (present->driver_completion) surface->driver_completion_count++;
     present->external_completion_registered = TRUE;
     present->completion_locked = FALSE;
     client_surface_unlock_present( surface );
@@ -1668,6 +1807,7 @@ static void CALLBACK client_surface_completion_worker( void *context )
             WARN( "deferred client-surface composition did not complete for %s\n",
                   debugstr_client_surface( surface ) );
         job->release( job->context );
+        InterlockedDecrement( &client_surface_deferred_present_count );
         free( job );
     }
 }
@@ -1688,6 +1828,21 @@ void client_surface_defer_present( struct client_surface *surface,
 
     if (!(job = malloc( sizeof(*job) )))
     {
+        client_surface_begin_inline_completion( surface, present );
+        elapsed = NtGetTickCount() - present->submission_time;
+        remaining = elapsed < CLIENT_SURFACE_PRESENT_TIMEOUT ?
+                    CLIENT_SURFACE_PRESENT_TIMEOUT - elapsed : 0;
+        completed = submitted && wait( context, remaining );
+        client_surface_complete_present( surface, present, submitted, completed,
+                                         expected_size, 0 );
+        release( context );
+        return;
+    }
+    if (InterlockedIncrement( &client_surface_deferred_present_count ) >
+        CLIENT_SURFACE_MAX_PROCESS_DEFERRED_PRESENTS)
+    {
+        InterlockedDecrement( &client_surface_deferred_present_count );
+        free( job );
         client_surface_begin_inline_completion( surface, present );
         elapsed = NtGetTickCount() - present->submission_time;
         remaining = elapsed < CLIENT_SURFACE_PRESENT_TIMEOUT ?
@@ -1728,10 +1883,12 @@ void client_surface_defer_present( struct client_surface *surface,
         client_surface_complete_present( surface, present, submitted, completed,
                                          expected_size, 0 );
         release( context );
+        InterlockedDecrement( &client_surface_deferred_present_count );
         free( job );
         return;
     }
     InterlockedIncrement( &surface->external_completion_count );
+    if (job->present.driver_completion) surface->driver_completion_count++;
     job->present.external_completion_registered = TRUE;
     job->present.completion_locked = FALSE;
     list_add_tail( &surface->completion_queue, &job->entry );
@@ -1839,6 +1996,13 @@ void recompose_client_surface( HWND hwnd, UINT_PTR identity )
          (!InterlockedCompareExchange( &selected->server_cached, 0, 0 ) ||
           !InterlockedCompareExchange( &selected->content_valid, 0, 0 ))))
     {
+        /* The queued notification is generation-neutral, but its HWND names
+         * the top-level which owned the surface when it was posted.  Queue
+         * removal has released notification_pending; immediately route the
+         * current generation after a cross-top-level reparent instead of
+         * leaving the new hierarchy to its publication timeout. */
+        if (surface_hwnd && geometry.toplevel && geometry.toplevel != toplevel)
+            client_surface_geometry_ready( geometry.toplevel );
         client_surface_release( selected );
         return;
     }
@@ -1911,9 +2075,63 @@ void client_surface_end_publish( HWND hwnd, UINT64 generation, UINT64 scene_gene
                                      generation, scene_generation, NULL );
 }
 
+BOOL client_surface_begin_prepare( HWND hwnd, UINT64 *scene_generation )
+{
+    BOOL prepare = FALSE;
+
+    *scene_generation = 0;
+    SERVER_START_REQ( set_client_surface_state )
+    {
+        req->handle = wine_server_user_handle( hwnd );
+        req->surface = 0;
+        req->flags = CLIENT_SURFACE_STATE_PREPARE_BEGIN;
+        req->generation = 0;
+        req->scene_generation = 0;
+        if (!wine_server_call( req ) && reply->publish)
+        {
+            *scene_generation = reply->scene_generation;
+            prepare = TRUE;
+        }
+    }
+    SERVER_END_REQ;
+    return prepare;
+}
+
+void client_surface_end_prepare( HWND hwnd, UINT64 scene_generation )
+{
+    set_client_surface_server_state( hwnd, NULL, CLIENT_SURFACE_STATE_PREPARE_COMMIT,
+                                     0, scene_generation, NULL );
+}
+
 BOOL client_surface_update( struct client_surface *surface )
 {
-    return client_surface_update_now( surface );
+    UINT64 scene_generation;
+    HWND scene_toplevel;
+    BOOL scene_valid, ret = FALSE;
+
+    client_surface_lock_present( surface );
+    client_surface_wait_driver_completion_locked( surface );
+    pthread_mutex_lock( &surface->present_lock );
+    scene_valid = get_client_surface_publication( surface, NULL, &scene_generation,
+                                                  &scene_toplevel, NULL );
+    if (scene_valid && surface->target_ready &&
+        surface->target_scene_toplevel == scene_toplevel &&
+        surface->target_scene_generation == scene_generation)
+        ret = TRUE;
+    else if (surface->hwnd)
+    {
+        ret = client_surface_update_present_locked( surface );
+        scene_valid = get_client_surface_publication( surface, NULL, &scene_generation,
+                                                      &scene_toplevel, NULL );
+        if (ret && scene_valid)
+        {
+            surface->target_scene_toplevel = scene_toplevel;
+            surface->target_scene_generation = scene_generation;
+        }
+    }
+    pthread_mutex_unlock( &surface->present_lock );
+    client_surface_unlock_present( surface );
+    return ret;
 }
 
 BOOL client_surface_get_size( struct client_surface *surface, SIZE *virtual_size, SIZE *monitor_size )
@@ -1934,8 +2152,8 @@ BOOL client_surface_get_size( struct client_surface *surface, SIZE *virtual_size
 
 void use_window_client_surface( struct client_surface *surface, BOOL use )
 {
-    HWND hwnd = 0, toplevel;
-    BOOL cache = FALSE, invalid = FALSE, wake = FALSE;
+    HWND hwnd = 0, toplevel = 0;
+    BOOL cache = FALSE, invalid = FALSE, renew_identity = FALSE, wake = FALSE;
     UINT flags;
 
     TRACE( "surface %s, use %u\n", debugstr_client_surface( surface ), use );
@@ -1985,6 +2203,11 @@ void use_window_client_surface( struct client_surface *surface, BOOL use )
             flags |= CLIENT_SURFACE_STATE_UNCACHE;
             InterlockedExchange( &surface->server_cached, FALSE );
         }
+        if (!(flags & CLIENT_SURFACE_STATE_CACHE))
+        {
+            InterlockedExchange( &surface->producer_claimed, FALSE );
+            renew_identity = TRUE;
+        }
         /* Publish the cached ownership before retiring the active ownership.
          * Lock-free begin_present() must not observe a gap between the two;
          * end_present() waits on present_lock until the server transition has
@@ -2006,6 +2229,10 @@ void use_window_client_surface( struct client_surface *surface, BOOL use )
          * be caused by an allocation failure while the HWND is still alive. */
         if (!toplevel && !NtUserIsWindow( hwnd )) invalid = TRUE;
     }
+    /* Keep the old token when the server request failed.  Re-registering the
+     * same identity can then repair client/server membership instead of
+     * leaking an unreachable active ref until process teardown. */
+    if (renew_identity && toplevel) renew_client_surface_identity( surface );
     pthread_mutex_unlock( &surface->present_lock );
 
     if (invalid) detach_client_surfaces( hwnd );
@@ -2027,6 +2254,8 @@ struct client_surface *get_unused_client_surface( HWND hwnd, int format, BOOL ra
     {
         if (candidate->hwnd != hwnd || candidate->format != format || candidate->raw != raw) continue;
         surface = candidate;
+        client_surface_lock_present( surface );
+        client_surface_wait_all_completions_locked( surface );
         pthread_mutex_lock( &surface->present_lock );
         list_remove( &surface->entry ); /* take over its reference */
         list_init( &surface->entry );
@@ -2046,6 +2275,7 @@ struct client_surface *get_unused_client_surface( HWND hwnd, int format, BOOL ra
         if (InterlockedCompareExchangePointer( (void **)&surface->hwnd, NULL, NULL ))
             client_surface_update_present_locked( surface ); /* refresh before creating GL/VK drawable */
         pthread_mutex_unlock( &surface->present_lock );
+        client_surface_unlock_present( surface );
         TRACE( "Reusing surface %s\n", debugstr_client_surface( surface ) );
     }
     return surface ? surface : user_driver->pCreateClientSurface( hwnd, format, raw );
@@ -3898,7 +4128,8 @@ static BOOL apply_window_pos( HWND hwnd, HWND insert_after, UINT swp_flags, stru
     {
         req->handle        = wine_server_user_handle( hwnd );
         req->previous      = wine_server_user_handle( insert_after );
-        req->swp_flags     = swp_flags & ~WINE_SWP_CLIENT_SURFACE_PUBLISH;
+        req->swp_flags     = swp_flags & ~(WINE_SWP_CLIENT_SURFACE_PUBLISH |
+                                           WINE_SWP_CLIENT_SURFACE_PREPARE);
         req->window        = wine_server_rectangle( new_rects->window );
         req->client        = wine_server_rectangle( new_rects->client );
         if (!EqualRect( &new_rects->window, &new_rects->visible ) || new_surface || valid_rects)
@@ -6529,6 +6760,11 @@ void update_window_state( HWND hwnd )
 BOOL publish_window_state( HWND hwnd )
 {
     return update_window_state_flags( hwnd, WINE_SWP_CLIENT_SURFACE_PUBLISH );
+}
+
+BOOL prepare_window_client_surfaces( HWND hwnd )
+{
+    return update_window_state_flags( hwnd, WINE_SWP_CLIENT_SURFACE_PREPARE );
 }
 
 void set_window_client_surface_backing( HWND hwnd, BOOL enable )

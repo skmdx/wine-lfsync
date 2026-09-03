@@ -339,7 +339,7 @@ void free_msg_queue( struct thread *thread )
     retry = remove_client_surface_notifications( queue );
     thread->queue = NULL;
     release_object( queue );
-    if (retry) retry_process_client_surface_notifications( thread->process );
+    if (retry) retry_process_client_surface_notifications( thread->process, 0 );
 }
 
 /* synchronize thread input keystate with the desktop */
@@ -1014,7 +1014,7 @@ static void remove_queue_message( struct msg_queue *queue, struct message *msg,
     case POST_MESSAGE:
         if (msg->msg == WM_WINE_UPDATEWINDOWSTATE &&
             msg->wparam == WINE_UPDATE_CLIENT_SURFACES)
-            client_surface_notification_removed( queue->process, msg->win, msg->lparam );
+            client_surface_notification_removed( queue->process, msg->lparam );
         if (list_empty( &queue->msg_list[kind] ) && !queue->quit_message)
             clear_queue_bits( queue, QS_POSTMESSAGE|QS_ALLPOSTMESSAGE );
         if (msg->msg == WM_HOTKEY && --queue->hotkey_count == 0)
@@ -2849,7 +2849,7 @@ void queue_cleanup_window( struct thread *thread, user_handle_t win )
 {
     struct msg_queue *queue = thread->queue;
     struct list *ptr;
-    int i;
+    int i, retry = 0;
 
     if (!queue) return;
 
@@ -2882,6 +2882,9 @@ void queue_cleanup_window( struct thread *thread, user_handle_t win )
             struct message *msg = LIST_ENTRY( ptr, struct message, entry );
             if (msg->win == win)
             {
+                if (i == POST_MESSAGE && msg->msg == WM_WINE_UPDATEWINDOWSTATE &&
+                    msg->wparam == WINE_UPDATE_CLIENT_SURFACES)
+                    retry = 1;
                 if (msg->msg == WM_QUIT && !queue->quit_message)
                 {
                     queue->quit_message = 1;
@@ -2891,6 +2894,8 @@ void queue_cleanup_window( struct thread *thread, user_handle_t win )
             }
         }
     }
+
+    if (retry) retry_process_client_surface_notifications( queue->process, win );
 
     thread_input_cleanup_window( queue, win );
 }

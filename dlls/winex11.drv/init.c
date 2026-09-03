@@ -30,6 +30,7 @@
 #include <stdarg.h>
 #include <string.h>
 #include <assert.h>
+#include <time.h>
 
 #include "windef.h"
 #include "winbase.h"
@@ -63,6 +64,10 @@ static pthread_once_t xdamage_once = PTHREAD_ONCE_INIT;
 static pthread_mutex_t xdamage_lock = PTHREAD_MUTEX_INITIALIZER;
 static Display *xdamage_display;
 static int xdamage_event_base;
+#define XDAMAGE_SURFACE_BUCKETS 256
+static struct x11drv_client_surface *xdamage_surfaces[XDAMAGE_SURFACE_BUCKETS];
+static BOOL xdamage_dispatching;
+static void insert_xdamage_surface_locked( struct x11drv_client_surface *surface );
 
 static void init_xdamage(void)
 {
@@ -308,15 +313,28 @@ static void x11drv_client_surface_destroy( struct client_surface *client )
     TRACE( "%s\n", debugstr_client_surface( client ) );
 
     x11drv_client_surface_abandon_completion( client );
+    if (surface->damage_cond_initialized) pthread_cond_destroy( &surface->damage_cond );
     if (surface->colormap != default_colormap) XFreeColormap( gdi_display, surface->colormap );
     if (surface->window) destroy_client_window( hwnd, surface->window );
     if (surface->hdc_dst) NtGdiDeleteObjectApp( surface->hdc_dst );
     if (surface->hdc_src) NtGdiDeleteObjectApp( surface->hdc_src );
 }
 
+#if defined(HAVE_X11_EXTENSIONS_XDAMAGE_H) && defined(SONAME_LIBXDAMAGE)
+static int xdamage_resource_error( Display *display, XErrorEvent *event, void *arg )
+{
+    int *error = arg;
+
+    *error = event->error_code;
+    return 1;
+}
+#endif
+
 static BOOL x11drv_client_surface_init_completion( struct x11drv_client_surface *surface )
 {
 #if defined(HAVE_X11_EXTENSIONS_XDAMAGE_H) && defined(SONAME_LIBXDAMAGE)
+    int error = 0;
+
     if (surface->completion_broken) return FALSE;
     if (surface->damage) return TRUE;
     pthread_once( &xdamage_once, init_xdamage );
@@ -326,8 +344,15 @@ static BOOL x11drv_client_surface_init_completion( struct x11drv_client_surface 
      * shared event connection creates a Damage object for that XID. */
     XSync( gdi_display, False );
     pthread_mutex_lock( &xdamage_lock );
+    X11DRV_expect_error( xdamage_display, xdamage_resource_error, &error );
     surface->damage = pXDamageCreate( xdamage_display, surface->window, XDamageReportNonEmpty );
-    if (surface->damage) XSync( xdamage_display, False );
+    XSync( xdamage_display, False );
+    X11DRV_check_error();
+    if (error) surface->damage = 0;
+    else if (surface->damage)
+    {
+        insert_xdamage_surface_locked( surface );
+    }
     pthread_mutex_unlock( &xdamage_lock );
     return !!surface->damage;
 #else
@@ -336,20 +361,80 @@ static BOOL x11drv_client_surface_init_completion( struct x11drv_client_surface 
 }
 
 #if defined(HAVE_X11_EXTENSIONS_XDAMAGE_H) && defined(SONAME_LIBXDAMAGE)
-static Bool match_client_surface_damage( Display *display, XEvent *event, XPointer arg )
+static unsigned int xdamage_surface_hash( XID damage )
 {
-    XID damage = (XID)(UINT_PTR)arg;
+    unsigned long value = damage;
 
-    return event->type == xdamage_event_base + XDamageNotify &&
-           ((XDamageNotifyEvent *)event)->damage == damage;
+    value ^= value >> 16;
+    return value & (XDAMAGE_SURFACE_BUCKETS - 1);
+}
+
+static struct x11drv_client_surface *find_xdamage_surface_locked( XID damage )
+{
+    struct x11drv_client_surface *surface;
+
+    for (surface = xdamage_surfaces[xdamage_surface_hash( damage )]; surface;
+         surface = surface->damage_next)
+        if (surface->damage == damage) return surface;
+    return NULL;
+}
+
+static void insert_xdamage_surface_locked( struct x11drv_client_surface *surface )
+{
+    unsigned int bucket = xdamage_surface_hash( surface->damage );
+
+    surface->damage_next = xdamage_surfaces[bucket];
+    xdamage_surfaces[bucket] = surface;
+}
+
+static void remove_xdamage_surface_locked( struct x11drv_client_surface *surface )
+{
+    struct x11drv_client_surface **cursor;
+
+    cursor = &xdamage_surfaces[xdamage_surface_hash( surface->damage )];
+    while (*cursor && *cursor != surface) cursor = &(*cursor)->damage_next;
+    if (*cursor) *cursor = surface->damage_next;
+    surface->damage_next = NULL;
+}
+
+static void dispatch_xdamage_events_locked(void)
+{
+    XEvent event;
+
+    while (XPending( xdamage_display ))
+    {
+        struct x11drv_client_surface *surface;
+
+        XNextEvent( xdamage_display, &event );
+        if (event.type != xdamage_event_base + XDamageNotify) continue;
+        surface = find_xdamage_surface_locked( ((XDamageNotifyEvent *)&event)->damage );
+        if (!surface) continue;
+        surface->completion_ready = TRUE;
+        pthread_cond_broadcast( &surface->damage_cond );
+    }
+}
+
+static void wake_xdamage_dispatcher_locked(void)
+{
+    struct x11drv_client_surface *surface;
+    unsigned int i;
+
+    for (i = 0; i < ARRAY_SIZE(xdamage_surfaces); ++i)
+        for (surface = xdamage_surfaces[i]; surface; surface = surface->damage_next)
+            if (surface->completion_waiting && !surface->completion_ready)
+            {
+                pthread_cond_signal( &surface->damage_cond );
+                return;
+            }
 }
 
 static BOOL take_client_surface_damage_locked( struct x11drv_client_surface *surface )
 {
-    XEvent event;
+    dispatch_xdamage_events_locked();
+    if (!surface->completion_ready) return FALSE;
 
-    return XCheckIfEvent( xdamage_display, &event, match_client_surface_damage,
-                          (XPointer)(UINT_PTR)surface->damage );
+    surface->completion_ready = FALSE;
+    return TRUE;
 }
 #endif
 
@@ -402,13 +487,15 @@ static void x11drv_client_surface_abandon_completion( struct client_surface *cli
     if (!surface->damage) return;
 
     pthread_mutex_lock( &xdamage_lock );
+    remove_xdamage_surface_locked( surface );
     /* Synchronize and drain before freeing the ID so a queued event cannot be
      * confused with a later Damage object if Xlib recycles the XID. */
     XSync( xdamage_display, False );
-    while (take_client_surface_damage_locked( surface ));
+    dispatch_xdamage_events_locked();
+    surface->completion_ready = FALSE;
     pXDamageDestroy( xdamage_display, surface->damage );
     XSync( xdamage_display, False );
-    while (take_client_surface_damage_locked( surface ));
+    dispatch_xdamage_events_locked();
     surface->damage = 0;
     pthread_mutex_unlock( &xdamage_lock );
 #endif
@@ -422,6 +509,9 @@ static BOOL x11drv_client_surface_wait_completion( struct client_surface *client
 
     for (;;)
     {
+        DWORD elapsed, remaining;
+        int ret = 0;
+
         pthread_mutex_lock( &xdamage_lock );
         if (take_client_surface_damage_locked( surface ))
         {
@@ -430,30 +520,53 @@ static BOOL x11drv_client_surface_wait_completion( struct client_surface *client
             pthread_mutex_unlock( &xdamage_lock );
             return TRUE;
         }
-        pthread_mutex_unlock( &xdamage_lock );
+        elapsed = NtGetTickCount() - start;
+        remaining = elapsed < timeout ? timeout - elapsed : 0;
+        if (!remaining)
         {
-            struct pollfd pollfd = {ConnectionNumber( xdamage_display ), POLLIN, 0};
-            DWORD elapsed = NtGetTickCount() - start;
-            DWORD remaining = elapsed < timeout ? timeout - elapsed : 0;
-            /* Another waiter can move our event from the socket into Xlib's
-             * process-local queue.  Recheck that queue periodically even when
-             * the shared fd is no longer readable. */
-            int ret = poll( &pollfd, 1, (int)min( remaining, (DWORD)10 ) );
-
-            if (ret > 0 && pollfd.revents & POLLIN) continue;
-            if (ret < 0 && errno == EINTR) continue;
-            if (!ret && remaining > 10) continue;
-            if (!ret)
-                WARN( "timed out waiting for presentation completion for %s\n",
-                      debugstr_client_surface( client ) );
-            else
-                WARN( "failed waiting for presentation completion for %s, ret %d, revents %#x\n",
-                      debugstr_client_surface( client ), ret, pollfd.revents );
-            /* A late event from this timed-out submission is indistinguishable
-             * from the next frame.  Permanently retire this monitor rather
-             * than permitting completion ABA. */
+            pthread_mutex_unlock( &xdamage_lock );
+            WARN( "timed out waiting for presentation completion for %s\n",
+                  debugstr_client_surface( client ) );
             x11drv_client_surface_abandon_completion( client );
             return FALSE;
+        }
+
+        if (!xdamage_dispatching)
+        {
+            struct pollfd pollfd = {ConnectionNumber( xdamage_display ), POLLIN, 0};
+
+            /* Elect one waiter to service the dedicated Damage connection.
+             * Other surfaces sleep on their own condition instead of every
+             * worker scanning the same global Xlib event queue. */
+            xdamage_dispatching = TRUE;
+            pthread_mutex_unlock( &xdamage_lock );
+            ret = poll( &pollfd, 1, (int)min( remaining, (DWORD)10 ) );
+            pthread_mutex_lock( &xdamage_lock );
+            if (ret > 0 && pollfd.revents & POLLIN) dispatch_xdamage_events_locked();
+            xdamage_dispatching = FALSE;
+            wake_xdamage_dispatcher_locked();
+            pthread_mutex_unlock( &xdamage_lock );
+
+            if (ret < 0 && errno != EINTR)
+            {
+                WARN( "failed waiting for presentation completion for %s, ret %d, revents %#x\n",
+                      debugstr_client_surface( client ), ret, pollfd.revents );
+                x11drv_client_surface_abandon_completion( client );
+                return FALSE;
+            }
+        }
+        else
+        {
+            struct timespec abstime;
+
+            clock_gettime( CLOCK_REALTIME, &abstime );
+            abstime.tv_nsec += (long)(remaining % 1000) * 1000000;
+            abstime.tv_sec += remaining / 1000 + abstime.tv_nsec / 1000000000;
+            abstime.tv_nsec %= 1000000000;
+            surface->completion_waiting = TRUE;
+            pthread_cond_timedwait( &surface->damage_cond, &xdamage_lock, &abstime );
+            surface->completion_waiting = FALSE;
+            pthread_mutex_unlock( &xdamage_lock );
         }
     }
 #else
@@ -631,6 +744,27 @@ static BOOL x11drv_client_surface_update( struct client_surface *client )
     return client_surface_update_offscreen( hwnd, surface );
 }
 
+static BOOL copy_client_surface( struct x11drv_client_surface *surface, Drawable target,
+                                 const RECT *rect_dst, const RECT *rect_src, HRGN region )
+{
+    RECT rect;
+
+    if (get_dc_drawable( surface->hdc_dst, &rect ) != target || !EqualRect( &rect, rect_dst ))
+        set_dc_drawable( surface->hdc_dst, target, rect_dst, IncludeInferiors );
+    /* RGN_COPY with a null region clears a clip left by an earlier present. */
+    NtGdiExtSelectClipRgn( surface->hdc_dst, region, RGN_COPY );
+
+    if (rect_dst->right - rect_dst->left == rect_src->right - rect_src->left &&
+        rect_dst->bottom - rect_dst->top == rect_src->bottom - rect_src->top)
+        return NtGdiBitBlt( surface->hdc_dst, 0, 0, rect_dst->right - rect_dst->left,
+                            rect_dst->bottom - rect_dst->top, surface->hdc_src, 0, 0,
+                            SRCCOPY, 0, 0 );
+    return NtGdiStretchBlt( surface->hdc_dst, 0, 0, rect_dst->right - rect_dst->left,
+                            rect_dst->bottom - rect_dst->top, surface->hdc_src, 0, 0,
+                            rect_src->right - rect_src->left, rect_src->bottom - rect_src->top,
+                            SRCCOPY, 0 );
+}
+
 static BOOL X11DRV_client_surface_present( struct client_surface *client, HDC hdc,
                                            HRGN surface_region, BOOL flush )
 {
@@ -638,6 +772,7 @@ static BOOL X11DRV_client_surface_present( struct client_surface *client, HDC hd
     HWND hwnd = client->hwnd, toplevel = client->toplevel;
     RECT rect_dst = client->monitor_rect, rect_src, rect_src_dc, rect;
     Drawable window;
+    Pixmap backing;
     BOOL ret;
     HRGN region;
 
@@ -654,6 +789,15 @@ static BOOL X11DRV_client_surface_present( struct client_surface *client, HDC hd
 
     window = X11DRV_get_whole_window( toplevel );
     if (!window || !surface->hdc_src || !surface->hdc_dst) return FALSE;
+    if (!surface->composition_backing ||
+        surface->composition_toplevel != client->composition_toplevel ||
+        surface->composition_scene_generation != client->composition_scene_generation)
+    {
+        surface->composition_toplevel = client->composition_toplevel;
+        surface->composition_scene_generation = client->composition_scene_generation;
+        surface->composition_backing = X11DRV_get_client_surface_backing( toplevel );
+    }
+    backing = surface->composition_backing;
 
     /* Exclusive fullscreen ignores normal window clipping. */
     if (hwnd == toplevel && NtUserGetPresentRect( toplevel, &rect, -1 /* raw dpi */ )) region = 0;
@@ -680,20 +824,13 @@ static BOOL X11DRV_client_surface_present( struct client_surface *client, HDC hd
         !EqualRect( &rect, &rect_src_dc ))
         set_dc_drawable( surface->hdc_src, surface->window, &rect_src_dc, IncludeInferiors );
 
-    if (get_dc_drawable( surface->hdc_dst, &rect ) != window || !EqualRect( &rect, &rect_dst ))
-        set_dc_drawable( surface->hdc_dst, window, &rect_dst, IncludeInferiors );
-    /* RGN_COPY with a null region clears a clip left by an earlier present. */
-    NtGdiExtSelectClipRgn( surface->hdc_dst, region, RGN_COPY );
-
-    if (rect_dst.right - rect_dst.left == rect_src.right - rect_src.left &&
-        rect_dst.bottom - rect_dst.top == rect_src.bottom - rect_src.top)
-        ret = NtGdiBitBlt( surface->hdc_dst, 0, 0, rect_dst.right - rect_dst.left,
-                           rect_dst.bottom - rect_dst.top, surface->hdc_src, 0, 0, SRCCOPY, 0, 0 );
-    else
-        ret = NtGdiStretchBlt( surface->hdc_dst, 0, 0, rect_dst.right - rect_dst.left,
-                               rect_dst.bottom - rect_dst.top, surface->hdc_src, 0, 0,
-                               rect_src.right - rect_src.left, rect_src.bottom - rect_src.top,
-                               SRCCOPY, 0 );
+    /* Scene generations are never written into the visible host piecemeal.
+     * Steady frames keep the same backing current, then update the visible
+     * region; a live or staged generation becomes visible only in the owner
+     * process after all renderer commits have reached the server. */
+    ret = backing ? copy_client_surface( surface, backing, &rect_dst, &rect_src, region ) : TRUE;
+    if (ret && (!flush || !backing))
+        ret = copy_client_surface( surface, window, &rect_dst, &rect_src, region );
     if (ret)
     {
         /* A staged generation may aggregate surfaces from several renderer
@@ -745,6 +882,8 @@ struct client_surface *X11DRV_CreateClientSurface( HWND hwnd, int format, BOOL r
 
     if (!(surface = client_surface_create( sizeof(*surface), &x11drv_client_surface_funcs, hwnd, format, raw ))) goto failed;
     surface->colormap = colormap;
+    if (pthread_cond_init( &surface->damage_cond, NULL )) goto failed;
+    surface->damage_cond_initialized = TRUE;
     rect = raw ? surface->client.monitor_rect : surface->client.virtual_rect;
     if (!(surface->window = create_client_window( hwnd, rect, &visual, colormap ))) goto failed;
     TRACE( "Created %s for client window %lx\n", debugstr_client_surface( &surface->client ), surface->window );

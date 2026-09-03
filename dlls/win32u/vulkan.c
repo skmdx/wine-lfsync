@@ -2309,13 +2309,15 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
         {
             BOOL completed;
             BOOL external_completed = FALSE;
+            DWORD elapsed = NtGetTickCount() - presents[i].submission_time;
+            DWORD remaining = elapsed < CLIENT_SURFACE_PRESENT_TIMEOUT ?
+                              CLIENT_SURFACE_PRESENT_TIMEOUT - elapsed : 0;
 
-            if (compose && use_internal_present_wait)
+            if (compose && presents[i].offscreen && use_internal_present_wait)
             {
                 struct vulkan_present_completion fallback = {device, swapchain, present_ids[i]};
                 client_surface_begin_inline_completion( surface->client, &presents[i] );
-                external_completed = wait_vulkan_present_completion(
-                    &fallback, CLIENT_SURFACE_PRESENT_TIMEOUT );
+                external_completed = wait_vulkan_present_completion( &fallback, remaining );
             }
 
             if (use_internal_present_wait)
@@ -2324,7 +2326,7 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
             else
                 completed = client_surface_complete_present_locked( surface->client, &presents[i],
                                                                     compose, FALSE, &expected_size,
-                                                                    CLIENT_SURFACE_PRESENT_TIMEOUT );
+                                                                    remaining );
             if (!completed && compose)
             {
                 /* The window changed after the post-present check, or the
