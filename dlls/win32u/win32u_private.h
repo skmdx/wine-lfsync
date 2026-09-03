@@ -338,6 +338,8 @@ extern HWND get_taskman_window(void);
 extern BOOL is_client_surface_window( struct client_surface *surface, HWND hwnd );
 extern BOOL client_surface_update( struct client_surface *surface );
 extern BOOL client_surface_get_size( struct client_surface *surface, SIZE *virtual_size, SIZE *monitor_size );
+extern void client_surface_register_external_completion_locked( struct client_surface *surface,
+                                                                 struct client_surface_present *present );
 extern void use_window_client_surface( struct client_surface *surface, BOOL use );
 extern struct client_surface *get_unused_client_surface( HWND hwnd, int format, BOOL raw );
 extern HICON get_window_icon_info( HWND hwnd, UINT type, HICON icon, ICONINFO *ret );

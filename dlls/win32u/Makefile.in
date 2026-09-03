@@ -15,6 +15,7 @@ SOURCES = \
 	class.c \
 	clipboard.c \
 	client_surface.c \
+	client_surface_completion.c \
 	clipping.c \
 	cursoricon.c \
 	d3dkmt.c \
