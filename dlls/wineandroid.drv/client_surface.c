@@ -17,10 +17,7 @@
 
 #include "android.h"
 
-static const struct client_surface_backend android_client_surface_backend = {0};
-
 struct client_surface *ANDROID_CreateClientSurface( HWND hwnd, int pixel_format, BOOL raw )
 {
-    return client_surface_create( sizeof(struct client_surface), &android_client_surface_backend,
-                                  hwnd, pixel_format, raw );
+    return client_surface_create( sizeof(struct client_surface), NULL, hwnd, pixel_format, raw );
 }

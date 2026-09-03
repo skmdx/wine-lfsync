@@ -23,6 +23,8 @@
 
 WINE_DEFAULT_DEBUG_CHANNEL(win);
 
+static const struct client_surface_backend default_client_surface_backend;
+
 static pthread_mutex_t surfaces_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t surface_index_lock = PTHREAD_MUTEX_INITIALIZER;
 static struct list client_surfaces = LIST_INIT( client_surfaces ); /* non-owning used client surfaces */
@@ -55,6 +57,23 @@ static BOOL client_surface_backend_present( struct client_surface *surface, HDC 
 {
     return !surface->backend->present ||
            surface->backend->present( surface, hdc, surface_region, flush );
+}
+
+static BOOL client_surface_backend_prepare_completion( struct client_surface *surface )
+{
+    return surface->backend->completion && surface->backend->completion->prepare( surface );
+}
+
+static BOOL client_surface_backend_wait_completion( struct client_surface *surface, DWORD timeout )
+{
+    assert( surface->backend->completion );
+    return surface->backend->completion->wait( surface, timeout );
+}
+
+static void client_surface_backend_abandon_completion( struct client_surface *surface )
+{
+    if (surface->backend->completion && surface->backend->completion->abandon)
+        surface->backend->completion->abandon( surface );
 }
 
 static unsigned int client_surface_backend_state_flags( const struct client_surface *surface )
@@ -842,9 +861,10 @@ void *client_surface_create( UINT size, const struct client_surface_backend *bac
     HWND toplevel = NtUserGetAncestor( hwnd, GA_ROOT );
     struct client_surface *surface;
 
-    if (!backend || size < sizeof(*surface) ||
-        !!backend->prepare_completion != !!backend->wait_completion)
-        return NULL;
+    if (size < sizeof(*surface)) return NULL;
+    if (!backend) backend = &default_client_surface_backend;
+    if (backend->completion &&
+        (!backend->completion->prepare || !backend->completion->wait)) return NULL;
     if (!(surface = calloc( 1, size ))) return NULL;
     if (pthread_mutex_init( &surface->present_lock, NULL ))
     {
@@ -1404,9 +1424,8 @@ void client_surface_prepare_present_locked( struct client_surface *surface,
     present->target_ready = InterlockedCompareExchange( &surface->target_ready, 0, 0 );
     present->offscreen = InterlockedCompareExchange( &surface->offscreen, 0, 0 );
     present->external_completion = present->target_ready && present->offscreen && external_completion;
-    if (present->target_ready && present->offscreen && !present->external_completion &&
-        surface->backend->prepare_completion)
-        present->driver_completion = surface->backend->prepare_completion( surface );
+    if (present->target_ready && present->offscreen && !present->external_completion)
+        present->driver_completion = client_surface_backend_prepare_completion( surface );
     pthread_mutex_unlock( &surface->present_lock );
 }
 
@@ -1500,16 +1519,15 @@ BOOL client_surface_complete_present_locked( struct client_surface *surface,
         /* A failed WSI call does not prove that no native request escaped.
          * Retire the armed boundary so a delayed request cannot satisfy the
          * next transaction's completion wait. */
-        if (surface->backend->abandon_completion)
-            surface->backend->abandon_completion( surface );
+        client_surface_backend_abandon_completion( surface );
         present->completion_failed = TRUE;
     }
     if (completed && present->offscreen)
     {
         if (present->external_completion)
             completed = external_completed;
-        else if (present->driver_completion && surface->backend->wait_completion)
-            completed = surface->backend->wait_completion( surface, timeout );
+        else if (present->driver_completion)
+            completed = client_surface_backend_wait_completion( surface, timeout );
         else
             completed = FALSE;
         present->completion_failed = !completed;
@@ -1572,7 +1590,7 @@ static BOOL wait_deferred_driver_completion( void *context, DWORD timeout )
 {
     struct client_surface *surface = context;
 
-    return surface->backend->wait_completion( surface, timeout );
+    return client_surface_backend_wait_completion( surface, timeout );
 }
 
 static void release_deferred_driver_completion( void *context )
@@ -1590,8 +1608,7 @@ BOOL client_surface_complete_present( struct client_surface *surface,
     /* An armed driver monitor has exclusive ownership through
      * completion_lock.  Transfer that ownership to the same bounded queue as
      * explicit GLX/EGL/Vulkan completion IDs instead of blocking the caller. */
-    if (submitted && present->driver_completion && present->offscreen &&
-        surface->backend->wait_completion && timeout)
+    if (submitted && present->driver_completion && present->offscreen && timeout)
     {
         present->external_completion = TRUE;
         client_surface_add_ref( surface );

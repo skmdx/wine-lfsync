@@ -878,14 +878,9 @@ static BOOL nulldrv_GetWindowStateUpdates( HWND hwnd, UINT *state_cmd, UINT *swp
     return FALSE;
 }
 
-static const struct client_surface_backend nulldrv_surface_backend =
-{
-    .caps = 0,
-};
-
 static struct client_surface *nulldrv_CreateClientSurface( HWND hwnd, int pixel_format, BOOL raw )
 {
-    return client_surface_create( sizeof(struct client_surface), &nulldrv_surface_backend, hwnd, pixel_format, raw );
+    return client_surface_create( sizeof(struct client_surface), NULL, hwnd, pixel_format, raw );
 }
 
 static BOOL nulldrv_CreateWindowSurface( HWND hwnd, BOOL layered, const RECT *surface_rect, struct window_surface **surface )

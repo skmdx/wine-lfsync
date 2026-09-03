@@ -657,6 +657,13 @@ static BOOL x11drv_client_surface_wait_completion( struct client_surface *client
 #endif
 }
 
+static const struct client_surface_completion_ops x11drv_client_surface_completion_ops =
+{
+    .prepare = x11drv_client_surface_prepare_completion,
+    .wait = x11drv_client_surface_wait_completion,
+    .abandon = x11drv_client_surface_abandon_completion,
+};
+
 static void x11drv_client_surface_detach( struct client_surface *client )
 {
     struct x11drv_client_surface *surface = impl_from_client_surface( client );
@@ -936,9 +943,7 @@ static const struct client_surface_backend x11drv_client_surface_backend =
     .detach = x11drv_client_surface_detach,
     .update = x11drv_client_surface_update,
     .present = X11DRV_client_surface_present,
-    .prepare_completion = x11drv_client_surface_prepare_completion,
-    .wait_completion = x11drv_client_surface_wait_completion,
-    .abandon_completion = x11drv_client_surface_abandon_completion,
+    .completion = &x11drv_client_surface_completion_ops,
 };
 
 static int visual_class_alloc( int class )

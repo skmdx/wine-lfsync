@@ -253,6 +253,15 @@ enum client_surface_backend_caps
     CLIENT_SURFACE_BACKEND_NATIVE_WRITE_LEASE = 0x02,
 };
 
+struct client_surface_completion_ops
+{
+    /* arm and wait for a host presentation completion boundary */
+    BOOL (*prepare)( struct client_surface *surface );
+    BOOL (*wait)( struct client_surface *surface, DWORD timeout );
+    /* retire an armed boundary when host submission may have partially failed */
+    void (*abandon)( struct client_surface *surface );
+};
+
 struct client_surface_backend
 {
     unsigned int caps;
@@ -265,11 +274,7 @@ struct client_surface_backend
     BOOL (*update)( struct client_surface *surface );
     /* present the client surface if necessary, hdc != NULL when offscreen, called from render thread */
     BOOL (*present)( struct client_surface *surface, HDC hdc, HRGN surface_region, BOOL flush );
-    /* arm and wait for a host presentation completion boundary */
-    BOOL (*prepare_completion)( struct client_surface *surface );
-    BOOL (*wait_completion)( struct client_surface *surface, DWORD timeout );
-    /* retire an armed boundary when host submission may have partially failed */
-    void (*abandon_completion)( struct client_surface *surface );
+    const struct client_surface_completion_ops *completion;
 };
 
 struct client_surface_present
