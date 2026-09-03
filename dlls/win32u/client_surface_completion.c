@@ -16,7 +16,7 @@
 #include <assert.h>
 
 #include "ntstatus.h"
-#include "ntgdi_private.h"
+#include "client_surface.h"
 #include "wine/debug.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(win);
