@@ -258,6 +258,22 @@ struct client_surface_funcs
     BOOL (*present)( struct client_surface *surface, HDC hdc, HRGN surface_region, BOOL flush );
     /* notify the window owner after a staged composition commit */
     BOOL (*commit)( struct client_surface *surface, HWND toplevel );
+    /* arm and wait for a host presentation completion boundary */
+    BOOL (*prepare_completion)( struct client_surface *surface );
+    BOOL (*wait_completion)( struct client_surface *surface, DWORD timeout );
+    /* retire an armed boundary when host submission may have partially failed */
+    void (*abandon_completion)( struct client_surface *surface );
+};
+
+struct client_surface_present
+{
+    UINT64 generation;
+    LONG64 geometry_seq;
+    LONG lifecycle_seq;
+    BOOL offscreen;
+    BOOL external_completion;
+    BOOL driver_completion;
+    BOOL completion_failed;
 };
 
 struct client_surface
@@ -265,6 +281,7 @@ struct client_surface
     const struct client_surface_funcs *funcs;
     struct list                        entry;          /* entry in win32u managed list */
     pthread_mutex_t                    present_lock;   /* serializes driver operations for this surface */
+    pthread_mutex_t                    completion_lock; /* serializes host presentation completion tracking */
     LONG                               ref;            /* reference count */
     HWND                               hwnd;           /* window the surface was created for */
     int                                format;         /* pixel format of the surface */
@@ -274,12 +291,15 @@ struct client_surface
     LONG                               active;         /* registered as active with the Wine server */
     LONG                               content_valid;  /* complete content exists at the current size */
     LONG                               server_cached;  /* registered as a cached owner with the Wine server */
-    LONG64                             geometry_seq;   /* seqlock for the published geometry */
+    LONG64                             geometry_seq;   /* seqlock for the driver-ready geometry */
     LONG                               lifecycle_seq;  /* seqlock for detach and destruction */
     LONG64                             recompose_requested; /* latest requested recomposition generation */
     LONG                               recompose_scheduled; /* a recomposition consumer owns a reference */
     RECT                               virtual_rect;   /* virtual size and position in the toplevel ancestor, relative to its visible rect */
     RECT                               monitor_rect;   /* raw physical size and position in the toplevel ancestor, relative to its visible rect */
+    HWND                               ready_toplevel; /* toplevel whose driver update has completed */
+    RECT                               ready_virtual_rect; /* driver-ready virtual geometry */
+    RECT                               ready_monitor_rect; /* driver-ready raw physical geometry */
     BOOL                               raw;            /* use the raw physical position and size for the host client surface */
 };
 
@@ -287,9 +307,22 @@ W32KAPI void *client_surface_create( UINT size, const struct client_surface_func
 W32KAPI void client_surface_add_ref( struct client_surface *surface );
 W32KAPI void client_surface_release( struct client_surface *surface );
 W32KAPI void client_surface_present( struct client_surface *surface );
-W32KAPI UINT64 client_surface_begin_present( struct client_surface *surface );
-W32KAPI BOOL client_surface_end_present( struct client_surface *surface, UINT64 generation,
-                                         const SIZE *expected_size );
+W32KAPI void client_surface_prepare_present( struct client_surface *surface,
+                                             struct client_surface_present *present,
+                                             BOOL external_completion );
+W32KAPI BOOL client_surface_complete_present( struct client_surface *surface,
+                                              struct client_surface_present *present,
+                                              BOOL submitted, BOOL external_completed,
+                                              const SIZE *expected_size, DWORD timeout );
+W32KAPI void client_surface_lock_present( struct client_surface *surface );
+W32KAPI void client_surface_unlock_present( struct client_surface *surface );
+W32KAPI void client_surface_prepare_present_locked( struct client_surface *surface,
+                                                    struct client_surface_present *present,
+                                                    BOOL external_completion );
+W32KAPI BOOL client_surface_complete_present_locked( struct client_surface *surface,
+                                                     struct client_surface_present *present,
+                                                     BOOL submitted, BOOL external_completed,
+                                                     const SIZE *expected_size, DWORD timeout );
 W32KAPI void client_surface_geometry_ready( HWND hwnd );
 W32KAPI void client_surface_set_staged( HWND hwnd );
 W32KAPI void client_surface_bypass_staging( HWND hwnd );

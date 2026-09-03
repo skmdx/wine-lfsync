@@ -30,8 +30,6 @@
 #include "config.h"
 
 #include <assert.h>
-#include <errno.h>
-#include <poll.h>
 #include <stdlib.h>
 #include <string.h>
 #include <dlfcn.h>
@@ -42,9 +40,6 @@
 
 #include "ntstatus.h"
 #include "x11drv.h"
-#if defined(HAVE_X11_EXTENSIONS_XDAMAGE_H) && defined(SONAME_LIBXDAMAGE)
-#include <X11/extensions/Xdamage.h>
-#endif
 #include "xcomposite.h"
 #include "winternl.h"
 #include "wine/debug.h"
@@ -201,9 +196,6 @@ struct gl_drawable
 {
     struct opengl_drawable         base;
     GLXDrawable                    drawable;     /* drawable for rendering with GL */
-    Display                       *damage_display;
-    XID                            damage;
-    int                            damage_event_base;
 };
 
 static struct gl_drawable *impl_from_opengl_drawable( struct opengl_drawable *base )
@@ -223,12 +215,6 @@ static struct glx_pixel_format *pixel_formats;
 static int nb_pixel_formats;
 static const struct egl_platform *egl;
 static BOOL (*p_egl_describe_pixel_format)( int format, struct wgl_pixel_format *pf );
-#if defined(HAVE_X11_EXTENSIONS_XDAMAGE_H) && defined(SONAME_LIBXDAMAGE)
-static typeof(XDamageQueryExtension) *pXDamageQueryExtension;
-static typeof(XDamageCreate) *pXDamageCreate;
-static typeof(XDamageSubtract) *pXDamageSubtract;
-static pthread_once_t xdamage_once = PTHREAD_ONCE_INIT;
-#endif
 
 /* Selects the preferred GLX swap control method for use by wglSwapIntervalEXT */
 static enum glx_swap_control_method swap_control_method = GLX_SWAP_CONTROL_NONE;
@@ -483,25 +469,6 @@ static void x11drv_init_egl_platform( struct egl_platform *platform )
     egl = platform;
 }
 
-#if defined(HAVE_X11_EXTENSIONS_XDAMAGE_H) && defined(SONAME_LIBXDAMAGE)
-static void init_xdamage(void)
-{
-    void *handle = dlopen( SONAME_LIBXDAMAGE, RTLD_NOW );
-
-    if (!handle) return;
-    pXDamageQueryExtension = dlsym( handle, "XDamageQueryExtension" );
-    pXDamageCreate = dlsym( handle, "XDamageCreate" );
-    pXDamageSubtract = dlsym( handle, "XDamageSubtract" );
-    if (!pXDamageQueryExtension || !pXDamageCreate || !pXDamageSubtract)
-    {
-        pXDamageQueryExtension = NULL;
-        pXDamageCreate = NULL;
-        pXDamageSubtract = NULL;
-        dlclose( handle );
-    }
-}
-#endif
-
 static EGLConfig egl_config_for_format( int format )
 {
     return egl->configs[(format - 1) % egl->config_count];
@@ -535,33 +502,6 @@ BOOL visual_from_pixel_format( int format, XVisualInfo *visual )
         return TRUE;
     }
 }
-
-#if defined(HAVE_X11_EXTENSIONS_XDAMAGE_H) && defined(SONAME_LIBXDAMAGE)
-static void x11drv_surface_init_damage( struct gl_drawable *gl, Window window )
-{
-    pthread_once( &xdamage_once, init_xdamage );
-    if (!pXDamageQueryExtension) return;
-
-    XSync( gdi_display, False );
-    if (!(gl->damage_display = XOpenDisplay( DisplayString( gdi_display ) ))) return;
-
-    {
-        int error_base;
-
-        if (pXDamageQueryExtension( gl->damage_display, &gl->damage_event_base, &error_base ))
-            gl->damage = pXDamageCreate( gl->damage_display, window, XDamageReportNonEmpty );
-    }
-    if (!gl->damage)
-    {
-        XCloseDisplay( gl->damage_display );
-        gl->damage_display = NULL;
-    }
-    else XSync( gl->damage_display, False );
-}
-
-static void x11drv_surface_prepare_swap( struct gl_drawable *gl );
-static BOOL x11drv_surface_wait_swap( struct gl_drawable *gl );
-#endif
 
 static BOOL x11drv_egl_describe_pixel_format( int format, struct wgl_pixel_format *pf )
 {
@@ -597,10 +537,6 @@ static BOOL x11drv_egl_surface_create( struct client_surface *client, int format
         opengl_drawable_release( &gl->base );
         return FALSE;
     }
-
-#if defined(HAVE_X11_EXTENSIONS_XDAMAGE_H) && defined(SONAME_LIBXDAMAGE)
-    x11drv_surface_init_damage( gl, surface->window );
-#endif
 
     TRACE( "Created drawable %s with client window %lx\n", debugstr_opengl_drawable( &gl->base ), surface->window );
     XFlush( gdi_display );
@@ -951,7 +887,6 @@ static void x11drv_surface_destroy( struct opengl_drawable *base )
 
     TRACE( "drawable %s\n", debugstr_opengl_drawable( base ) );
 
-    if (gl->damage_display) XCloseDisplay( gl->damage_display );
     if (gl->drawable) pglXDestroyWindow( gdi_display, gl->drawable );
 }
 
@@ -1018,10 +953,6 @@ static BOOL x11drv_surface_create( struct client_surface *client, int format, st
         opengl_drawable_release( &gl->base );
         return FALSE;
     }
-
-#if defined(HAVE_X11_EXTENSIONS_XDAMAGE_H) && defined(SONAME_LIBXDAMAGE)
-    x11drv_surface_init_damage( gl, surface->window );
-#endif
 
     TRACE( "Created drawable %s with client window %lx\n", debugstr_opengl_drawable( &gl->base ), surface->window );
     XFlush( gdi_display );
@@ -1250,19 +1181,20 @@ static BOOL x11drv_make_current( struct opengl_drawable *draw_base, struct openg
 static void x11drv_surface_flush( struct opengl_drawable *base, UINT flags )
 {
     struct gl_drawable *gl = impl_from_opengl_drawable( base );
+    struct client_surface_present present;
 
     TRACE( "%s flags %#x\n", debugstr_opengl_drawable( base ), flags );
 
     if (flags & GL_FLUSH_INTERVAL) set_swap_interval( gl, base->interval );
     if (!(flags & GL_FLUSH_PRESENT)) return;
 
+    client_surface_prepare_present( base->client, &present, TRUE );
     if (InterlockedCompareExchange( &base->client->offscreen, 0, 0 ))
     {
         if (!(flags & GL_FLUSH_FINISHED)) funcs->p_glFinish();
         XFlush( gdi_display );
     }
-
-    client_surface_present( base->client );
+    client_surface_complete_present( base->client, &present, TRUE, TRUE, NULL, 0 );
 }
 
 /***********************************************************************
@@ -1520,21 +1452,17 @@ static BOOL x11drv_surface_swap( struct opengl_drawable *base )
 {
     GLXContext ctx = NtCurrentTeb()->glReserved2;
     struct gl_drawable *gl = impl_from_opengl_drawable( base );
+    struct client_surface_present present;
     INT64 ust, msc, sbc, target_sbc;
-    BOOL offscreen, use_damage_wait = FALSE, use_oml_wait;
+    BOOL offscreen, use_oml_wait;
 
     TRACE( "drawable %s\n", debugstr_opengl_drawable( base ) );
 
+    /* OML is a WSI completion boundary.  Otherwise the client-surface driver
+     * arms its native completion source before this swap is submitted. */
     offscreen = InterlockedCompareExchange( &base->client->offscreen, 0, 0 );
-#if defined(HAVE_X11_EXTENSIONS_XDAMAGE_H) && defined(SONAME_LIBXDAMAGE)
-    use_damage_wait = offscreen && gl->damage;
-    if (use_damage_wait) x11drv_surface_prepare_swap( gl );
-#endif
-    /* Damage observes the redirected pixmap which client_surface_present()
-     * copies, so it is the authoritative completion boundary when available.
-     * OML observes the GLX swap itself and is retained as the fallback. */
-    use_oml_wait = offscreen && !use_damage_wait && ctx &&
-                   pglXSwapBuffersMscOML && pglXWaitForSbcOML;
+    use_oml_wait = offscreen && ctx && pglXSwapBuffersMscOML && pglXWaitForSbcOML;
+    client_surface_prepare_present( base->client, &present, use_oml_wait );
 
     if (!use_oml_wait) pglXSwapBuffers( gdi_display, gl->drawable );
     else
@@ -1546,91 +1474,27 @@ static BOOL x11drv_surface_swap( struct opengl_drawable *base )
         {
             WARN( "Failed waiting for GLX swap completion for %s\n",
                   debugstr_opengl_drawable( base ) );
+            client_surface_complete_present( base->client, &present, FALSE, FALSE, NULL, 0 );
             return FALSE;
         }
     }
 
-#if defined(HAVE_X11_EXTENSIONS_XDAMAGE_H) && defined(SONAME_LIBXDAMAGE)
-    if (use_damage_wait)
-    {
-        if (!x11drv_surface_wait_swap( gl )) return FALSE;
-    }
-    else if (offscreen && !use_oml_wait) XFlush( gdi_display );
-#else
-    if (offscreen && !use_oml_wait) XFlush( gdi_display );
-#endif
-
-    client_surface_present( base->client );
+    if (!client_surface_complete_present( base->client, &present, TRUE,
+                                          use_oml_wait, NULL, 5000 ))
+        WARN( "client-surface composition did not complete for %s\n",
+              debugstr_opengl_drawable( base ) );
     return TRUE;
 }
 
 static void x11drv_egl_surface_destroy( struct opengl_drawable *base )
 {
-    struct gl_drawable *gl = impl_from_opengl_drawable( base );
-
     TRACE( "drawable %s\n", debugstr_opengl_drawable( base ) );
-
-    /* Closing the private connection also releases the Damage object.  Do not
-     * destroy it separately because the native drawable may already be gone. */
-    if (gl->damage_display) XCloseDisplay( gl->damage_display );
 }
-
-#if defined(HAVE_X11_EXTENSIONS_XDAMAGE_H) && defined(SONAME_LIBXDAMAGE)
-static void x11drv_surface_prepare_swap( struct gl_drawable *gl )
-{
-    XEvent event;
-
-    if (!gl->damage) return;
-    do
-    {
-        while (XPending( gl->damage_display )) XNextEvent( gl->damage_display, &event );
-        pXDamageSubtract( gl->damage_display, gl->damage, None, None );
-        /* The empty region must exist at the server before this swap is
-         * queued on the EGL connection.  Damage from another connection can
-         * race the subtract request and enqueue an event while leaving the
-         * region non-empty.  Drain and subtract again in that case; merely
-         * discarding the event would prevent the next non-empty transition
-         * and make the following swap wait time out. */
-        XSync( gl->damage_display, False );
-    } while (XPending( gl->damage_display ));
-}
-
-static BOOL x11drv_surface_wait_swap( struct gl_drawable *gl )
-{
-    for (;;)
-    {
-        while (XPending( gl->damage_display ))
-        {
-            XEvent event;
-
-            XNextEvent( gl->damage_display, &event );
-            if (event.type != gl->damage_event_base + XDamageNotify ||
-                ((XDamageNotifyEvent *)&event)->damage != gl->damage) continue;
-            pXDamageSubtract( gl->damage_display, gl->damage, None, None );
-            XFlush( gl->damage_display );
-            return TRUE;
-        }
-        for (;;)
-        {
-            struct pollfd pollfd = {ConnectionNumber( gl->damage_display ), POLLIN, 0};
-            int ret = poll( &pollfd, 1, 5000 );
-
-            if (ret > 0 && pollfd.revents & POLLIN) break;
-            if (ret < 0 && errno == EINTR) continue;
-            if (!ret)
-                WARN( "Timed out waiting for window damage for %s\n",
-                      debugstr_opengl_drawable( &gl->base ) );
-            else
-                WARN( "Failed waiting for window damage for %s, ret %d, revents %#x\n",
-                      debugstr_opengl_drawable( &gl->base ), ret, pollfd.revents );
-            return FALSE;
-        }
-    }
-}
-#endif
 
 static void x11drv_egl_surface_flush( struct opengl_drawable *base, UINT flags )
 {
+    struct client_surface_present present;
+
     TRACE( "%s flags %#x\n", debugstr_opengl_drawable( base ), flags );
 
     if (flags & GL_FLUSH_INTERVAL) funcs->p_eglSwapInterval( egl->display, abs( base->interval ) );
@@ -1651,47 +1515,38 @@ static void x11drv_egl_surface_flush( struct opengl_drawable *base, UINT flags )
     }
     if (!(flags & GL_FLUSH_PRESENT)) return;
 
+    client_surface_prepare_present( base->client, &present, TRUE );
     if (InterlockedCompareExchange( &base->client->offscreen, 0, 0 ))
     {
         if (!(flags & GL_FLUSH_FINISHED)) funcs->p_glFinish();
         XFlush( gdi_display );
     }
 
-    client_surface_present( base->client );
+    client_surface_complete_present( base->client, &present, TRUE, TRUE, NULL, 0 );
 }
 
 static BOOL x11drv_egl_surface_swap( struct opengl_drawable *base )
 {
     struct gl_drawable *gl = impl_from_opengl_drawable( base );
-    BOOL offscreen;
+    struct client_surface_present present;
     EGLint err;
     EGLBoolean ret;
 
     TRACE( "%s\n", debugstr_opengl_drawable( base ) );
 
-    offscreen = InterlockedCompareExchange( &base->client->offscreen, 0, 0 );
-#if defined(HAVE_X11_EXTENSIONS_XDAMAGE_H) && defined(SONAME_LIBXDAMAGE)
-    if (offscreen && gl->damage) x11drv_surface_prepare_swap( gl );
-#endif
+    client_surface_prepare_present( base->client, &present, FALSE );
     ret = funcs->p_eglSwapBuffers( egl->display, gl->base.surface );
     if (!ret)
     {
         err = funcs->p_eglGetError();
         WARN( "Failed to swap EGL surface %s, error %#x\n", debugstr_opengl_drawable( base ), err );
+        client_surface_complete_present( base->client, &present, FALSE, FALSE, NULL, 0 );
         return FALSE;
     }
 
-#if defined(HAVE_X11_EXTENSIONS_XDAMAGE_H) && defined(SONAME_LIBXDAMAGE)
-    if (offscreen && gl->damage)
-    {
-        if (!x11drv_surface_wait_swap( gl )) return FALSE;
-    }
-    else if (offscreen) XFlush( gdi_display );
-#else
-    if (offscreen) XFlush( gdi_display );
-#endif
-
-    client_surface_present( base->client );
+    if (!client_surface_complete_present( base->client, &present, TRUE, FALSE, NULL, 5000 ))
+        WARN( "client-surface composition did not complete for %s\n",
+              debugstr_opengl_drawable( base ) );
     return TRUE;
 }
 

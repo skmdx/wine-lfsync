@@ -2854,32 +2854,32 @@ void queue_cleanup_window( struct thread *thread, user_handle_t win )
     thread_input_cleanup_window( queue, win );
 }
 
-static void post_thread_message( struct thread *thread, user_handle_t win, unsigned int message,
-                                 lparam_t wparam, lparam_t lparam )
+static int post_thread_message( struct thread *thread, user_handle_t win, unsigned int message,
+                                lparam_t wparam, lparam_t lparam )
 {
     struct message *msg;
 
-    if (thread->queue && (msg = mem_alloc( sizeof(*msg) )))
+    if (!thread->queue || !(msg = mem_alloc( sizeof(*msg) ))) return 0;
+
+    msg->type      = MSG_POSTED;
+    msg->win       = get_user_full_handle( win );
+    msg->msg       = message;
+    msg->wparam    = wparam;
+    msg->lparam    = lparam;
+    msg->result    = NULL;
+    msg->data      = NULL;
+    msg->data_size = 0;
+
+    get_message_defaults( thread->queue, &msg->x, &msg->y, &msg->time );
+
+    list_add_tail( &thread->queue->msg_list[POST_MESSAGE], &msg->entry );
+    set_queue_bits( thread->queue, QS_POSTMESSAGE|QS_ALLPOSTMESSAGE );
+    if (message == WM_HOTKEY)
     {
-        msg->type      = MSG_POSTED;
-        msg->win       = get_user_full_handle( win );
-        msg->msg       = message;
-        msg->wparam    = wparam;
-        msg->lparam    = lparam;
-        msg->result    = NULL;
-        msg->data      = NULL;
-        msg->data_size = 0;
-
-        get_message_defaults( thread->queue, &msg->x, &msg->y, &msg->time );
-
-        list_add_tail( &thread->queue->msg_list[POST_MESSAGE], &msg->entry );
-        set_queue_bits( thread->queue, QS_POSTMESSAGE|QS_ALLPOSTMESSAGE );
-        if (message == WM_HOTKEY)
-        {
-            set_queue_bits( thread->queue, QS_HOTKEY );
-            thread->queue->hotkey_count++;
-        }
+        set_queue_bits( thread->queue, QS_HOTKEY );
+        thread->queue->hotkey_count++;
     }
+    return 1;
 }
 
 /* post a message to a window */
@@ -2895,8 +2895,8 @@ void post_message( user_handle_t win, unsigned int message, lparam_t wparam, lpa
 /* Post an internal message to the process queue which was accessed most
  * recently.  Client-rendered surfaces are process-local, but the HWND they
  * render may belong to a different process. */
-void post_process_message( struct process *process, user_handle_t win, unsigned int message,
-                           lparam_t wparam, lparam_t lparam )
+int post_process_message( struct process *process, user_handle_t win, unsigned int message,
+                          lparam_t wparam, lparam_t lparam )
 {
     struct thread *thread, *target = NULL;
     timeout_t access_time = 0;
@@ -2910,7 +2910,7 @@ void post_process_message( struct process *process, user_handle_t win, unsigned 
             access_time = thread->queue->shared->access_time;
         }
     }
-    if (target) post_thread_message( target, win, message, wparam, lparam );
+    return target && post_thread_message( target, win, message, wparam, lparam );
 }
 
 /* send a notify message to a window */

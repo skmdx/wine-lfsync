@@ -3601,33 +3601,35 @@ void X11DRV_SetWindowRgn( HWND hwnd, HRGN hrgn, BOOL redraw )
  *
  * Set transparency attributes for a layered window.
  */
+static void set_layered_window_attributes( struct x11drv_win_data *data, BYTE alpha, DWORD flags )
+{
+    set_window_visual( data, &default_visual, FALSE );
+
+    if (data->whole_window)
+    {
+        set_window_opacity( data, alpha, flags );
+        XFlush( data->display );
+    }
+    data->layered = TRUE;
+}
+
 void X11DRV_SetLayeredWindowAttributes( HWND hwnd, COLORREF key, BYTE alpha, DWORD flags )
 {
     struct x11drv_win_data *data = get_win_data( hwnd );
 
     if (data)
     {
-        set_window_visual( data, &default_visual, FALSE );
-
-        if (data->whole_window)
-        {
-            set_window_opacity( data, alpha, flags );
-            XFlush( data->display );
-        }
-
-        data->layered = TRUE;
+        set_layered_window_attributes( data, alpha, flags );
         release_win_data( data );
     }
-    else
+    else if (X11DRV_get_whole_window( hwnd ))
     {
-        Window win = X11DRV_get_whole_window( hwnd );
-        if (win)
-        {
-            sync_window_opacity( gdi_display, win, alpha, flags );
-            if (flags & LWA_COLORKEY)
-                FIXME( "LWA_COLORKEY not supported on foreign process window %p\n", hwnd );
-            XFlush( gdi_display );
-        }
+        /* Opacity staging is tracked by the process which owns the X11
+         * window data.  Updating the X property directly from a foreign
+         * renderer could expose an incomplete staged generation. */
+        send_message( hwnd, WM_X11DRV_SET_LAYERED_ATTRIBUTES, alpha, flags );
+        if (flags & LWA_COLORKEY)
+            FIXME( "LWA_COLORKEY not supported on foreign process window %p\n", hwnd );
     }
 }
 
@@ -3708,6 +3710,13 @@ LRESULT X11DRV_WindowMessage( HWND hwnd, UINT msg, WPARAM wp, LPARAM lp )
         return 0;
     case WM_X11DRV_ADD_TAB:
         taskbar_add_tab( hwnd );
+        return 0;
+    case WM_X11DRV_SET_LAYERED_ATTRIBUTES:
+        if ((data = get_win_data( hwnd )))
+        {
+            set_layered_window_attributes( data, (BYTE)wp, (DWORD)lp );
+            release_win_data( data );
+        }
         return 0;
     default:
         FIXME( "got window msg %x hwnd %p wp %lx lp %lx\n", msg, hwnd, (long)wp, lp );

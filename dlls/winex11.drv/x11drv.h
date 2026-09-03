@@ -372,8 +372,12 @@ struct x11drv_client_surface
     Colormap colormap;
     Window window;
     Window backing_window;  /* whole window with backing store enabled */
+    Display *damage_display; /* private completion event connection */
+    XID damage;
+    int damage_event_base;
     BOOL keep_offscreen;    /* preserve a drawable which was used while hidden */
     BOOL manual_redirect;   /* client drawable is manually XComposite redirected */
+    BOOL completion_broken; /* an unbounded old present can no longer be distinguished */
 
     HDC hdc_src;
     HDC hdc_dst;
@@ -637,7 +641,8 @@ enum x11drv_window_messages
     WM_X11DRV_UPDATE_CLIPBOARD = WM_WINE_FIRST_DRIVER_MSG,
     WM_X11DRV_SET_WIN_REGION,
     WM_X11DRV_DELETE_TAB,
-    WM_X11DRV_ADD_TAB
+    WM_X11DRV_ADD_TAB,
+    WM_X11DRV_SET_LAYERED_ATTRIBUTES
 };
 
 /* _NET_WM_STATE properties that we keep track of */

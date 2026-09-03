@@ -294,6 +294,9 @@ void *free_user_handle( HANDLE handle, unsigned short type )
 static pthread_mutex_t surfaces_lock = PTHREAD_MUTEX_INITIALIZER;
 static struct list client_surfaces = LIST_INIT( client_surfaces ); /* non-owning used client surfaces */
 static struct list unused_surfaces = LIST_INIT( unused_surfaces ); /* owning unused client surfaces */
+static unsigned int unused_surface_count;
+
+#define MAX_UNUSED_CLIENT_SURFACES 64
 
 static HWND set_client_surface_server_state( HWND hwnd, const struct client_surface *surface,
                                              UINT flags, UINT64 generation,
@@ -360,8 +363,9 @@ static void client_surface_detach_locked( struct client_surface *surface )
     }
     list_remove( &surface->entry );
     surface->funcs->detach( surface );
-    InterlockedIncrement64( &surface->geometry_seq );
     surface->toplevel = NULL;
+    InterlockedIncrement64( &surface->geometry_seq );
+    surface->ready_toplevel = NULL;
     InterlockedIncrement64( &surface->geometry_seq );
     InterlockedExchangePointer( (void **)&surface->hwnd, NULL );
     InterlockedIncrement( &surface->lifecycle_seq );
@@ -377,8 +381,30 @@ static void client_surface_release_locked( struct client_surface *surface )
     {
         client_surface_detach_locked( surface );
         surface->funcs->destroy( surface );
+        pthread_mutex_destroy( &surface->completion_lock );
         pthread_mutex_destroy( &surface->present_lock );
         free( surface );
+    }
+}
+
+static void trim_unused_client_surfaces_locked(void)
+{
+    while (unused_surface_count > MAX_UNUSED_CLIENT_SURFACES)
+    {
+        struct client_surface *surface = LIST_ENTRY( list_tail( &unused_surfaces ),
+                                                     struct client_surface, entry );
+
+        list_remove( &surface->entry );
+        list_init( &surface->entry );
+        unused_surface_count--;
+
+        /* Retire server membership immediately even if a queued recomposition
+         * still owns a temporary reference.  The final release then destroys
+         * the native drawable without allowing the cache to grow unbounded. */
+        pthread_mutex_lock( &surface->present_lock );
+        client_surface_uncache_present_locked( surface );
+        pthread_mutex_unlock( &surface->present_lock );
+        client_surface_release_locked( surface );
     }
 }
 
@@ -393,6 +419,8 @@ void detach_client_surfaces( HWND hwnd )
     LIST_FOR_EACH_ENTRY_SAFE( surface, next, &unused_surfaces, struct client_surface, entry )
     {
         if (surface->hwnd != hwnd) continue;
+        assert( unused_surface_count );
+        unused_surface_count--;
         client_surface_detach_locked( surface );
         client_surface_release_locked( surface );
     }
@@ -441,9 +469,9 @@ static void get_client_surface_geometry( const struct client_surface *surface,
     {
         while ((seq = ReadNoFence64( &surface->geometry_seq )) & 1) YieldProcessor();
         __SHARED_READ_FENCE;
-        geometry->toplevel = surface->toplevel;
-        geometry->virtual_rect = surface->virtual_rect;
-        geometry->monitor_rect = surface->monitor_rect;
+        geometry->toplevel = surface->ready_toplevel;
+        geometry->virtual_rect = surface->ready_virtual_rect;
+        geometry->monitor_rect = surface->ready_monitor_rect;
         __SHARED_READ_FENCE;
     } while (seq != ReadNoFence64( &surface->geometry_seq ));
 }
@@ -464,11 +492,9 @@ static void client_surface_update_present_locked( struct client_surface *surface
     changed = new_toplevel != toplevel || !EqualRect( &new_virtual_rect, &virtual_rect ) ||
               !EqualRect( &new_monitor_rect, &monitor_rect );
 
-    InterlockedIncrement64( &surface->geometry_seq );
     surface->toplevel = new_toplevel;
     surface->virtual_rect = new_virtual_rect;
     surface->monitor_rect = new_monitor_rect;
-    InterlockedIncrement64( &surface->geometry_seq );
 
     /* A larger drawable contains pixels for which no completed application
      * frame exists yet.  Do not treat its old intersection as a complete
@@ -488,7 +514,15 @@ static void client_surface_update_present_locked( struct client_surface *surface
            wine_dbgstr_rect( &surface->virtual_rect ), wine_dbgstr_rect( &surface->monitor_rect ) );
     surface->funcs->update( surface );
 
+    /* Publish geometry only after the driver has resized/reparented its native
+     * drawable.  Lock-free readers must never observe a new extent paired with
+     * the previous X11/EGL or Wayland surface state. */
+    InterlockedIncrement64( &surface->geometry_seq );
+    surface->ready_toplevel = new_toplevel;
+    surface->ready_virtual_rect = new_virtual_rect;
+    surface->ready_monitor_rect = new_monitor_rect;
     if (changed) InterlockedExchange( &surface->updated, TRUE );
+    InterlockedIncrement64( &surface->geometry_seq );
 }
 
 static void client_surface_update_now( struct client_surface *surface )
@@ -661,6 +695,8 @@ void update_client_surfaces( HWND hwnd )
          * still hold the object alive, but it must no longer be reusable. */
         list_remove( &surface->entry );
         list_init( &surface->entry );
+        assert( unused_surface_count );
+        unused_surface_count--;
         client_surface_release_locked( surface );
     }
     for (i = 0; i < update_count; ++i) client_surface_release_locked( update_surfaces[i] );
@@ -694,6 +730,12 @@ void *client_surface_create( UINT size, const struct client_surface_funcs *funcs
         free( surface );
         return NULL;
     }
+    if (pthread_mutex_init( &surface->completion_lock, NULL ))
+    {
+        pthread_mutex_destroy( &surface->present_lock );
+        free( surface );
+        return NULL;
+    }
     surface->funcs = funcs;
     surface->ref = 1;
     surface->hwnd = hwnd;
@@ -701,6 +743,9 @@ void *client_surface_create( UINT size, const struct client_surface_funcs *funcs
     surface->raw = raw;
     surface->toplevel = toplevel;
     surface->virtual_rect = get_client_surface_rects( toplevel, hwnd, &surface->monitor_rect );
+    surface->ready_toplevel = surface->toplevel;
+    surface->ready_virtual_rect = surface->virtual_rect;
+    surface->ready_monitor_rect = surface->monitor_rect;
     list_init( &surface->entry );
 
     TRACE( "created %s, format %d, raw %u, toplevel %p, virtual_rect %s, monitor_rect %s\n", debugstr_client_surface( surface ),
@@ -881,7 +926,7 @@ static BOOL client_surface_validate_size_locked( struct client_surface *surface,
     return TRUE;
 }
 
-UINT64 client_surface_begin_present( struct client_surface *surface )
+static UINT64 get_client_surface_generation( struct client_surface *surface )
 {
     struct object_lock lock = OBJECT_LOCK_INIT;
     const window_shm_t *window_shm = NULL;
@@ -990,22 +1035,120 @@ static BOOL client_surface_end_present_internal( struct client_surface *surface,
     return composed;
 }
 
-BOOL client_surface_end_present( struct client_surface *surface, UINT64 generation,
-                                 const SIZE *expected_size )
+void client_surface_lock_present( struct client_surface *surface )
 {
-    return client_surface_end_present_internal( surface, generation, expected_size, TRUE );
+    pthread_mutex_lock( &surface->completion_lock );
+}
+
+void client_surface_unlock_present( struct client_surface *surface )
+{
+    pthread_mutex_unlock( &surface->completion_lock );
+}
+
+void client_surface_prepare_present_locked( struct client_surface *surface,
+                                            struct client_surface_present *present,
+                                            BOOL external_completion )
+{
+    memset( present, 0, sizeof(*present) );
+
+    /* Bring the native target and the published geometry to one boundary
+     * before arming backend completion tracking.  A later geometry sequence
+     * change invalidates this transaction instead of pairing a new target
+     * with an older host presentation. */
+    client_surface_update_now( surface );
+    present->generation = get_client_surface_generation( surface );
+    present->geometry_seq = ReadAcquire64( &surface->geometry_seq );
+    present->lifecycle_seq = ReadAcquire( &surface->lifecycle_seq );
+    present->offscreen = InterlockedCompareExchange( &surface->offscreen, 0, 0 );
+    present->external_completion = present->offscreen && external_completion;
+    if (present->offscreen && !present->external_completion &&
+        surface->funcs->prepare_completion)
+        present->driver_completion = surface->funcs->prepare_completion( surface );
+}
+
+void client_surface_prepare_present( struct client_surface *surface,
+                                     struct client_surface_present *present,
+                                     BOOL external_completion )
+{
+    client_surface_lock_present( surface );
+    client_surface_prepare_present_locked( surface, present, external_completion );
+}
+
+BOOL client_surface_complete_present_locked( struct client_surface *surface,
+                                             struct client_surface_present *present,
+                                             BOOL submitted, BOOL external_completed,
+                                             const SIZE *expected_size, DWORD timeout )
+{
+    BOOL completed = submitted;
+
+    if (!submitted && present->driver_completion)
+    {
+        /* A failed WSI call does not prove that no native request escaped.
+         * Retire the armed boundary so a delayed request cannot satisfy the
+         * next transaction's completion wait. */
+        if (surface->funcs->abandon_completion)
+            surface->funcs->abandon_completion( surface );
+        present->completion_failed = TRUE;
+    }
+    if (completed && present->offscreen)
+    {
+        if (present->external_completion)
+            completed = external_completed;
+        else if (present->driver_completion && surface->funcs->wait_completion)
+            completed = surface->funcs->wait_completion( surface, timeout );
+        else
+            completed = FALSE;
+        present->completion_failed = !completed;
+    }
+    /* Drain the submitted operation before checking its target token.  If a
+     * stale operation were left pending, its late completion event could be
+     * consumed as proof for the next presentation (completion ABA). */
+    if (completed && (present->geometry_seq != ReadAcquire64( &surface->geometry_seq ) ||
+        present->lifecycle_seq != ReadAcquire( &surface->lifecycle_seq )))
+    {
+        TRACE( "discarding %s presentation across target state change\n",
+               debugstr_client_surface( surface ) );
+        completed = FALSE;
+    }
+    if (completed)
+        completed = client_surface_end_present_internal( surface, present->generation,
+                                                         expected_size, TRUE );
+    return completed;
+}
+
+BOOL client_surface_complete_present( struct client_surface *surface,
+                                      struct client_surface_present *present,
+                                      BOOL submitted, BOOL external_completed,
+                                      const SIZE *expected_size, DWORD timeout )
+{
+    BOOL ret = client_surface_complete_present_locked( surface, present, submitted,
+                                                       external_completed, expected_size, timeout );
+    client_surface_unlock_present( surface );
+    return ret;
 }
 
 void client_surface_present( struct client_surface *surface )
 {
-    UINT64 generation = client_surface_begin_present( surface );
-    client_surface_end_present_internal( surface, generation, NULL, TRUE );
+    struct client_surface_present present;
+
+    /* Compatibility path for drivers whose presentation callback already
+     * supplies a host completion boundary.  It still participates in target
+     * token validation and per-surface submission serialization. */
+    client_surface_prepare_present( surface, &present, TRUE );
+    client_surface_complete_present( surface, &present, TRUE, TRUE, NULL, 0 );
 }
 
 static void client_surface_recompose( struct client_surface *surface )
 {
-    UINT64 generation = client_surface_begin_present( surface );
+    UINT64 generation;
+
+    /* Cached replay reads the same native drawable that a host presentation
+     * updates.  Join the completion transaction so geometry-ready work cannot
+     * copy a partially presented frame or commit its generation first. */
+    client_surface_lock_present( surface );
+    generation = get_client_surface_generation( surface );
     client_surface_end_present_internal( surface, generation, NULL, FALSE );
+    client_surface_unlock_present( surface );
 }
 
 static void drain_client_surface_recompose( struct client_surface *surface )
@@ -1082,7 +1225,12 @@ void recompose_client_surfaces( HWND hwnd )
 
 void client_surface_geometry_ready( HWND hwnd )
 {
-    set_client_surface_server_state( hwnd, NULL, CLIENT_SURFACE_STATE_GEOMETRY_READY, 0, NULL );
+    HWND toplevel;
+    BOOL wake;
+
+    toplevel = set_client_surface_server_state( hwnd, NULL,
+                                                CLIENT_SURFACE_STATE_GEOMETRY_READY, 0, &wake );
+    if (wake && toplevel) NtUserPostMessage( toplevel, WM_WINE_UPDATEWINDOWSTATE, 0, 0 );
 }
 
 void client_surface_set_staged( HWND hwnd )
@@ -1152,6 +1300,7 @@ void use_window_client_surface( struct client_surface *surface, BOOL use )
     {
         list_remove( &surface->entry ); /* remove it from client_surfaces, if it was used */
         list_add_head( &unused_surfaces, &surface->entry ); /* add it to the head, so we discard older ones */
+        unused_surface_count++;
         client_surface_add_ref( surface );
         flags = CLIENT_SURFACE_STATE_UNREGISTER;
         if (InterlockedCompareExchange( &surface->content_valid, 0, 0 ))
@@ -1192,6 +1341,12 @@ void use_window_client_surface( struct client_surface *surface, BOOL use )
     pthread_mutex_unlock( &surface->present_lock );
 
     if (invalid) detach_client_surfaces( hwnd );
+    else if (!use)
+    {
+        pthread_mutex_lock( &surfaces_lock );
+        trim_unused_client_surfaces_locked();
+        pthread_mutex_unlock( &surfaces_lock );
+    }
 }
 
 struct client_surface *get_unused_client_surface( HWND hwnd, int format, BOOL raw )
@@ -1207,6 +1362,8 @@ struct client_surface *get_unused_client_surface( HWND hwnd, int format, BOOL ra
         pthread_mutex_lock( &surface->present_lock );
         list_remove( &surface->entry ); /* take over its reference */
         list_init( &surface->entry );
+        assert( unused_surface_count );
+        unused_surface_count--;
         /* A queued cached recomposition may still hold a reference after the
          * list entry is removed.  Invalidate its old frame while serialized
          * with presentation so it cannot copy from the replacement drawable. */

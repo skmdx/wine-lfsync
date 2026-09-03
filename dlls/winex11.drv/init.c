@@ -24,6 +24,10 @@
 
 #include "config.h"
 
+#include <dlfcn.h>
+#include <errno.h>
+#include <limits.h>
+#include <poll.h>
 #include <stdarg.h>
 #include <string.h>
 #include <assert.h>
@@ -32,6 +36,9 @@
 #include "winbase.h"
 #include "winreg.h"
 #include "x11drv.h"
+#if defined(HAVE_X11_EXTENSIONS_XDAMAGE_H) && defined(SONAME_LIBXDAMAGE)
+#include <X11/extensions/Xdamage.h>
+#endif
 #include "xcomposite.h"
 #include "wine/debug.h"
 
@@ -47,6 +54,30 @@ static pthread_once_t init_once = PTHREAD_ONCE_INIT;
 
 static const struct user_driver_funcs x11drv_funcs;
 static const struct gdi_dc_funcs *xrender_funcs;
+
+#if defined(HAVE_X11_EXTENSIONS_XDAMAGE_H) && defined(SONAME_LIBXDAMAGE)
+static typeof(XDamageQueryExtension) *pXDamageQueryExtension;
+static typeof(XDamageCreate) *pXDamageCreate;
+static typeof(XDamageSubtract) *pXDamageSubtract;
+static pthread_once_t xdamage_once = PTHREAD_ONCE_INIT;
+
+static void init_xdamage(void)
+{
+    void *handle = dlopen( SONAME_LIBXDAMAGE, RTLD_NOW );
+
+    if (!handle) return;
+    pXDamageQueryExtension = dlsym( handle, "XDamageQueryExtension" );
+    pXDamageCreate = dlsym( handle, "XDamageCreate" );
+    pXDamageSubtract = dlsym( handle, "XDamageSubtract" );
+    if (!pXDamageQueryExtension || !pXDamageCreate || !pXDamageSubtract)
+    {
+        pXDamageQueryExtension = NULL;
+        pXDamageCreate = NULL;
+        pXDamageSubtract = NULL;
+        dlclose( handle );
+    }
+}
+#endif
 
 
 void init_recursive_mutex( pthread_mutex_t *mutex )
@@ -265,10 +296,132 @@ static void x11drv_client_surface_destroy( struct client_surface *client )
 
     TRACE( "%s\n", debugstr_client_surface( client ) );
 
+    /* Closing the private connection also releases the Damage object. */
+    if (surface->damage_display) XCloseDisplay( surface->damage_display );
     if (surface->colormap != default_colormap) XFreeColormap( gdi_display, surface->colormap );
     if (surface->window) destroy_client_window( hwnd, surface->window );
     if (surface->hdc_dst) NtGdiDeleteObjectApp( surface->hdc_dst );
     if (surface->hdc_src) NtGdiDeleteObjectApp( surface->hdc_src );
+}
+
+static BOOL x11drv_client_surface_init_completion( struct x11drv_client_surface *surface )
+{
+#if defined(HAVE_X11_EXTENSIONS_XDAMAGE_H) && defined(SONAME_LIBXDAMAGE)
+    int error_base;
+
+    if (surface->completion_broken) return FALSE;
+    if (surface->damage) return TRUE;
+    pthread_once( &xdamage_once, init_xdamage );
+    if (!pXDamageQueryExtension) return FALSE;
+
+    /* The client window is created on gdi_display.  Establish it before the
+     * private event connection creates a Damage object for that XID. */
+    XSync( gdi_display, False );
+    if (!(surface->damage_display = XOpenDisplay( DisplayString( gdi_display ) ))) return FALSE;
+    if (pXDamageQueryExtension( surface->damage_display, &surface->damage_event_base,
+                                &error_base ))
+        surface->damage = pXDamageCreate( surface->damage_display, surface->window,
+                                         XDamageReportNonEmpty );
+    if (!surface->damage)
+    {
+        XCloseDisplay( surface->damage_display );
+        surface->damage_display = NULL;
+    }
+    else XSync( surface->damage_display, False );
+    return !!surface->damage;
+#else
+    return FALSE;
+#endif
+}
+
+static BOOL x11drv_client_surface_prepare_completion( struct client_surface *client )
+{
+#if defined(HAVE_X11_EXTENSIONS_XDAMAGE_H) && defined(SONAME_LIBXDAMAGE)
+    struct x11drv_client_surface *surface = impl_from_client_surface( client );
+    XEvent event;
+
+    if (!x11drv_client_surface_init_completion( surface ))
+    {
+        /* The caller will still submit the host present.  Retrying with a new
+         * monitor could then mistake that unobserved operation for a future
+         * presentation. */
+        surface->completion_broken = TRUE;
+        return FALSE;
+    }
+    do
+    {
+        while (XPending( surface->damage_display )) XNextEvent( surface->damage_display, &event );
+        pXDamageSubtract( surface->damage_display, surface->damage, None, None );
+        /* Empty the region before the WSI request is submitted on its own
+         * connection.  Repeat if an earlier update raced the subtraction. */
+        XSync( surface->damage_display, False );
+    } while (XPending( surface->damage_display ));
+    return TRUE;
+#else
+    return FALSE;
+#endif
+}
+
+static void x11drv_client_surface_abandon_completion( struct client_surface *client )
+{
+#if defined(HAVE_X11_EXTENSIONS_XDAMAGE_H) && defined(SONAME_LIBXDAMAGE)
+    struct x11drv_client_surface *surface = impl_from_client_surface( client );
+
+    /* An operation which may already have escaped can damage the drawable
+     * after any newly created Damage object is armed.  There is no serial in
+     * XDamage with which to reject that event, so this drawable can no longer
+     * provide causal completion evidence. */
+    surface->completion_broken = TRUE;
+    if (surface->damage_display) XCloseDisplay( surface->damage_display );
+    surface->damage_display = NULL;
+    surface->damage = 0;
+#endif
+}
+
+static BOOL x11drv_client_surface_wait_completion( struct client_surface *client, DWORD timeout )
+{
+#if defined(HAVE_X11_EXTENSIONS_XDAMAGE_H) && defined(SONAME_LIBXDAMAGE)
+    struct x11drv_client_surface *surface = impl_from_client_surface( client );
+    DWORD start = NtGetTickCount();
+
+    for (;;)
+    {
+        while (XPending( surface->damage_display ))
+        {
+            XEvent event;
+
+            XNextEvent( surface->damage_display, &event );
+            if (event.type != surface->damage_event_base + XDamageNotify ||
+                ((XDamageNotifyEvent *)&event)->damage != surface->damage) continue;
+            pXDamageSubtract( surface->damage_display, surface->damage, None, None );
+            XFlush( surface->damage_display );
+            return TRUE;
+        }
+        for (;;)
+        {
+            struct pollfd pollfd = {ConnectionNumber( surface->damage_display ), POLLIN, 0};
+            DWORD elapsed = NtGetTickCount() - start;
+            DWORD remaining = elapsed < timeout ? timeout - elapsed : 0;
+            int ret = poll( &pollfd, 1, (int)min( remaining, (DWORD)INT_MAX ) );
+
+            if (ret > 0 && pollfd.revents & POLLIN) break;
+            if (ret < 0 && errno == EINTR) continue;
+            if (!ret)
+                WARN( "timed out waiting for presentation completion for %s\n",
+                      debugstr_client_surface( client ) );
+            else
+                WARN( "failed waiting for presentation completion for %s, ret %d, revents %#x\n",
+                      debugstr_client_surface( client ), ret, pollfd.revents );
+            /* A late event from this timed-out submission is indistinguishable
+             * from the next frame.  Permanently retire this monitor rather
+             * than permitting completion ABA. */
+            x11drv_client_surface_abandon_completion( client );
+            return FALSE;
+        }
+    }
+#else
+    return FALSE;
+#endif
 }
 
 static void x11drv_client_surface_detach( struct client_surface *client )
@@ -535,6 +688,9 @@ static const struct client_surface_funcs x11drv_client_surface_funcs =
     .update = x11drv_client_surface_update,
     .present = X11DRV_client_surface_present,
     .commit = X11DRV_client_surface_commit,
+    .prepare_completion = x11drv_client_surface_prepare_completion,
+    .wait_completion = x11drv_client_surface_wait_completion,
+    .abandon_completion = x11drv_client_surface_abandon_completion,
 };
 
 static int visual_class_alloc( int class )
@@ -565,7 +721,6 @@ struct client_surface *X11DRV_CreateClientSurface( HWND hwnd, int format, BOOL r
     surface->colormap = colormap;
     rect = raw ? surface->client.monitor_rect : surface->client.virtual_rect;
     if (!(surface->window = create_client_window( hwnd, rect, &visual, colormap ))) goto failed;
-
     TRACE( "Created %s for client window %lx\n", debugstr_client_surface( &surface->client ), surface->window );
     return &surface->client;
 

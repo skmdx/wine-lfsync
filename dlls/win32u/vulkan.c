@@ -1872,6 +1872,14 @@ static int compare_swapchain_ptrs( const void *left, const void *right )
     return (a > b) - (a < b);
 }
 
+static int compare_client_surface_ptrs( const void *left, const void *right )
+{
+    UINT_PTR a = (UINT_PTR)*(const struct client_surface * const *)left;
+    UINT_PTR b = (UINT_PTR)*(const struct client_surface * const *)right;
+
+    return (a > b) - (a < b);
+}
+
 static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwapchainCreateInfoKHR *create_info,
                                              const VkAllocationCallbacks *allocator, VkSwapchainKHR *ret )
 {
@@ -2038,12 +2046,14 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
     struct vulkan_queue *queue = vulkan_queue_from_handle( client_queue );
     VkSwapchainKHR swapchains_buffer[16], *swapchains = swapchains_buffer;
     struct swapchain *present_swapchains_buffer[16], **present_swapchains = present_swapchains_buffer;
-    UINT64 generations_buffer[16], *generations = generations_buffer;
+    struct client_surface *present_surfaces_buffer[16], **present_surfaces = present_surfaces_buffer;
+    struct client_surface_present presents_buffer[16], *presents = presents_buffer;
     uint64_t present_ids_buffer[16], *present_ids = present_ids_buffer;
     VkPresentIdKHR present_id_info = {VK_STRUCTURE_TYPE_PRESENT_ID_KHR};
     struct vulkan_device *device = queue->device;
     const VkSwapchainKHR *client_swapchains;
-    uint32_t locked_count = 0;
+    uint32_t locked_count = 0, surface_locked_count = 0;
+    DWORD completion_start;
     VkResult res;
 
     TRACE( "queue %p, present_info %p\n", queue, present_info );
@@ -2051,16 +2061,24 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
     if (present_info->swapchainCount > ARRAY_SIZE(swapchains_buffer) &&
         !(swapchains = malloc( present_info->swapchainCount * sizeof(*swapchains) )))
         return VK_ERROR_OUT_OF_HOST_MEMORY;
-    if (present_info->swapchainCount > ARRAY_SIZE(generations_buffer) &&
-        !(generations = malloc( present_info->swapchainCount * sizeof(*generations) )))
+    if (present_info->swapchainCount > ARRAY_SIZE(presents_buffer) &&
+        !(presents = calloc( present_info->swapchainCount, sizeof(*presents) )))
     {
+        if (swapchains != swapchains_buffer) free( swapchains );
+        return VK_ERROR_OUT_OF_HOST_MEMORY;
+    }
+    if (present_info->swapchainCount > ARRAY_SIZE(present_surfaces_buffer) &&
+        !(present_surfaces = malloc( present_info->swapchainCount * sizeof(*present_surfaces) )))
+    {
+        if (presents != presents_buffer) free( presents );
         if (swapchains != swapchains_buffer) free( swapchains );
         return VK_ERROR_OUT_OF_HOST_MEMORY;
     }
     if (device->internal_present_wait && present_info->swapchainCount > ARRAY_SIZE(present_ids_buffer) &&
         !(present_ids = malloc( present_info->swapchainCount * sizeof(*present_ids) )))
     {
-        if (generations != generations_buffer) free( generations );
+        if (present_surfaces != present_surfaces_buffer) free( present_surfaces );
+        if (presents != presents_buffer) free( presents );
         if (swapchains != swapchains_buffer) free( swapchains );
         return VK_ERROR_OUT_OF_HOST_MEMORY;
     }
@@ -2068,7 +2086,8 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
         !(present_swapchains = malloc( present_info->swapchainCount * sizeof(*present_swapchains) )))
     {
         if (present_ids != present_ids_buffer) free( present_ids );
-        if (generations != generations_buffer) free( generations );
+        if (present_surfaces != present_surfaces_buffer) free( present_surfaces );
+        if (presents != presents_buffer) free( presents );
         if (swapchains != swapchains_buffer) free( swapchains );
         return VK_ERROR_OUT_OF_HOST_MEMORY;
     }
@@ -2084,6 +2103,7 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
     {
         struct swapchain *swapchain = swapchain_from_handle( present_info->pSwapchains[i] );
         swapchains[i] = swapchain->obj.host.swapchain;
+        present_surfaces[i] = swapchain->surface->client;
         if (device->internal_present_wait) present_swapchains[i] = swapchain;
     }
 
@@ -2102,11 +2122,28 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
         struct swapchain *swapchain = swapchain_from_handle( client_swapchains[i] );
         struct surface *surface = swapchain->surface;
         client_surface_update( surface->client );
-        /* Acquisition may happen while a popup is hidden, before its staged
-         * publication generation exists.  Sample the generation immediately
-         * before the present which will populate the host, so a single-frame
-         * popup can publish without waiting for a second acquire/present. */
-        generations[i] = client_surface_begin_present( surface->client );
+    }
+
+    /* Completion monitors are per client surface.  Acquire them in a stable
+     * order across queues, then keep them reserved through submission, host
+     * completion and composition.  This prevents one present from clearing
+     * another present's native completion event. */
+    if (present_info->swapchainCount > 1)
+        qsort( present_surfaces, present_info->swapchainCount,
+               sizeof(*present_surfaces), compare_client_surface_ptrs );
+    for (uint32_t i = 0; i < present_info->swapchainCount; i++)
+    {
+        if (surface_locked_count && present_surfaces[i] == present_surfaces[surface_locked_count - 1])
+            continue;
+        client_surface_lock_present( present_surfaces[i] );
+        present_surfaces[surface_locked_count++] = present_surfaces[i];
+    }
+    for (uint32_t i = 0; i < present_info->swapchainCount; i++)
+    {
+        struct swapchain *swapchain = swapchain_from_handle( client_swapchains[i] );
+
+        client_surface_prepare_present_locked( swapchain->surface->client, &presents[i],
+                                               device->internal_present_wait );
     }
 
     if (device->internal_present_wait)
@@ -2132,6 +2169,7 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
     }
 
     res = device->p_vkQueuePresentKHR( queue->host.queue, present_info );
+    completion_start = NtGetTickCount();
 
     while (locked_count)
         pthread_mutex_unlock( &present_swapchains[--locked_count]->present_lock );
@@ -2167,7 +2205,7 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
              * its completion wait merely because the shared Win32 geometry
              * is between resize states: this may be the application's only
              * frame at the new extent.  The wait supplies the required image
-             * completion boundary, then client_surface_end_present() refreshes
+             * completion boundary, then the client-surface transaction refreshes
              * and checks the geometry again before taking its composition
              * snapshot.  It copies only if that check matches the presented
              * extent. */
@@ -2176,9 +2214,12 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
         if (compose && InterlockedCompareExchange( &surface->client->offscreen, 0, 0 ) &&
             device->internal_present_wait)
         {
+            DWORD elapsed = NtGetTickCount() - completion_start;
+            DWORD remaining = elapsed < 5000 ? 5000 - elapsed : 0;
             VkResult wait_res = device->p_vkWaitForPresentKHR( device->host.device,
                                                                swapchain->obj.host.swapchain,
-                                                               present_ids[i], 5000000000ULL );
+                                                               present_ids[i],
+                                                               (uint64_t)remaining * 1000000 );
             if (wait_res != VK_SUCCESS)
             {
                 WARN( "Failed waiting for present %s, status %d\n",
@@ -2197,22 +2238,34 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
             }
         }
 
-        if (compose && !client_surface_end_present( surface->client, generations[i], &expected_size ))
         {
-            /* The window changed after the post-present check but before the
-             * composition lock was acquired.  Preserve the staged generation
-             * for a correctly sized frame instead of publishing a partial old
-             * swapchain image into the resized host. */
-            WARN( "Swapchain size %dx%d changed before composition, returning VK_SUBOPTIMAL_KHR\n",
-                  swapchain->extents.width, swapchain->extents.height );
-            if (present_info->pResults) present_info->pResults[i] = VK_SUBOPTIMAL_KHR;
-            if (!res) res = VK_SUBOPTIMAL_KHR;
+            DWORD elapsed = NtGetTickCount() - completion_start;
+            DWORD remaining = elapsed < 5000 ? 5000 - elapsed : 0;
+
+            if (!client_surface_complete_present_locked( surface->client, &presents[i], compose,
+                                                         device->internal_present_wait && compose,
+                                                         &expected_size, remaining ) && compose)
+            {
+                /* The window changed after the post-present check, or the
+                 * native completion source failed.  Preserve the staged
+                 * generation for a correctly completed frame. */
+                WARN( "Swapchain size %dx%d changed or did not complete before composition\n",
+                      swapchain->extents.width, swapchain->extents.height );
+                if (!presents[i].completion_failed)
+                {
+                    if (present_info->pResults) present_info->pResults[i] = VK_SUBOPTIMAL_KHR;
+                    if (!res) res = VK_SUBOPTIMAL_KHR;
+                }
+            }
         }
     }
 
+    while (surface_locked_count)
+        client_surface_unlock_present( present_surfaces[--surface_locked_count] );
     if (present_swapchains != present_swapchains_buffer) free( present_swapchains );
     if (present_ids != present_ids_buffer) free( present_ids );
-    if (generations != generations_buffer) free( generations );
+    if (present_surfaces != present_surfaces_buffer) free( present_surfaces );
+    if (presents != presents_buffer) free( presents );
     if (swapchains != swapchains_buffer) free( swapchains );
 
     if (TRACE_ON( fps ))

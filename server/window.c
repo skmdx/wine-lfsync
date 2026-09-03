@@ -112,6 +112,8 @@ struct window
     unsigned int     client_surface_staged; /* host window is mapped into an unpublished composition */
     unsigned long long client_surface_generation; /* current unpublished composition generation */
     unsigned int     client_surface_pending_count; /* surfaces still missing from staged generation */
+    struct timeout_user *client_surface_timeout; /* deadline for an unpublished generation */
+    unsigned long long client_surface_timeout_generation;
     int              prop_inuse;      /* number of in-use window properties */
     int              prop_alloc;      /* number of allocated window properties */
     struct property *properties;      /* window properties array */
@@ -135,6 +137,10 @@ static void window_destroy( struct object *obj );
 static int is_visible( const struct window *win );
 static int has_client_surface( const struct window *win );
 static struct window *get_toplevel_window( struct window *win );
+static unsigned int clear_client_surface_subtree_generation( struct window *win,
+                                                             unsigned long long generation );
+static void cancel_client_surface_timeout( struct window *top );
+static void finish_client_surface_publication( struct window *top );
 
 static const struct object_ops window_ops =
 {
@@ -186,6 +192,7 @@ static void window_destroy( struct object *obj )
     struct client_surface_ref *surface, *surface_next;
 
     assert( !win->handle );
+    assert( !win->client_surface_timeout );
 
     if (win->parent)
     {
@@ -508,6 +515,7 @@ static int set_parent_window( struct window *win, struct window *parent )
                  * even when other surfaces remain there; otherwise commits
                  * from the moved subtree can leave the old top permanently
                  * waiting for surfaces which no longer belong to it. */
+                cancel_client_surface_timeout( old_top );
                 old_top->client_surface_staged = 0;
                 old_top->client_surface_pending_count = 0;
                 if (old_top == win || !has_client_surface( old_top ))
@@ -517,6 +525,7 @@ static int set_parent_window( struct window *win, struct window *parent )
                     post_message( old_top->handle, WM_WINE_UPDATEWINDOWSTATE, 0, 0 );
 
                 new_top->client_surface_dirty = 1;
+                cancel_client_surface_timeout( new_top );
                 new_top->client_surface_staged = 0;
                 new_top->client_surface_pending_count = 0;
                 update_client_surface_publication( new_top );
@@ -767,6 +776,8 @@ static struct window *create_window( struct window *parent, struct window *owner
     win->client_surface_staged = 0;
     win->client_surface_generation = 0;
     win->client_surface_pending_count = 0;
+    win->client_surface_timeout = NULL;
+    win->client_surface_timeout_generation = 0;
     win->prop_inuse     = 0;
     win->prop_alloc     = 0;
     win->properties     = NULL;
@@ -1035,6 +1046,53 @@ static void release_client_surface_owner( struct client_surface_owner *owner )
     free( owner );
 }
 
+static void cancel_client_surface_timeout( struct window *top )
+{
+    if (!top->client_surface_timeout) return;
+    remove_timeout_user( top->client_surface_timeout );
+    top->client_surface_timeout = NULL;
+    top->client_surface_timeout_generation = 0;
+}
+
+static void finish_client_surface_publication( struct window *top )
+{
+    cancel_client_surface_timeout( top );
+    top->client_surface_dirty = 0;
+    top->client_surface_staged = 0;
+    top->client_surface_pending_count = 0;
+    update_client_surface_publication( top );
+}
+
+static void client_surface_publication_timeout( void *private )
+{
+    struct window *top = private;
+    unsigned long long generation = top->client_surface_timeout_generation;
+
+    top->client_surface_timeout = NULL;
+    top->client_surface_timeout_generation = 0;
+    if (!top->handle || !top->client_surface_staged ||
+        generation != top->client_surface_generation) return;
+
+    clear_client_surface_subtree_generation( top, generation );
+    finish_client_surface_publication( top );
+    if (is_visible( top )) post_message( top->handle, WM_WINE_UPDATEWINDOWSTATE, 0, 0 );
+}
+
+static void arm_client_surface_timeout( struct window *top )
+{
+    cancel_client_surface_timeout( top );
+    top->client_surface_timeout_generation = top->client_surface_generation;
+    top->client_surface_timeout = add_timeout_user( -TICKS_PER_SEC,
+                                                    client_surface_publication_timeout, top );
+    if (!top->client_surface_timeout)
+    {
+        /* Allocation failure cannot turn an optimization into a permanently
+         * invisible host window. */
+        clear_error();
+        client_surface_publication_timeout( top );
+    }
+}
+
 static int complete_client_surface_generation( struct window *top, struct client_surface_ref *surface,
                                                unsigned long long generation )
 {
@@ -1046,9 +1104,7 @@ static int complete_client_surface_generation( struct window *top, struct client
     assert( top->client_surface_pending_count );
     if (--top->client_surface_pending_count) return 0;
 
-    top->client_surface_dirty = 0;
-    top->client_surface_staged = 0;
-    update_client_surface_publication( top );
+    finish_client_surface_publication( top );
     return 1;
 }
 
@@ -1076,9 +1132,7 @@ static int complete_client_surface_window_generation( struct window *top, struct
     top->client_surface_pending_count -= count;
     if (top->client_surface_pending_count) return 0;
 
-    top->client_surface_dirty = 0;
-    top->client_surface_staged = 0;
-    update_client_surface_publication( top );
+    finish_client_surface_publication( top );
     return 1;
 }
 
@@ -1106,6 +1160,38 @@ static unsigned int clear_client_surface_subtree_generation( struct window *win,
     return count;
 }
 
+static unsigned int clear_client_surface_owner_generation( struct client_surface_owner *owner,
+                                                            unsigned long long generation )
+{
+    struct client_surface_ref *surface;
+    unsigned int count = 0;
+
+    LIST_FOR_EACH_ENTRY( surface, &owner->surfaces, struct client_surface_ref, entry )
+    {
+        if (surface->generation != generation) continue;
+        surface->generation = 0;
+        count++;
+    }
+    return count;
+}
+
+static int retire_client_surface_owner_generation( struct window *top,
+                                                    struct client_surface_owner *owner,
+                                                    unsigned long long generation )
+{
+    unsigned int count;
+
+    if (!top->client_surface_staged || generation != top->client_surface_generation) return 0;
+    if (!(count = clear_client_surface_owner_generation( owner, generation ))) return 0;
+
+    assert( top->client_surface_pending_count >= count );
+    top->client_surface_pending_count -= count;
+    if (top->client_surface_pending_count) return 0;
+
+    finish_client_surface_publication( top );
+    return 1;
+}
+
 static int retire_client_surface_subtree_generation( struct window *top, struct window *win,
                                                      unsigned long long generation )
 {
@@ -1119,9 +1205,7 @@ static int retire_client_surface_subtree_generation( struct window *top, struct 
     top->client_surface_pending_count -= count;
     if (top->client_surface_pending_count) return 0;
 
-    top->client_surface_dirty = 0;
-    top->client_surface_staged = 0;
-    update_client_surface_publication( top );
+    finish_client_surface_publication( top );
     return 1;
 }
 
@@ -1165,12 +1249,7 @@ static int discard_client_surface_owners( struct window *win, struct window *top
     }
 
     if (!has_client_surface( top ))
-    {
-        top->client_surface_dirty = 0;
-        top->client_surface_staged = 0;
-        top->client_surface_pending_count = 0;
-        update_client_surface_publication( top );
-    }
+        finish_client_surface_publication( top );
     return was_pending && is_visible( top ) && !top->client_surface_dirty;
 }
 
@@ -1192,12 +1271,7 @@ void cleanup_process_client_surfaces( struct process *process )
         was_pending = top->client_surface_dirty;
         discard_client_surface_owner( win, owner, top );
         if (!has_client_surface( top ))
-        {
-            top->client_surface_dirty = 0;
-            top->client_surface_staged = 0;
-            top->client_surface_pending_count = 0;
-            update_client_surface_publication( top );
-        }
+            finish_client_surface_publication( top );
         if (was_pending && is_visible( top ) && !top->client_surface_dirty)
             post_message( top->handle, WM_WINE_UPDATEWINDOWSTATE, 0, 0 );
     }
@@ -1249,20 +1323,24 @@ static int notify_client_surface_geometry_ready_recursive( struct window *win, s
         }
         if (owner->process->client_surface_notification != notification)
         {
-            owner->process->client_surface_notification = notification;
-            post_process_message( owner->process, top->handle, WM_WINE_UPDATEWINDOWSTATE,
-                                  WINE_UPDATE_CLIENT_SURFACES, 0 );
+            if (post_process_message( owner->process, top->handle, WM_WINE_UPDATEWINDOWSTATE,
+                                      WINE_UPDATE_CLIENT_SURFACES, 0 ))
+                owner->process->client_surface_notification = notification;
+            else
+            {
+                /* A process can own a surface before any of its threads has
+                 * created a message queue.  Failed delivery must not leave
+                 * the host window unpublished forever. */
+                clear_error();
+                retire_client_surface_owner_generation( top, owner,
+                                                        top->client_surface_generation );
+            }
         }
     }
     LIST_FOR_EACH_ENTRY( child, &win->children, struct window, entry )
         removed_surface |= notify_client_surface_geometry_ready_recursive( child, top, notification );
     if (removed_surface && !has_client_surface( top ))
-    {
-        top->client_surface_dirty = 0;
-        top->client_surface_staged = 0;
-        top->client_surface_pending_count = 0;
-        update_client_surface_publication( top );
-    }
+        finish_client_surface_publication( top );
     return removed_surface;
 }
 
@@ -2354,6 +2432,7 @@ static void set_window_pos( struct window *win, struct window *previous,
         if (!is_visible( client_surface_top ))
         {
             client_surface_top->client_surface_dirty = 1;
+            cancel_client_surface_timeout( client_surface_top );
             client_surface_top->client_surface_staged = 0;
             client_surface_top->client_surface_pending_count = 0;
             update_client_surface_publication( client_surface_top );
@@ -2550,6 +2629,7 @@ void free_window_handle( struct window *win )
 
     assert( win->handle );
     client_surface_top = get_toplevel_window( win );
+    if (client_surface_top == win) cancel_client_surface_timeout( win );
 
     /* hide the window */
     if (is_visible(win))
@@ -3290,15 +3370,11 @@ DECL_HANDLER(set_client_surface_state)
     }
     if ((req->flags & (CLIENT_SURFACE_STATE_UNREGISTER | CLIENT_SURFACE_STATE_UNCACHE)) &&
         !has_client_surface( top ))
-    {
-        top->client_surface_dirty = 0;
-        top->client_surface_staged = 0;
-        top->client_surface_pending_count = 0;
-        update_client_surface_publication( top );
-    }
+        finish_client_surface_publication( top );
     if (owner) release_client_surface_owner( owner );
     if (req->flags & CLIENT_SURFACE_STATE_STAGED)
     {
+        cancel_client_surface_timeout( top );
         top->client_surface_staged = top->client_surface_dirty && is_visible( top );
         if (top->client_surface_staged)
         {
@@ -3308,10 +3384,7 @@ DECL_HANDLER(set_client_surface_state)
         top->client_surface_pending_count = top->client_surface_staged ?
             prepare_client_surface_generation( top, top->client_surface_generation ) : 0;
         if (top->client_surface_staged && !top->client_surface_pending_count)
-        {
-            top->client_surface_dirty = 0;
-            top->client_surface_staged = 0;
-        }
+            finish_client_surface_publication( top );
         update_client_surface_publication( top );
         /* The host driver has now mapped the top-level window into its private
          * staging buffer.  A client surface may already contain a complete
@@ -3322,14 +3395,10 @@ DECL_HANDLER(set_client_surface_state)
          * rejected by the client-side completeness check and remain staged
          * until an application present completes them. */
         if (top->client_surface_staged) notify_client_surface_geometry_ready( top );
+        if (top->client_surface_staged) arm_client_surface_timeout( top );
     }
     if (req->flags & CLIENT_SURFACE_STATE_BYPASS)
-    {
-        top->client_surface_dirty = 0;
-        top->client_surface_staged = 0;
-        top->client_surface_pending_count = 0;
-        update_client_surface_publication( top );
-    }
+        finish_client_surface_publication( top );
     if (req->flags & CLIENT_SURFACE_STATE_GEOMETRY_READY)
         notify_client_surface_geometry_ready( top );
     if ((req->flags & CLIENT_SURFACE_STATE_PRESENT_COMMIT) && surface &&

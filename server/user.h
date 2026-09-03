@@ -127,8 +127,8 @@ extern void set_clip_rectangle( struct desktop *desktop, const struct rectangle 
 extern void update_cursor_pos( struct desktop *desktop );
 extern void post_message( user_handle_t win, unsigned int message,
                           lparam_t wparam, lparam_t lparam );
-extern void post_process_message( struct process *process, user_handle_t win,
-                                  unsigned int message, lparam_t wparam, lparam_t lparam );
+extern int post_process_message( struct process *process, user_handle_t win,
+                                 unsigned int message, lparam_t wparam, lparam_t lparam );
 extern void send_notify_message( user_handle_t win, unsigned int message,
                                  lparam_t wparam, lparam_t lparam );
 extern void post_win_event( struct thread *thread, unsigned int event,

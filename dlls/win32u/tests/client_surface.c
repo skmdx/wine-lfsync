@@ -422,8 +422,9 @@ static void test_concurrent_state_changes(void)
     DestroyWindow( hwnd );
 }
 
-static void owner_exit_child( HWND hwnd, HANDLE ready, HANDLE release )
+static void owner_exit_child( HWND hwnd, HANDLE ready, HANDLE release, BOOL create_queue )
 {
+    MSG message;
     unsigned int i, status;
 
     for (i = 0; i < OWNER_SURFACES; ++i)
@@ -433,6 +434,7 @@ static void owner_exit_child( HWND hwnd, HANDLE ready, HANDLE release )
                                     0, NULL );
         ok( !status, "owner register %u failed, status %#x\n", i, status );
     }
+    if (create_queue) PeekMessageA( &message, NULL, 0, 0, PM_NOREMOVE );
     SetEvent( ready );
     ok( WaitForSingleObject( release, 10000 ) == WAIT_OBJECT_0,
         "owner exit child release timed out\n" );
@@ -456,7 +458,9 @@ static BOOL run_child( char **argv, const char *mode, HWND hwnd, DWORD delay )
     char command[MAX_PATH * 2];
 
     ready = CreateEventA( &attr, TRUE, FALSE, NULL );
-    if (!strcmp( mode, "owner_exit" )) release = CreateEventA( &attr, TRUE, FALSE, NULL );
+    if (!strcmp( mode, "owner_exit" ) || !strcmp( mode, "owner_no_queue" ) ||
+        !strcmp( mode, "owner_stalled" ))
+        release = CreateEventA( &attr, TRUE, FALSE, NULL );
     sprintf( command, "%s %s %s %p %p %p", argv[0], argv[1], mode, hwnd, ready, release );
     if (!CreateProcessA( NULL, command, NULL, NULL, !!ready, 0, NULL, NULL, &startup, &process ))
     {
@@ -467,7 +471,8 @@ static BOOL run_child( char **argv, const char *mode, HWND hwnd, DWORD delay )
     }
     ok( WaitForSingleObject( ready, 10000 ) == WAIT_OBJECT_0,
         "%s child did not become ready\n", mode );
-    if (!strcmp( mode, "owner_exit" ))
+    if (!strcmp( mode, "owner_exit" ) || !strcmp( mode, "owner_no_queue" ) ||
+        !strcmp( mode, "owner_stalled" ))
     {
         struct surface_state state;
         unsigned int status;
@@ -475,8 +480,22 @@ static BOOL run_child( char **argv, const char *mode, HWND hwnd, DWORD delay )
         ShowWindow( hwnd, SW_SHOW );
         status = set_surface_state( hwnd, 0, CLIENT_SURFACE_STATE_STAGED, 0, &state );
         ok( !status, "owner exit stage failed, status %#x\n", status );
-        ok( state.staged && state.pending == OWNER_SURFACES,
-            "owner generation staged %u pending %u\n", state.staged, state.pending );
+        if (strcmp( mode, "owner_no_queue" ))
+            ok( state.staged && state.pending == OWNER_SURFACES,
+                "owner generation staged %u pending %u\n", state.staged, state.pending );
+        else
+            ok( !state.staged && !state.pending && state.wake,
+                "queue-less owner blocked publication: staged %u pending %u wake %u\n",
+                state.staged, state.pending, state.wake );
+        if (!strcmp( mode, "owner_stalled" ))
+        {
+            Sleep( 1500 );
+            status = set_surface_state( hwnd, 0, 0, 0, &state );
+            ok( !status, "stalled owner state query failed, status %#x\n", status );
+            ok( !state.staged && !state.pending,
+                "stalled owner blocked publication deadline: staged %u pending %u\n",
+                state.staged, state.pending );
+        }
         SetEvent( release );
     }
     else
@@ -728,6 +747,26 @@ static void test_owner_exit_and_destroy( char **argv )
     ok( !!hwnd, "failed to create owner window, error %lu\n", GetLastError() );
     if (!hwnd) return;
 
+    if (run_child( argv, "owner_no_queue", hwnd, 0 ))
+    {
+        status = set_surface_state( hwnd, 0, 0, 0, &state );
+        ok( !status, "state query after queue-less owner exit failed, status %#x\n", status );
+        ok( !state.active && !state.cached && !state.pending,
+            "queue-less owner leaked state: active %u cached %u pending %u\n",
+            state.active, state.cached, state.pending );
+    }
+
+    ShowWindow( hwnd, SW_HIDE );
+    if (run_child( argv, "owner_stalled", hwnd, 0 ))
+    {
+        status = set_surface_state( hwnd, 0, 0, 0, &state );
+        ok( !status, "state query after stalled owner exit failed, status %#x\n", status );
+        ok( !state.active && !state.cached && !state.pending,
+            "stalled owner leaked state: active %u cached %u pending %u\n",
+            state.active, state.cached, state.pending );
+    }
+
+    ShowWindow( hwnd, SW_HIDE );
     if (run_child( argv, "owner_exit", hwnd, 0 ))
     {
         status = set_surface_state( hwnd, 0, 0, 0, &state );
@@ -755,14 +794,16 @@ START_TEST(client_surface)
         return;
     }
 
-    if (argc > 5 && !strcmp( argv[2], "owner_exit" ))
+    if (argc > 5 && (!strcmp( argv[2], "owner_exit" ) ||
+                     !strcmp( argv[2], "owner_no_queue" ) ||
+                     !strcmp( argv[2], "owner_stalled" )))
     {
         HANDLE ready, release;
 
         sscanf( argv[3], "%p", &hwnd );
         sscanf( argv[4], "%p", &ready );
         sscanf( argv[5], "%p", &release );
-        owner_exit_child( hwnd, ready, release );
+        owner_exit_child( hwnd, ready, release, strcmp( argv[2], "owner_no_queue" ) );
         return;
     }
     if (argc > 4 && !strcmp( argv[2], "destroy_race" ))
