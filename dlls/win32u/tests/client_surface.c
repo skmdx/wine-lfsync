@@ -108,6 +108,14 @@ static unsigned int begin_surface_state( HWND hwnd, UINT_PTR surface,
                                          const struct surface_state *generation,
                                          struct surface_state *state )
 {
+    return set_surface_state_scene( hwnd, surface, CLIENT_SURFACE_STATE_PRESENT_BEGIN,
+                                    generation->generation, generation->scene_generation, state );
+}
+
+static unsigned int begin_surface_write_state( HWND hwnd, UINT_PTR surface,
+                                               const struct surface_state *generation,
+                                               struct surface_state *state )
+{
     return set_surface_state_scene( hwnd, surface, CLIENT_SURFACE_STATE_PRESENT_BEGIN |
                                     CLIENT_SURFACE_STATE_PRESENT_WRITE_LEASE,
                                     generation->generation, generation->scene_generation, state );
@@ -776,7 +784,7 @@ static void test_scene_writer_barrier(void)
         "writer barrier initial publication failed: status %#x generation %s ready %u\n",
         status, wine_dbgstr_longlong( state.generation ), state.ready );
 
-    status = begin_surface_state( hwnd, surface, &state, &steady );
+    status = begin_surface_write_state( hwnd, surface, &state, &steady );
     ok( !status && steady.compose,
         "steady backing writer was not admitted: status %#x compose %u\n", status, steady.compose );
     SetWindowPos( hwnd, NULL, 17, 10, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE );
@@ -809,7 +817,7 @@ static void test_scene_writer_barrier(void)
 static void test_backend_capability_isolation(void)
 {
     const UINT_PTR surface = 0x123b8000, barrier = 0x45668000;
-    struct surface_state state, composing, ready, steady, sealed;
+    struct surface_state state, composing, ready, steady, denied, sealed;
     HWND hwnd;
     unsigned int status;
 
@@ -837,6 +845,10 @@ static void test_backend_capability_isolation(void)
     ok( !status && steady.compose,
         "scene publication backend was not admitted, status %#x compose %u\n",
         status, steady.compose );
+    status = begin_surface_write_state( hwnd, surface, &state, &denied );
+    ok( !status && !denied.compose,
+        "publication-only backend was granted a write lease, status %#x compose %u\n",
+        status, denied.compose );
     status = set_surface_state( hwnd, barrier, CLIENT_SURFACE_STATE_NATIVE_BARRIER_BEGIN,
                                 0, &sealed );
     ok( !status && !sealed.pending && (sealed.scene_generation & 1),
@@ -878,7 +890,7 @@ static void test_native_backing_barrier(void)
     status = publish_surface_state( hwnd, &state );
     ok( !status && !state.generation, "native barrier publication failed, status %#x\n", status );
 
-    status = begin_surface_state( hwnd, surface, &state, &steady );
+    status = begin_surface_write_state( hwnd, surface, &state, &steady );
     ok( !status && steady.compose, "native barrier writer was not admitted, status %#x\n", status );
     status = set_surface_state( hwnd, barrier, CLIENT_SURFACE_STATE_NATIVE_BARRIER_BEGIN,
                                 0, &sealed );
@@ -891,7 +903,7 @@ static void test_native_backing_barrier(void)
     status = set_surface_state( hwnd, barrier, CLIENT_SURFACE_STATE_NATIVE_BARRIER_END, 0, NULL );
     ok( status == STATUS_DEVICE_BUSY, "active native barrier ended with status %#x\n", status );
 
-    status = begin_surface_state( hwnd, surface, &state, &blocked );
+    status = begin_surface_write_state( hwnd, surface, &state, &blocked );
     ok( !status && !blocked.compose,
         "new writer crossed native barrier: status %#x compose %u\n", status, blocked.compose );
     status = commit_surface_state( hwnd, surface, &state, &sealed );

@@ -4373,10 +4373,9 @@ DECL_HANDLER(set_client_surface_state)
                  !top->client_surface_publishing)
             compose = 1;
 
-        if (compose && surface->native_write_lease &&
-            (req->flags & CLIENT_SURFACE_STATE_PRESENT_WRITE_LEASE))
+        if (compose && (req->flags & CLIENT_SURFACE_STATE_PRESENT_WRITE_LEASE))
         {
-            if (surface->writing) compose = 0;
+            if (!surface->native_write_lease || surface->writing) compose = 0;
             else
             {
                 surface->writing = 1;
