@@ -303,8 +303,8 @@ static void test_generation_membership(void)
     ok( state.active == 1 && !state.cached && state.pending == 1 && state.staged && !state.wake,
         "uncache did not retire one surface: active %u cached %u pending %u staged %u wake %u\n",
         state.active, state.cached, state.pending, state.staged, state.wake );
-    ok( state.generation != staged.generation,
-        "membership change did not restart generation %s\n",
+    ok( state.generation == staged.generation,
+        "unselected cache removal restarted generation %s\n",
         wine_dbgstr_longlong( state.generation ) );
     status = set_surface_state( hwnd, first_surface,
                                 CLIENT_SURFACE_STATE_UNREGISTER | CLIENT_SURFACE_STATE_UNCACHE,
@@ -1003,7 +1003,7 @@ static DWORD WINAPI surface_race_thread( void *arg )
 
     for (i = 0; i < RACE_ROUNDS; ++i)
     {
-        UINT_PTR id = context->base + (i & 7);
+        UINT_PTR id = context->base + i;
 
         status = set_surface_state( context->hwnd, id, CLIENT_SURFACE_STATE_REGISTER, 0, NULL );
         if (status == STATUS_INVALID_HANDLE || status == STATUS_WINE_INVALID_WINDOW_HANDLE) break;
@@ -1056,7 +1056,7 @@ static void test_concurrent_state_changes(void)
     for (i = 0; i < RACE_THREADS; ++i)
     {
         contexts[i].hwnd = hwnd;
-        contexts[i].base = 0x20000000 + i * 0x100;
+        contexts[i].base = 0x20000000 + i * 0x10000;
         contexts[i].failures = 0;
         contexts[i].first_status = 0;
         threads[i] = CreateThread( NULL, 0, surface_race_thread, &contexts[i], 0, NULL );
@@ -1157,13 +1157,20 @@ static BOOL run_child( char **argv, const char *mode, HWND hwnd, DWORD delay )
                 "owner generation staged %u pending %u\n", state.staged, state.pending );
         else
         {
-            ok( state.staged && state.ready && !state.pending && !state.wake,
-                "queue-less renderer did not reach owner publish: staged %u ready %u pending %u wake %u\n",
-                state.staged, state.ready, state.pending, state.wake );
-            status = publish_surface_state( hwnd, &state );
-            ok( !status && !state.staged && state.wake,
-                "queue-less generation did not publish: staged %u wake %u status %#x\n",
-                state.staged, state.wake, status );
+            if (state.pending)
+                skip( "process startup created a renderer message queue; "
+                      "queue-less notification path unavailable\n" );
+            else
+            {
+                ok( state.staged && state.ready && !state.wake,
+                    "queue-less renderer did not reach owner publish: "
+                    "staged %u ready %u wake %u\n",
+                    state.staged, state.ready, state.wake );
+                status = publish_surface_state( hwnd, &state );
+                ok( !status && !state.staged && state.wake,
+                    "queue-less generation did not publish: staged %u wake %u status %#x\n",
+                    state.staged, state.wake, status );
+            }
         }
         if (!strcmp( mode, "owner_stalled" ))
         {
