@@ -1331,6 +1331,87 @@ done:
     DestroyWindow( hwnd );
 }
 
+static BOOL register_present_test_class(void)
+{
+    WNDCLASSA class = {0};
+
+    class.style = CS_OWNDC;
+    class.lpfnWndProc = client_surface_proc;
+    class.hInstance = GetModuleHandleA( NULL );
+    class.lpszClassName = "client_surface_present_race";
+    if (!RegisterClassA( &class ) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS)
+    {
+        win_skip( "failed to register OpenGL present window, error %lu\n", GetLastError() );
+        return FALSE;
+    }
+    return TRUE;
+}
+
+static void test_paced_present_completion(void)
+{
+    PIXELFORMATDESCRIPTOR pfd = {sizeof(pfd), 1, PFD_DRAW_TO_WINDOW | PFD_SUPPORT_OPENGL |
+                                PFD_DOUBLEBUFFER, PFD_TYPE_RGBA, 24};
+    static const float colors[][3] = {{0.75, 0.25, 0.125}, {0.125, 0.625, 0.875}};
+    struct surface_state state;
+    HGLRC glrc = NULL;
+    HDC hdc = NULL;
+    HWND hwnd;
+    COLORREF color;
+    RECT rect;
+    unsigned int status;
+    unsigned int i;
+    int format;
+
+    if (!register_present_test_class()) return;
+    hwnd = CreateWindowExA( WS_EX_LAYERED | WS_EX_TOPMOST, "client_surface_present_race",
+                            "paced presents", WS_POPUP, 520, 240, 160, 120,
+                            NULL, NULL, GetModuleHandleA( NULL ), NULL );
+    ok( !!hwnd, "failed to create paced-present window, error %lu\n", GetLastError() );
+    if (!hwnd) return;
+    ok( SetLayeredWindowAttributes( hwnd, 0, 255, LWA_ALPHA ),
+        "failed to initialize paced-present layered attributes, error %lu\n", GetLastError() );
+
+    hdc = GetDC( hwnd );
+    format = hdc ? ChoosePixelFormat( hdc, &pfd ) : 0;
+    if (!hdc || !format || !SetPixelFormat( hdc, format, &pfd ) ||
+        !(glrc = wglCreateContext( hdc )) || !wglMakeCurrent( hdc, glrc ))
+    {
+        win_skip( "paced-present OpenGL context setup failed, error %lu\n", GetLastError() );
+        goto done;
+    }
+
+    GetClientRect( hwnd, &rect );
+    glViewport( 0, 0, rect.right, rect.bottom );
+    for (i = 0; i < 16; ++i)
+    {
+        GLenum error;
+
+        glClearColor( colors[i & 1][0], colors[i & 1][1], colors[i & 1][2], 1.0 );
+        glClear( GL_COLOR_BUFFER_BIT );
+        error = glGetError();
+        ok( error == GL_NO_ERROR, "frame %u GL error %#x\n", i, error );
+        ok( SwapBuffers( hdc ), "frame %u SwapBuffers failed, error %lu\n",
+            i, GetLastError() );
+        Sleep( 50 );
+    }
+
+    ShowWindow( hwnd, SW_SHOWNA );
+    pump_messages( 500 );
+    status = set_surface_state( hwnd, 0, 0, 0, &state );
+    ok( !status, "paced-present state query failed, status %#x\n", status );
+    ok( !state.staged && !state.pending,
+        "paced presents not published: staged %u pending %u\n", state.staged, state.pending );
+    color = get_gl_front_pixel( &rect );
+    ok( color_matches( color, 32, 159, 223 ), "unexpected final paced-present pixel %#lx\n",
+        color );
+
+done:
+    if (glrc) wglMakeCurrent( NULL, NULL );
+    if (glrc) wglDeleteContext( glrc );
+    if (hdc) ReleaseDC( hwnd, hdc );
+    DestroyWindow( hwnd );
+}
+
 static DWORD WINAPI present_race_thread( void *arg )
 {
     struct present_race_context *context = arg;
@@ -1370,18 +1451,9 @@ static DWORD WINAPI present_race_thread( void *arg )
 
 static void test_present_destroy_race(void)
 {
-    WNDCLASSA class = {0};
     unsigned int i;
 
-    class.style = CS_OWNDC;
-    class.lpfnWndProc = client_surface_proc;
-    class.hInstance = GetModuleHandleA( NULL );
-    class.lpszClassName = "client_surface_present_race";
-    if (!RegisterClassA( &class ) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS)
-    {
-        win_skip( "failed to register OpenGL race window, error %lu\n", GetLastError() );
-        return;
-    }
+    if (!register_present_test_class()) return;
 
     for (i = 0; i < 10; ++i)
     {
@@ -1389,8 +1461,9 @@ static void test_present_destroy_race(void)
         HANDLE thread;
         unsigned int j;
 
-        context.hwnd = CreateWindowA( class.lpszClassName, "present race", WS_POPUP | WS_VISIBLE,
-                                      20, 20, 160, 120, NULL, NULL, class.hInstance, NULL );
+        context.hwnd = CreateWindowA( "client_surface_present_race", "present race",
+                                      WS_POPUP | WS_VISIBLE, 20, 20, 160, 120,
+                                      NULL, NULL, GetModuleHandleA( NULL ), NULL );
         ok( !!context.hwnd, "failed to create OpenGL race window, error %lu\n", GetLastError() );
         if (!context.hwnd) break;
         context.ready = CreateEventA( NULL, TRUE, FALSE, NULL );
@@ -1542,6 +1615,8 @@ START_TEST(client_surface)
     test_owner_exit_and_destroy( argv );
     trace( "testing present and window destruction race\n" );
     test_present_destroy_race();
+    trace( "testing paced present completion\n" );
+    test_paced_present_completion();
     trace( "testing hidden present and resize\n" );
     test_hidden_present_resize();
 }
