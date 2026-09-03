@@ -256,6 +256,8 @@ enum client_surface_backend_caps
 struct client_surface_backend
 {
     unsigned int caps;
+    /* Resource and presentation hooks are optional.  An omitted lifecycle
+     * hook is a no-op; omitted update and present hooks succeed immediately. */
     void (*destroy)( struct client_surface *surface );
     /* detach the surface from its window, called from window owner thread */
     void (*detach)( struct client_surface *surface );

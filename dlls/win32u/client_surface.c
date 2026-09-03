@@ -57,6 +57,17 @@ static BOOL client_surface_backend_present( struct client_surface *surface, HDC 
            surface->backend->present( surface, hdc, surface_region, flush );
 }
 
+static unsigned int client_surface_backend_state_flags( const struct client_surface *surface )
+{
+    unsigned int flags = 0;
+
+    if (client_surface_backend_has_cap( surface, CLIENT_SURFACE_BACKEND_SCENE_PUBLICATION ))
+        flags |= CLIENT_SURFACE_STATE_SCENE_PUBLICATION;
+    if (client_surface_backend_has_cap( surface, CLIENT_SURFACE_BACKEND_NATIVE_WRITE_LEASE ))
+        flags |= CLIENT_SURFACE_STATE_NATIVE_WRITE_LEASE;
+    return flags;
+}
+
 static void remove_client_surface_chain( struct client_surface **head,
                                          struct client_surface *surface, BOOL identity );
 
@@ -812,6 +823,9 @@ void *client_surface_create( UINT size, const struct client_surface_backend *bac
     HWND toplevel = NtUserGetAncestor( hwnd, GA_ROOT );
     struct client_surface *surface;
 
+    if (!backend || size < sizeof(*surface) ||
+        !!backend->prepare_completion != !!backend->wait_completion)
+        return NULL;
     if (!(surface = calloc( 1, size ))) return NULL;
     if (pthread_mutex_init( &surface->present_lock, NULL ))
     {
@@ -2015,11 +2029,7 @@ void use_window_client_surface( struct client_surface *surface, BOOL use )
         /* surface wasn't used, it shouldn't be in any list */
         list_add_tail( &client_surfaces, &surface->entry );
         InterlockedExchange( &surface->active, TRUE );
-        flags = CLIENT_SURFACE_STATE_REGISTER;
-        if (client_surface_backend_has_cap( surface, CLIENT_SURFACE_BACKEND_SCENE_PUBLICATION ))
-            flags |= CLIENT_SURFACE_STATE_SCENE_PUBLICATION;
-        if (client_surface_backend_has_cap( surface, CLIENT_SURFACE_BACKEND_NATIVE_WRITE_LEASE ))
-            flags |= CLIENT_SURFACE_STATE_NATIVE_WRITE_LEASE;
+        flags = CLIENT_SURFACE_STATE_REGISTER | client_surface_backend_state_flags( surface );
         if (surface->server_cached)
         {
             flags |= CLIENT_SURFACE_STATE_UNCACHE;
@@ -2041,11 +2051,7 @@ void use_window_client_surface( struct client_surface *surface, BOOL use )
         flags = CLIENT_SURFACE_STATE_UNREGISTER;
         if (cache && InterlockedCompareExchange( &surface->content_valid, 0, 0 ))
         {
-            flags |= CLIENT_SURFACE_STATE_CACHE;
-            if (client_surface_backend_has_cap( surface, CLIENT_SURFACE_BACKEND_SCENE_PUBLICATION ))
-                flags |= CLIENT_SURFACE_STATE_SCENE_PUBLICATION;
-            if (client_surface_backend_has_cap( surface, CLIENT_SURFACE_BACKEND_NATIVE_WRITE_LEASE ))
-                flags |= CLIENT_SURFACE_STATE_NATIVE_WRITE_LEASE;
+            flags |= CLIENT_SURFACE_STATE_CACHE | client_surface_backend_state_flags( surface );
             InterlockedExchange( &surface->server_cached, TRUE );
         }
         else if (InterlockedCompareExchange( &surface->server_cached, 0, 0 ))
