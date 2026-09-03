@@ -10,6 +10,7 @@ SOURCES = \
 	brush.c \
 	clipboard.c \
 	client_surface.c \
+	client_surface_backing.c \
 	desktop.c \
 	display.c \
 	dllmain.c \
