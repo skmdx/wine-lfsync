@@ -35,7 +35,7 @@
 #include "winbase.h"
 
 #include "wine/debug.h"
-#include "x11drv.h"
+#include "client_surface.h"
 #include "xcomposite.h"
 
 #define WINE_VULKAN_NO_X11_TYPES

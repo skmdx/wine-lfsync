@@ -39,7 +39,7 @@
 #endif
 
 #include "ntstatus.h"
-#include "x11drv.h"
+#include "client_surface.h"
 #include "xcomposite.h"
 #include "winternl.h"
 #include "wine/debug.h"

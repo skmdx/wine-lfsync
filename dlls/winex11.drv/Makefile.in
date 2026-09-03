@@ -11,6 +11,7 @@ SOURCES = \
 	clipboard.c \
 	client_surface.c \
 	client_surface_backing.c \
+	client_surface_completion.c \
 	desktop.c \
 	display.c \
 	dllmain.c \

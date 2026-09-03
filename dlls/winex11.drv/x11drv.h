@@ -365,32 +365,6 @@ struct x11drv_escape_get_drawable
     RECT                     dc_rect;      /* DC rectangle relative to drawable */
 };
 
-struct x11drv_client_surface
-{
-    struct client_surface client;
-    XWindowChanges changes;
-    Colormap colormap;
-    Window window;
-    XID damage;
-    Pixmap composition_backing;
-    UINT64 composition_scene_generation;
-    HWND composition_toplevel;
-    struct x11drv_client_surface *damage_next;
-    struct list damage_wait_entry;
-    pthread_cond_t damage_cond;
-    BOOL keep_offscreen;    /* preserve a drawable which was used while hidden */
-    BOOL manual_redirect;   /* client drawable is manually XComposite redirected */
-    BOOL completion_broken; /* shared monitor is tainted until this drawable is destroyed */
-    BOOL completion_ready;
-    BOOL completion_waiting;
-    BOOL damage_cond_initialized;
-
-    HDC hdc_src;
-    HDC hdc_dst;
-};
-
-extern struct x11drv_client_surface *impl_from_client_surface( struct client_surface *client );
-
 extern void set_dc_drawable( HDC hdc, Drawable drawable, const RECT *rect, int mode );
 extern Drawable get_dc_drawable( HDC hdc, RECT *rect );
 extern HRGN get_dc_monitor_region( HWND hwnd, HDC hdc );
