@@ -101,8 +101,6 @@ static XContext host_window_context = 0;
 
 static const WCHAR whole_window_prop[] =
     {'_','_','w','i','n','e','_','x','1','1','_','w','h','o','l','e','_','w','i','n','d','o','w',0};
-static const WCHAR client_surface_backing_prop[] =
-    {'_','_','w','i','n','e','_','x','1','1','_','c','l','i','e','n','t','_','s','u','r','f','a','c','e','_','b','a','c','k','i','n','g',0};
 static const WCHAR clip_window_prop[] =
     {'_','_','w','i','n','e','_','x','1','1','_','c','l','i','p','_','w','i','n','d','o','w',0};
 static const WCHAR focus_time_prop[] =
@@ -603,214 +601,6 @@ static void set_empty_window_input_shape( struct x11drv_win_data *data )
     XShapeCombineRectangles( data->display, data->whole_window, ShapeInput, 0, 0,
                              &empty_rect, 1, ShapeSet, YXBanded );
 #endif
-}
-
-struct x11drv_retired_pixmap
-{
-    struct x11drv_retired_pixmap *next;
-    Pixmap pixmap;
-};
-
-static unsigned int client_surface_backing_extent( int size )
-{
-    unsigned int extent = 64, requested = min( max( size, 1 ), 65535 );
-
-    while (extent < requested)
-    {
-        if (extent >= 32768) return 65535;
-        extent <<= 1;
-    }
-    return extent;
-}
-
-static BOOL get_client_surface_window_extent( struct x11drv_win_data *data,
-                                              unsigned int *width, unsigned int *height )
-{
-    Window root;
-    unsigned int border, depth;
-    int x, y;
-
-    return XGetGeometry( data->display, data->whole_window, &root, &x, &y,
-                         width, height, &border, &depth );
-}
-
-static int client_surface_backing_error( Display *display, XErrorEvent *event, void *arg )
-{
-    int *error = arg;
-
-    *error = event->error_code;
-    return 1;
-}
-
-static void destroy_client_surface_backing( struct x11drv_win_data *data )
-{
-    struct x11drv_retired_pixmap *retired, *next;
-
-    NtUserRemoveProp( data->hwnd, client_surface_backing_prop );
-    if (data->client_surface_backing)
-        XFreePixmap( data->display, data->client_surface_backing );
-    if (data->client_surface_gc) XFreeGC( data->display, data->client_surface_gc );
-    for (retired = data->client_surface_retired; retired; retired = next)
-    {
-        next = retired->next;
-        XFreePixmap( data->display, retired->pixmap );
-        free( retired );
-    }
-    data->client_surface_backing = 0;
-    data->client_surface_gc = 0;
-    data->client_surface_backing_width = 0;
-    data->client_surface_backing_height = 0;
-    data->client_surface_retired = NULL;
-    data->client_surface_backing_valid = FALSE;
-}
-
-/* Grow geometrically and retain old XIDs until the top-level is destroyed.
- * A renderer from another process can pass its scene validation immediately
- * before a resize replaces the property.  Reusing or freeing that Pixmap
- * would turn the race into a cross-client Drawable ABA.  Geometric growth
- * bounds the retained area by a small multiple of the largest allocation. */
-static BOOL ensure_client_surface_backing( struct x11drv_win_data *data )
-{
-    struct x11drv_retired_pixmap *retired = NULL;
-    unsigned int width, height, window_width, window_height;
-    BOOL new_gc, old_valid;
-    int error = 0;
-    Pixmap pixmap;
-    GC gc;
-
-    if (!data->whole_window) return FALSE;
-    if (!get_client_surface_window_extent( data, &window_width, &window_height )) return FALSE;
-    width = client_surface_backing_extent( data->rects.visible.right - data->rects.visible.left );
-    height = client_surface_backing_extent( data->rects.visible.bottom - data->rects.visible.top );
-    if (data->client_surface_backing && data->client_surface_backing_width >= width &&
-        data->client_surface_backing_height >= height)
-        return TRUE;
-
-    /* Grow both axes monotonically.  If alternating wide and tall windows
-     * replaced one undersized axis while shrinking the other, each resize
-     * would retire another Pixmap of the opposite aspect ratio forever.
-     * Monotonic extents make every replacement at least double in area and
-     * bound all retired allocations by a geometric series. */
-    width = max( width, data->client_surface_backing_width );
-    height = max( height, data->client_surface_backing_height );
-    old_valid = data->client_surface_backing_valid;
-
-    /* Until a larger capability has been committed, the old Pixmap no longer
-     * represents the complete host extent and must not satisfy Expose. */
-    data->client_surface_backing_valid = FALSE;
-
-    if (data->client_surface_backing && !(retired = malloc( sizeof(*retired) ))) return FALSE;
-    pixmap = XCreatePixmap( data->display, data->whole_window, width, height, data->vis.depth );
-    gc = data->client_surface_gc;
-    new_gc = !gc;
-    if (!pixmap || (!gc && !(gc = XCreateGC( data->display, pixmap, 0, NULL ))))
-    {
-        if (pixmap) XFreePixmap( data->display, pixmap );
-        free( retired );
-        return FALSE;
-    }
-
-    X11DRV_expect_error( data->display, client_surface_backing_error, &error );
-    XCopyArea( data->display, data->whole_window, pixmap, gc, 0, 0,
-               min( window_width, width ), min( window_height, height ), 0, 0 );
-    if (data->client_surface_backing && old_valid)
-    {
-        XCopyArea( data->display, data->client_surface_backing, pixmap, gc, 0, 0,
-                   data->client_surface_backing_width, data->client_surface_backing_height, 0, 0 );
-    }
-    XSync( data->display, False );
-    X11DRV_check_error();
-
-    /* The HWND property is the renderer-visible capability for this backing.
-     * Commit it before replacing local state.  Otherwise a failed property
-     * allocation could make the owner publish one Pixmap while renderers keep
-     * writing the old one. */
-    if (error || !NtUserSetProp( data->hwnd, client_surface_backing_prop, (HANDLE)pixmap ))
-    {
-        int cleanup_error = 0;
-
-        X11DRV_expect_error( data->display, client_surface_backing_error, &cleanup_error );
-        XFreePixmap( data->display, pixmap );
-        if (new_gc) XFreeGC( data->display, gc );
-        XSync( data->display, False );
-        X11DRV_check_error();
-        free( retired );
-        return FALSE;
-    }
-
-    if (data->client_surface_backing)
-    {
-        retired->pixmap = data->client_surface_backing;
-        retired->next = data->client_surface_retired;
-        data->client_surface_retired = retired;
-    }
-
-    data->client_surface_backing = pixmap;
-    data->client_surface_gc = gc;
-    data->client_surface_backing_width = width;
-    data->client_surface_backing_height = height;
-    data->client_surface_backing_valid = TRUE;
-    return TRUE;
-}
-
-static BOOL snapshot_client_surface_backing( struct x11drv_win_data *data, BOOL invalidate )
-{
-    unsigned int width, height, window_width, window_height;
-    int error = 0;
-
-    if (!ensure_client_surface_backing( data )) return FALSE;
-    if (!get_client_surface_window_extent( data, &window_width, &window_height )) return FALSE;
-    width = min( data->client_surface_backing_width, window_width );
-    height = min( data->client_surface_backing_height, window_height );
-    data->client_surface_backing_valid = FALSE;
-    X11DRV_expect_error( data->display, client_surface_backing_error, &error );
-    XCopyArea( data->display, data->whole_window, data->client_surface_backing,
-               data->client_surface_gc,
-               0, 0, width, height, 0, 0 );
-    XSync( data->display, False );
-    X11DRV_check_error();
-    if (error) return FALSE;
-    data->client_surface_backing_valid = !invalidate;
-    return TRUE;
-}
-
-static BOOL publish_client_surface_backing( struct x11drv_win_data *data )
-{
-    unsigned int width, height, window_width, window_height;
-    int error = 0;
-
-    if (!data->whole_window || !data->client_surface_backing || !data->client_surface_gc)
-        return FALSE;
-    if (!get_client_surface_window_extent( data, &window_width, &window_height )) return FALSE;
-    width = min( data->client_surface_backing_width, window_width );
-    height = min( data->client_surface_backing_height, window_height );
-    X11DRV_expect_error( data->display, client_surface_backing_error, &error );
-    XCopyArea( data->display, data->client_surface_backing, data->whole_window,
-               data->client_surface_gc,
-               0, 0, width, height, 0, 0 );
-    XSync( data->display, False );
-    X11DRV_check_error();
-    if (error) return FALSE;
-    data->client_surface_backing_valid = TRUE;
-    return TRUE;
-}
-
-BOOL X11DRV_restore_client_surface_backing( struct x11drv_win_data *data,
-                                            Window window, const RECT *rect )
-{
-    if (window != data->whole_window || !data->client_surface_backing ||
-        !data->client_surface_gc || !data->client_surface_backing_valid || IsRectEmpty( rect ))
-        return FALSE;
-    if (rect->left < 0 || rect->top < 0 ||
-        (unsigned int)rect->right > data->client_surface_backing_width ||
-        (unsigned int)rect->bottom > data->client_surface_backing_height)
-        return FALSE;
-    XCopyArea( data->display, data->client_surface_backing, data->whole_window,
-               data->client_surface_gc,
-               rect->left, rect->top, rect->right - rect->left, rect->bottom - rect->top,
-               rect->left, rect->top );
-    XFlush( data->display );
-    return TRUE;
 }
 
 /* Keep a logically visible host window mapped and drawable while withholding
@@ -2791,7 +2581,8 @@ static void create_whole_window( struct x11drv_win_data *data )
     if (!NtUserGetLayeredWindowAttributes( data->hwnd, &key, &alpha, &layered_flags )) layered_flags = 0;
     set_window_opacity( data, alpha, layered_flags );
     sync_window_input_shape( data );
-    if (data->client_surface_backing_enabled) snapshot_client_surface_backing( data, FALSE );
+    if (data->client_surface_backing_enabled)
+        X11DRV_client_surface_backing_snapshot( data, FALSE );
 
     XFlush( data->display );  /* make sure the window exists before we start painting to it */
 
@@ -2833,7 +2624,7 @@ static void destroy_whole_window( struct x11drv_win_data *data, BOOL already_des
         if (!barrier)
             ERR( "failed to seal client-surface backing for window %p\n", data->hwnd );
     }
-    destroy_client_surface_backing( data );
+    X11DRV_client_surface_backing_destroy( data );
     if (!data->whole_window)
     {
         if (data->embedded) goto done;
@@ -3382,23 +3173,6 @@ Window X11DRV_get_whole_window_property( HWND hwnd )
     return (Window)NtUserGetProp( hwnd, whole_window_prop );
 }
 
-Pixmap X11DRV_get_client_surface_backing( HWND hwnd )
-{
-    struct x11drv_win_data *data = get_win_data( hwnd );
-    Pixmap ret;
-
-    if (!data) return (Pixmap)NtUserGetProp( hwnd, client_surface_backing_prop );
-    ret = data->client_surface_backing;
-    release_win_data( data );
-    return ret;
-}
-
-Pixmap X11DRV_get_client_surface_backing_property( HWND hwnd )
-{
-    return (Pixmap)NtUserGetProp( hwnd, client_surface_backing_prop );
-}
-
-
 /***********************************************************************
  *		X11DRV_GetDC   (X11DRV.@)
  */
@@ -3730,22 +3504,23 @@ void X11DRV_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_hint, UIN
 #endif
     }
 
-    if (data->client_surface_backing) ensure_client_surface_backing( data );
+    if (data->client_surface_backing) X11DRV_client_surface_backing_ensure( data );
     if (enable_client_surface_backing || disable_client_surface_backing)
     {
-        if (enable_client_surface_backing) snapshot_client_surface_backing( data, FALSE );
-        else destroy_client_surface_backing( data );
+        if (enable_client_surface_backing)
+            X11DRV_client_surface_backing_snapshot( data, FALSE );
+        else X11DRV_client_surface_backing_destroy( data );
     }
 
     window_set_wm_state( data, get_desired_wm_state( new_style, new_rects ), activate );
-    if (prepare_client_surface && !snapshot_client_surface_backing( data, TRUE ))
+    if (prepare_client_surface && !X11DRV_client_surface_backing_snapshot( data, TRUE ))
         client_surface_bypass_staging( hwnd );
     if (publish_client_surface)
     {
         /* The server keeps the live or staged token active until this X
          * request has completed.  This is the native linearization point for
          * publication. */
-        if (!publish_client_surface_backing( data )) client_surface_bypass_staging( hwnd );
+        if (!X11DRV_client_surface_backing_publish( data )) client_surface_bypass_staging( hwnd );
         if (data->client_surface_redirected || data->client_surface_opacity_staged)
             finish_client_surface_staging( data );
         XSync( data->display, False );
@@ -3755,7 +3530,7 @@ void X11DRV_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_hint, UIN
         /* The redirect and map must reach the X server before another process
          * is allowed to commit into this publication generation. */
         XSync( data->display, False );
-        if (snapshot_client_surface_backing( data, TRUE ))
+        if (X11DRV_client_surface_backing_snapshot( data, TRUE ))
         {
             client_surface_set_staged( hwnd );
             data->client_surface_staged = TRUE;

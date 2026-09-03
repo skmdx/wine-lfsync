@@ -845,7 +845,7 @@ static BOOL X11DRV_Expose( HWND hwnd, XEvent *xev )
     rect.top    = pos.y;
     rect.right  = pos.x + event->width;
     rect.bottom = pos.y + event->height;
-    restored = X11DRV_restore_client_surface_backing( data, event->window, &rect );
+    restored = X11DRV_client_surface_backing_restore( data, event->window, &rect );
     repair = event->window == data->whole_window && data->client_surface_backing &&
              !data->client_surface_backing_valid;
 

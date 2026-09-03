@@ -746,8 +746,12 @@ extern Window X11DRV_get_whole_window( HWND hwnd );
 extern Window X11DRV_get_whole_window_property( HWND hwnd );
 extern Pixmap X11DRV_get_client_surface_backing( HWND hwnd );
 extern Pixmap X11DRV_get_client_surface_backing_property( HWND hwnd );
-extern BOOL X11DRV_restore_client_surface_backing( struct x11drv_win_data *data,
-                                                   Window window, const RECT *rect );
+extern void X11DRV_client_surface_backing_destroy( struct x11drv_win_data *data );
+extern BOOL X11DRV_client_surface_backing_ensure( struct x11drv_win_data *data );
+extern BOOL X11DRV_client_surface_backing_snapshot( struct x11drv_win_data *data, BOOL invalidate );
+extern BOOL X11DRV_client_surface_backing_publish( struct x11drv_win_data *data );
+extern BOOL X11DRV_client_surface_backing_restore( struct x11drv_win_data *data,
+                                                  Window window, const RECT *rect );
 extern Window get_dummy_parent(void);
 
 extern BOOL window_is_reparenting( HWND hwnd );
