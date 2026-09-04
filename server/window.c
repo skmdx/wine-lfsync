@@ -78,7 +78,6 @@ struct client_surface_ref
     client_ptr_t    id;
     unsigned long long generation;
     unsigned long long sequence;
-    unsigned int    refs; /* membership, queued notifications and destroy obligation */
     unsigned int    active : 1;
     unsigned int    cached : 1;
     unsigned int    claimed : 1; /* an active surface which completed a host present */
@@ -136,20 +135,13 @@ static void remove_client_surface_ref_index( struct client_surface_ref *surface 
     assert( 0 );
 }
 
-static void grab_client_surface_ref( struct client_surface_ref *surface )
+static void free_client_surface_ref_if_unused( struct client_surface_ref *surface )
 {
-    assert( surface->refs && surface->refs < UINT_MAX );
-    surface->refs++;
-}
+    if (surface->owner || surface->notification_pending ||
+        surface->destroy_state != CLIENT_SURFACE_DESTROY_NONE)
+        return;
 
-static void release_client_surface_refs( struct client_surface_ref *surface, unsigned int refs )
-{
-    assert( refs && surface->refs >= refs );
-    if ((surface->refs -= refs)) return;
-
-    assert( !surface->owner && !surface->active && !surface->cached && !surface->writing );
-    assert( !surface->notification_pending &&
-            surface->destroy_state == CLIENT_SURFACE_DESTROY_NONE );
+    assert( !surface->active && !surface->cached && !surface->writing );
     remove_client_surface_ref_index( surface );
     free( surface );
 }
@@ -163,7 +155,7 @@ static void retire_client_surface_ref( struct client_surface_ref *surface )
     list_remove( &surface->entry );
     surface->active = surface->cached = surface->claimed = 0;
     surface->owner = NULL;
-    release_client_surface_refs( surface, 1 );
+    free_client_surface_ref_if_unused( surface );
 }
 
 
@@ -1265,7 +1257,6 @@ static struct client_surface_ref *get_client_surface_ref( struct client_surface_
     surface->id = id;
     surface->generation = 0;
     surface->sequence = 0;
-    surface->refs = 1;
     surface->active = 0;
     surface->cached = 0;
     surface->claimed = 0;
@@ -1703,13 +1694,11 @@ static int discard_client_surface_owners( struct window *win, struct window *top
         {
             assert( surface->destroy_state == CLIENT_SURFACE_DESTROY_NONE );
             surface->destroy_state = CLIENT_SURFACE_DESTROY_PENDING;
-            grab_client_surface_ref( surface ); /* destroy delivery obligation */
             owner->process->client_surface_destroy_count++;
             if (post_process_message( owner->process, 0, WM_WINE_UPDATEWINDOWSTATE,
                                       WINE_DESTROY_CLIENT_SURFACES, surface->id ))
             {
                 surface->destroy_state = CLIENT_SURFACE_DESTROY_QUEUED;
-                grab_client_surface_ref( surface ); /* queued notification */
             }
             else clear_error();
         }
@@ -1756,16 +1745,12 @@ void cleanup_process_client_surfaces( struct process *process )
             next = surface->index_next;
             if (surface->process != process)
                 continue;
-            assert( !surface->owner && surface->refs == 1 &&
-                    !surface->notification_pending &&
-                    surface->destroy_state != CLIENT_SURFACE_DESTROY_QUEUED );
-            if (surface->destroy_state == CLIENT_SURFACE_DESTROY_PENDING)
-            {
-                assert( process->client_surface_destroy_count );
-                process->client_surface_destroy_count--;
-                surface->destroy_state = CLIENT_SURFACE_DESTROY_NONE;
-            }
-            release_client_surface_refs( surface, 1 );
+            assert( !surface->owner && !surface->notification_pending &&
+                    surface->destroy_state == CLIENT_SURFACE_DESTROY_PENDING );
+            assert( process->client_surface_destroy_count );
+            process->client_surface_destroy_count--;
+            surface->destroy_state = CLIENT_SURFACE_DESTROY_NONE;
+            free_client_surface_ref_if_unused( surface );
         }
     }
     assert( !process->client_surface_destroy_count );
@@ -1826,7 +1811,6 @@ static int notify_client_surface_geometry_ready_recursive( struct window *win, s
                                       WINE_UPDATE_CLIENT_SURFACES, surface->id ))
             {
                 surface->notification_pending = 1;
-                grab_client_surface_ref( surface );
                 continue;
             }
             else
@@ -1860,7 +1844,6 @@ void client_surface_notification_removed( struct process *process, client_ptr_t 
                                           lparam_t type, int delivered )
 {
     struct client_surface_ref *surface = find_indexed_client_surface_ref( process, id );
-    unsigned int refs = 1; /* queued notification */
 
     if (!surface) return;
     if (type == WINE_UPDATE_CLIENT_SURFACES)
@@ -1876,12 +1859,11 @@ void client_surface_notification_removed( struct process *process, client_ptr_t 
                                              CLIENT_SURFACE_DESTROY_PENDING;
         if (delivered)
         {
-            refs++; /* destroy delivery obligation */
             assert( process->client_surface_destroy_count );
             process->client_surface_destroy_count--;
         }
     }
-    release_client_surface_refs( surface, refs );
+    free_client_surface_ref_if_unused( surface );
 }
 
 /* Window destruction can race a renderer moving or creating its message
@@ -1905,7 +1887,6 @@ void retry_process_client_surface_destroys( struct process *process )
                                       WINE_DESTROY_CLIENT_SURFACES, surface->id ))
             {
                 surface->destroy_state = CLIENT_SURFACE_DESTROY_QUEUED;
-                grab_client_surface_ref( surface );
             }
             else clear_error();
         }
@@ -1937,7 +1918,6 @@ void retry_process_client_surface_notifications( struct process *process, user_h
                                       WINE_UPDATE_CLIENT_SURFACES, surface->id ))
             {
                 surface->notification_pending = 1;
-                grab_client_surface_ref( surface );
             }
             else clear_error();
         }
