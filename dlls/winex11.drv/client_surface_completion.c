@@ -124,11 +124,10 @@ static void dispatch_xdamage_events_locked(void)
         surface = find_xdamage_surface_locked( ((XDamageNotifyEvent *)&event)->damage );
         if (!surface) continue;
         surface->completion.ready = TRUE;
-        if (surface->completion.waiting)
+        if (!list_empty( &surface->completion.wait_entry ))
         {
             list_remove( &surface->completion.wait_entry );
             list_init( &surface->completion.wait_entry );
-            surface->completion.waiting = FALSE;
             pthread_cond_signal( &surface->completion.cond );
         }
     }
@@ -145,7 +144,6 @@ static void wake_xdamage_dispatcher_locked(void)
     surface = CONTAINING_RECORD( completion, struct x11drv_client_surface, completion );
     list_remove( entry );
     list_init( entry );
-    surface->completion.waiting = FALSE;
     pthread_cond_signal( &surface->completion.cond );
 }
 
@@ -236,7 +234,7 @@ static void x11drv_client_surface_abandon_completion( struct client_surface *cli
     if (!surface->completion.damage) return;
 
     pthread_mutex_lock( &xdamage_lock );
-    assert( !surface->completion.waiting );
+    assert( list_empty( &surface->completion.wait_entry ) );
     remove_xdamage_surface_locked( surface );
     /* Synchronize and drain before freeing the ID so a queued event cannot be
      * confused with a later Damage object if Xlib recycles the XID. */
@@ -318,14 +316,13 @@ static BOOL x11drv_client_surface_wait_completion( struct client_surface *client
             abstime.tv_nsec += (long)(remaining % 1000) * 1000000;
             abstime.tv_sec += remaining / 1000 + abstime.tv_nsec / 1000000000;
             abstime.tv_nsec %= 1000000000;
-            surface->completion.waiting = TRUE;
+            assert( list_empty( &surface->completion.wait_entry ) );
             list_add_tail( &xdamage_waiters, &surface->completion.wait_entry );
             pthread_cond_timedwait( &surface->completion.cond, &xdamage_lock, &abstime );
-            if (surface->completion.waiting)
+            if (!list_empty( &surface->completion.wait_entry ))
             {
                 list_remove( &surface->completion.wait_entry );
                 list_init( &surface->completion.wait_entry );
-                surface->completion.waiting = FALSE;
             }
             pthread_mutex_unlock( &xdamage_lock );
         }

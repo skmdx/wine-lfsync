@@ -24,7 +24,6 @@ struct x11drv_client_surface_completion
     pthread_cond_t cond;
     BOOL broken; /* shared monitor is tainted until this drawable is destroyed */
     BOOL ready;
-    BOOL waiting;
     BOOL cond_initialized;
 };
 
