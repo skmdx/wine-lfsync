@@ -299,7 +299,8 @@ static BOOL copy_client_surface( struct x11drv_client_surface *surface, Drawable
 }
 
 static BOOL X11DRV_client_surface_present( struct client_surface *client, HDC hdc,
-                                           HRGN surface_region, BOOL flush )
+                                           HRGN surface_region, BOOL flush,
+                                           BOOL defer_visible )
 {
     struct x11drv_client_surface *surface = impl_from_client_surface( client );
     HWND hwnd = client->hwnd, toplevel = client->toplevel;
@@ -362,7 +363,7 @@ static BOOL X11DRV_client_surface_present( struct client_surface *client, HDC hd
      * region; a live or staged generation becomes visible only in the owner
      * process after all renderer commits have reached the server. */
     ret = backing ? copy_client_surface( surface, backing, &rect_dst, &rect_src, region ) : TRUE;
-    if (ret && (!flush || !backing))
+    if (ret && (!defer_visible || !backing))
         ret = copy_client_surface( surface, window, &rect_dst, &rect_src, region );
     if (ret)
     {

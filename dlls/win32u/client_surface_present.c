@@ -24,10 +24,11 @@
 WINE_DEFAULT_DEBUG_CHANNEL(win);
 
 static BOOL client_surface_backend_present( struct client_surface *surface, HDC hdc,
-                                            HRGN surface_region, BOOL flush )
+                                            HRGN surface_region, BOOL flush,
+                                            BOOL defer_visible )
 {
     return !surface->backend->present ||
-           surface->backend->present( surface, hdc, surface_region, flush );
+           surface->backend->present( surface, hdc, surface_region, flush, defer_visible );
 }
 
 static BOOL client_surface_backend_prepare_completion( struct client_surface *surface )
@@ -396,7 +397,8 @@ BOOL client_surface_end_present_internal( struct client_surface *surface, UINT64
          * not merely submission from this process.  Complete the backend
          * copy before returning the lease so the owner cannot publish or
          * replace the shared target ahead of work queued on this connection. */
-        copied = client_surface_backend_present( surface, hdc, surface_region, sync || leased );
+        copied = client_surface_backend_present( surface, hdc, surface_region,
+                                                 sync || leased, sync );
         composed = copied;
     }
     if (copied && offscreen && !client_surface_publication_matches( present ))

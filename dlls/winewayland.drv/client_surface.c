@@ -69,7 +69,8 @@ static BOOL wayland_client_surface_update(struct client_surface *client)
     return TRUE;
 }
 
-static BOOL wayland_client_surface_present(struct client_surface *client, HDC hdc, HRGN surface_region, BOOL flush)
+static BOOL wayland_client_surface_present(struct client_surface *client, HDC hdc, HRGN surface_region,
+                                           BOOL flush, BOOL defer_visible)
 {
     struct wayland_client_surface *surface = impl_from_client_surface(client);
     HWND hwnd = client->hwnd, toplevel = client->toplevel;

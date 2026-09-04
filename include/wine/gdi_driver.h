@@ -272,8 +272,10 @@ struct client_surface_backend
     void (*detach)( struct client_surface *surface );
     /* update the surface to match its window state; return whether the native target is usable */
     BOOL (*update)( struct client_surface *surface );
-    /* present the client surface if necessary, hdc != NULL when offscreen, called from render thread */
-    BOOL (*present)( struct client_surface *surface, HDC hdc, HRGN surface_region, BOOL flush );
+    /* present the client surface if necessary, hdc != NULL when offscreen, called from render thread;
+     * flush requires host completion before returning, defer_visible keeps a scene generation staged */
+    BOOL (*present)( struct client_surface *surface, HDC hdc, HRGN surface_region,
+                     BOOL flush, BOOL defer_visible );
     const struct client_surface_completion_ops *completion;
 };
 

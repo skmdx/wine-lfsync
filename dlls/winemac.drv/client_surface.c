@@ -66,7 +66,8 @@ static BOOL macdrv_client_surface_update(struct client_surface *client)
     return TRUE;
 }
 
-static BOOL macdrv_client_surface_present(struct client_surface *client, HDC hdc, HRGN surface_region, BOOL flush)
+static BOOL macdrv_client_surface_present(struct client_surface *client, HDC hdc, HRGN surface_region,
+                                          BOOL flush, BOOL defer_visible)
 {
     struct macdrv_client_surface *surface = impl_from_client_surface(client);
     struct macdrv_win_data *data;
@@ -114,7 +115,7 @@ struct client_surface *macdrv_CreateClientSurface(HWND hwnd, int pixel_format, B
     macdrv_set_view_hidden(surface->cocoa_view, TRUE);
 
     macdrv_client_surface_update(&surface->client);
-    macdrv_client_surface_present(&surface->client, 0, 0, FALSE);
+    macdrv_client_surface_present(&surface->client, 0, 0, FALSE, FALSE);
 
     return &surface->client;
 }
