@@ -51,16 +51,17 @@ static void macdrv_client_surface_detach(struct client_surface *client)
     }
 }
 
-static BOOL macdrv_client_surface_update(struct client_surface *client)
+static BOOL macdrv_client_surface_update(struct client_surface *client,
+                                         struct client_surface_target *target)
 {
     struct macdrv_client_surface *surface = impl_from_client_surface(client);
-    HWND hwnd = client->hwnd, toplevel = NtUserGetAncestor(hwnd, GA_ROOT);
+    HWND hwnd = client->hwnd, toplevel = target->toplevel;
     struct macdrv_win_data *data;
 
     TRACE("%s\n", debugstr_client_surface(client));
 
     if (!(data = get_win_data(toplevel))) return FALSE;
-    macdrv_set_view_frame(surface->cocoa_view, cgrect_from_rect(client->monitor_rect));
+    macdrv_set_view_frame(surface->cocoa_view, cgrect_from_rect(target->monitor_rect));
     macdrv_set_view_superview(surface->cocoa_view, toplevel == hwnd ? NULL : data->client_view, data->cocoa_window, NULL, NULL);
     release_win_data(data);
     return TRUE;
@@ -107,14 +108,14 @@ struct client_surface *macdrv_CreateClientSurface(HWND hwnd, int pixel_format, B
     if (!(surface = client_surface_create(sizeof(*surface), &macdrv_client_surface_backend,
                                           hwnd, pixel_format, raw)))
         return NULL;
-    if (!(surface->cocoa_view = macdrv_create_view(cgrect_from_rect(surface->client.monitor_rect))))
+    if (!(surface->cocoa_view = macdrv_create_view(cgrect_from_rect(surface->client.target.monitor_rect))))
     {
         client_surface_release(&surface->client);
         return NULL;
     }
     macdrv_set_view_hidden(surface->cocoa_view, TRUE);
 
-    macdrv_client_surface_update(&surface->client);
+    client_surface_update(&surface->client);
     macdrv_client_surface_present(&surface->client, 0, 0, FALSE, FALSE);
 
     return &surface->client;

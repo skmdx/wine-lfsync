@@ -1190,7 +1190,7 @@ static void x11drv_surface_flush( struct opengl_drawable *base, UINT flags )
 
     client_surface_prepare_present( base->client, &present, TRUE );
     client_surface_begin_present( base->client, &present );
-    if (InterlockedCompareExchange( &base->client->offscreen, 0, 0 ))
+    if (present.offscreen)
     {
         if (!(flags & GL_FLUSH_FINISHED)) funcs->p_glFinish();
         XFlush( gdi_display );
@@ -1580,7 +1580,7 @@ static void x11drv_egl_surface_flush( struct opengl_drawable *base, UINT flags )
 
     client_surface_prepare_present( base->client, &present, TRUE );
     client_surface_begin_present( base->client, &present );
-    if (InterlockedCompareExchange( &base->client->offscreen, 0, 0 ))
+    if (present.offscreen)
     {
         if (!(flags & GL_FLUSH_FINISHED)) funcs->p_glFinish();
         XFlush( gdi_display );

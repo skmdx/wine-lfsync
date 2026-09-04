@@ -123,9 +123,10 @@ static void x11drv_client_surface_detach( struct client_surface *client )
     }
 }
 
-static void client_surface_update_geometry( HWND hwnd, struct x11drv_client_surface *surface )
+static void client_surface_update_geometry( HWND hwnd, struct x11drv_client_surface *surface,
+                                            const struct client_surface_target *target )
 {
-    RECT rect = surface->client.raw ? surface->client.monitor_rect : surface->client.virtual_rect;
+    RECT rect = surface->client.raw ? target->monitor_rect : target->virtual_rect;
     XWindowChanges changes = surface->changes;
     int mask = 0;
 
@@ -165,7 +166,8 @@ static int client_surface_redirect_error( Display *display, XErrorEvent *event, 
 }
 #endif
 
-static BOOL client_surface_update_offscreen( HWND hwnd, struct x11drv_client_surface *surface )
+static BOOL client_surface_update_offscreen( HWND hwnd, struct x11drv_client_surface *surface,
+                                             struct client_surface_target *target )
 {
     BOOL offscreen, old_offscreen;
     struct x11drv_win_data *data;
@@ -176,7 +178,8 @@ static BOOL client_surface_update_offscreen( HWND hwnd, struct x11drv_client_sur
     offscreen = !NtUserIsWindowVisible( hwnd ) || surface->keep_offscreen ||
                 needs_offscreen_rendering( hwnd, surface->client.raw );
 
-    old_offscreen = InterlockedCompareExchange( &surface->client.offscreen, 0, 0 );
+    old_offscreen = surface->client.target.offscreen;
+    target->offscreen = offscreen;
     if (old_offscreen == offscreen)
     {
         if (!offscreen && (data = get_win_data( hwnd )))
@@ -213,7 +216,7 @@ static BOOL client_surface_update_offscreen( HWND hwnd, struct x11drv_client_sur
     {
         static const WCHAR displayW[] = {'D','I','S','P','L','A','Y', 0};
         UNICODE_STRING device_str = RTL_CONSTANT_STRING(displayW);
-        RECT rect = surface->client.virtual_rect;
+        RECT rect = target->virtual_rect;
         HDC hdc_dst, hdc_src;
 
         OffsetRect( &rect, -rect.left, -rect.top );
@@ -264,17 +267,17 @@ static BOOL client_surface_update_offscreen( HWND hwnd, struct x11drv_client_sur
         else attach_client_window( data, surface->window );
         release_win_data( data );
     }
-    InterlockedExchange( &surface->client.offscreen, offscreen );
     return TRUE;
 }
 
-static BOOL x11drv_client_surface_update( struct client_surface *client )
+static BOOL x11drv_client_surface_update( struct client_surface *client,
+                                          struct client_surface_target *target )
 {
     struct x11drv_client_surface *surface = impl_from_client_surface( client );
     HWND hwnd = client->hwnd;
 
-    client_surface_update_geometry( hwnd, surface );
-    return client_surface_update_offscreen( hwnd, surface );
+    client_surface_update_geometry( hwnd, surface, target );
+    return client_surface_update_offscreen( hwnd, surface, target );
 }
 
 static BOOL copy_client_surface( struct x11drv_client_surface *surface, Drawable target,
@@ -303,8 +306,8 @@ static BOOL X11DRV_client_surface_present( struct client_surface *client, HDC hd
                                            BOOL defer_visible )
 {
     struct x11drv_client_surface *surface = impl_from_client_surface( client );
-    HWND hwnd = client->hwnd, toplevel = client->toplevel;
-    RECT rect_dst = client->monitor_rect, rect_src, rect_src_dc, rect;
+    HWND hwnd = client->hwnd, toplevel = client->target.toplevel;
+    RECT rect_dst = client->target.monitor_rect, rect_src, rect_src_dc, rect;
     Drawable window;
     Pixmap backing;
     BOOL ret;
@@ -344,7 +347,7 @@ static BOOL X11DRV_client_surface_present( struct client_surface *client, HDC hd
             NtGdiCombineRgn( region, surface_region, 0, RGN_COPY );
     }
 
-    rect_src = surface->client.raw ? surface->client.monitor_rect : surface->client.virtual_rect;
+    rect_src = surface->client.raw ? client->target.monitor_rect : client->target.virtual_rect;
     TRACE( "hwnd %p %s to toplevel %p %s region %p\n", hwnd, wine_dbgstr_rect(&rect_src),
            toplevel, wine_dbgstr_rect(&rect_dst), region );
 
@@ -417,7 +420,7 @@ struct client_surface *X11DRV_CreateClientSurface( HWND hwnd, int format, BOOL r
     if (!(surface = client_surface_create( sizeof(*surface), &x11drv_client_surface_backend, hwnd, format, raw ))) goto failed;
     surface->colormap = colormap;
     if (!x11drv_client_surface_completion_init( surface )) goto failed;
-    rect = raw ? surface->client.monitor_rect : surface->client.virtual_rect;
+    rect = raw ? surface->client.target.monitor_rect : surface->client.target.virtual_rect;
     if (!(surface->window = create_client_window( hwnd, rect, &visual, colormap ))) goto failed;
     TRACE( "Created %s for client window %lx\n", debugstr_client_surface( &surface->client ), surface->window );
     return &surface->client;

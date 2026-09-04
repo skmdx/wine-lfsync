@@ -49,10 +49,11 @@ static void wayland_client_surface_detach(struct client_surface *client)
     }
 }
 
-static BOOL wayland_client_surface_update(struct client_surface *client)
+static BOOL wayland_client_surface_update(struct client_surface *client,
+                                          struct client_surface_target *target)
 {
     struct wayland_client_surface *surface = impl_from_client_surface(client);
-    HWND hwnd = client->hwnd, toplevel = client->toplevel;
+    HWND hwnd = client->hwnd, toplevel = target->toplevel;
     struct wayland_win_data *data;
     BOOL visible = FALSE;
 
@@ -61,7 +62,7 @@ static BOOL wayland_client_surface_update(struct client_surface *client)
     if (!(data = wayland_win_data_get(hwnd))) return FALSE;
 
     if (toplevel && visible)
-        wayland_client_surface_attach(surface, toplevel, &client->monitor_rect);
+        wayland_client_surface_attach(surface, toplevel, &target->monitor_rect);
     else
         wayland_client_surface_attach(surface, NULL, NULL);
 
@@ -73,7 +74,7 @@ static BOOL wayland_client_surface_present(struct client_surface *client, HDC hd
                                            BOOL flush, BOOL defer_visible)
 {
     struct wayland_client_surface *surface = impl_from_client_surface(client);
-    HWND hwnd = client->hwnd, toplevel = client->toplevel;
+    HWND hwnd = client->hwnd, toplevel = client->target.toplevel;
     struct wayland_surface *wayland_surface;
     struct wayland_win_data *data;
 

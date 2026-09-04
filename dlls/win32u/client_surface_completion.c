@@ -63,6 +63,7 @@ BOOL client_surface_wait_present_completion( struct client_surface *surface,
                                              client_surface_completion_wait_func wait,
                                              void *context, DWORD timeout )
 {
+    struct client_surface_target target;
     DWORD elapsed, start = NtGetTickCount();
     BOOL completed;
 
@@ -76,9 +77,9 @@ BOOL client_surface_wait_present_completion( struct client_surface *surface,
      * behind a completion which already observed the detach. */
     elapsed = NtGetTickCount() - start;
     timeout = elapsed < timeout ? timeout - elapsed : 0;
-    completed = submitted && present->target_ready &&
-                present->target_epoch == ReadAcquire64( &surface->target_epoch ) &&
-                present->lifecycle_seq == ReadAcquire( &surface->lifecycle_seq ) &&
+    client_surface_get_target( surface, &target );
+    completed = submitted && present->target_valid && target.valid &&
+                present->target_seq == target.seq &&
                 wait( context, timeout );
     pthread_mutex_unlock( &surface->completion_wait_lock );
     return completed;

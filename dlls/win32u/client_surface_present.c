@@ -181,18 +181,15 @@ static BOOL get_cached_client_surface_region( struct client_surface *surface, HW
                                               HRGN *region )
 {
     struct client_surface_clip_snapshot snapshot = {0};
-    struct ratio raw_dpi;
+    struct ratio raw_dpi = {surface->target.dpi_num, surface->target.dpi_den};
     HRGN new_region = 0;
     BOOL valid;
 
-    get_win_monitor_dpi( hwnd, &raw_dpi );
     if (!raw_dpi.num || !raw_dpi.den || !present->scene_valid) return FALSE;
 
     if (surface->clip_region_valid &&
         surface->clip_scene_generation == present->scene_generation &&
-        surface->clip_target_epoch == present->target_epoch &&
-        surface->clip_dpi_num == raw_dpi.num && surface->clip_dpi_den == raw_dpi.den &&
-        EqualRect( &surface->clip_monitor_rect, monitor_rect ))
+        surface->clip_target_seq == present->target_seq)
     {
         *region = surface->clip_region;
         return TRUE;
@@ -209,10 +206,7 @@ static BOOL get_cached_client_surface_region( struct client_surface *surface, HW
 
     if (surface->clip_region) NtGdiDeleteObjectApp( surface->clip_region );
     surface->clip_scene_generation = present->scene_generation;
-    surface->clip_target_epoch = present->target_epoch;
-    surface->clip_monitor_rect = *monitor_rect;
-    surface->clip_dpi_num = raw_dpi.num;
-    surface->clip_dpi_den = raw_dpi.den;
+    surface->clip_target_seq = present->target_seq;
     surface->clip_region = new_region;
     surface->clip_region_valid = TRUE;
     *region = new_region;
@@ -223,13 +217,13 @@ static BOOL client_surface_validate_size_locked( struct client_surface *surface,
                                                  const SIZE *expected_size )
 {
     if (expected_size &&
-        (surface->virtual_rect.right - surface->virtual_rect.left != expected_size->cx ||
-         surface->virtual_rect.bottom - surface->virtual_rect.top != expected_size->cy))
+        (surface->target.virtual_rect.right - surface->target.virtual_rect.left != expected_size->cx ||
+         surface->target.virtual_rect.bottom - surface->target.virtual_rect.top != expected_size->cy))
     {
         WARN( "not composing %s size %dx%d for expected frame %dx%d\n",
               debugstr_client_surface( surface ),
-              surface->virtual_rect.right - surface->virtual_rect.left,
-              surface->virtual_rect.bottom - surface->virtual_rect.top,
+              surface->target.virtual_rect.right - surface->target.virtual_rect.left,
+              surface->target.virtual_rect.bottom - surface->target.virtual_rect.top,
               (int)expected_size->cx, (int)expected_size->cy );
         return FALSE;
     }
@@ -292,10 +286,9 @@ BOOL client_surface_end_present_internal( struct client_surface *surface, UINT64
      * the process-wide registry lock is neither needed for lifetime nor for
      * target validation on the per-frame path. */
     pthread_mutex_lock( &surface->present_lock );
-    if (!present->target_ready ||
-        present->target_epoch != ReadAcquire64( &surface->target_epoch ) ||
-        present->lifecycle_seq != ReadAcquire( &surface->lifecycle_seq ) ||
-        present->scene_toplevel != surface->ready_toplevel)
+    if (!present->target_valid ||
+        present->target_seq != surface->target.seq ||
+        present->scene_toplevel != surface->target.toplevel)
     {
         TRACE( "discarding %s presentation across target state change\n",
                debugstr_client_surface( surface ) );
@@ -308,7 +301,7 @@ BOOL client_surface_end_present_internal( struct client_surface *surface, UINT64
                wine_dbgstr_longlong( surface->composed_serial ) );
     }
     else if ((hwnd = surface->hwnd) &&
-             InterlockedCompareExchange( &surface->target_ready, 0, 0 ) &&
+             surface->target.valid &&
              (InterlockedCompareExchange( &surface->active, 0, 0 ) ||
               InterlockedCompareExchange( &surface->server_cached, 0, 0 )))
     {
@@ -316,8 +309,8 @@ BOOL client_surface_end_present_internal( struct client_surface *surface, UINT64
         if (new_content || InterlockedCompareExchange( &surface->content_valid, 0, 0 ))
         {
             compose = client_surface_validate_size_locked( surface, expected_size );
-            monitor_rect = surface->monitor_rect;
-            offscreen = InterlockedCompareExchange( &surface->offscreen, 0, 0 );
+            monitor_rect = surface->target.monitor_rect;
+            offscreen = surface->target.offscreen;
         }
         else
             TRACE( "not recomposing incomplete cached content for %s\n",
@@ -465,6 +458,8 @@ void client_surface_prepare_present_locked( struct client_surface *surface,
                                             struct client_surface_present *present,
                                             BOOL external_completion )
 {
+    struct client_surface_target target;
+
     while (InterlockedCompareExchange( &surface->target_update_waiters, 0, 0 ) ||
            surface->native_present_count)
         pthread_cond_wait( &surface->completion_cond, &surface->completion_lock );
@@ -498,8 +493,8 @@ void client_surface_prepare_present_locked( struct client_surface *surface,
                                                            &present->scene_toplevel,
                                                            &present->authoritative );
     if (surface->hwnd &&
-        (!present->scene_valid || !surface->target_ready ||
-         surface->target_scene_toplevel != present->scene_toplevel ||
+        (!present->scene_valid || !surface->target.valid ||
+         surface->target.toplevel != present->scene_toplevel ||
          surface->target_scene_generation != present->scene_generation))
     {
         client_surface_update_present_locked( surface );
@@ -508,17 +503,14 @@ void client_surface_prepare_present_locked( struct client_surface *surface,
                                                                &present->scene_toplevel,
                                                                &present->authoritative );
     }
-    if (present->scene_valid && surface->target_ready)
-    {
-        surface->target_scene_toplevel = present->scene_toplevel;
+    if (present->scene_valid && surface->target.valid)
         surface->target_scene_generation = present->scene_generation;
-    }
-    present->target_epoch = ReadAcquire64( &surface->target_epoch );
-    present->lifecycle_seq = ReadAcquire( &surface->lifecycle_seq );
-    present->target_ready = InterlockedCompareExchange( &surface->target_ready, 0, 0 );
-    present->offscreen = InterlockedCompareExchange( &surface->offscreen, 0, 0 );
-    present->external_completion = present->target_ready && present->offscreen && external_completion;
-    if (present->target_ready && present->offscreen && !present->external_completion)
+    client_surface_get_target( surface, &target );
+    present->target_seq = target.seq;
+    present->target_valid = target.valid;
+    present->offscreen = target.offscreen;
+    present->external_completion = present->target_valid && present->offscreen && external_completion;
+    if (present->target_valid && present->offscreen && !present->external_completion)
         present->driver_completion = client_surface_backend_prepare_completion( surface );
     pthread_mutex_unlock( &surface->present_lock );
 }
@@ -603,7 +595,7 @@ BOOL client_surface_complete_present_locked( struct client_surface *surface,
                                              BOOL submitted, BOOL external_completed,
                                              const SIZE *expected_size, DWORD timeout )
 {
-    BOOL completed = submitted && present->target_ready;
+    BOOL completed = submitted && present->target_valid;
 
     if (!submitted && present->external_completion)
         present->completion_failed = TRUE;

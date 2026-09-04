@@ -48,9 +48,10 @@ static void client_surface_backend_detach( struct client_surface *surface )
     if (surface->backend->detach) surface->backend->detach( surface );
 }
 
-static BOOL client_surface_backend_update( struct client_surface *surface )
+static BOOL client_surface_backend_update( struct client_surface *surface,
+                                           struct client_surface_target *target )
 {
-    return !surface->backend->update || surface->backend->update( surface );
+    return !surface->backend->update || surface->backend->update( surface, target );
 }
 
 static unsigned int client_surface_backend_state_flags( const struct client_surface *surface )
@@ -101,10 +102,10 @@ static void insert_client_surface_index( struct client_surface *surface )
 {
     pthread_mutex_lock( &surface_index_lock );
     assign_client_surface_identity_locked( surface );
-    surface->indexed_toplevel = surface->ready_toplevel;
-    if (surface->ready_toplevel)
+    surface->indexed_toplevel = surface->target.toplevel;
+    if (surface->target.toplevel)
     {
-        unsigned int bucket = client_surface_index_hash( (UINT_PTR)surface->ready_toplevel );
+        unsigned int bucket = client_surface_index_hash( (UINT_PTR)surface->target.toplevel );
         surface->toplevel_next = client_surface_toplevel_index[bucket];
         client_surface_toplevel_index[bucket] = surface;
     }
@@ -159,8 +160,8 @@ static void remove_client_surface_index_locked( struct client_surface *surface )
 
 /* present_lock protects the native target while this atomically moves the
  * lock-free geometry snapshot between top-level index buckets. */
-static void publish_client_surface_geometry( struct client_surface *surface, HWND toplevel,
-                                             const RECT *virtual_rect, const RECT *monitor_rect )
+static void publish_client_surface_target( struct client_surface *surface,
+                                           const struct client_surface_target *target )
 {
     unsigned int bucket;
 
@@ -171,17 +172,21 @@ static void publish_client_surface_geometry( struct client_surface *surface, HWN
         remove_client_surface_chain( &client_surface_toplevel_index[bucket], surface, FALSE );
     }
 
-    InterlockedIncrement64( &surface->geometry_seq );
-    surface->ready_toplevel = toplevel;
-    if (virtual_rect) surface->ready_virtual_rect = *virtual_rect;
-    if (monitor_rect) surface->ready_monitor_rect = *monitor_rect;
-    InterlockedIncrement64( &surface->geometry_seq );
+    InterlockedIncrement64( &surface->target.seq );
+    surface->target.toplevel = target->toplevel;
+    surface->target.virtual_rect = target->virtual_rect;
+    surface->target.monitor_rect = target->monitor_rect;
+    surface->target.dpi_num = target->dpi_num;
+    surface->target.dpi_den = target->dpi_den;
+    surface->target.offscreen = target->offscreen;
+    surface->target.valid = target->valid;
+    InterlockedIncrement64( &surface->target.seq );
 
-    surface->indexed_toplevel = toplevel;
+    surface->indexed_toplevel = target->toplevel;
     surface->toplevel_next = NULL;
-    if (toplevel)
+    if (target->toplevel)
     {
-        bucket = client_surface_index_hash( (UINT_PTR)toplevel );
+        bucket = client_surface_index_hash( (UINT_PTR)target->toplevel );
         surface->toplevel_next = client_surface_toplevel_index[bucket];
         client_surface_toplevel_index[bucket] = surface;
     }
@@ -193,7 +198,7 @@ static void publish_client_surface_geometry( struct client_surface *surface, HWN
 
 static UINT64 get_client_surface_cache_cost( const struct client_surface *surface )
 {
-    const RECT *rect = surface->raw ? &surface->ready_monitor_rect : &surface->ready_virtual_rect;
+    const RECT *rect = surface->raw ? &surface->target.monitor_rect : &surface->target.virtual_rect;
     LONGLONG signed_width = (LONGLONG)rect->right - rect->left;
     LONGLONG signed_height = (LONGLONG)rect->bottom - rect->top;
     UINT64 width = max( (LONGLONG)0, signed_width );
@@ -291,6 +296,7 @@ static void client_surface_wait_all_completions_locked( struct client_surface *s
 
 static void client_surface_detach_locked( struct client_surface *surface )
 {
+    struct client_surface_target target;
     HWND toplevel;
     BOOL wake;
     UINT flags = 0;
@@ -303,8 +309,9 @@ static void client_surface_detach_locked( struct client_surface *surface )
         client_surface_unlock_target( surface );
         return;
     }
-    InterlockedIncrement( &surface->lifecycle_seq );
-    InterlockedExchange( &surface->target_ready, FALSE );
+    client_surface_get_target( surface, &target );
+    target.valid = FALSE;
+    publish_client_surface_target( surface, &target );
 
     if (surface->active)
     {
@@ -324,11 +331,9 @@ static void client_surface_detach_locked( struct client_surface *surface )
     }
     list_remove( &surface->entry );
     client_surface_backend_detach( surface );
-    surface->toplevel = NULL;
-    InterlockedIncrement64( &surface->target_epoch );
-    publish_client_surface_geometry( surface, NULL, NULL, NULL );
+    target.toplevel = NULL;
+    publish_client_surface_target( surface, &target );
     InterlockedExchangePointer( (void **)&surface->hwnd, NULL );
-    InterlockedIncrement( &surface->lifecycle_seq );
     pthread_mutex_unlock( &surface->present_lock );
     client_surface_unlock_target( surface );
 }
@@ -435,8 +440,8 @@ done:
     pthread_mutex_unlock( &surfaces_lock );
 }
 
-static BOOL get_client_surface_rects( HWND toplevel, HWND hwnd, RECT *virtual_rect,
-                                      RECT *monitor_rect )
+static BOOL get_client_surface_rects( HWND toplevel, HWND hwnd,
+                                      struct client_surface_target *target )
 {
     struct ratio dpi = get_dpi_for_window( hwnd ), raw_dpi;
     struct window_rects rects, monitor_rects;
@@ -456,32 +461,46 @@ static BOOL get_client_surface_rects( HWND toplevel, HWND hwnd, RECT *virtual_re
 
     get_win_monitor_dpi( hwnd, &raw_dpi );
     if (!raw_dpi.num) return FALSE;
-    *monitor_rect = map_dpi_rect( rect, dpi, raw_dpi );
+    target->monitor_rect = map_dpi_rect( rect, dpi, raw_dpi );
 
     /* use toplevel visible rect relative position, so drivers can then assume it */
-    OffsetRect( monitor_rect, monitor_rects.client.left - monitor_rects.visible.left,
+    OffsetRect( &target->monitor_rect, monitor_rects.client.left - monitor_rects.visible.left,
                 monitor_rects.client.top - monitor_rects.visible.top );
     OffsetRect( &rect, rects.client.left - rects.visible.left,
                 rects.client.top - rects.visible.top );
 
-    *virtual_rect = rect;
+    target->toplevel = toplevel;
+    target->virtual_rect = rect;
+    target->dpi_num = raw_dpi.num;
+    target->dpi_den = raw_dpi.den;
     return TRUE;
 }
 
-void client_surface_get_geometry( const struct client_surface *surface,
-                                  struct client_surface_geometry *geometry )
+void client_surface_get_target( const struct client_surface *surface,
+                                struct client_surface_target *target )
 {
     LONG64 seq;
 
     do
     {
-        while ((seq = ReadNoFence64( &surface->geometry_seq )) & 1) YieldProcessor();
+        while ((seq = ReadNoFence64( &surface->target.seq )) & 1) YieldProcessor();
         __SHARED_READ_FENCE;
-        geometry->toplevel = surface->ready_toplevel;
-        geometry->virtual_rect = surface->ready_virtual_rect;
-        geometry->monitor_rect = surface->ready_monitor_rect;
+        *target = surface->target;
         __SHARED_READ_FENCE;
-    } while (seq != ReadNoFence64( &surface->geometry_seq ));
+    } while (seq != ReadNoFence64( &surface->target.seq ));
+    target->seq = seq;
+}
+
+void client_surface_get_geometry( const struct client_surface *surface,
+                                  struct client_surface_geometry *geometry )
+{
+    struct client_surface_target target;
+
+    client_surface_get_target( surface, &target );
+
+    geometry->toplevel = target.toplevel;
+    geometry->virtual_rect = target.virtual_rect;
+    geometry->monitor_rect = target.monitor_rect;
 }
 
 BOOL client_surface_get_publication( struct client_surface *surface, UINT64 *generation,
@@ -541,34 +560,30 @@ BOOL client_surface_get_publication( struct client_surface *surface, UINT64 *gen
 
 BOOL client_surface_update_present_locked( struct client_surface *surface )
 {
-    RECT virtual_rect = surface->virtual_rect, monitor_rect = surface->monitor_rect;
-    HWND toplevel = surface->toplevel;
-    RECT old_source_rect = surface->raw ? monitor_rect : virtual_rect;
-    RECT new_virtual_rect, new_monitor_rect;
-    HWND new_toplevel;
-    RECT new_source_rect;
-    BOOL changed, offscreen, publish_changed, ready;
+    struct client_surface_target current, next, invalid;
+    RECT old_source_rect, new_source_rect;
+    BOOL changed, ready;
 
-    new_toplevel = NtUserGetAncestor( surface->hwnd, GA_ROOT );
-    if (!new_toplevel || !get_client_surface_rects( new_toplevel, surface->hwnd,
-                                                    &new_virtual_rect, &new_monitor_rect ))
+    client_surface_get_target( surface, &current );
+    next = current;
+    next.toplevel = NtUserGetAncestor( surface->hwnd, GA_ROOT );
+    if (!next.toplevel || !get_client_surface_rects( next.toplevel, surface->hwnd, &next ))
     {
-        if (InterlockedCompareExchange( &surface->target_ready, FALSE, TRUE ))
-            InterlockedIncrement64( &surface->target_epoch );
+        if (current.valid)
+        {
+            invalid = current;
+            invalid.valid = FALSE;
+            publish_client_surface_target( surface, &invalid );
+        }
         InterlockedExchange( &surface->content_valid, FALSE );
         return FALSE;
     }
-    new_source_rect = surface->raw ? new_monitor_rect : new_virtual_rect;
-    changed = new_toplevel != toplevel || !EqualRect( &new_virtual_rect, &virtual_rect ) ||
-              !EqualRect( &new_monitor_rect, &monitor_rect );
-    publish_changed = new_toplevel != surface->ready_toplevel ||
-                      !EqualRect( &new_virtual_rect, &surface->ready_virtual_rect ) ||
-                      !EqualRect( &new_monitor_rect, &surface->ready_monitor_rect );
-    offscreen = InterlockedCompareExchange( &surface->offscreen, 0, 0 );
-
-    surface->toplevel = new_toplevel;
-    surface->virtual_rect = new_virtual_rect;
-    surface->monitor_rect = new_monitor_rect;
+    old_source_rect = surface->raw ? current.monitor_rect : current.virtual_rect;
+    new_source_rect = surface->raw ? next.monitor_rect : next.virtual_rect;
+    changed = next.toplevel != current.toplevel ||
+              !EqualRect( &next.virtual_rect, &current.virtual_rect ) ||
+              !EqualRect( &next.monitor_rect, &current.monitor_rect ) ||
+              next.dpi_num != current.dpi_num || next.dpi_den != current.dpi_den;
 
     /* A larger drawable contains pixels for which no completed application
      * frame exists yet.  Do not treat its old intersection as a complete
@@ -584,28 +599,30 @@ BOOL client_surface_update_present_locked( struct client_surface *surface )
             client_surface_uncache_present_locked( surface );
     }
 
-    TRACE( "updating %s, toplevel %p, virtual_rect %s, monitor_rect %s\n", debugstr_client_surface( surface ), surface->toplevel,
-           wine_dbgstr_rect( &surface->virtual_rect ), wine_dbgstr_rect( &surface->monitor_rect ) );
-    ready = client_surface_backend_update( surface );
-
-    if (publish_changed || offscreen != InterlockedCompareExchange( &surface->offscreen, 0, 0 ) ||
-        ready != InterlockedCompareExchange( &surface->target_ready, 0, 0 ))
-        InterlockedIncrement64( &surface->target_epoch );
-    InterlockedExchange( &surface->target_ready, ready );
+    TRACE( "updating %s, toplevel %p, virtual_rect %s, monitor_rect %s\n",
+           debugstr_client_surface( surface ), next.toplevel,
+           wine_dbgstr_rect( &next.virtual_rect ), wine_dbgstr_rect( &next.monitor_rect ) );
+    ready = client_surface_backend_update( surface, &next );
 
     if (!ready)
     {
+        if (current.valid)
+        {
+            invalid = current;
+            invalid.valid = FALSE;
+            publish_client_surface_target( surface, &invalid );
+        }
         InterlockedExchange( &surface->content_valid, FALSE );
         return FALSE;
     }
 
-    /* Publish geometry only after the driver has resized/reparented its native
-     * drawable.  Lock-free readers must never observe a new extent paired with
-     * the previous X11/EGL or Wayland surface state. */
-    if (publish_changed)
+    next.valid = TRUE;
+    /* Publish the complete target only after the driver has resized and
+     * reparented its native drawable.  Readers can therefore validate one
+     * sequence instead of pairing geometry and lifecycle counters. */
+    if (changed || next.offscreen != current.offscreen || next.valid != current.valid)
     {
-        publish_client_surface_geometry( surface, new_toplevel, &new_virtual_rect,
-                                         &new_monitor_rect );
+        publish_client_surface_target( surface, &next );
         if (changed) InterlockedExchange( &surface->updated, TRUE );
     }
     return TRUE;
@@ -789,11 +806,11 @@ void update_client_surfaces( HWND hwnd )
             client_surface_unlock_target( surface );
             continue;
         }
-        monitor_rect = surface->monitor_rect;
-        toplevel = surface->toplevel;
+        monitor_rect = surface->target.monitor_rect;
+        toplevel = surface->target.toplevel;
         client_surface_update_present_locked( surface );
-        new_monitor_rect = surface->monitor_rect;
-        new_toplevel = surface->toplevel;
+        new_monitor_rect = surface->target.monitor_rect;
+        new_toplevel = surface->target.toplevel;
         visible = NtUserIsWindowVisible( surface_hwnd );
         pthread_mutex_unlock( &surface->present_lock );
         client_surface_unlock_target( surface );
@@ -918,12 +935,9 @@ void *client_surface_create( UINT size, const struct client_surface_backend *bac
     surface->format = format;
     surface->raw = raw;
     surface->cacheable = TRUE;
-    surface->toplevel = toplevel;
-    if (!get_client_surface_rects( toplevel, hwnd, &surface->virtual_rect, &surface->monitor_rect ))
-        surface->virtual_rect = surface->monitor_rect = (RECT){0};
-    surface->ready_toplevel = surface->toplevel;
-    surface->ready_virtual_rect = surface->virtual_rect;
-    surface->ready_monitor_rect = surface->monitor_rect;
+    surface->target.toplevel = toplevel;
+    if (!get_client_surface_rects( toplevel, hwnd, &surface->target ))
+        surface->target.virtual_rect = surface->target.monitor_rect = (RECT){0};
     list_init( &surface->entry );
     list_init( &surface->completion_queue );
     InterlockedCompareExchange( &client_surface_process_id,
@@ -931,7 +945,8 @@ void *client_surface_create( UINT size, const struct client_surface_backend *bac
     insert_client_surface_index( surface );
 
     TRACE( "created %s, format %d, raw %u, toplevel %p, virtual_rect %s, monitor_rect %s\n", debugstr_client_surface( surface ),
-           format, raw, toplevel, wine_dbgstr_rect( &surface->virtual_rect ), wine_dbgstr_rect( &surface->monitor_rect ) );
+           format, raw, toplevel, wine_dbgstr_rect( &surface->target.virtual_rect ),
+           wine_dbgstr_rect( &surface->target.monitor_rect ) );
     return surface;
 }
 
@@ -1166,8 +1181,8 @@ BOOL client_surface_update( struct client_surface *surface )
     pthread_mutex_lock( &surface->present_lock );
     scene_valid = client_surface_get_publication( surface, NULL, &scene_generation,
                                                   &scene_toplevel, NULL );
-    if (scene_valid && surface->target_ready &&
-        surface->target_scene_toplevel == scene_toplevel &&
+    if (scene_valid && surface->target.valid &&
+        surface->target.toplevel == scene_toplevel &&
         surface->target_scene_generation == scene_generation)
         ret = TRUE;
     else if (surface->hwnd)
@@ -1176,10 +1191,7 @@ BOOL client_surface_update( struct client_surface *surface )
         scene_valid = client_surface_get_publication( surface, NULL, &scene_generation,
                                                       &scene_toplevel, NULL );
         if (ret && scene_valid)
-        {
-            surface->target_scene_toplevel = scene_toplevel;
             surface->target_scene_generation = scene_generation;
-        }
     }
     pthread_mutex_unlock( &surface->present_lock );
     client_surface_unlock_target( surface );

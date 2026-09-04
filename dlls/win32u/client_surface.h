@@ -26,6 +26,8 @@ extern HWND client_surface_set_server_state( HWND hwnd, const struct client_surf
                                              UINT64 scene_generation, BOOL *wake );
 extern void client_surface_get_geometry( const struct client_surface *surface,
                                          struct client_surface_geometry *geometry );
+extern void client_surface_get_target( const struct client_surface *surface,
+                                       struct client_surface_target *target );
 extern BOOL client_surface_get_publication( struct client_surface *surface, UINT64 *generation,
                                             UINT64 *scene_generation, HWND *scene_toplevel,
                                             BOOL *authoritative );

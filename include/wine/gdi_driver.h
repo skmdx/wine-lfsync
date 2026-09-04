@@ -247,6 +247,21 @@ static inline void push_dc_driver( PHYSDEV *dev, PHYSDEV physdev, const struct g
 /* support for client surfaces */
 
 struct client_surface;
+
+/* Driver-ready native target.  seq is a seqlock and the sole invalidation
+ * token for geometry, offscreen mode, resize, detach and native replacement. */
+struct client_surface_target
+{
+    LONG64 seq;
+    HWND toplevel;
+    RECT virtual_rect;
+    RECT monitor_rect;
+    UINT dpi_num;
+    UINT dpi_den;
+    LONG offscreen;
+    LONG valid;
+};
+
 enum client_surface_backend_caps
 {
     CLIENT_SURFACE_BACKEND_SCENE_PUBLICATION = 0x01,
@@ -270,8 +285,8 @@ struct client_surface_backend
     void (*destroy)( struct client_surface *surface );
     /* detach the surface from its window, called from window owner thread */
     void (*detach)( struct client_surface *surface );
-    /* update the surface to match its window state; return whether the native target is usable */
-    BOOL (*update)( struct client_surface *surface );
+    /* prepare target for publication; the backend may select its offscreen mode */
+    BOOL (*update)( struct client_surface *surface, struct client_surface_target *target );
     /* present the client surface if necessary, hdc != NULL when offscreen, called from render thread;
      * flush requires host completion before returning, defer_visible keeps a scene generation staged */
     BOOL (*present)( struct client_surface *surface, HDC hdc, HRGN surface_region,
@@ -285,13 +300,12 @@ struct client_surface_present
     UINT64 scene_generation;
     LONG64 serial;
     DWORD submission_time;
-    LONG64 target_epoch;
-    LONG lifecycle_seq;
+    LONG64 target_seq;
     HWND scene_toplevel;
     BOOL scene_valid;
     BOOL authoritative;
     BOOL offscreen;
-    BOOL target_ready;
+    BOOL target_valid;
     BOOL completion_locked;
     BOOL native_present_registered;
     BOOL external_completion;
@@ -327,18 +341,14 @@ struct client_surface
     HWND                               hwnd;           /* window the surface was created for */
     int                                format;         /* pixel format of the surface */
     LONG                               updated;        /* has been moved / resized / reparented */
-    HWND                               toplevel;       /* toplevel window of the surface */
-    LONG                               offscreen;      /* client window is offscreen */
+    struct client_surface_target       target;         /* driver-ready native target snapshot */
     LONG                               active;         /* registered as active with the Wine server */
     LONG                               producer_claimed; /* active registration has claimed a completed frame */
     LONG                               content_valid;  /* complete content exists at the current size */
     LONG                               cacheable;      /* native completion state is safe to reuse */
     LONG                               server_cached;  /* registered as a cached owner with the Wine server */
     UINT64                             cache_cost;     /* estimated bytes while on the unused list */
-    LONG64                             geometry_seq;   /* seqlock for the driver-ready geometry */
-    LONG64                             target_epoch;   /* native target identity, incremented after target changes */
     UINT64                             target_scene_generation; /* last server scene applied to native target */
-    HWND                               target_scene_toplevel;
     UINT64                             composition_scene_generation; /* scene passed to driver composition */
     HWND                               composition_toplevel;
     LONG64                             present_serial; /* producer submission order */
@@ -348,24 +358,14 @@ struct client_surface
     LONG                               driver_completion_waiters; /* pending shared-monitor mode transitions */
     LONG                               native_present_count; /* native presentation calls currently in flight */
     LONG                               target_update_waiters; /* pending native target mutations */
-    LONG                               lifecycle_seq;  /* seqlock for detach and destruction */
-    LONG                               target_ready;   /* driver successfully prepared the current target */
     LONG64                             recompose_requested; /* latest requested recomposition generation */
     LONG64                             recompose_retry_generation; /* newest generation granted one retry */
     LONG                               recompose_scheduled; /* a recomposition consumer owns a reference */
     LONG                               recompose_deferred; /* completion owner must reschedule replay */
     UINT64                             clip_scene_generation; /* scene owning the cached cross-process clip */
-    LONG64                             clip_target_epoch;
-    RECT                               clip_monitor_rect;
-    UINT                               clip_dpi_num;
-    UINT                               clip_dpi_den;
+    LONG64                             clip_target_seq;
     HRGN                               clip_region;
     BOOL                               clip_region_valid;
-    RECT                               virtual_rect;   /* virtual size and position in the toplevel ancestor, relative to its visible rect */
-    RECT                               monitor_rect;   /* raw physical size and position in the toplevel ancestor, relative to its visible rect */
-    HWND                               ready_toplevel; /* toplevel whose driver update has completed */
-    RECT                               ready_virtual_rect; /* driver-ready virtual geometry */
-    RECT                               ready_monitor_rect; /* driver-ready raw physical geometry */
     BOOL                               raw;            /* use the raw physical position and size for the host client surface */
 };
 
@@ -377,6 +377,7 @@ static inline BOOL client_surface_backend_has_cap( const struct client_surface *
 
 W32KAPI void *client_surface_create( UINT size, const struct client_surface_backend *backend,
                                     HWND hwnd, int format, BOOL raw );
+W32KAPI BOOL client_surface_update( struct client_surface *surface );
 W32KAPI void client_surface_add_ref( struct client_surface *surface );
 W32KAPI void client_surface_release( struct client_surface *surface );
 W32KAPI void client_surface_present( struct client_surface *surface );
