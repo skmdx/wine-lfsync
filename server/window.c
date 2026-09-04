@@ -85,7 +85,6 @@ struct client_surface_ref
     unsigned int    native_write_lease : 1; /* renderer supports native-target write exclusion */
     unsigned int    notification_pending : 1; /* an update for this identity is queued */
     unsigned int    destroy_state : 2; /* renderer destroy delivery state */
-    unsigned int    writing : 1; /* renderer owns a native-target write lease */
 };
 
 #define CLIENT_SURFACE_REF_BUCKETS 256
@@ -141,7 +140,8 @@ static void free_client_surface_ref_if_unused( struct client_surface_ref *surfac
         surface->destroy_state != CLIENT_SURFACE_DESTROY_NONE)
         return;
 
-    assert( !surface->active && !surface->cached && !surface->writing );
+    assert( !surface->active && !surface->cached &&
+            !surface->writer_thread && !surface->writer_top );
     remove_client_surface_ref_index( surface );
     free( surface );
 }
@@ -151,7 +151,7 @@ static void free_client_surface_ref_if_unused( struct client_surface_ref *surfac
  * pointer-sized token can make an old notification address a new surface. */
 static void retire_client_surface_ref( struct client_surface_ref *surface )
 {
-    assert( !surface->writing && !surface->writer_thread && !surface->writer_top );
+    assert( !surface->writer_thread && !surface->writer_top );
     list_remove( &surface->entry );
     surface->active = surface->cached = surface->claimed = 0;
     surface->owner = NULL;
@@ -1264,7 +1264,6 @@ static struct client_surface_ref *get_client_surface_ref( struct client_surface_
     surface->native_write_lease = 0;
     surface->notification_pending = 0;
     surface->destroy_state = CLIENT_SURFACE_DESTROY_NONE;
-    surface->writing = 0;
     list_add_tail( &owner->surfaces, &surface->entry );
     insert_client_surface_ref_index( surface );
     return surface;
@@ -1491,9 +1490,8 @@ static struct window *release_client_surface_writer( struct client_surface_ref *
     struct window *top = surface->writer_top;
     struct thread *thread = surface->writer_thread;
 
-    if (!surface->writing) return NULL;
-    assert( top && thread );
-    surface->writing = 0;
+    if (!thread) return NULL;
+    assert( top );
     surface->writer_thread = NULL;
     surface->writer_top = NULL;
     assert( top->client_surface_writer_count );
@@ -1516,7 +1514,7 @@ void cleanup_thread_client_surface_writers( struct thread *thread )
     {
         for (surface = client_surface_ref_index[bucket]; surface; surface = surface->index_next)
         {
-            if (!surface->writing || surface->writer_thread != thread) continue;
+            if (surface->writer_thread != thread) continue;
             top = release_client_surface_writer( surface );
             if (!top->client_surface_writer_count && top->client_surface_transaction.restart_pending &&
                 !(top->client_surface_scene_generation & 1))
@@ -4372,10 +4370,9 @@ DECL_HANDLER(set_client_surface_state)
 
         if (compose && (req->flags & CLIENT_SURFACE_STATE_PRESENT_WRITE_LEASE))
         {
-            if (!surface->native_write_lease || surface->writing) compose = 0;
+            if (!surface->native_write_lease || surface->writer_thread) compose = 0;
             else
             {
-                surface->writing = 1;
                 surface->writer_thread = (struct thread *)grab_object( current );
                 surface->writer_top = (struct window *)grab_object( top );
                 top->client_surface_writer_count++;
