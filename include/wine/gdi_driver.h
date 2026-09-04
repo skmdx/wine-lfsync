@@ -40,6 +40,7 @@
 #include "kbd.h"
 #include "wine/list.h"
 #include "wine/debug.h"
+#include "wine/client_surface.h"
 
 struct gdi_dc_funcs;
 struct opengl_funcs;
@@ -293,25 +294,6 @@ struct client_surface_backend
     BOOL (*present)( struct client_surface *surface, const struct client_surface_scene *scene,
                      HDC hdc, HRGN surface_region, BOOL flush, BOOL defer_visible );
     const struct client_surface_completion_ops *completion;
-};
-
-enum client_surface_completion_kind
-{
-    CLIENT_SURFACE_COMPLETION_NONE,
-    CLIENT_SURFACE_COMPLETION_EXACT,
-    CLIENT_SURFACE_COMPLETION_SHARED,
-};
-
-typedef BOOL (*client_surface_completion_wait_func)( void *context, DWORD timeout );
-typedef void (*client_surface_completion_release_func)( void *context );
-
-struct client_surface_completion
-{
-    enum client_surface_completion_kind kind;
-    BOOL external_result; /* completion result is supplied by the caller or queued token */
-    client_surface_completion_wait_func wait;
-    client_surface_completion_release_func release;
-    void *context;
 };
 
 struct client_surface_scene

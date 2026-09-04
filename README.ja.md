@@ -117,6 +117,21 @@ lock-free 共通実装には、イベント、セマフォ、ミューテック�
 
 X11 の描画修正は、固定 RGB8 正解画像を持つ Win32/WGL テストアプリで、可視40状態、故障注入6種、非表示11状態を検査しています。さらに Steam のクリック、開閉、開いたままの切替、hover、4段階のリサイズを含む37遷移を検査し、固定メニュー画像を評価した66 captureで pixel mismatch、黒・白置換、外部遮蔽がすべて0であることを確認しています。
 
+### 描画不具合と回帰テストの対応
+
+Wine tree 内の `dlls/win32u/tests/client_surface.c` は、実アプリで見つかった不具合を次の最小境界へ分解して検査します。
+
+| 不具合の境界 | 最小回帰テスト |
+| --- | --- |
+| completion の種類と、caller または queue が供給済みの結果を混同する | `test_completion_result_provenance()`。製品コードと同じ `client_surface_completion_result_is_external()` を使い、shared/exact と supplied/unsupplied の4組を検査する |
+| 別プロセス所有の HWND で WGL pixel format が失われる | `test_cross_process_pixel_format()`。親が `SetPixelFormat()` した HWND を子プロセスが `GetPixelFormat()` し、同じ値であることを検査する |
+| 非表示中の present、表示時の切替、リサイズ後の完了が欠落する | `test_hidden_present_resize()`、`test_grow64_present_completion()`、`test_paced_present_completion()`。固定色の GL front buffer と server の staged/pending 状態を検査する |
+| scene 変更、古い generation、重複 producer、遅延完了が新しい frame を上書きする | generation、scene snapshot、publish/live-prepare、writer barrier、native backing、late-present、concurrent-state の各テスト |
+| 通知 filter、thread/process 終了、destroy 競合で公開が停止または誤配送される | `test_notification_identity_aba()`、`test_writer_thread_exit()`、`test_present_destroy_race()`、`test_owner_exit_and_destroy()` |
+| Chromium 型の Job limit read/modify/write で `KILL_ON_JOB_CLOSE` が消える | `dlls/kernel32/tests/process.c` の `test_QueryInformationJobObject()`。Extended/Basic query、read/OR/write、子プロセス終了を検査する |
+
+`WINETEST_CLIENT_SURFACE_CASE` に `completion-provenance`、`cross-process-pixel-format`、または `grow64-completion` を指定すると、該当する最小ケースだけを実行できます。前二者は意図的に修正を戻した境界で失敗することも確認します。GL front buffer の検査だけでは X11 compositor 上の黒・白・glitch を証明できないため、最終的な画面回帰は上記の固定 RGB8 Electron テストで別に判定します。実 Steam は操作経路の確認に使いますが、ネットワーク内容や更新に依存する画面を唯一の正解画像にはしません。
+
 ただし、このブランチは実験段階です。固定容量の共有領域が枯渇するケース、未検証のアプリケーション固有の同期パターン、および通常とは異なるプロセス終了経路については、追加検証が必要です。性能もワークロードに依存するため、ntsync や通常の wineserver 経路に常に優越するとは限りません。
 
 `d3dkmt` のテストには、Xvfb と llvmpipe の組み合わせで不足する OpenGL 拡張や、RADV が返す timeline semaphore 上限など、実行環境に依存する失敗があります。該当テスト本体は upstream と同一であり、これらを本ブランチの回帰とは扱っていません。ウィンドウおよび Vulkan の変更を評価する際は、使用する X server と GPU ドライバの能力を分けて確認する必要があります。

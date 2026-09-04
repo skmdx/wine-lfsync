@@ -18,6 +18,7 @@
 #include "wine/server.h"
 #include "wine/test.h"
 #include "wine/wgl.h"
+#include "wine/client_surface.h"
 
 #define RACE_THREADS 4
 #define RACE_ROUNDS 2000
@@ -186,6 +187,25 @@ static BOOL clip_state_contains( const struct clip_state *state, HWND hwnd )
     for (i = 0; i < state->count && i < ARRAY_SIZE(state->windows); ++i)
         if (wine_server_ptr_handle( state->windows[i].handle ) == hwnd) return TRUE;
     return FALSE;
+}
+
+static void test_completion_result_provenance(void)
+{
+    struct client_surface_completion completion = {0};
+
+    completion.kind = CLIENT_SURFACE_COMPLETION_SHARED;
+    ok( !client_surface_completion_result_is_external( &completion ),
+        "unresolved shared completion has an external result\n" );
+    completion.external_result = TRUE;
+    ok( client_surface_completion_result_is_external( &completion ),
+        "queued shared completion lost its supplied result\n" );
+
+    completion.kind = CLIENT_SURFACE_COMPLETION_EXACT;
+    ok( client_surface_completion_result_is_external( &completion ),
+        "exact completion lost its supplied result\n" );
+    completion.external_result = FALSE;
+    ok( !client_surface_completion_result_is_external( &completion ),
+        "unresolved exact completion has an external result\n" );
 }
 
 static UINT clip_state_count( const struct clip_state *state, HWND hwnd )
@@ -1272,6 +1292,8 @@ static void destroy_race_child( HWND hwnd )
         context.failures, context.first_status );
 }
 
+static BOOL register_present_test_class(void);
+
 static BOOL run_child( char **argv, const char *mode, HWND hwnd, DWORD delay )
 {
     SECURITY_ATTRIBUTES attr = {sizeof(attr), NULL, TRUE};
@@ -1358,6 +1380,62 @@ static BOOL run_child( char **argv, const char *mode, HWND hwnd, DWORD delay )
     return TRUE;
 }
 
+static void pixel_format_child( HWND hwnd, int expected )
+{
+    HDC hdc;
+    int format;
+
+    hdc = GetDC( hwnd );
+    ok( !!hdc, "failed to get foreign window DC, error %lu\n", GetLastError() );
+    if (!hdc) return;
+    format = GetPixelFormat( hdc );
+    ok( format == expected, "foreign window pixel format %d, expected %d\n", format, expected );
+    ReleaseDC( hwnd, hdc );
+}
+
+static void test_cross_process_pixel_format( char **argv )
+{
+    PIXELFORMATDESCRIPTOR pfd = {sizeof(pfd), 1, PFD_DRAW_TO_WINDOW | PFD_SUPPORT_OPENGL |
+                                PFD_DOUBLEBUFFER, PFD_TYPE_RGBA, 24};
+    STARTUPINFOA startup = {.cb = sizeof(startup)};
+    PROCESS_INFORMATION process;
+    char command[MAX_PATH * 2];
+    HDC hdc;
+    HWND hwnd;
+    int format;
+
+    if (!register_present_test_class()) return;
+    hwnd = CreateWindowA( "client_surface_present_race", "cross-process pixel format",
+                          WS_POPUP, 20, 20, 160, 120, NULL, NULL,
+                          GetModuleHandleA( NULL ), NULL );
+    ok( !!hwnd, "failed to create pixel-format window, error %lu\n", GetLastError() );
+    if (!hwnd) return;
+
+    hdc = GetDC( hwnd );
+    format = hdc ? ChoosePixelFormat( hdc, &pfd ) : 0;
+    if (!hdc || !format || !SetPixelFormat( hdc, format, &pfd ))
+    {
+        win_skip( "pixel-format setup failed, error %lu\n", GetLastError() );
+        if (hdc) ReleaseDC( hwnd, hdc );
+        DestroyWindow( hwnd );
+        return;
+    }
+    ok( GetPixelFormat( hdc ) == format, "owner window lost pixel format %d\n", format );
+
+    sprintf( command, "%s %s pixel_format %p %d", argv[0], argv[1], hwnd, format );
+    if (!CreateProcessA( NULL, command, NULL, NULL, FALSE, 0, NULL, NULL, &startup, &process ))
+        ok( 0, "CreateProcess failed, error %lu\n", GetLastError() );
+    else
+    {
+        wait_child_process( &process );
+        CloseHandle( process.hThread );
+        CloseHandle( process.hProcess );
+    }
+
+    ReleaseDC( hwnd, hdc );
+    DestroyWindow( hwnd );
+}
+
 struct present_race_context
 {
     HWND hwnd;
@@ -1393,6 +1471,20 @@ static COLORREF get_gl_front_pixel( const RECT *rect )
                   1, 1, GL_RGBA, GL_UNSIGNED_BYTE, pixel );
     glFinish();
     return RGB( pixel[0], pixel[1], pixel[2] );
+}
+
+static BOOL wait_for_surface_idle( HWND hwnd, DWORD timeout, struct surface_state *state )
+{
+    DWORD start = GetTickCount();
+    unsigned int status;
+
+    do
+    {
+        pump_messages( 10 );
+        status = set_surface_state( hwnd, 0, 0, 0, state );
+        if (status || (!state->staged && !state->pending)) return !status;
+    } while (GetTickCount() - start < timeout);
+    return FALSE;
 }
 
 static BOOL color_matches( COLORREF color, BYTE red, BYTE green, BYTE blue )
@@ -1448,8 +1540,8 @@ static void test_hidden_present_resize(void)
     ok( state.active == 1, "hidden present active surface count %u\n", state.active );
 
     ShowWindow( hwnd, SW_SHOWNA );
-    pump_messages( 500 );
-    set_surface_state( hwnd, 0, 0, 0, &state );
+    ok( wait_for_surface_idle( hwnd, 7000, &state ),
+        "first hidden frame did not become idle\n" );
     ok( !state.staged && !state.pending,
         "first hidden frame not published: staged %u pending %u\n", state.staged, state.pending );
     color = get_gl_front_pixel( &rect );
@@ -1467,13 +1559,74 @@ static void test_hidden_present_resize(void)
     glClear( GL_COLOR_BUFFER_BIT );
     ok( SwapBuffers( hdc ), "second hidden SwapBuffers failed, error %lu\n", GetLastError() );
     ShowWindow( hwnd, SW_SHOWNA );
-    pump_messages( 500 );
-    set_surface_state( hwnd, 0, 0, 0, &state );
+    ok( wait_for_surface_idle( hwnd, 7000, &state ),
+        "resized hidden frame did not become idle\n" );
     ok( !state.staged && !state.pending,
         "resized hidden frame not published: staged %u pending %u\n", state.staged, state.pending );
     color = get_gl_front_pixel( &rect );
     trace( "resized hidden-present front pixel %#lx\n", color );
     ok( color_matches( color, 26, 191, 51 ), "unexpected resized front pixel %#lx\n", color );
+
+done:
+    if (glrc) wglMakeCurrent( NULL, NULL );
+    if (glrc) wglDeleteContext( glrc );
+    if (hdc) ReleaseDC( hwnd, hdc );
+    DestroyWindow( hwnd );
+}
+
+static void test_grow64_present_completion(void)
+{
+    PIXELFORMATDESCRIPTOR pfd = {sizeof(pfd), 1, PFD_DRAW_TO_WINDOW | PFD_SUPPORT_OPENGL |
+                                PFD_DOUBLEBUFFER, PFD_TYPE_RGBA, 24};
+    struct surface_state state = {0};
+    HGLRC glrc = NULL;
+    HDC hdc = NULL;
+    COLORREF color;
+    HWND hwnd;
+    RECT rect;
+    int format;
+
+    if (!register_present_test_class()) return;
+    hwnd = CreateWindowExA( WS_EX_LAYERED | WS_EX_TOPMOST, "client_surface_present_race",
+                            "grow64 present completion", WS_POPUP, 720, 240, 64, 64,
+                            NULL, NULL, GetModuleHandleA( NULL ), NULL );
+    ok( !!hwnd, "failed to create grow64 window, error %lu\n", GetLastError() );
+    if (!hwnd) return;
+    ok( SetLayeredWindowAttributes( hwnd, 0, 255, LWA_ALPHA ),
+        "failed to initialize grow64 layered attributes, error %lu\n", GetLastError() );
+
+    hdc = GetDC( hwnd );
+    format = hdc ? ChoosePixelFormat( hdc, &pfd ) : 0;
+    if (!hdc || !format || !SetPixelFormat( hdc, format, &pfd ) ||
+        !(glrc = wglCreateContext( hdc )) || !wglMakeCurrent( hdc, glrc ))
+    {
+        win_skip( "grow64 OpenGL context setup failed, error %lu\n", GetLastError() );
+        goto done;
+    }
+
+    GetClientRect( hwnd, &rect );
+    ok( rect.right == 64 && rect.bottom == 64,
+        "unexpected grow64 initial size %ldx%ld\n", rect.right, rect.bottom );
+    glViewport( 0, 0, rect.right, rect.bottom );
+    glClearColor( 0.7, 0.2, 0.85, 1.0 );
+    glClear( GL_COLOR_BUFFER_BIT );
+    ok( SwapBuffers( hdc ), "grow64 reset SwapBuffers failed, error %lu\n", GetLastError() );
+
+    ok( SetWindowPos( hwnd, HWND_TOPMOST, 720, 240, 196, 140,
+                      SWP_NOACTIVATE | SWP_SHOWWINDOW ),
+        "failed to grow and show window, error %lu\n", GetLastError() );
+    GetClientRect( hwnd, &rect );
+    ok( rect.right == 196 && rect.bottom == 140,
+        "unexpected grown size %ldx%ld\n", rect.right, rect.bottom );
+    glViewport( 0, 0, rect.right, rect.bottom );
+    glClearColor( 0.15, 0.65, 0.35, 1.0 );
+    glClear( GL_COLOR_BUFFER_BIT );
+    ok( SwapBuffers( hdc ), "grown SwapBuffers failed, error %lu\n", GetLastError() );
+
+    ok( wait_for_surface_idle( hwnd, 7000, &state ),
+        "grown frame did not become idle: staged %u pending %u\n", state.staged, state.pending );
+    color = get_gl_front_pixel( &rect );
+    ok( color_matches( color, 38, 166, 89 ), "unexpected grown front pixel %#lx\n", color );
 
 done:
     if (glrc) wglMakeCurrent( NULL, NULL );
@@ -1702,6 +1855,7 @@ static void test_owner_exit_and_destroy( char **argv )
 START_TEST(client_surface)
 {
     HMODULE ntdll = GetModuleHandleA( "ntdll.dll" );
+    const char *test_case;
     char **argv;
     int argc;
     HWND hwnd;
@@ -1736,8 +1890,45 @@ START_TEST(client_surface)
         destroy_race_child( hwnd );
         return;
     }
+    if (argc > 4 && !strcmp( argv[2], "pixel_format" ))
+    {
+        int format;
+
+        sscanf( argv[3], "%p", &hwnd );
+        format = atoi( argv[4] );
+        pixel_format_child( hwnd, format );
+        return;
+    }
+
+    test_case = getenv( "WINETEST_CLIENT_SURFACE_CASE" );
+    if (test_case && !strcmp( test_case, "completion-provenance" ))
+    {
+        trace( "testing client surface completion result provenance\n" );
+        test_completion_result_provenance();
+        return;
+    }
+    if (test_case && !strcmp( test_case, "cross-process-pixel-format" ))
+    {
+        trace( "testing cross-process pixel format persistence\n" );
+        test_cross_process_pixel_format( argv );
+        return;
+    }
+    if (test_case && !strcmp( test_case, "grow64-completion" ))
+    {
+        GetDesktopWindow();
+        trace( "testing 64x64 grow presentation completion\n" );
+        test_grow64_present_completion();
+        return;
+    }
+    if (test_case && *test_case)
+    {
+        ok( 0, "unknown WINETEST_CLIENT_SURFACE_CASE %s\n", test_case );
+        return;
+    }
 
     GetDesktopWindow();
+    trace( "testing client surface completion result provenance\n" );
+    test_completion_result_provenance();
     trace( "testing client surface generations\n" );
     test_generation_aba();
     trace( "testing client surface host publication transaction\n" );
@@ -1772,6 +1963,10 @@ START_TEST(client_surface)
     test_present_destroy_race();
     trace( "testing paced present completion\n" );
     test_paced_present_completion();
+    trace( "testing cross-process pixel format persistence\n" );
+    test_cross_process_pixel_format( argv );
     trace( "testing hidden present and resize\n" );
     test_hidden_present_resize();
+    trace( "testing 64x64 grow presentation completion\n" );
+    test_grow64_present_completion();
 }

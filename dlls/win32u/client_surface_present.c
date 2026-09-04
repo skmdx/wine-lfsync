@@ -565,7 +565,7 @@ BOOL client_surface_complete_present_locked( struct client_surface *surface,
          * identifies who consumed it.  A queued shared monitor has already
          * consumed its one-shot backend event and its supplied result must be
          * used instead of waiting on that event a second time. */
-        if (present->completion.external_result)
+        if (client_surface_completion_result_is_external( &present->completion ))
             completed = external_completed;
         else if (present->completion.kind == CLIENT_SURFACE_COMPLETION_SHARED)
             completed = client_surface_backend_wait_completion( surface, timeout );
