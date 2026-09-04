@@ -1181,7 +1181,7 @@ static BOOL x11drv_make_current( struct opengl_drawable *draw_base, struct openg
 static void x11drv_surface_flush( struct opengl_drawable *base, UINT flags )
 {
     struct gl_drawable *gl = impl_from_opengl_drawable( base );
-    struct client_surface_present present;
+    struct client_surface_frame present;
 
     TRACE( "%s flags %#x\n", debugstr_opengl_drawable( base ), flags );
 
@@ -1494,7 +1494,7 @@ static BOOL x11drv_surface_swap( struct opengl_drawable *base )
 {
     GLXContext ctx = NtCurrentTeb()->glReserved2;
     struct gl_drawable *gl = impl_from_opengl_drawable( base );
-    struct client_surface_present present;
+    struct client_surface_frame present;
     BOOL completed = FALSE, submitted = TRUE, use_oml;
     INT64 target_sbc = 0;
 
@@ -1556,7 +1556,7 @@ static void x11drv_egl_surface_destroy( struct opengl_drawable *base )
 
 static void x11drv_egl_surface_flush( struct opengl_drawable *base, UINT flags )
 {
-    struct client_surface_present present;
+    struct client_surface_frame present;
 
     TRACE( "%s flags %#x\n", debugstr_opengl_drawable( base ), flags );
 
@@ -1633,7 +1633,7 @@ static void release_egl_present_completion( void *context )
 static BOOL x11drv_egl_surface_swap( struct opengl_drawable *base )
 {
     struct gl_drawable *gl = impl_from_opengl_drawable( base );
-    struct client_surface_present present;
+    struct client_surface_frame present;
     EGLuint64KHR frame_id = 0;
     BOOL timestamp_completion;
     EGLint err;

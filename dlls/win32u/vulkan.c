@@ -2103,7 +2103,7 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
     VkSwapchainKHR swapchains_buffer[16], *swapchains = swapchains_buffer;
     struct swapchain *present_swapchains_buffer[16], **present_swapchains = present_swapchains_buffer;
     struct client_surface *present_surfaces_buffer[16], **present_surfaces = present_surfaces_buffer;
-    struct client_surface_present presents_buffer[16], *presents = presents_buffer;
+    struct client_surface_frame presents_buffer[16], *presents = presents_buffer;
     uint64_t present_ids_buffer[16], *present_ids = present_ids_buffer;
     VkPresentIdKHR present_id_info = {VK_STRUCTURE_TYPE_PRESENT_ID_KHR};
     struct vulkan_device *device = queue->device;
@@ -2321,7 +2321,7 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
                  * generation for a correctly completed frame. */
                 WARN( "Swapchain size %dx%d changed or did not complete before composition\n",
                       swapchain->extents.width, swapchain->extents.height );
-                if (!presents[i].completion_failed && !presents[i].superseded)
+                if (presents[i].result == CLIENT_SURFACE_FRAME_PENDING)
                 {
                     if (present_info->pResults) present_info->pResults[i] = VK_SUBOPTIMAL_KHR;
                     if (!res) res = VK_SUBOPTIMAL_KHR;

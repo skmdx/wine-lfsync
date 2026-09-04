@@ -49,7 +49,7 @@ static void client_surface_backend_abandon_completion( struct client_surface *su
 }
 
 static BOOL begin_client_surface_composition( HWND hwnd, const struct client_surface *surface,
-                                              const struct client_surface_present *present,
+                                              const struct client_surface_frame *present,
                                               BOOL lease, BOOL *valid )
 {
     BOOL compose = FALSE;
@@ -81,7 +81,7 @@ struct client_surface_clip_snapshot
 };
 
 static BOOL get_client_surface_clip_snapshot( HWND hwnd, const struct ratio *raw_dpi,
-                                              const struct client_surface_present *present,
+                                              const struct client_surface_frame *present,
                                               struct client_surface_clip_snapshot *snapshot )
 {
     NTSTATUS status;
@@ -177,7 +177,7 @@ static BOOL get_client_surface_region( const RECT *monitor_rect,
  * server round trip, heap allocation, and O(occluders) region reconstruction. */
 static BOOL get_cached_client_surface_region( struct client_surface *surface, HWND hwnd,
                                               const RECT *monitor_rect,
-                                              const struct client_surface_present *present,
+                                              const struct client_surface_frame *present,
                                               HRGN *region )
 {
     struct client_surface_clip_snapshot snapshot = {0};
@@ -247,7 +247,7 @@ static BOOL claim_client_surface_retry( struct client_surface *surface, UINT64 g
 
 BOOL client_surface_end_present_internal( struct client_surface *surface,
                                           const SIZE *expected_size, BOOL new_content,
-                                          struct client_surface_present *present )
+                                          struct client_surface_frame *present )
 {
     HWND hwnd = 0, toplevel = 0;
     RECT monitor_rect = {0};
@@ -275,7 +275,7 @@ BOOL client_surface_end_present_internal( struct client_surface *surface,
     }
     else if (new_content && present->serial <= surface->composed_serial)
     {
-        present->superseded = TRUE;
+        present->result = CLIENT_SURFACE_FRAME_SUPERSEDED;
         TRACE( "discarding superseded presentation %s serial %s, composed %s\n",
                debugstr_client_surface( surface ), wine_dbgstr_longlong( present->serial ),
                wine_dbgstr_longlong( surface->composed_serial ) );
@@ -426,7 +426,7 @@ void client_surface_unlock_present( struct client_surface *surface )
 }
 
 void client_surface_prepare_present_locked( struct client_surface *surface,
-                                            struct client_surface_present *present,
+                                            struct client_surface_frame *present,
                                             BOOL external_completion )
 {
     struct client_surface_target target;
@@ -484,7 +484,7 @@ void client_surface_prepare_present_locked( struct client_surface *surface,
 }
 
 void client_surface_prepare_present( struct client_surface *surface,
-                                     struct client_surface_present *present,
+                                     struct client_surface_frame *present,
                                      BOOL external_completion )
 {
     client_surface_lock_present( surface );
@@ -503,7 +503,7 @@ void client_surface_begin_present( struct client_surface *surface )
 }
 
 static void client_surface_register_completion_locked( struct client_surface *surface,
-                                                       struct client_surface_present *present )
+                                                       struct client_surface_frame *present )
 {
     if (present->completion.kind == CLIENT_SURFACE_COMPLETION_NONE) return;
     InterlockedIncrement( &surface->external_completion_count );
@@ -512,7 +512,7 @@ static void client_surface_register_completion_locked( struct client_surface *su
 }
 
 void client_surface_submit_present_locked( struct client_surface *surface,
-                                           struct client_surface_present *present )
+                                           struct client_surface_frame *present )
 {
     /* Submission serials, unlike preparation serials, preserve the native
      * order observed by concurrent producer queues. */
@@ -528,7 +528,7 @@ void client_surface_submit_present_locked( struct client_surface *surface,
 }
 
 void client_surface_submit_present( struct client_surface *surface,
-                                    struct client_surface_present *present )
+                                    struct client_surface_frame *present )
 {
     client_surface_lock_present( surface );
     client_surface_submit_present_locked( surface, present );
@@ -539,14 +539,14 @@ void client_surface_submit_present( struct client_surface *surface,
 }
 
 BOOL client_surface_complete_present_locked( struct client_surface *surface,
-                                             struct client_surface_present *present,
+                                             struct client_surface_frame *present,
                                              BOOL submitted, BOOL external_completed,
                                              const SIZE *expected_size, DWORD timeout )
 {
     BOOL completed = submitted && present->target_valid;
 
     if (!submitted && present->completion.kind == CLIENT_SURFACE_COMPLETION_EXACT)
-        present->completion_failed = TRUE;
+        present->result = CLIENT_SURFACE_FRAME_COMPLETION_FAILED;
 
     if (!submitted && present->completion.kind == CLIENT_SURFACE_COMPLETION_SHARED)
     {
@@ -554,7 +554,7 @@ BOOL client_surface_complete_present_locked( struct client_surface *surface,
          * Retire the armed boundary so a delayed request cannot satisfy the
          * next transaction's completion wait. */
         client_surface_backend_abandon_completion( surface );
-        present->completion_failed = TRUE;
+        present->result = CLIENT_SURFACE_FRAME_COMPLETION_FAILED;
     }
     if (completed && present->offscreen)
     {
@@ -564,7 +564,7 @@ BOOL client_surface_complete_present_locked( struct client_surface *surface,
             completed = client_surface_backend_wait_completion( surface, timeout );
         else
             completed = FALSE;
-        present->completion_failed = !completed;
+        if (!completed) present->result = CLIENT_SURFACE_FRAME_COMPLETION_FAILED;
     }
     if (completed && InterlockedCompareExchange( &surface->active, 0, 0 ) &&
         (!present->scene.authoritative ||
@@ -628,7 +628,7 @@ static void release_deferred_driver_completion( void *context )
 }
 
 BOOL client_surface_complete_present( struct client_surface *surface,
-                                      struct client_surface_present *present,
+                                      struct client_surface_frame *present,
                                       BOOL submitted, BOOL external_completed,
                                       const SIZE *expected_size, DWORD timeout )
 {
@@ -656,7 +656,7 @@ BOOL client_surface_complete_present( struct client_surface *surface,
 
 void client_surface_present( struct client_surface *surface )
 {
-    struct client_surface_present present;
+    struct client_surface_frame present;
 
     /* Compatibility path for drivers whose presentation callback already
      * supplies a host completion boundary.  It still participates in target

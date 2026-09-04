@@ -978,7 +978,7 @@ void client_surface_release( struct client_surface *surface )
 
 static BOOL client_surface_recompose( struct client_surface *surface, LONG64 seq )
 {
-    struct client_surface_present present;
+    struct client_surface_frame present;
 
     /* Cached replay reads the same native drawable that a deferred host
      * presentation updates.  Do not let an older cached frame commit the

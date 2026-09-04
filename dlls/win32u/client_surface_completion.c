@@ -25,7 +25,7 @@ WINE_DEFAULT_DEBUG_CHANNEL(win);
 struct client_surface_completion_job
 {
     struct list entry;
-    struct client_surface_present present;
+    struct client_surface_frame present;
     SIZE expected_size;
     DWORD submission_time;
     BOOL has_expected_size;
@@ -38,7 +38,7 @@ struct client_surface_completion_job
 static LONG client_surface_deferred_present_count;
 
 BOOL client_surface_wait_present_completion( struct client_surface *surface,
-                                             const struct client_surface_present *present,
+                                             const struct client_surface_frame *present,
                                              BOOL submitted, DWORD timeout )
 {
     struct client_surface_target target;
@@ -63,7 +63,7 @@ BOOL client_surface_wait_present_completion( struct client_surface *surface,
     return completed;
 }
 
-void client_surface_set_present_completion( struct client_surface_present *present,
+void client_surface_set_present_completion( struct client_surface_frame *present,
                                             client_surface_completion_wait_func wait,
                                             client_surface_completion_release_func release,
                                             void *context )
@@ -132,7 +132,7 @@ static void client_surface_completion_worker( struct client_surface *surface, BO
                                               completed,
                                               job->has_expected_size ? &job->expected_size : NULL,
                                               0 ) && job->submitted &&
-            !job->present.superseded && !job->present.completion_failed)
+            job->present.result == CLIENT_SURFACE_FRAME_PENDING)
             WARN( "deferred client-surface composition did not complete for %s\n",
                   debugstr_client_surface( surface ) );
         completion.release( completion.context );
@@ -150,7 +150,7 @@ static void client_surface_completion_thread( void *context )
 }
 
 void client_surface_defer_present( struct client_surface *surface,
-                                   struct client_surface_present *present,
+                                   struct client_surface_frame *present,
                                    BOOL submitted, const SIZE *expected_size )
 {
     struct client_surface_completion completion = present->completion;
