@@ -23,12 +23,13 @@
 
 WINE_DEFAULT_DEBUG_CHANNEL(win);
 
-static BOOL client_surface_backend_present( struct client_surface *surface, HDC hdc,
-                                            HRGN surface_region, BOOL flush,
-                                            BOOL defer_visible )
+static BOOL client_surface_backend_present( struct client_surface *surface,
+                                            const struct client_surface_scene *scene,
+                                            HDC hdc, HRGN surface_region,
+                                            BOOL flush, BOOL defer_visible )
 {
     return !surface->backend->present ||
-           surface->backend->present( surface, hdc, surface_region, flush, defer_visible );
+           surface->backend->present( surface, scene, hdc, surface_region, flush, defer_visible );
 }
 
 static BOOL client_surface_backend_prepare_completion( struct client_surface *surface )
@@ -364,13 +365,11 @@ BOOL client_surface_end_present_internal( struct client_surface *surface,
      * surface while it runs, allowing independent surfaces to keep moving. */
     if (compose)
     {
-        surface->composition_scene_epoch = present->scene.epoch;
-        surface->composition_toplevel = present->scene.toplevel;
         /* A native-target writer lease protects execution on the host server,
          * not merely submission from this process.  Complete the backend
          * copy before returning the lease so the owner cannot publish or
          * replace the shared target ahead of work queued on this connection. */
-        copied = client_surface_backend_present( surface, hdc, surface_region,
+        copied = client_surface_backend_present( surface, &present->scene, hdc, surface_region,
                                                  sync || leased, sync );
         composed = copied;
     }

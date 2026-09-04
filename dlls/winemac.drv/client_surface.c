@@ -67,8 +67,9 @@ static BOOL macdrv_client_surface_update(struct client_surface *client,
     return TRUE;
 }
 
-static BOOL macdrv_client_surface_present(struct client_surface *client, HDC hdc, HRGN surface_region,
-                                          BOOL flush, BOOL defer_visible)
+static BOOL macdrv_client_surface_present(struct client_surface *client,
+                                          const struct client_surface_scene *scene,
+                                          HDC hdc, HRGN surface_region, BOOL flush, BOOL defer_visible)
 {
     struct macdrv_client_surface *surface = impl_from_client_surface(client);
     struct macdrv_win_data *data;

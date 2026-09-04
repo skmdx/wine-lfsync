@@ -247,6 +247,7 @@ static inline void push_dc_driver( PHYSDEV *dev, PHYSDEV physdev, const struct g
 /* support for client surfaces */
 
 struct client_surface;
+struct client_surface_scene;
 
 /* Driver-ready native target.  seq is a seqlock and the sole invalidation
  * token for geometry, offscreen mode, resize, detach and native replacement. */
@@ -289,8 +290,8 @@ struct client_surface_backend
     BOOL (*update)( struct client_surface *surface, struct client_surface_target *target );
     /* present the client surface if necessary, hdc != NULL when offscreen, called from render thread;
      * flush requires host completion before returning, defer_visible keeps a scene generation staged */
-    BOOL (*present)( struct client_surface *surface, HDC hdc, HRGN surface_region,
-                     BOOL flush, BOOL defer_visible );
+    BOOL (*present)( struct client_surface *surface, const struct client_surface_scene *scene,
+                     HDC hdc, HRGN surface_region, BOOL flush, BOOL defer_visible );
     const struct client_surface_completion_ops *completion;
 };
 
@@ -369,8 +370,6 @@ struct client_surface
     LONG                               server_cached;  /* registered as a cached owner with the Wine server */
     UINT64                             cache_cost;     /* estimated bytes while on the unused list */
     UINT64                             target_scene_epoch; /* last server scene applied to native target */
-    UINT64                             composition_scene_epoch; /* scene passed to driver composition */
-    HWND                               composition_toplevel;
     LONG64                             present_serial; /* producer submission order */
     LONG64                             composed_serial; /* newest producer copied into the host target */
     LONG                               external_completion_count; /* causal tokens currently in flight */

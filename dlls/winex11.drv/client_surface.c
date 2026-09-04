@@ -301,9 +301,10 @@ static BOOL copy_client_surface( struct x11drv_client_surface *surface, Drawable
                             SRCCOPY, 0 );
 }
 
-static BOOL X11DRV_client_surface_present( struct client_surface *client, HDC hdc,
-                                           HRGN surface_region, BOOL flush,
-                                           BOOL defer_visible )
+static BOOL X11DRV_client_surface_present( struct client_surface *client,
+                                           const struct client_surface_scene *scene,
+                                           HDC hdc, HRGN surface_region,
+                                           BOOL flush, BOOL defer_visible )
 {
     struct x11drv_client_surface *surface = impl_from_client_surface( client );
     HWND hwnd = client->hwnd, toplevel = client->target.toplevel;
@@ -327,11 +328,11 @@ static BOOL X11DRV_client_surface_present( struct client_surface *client, HDC hd
     window = X11DRV_get_whole_window_property( toplevel );
     if (!window || !surface->hdc_src || !surface->hdc_dst) return FALSE;
     if (!surface->composition_backing ||
-        surface->composition_toplevel != client->composition_toplevel ||
-        surface->composition_scene_epoch != client->composition_scene_epoch)
+        surface->composition_toplevel != scene->toplevel ||
+        surface->composition_scene_epoch != scene->epoch)
     {
-        surface->composition_toplevel = client->composition_toplevel;
-        surface->composition_scene_epoch = client->composition_scene_epoch;
+        surface->composition_toplevel = scene->toplevel;
+        surface->composition_scene_epoch = scene->epoch;
         surface->composition_backing = X11DRV_get_client_surface_backing_property( toplevel );
     }
     backing = surface->composition_backing;
