@@ -370,7 +370,6 @@ struct client_surface
     LONG                               updated;        /* has been moved / resized / reparented */
     struct client_surface_target       target;         /* driver-ready native target snapshot */
     LONG                               active;         /* registered as active with the Wine server */
-    LONG                               producer_claimed; /* active registration has claimed a completed frame */
     LONG                               content_valid;  /* complete content exists at the current size */
     LONG                               cacheable;      /* native completion state is safe to reuse */
     LONG                               server_cached;  /* registered as a cached owner with the Wine server */

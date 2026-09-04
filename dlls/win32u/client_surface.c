@@ -317,7 +317,6 @@ static void client_surface_detach_locked( struct client_surface *surface )
     {
         flags |= CLIENT_SURFACE_STATE_UNREGISTER;
         InterlockedExchange( &surface->active, FALSE );
-        InterlockedExchange( &surface->producer_claimed, FALSE );
     }
     if (surface->server_cached)
     {
@@ -1279,11 +1278,7 @@ void use_window_client_surface( struct client_surface *surface, BOOL use )
             flags |= CLIENT_SURFACE_STATE_UNCACHE;
             InterlockedExchange( &surface->server_cached, FALSE );
         }
-        if (!(flags & CLIENT_SURFACE_STATE_CACHE))
-        {
-            InterlockedExchange( &surface->producer_claimed, FALSE );
-            renew_identity = TRUE;
-        }
+        if (!(flags & CLIENT_SURFACE_STATE_CACHE)) renew_identity = TRUE;
         /* Publish the cached ownership before retiring the active ownership.
          * Lock-free begin_present() must not observe a gap between the two;
          * end_present() waits on present_lock until the server transition has

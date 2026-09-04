@@ -567,8 +567,7 @@ BOOL client_surface_complete_present_locked( struct client_surface *surface,
         if (!completed) present->result = CLIENT_SURFACE_FRAME_COMPLETION_FAILED;
     }
     if (completed && InterlockedCompareExchange( &surface->active, 0, 0 ) &&
-        (!present->scene.authoritative ||
-         !InterlockedCompareExchange( &surface->producer_claimed, 0, 0 )))
+        !present->scene.authoritative)
     {
         BOOL wake = FALSE;
         HWND hwnd;
@@ -591,8 +590,6 @@ BOOL client_surface_complete_present_locked( struct client_surface *surface,
             if (wake && toplevel)
                 NtUserPostMessage( toplevel, WM_WINE_UPDATEWINDOWSTATE, 0, 0 );
             client_surface_get_scene( surface, &present->scene );
-            InterlockedExchange( &surface->producer_claimed,
-                                 present->scene.authoritative );
         }
         pthread_mutex_unlock( &surface->present_lock );
     }
