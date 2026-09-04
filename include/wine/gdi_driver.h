@@ -301,16 +301,21 @@ enum client_surface_completion_kind
     CLIENT_SURFACE_COMPLETION_SHARED,
 };
 
-struct client_surface_present
+struct client_surface_scene
 {
     UINT64 generation;
-    UINT64 scene_generation;
+    UINT64 epoch;
+    HWND toplevel;
+    BOOL valid;
+    BOOL authoritative;
+};
+
+struct client_surface_present
+{
+    struct client_surface_scene scene;
     LONG64 serial;
     DWORD submission_time;
     LONG64 target_seq;
-    HWND scene_toplevel;
-    BOOL scene_valid;
-    BOOL authoritative;
     BOOL offscreen;
     BOOL target_valid;
     enum client_surface_completion_kind completion;
@@ -351,8 +356,8 @@ struct client_surface
     LONG                               cacheable;      /* native completion state is safe to reuse */
     LONG                               server_cached;  /* registered as a cached owner with the Wine server */
     UINT64                             cache_cost;     /* estimated bytes while on the unused list */
-    UINT64                             target_scene_generation; /* last server scene applied to native target */
-    UINT64                             composition_scene_generation; /* scene passed to driver composition */
+    UINT64                             target_scene_epoch; /* last server scene applied to native target */
+    UINT64                             composition_scene_epoch; /* scene passed to driver composition */
     HWND                               composition_toplevel;
     LONG64                             present_serial; /* producer submission order */
     LONG64                             composed_serial; /* newest producer copied into the host target */
@@ -365,7 +370,7 @@ struct client_surface
     LONG64                             recompose_done; /* latest completed cached replay */
     LONG                               recompose_queued; /* a consumer owns the pending request */
     LONG64                             scene_retry_generation; /* newest server generation granted one retry */
-    UINT64                             clip_scene_generation; /* scene owning the cached cross-process clip */
+    UINT64                             clip_scene_epoch; /* scene owning the cached cross-process clip */
     LONG64                             clip_target_seq;
     HRGN                               clip_region;
     BOOL                               clip_region_valid;

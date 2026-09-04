@@ -61,8 +61,8 @@ static BOOL begin_client_surface_composition( HWND hwnd, const struct client_sur
         req->surface = surface->identity;
         req->flags = CLIENT_SURFACE_STATE_PRESENT_BEGIN |
                      (lease ? CLIENT_SURFACE_STATE_PRESENT_WRITE_LEASE : 0);
-        req->generation = present->generation;
-        req->scene_generation = present->scene_generation;
+        req->generation = present->scene.generation;
+        req->scene_generation = present->scene.epoch;
         if (!wine_server_call( req ))
         {
             compose = reply->compose;
@@ -124,8 +124,8 @@ static BOOL get_client_surface_clip_snapshot( HWND hwnd, const struct ratio *raw
 
         snapshot->count = count;
         return reply_size == count * sizeof(*snapshot->windows) &&
-               present->scene_valid && toplevel == present->scene_toplevel &&
-               !(scene_generation & 1) && scene_generation == present->scene_generation;
+               present->scene.valid && toplevel == present->scene.toplevel &&
+               !(scene_generation & 1) && scene_generation == present->scene.epoch;
     }
 }
 
@@ -185,10 +185,10 @@ static BOOL get_cached_client_surface_region( struct client_surface *surface, HW
     HRGN new_region = 0;
     BOOL valid;
 
-    if (!raw_dpi.num || !raw_dpi.den || !present->scene_valid) return FALSE;
+    if (!raw_dpi.num || !raw_dpi.den || !present->scene.valid) return FALSE;
 
     if (surface->clip_region_valid &&
-        surface->clip_scene_generation == present->scene_generation &&
+        surface->clip_scene_epoch == present->scene.epoch &&
         surface->clip_target_seq == present->target_seq)
     {
         *region = surface->clip_region;
@@ -205,7 +205,7 @@ static BOOL get_cached_client_surface_region( struct client_surface *surface, HW
     }
 
     if (surface->clip_region) NtGdiDeleteObjectApp( surface->clip_region );
-    surface->clip_scene_generation = present->scene_generation;
+    surface->clip_scene_epoch = present->scene.epoch;
     surface->clip_target_seq = present->target_seq;
     surface->clip_region = new_region;
     surface->clip_region_valid = TRUE;
@@ -230,26 +230,6 @@ static BOOL client_surface_validate_size_locked( struct client_surface *surface,
     return TRUE;
 }
 
-static BOOL client_surface_publication_matches( const struct client_surface_present *present )
-{
-    struct object_lock lock = OBJECT_LOCK_INIT;
-    const window_shm_t *window_shm = NULL;
-    UINT64 generation = 0, scene_generation = 0;
-    BOOL preparing = FALSE;
-    NTSTATUS status;
-
-    if (!present->scene_valid || !present->scene_toplevel) return FALSE;
-    while ((status = get_shared_window( present->scene_toplevel, &lock, &window_shm )) == STATUS_PENDING)
-    {
-        generation = (window_shm->client_surface_flags & WINDOW_SHM_CLIENT_SURFACE_COMPOSING) ?
-                     window_shm->client_surface_generation : 0;
-        scene_generation = window_shm->client_surface_scene_generation;
-        preparing = !!(window_shm->client_surface_flags & WINDOW_SHM_CLIENT_SURFACE_PREPARING);
-    }
-    return !status && !preparing && generation == present->generation && !(scene_generation & 1) &&
-           scene_generation == present->scene_generation;
-}
-
 static BOOL claim_client_surface_retry( struct client_surface *surface, UINT64 generation )
 {
     LONG64 current;
@@ -265,7 +245,7 @@ static BOOL claim_client_surface_retry( struct client_surface *surface, UINT64 g
     }
 }
 
-BOOL client_surface_end_present_internal( struct client_surface *surface, UINT64 generation,
+BOOL client_surface_end_present_internal( struct client_surface *surface,
                                           const SIZE *expected_size, BOOL new_content,
                                           struct client_surface_present *present )
 {
@@ -273,8 +253,8 @@ BOOL client_surface_end_present_internal( struct client_surface *surface, UINT64
     RECT monitor_rect = {0};
     HRGN surface_region = 0;
     BOOL commit = FALSE, compose = FALSE, composed = FALSE, copied = FALSE, offscreen = FALSE;
-    BOOL region_valid = TRUE, sync = !!generation, wake = FALSE;
-    BOOL authorized = present && present->authoritative;
+    BOOL region_valid = TRUE, sync = !!present->scene.generation, wake = FALSE;
+    BOOL authorized = present->scene.authoritative;
     BOOL begin_valid = TRUE, composition_retry = FALSE, guarded = FALSE, leased = FALSE;
     BOOL scene_retry = FALSE, source_valid = FALSE;
     UINT server_flags = 0;
@@ -288,7 +268,7 @@ BOOL client_surface_end_present_internal( struct client_surface *surface, UINT64
     pthread_mutex_lock( &surface->present_lock );
     if (!present->target_valid ||
         present->target_seq != surface->target.seq ||
-        present->scene_toplevel != surface->target.toplevel)
+        present->scene.toplevel != surface->target.toplevel)
     {
         TRACE( "discarding %s presentation across target state change\n",
                debugstr_client_surface( surface ) );
@@ -317,7 +297,7 @@ BOOL client_surface_end_present_internal( struct client_surface *surface, UINT64
                    debugstr_client_surface( surface ) );
     }
     source_valid = compose && new_content;
-    if (compose && offscreen && present && !present->scene_valid) compose = FALSE;
+    if (compose && offscreen && !present->scene.valid) compose = FALSE;
     guarded = compose && offscreen &&
               client_surface_backend_has_cap( surface, CLIENT_SURFACE_BACKEND_NATIVE_WRITE_LEASE );
     if (compose && (sync || guarded))
@@ -330,7 +310,7 @@ BOOL client_surface_end_present_internal( struct client_surface *surface, UINT64
             /* Only the authoritative producer for an HWND may touch its
              * composition destination.  A still-current denial is therefore a
              * successful no-op; a stale denial is retried in the new scene. */
-            composed = begin_valid && client_surface_publication_matches( present );
+            composed = begin_valid && client_surface_scene_current( &present->scene );
             scene_retry = !composed;
             compose = FALSE;
         }
@@ -340,7 +320,7 @@ BOOL client_surface_end_present_internal( struct client_surface *surface, UINT64
         /* Steady-state presents also obey the server's active-over-cache
          * producer choice.  The shared identity is covered by the top-level
          * scene seqlock, so this adds no per-frame server round trip. */
-        composed = begin_valid && client_surface_publication_matches( present );
+        composed = begin_valid && client_surface_scene_current( &present->scene );
         scene_retry = !composed;
         compose = FALSE;
     }
@@ -354,7 +334,7 @@ BOOL client_surface_end_present_internal( struct client_surface *surface, UINT64
         if (!region_valid)
         {
             WARN( "failed to derive client surface clip state\n" );
-            if (!client_surface_publication_matches( present )) scene_retry = TRUE;
+            if (!client_surface_scene_current( &present->scene )) scene_retry = TRUE;
             compose = FALSE;
         }
         else
@@ -372,7 +352,7 @@ BOOL client_surface_end_present_internal( struct client_surface *surface, UINT64
         }
     }
 
-    if (compose && offscreen && !client_surface_publication_matches( present ))
+    if (compose && offscreen && !client_surface_scene_current( &present->scene ))
     {
         TRACE( "discarding %s composition across scene change\n",
                debugstr_client_surface( surface ) );
@@ -384,8 +364,8 @@ BOOL client_surface_end_present_internal( struct client_surface *surface, UINT64
      * surface while it runs, allowing independent surfaces to keep moving. */
     if (compose)
     {
-        surface->composition_scene_generation = present->scene_generation;
-        surface->composition_toplevel = present->scene_toplevel;
+        surface->composition_scene_epoch = present->scene.epoch;
+        surface->composition_toplevel = present->scene.toplevel;
         /* A native-target writer lease protects execution on the host server,
          * not merely submission from this process.  Complete the backend
          * copy before returning the lease so the owner cannot publish or
@@ -394,7 +374,7 @@ BOOL client_surface_end_present_internal( struct client_surface *surface, UINT64
                                                  sync || leased, sync );
         composed = copied;
     }
-    if (copied && offscreen && !client_surface_publication_matches( present ))
+    if (copied && offscreen && !client_surface_scene_current( &present->scene ))
     {
         TRACE( "not committing %s composition invalidated while copying\n",
                debugstr_client_surface( surface ) );
@@ -420,15 +400,16 @@ BOOL client_surface_end_present_internal( struct client_surface *surface, UINT64
     if (commit) server_flags |= CLIENT_SURFACE_STATE_PRESENT_COMMIT;
     if (server_flags)
         toplevel = client_surface_set_server_state( hwnd, surface, server_flags,
-                                                    generation, present->scene_generation, &wake );
+                                                    present->scene.generation,
+                                                    present->scene.epoch, &wake );
     if (wake && toplevel) NtUserPostMessage( toplevel, WM_WINE_UPDATEWINDOWSTATE, 0, 0 );
 
     /* Release a native-target writer before requesting repair.  The server
      * can then linearize the fresh owner snapshot immediately after the last
      * stale writer instead of creating a second deferred restart. */
-    if ((scene_retry || composition_retry) && present->scene_toplevel &&
-        claim_client_surface_retry( surface, generation ))
-        client_surface_geometry_ready( present->scene_toplevel );
+    if ((scene_retry || composition_retry) && present->scene.toplevel &&
+        claim_client_surface_retry( surface, present->scene.generation ))
+        client_surface_geometry_ready( present->scene.toplevel );
     return composed;
 }
 
@@ -477,23 +458,17 @@ void client_surface_prepare_present_locked( struct client_surface *surface,
      * geometry.  Reapplying an unchanged scene on every GL/Vulkan frame made
      * resize queries and X11 target setup part of the steady-state hot path. */
     pthread_mutex_lock( &surface->present_lock );
-    present->scene_valid = client_surface_get_publication( surface, &present->generation,
-                                                           &present->scene_generation,
-                                                           &present->scene_toplevel,
-                                                           &present->authoritative );
+    client_surface_get_scene( surface, &present->scene );
     if (surface->hwnd &&
-        (!present->scene_valid || !surface->target.valid ||
-         surface->target.toplevel != present->scene_toplevel ||
-         surface->target_scene_generation != present->scene_generation))
+        (!present->scene.valid || !surface->target.valid ||
+         surface->target.toplevel != present->scene.toplevel ||
+         surface->target_scene_epoch != present->scene.epoch))
     {
         client_surface_update_present_locked( surface );
-        present->scene_valid = client_surface_get_publication( surface, &present->generation,
-                                                               &present->scene_generation,
-                                                               &present->scene_toplevel,
-                                                               &present->authoritative );
+        client_surface_get_scene( surface, &present->scene );
     }
-    if (present->scene_valid && surface->target.valid)
-        surface->target_scene_generation = present->scene_generation;
+    if (present->scene.valid && surface->target.valid)
+        surface->target_scene_epoch = present->scene.epoch;
     client_surface_get_target( surface, &target );
     present->target_seq = target.seq;
     present->target_valid = target.valid;
@@ -592,7 +567,7 @@ BOOL client_surface_complete_present_locked( struct client_surface *surface,
         present->completion_failed = !completed;
     }
     if (completed && InterlockedCompareExchange( &surface->active, 0, 0 ) &&
-        (!present->authoritative ||
+        (!present->scene.authoritative ||
          !InterlockedCompareExchange( &surface->producer_claimed, 0, 0 )))
     {
         BOOL wake = FALSE;
@@ -615,19 +590,14 @@ BOOL client_surface_complete_present_locked( struct client_surface *surface,
                                                         0, 0, &wake );
             if (wake && toplevel)
                 NtUserPostMessage( toplevel, WM_WINE_UPDATEWINDOWSTATE, 0, 0 );
-            present->scene_valid = client_surface_get_publication( surface,
-                                                    &present->generation,
-                                                    &present->scene_generation,
-                                                    &present->scene_toplevel,
-                                                    &present->authoritative );
+            client_surface_get_scene( surface, &present->scene );
             InterlockedExchange( &surface->producer_claimed,
-                                 present->authoritative );
+                                 present->scene.authoritative );
         }
         pthread_mutex_unlock( &surface->present_lock );
     }
     if (completed)
-        completed = client_surface_end_present_internal( surface, present->generation,
-                                                         expected_size, TRUE, present );
+        completed = client_surface_end_present_internal( surface, expected_size, TRUE, present );
     if (present->completion != CLIENT_SURFACE_COMPLETION_NONE)
     {
         BOOL wake = FALSE;

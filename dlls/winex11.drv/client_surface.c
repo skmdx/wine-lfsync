@@ -328,10 +328,10 @@ static BOOL X11DRV_client_surface_present( struct client_surface *client, HDC hd
     if (!window || !surface->hdc_src || !surface->hdc_dst) return FALSE;
     if (!surface->composition_backing ||
         surface->composition_toplevel != client->composition_toplevel ||
-        surface->composition_scene_generation != client->composition_scene_generation)
+        surface->composition_scene_epoch != client->composition_scene_epoch)
     {
         surface->composition_toplevel = client->composition_toplevel;
-        surface->composition_scene_generation = client->composition_scene_generation;
+        surface->composition_scene_epoch = client->composition_scene_epoch;
         surface->composition_backing = X11DRV_get_client_surface_backing_property( toplevel );
     }
     backing = surface->composition_backing;

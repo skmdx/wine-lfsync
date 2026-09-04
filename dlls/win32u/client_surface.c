@@ -503,23 +503,40 @@ void client_surface_get_geometry( const struct client_surface *surface,
     geometry->monitor_rect = target.monitor_rect;
 }
 
-BOOL client_surface_get_publication( struct client_surface *surface, UINT64 *generation,
-                                     UINT64 *scene_generation, HWND *scene_toplevel,
-                                     BOOL *authoritative )
+static BOOL read_client_surface_scene( HWND toplevel, struct client_surface_scene *scene,
+                                       process_id_t *producer_process, client_ptr_t *producer_id )
 {
-    struct object_lock top_lock = OBJECT_LOCK_INIT, producer_lock = OBJECT_LOCK_INIT;
-    const window_shm_t *top_shm = NULL, *producer_shm = NULL;
+    struct object_lock lock = OBJECT_LOCK_INIT;
+    const window_shm_t *window_shm = NULL;
+    BOOL preparing = FALSE;
+    NTSTATUS status;
+
+    memset( scene, 0, sizeof(*scene) );
+    scene->toplevel = toplevel;
+    while ((status = get_shared_window( toplevel, &lock, &window_shm )) == STATUS_PENDING)
+    {
+        scene->generation = (window_shm->client_surface_flags & WINDOW_SHM_CLIENT_SURFACE_COMPOSING) ?
+                            window_shm->client_surface_generation : 0;
+        scene->epoch = window_shm->client_surface_scene_generation;
+        preparing = !!(window_shm->client_surface_flags & WINDOW_SHM_CLIENT_SURFACE_PREPARING);
+        if (producer_process) *producer_process = window_shm->client_surface_process;
+        if (producer_id) *producer_id = window_shm->client_surface_id;
+    }
+    if (status) return FALSE;
+    scene->valid = !preparing && !(scene->epoch & 1);
+    return TRUE;
+}
+
+BOOL client_surface_get_scene( struct client_surface *surface, struct client_surface_scene *scene )
+{
+    struct object_lock producer_lock = OBJECT_LOCK_INIT;
+    const window_shm_t *producer_shm = NULL;
     process_id_t producer_process = 0;
     client_ptr_t producer_id = 0;
     HWND hwnd, toplevel;
-    NTSTATUS status;
-    UINT64 current_generation = 0, current_scene_generation = 0;
-    BOOL preparing = FALSE;
+    NTSTATUS status = STATUS_SUCCESS;
 
-    if (generation) *generation = 0;
-    if (scene_generation) *scene_generation = 0;
-    if (scene_toplevel) *scene_toplevel = 0;
-    if (authoritative) *authoritative = FALSE;
+    memset( scene, 0, sizeof(*scene) );
 
     hwnd = InterlockedCompareExchangePointer( (void **)&surface->hwnd, NULL, NULL );
     if (!hwnd || (!InterlockedCompareExchange( &surface->active, 0, 0 ) &&
@@ -527,19 +544,7 @@ BOOL client_surface_get_publication( struct client_surface *surface, UINT64 *gen
         return FALSE;
 
     if (!(toplevel = NtUserGetAncestor( hwnd, GA_ROOT ))) return FALSE;
-    while ((status = get_shared_window( toplevel, &top_lock, &top_shm )) == STATUS_PENDING)
-    {
-        current_generation = (top_shm->client_surface_flags & WINDOW_SHM_CLIENT_SURFACE_COMPOSING) ?
-                             top_shm->client_surface_generation : 0;
-        current_scene_generation = top_shm->client_surface_scene_generation;
-        preparing = !!(top_shm->client_surface_flags & WINDOW_SHM_CLIENT_SURFACE_PREPARING);
-        if (hwnd == toplevel)
-        {
-            producer_process = top_shm->client_surface_process;
-            producer_id = top_shm->client_surface_id;
-        }
-    }
-    if (status || (current_scene_generation & 1)) return FALSE;
+    if (!read_client_surface_scene( toplevel, scene, &producer_process, &producer_id )) return FALSE;
 
     while (hwnd != toplevel &&
            (status = get_shared_window( hwnd, &producer_lock, &producer_shm )) == STATUS_PENDING)
@@ -547,15 +552,26 @@ BOOL client_surface_get_publication( struct client_surface *surface, UINT64 *gen
         producer_process = producer_shm->client_surface_process;
         producer_id = producer_shm->client_surface_id;
     }
-    if (status) return FALSE;
+    if (status)
+    {
+        scene->valid = FALSE;
+        return FALSE;
+    }
+    if (hwnd != toplevel && scene->valid && !client_surface_scene_current( scene ))
+        scene->valid = FALSE;
+    scene->authoritative = producer_process == (process_id_t)client_surface_process_id &&
+                           producer_id == surface->identity;
+    return scene->valid;
+}
 
-    if (generation) *generation = current_generation;
-    if (scene_generation) *scene_generation = current_scene_generation;
-    if (scene_toplevel) *scene_toplevel = toplevel;
-    if (authoritative)
-        *authoritative = producer_process == (process_id_t)client_surface_process_id &&
-                         producer_id == surface->identity;
-    return !preparing;
+BOOL client_surface_scene_current( const struct client_surface_scene *scene )
+{
+    struct client_surface_scene current;
+
+    if (!scene->valid || !scene->toplevel ||
+        !read_client_surface_scene( scene->toplevel, &current, NULL, NULL ) || !current.valid)
+        return FALSE;
+    return current.generation == scene->generation && current.epoch == scene->epoch;
 }
 
 BOOL client_surface_update_present_locked( struct client_surface *surface )
@@ -997,7 +1013,7 @@ static BOOL client_surface_recompose( struct client_surface *surface, LONG64 seq
         return FALSE;
     }
     client_surface_prepare_present_locked( surface, &present, TRUE );
-    client_surface_end_present_internal( surface, present.generation, NULL, FALSE, &present );
+    client_surface_end_present_internal( surface, NULL, FALSE, &present );
     complete_client_surface_recompose( surface, seq );
     /* drain_client_surface_recompose() owns scheduling while this lock is
      * held.  Unlock directly so a request arriving during the replay is
@@ -1193,25 +1209,22 @@ void client_surface_end_prepare( HWND hwnd, UINT64 scene_generation )
 
 BOOL client_surface_update( struct client_surface *surface )
 {
-    UINT64 scene_generation;
-    HWND scene_toplevel;
+    struct client_surface_scene scene;
     BOOL scene_valid, ret = FALSE;
 
     client_surface_lock_target( surface );
     pthread_mutex_lock( &surface->present_lock );
-    scene_valid = client_surface_get_publication( surface, NULL, &scene_generation,
-                                                  &scene_toplevel, NULL );
+    scene_valid = client_surface_get_scene( surface, &scene );
     if (scene_valid && surface->target.valid &&
-        surface->target.toplevel == scene_toplevel &&
-        surface->target_scene_generation == scene_generation)
+        surface->target.toplevel == scene.toplevel &&
+        surface->target_scene_epoch == scene.epoch)
         ret = TRUE;
     else if (surface->hwnd)
     {
         ret = client_surface_update_present_locked( surface );
-        scene_valid = client_surface_get_publication( surface, NULL, &scene_generation,
-                                                      &scene_toplevel, NULL );
+        scene_valid = client_surface_get_scene( surface, &scene );
         if (ret && scene_valid)
-            surface->target_scene_generation = scene_generation;
+            surface->target_scene_epoch = scene.epoch;
     }
     pthread_mutex_unlock( &surface->present_lock );
     client_surface_unlock_target( surface );

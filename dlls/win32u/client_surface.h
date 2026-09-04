@@ -28,11 +28,11 @@ extern void client_surface_get_geometry( const struct client_surface *surface,
                                          struct client_surface_geometry *geometry );
 extern void client_surface_get_target( const struct client_surface *surface,
                                        struct client_surface_target *target );
-extern BOOL client_surface_get_publication( struct client_surface *surface, UINT64 *generation,
-                                            UINT64 *scene_generation, HWND *scene_toplevel,
-                                            BOOL *authoritative );
+extern BOOL client_surface_get_scene( struct client_surface *surface,
+                                      struct client_surface_scene *scene );
+extern BOOL client_surface_scene_current( const struct client_surface_scene *scene );
 extern BOOL client_surface_update_present_locked( struct client_surface *surface );
-extern BOOL client_surface_end_present_internal( struct client_surface *surface, UINT64 generation,
+extern BOOL client_surface_end_present_internal( struct client_surface *surface,
                                                  const SIZE *expected_size, BOOL new_content,
                                                  struct client_surface_present *present );
 extern void client_surface_resume_recompose( struct client_surface *surface );
