@@ -420,14 +420,14 @@ W32KAPI BOOL client_surface_complete_present( struct client_surface *surface,
                                               const SIZE *expected_size, DWORD timeout );
 W32KAPI BOOL client_surface_wait_present_completion( struct client_surface *surface,
                                                       const struct client_surface_frame *present,
-                                                      BOOL submitted, DWORD timeout );
+                                                      DWORD timeout );
 W32KAPI void client_surface_set_present_completion( struct client_surface_frame *present,
                                                      client_surface_completion_wait_func wait,
                                                      client_surface_completion_release_func release,
                                                      void *context );
 W32KAPI void client_surface_defer_present( struct client_surface *surface,
                                            struct client_surface_frame *present,
-                                           BOOL submitted, const SIZE *expected_size );
+                                           const SIZE *expected_size );
 W32KAPI void client_surface_lock_present( struct client_surface *surface );
 W32KAPI void client_surface_unlock_present( struct client_surface *surface );
 W32KAPI void client_surface_prepare_present_locked( struct client_surface *surface,

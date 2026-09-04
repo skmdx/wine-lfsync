@@ -643,7 +643,7 @@ BOOL client_surface_complete_present( struct client_surface *surface,
         client_surface_add_ref( surface );
         client_surface_set_present_completion( present, wait_deferred_driver_completion,
                                                release_deferred_driver_completion, surface );
-        client_surface_defer_present( surface, present, TRUE, expected_size );
+        client_surface_defer_present( surface, present, expected_size );
         return TRUE;
     }
 

@@ -1523,7 +1523,7 @@ static BOOL x11drv_surface_swap( struct opengl_drawable *base )
                 opengl_drawable_add_ref( base );
                 client_surface_set_present_completion( &present, wait_glx_present_completion,
                                                        release_glx_present_completion, completion );
-                client_surface_defer_present( base->client, &present, TRUE, NULL );
+                client_surface_defer_present( base->client, &present, NULL );
                 return TRUE;
             }
             {
@@ -1531,7 +1531,7 @@ static BOOL x11drv_surface_swap( struct opengl_drawable *base )
 
                 client_surface_set_present_completion( &present, wait_glx_present_completion,
                                                        NULL, &fallback );
-                completed = client_surface_wait_present_completion( base->client, &present, TRUE,
+                completed = client_surface_wait_present_completion( base->client, &present,
                                                                      CLIENT_SURFACE_PRESENT_TIMEOUT );
             }
         }
@@ -1674,7 +1674,7 @@ static BOOL x11drv_egl_surface_swap( struct opengl_drawable *base )
             opengl_drawable_add_ref( base );
             client_surface_set_present_completion( &present, wait_egl_present_completion,
                                                    release_egl_present_completion, completion );
-            client_surface_defer_present( base->client, &present, TRUE, NULL );
+            client_surface_defer_present( base->client, &present, NULL );
             return TRUE;
         }
 
@@ -1683,7 +1683,7 @@ static BOOL x11drv_egl_surface_swap( struct opengl_drawable *base )
             client_surface_set_present_completion( &present, wait_egl_present_completion,
                                                    NULL, &fallback );
             timestamp_completion = client_surface_wait_present_completion(
-                base->client, &present, TRUE, CLIENT_SURFACE_PRESENT_TIMEOUT );
+                base->client, &present, CLIENT_SURFACE_PRESENT_TIMEOUT );
         }
     }
     else timestamp_completion = FALSE;

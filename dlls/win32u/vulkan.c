@@ -2287,8 +2287,7 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
                 retain_swapchain_completion( swapchain );
                 client_surface_set_present_completion( &presents[i], wait_vulkan_present_completion,
                                                        release_vulkan_present_completion, completion );
-                client_surface_defer_present( surface->client, &presents[i], TRUE,
-                                              &expected_size );
+                client_surface_defer_present( surface->client, &presents[i], &expected_size );
                 continue;
             }
         }
@@ -2308,7 +2307,7 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
                 client_surface_set_present_completion( &presents[i], wait_vulkan_present_completion,
                                                        NULL, &fallback );
                 external_completed = client_surface_wait_present_completion(
-                    surface->client, &presents[i], TRUE, remaining );
+                    surface->client, &presents[i], remaining );
             }
 
             completed = client_surface_complete_present( surface->client, &presents[i], compose,
