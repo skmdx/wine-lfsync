@@ -329,14 +329,20 @@ enum client_surface_frame_result
     CLIENT_SURFACE_FRAME_SUPERSEDED,
 };
 
+enum client_surface_frame_target
+{
+    CLIENT_SURFACE_FRAME_TARGET_INVALID,
+    CLIENT_SURFACE_FRAME_TARGET_ONSCREEN,
+    CLIENT_SURFACE_FRAME_TARGET_OFFSCREEN,
+};
+
 struct client_surface_frame
 {
     struct client_surface_scene scene;
     LONG64 serial;
     DWORD submission_time;
     LONG64 target_seq;
-    BOOL offscreen;
-    BOOL target_valid;
+    enum client_surface_frame_target target;
     struct client_surface_completion completion;
     enum client_surface_frame_result result;
 };

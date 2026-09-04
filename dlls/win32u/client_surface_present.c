@@ -267,7 +267,7 @@ BOOL client_surface_end_present_internal( struct client_surface *surface,
      * the process-wide registry lock is neither needed for lifetime nor for
      * target validation on the per-frame path. */
     pthread_mutex_lock( &surface->present_lock );
-    if (!present->target_valid ||
+    if (present->target == CLIENT_SURFACE_FRAME_TARGET_INVALID ||
         present->target_seq != surface->target.seq ||
         present->scene.toplevel != surface->target.toplevel)
     {
@@ -470,9 +470,10 @@ void client_surface_prepare_present_locked( struct client_surface *surface,
         surface->target_scene_epoch = present->scene.epoch;
     client_surface_get_target( surface, &target );
     present->target_seq = target.seq;
-    present->target_valid = target.valid;
-    present->offscreen = target.offscreen;
-    if (present->target_valid && present->offscreen)
+    present->target = !target.valid ? CLIENT_SURFACE_FRAME_TARGET_INVALID :
+                      target.offscreen ? CLIENT_SURFACE_FRAME_TARGET_OFFSCREEN :
+                      CLIENT_SURFACE_FRAME_TARGET_ONSCREEN;
+    if (present->target == CLIENT_SURFACE_FRAME_TARGET_OFFSCREEN)
     {
         if (external_completion)
             present->completion.kind = CLIENT_SURFACE_COMPLETION_EXACT;
@@ -542,7 +543,7 @@ BOOL client_surface_complete_present_locked( struct client_surface *surface,
                                              BOOL submitted, BOOL external_completed,
                                              const SIZE *expected_size, DWORD timeout )
 {
-    BOOL completed = submitted && present->target_valid;
+    BOOL completed = submitted && present->target != CLIENT_SURFACE_FRAME_TARGET_INVALID;
 
     if (!submitted && present->completion.kind == CLIENT_SURFACE_COMPLETION_EXACT)
         present->result = CLIENT_SURFACE_FRAME_COMPLETION_FAILED;
@@ -555,7 +556,7 @@ BOOL client_surface_complete_present_locked( struct client_surface *surface,
         client_surface_backend_abandon_completion( surface );
         present->result = CLIENT_SURFACE_FRAME_COMPLETION_FAILED;
     }
-    if (completed && present->offscreen)
+    if (completed && present->target == CLIENT_SURFACE_FRAME_TARGET_OFFSCREEN)
     {
         if (present->completion.kind == CLIENT_SURFACE_COMPLETION_EXACT)
             completed = external_completed;
@@ -637,7 +638,7 @@ BOOL client_surface_complete_present( struct client_surface *surface,
      * completion_lock.  Transfer that ownership to the same bounded queue as
      * explicit GLX/EGL/Vulkan completion IDs instead of blocking the caller. */
     if (submitted && present->completion.kind == CLIENT_SURFACE_COMPLETION_SHARED &&
-        present->offscreen && timeout)
+        present->target == CLIENT_SURFACE_FRAME_TARGET_OFFSCREEN && timeout)
     {
         client_surface_add_ref( surface );
         client_surface_set_present_completion( present, wait_deferred_driver_completion,
