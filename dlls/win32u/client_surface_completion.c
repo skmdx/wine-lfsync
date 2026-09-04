@@ -86,8 +86,8 @@ static BOOL wait_for_completion_job_locked( struct client_surface *surface )
     abstime.tv_nsec %= 1000000000;
 
     while (list_empty( &surface->completion_queue ) && !ret)
-        ret = pthread_cond_timedwait( &surface->completion_queue_cond,
-                                     &surface->completion_queue_lock, &abstime );
+        ret = pthread_cond_timedwait( &surface->completion_cond,
+                                     &surface->completion_lock, &abstime );
     return !list_empty( &surface->completion_queue );
 }
 
@@ -101,7 +101,7 @@ static void client_surface_completion_worker( struct client_surface *surface, BO
         DWORD elapsed, remaining;
         BOOL completed;
 
-        pthread_mutex_lock( &surface->completion_queue_lock );
+        pthread_mutex_lock( &surface->completion_lock );
         /* Backend completion callbacks may depend on per-thread state.  Reuse
          * this worker only for its own surface and only across short frame
          * gaps, preserving both affinity and the original concurrency bound. */
@@ -109,14 +109,14 @@ static void client_surface_completion_worker( struct client_surface *surface, BO
             (!linger || !wait_for_completion_job_locked( surface )))
         {
             surface->completion_worker_active = FALSE;
-            pthread_mutex_unlock( &surface->completion_queue_lock );
+            pthread_mutex_unlock( &surface->completion_lock );
             client_surface_release( surface );
             return;
         }
         job = LIST_ENTRY( list_head( &surface->completion_queue ),
                           struct client_surface_completion_job, entry );
         list_remove( &job->entry );
-        pthread_mutex_unlock( &surface->completion_queue_lock );
+        pthread_mutex_unlock( &surface->completion_lock );
 
         completion = job->present.completion;
         elapsed = NtGetTickCount() - job->submission_time;
@@ -193,11 +193,11 @@ void client_surface_defer_present( struct client_surface *surface,
     if (expected_size) job->expected_size = *expected_size;
 
     job->present = *present;
-    pthread_mutex_lock( &surface->completion_queue_lock );
+    pthread_mutex_lock( &surface->completion_lock );
     if (InterlockedCompareExchange( &surface->external_completion_count, 0, 0 ) >=
         CLIENT_SURFACE_MAX_DEFERRED_PRESENTS)
     {
-        pthread_mutex_unlock( &surface->completion_queue_lock );
+        pthread_mutex_unlock( &surface->completion_lock );
         elapsed = NtGetTickCount() - present->submission_time;
         remaining = elapsed < CLIENT_SURFACE_PRESENT_TIMEOUT ?
                     CLIENT_SURFACE_PRESENT_TIMEOUT - elapsed : 0;
@@ -216,8 +216,8 @@ void client_surface_defer_present( struct client_surface *surface,
         client_surface_add_ref( surface );
         start_worker = TRUE;
     }
-    else pthread_cond_signal( &surface->completion_queue_cond );
-    pthread_mutex_unlock( &surface->completion_queue_lock );
+    else pthread_cond_signal( &surface->completion_cond );
+    pthread_mutex_unlock( &surface->completion_lock );
 
     if (start_worker)
     {
