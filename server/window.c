@@ -73,17 +73,16 @@ struct client_surface_ref
     client_ptr_t    id;
     unsigned long long generation;
     unsigned long long sequence;
+    unsigned int    refs; /* membership, queued notifications and destroy obligation */
     unsigned int    active : 1;
     unsigned int    cached : 1;
     unsigned int    claimed : 1; /* an active surface which completed a host present */
     unsigned int    scene_publication : 1; /* renderer supports owner scene publication */
     unsigned int    native_write_lease : 1; /* renderer supports native-target write exclusion */
-    unsigned int    retired : 1; /* detached identity waiting for its queued message */
     unsigned int    notification_pending : 1; /* an update for this identity is queued */
     unsigned int    destroy_pending : 1; /* destroy must reach a live process queue */
     unsigned int    destroy_notification_pending : 1;
     unsigned int    writing : 1; /* renderer owns a native-target write lease */
-    unsigned int    notification_count; /* queued update and destroy identity owners */
 };
 
 #define CLIENT_SURFACE_REF_BUCKETS 256
@@ -133,6 +132,24 @@ static void remove_client_surface_ref_index( struct client_surface_ref *surface 
     assert( 0 );
 }
 
+static void grab_client_surface_ref( struct client_surface_ref *surface )
+{
+    assert( surface->refs && surface->refs < UINT_MAX );
+    surface->refs++;
+}
+
+static void release_client_surface_refs( struct client_surface_ref *surface, unsigned int refs )
+{
+    assert( refs && surface->refs >= refs );
+    if ((surface->refs -= refs)) return;
+
+    assert( !surface->owner && !surface->active && !surface->cached && !surface->writing );
+    assert( !surface->notification_pending && !surface->destroy_pending &&
+            !surface->destroy_notification_pending );
+    remove_client_surface_ref_index( surface );
+    free( surface );
+}
+
 /* Queue removal is the lifetime boundary of a posted identity.  Keep a
  * detached tombstone indexed until that callback arrives; otherwise a reused
  * pointer-sized token can make an old notification address a new surface. */
@@ -141,14 +158,8 @@ static void retire_client_surface_ref( struct client_surface_ref *surface )
     assert( !surface->writing && !surface->writer_thread && !surface->writer_top );
     list_remove( &surface->entry );
     surface->active = surface->cached = surface->claimed = 0;
-    if (surface->notification_count || surface->destroy_pending)
-    {
-        surface->retired = 1;
-        surface->owner = NULL;
-        return;
-    }
-    remove_client_surface_ref_index( surface );
-    free( surface );
+    surface->owner = NULL;
+    release_client_surface_refs( surface, 1 );
 }
 
 
@@ -1253,17 +1264,16 @@ static struct client_surface_ref *get_client_surface_ref( struct client_surface_
     surface->id = id;
     surface->generation = 0;
     surface->sequence = 0;
+    surface->refs = 1;
     surface->active = 0;
     surface->cached = 0;
     surface->claimed = 0;
     surface->scene_publication = 0;
     surface->native_write_lease = 0;
-    surface->retired = 0;
     surface->notification_pending = 0;
     surface->destroy_pending = 0;
     surface->destroy_notification_pending = 0;
     surface->writing = 0;
-    surface->notification_count = 0;
     list_add_tail( &owner->surfaces, &surface->entry );
     insert_client_surface_ref_index( surface );
     return surface;
@@ -1690,12 +1700,13 @@ static int discard_client_surface_owners( struct window *win, struct window *top
         {
             assert( !surface->destroy_pending );
             surface->destroy_pending = 1;
+            grab_client_surface_ref( surface ); /* destroy delivery obligation */
             owner->process->client_surface_destroy_count++;
             if (post_process_message( owner->process, 0, WM_WINE_UPDATEWINDOWSTATE,
                                       WINE_DESTROY_CLIENT_SURFACES, surface->id ))
             {
                 surface->destroy_notification_pending = 1;
-                surface->notification_count++;
+                grab_client_surface_ref( surface ); /* queued notification */
             }
             else clear_error();
         }
@@ -1709,7 +1720,7 @@ static int discard_client_surface_owners( struct window *win, struct window *top
 
 void cleanup_process_client_surfaces( struct process *process )
 {
-    struct client_surface_ref **cursor, *surface;
+    struct client_surface_ref *surface, *next;
     user_handle_t handle = 0;
     struct client_surface_owner *owner;
     struct window *win, *top;
@@ -1737,23 +1748,20 @@ void cleanup_process_client_surfaces( struct process *process )
      * address them, and retaining their raw process key would outlive it. */
     for (bucket = 0; bucket < CLIENT_SURFACE_REF_BUCKETS; bucket++)
     {
-        cursor = &client_surface_ref_index[bucket];
-        while ((surface = *cursor))
+        for (surface = client_surface_ref_index[bucket]; surface; surface = next)
         {
+            next = surface->index_next;
             if (surface->process != process)
-            {
-                cursor = &surface->index_next;
                 continue;
-            }
-            assert( surface->retired && !surface->owner && !surface->notification_count &&
+            assert( !surface->owner && surface->refs == 1 &&
                     !surface->notification_pending && !surface->destroy_notification_pending );
-            *cursor = surface->index_next;
             if (surface->destroy_pending)
             {
                 assert( process->client_surface_destroy_count );
                 process->client_surface_destroy_count--;
+                surface->destroy_pending = 0;
             }
-            free( surface );
+            release_client_surface_refs( surface, 1 );
         }
     }
     assert( !process->client_surface_destroy_count );
@@ -1814,7 +1822,7 @@ static int notify_client_surface_geometry_ready_recursive( struct window *win, s
                                       WINE_UPDATE_CLIENT_SURFACES, surface->id ))
             {
                 surface->notification_pending = 1;
-                surface->notification_count++;
+                grab_client_surface_ref( surface );
                 continue;
             }
             else
@@ -1848,6 +1856,7 @@ void client_surface_notification_removed( struct process *process, client_ptr_t 
                                           lparam_t type, int delivered )
 {
     struct client_surface_ref *surface = find_indexed_client_surface_ref( process, id );
+    unsigned int refs = 1; /* queued notification */
 
     if (!surface) return;
     if (type == WINE_UPDATE_CLIENT_SURFACES)
@@ -1863,17 +1872,12 @@ void client_surface_notification_removed( struct process *process, client_ptr_t 
         if (delivered)
         {
             surface->destroy_pending = 0;
+            refs++; /* destroy delivery obligation */
             assert( process->client_surface_destroy_count );
             process->client_surface_destroy_count--;
         }
     }
-    assert( surface->notification_count );
-    surface->notification_count--;
-    if (!surface->retired || surface->notification_count || surface->destroy_pending) return;
-    assert( !surface->notification_pending && !surface->destroy_notification_pending &&
-            !surface->owner );
-    remove_client_surface_ref_index( surface );
-    free( surface );
+    release_client_surface_refs( surface, refs );
 }
 
 /* Window destruction can race a renderer moving or creating its message
@@ -1889,7 +1893,7 @@ void retry_process_client_surface_destroys( struct process *process )
     {
         for (surface = client_surface_ref_index[bucket]; surface; surface = surface->index_next)
         {
-            if (surface->process != process || !surface->retired || !surface->destroy_pending ||
+            if (surface->process != process || surface->owner || !surface->destroy_pending ||
                 surface->destroy_notification_pending)
                 continue;
             if (post_process_message( process, 0,
@@ -1897,7 +1901,7 @@ void retry_process_client_surface_destroys( struct process *process )
                                       WINE_DESTROY_CLIENT_SURFACES, surface->id ))
             {
                 surface->destroy_notification_pending = 1;
-                surface->notification_count++;
+                grab_client_surface_ref( surface );
             }
             else clear_error();
         }
@@ -1929,7 +1933,7 @@ void retry_process_client_surface_notifications( struct process *process, user_h
                                       WINE_UPDATE_CLIENT_SURFACES, surface->id ))
             {
                 surface->notification_pending = 1;
-                surface->notification_count++;
+                grab_client_surface_ref( surface );
             }
             else clear_error();
         }
