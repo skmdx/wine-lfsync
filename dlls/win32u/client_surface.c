@@ -36,6 +36,7 @@ static UINT64 unused_surface_bytes;
 static struct client_surface *client_surface_identity_index[CLIENT_SURFACE_INDEX_BUCKETS];
 static struct client_surface *client_surface_toplevel_index[CLIENT_SURFACE_INDEX_BUCKETS];
 static UINT_PTR client_surface_identity;
+static LONG client_surface_process_id;
 
 static void client_surface_backend_destroy( struct client_surface *surface )
 {
@@ -533,7 +534,7 @@ BOOL client_surface_get_publication( struct client_surface *surface, UINT64 *gen
     if (scene_generation) *scene_generation = current_scene_generation;
     if (scene_toplevel) *scene_toplevel = toplevel;
     if (authoritative)
-        *authoritative = producer_process == HandleToULong( NtCurrentTeb()->ClientId.UniqueProcess ) &&
+        *authoritative = producer_process == (process_id_t)client_surface_process_id &&
                          producer_id == surface->identity;
     return !preparing;
 }
@@ -925,6 +926,8 @@ void *client_surface_create( UINT size, const struct client_surface_backend *bac
     surface->ready_monitor_rect = surface->monitor_rect;
     list_init( &surface->entry );
     list_init( &surface->completion_queue );
+    InterlockedCompareExchange( &client_surface_process_id,
+                                HandleToULong( NtCurrentTeb()->ClientId.UniqueProcess ), 0 );
     insert_client_surface_index( surface );
 
     TRACE( "created %s, format %d, raw %u, toplevel %p, virtual_rect %s, monitor_rect %s\n", debugstr_client_surface( surface ),

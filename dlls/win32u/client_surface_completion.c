@@ -149,17 +149,10 @@ static void client_surface_completion_worker( struct client_surface *surface, BO
     }
 }
 
-/* NtCreateThreadEx enters its start routine with the Windows ABI, while this
- * Unix library normally uses the host ABI.  Keep the actual worker in the
- * host ABI and use a narrow bridge on architectures where the argument
- * registers differ. */
-#if defined(__x86_64__)
-static void __attribute__((ms_abi)) client_surface_completion_thread( void *context )
-#elif defined(__i386__)
-static void __attribute__((stdcall)) client_surface_completion_thread( void *context )
-#else
+/* This entry point belongs to the Unix library and must run as host code.
+ * PsCreateSystemThread invokes it directly on the Unix side, including when
+ * the Windows process machine differs from the host machine. */
 static void client_surface_completion_thread( void *context )
-#endif
 {
     client_surface_completion_worker( context, TRUE );
 }
@@ -261,9 +254,8 @@ void client_surface_defer_present( struct client_surface *surface,
         HANDLE thread;
         NTSTATUS status;
 
-        status = NtCreateThreadEx( &thread, THREAD_ALL_ACCESS, NULL, NtCurrentProcess(),
-                                   (PRTL_THREAD_START_ROUTINE)client_surface_completion_thread,
-                                   surface, 0, 0, 0, 0, NULL );
+        status = PsCreateSystemThread( &thread, THREAD_ALL_ACCESS, NULL, 0, NULL,
+                                       client_surface_completion_thread, surface );
         if (status)
         {
             /* Thread allocation failure is rare.  Drain this FIFO inline so
