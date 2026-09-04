@@ -707,6 +707,8 @@ struct x11drv_win_data
     GC             client_surface_gc;
     unsigned int   client_surface_backing_width;
     unsigned int   client_surface_backing_height;
+    unsigned int   client_surface_backing_valid_width;
+    unsigned int   client_surface_backing_valid_height;
     struct x11drv_retired_pixmap *client_surface_retired;
     unsigned long configure_serial;    /* serial of last pending configure request */
     unsigned long net_wm_icon_serial;  /* serial of last pending _NET_WM_ICON request */

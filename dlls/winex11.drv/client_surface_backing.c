@@ -75,6 +75,8 @@ void X11DRV_client_surface_backing_destroy( struct x11drv_win_data *data )
     data->client_surface_gc = 0;
     data->client_surface_backing_width = 0;
     data->client_surface_backing_height = 0;
+    data->client_surface_backing_valid_width = 0;
+    data->client_surface_backing_valid_height = 0;
     data->client_surface_retired = NULL;
     data->client_surface_backing_valid = FALSE;
 }
@@ -88,7 +90,8 @@ BOOL X11DRV_client_surface_backing_ensure( struct x11drv_win_data *data )
 {
     struct x11drv_retired_pixmap *retired = NULL;
     unsigned int width, height, window_width, window_height;
-    BOOL new_gc, old_valid;
+    unsigned int old_valid_width, old_valid_height;
+    BOOL new_gc, old_valid, valid;
     int error = 0;
     Pixmap pixmap;
     GC gc;
@@ -99,7 +102,28 @@ BOOL X11DRV_client_surface_backing_ensure( struct x11drv_win_data *data )
     height = client_surface_backing_extent( data->rects.visible.bottom - data->rects.visible.top );
     if (data->client_surface_backing && data->client_surface_backing_width >= width &&
         data->client_surface_backing_height >= height)
+    {
+        /* Allocation capacity is not content validity.  After a shrink, the
+         * unused tail can contain an older scene (or allocation black).  A
+         * later growth within the same geometric allocation must therefore
+         * invalidate the backing and request a complete recomposition. */
+        if (data->client_surface_backing_valid &&
+            (window_width > data->client_surface_backing_valid_width ||
+             window_height > data->client_surface_backing_valid_height))
+        {
+            data->client_surface_backing_valid = FALSE;
+            data->client_surface_backing_valid_width = 0;
+            data->client_surface_backing_valid_height = 0;
+        }
+        else if (data->client_surface_backing_valid)
+        {
+            data->client_surface_backing_valid_width =
+                min( data->client_surface_backing_valid_width, window_width );
+            data->client_surface_backing_valid_height =
+                min( data->client_surface_backing_valid_height, window_height );
+        }
         return TRUE;
+    }
 
     /* Grow both axes monotonically.  If alternating wide and tall windows
      * replaced one undersized axis while shrinking the other, each resize
@@ -109,10 +133,14 @@ BOOL X11DRV_client_surface_backing_ensure( struct x11drv_win_data *data )
     width = max( width, data->client_surface_backing_width );
     height = max( height, data->client_surface_backing_height );
     old_valid = data->client_surface_backing_valid;
+    old_valid_width = data->client_surface_backing_valid_width;
+    old_valid_height = data->client_surface_backing_valid_height;
 
     /* Until a larger capability has been committed, the old Pixmap no longer
      * represents the complete host extent and must not satisfy Expose. */
     data->client_surface_backing_valid = FALSE;
+    data->client_surface_backing_valid_width = 0;
+    data->client_surface_backing_valid_height = 0;
 
     if (data->client_surface_backing && !(retired = malloc( sizeof(*retired) ))) return FALSE;
     pixmap = XCreatePixmap( data->display, data->whole_window, width, height, data->vis.depth );
@@ -131,7 +159,7 @@ BOOL X11DRV_client_surface_backing_ensure( struct x11drv_win_data *data )
     if (data->client_surface_backing && old_valid)
     {
         XCopyArea( data->display, data->client_surface_backing, pixmap, gc, 0, 0,
-                   data->client_surface_backing_width, data->client_surface_backing_height, 0, 0 );
+                   old_valid_width, old_valid_height, 0, 0 );
     }
     XSync( data->display, False );
     X11DRV_check_error();
@@ -164,7 +192,13 @@ BOOL X11DRV_client_surface_backing_ensure( struct x11drv_win_data *data )
     data->client_surface_gc = gc;
     data->client_surface_backing_width = width;
     data->client_surface_backing_height = height;
-    data->client_surface_backing_valid = TRUE;
+    valid = old_valid && old_valid_width >= window_width && old_valid_height >= window_height;
+    data->client_surface_backing_valid = valid;
+    if (valid)
+    {
+        data->client_surface_backing_valid_width = window_width;
+        data->client_surface_backing_valid_height = window_height;
+    }
     return TRUE;
 }
 
@@ -178,6 +212,8 @@ BOOL X11DRV_client_surface_backing_snapshot( struct x11drv_win_data *data, BOOL 
     width = min( data->client_surface_backing_width, window_width );
     height = min( data->client_surface_backing_height, window_height );
     data->client_surface_backing_valid = FALSE;
+    data->client_surface_backing_valid_width = 0;
+    data->client_surface_backing_valid_height = 0;
     X11DRV_expect_error( data->display, client_surface_backing_error, &error );
     XCopyArea( data->display, data->whole_window, data->client_surface_backing,
                data->client_surface_gc,
@@ -185,7 +221,13 @@ BOOL X11DRV_client_surface_backing_snapshot( struct x11drv_win_data *data, BOOL 
     XSync( data->display, False );
     X11DRV_check_error();
     if (error) return FALSE;
-    data->client_surface_backing_valid = !invalidate;
+    if (width != window_width || height != window_height) return FALSE;
+    if (!invalidate)
+    {
+        data->client_surface_backing_valid = TRUE;
+        data->client_surface_backing_valid_width = window_width;
+        data->client_surface_backing_valid_height = window_height;
+    }
     return TRUE;
 }
 
@@ -206,7 +248,10 @@ BOOL X11DRV_client_surface_backing_publish( struct x11drv_win_data *data )
     XSync( data->display, False );
     X11DRV_check_error();
     if (error) return FALSE;
+    if (width != window_width || height != window_height) return FALSE;
     data->client_surface_backing_valid = TRUE;
+    data->client_surface_backing_valid_width = window_width;
+    data->client_surface_backing_valid_height = window_height;
     return TRUE;
 }
 
@@ -217,8 +262,8 @@ BOOL X11DRV_client_surface_backing_restore( struct x11drv_win_data *data,
         !data->client_surface_gc || !data->client_surface_backing_valid || IsRectEmpty( rect ))
         return FALSE;
     if (rect->left < 0 || rect->top < 0 ||
-        (unsigned int)rect->right > data->client_surface_backing_width ||
-        (unsigned int)rect->bottom > data->client_surface_backing_height)
+        (unsigned int)rect->right > data->client_surface_backing_valid_width ||
+        (unsigned int)rect->bottom > data->client_surface_backing_valid_height)
         return FALSE;
     XCopyArea( data->display, data->client_surface_backing, data->whole_window,
                data->client_surface_gc,
