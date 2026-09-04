@@ -1189,7 +1189,7 @@ static void x11drv_surface_flush( struct opengl_drawable *base, UINT flags )
     if (!(flags & GL_FLUSH_PRESENT)) return;
 
     client_surface_prepare_present( base->client, &present, TRUE );
-    client_surface_begin_present( base->client, &present );
+    client_surface_begin_present( base->client );
     if (present.offscreen)
     {
         if (!(flags & GL_FLUSH_FINISHED)) funcs->p_glFinish();
@@ -1502,8 +1502,8 @@ static BOOL x11drv_surface_swap( struct opengl_drawable *base )
 
     use_oml = ctx && pglXGetSyncValuesOML && pglXSwapBuffersMscOML;
     client_surface_prepare_present( base->client, &present, use_oml );
-    client_surface_begin_present( base->client, &present );
-    if (present.external_completion)
+    client_surface_begin_present( base->client );
+    if (present.completion == CLIENT_SURFACE_COMPLETION_EXACT)
     {
         /* The swap buffer count identifies this exact GLX presentation.  Poll
          * it with a deadline instead of using the unbounded WaitForSbc call or
@@ -1526,7 +1526,6 @@ static BOOL x11drv_surface_swap( struct opengl_drawable *base )
                                               release_glx_present_completion, completion );
                 return TRUE;
             }
-            client_surface_begin_inline_completion( base->client, &present );
             {
                 struct glx_present_completion fallback = {base, target_sbc};
 
@@ -1579,7 +1578,7 @@ static void x11drv_egl_surface_flush( struct opengl_drawable *base, UINT flags )
     if (!(flags & GL_FLUSH_PRESENT)) return;
 
     client_surface_prepare_present( base->client, &present, TRUE );
-    client_surface_begin_present( base->client, &present );
+    client_surface_begin_present( base->client );
     if (present.offscreen)
     {
         if (!(flags & GL_FLUSH_FINISHED)) funcs->p_glFinish();
@@ -1645,14 +1644,14 @@ static BOOL x11drv_egl_surface_swap( struct opengl_drawable *base )
         funcs->p_eglGetFrameTimestampSupportedANDROID( egl->display, gl->base.surface,
                                                        EGL_DISPLAY_PRESENT_TIME_ANDROID );
     client_surface_prepare_present( base->client, &present, timestamp_completion );
-    if (present.external_completion &&
+    if (present.completion == CLIENT_SURFACE_COMPLETION_EXACT &&
         !funcs->p_eglGetNextFrameIdANDROID( egl->display, gl->base.surface, &frame_id ))
     {
         WARN( "Failed to allocate EGL presentation frame ID for %s\n",
               debugstr_opengl_drawable( base ) );
         frame_id = 0;
     }
-    client_surface_begin_present( base->client, &present );
+    client_surface_begin_present( base->client );
     ret = funcs->p_eglSwapBuffers( egl->display, gl->base.surface );
     client_surface_submit_present( base->client, &present );
     if (!ret)
@@ -1663,7 +1662,7 @@ static BOOL x11drv_egl_surface_swap( struct opengl_drawable *base )
         return FALSE;
     }
 
-    if (present.external_completion && frame_id)
+    if (present.completion == CLIENT_SURFACE_COMPLETION_EXACT && frame_id)
     {
         struct egl_present_completion *completion;
 
@@ -1680,7 +1679,6 @@ static BOOL x11drv_egl_surface_swap( struct opengl_drawable *base )
 
         {
             struct egl_present_completion fallback = {base, frame_id};
-            client_surface_begin_inline_completion( base->client, &present );
             timestamp_completion = client_surface_wait_present_completion(
                 base->client, &present, TRUE, wait_egl_present_completion, &fallback,
                 CLIENT_SURFACE_PRESENT_TIMEOUT );

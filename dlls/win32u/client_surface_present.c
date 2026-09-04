@@ -482,7 +482,6 @@ void client_surface_prepare_present_locked( struct client_surface *surface,
     }
 
     memset( present, 0, sizeof(*present) );
-    present->completion_locked = TRUE;
 
     /* A server scene sequence is also the invalidation token for native
      * geometry.  Reapplying an unchanged scene on every GL/Vulkan frame made
@@ -509,9 +508,13 @@ void client_surface_prepare_present_locked( struct client_surface *surface,
     present->target_seq = target.seq;
     present->target_valid = target.valid;
     present->offscreen = target.offscreen;
-    present->external_completion = present->target_valid && present->offscreen && external_completion;
-    if (present->target_valid && present->offscreen && !present->external_completion)
-        present->driver_completion = client_surface_backend_prepare_completion( surface );
+    if (present->target_valid && present->offscreen)
+    {
+        if (external_completion)
+            present->completion = CLIENT_SURFACE_COMPLETION_EXACT;
+        else if (client_surface_backend_prepare_completion( surface ))
+            present->completion = CLIENT_SURFACE_COMPLETION_SHARED;
+    }
     pthread_mutex_unlock( &surface->present_lock );
 }
 
@@ -523,71 +526,51 @@ void client_surface_prepare_present( struct client_surface *surface,
     client_surface_prepare_present_locked( surface, present, external_completion );
 }
 
-static void client_surface_begin_present_locked( struct client_surface *surface,
-                                                 struct client_surface_present *present )
+static void client_surface_begin_present_locked( struct client_surface *surface )
 {
-    assert( present->completion_locked );
-    assert( !present->native_present_registered );
     surface->native_present_count++;
-    present->native_present_registered = TRUE;
 }
 
-void client_surface_begin_present( struct client_surface *surface,
-                                   struct client_surface_present *present )
+void client_surface_begin_present( struct client_surface *surface )
 {
-    client_surface_begin_present_locked( surface, present );
-    present->completion_locked = FALSE;
+    client_surface_begin_present_locked( surface );
     client_surface_unlock_present( surface );
 }
 
-void client_surface_register_external_completion_locked( struct client_surface *surface,
-                                                          struct client_surface_present *present )
+static void client_surface_register_completion_locked( struct client_surface *surface,
+                                                       struct client_surface_present *present )
 {
-    if (present->external_completion_registered) return;
+    if (present->completion == CLIENT_SURFACE_COMPLETION_NONE) return;
     InterlockedIncrement( &surface->external_completion_count );
-    if (present->driver_completion) surface->driver_completion_count++;
-    present->external_completion_registered = TRUE;
+    if (present->completion == CLIENT_SURFACE_COMPLETION_SHARED)
+        surface->driver_completion_count++;
 }
 
 void client_surface_submit_present_locked( struct client_surface *surface,
                                            struct client_surface_present *present )
 {
-    assert( present->completion_locked );
     /* Submission serials, unlike preparation serials, preserve the native
      * order observed by concurrent producer queues. */
     if (!present->serial)
     {
         present->serial = InterlockedIncrement64( &surface->present_serial );
         present->submission_time = NtGetTickCount();
-    }
-    /* Register exact completion ownership before releasing submission
-     * serialization.  Otherwise cached replay can enter after the native
-     * request escaped but before its deferred job increments the count. */
-    if (present->external_completion)
-        client_surface_register_external_completion_locked( surface, present );
-    if (present->native_present_registered)
-    {
-        assert( surface->native_present_count > 0 );
-        present->native_present_registered = FALSE;
-        if (!--surface->native_present_count)
-            pthread_cond_broadcast( &surface->completion_cond );
+        /* Register completion ownership before releasing submission
+         * serialization.  Cached replay can then never pass a native request
+         * which escaped without yet reaching the completion queue. */
+        client_surface_register_completion_locked( surface, present );
     }
 }
 
 void client_surface_submit_present( struct client_surface *surface,
                                     struct client_surface_present *present )
 {
-    if (!present->completion_locked)
-    {
-        client_surface_lock_present( surface );
-        present->completion_locked = TRUE;
-    }
+    client_surface_lock_present( surface );
     client_surface_submit_present_locked( surface, present );
-    if (present->completion_locked && present->external_completion)
-    {
-        present->completion_locked = FALSE;
-        client_surface_unlock_present( surface );
-    }
+    assert( surface->native_present_count > 0 );
+    if (!--surface->native_present_count)
+        pthread_cond_broadcast( &surface->completion_cond );
+    client_surface_unlock_present( surface );
 }
 
 BOOL client_surface_complete_present_locked( struct client_surface *surface,
@@ -597,10 +580,10 @@ BOOL client_surface_complete_present_locked( struct client_surface *surface,
 {
     BOOL completed = submitted && present->target_valid;
 
-    if (!submitted && present->external_completion)
+    if (!submitted && present->completion == CLIENT_SURFACE_COMPLETION_EXACT)
         present->completion_failed = TRUE;
 
-    if (!submitted && present->driver_completion)
+    if (!submitted && present->completion == CLIENT_SURFACE_COMPLETION_SHARED)
     {
         /* A failed WSI call does not prove that no native request escaped.
          * Retire the armed boundary so a delayed request cannot satisfy the
@@ -610,9 +593,9 @@ BOOL client_surface_complete_present_locked( struct client_surface *surface,
     }
     if (completed && present->offscreen)
     {
-        if (present->external_completion)
+        if (present->completion == CLIENT_SURFACE_COMPLETION_EXACT)
             completed = external_completed;
-        else if (present->driver_completion)
+        else if (present->completion == CLIENT_SURFACE_COMPLETION_SHARED)
             completed = client_surface_backend_wait_completion( surface, timeout );
         else
             completed = FALSE;
@@ -655,18 +638,18 @@ BOOL client_surface_complete_present_locked( struct client_surface *surface,
     if (completed)
         completed = client_surface_end_present_internal( surface, present->generation,
                                                          expected_size, TRUE, present );
-    if (present->external_completion_registered)
+    if (present->completion != CLIENT_SURFACE_COMPLETION_NONE)
     {
         BOOL wake = FALSE;
 
         assert( InterlockedCompareExchange( &surface->external_completion_count, 0, 0 ) > 0 );
-        if (present->driver_completion)
+        if (present->completion == CLIENT_SURFACE_COMPLETION_SHARED)
         {
             assert( surface->driver_completion_count > 0 );
             if (!--surface->driver_completion_count) wake = TRUE;
         }
         if (!InterlockedDecrement( &surface->external_completion_count )) wake = TRUE;
-        present->external_completion_registered = FALSE;
+        present->completion = CLIENT_SURFACE_COMPLETION_NONE;
         if (wake) pthread_cond_broadcast( &surface->completion_cond );
     }
     return completed;
@@ -694,9 +677,9 @@ BOOL client_surface_complete_present( struct client_surface *surface,
     /* An armed driver monitor has exclusive ownership through
      * completion_lock.  Transfer that ownership to the same bounded queue as
      * explicit GLX/EGL/Vulkan completion IDs instead of blocking the caller. */
-    if (submitted && present->driver_completion && present->offscreen && timeout)
+    if (submitted && present->completion == CLIENT_SURFACE_COMPLETION_SHARED &&
+        present->offscreen && timeout)
     {
-        present->external_completion = TRUE;
         client_surface_add_ref( surface );
         client_surface_defer_present( surface, present, TRUE, expected_size,
                                       wait_deferred_driver_completion,
@@ -704,15 +687,10 @@ BOOL client_surface_complete_present( struct client_surface *surface,
         return TRUE;
     }
 
-    if (!present->completion_locked)
-    {
-        client_surface_lock_present( surface );
-        present->completion_locked = TRUE;
-    }
+    client_surface_lock_present( surface );
     ret = client_surface_complete_present_locked( surface, present, submitted,
                                                   external_completed, expected_size, timeout );
     client_surface_unlock_present( surface );
-    present->completion_locked = FALSE;
     return ret;
 }
 
@@ -724,6 +702,7 @@ void client_surface_present( struct client_surface *surface )
      * supplies a host completion boundary.  It still participates in target
      * token validation and per-surface submission serialization. */
     client_surface_prepare_present( surface, &present, TRUE );
+    client_surface_begin_present( surface );
     client_surface_submit_present( surface, &present );
     client_surface_complete_present( surface, &present, TRUE, TRUE, NULL, 0 );
 }

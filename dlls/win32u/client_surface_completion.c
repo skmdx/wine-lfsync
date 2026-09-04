@@ -40,23 +40,6 @@ struct client_surface_completion_job
 #define CLIENT_SURFACE_COMPLETION_WORKER_IDLE_TIMEOUT_MS 100
 static LONG client_surface_deferred_present_count;
 
-void client_surface_begin_inline_completion( struct client_surface *surface,
-                                             struct client_surface_present *present )
-{
-    /* Inline fallback still owns a causal completion boundary.  Publish that
-     * ownership under completion_lock so cached replay and a shared driver
-     * monitor cannot pass it merely because no FIFO node was allocated. */
-    assert( present->external_completion );
-    if (!present->completion_locked)
-    {
-        client_surface_lock_present( surface );
-        present->completion_locked = TRUE;
-    }
-    client_surface_register_external_completion_locked( surface, present );
-    present->completion_locked = FALSE;
-    client_surface_unlock_present( surface );
-}
-
 BOOL client_surface_wait_present_completion( struct client_surface *surface,
                                              const struct client_surface_present *present,
                                              BOOL submitted,
@@ -169,12 +152,12 @@ void client_surface_defer_present( struct client_surface *surface,
     BOOL completed, start_worker = FALSE;
     DWORD elapsed, remaining;
 
-    assert( present->external_completion );
+    assert( present->completion != CLIENT_SURFACE_COMPLETION_NONE );
+    assert( InterlockedCompareExchange( &surface->external_completion_count, 0, 0 ) > 0 );
     assert( wait && release );
 
     if (!(job = malloc( sizeof(*job) )))
     {
-        client_surface_begin_inline_completion( surface, present );
         elapsed = NtGetTickCount() - present->submission_time;
         remaining = elapsed < CLIENT_SURFACE_PRESENT_TIMEOUT ?
                     CLIENT_SURFACE_PRESENT_TIMEOUT - elapsed : 0;
@@ -190,7 +173,6 @@ void client_surface_defer_present( struct client_surface *surface,
     {
         InterlockedDecrement( &client_surface_deferred_present_count );
         free( job );
-        client_surface_begin_inline_completion( surface, present );
         elapsed = NtGetTickCount() - present->submission_time;
         remaining = elapsed < CLIENT_SURFACE_PRESENT_TIMEOUT ?
                     CLIENT_SURFACE_PRESENT_TIMEOUT - elapsed : 0;
@@ -209,22 +191,12 @@ void client_surface_defer_present( struct client_surface *surface,
     job->has_expected_size = !!expected_size;
     if (expected_size) job->expected_size = *expected_size;
 
-    /* Register queue ownership while excluding cached replay.  A native
-     * driver monitor may transfer an already-held completion lock; explicit
-     * completion IDs acquire it only for this ownership hand-off. */
-    if (!present->completion_locked)
-    {
-        client_surface_lock_present( surface );
-        present->completion_locked = TRUE;
-    }
-    client_surface_register_external_completion_locked( surface, present );
     job->present = *present;
     pthread_mutex_lock( &surface->completion_queue_lock );
     if (InterlockedCompareExchange( &surface->external_completion_count, 0, 0 ) >=
         CLIENT_SURFACE_MAX_DEFERRED_PRESENTS)
     {
         pthread_mutex_unlock( &surface->completion_queue_lock );
-        client_surface_begin_inline_completion( surface, present );
         elapsed = NtGetTickCount() - present->submission_time;
         remaining = elapsed < CLIENT_SURFACE_PRESENT_TIMEOUT ?
                     CLIENT_SURFACE_PRESENT_TIMEOUT - elapsed : 0;
@@ -237,7 +209,6 @@ void client_surface_defer_present( struct client_surface *surface,
         free( job );
         return;
     }
-    job->present.completion_locked = FALSE;
     list_add_tail( &surface->completion_queue, &job->entry );
     if (!surface->completion_worker_active)
     {
@@ -247,8 +218,6 @@ void client_surface_defer_present( struct client_surface *surface,
     }
     else pthread_cond_signal( &surface->completion_queue_cond );
     pthread_mutex_unlock( &surface->completion_queue_lock );
-    present->completion_locked = FALSE;
-    client_surface_unlock_present( surface );
 
     if (start_worker)
     {

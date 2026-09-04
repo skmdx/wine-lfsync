@@ -32,8 +32,6 @@ extern BOOL client_surface_get_publication( struct client_surface *surface, UINT
                                             UINT64 *scene_generation, HWND *scene_toplevel,
                                             BOOL *authoritative );
 extern BOOL client_surface_update_present_locked( struct client_surface *surface );
-extern void client_surface_register_external_completion_locked( struct client_surface *surface,
-                                                                 struct client_surface_present *present );
 extern BOOL client_surface_end_present_internal( struct client_surface *surface, UINT64 generation,
                                                  const SIZE *expected_size, BOOL new_content,
                                                  struct client_surface_present *present );

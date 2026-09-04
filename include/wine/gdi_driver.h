@@ -294,6 +294,13 @@ struct client_surface_backend
     const struct client_surface_completion_ops *completion;
 };
 
+enum client_surface_completion_kind
+{
+    CLIENT_SURFACE_COMPLETION_NONE,
+    CLIENT_SURFACE_COMPLETION_EXACT,
+    CLIENT_SURFACE_COMPLETION_SHARED,
+};
+
 struct client_surface_present
 {
     UINT64 generation;
@@ -306,11 +313,7 @@ struct client_surface_present
     BOOL authoritative;
     BOOL offscreen;
     BOOL target_valid;
-    BOOL completion_locked;
-    BOOL native_present_registered;
-    BOOL external_completion;
-    BOOL external_completion_registered;
-    BOOL driver_completion;
+    enum client_surface_completion_kind completion;
     BOOL completion_failed;
     BOOL superseded;
 };
@@ -384,8 +387,7 @@ W32KAPI void client_surface_present( struct client_surface *surface );
 W32KAPI void client_surface_prepare_present( struct client_surface *surface,
                                              struct client_surface_present *present,
                                              BOOL external_completion );
-W32KAPI void client_surface_begin_present( struct client_surface *surface,
-                                           struct client_surface_present *present );
+W32KAPI void client_surface_begin_present( struct client_surface *surface );
 W32KAPI void client_surface_submit_present( struct client_surface *surface,
                                              struct client_surface_present *present );
 W32KAPI void client_surface_submit_present_locked( struct client_surface *surface,
@@ -394,8 +396,6 @@ W32KAPI BOOL client_surface_complete_present( struct client_surface *surface,
                                               struct client_surface_present *present,
                                               BOOL submitted, BOOL external_completed,
                                               const SIZE *expected_size, DWORD timeout );
-W32KAPI void client_surface_begin_inline_completion( struct client_surface *surface,
-                                                      struct client_surface_present *present );
 W32KAPI BOOL client_surface_wait_present_completion( struct client_surface *surface,
                                                       const struct client_surface_present *present,
                                                       BOOL submitted,
