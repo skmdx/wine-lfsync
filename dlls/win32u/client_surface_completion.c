@@ -26,9 +26,6 @@ struct client_surface_completion_job
 {
     struct list entry;
     struct client_surface_present present;
-    client_surface_completion_wait_func wait;
-    client_surface_completion_release_func release;
-    void *context;
     SIZE expected_size;
     DWORD submission_time;
     BOOL has_expected_size;
@@ -42,15 +39,13 @@ static LONG client_surface_deferred_present_count;
 
 BOOL client_surface_wait_present_completion( struct client_surface *surface,
                                              const struct client_surface_present *present,
-                                             BOOL submitted,
-                                             client_surface_completion_wait_func wait,
-                                             void *context, DWORD timeout )
+                                             BOOL submitted, DWORD timeout )
 {
     struct client_surface_target target;
     DWORD elapsed, start = NtGetTickCount();
     BOOL completed;
 
-    assert( wait );
+    assert( present->completion.wait );
     pthread_mutex_lock( &surface->completion_wait_lock );
     /* Queue saturation and allocation failure execute the wait on the producer
      * thread.  Serialize that rare fallback with the surface worker: some host
@@ -63,9 +58,21 @@ BOOL client_surface_wait_present_completion( struct client_surface *surface,
     client_surface_get_target( surface, &target );
     completed = submitted && present->target_valid && target.valid &&
                 present->target_seq == target.seq &&
-                wait( context, timeout );
+                present->completion.wait( present->completion.context, timeout );
     pthread_mutex_unlock( &surface->completion_wait_lock );
     return completed;
+}
+
+void client_surface_set_present_completion( struct client_surface_present *present,
+                                            client_surface_completion_wait_func wait,
+                                            client_surface_completion_release_func release,
+                                            void *context )
+{
+    assert( present->completion.kind != CLIENT_SURFACE_COMPLETION_NONE );
+    assert( wait );
+    present->completion.wait = wait;
+    present->completion.release = release;
+    present->completion.context = context;
 }
 
 static BOOL wait_for_completion_job_locked( struct client_surface *surface )
@@ -90,6 +97,7 @@ static void client_surface_completion_worker( struct client_surface *surface, BO
 
     for (;;)
     {
+        struct client_surface_completion completion;
         DWORD elapsed, remaining;
         BOOL completed;
 
@@ -110,6 +118,7 @@ static void client_surface_completion_worker( struct client_surface *surface, BO
         list_remove( &job->entry );
         pthread_mutex_unlock( &surface->completion_queue_lock );
 
+        completion = job->present.completion;
         elapsed = NtGetTickCount() - job->submission_time;
         remaining = elapsed < CLIENT_SURFACE_PRESENT_TIMEOUT ?
                     CLIENT_SURFACE_PRESENT_TIMEOUT - elapsed : 0;
@@ -118,8 +127,7 @@ static void client_surface_completion_worker( struct client_surface *surface, BO
          * queued request retires, but waiting for an unmapped drawable may
          * otherwise run to the full timeout for every queued frame. */
         completed = client_surface_wait_present_completion( surface, &job->present,
-                                                            job->submitted, job->wait,
-                                                            job->context, remaining );
+                                                            job->submitted, remaining );
         if (!client_surface_complete_present( surface, &job->present, job->submitted,
                                               completed,
                                               job->has_expected_size ? &job->expected_size : NULL,
@@ -127,7 +135,7 @@ static void client_surface_completion_worker( struct client_surface *surface, BO
             !job->present.superseded && !job->present.completion_failed)
             WARN( "deferred client-surface composition did not complete for %s\n",
                   debugstr_client_surface( surface ) );
-        job->release( job->context );
+        completion.release( completion.context );
         InterlockedDecrement( &client_surface_deferred_present_count );
         free( job );
     }
@@ -143,29 +151,26 @@ static void client_surface_completion_thread( void *context )
 
 void client_surface_defer_present( struct client_surface *surface,
                                    struct client_surface_present *present,
-                                   BOOL submitted, const SIZE *expected_size,
-                                   client_surface_completion_wait_func wait,
-                                   client_surface_completion_release_func release,
-                                   void *context )
+                                   BOOL submitted, const SIZE *expected_size )
 {
+    struct client_surface_completion completion = present->completion;
     struct client_surface_completion_job *job;
     BOOL completed, start_worker = FALSE;
     DWORD elapsed, remaining;
 
-    assert( present->completion != CLIENT_SURFACE_COMPLETION_NONE );
+    assert( completion.kind != CLIENT_SURFACE_COMPLETION_NONE );
     assert( InterlockedCompareExchange( &surface->external_completion_count, 0, 0 ) > 0 );
-    assert( wait && release );
+    assert( completion.wait && completion.release );
 
     if (!(job = malloc( sizeof(*job) )))
     {
         elapsed = NtGetTickCount() - present->submission_time;
         remaining = elapsed < CLIENT_SURFACE_PRESENT_TIMEOUT ?
                     CLIENT_SURFACE_PRESENT_TIMEOUT - elapsed : 0;
-        completed = client_surface_wait_present_completion( surface, present, submitted,
-                                                            wait, context, remaining );
+        completed = client_surface_wait_present_completion( surface, present, submitted, remaining );
         client_surface_complete_present( surface, present, submitted, completed,
                                          expected_size, 0 );
-        release( context );
+        completion.release( completion.context );
         return;
     }
     if (InterlockedIncrement( &client_surface_deferred_present_count ) >
@@ -176,16 +181,12 @@ void client_surface_defer_present( struct client_surface *surface,
         elapsed = NtGetTickCount() - present->submission_time;
         remaining = elapsed < CLIENT_SURFACE_PRESENT_TIMEOUT ?
                     CLIENT_SURFACE_PRESENT_TIMEOUT - elapsed : 0;
-        completed = client_surface_wait_present_completion( surface, present, submitted,
-                                                            wait, context, remaining );
+        completed = client_surface_wait_present_completion( surface, present, submitted, remaining );
         client_surface_complete_present( surface, present, submitted, completed,
                                          expected_size, 0 );
-        release( context );
+        completion.release( completion.context );
         return;
     }
-    job->wait = wait;
-    job->release = release;
-    job->context = context;
     job->submission_time = present->submission_time;
     job->submitted = submitted;
     job->has_expected_size = !!expected_size;
@@ -200,11 +201,10 @@ void client_surface_defer_present( struct client_surface *surface,
         elapsed = NtGetTickCount() - present->submission_time;
         remaining = elapsed < CLIENT_SURFACE_PRESENT_TIMEOUT ?
                     CLIENT_SURFACE_PRESENT_TIMEOUT - elapsed : 0;
-        completed = client_surface_wait_present_completion( surface, present, submitted,
-                                                            wait, context, remaining );
+        completed = client_surface_wait_present_completion( surface, present, submitted, remaining );
         client_surface_complete_present( surface, present, submitted, completed,
                                          expected_size, 0 );
-        release( context );
+        completion.release( completion.context );
         InterlockedDecrement( &client_surface_deferred_present_count );
         free( job );
         return;

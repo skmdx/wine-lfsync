@@ -301,6 +301,17 @@ enum client_surface_completion_kind
     CLIENT_SURFACE_COMPLETION_SHARED,
 };
 
+typedef BOOL (*client_surface_completion_wait_func)( void *context, DWORD timeout );
+typedef void (*client_surface_completion_release_func)( void *context );
+
+struct client_surface_completion
+{
+    enum client_surface_completion_kind kind;
+    client_surface_completion_wait_func wait;
+    client_surface_completion_release_func release;
+    void *context;
+};
+
 struct client_surface_scene
 {
     UINT64 generation;
@@ -318,13 +329,10 @@ struct client_surface_present
     LONG64 target_seq;
     BOOL offscreen;
     BOOL target_valid;
-    enum client_surface_completion_kind completion;
+    struct client_surface_completion completion;
     BOOL completion_failed;
     BOOL superseded;
 };
-
-typedef BOOL (*client_surface_completion_wait_func)( void *context, DWORD timeout );
-typedef void (*client_surface_completion_release_func)( void *context );
 
 /* Backend completion and publication must share one bounded wait contract. */
 #define CLIENT_SURFACE_PRESENT_TIMEOUT 5000
@@ -403,15 +411,14 @@ W32KAPI BOOL client_surface_complete_present( struct client_surface *surface,
                                               const SIZE *expected_size, DWORD timeout );
 W32KAPI BOOL client_surface_wait_present_completion( struct client_surface *surface,
                                                       const struct client_surface_present *present,
-                                                      BOOL submitted,
-                                                      client_surface_completion_wait_func wait,
-                                                      void *context, DWORD timeout );
+                                                      BOOL submitted, DWORD timeout );
+W32KAPI void client_surface_set_present_completion( struct client_surface_present *present,
+                                                     client_surface_completion_wait_func wait,
+                                                     client_surface_completion_release_func release,
+                                                     void *context );
 W32KAPI void client_surface_defer_present( struct client_surface *surface,
                                            struct client_surface_present *present,
-                                           BOOL submitted, const SIZE *expected_size,
-                                           client_surface_completion_wait_func wait,
-                                           client_surface_completion_release_func release,
-                                           void *context );
+                                           BOOL submitted, const SIZE *expected_size );
 W32KAPI void client_surface_lock_present( struct client_surface *surface );
 W32KAPI void client_surface_unlock_present( struct client_surface *surface );
 W32KAPI void client_surface_prepare_present_locked( struct client_surface *surface,

@@ -476,9 +476,9 @@ void client_surface_prepare_present_locked( struct client_surface *surface,
     if (present->target_valid && present->offscreen)
     {
         if (external_completion)
-            present->completion = CLIENT_SURFACE_COMPLETION_EXACT;
+            present->completion.kind = CLIENT_SURFACE_COMPLETION_EXACT;
         else if (client_surface_backend_prepare_completion( surface ))
-            present->completion = CLIENT_SURFACE_COMPLETION_SHARED;
+            present->completion.kind = CLIENT_SURFACE_COMPLETION_SHARED;
     }
     pthread_mutex_unlock( &surface->present_lock );
 }
@@ -505,9 +505,9 @@ void client_surface_begin_present( struct client_surface *surface )
 static void client_surface_register_completion_locked( struct client_surface *surface,
                                                        struct client_surface_present *present )
 {
-    if (present->completion == CLIENT_SURFACE_COMPLETION_NONE) return;
+    if (present->completion.kind == CLIENT_SURFACE_COMPLETION_NONE) return;
     InterlockedIncrement( &surface->external_completion_count );
-    if (present->completion == CLIENT_SURFACE_COMPLETION_SHARED)
+    if (present->completion.kind == CLIENT_SURFACE_COMPLETION_SHARED)
         surface->driver_completion_count++;
 }
 
@@ -545,10 +545,10 @@ BOOL client_surface_complete_present_locked( struct client_surface *surface,
 {
     BOOL completed = submitted && present->target_valid;
 
-    if (!submitted && present->completion == CLIENT_SURFACE_COMPLETION_EXACT)
+    if (!submitted && present->completion.kind == CLIENT_SURFACE_COMPLETION_EXACT)
         present->completion_failed = TRUE;
 
-    if (!submitted && present->completion == CLIENT_SURFACE_COMPLETION_SHARED)
+    if (!submitted && present->completion.kind == CLIENT_SURFACE_COMPLETION_SHARED)
     {
         /* A failed WSI call does not prove that no native request escaped.
          * Retire the armed boundary so a delayed request cannot satisfy the
@@ -558,9 +558,9 @@ BOOL client_surface_complete_present_locked( struct client_surface *surface,
     }
     if (completed && present->offscreen)
     {
-        if (present->completion == CLIENT_SURFACE_COMPLETION_EXACT)
+        if (present->completion.kind == CLIENT_SURFACE_COMPLETION_EXACT)
             completed = external_completed;
-        else if (present->completion == CLIENT_SURFACE_COMPLETION_SHARED)
+        else if (present->completion.kind == CLIENT_SURFACE_COMPLETION_SHARED)
             completed = client_surface_backend_wait_completion( surface, timeout );
         else
             completed = FALSE;
@@ -598,18 +598,18 @@ BOOL client_surface_complete_present_locked( struct client_surface *surface,
     }
     if (completed)
         completed = client_surface_end_present_internal( surface, expected_size, TRUE, present );
-    if (present->completion != CLIENT_SURFACE_COMPLETION_NONE)
+    if (present->completion.kind != CLIENT_SURFACE_COMPLETION_NONE)
     {
         BOOL wake = FALSE;
 
         assert( InterlockedCompareExchange( &surface->external_completion_count, 0, 0 ) > 0 );
-        if (present->completion == CLIENT_SURFACE_COMPLETION_SHARED)
+        if (present->completion.kind == CLIENT_SURFACE_COMPLETION_SHARED)
         {
             assert( surface->driver_completion_count > 0 );
             if (!--surface->driver_completion_count) wake = TRUE;
         }
         if (!InterlockedDecrement( &surface->external_completion_count )) wake = TRUE;
-        present->completion = CLIENT_SURFACE_COMPLETION_NONE;
+        memset( &present->completion, 0, sizeof(present->completion) );
         if (wake) pthread_cond_broadcast( &surface->completion_cond );
     }
     return completed;
@@ -637,13 +637,13 @@ BOOL client_surface_complete_present( struct client_surface *surface,
     /* An armed driver monitor has exclusive ownership through
      * completion_lock.  Transfer that ownership to the same bounded queue as
      * explicit GLX/EGL/Vulkan completion IDs instead of blocking the caller. */
-    if (submitted && present->completion == CLIENT_SURFACE_COMPLETION_SHARED &&
+    if (submitted && present->completion.kind == CLIENT_SURFACE_COMPLETION_SHARED &&
         present->offscreen && timeout)
     {
         client_surface_add_ref( surface );
-        client_surface_defer_present( surface, present, TRUE, expected_size,
-                                      wait_deferred_driver_completion,
-                                      release_deferred_driver_completion, surface );
+        client_surface_set_present_completion( present, wait_deferred_driver_completion,
+                                               release_deferred_driver_completion, surface );
+        client_surface_defer_present( surface, present, TRUE, expected_size );
         return TRUE;
     }
 

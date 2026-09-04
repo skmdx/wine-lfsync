@@ -1503,7 +1503,7 @@ static BOOL x11drv_surface_swap( struct opengl_drawable *base )
     use_oml = ctx && pglXGetSyncValuesOML && pglXSwapBuffersMscOML;
     client_surface_prepare_present( base->client, &present, use_oml );
     client_surface_begin_present( base->client );
-    if (present.completion == CLIENT_SURFACE_COMPLETION_EXACT)
+    if (present.completion.kind == CLIENT_SURFACE_COMPLETION_EXACT)
     {
         /* The swap buffer count identifies this exact GLX presentation.  Poll
          * it with a deadline instead of using the unbounded WaitForSbc call or
@@ -1521,17 +1521,18 @@ static BOOL x11drv_surface_swap( struct opengl_drawable *base )
                 completion->drawable = base;
                 completion->target_sbc = target_sbc;
                 opengl_drawable_add_ref( base );
-                client_surface_defer_present( base->client, &present, TRUE, NULL,
-                                              wait_glx_present_completion,
-                                              release_glx_present_completion, completion );
+                client_surface_set_present_completion( &present, wait_glx_present_completion,
+                                                       release_glx_present_completion, completion );
+                client_surface_defer_present( base->client, &present, TRUE, NULL );
                 return TRUE;
             }
             {
                 struct glx_present_completion fallback = {base, target_sbc};
 
-                completed = client_surface_wait_present_completion(
-                    base->client, &present, TRUE, wait_glx_present_completion,
-                    &fallback, CLIENT_SURFACE_PRESENT_TIMEOUT );
+                client_surface_set_present_completion( &present, wait_glx_present_completion,
+                                                       NULL, &fallback );
+                completed = client_surface_wait_present_completion( base->client, &present, TRUE,
+                                                                     CLIENT_SURFACE_PRESENT_TIMEOUT );
             }
         }
     }
@@ -1644,7 +1645,7 @@ static BOOL x11drv_egl_surface_swap( struct opengl_drawable *base )
         funcs->p_eglGetFrameTimestampSupportedANDROID( egl->display, gl->base.surface,
                                                        EGL_DISPLAY_PRESENT_TIME_ANDROID );
     client_surface_prepare_present( base->client, &present, timestamp_completion );
-    if (present.completion == CLIENT_SURFACE_COMPLETION_EXACT &&
+    if (present.completion.kind == CLIENT_SURFACE_COMPLETION_EXACT &&
         !funcs->p_eglGetNextFrameIdANDROID( egl->display, gl->base.surface, &frame_id ))
     {
         WARN( "Failed to allocate EGL presentation frame ID for %s\n",
@@ -1662,7 +1663,7 @@ static BOOL x11drv_egl_surface_swap( struct opengl_drawable *base )
         return FALSE;
     }
 
-    if (present.completion == CLIENT_SURFACE_COMPLETION_EXACT && frame_id)
+    if (present.completion.kind == CLIENT_SURFACE_COMPLETION_EXACT && frame_id)
     {
         struct egl_present_completion *completion;
 
@@ -1671,17 +1672,18 @@ static BOOL x11drv_egl_surface_swap( struct opengl_drawable *base )
             completion->drawable = base;
             completion->frame_id = frame_id;
             opengl_drawable_add_ref( base );
-            client_surface_defer_present( base->client, &present, TRUE, NULL,
-                                          wait_egl_present_completion,
-                                          release_egl_present_completion, completion );
+            client_surface_set_present_completion( &present, wait_egl_present_completion,
+                                                   release_egl_present_completion, completion );
+            client_surface_defer_present( base->client, &present, TRUE, NULL );
             return TRUE;
         }
 
         {
             struct egl_present_completion fallback = {base, frame_id};
+            client_surface_set_present_completion( &present, wait_egl_present_completion,
+                                                   NULL, &fallback );
             timestamp_completion = client_surface_wait_present_completion(
-                base->client, &present, TRUE, wait_egl_present_completion, &fallback,
-                CLIENT_SURFACE_PRESENT_TIMEOUT );
+                base->client, &present, TRUE, CLIENT_SURFACE_PRESENT_TIMEOUT );
         }
     }
     else timestamp_completion = FALSE;

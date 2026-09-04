@@ -2274,7 +2274,7 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
              * extent. */
         }
 
-        if (compose && presents[i].completion == CLIENT_SURFACE_COMPLETION_EXACT &&
+        if (compose && presents[i].completion.kind == CLIENT_SURFACE_COMPLETION_EXACT &&
             use_internal_present_wait)
         {
             struct vulkan_present_completion *completion;
@@ -2285,10 +2285,10 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
                 completion->swapchain = swapchain;
                 completion->present_id = present_ids[i];
                 retain_swapchain_completion( swapchain );
+                client_surface_set_present_completion( &presents[i], wait_vulkan_present_completion,
+                                                       release_vulkan_present_completion, completion );
                 client_surface_defer_present( surface->client, &presents[i], TRUE,
-                                              &expected_size,
-                                              wait_vulkan_present_completion,
-                                              release_vulkan_present_completion, completion );
+                                              &expected_size );
                 continue;
             }
         }
@@ -2300,13 +2300,15 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
             DWORD remaining = elapsed < CLIENT_SURFACE_PRESENT_TIMEOUT ?
                               CLIENT_SURFACE_PRESENT_TIMEOUT - elapsed : 0;
 
-            if (compose && presents[i].completion == CLIENT_SURFACE_COMPLETION_EXACT &&
+            if (compose && presents[i].completion.kind == CLIENT_SURFACE_COMPLETION_EXACT &&
                 use_internal_present_wait)
             {
                 struct vulkan_present_completion fallback = {device, swapchain, present_ids[i]};
+
+                client_surface_set_present_completion( &presents[i], wait_vulkan_present_completion,
+                                                       NULL, &fallback );
                 external_completed = client_surface_wait_present_completion(
-                    surface->client, &presents[i], TRUE, wait_vulkan_present_completion,
-                    &fallback, remaining );
+                    surface->client, &presents[i], TRUE, remaining );
             }
 
             completed = client_surface_complete_present( surface->client, &presents[i], compose,
