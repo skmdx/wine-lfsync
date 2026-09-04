@@ -1507,6 +1507,7 @@ static void test_hidden_present_resize(void)
     const char *renderer;
     int format;
 
+    if (!register_present_test_class()) return;
     hwnd = CreateWindowExA( WS_EX_LAYERED | WS_EX_TOPMOST, "client_surface_present_race",
                             "hidden present", WS_POPUP, 320, 240, 160, 120,
                             NULL, NULL, GetModuleHandleA( NULL ), NULL );
@@ -1852,6 +1853,77 @@ static void test_owner_exit_and_destroy( char **argv )
     run_child( argv, "destroy_race", hwnd, 10 );
 }
 
+struct focused_test_case
+{
+    const char *name;
+    const char *description;
+    void (*func)(void);
+};
+
+static BOOL run_focused_test_case( const char *name, char **argv )
+{
+    static const struct focused_test_case cases[] =
+    {
+        {"completion-provenance", "client surface completion result provenance",
+         test_completion_result_provenance},
+        {"generation-membership", "client surface generation membership",
+         test_generation_membership},
+        {"clip-scene-snapshot", "client surface clip scene snapshots",
+         test_clip_scene_snapshot},
+        {"subtree-retirement", "client surface subtree retirement",
+         test_subtree_generation_retirement},
+        {"generation-aba", "client surface generation ABA exclusion", test_generation_aba},
+        {"publish-transaction", "client surface host publication transaction",
+         test_publish_transaction},
+        {"live-prepare", "live client surface prepare transaction",
+         test_live_prepare_transaction},
+        {"unbacked-live", "unbacked live client surface publication",
+         test_unbacked_live_generation},
+        {"scene-writer-barrier", "client surface scene writer barrier",
+         test_scene_writer_barrier},
+        {"backend-capability", "client surface backend capability isolation",
+         test_backend_capability_isolation},
+        {"native-backing-barrier", "native backing destruction barrier",
+         test_native_backing_barrier},
+        {"notification-filter", "client surface notification filter bypass",
+         test_notification_identity_aba},
+        {"writer-thread-exit", "writer thread exit lease cleanup", test_writer_thread_exit},
+        {"late-present-cutover", "late client surface publication cut-over",
+         test_late_present_cutover},
+        {"concurrent-state", "concurrent client surface state changes",
+         test_concurrent_state_changes},
+        {"hidden-present-resize", "hidden present and resize", test_hidden_present_resize},
+        {"grow64-completion", "64x64 grow presentation completion",
+         test_grow64_present_completion},
+        {"paced-completion", "paced hidden client surface presents",
+         test_paced_present_completion},
+        {"present-destroy-race", "present and window destruction race",
+         test_present_destroy_race},
+    };
+    unsigned int i;
+
+    for (i = 0; i < ARRAY_SIZE(cases); ++i)
+    {
+        if (strcmp( name, cases[i].name )) continue;
+        trace( "testing %s\n", cases[i].description );
+        cases[i].func();
+        return TRUE;
+    }
+    if (!strcmp( name, "cross-process-pixel-format" ))
+    {
+        trace( "testing cross-process pixel format persistence\n" );
+        test_cross_process_pixel_format( argv );
+        return TRUE;
+    }
+    if (!strcmp( name, "owner-exit-destroy" ))
+    {
+        trace( "testing owner exit and window destruction\n" );
+        test_owner_exit_and_destroy( argv );
+        return TRUE;
+    }
+    return FALSE;
+}
+
 START_TEST(client_surface)
 {
     HMODULE ntdll = GetModuleHandleA( "ntdll.dll" );
@@ -1901,28 +1973,11 @@ START_TEST(client_surface)
     }
 
     test_case = getenv( "WINETEST_CLIENT_SURFACE_CASE" );
-    if (test_case && !strcmp( test_case, "completion-provenance" ))
-    {
-        trace( "testing client surface completion result provenance\n" );
-        test_completion_result_provenance();
-        return;
-    }
-    if (test_case && !strcmp( test_case, "cross-process-pixel-format" ))
-    {
-        trace( "testing cross-process pixel format persistence\n" );
-        test_cross_process_pixel_format( argv );
-        return;
-    }
-    if (test_case && !strcmp( test_case, "grow64-completion" ))
-    {
-        GetDesktopWindow();
-        trace( "testing 64x64 grow presentation completion\n" );
-        test_grow64_present_completion();
-        return;
-    }
     if (test_case && *test_case)
     {
-        ok( 0, "unknown WINETEST_CLIENT_SURFACE_CASE %s\n", test_case );
+        GetDesktopWindow();
+        if (!run_focused_test_case( test_case, argv ))
+            ok( 0, "unknown WINETEST_CLIENT_SURFACE_CASE %s\n", test_case );
         return;
     }
 

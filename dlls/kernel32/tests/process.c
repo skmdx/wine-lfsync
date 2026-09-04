@@ -5730,6 +5730,7 @@ static void test_GetProcessInformation(void)
 
 START_TEST(process)
 {
+    const char *test_case;
     HANDLE job, hproc, h, h2;
     BOOL b = init();
     ok(b, "Basic init of CreateProcess test\n");
@@ -5812,6 +5813,19 @@ START_TEST(process)
         ok(0, "Unexpected command %s\n", myARGV[2]);
         return;
     }
+
+    test_case = getenv("WINETEST_PROCESS_CASE");
+    if (test_case && *test_case)
+    {
+        if (!strcmp(test_case, "job-limit-roundtrip"))
+        {
+            if (pCreateJobObjectW) test_KillOnJobClose();
+            else win_skip("No job object support\n");
+        }
+        else ok(0, "Unknown WINETEST_PROCESS_CASE %s\n", test_case);
+        return;
+    }
+
     hproc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, GetCurrentProcessId());
     if (hproc)
     {

@@ -128,9 +128,11 @@ Wine tree 内の `dlls/win32u/tests/client_surface.c` は、実アプリで見�
 | 非表示中の present、表示時の切替、リサイズ後の完了が欠落する | `test_hidden_present_resize()`、`test_grow64_present_completion()`、`test_paced_present_completion()`。固定色の GL front buffer と server の staged/pending 状態を検査する |
 | scene 変更、古い generation、重複 producer、遅延完了が新しい frame を上書きする | generation、scene snapshot、publish/live-prepare、writer barrier、native backing、late-present、concurrent-state の各テスト |
 | 通知 filter、thread/process 終了、destroy 競合で公開が停止または誤配送される | `test_notification_identity_aba()`、`test_writer_thread_exit()`、`test_present_destroy_race()`、`test_owner_exit_and_destroy()` |
-| Chromium 型の Job limit read/modify/write で `KILL_ON_JOB_CLOSE` が消える | `dlls/kernel32/tests/process.c` の `test_QueryInformationJobObject()`。Extended/Basic query、read/OR/write、子プロセス終了を検査する |
+| Chromium 型の Job limit read/modify/write で `KILL_ON_JOB_CLOSE` が消える | `dlls/kernel32/tests/process.c` の `test_KillOnJobClose()`。Extended/Basic query、read/OR/write、Job close後の子プロセス終了を検査する |
 
-`WINETEST_CLIENT_SURFACE_CASE` に `completion-provenance`、`cross-process-pixel-format`、または `grow64-completion` を指定すると、該当する最小ケースだけを実行できます。前二者は意図的に修正を戻した境界で失敗することも確認します。GL front buffer の検査だけでは X11 compositor 上の黒・白・glitch を証明できないため、最終的な画面回帰は上記の固定 RGB8 Electron テストで別に判定します。実 Steam は操作経路の確認に使いますが、ネットワーク内容や更新に依存する画面を唯一の正解画像にはしません。
+`WINETEST_CLIENT_SURFACE_CASE` には各テスト名に対応する focused case を指定できます。実アプリ由来の主要境界は `completion-provenance`、`generation-membership`、`publish-transaction`、`live-prepare`、`native-backing-barrier`、`notification-filter`、`hidden-present-resize`、`grow64-completion`、`paced-completion`、`cross-process-pixel-format`、`owner-exit-destroy` です。`WINETEST_PROCESS_CASE=job-limit-roundtrip` は Chromium と同じ Job query/read-modify-write/close だけを実行します。これらの入口は全suiteと同じテスト関数を呼ぶため、focused run と通常回帰の内容が分岐しません。
+
+completion provenance と cross-process pixel format は、意図的に修正を戻した境界で focused test が失敗することも確認しています。notification filter は修正前 wineserver で失敗し、Job round-trip は修正前 runtime で query flags 0・子process残留を検出しています。GL front buffer や server state の検査だけでは X11 compositor 上の黒・白・glitch を証明できないため、最終的な画面回帰は上記の固定 RGB8 Electron テストで別に判定します。実 Steam は操作経路とproduction固有のcross-process構成を確認しますが、network内容や更新に依存する画面を唯一の正解画像にはしません。
 
 ただし、このブランチは実験段階です。固定容量の共有領域が枯渇するケース、未検証のアプリケーション固有の同期パターン、および通常とは異なるプロセス終了経路については、追加検証が必要です。性能もワークロードに依存するため、ntsync や通常の wineserver 経路に常に優越するとは限りません。
 
