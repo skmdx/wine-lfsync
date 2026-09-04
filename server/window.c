@@ -206,14 +206,11 @@ struct window
     unsigned int     client_surface_writer_count; /* writes which started before a scene cut-over */
     client_ptr_t     client_surface_native_barrier; /* owner token sealing native target replacement */
     unsigned int     client_surface_staged_prepare; /* staged backing needs a post-writer snapshot */
-    unsigned int     client_surface_publish_invalidated; /* scene changed after publish begin */
     unsigned long long client_surface_generation; /* current composition generation */
     unsigned long long client_surface_scene_generation; /* even when the scene is stable */
     unsigned int     client_surface_scene_change_depth;
     unsigned int     client_surface_pending_count; /* producers missing from the active generation */
     unsigned long long client_surface_ready_scene_generation;
-    unsigned long long client_surface_publish_generation;
-    unsigned long long client_surface_publish_scene_generation;
     unsigned int     client_surface_restarting;
     unsigned int     client_surface_restart_pending;
     struct timeout_user *client_surface_timeout; /* deadline for the current composition episode */
@@ -934,14 +931,11 @@ static struct window *create_window( struct window *parent, struct window *owner
     win->client_surface_writer_count = 0;
     win->client_surface_native_barrier = 0;
     win->client_surface_staged_prepare = 0;
-    win->client_surface_publish_invalidated = 0;
     win->client_surface_generation = 0;
     win->client_surface_scene_generation = 0;
     win->client_surface_scene_change_depth = 0;
     win->client_surface_pending_count = 0;
     win->client_surface_ready_scene_generation = 0;
-    win->client_surface_publish_generation = 0;
-    win->client_surface_publish_scene_generation = 0;
     win->client_surface_restarting = 0;
     win->client_surface_restart_pending = 0;
     win->client_surface_timeout = NULL;
@@ -1211,11 +1205,19 @@ static void end_client_surface_scene_change( struct window *top )
         if (top->client_surface_staged) top->client_surface_staged_prepare = 1;
         return;
     }
-    if (client_surface_is_publishing( top ))
-        top->client_surface_publish_invalidated = 1;
-    else if (top->client_surface_staged ||
-             (is_visible( top ) && has_client_surface( top )))
+    if (!client_surface_is_publishing( top ) &&
+        (top->client_surface_staged || (is_visible( top ) && has_client_surface( top ))))
         restart_client_surface_generation( top );
+}
+
+/* A newer frame in the same geometric scene still invalidates a publication
+ * which has crossed PUBLISH_BEGIN.  Advance the stable epoch by one full
+ * seqlock cycle so every earlier transaction token becomes stale. */
+static void invalidate_client_surface_scene( struct window *top )
+{
+    assert( !(top->client_surface_scene_generation & 1) );
+    top->client_surface_scene_generation += 2;
+    update_client_surface_publication( top );
 }
 
 static struct client_surface_owner *get_client_surface_owner( struct window *win,
@@ -1375,9 +1377,6 @@ static void finish_client_surface_generation( struct window *top )
     top->client_surface_generation = 0;
     top->client_surface_pending_count = 0;
     top->client_surface_ready_scene_generation = 0;
-    top->client_surface_publish_invalidated = 0;
-    top->client_surface_publish_generation = 0;
-    top->client_surface_publish_scene_generation = 0;
     update_client_surface_publication( top );
 }
 
@@ -1423,7 +1422,8 @@ static void client_surface_publication_timeout( void *private )
     unsigned long long generation = top->client_surface_timeout_generation;
     int staged = top->client_surface_staged;
     int repair = staged && client_surface_is_publishing( top ) &&
-                 top->client_surface_publish_invalidated;
+                 top->client_surface_ready_scene_generation !=
+                 top->client_surface_scene_generation;
 
     top->client_surface_timeout = NULL;
     top->client_surface_timeout_generation = 0;
@@ -1969,10 +1969,7 @@ static void restart_client_surface_generation( struct window *top )
         return;
     }
     if (client_surface_is_publishing( top ))
-    {
-        top->client_surface_publish_invalidated = 1;
         return;
-    }
     if (top->client_surface_writer_count)
     {
         top->client_surface_restart_pending = 1;
@@ -4382,7 +4379,7 @@ DECL_HANDLER(set_client_surface_state)
             {
                 /* Host exposure has already crossed PUBLISH_BEGIN.  Preserve
                  * this source frame and repair the visible host after ACK. */
-                top->client_surface_publish_invalidated = 1;
+                invalidate_client_surface_scene( top );
             }
         }
         else if (surface->scene_publication && !req->generation &&
@@ -4437,18 +4434,16 @@ DECL_HANDLER(set_client_surface_state)
         top->client_surface_ready_scene_generation == top->client_surface_scene_generation)
     {
         top->client_surface_phase = CLIENT_SURFACE_PHASE_PUBLISHING;
-        top->client_surface_publish_invalidated = 0;
-        top->client_surface_publish_generation = top->client_surface_generation;
-        top->client_surface_publish_scene_generation = top->client_surface_scene_generation;
         update_client_surface_publication( top );
         reply->publish = 1;
     }
     if ((req->flags & CLIENT_SURFACE_STATE_PUBLISH_COMMIT) && top->thread == current &&
         client_surface_is_publishing( top ) &&
-        req->generation == top->client_surface_publish_generation &&
-        req->scene_generation == top->client_surface_publish_scene_generation)
+        req->generation == top->client_surface_generation &&
+        req->scene_generation == top->client_surface_ready_scene_generation)
     {
-        int invalidated = top->client_surface_publish_invalidated;
+        int invalidated = top->client_surface_ready_scene_generation !=
+                          top->client_surface_scene_generation;
 
         finish_client_surface_publication( top );
         if (invalidated && is_visible( top ) && has_client_surface( top ))
