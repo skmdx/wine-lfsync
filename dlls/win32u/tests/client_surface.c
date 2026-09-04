@@ -549,6 +549,10 @@ static void test_generation_aba(void)
     ok( !status, "first stage failed, status %#x\n", status );
     ok( first.staged, "first generation was not staged\n" );
     ok( first.generation != 0, "first generation is zero\n" );
+    ok( first.generation == first.scene_generation,
+        "first transaction %s does not match scene epoch %s\n",
+        wine_dbgstr_longlong( first.generation ),
+        wine_dbgstr_longlong( first.scene_generation ) );
     ok( first.pending == 1, "first pending count %u\n", first.pending );
 
     status = set_surface_state( hwnd, 0, CLIENT_SURFACE_STATE_STAGED, 0, &second );
@@ -557,6 +561,12 @@ static void test_generation_aba(void)
     ok( second.generation && second.generation != first.generation,
         "generation was reused, first %s second %s\n",
         wine_dbgstr_longlong( first.generation ), wine_dbgstr_longlong( second.generation ) );
+    ok( second.generation == second.scene_generation &&
+        second.scene_generation != first.scene_generation,
+        "second transaction %s did not advance scene epoch %s from %s\n",
+        wine_dbgstr_longlong( second.generation ),
+        wine_dbgstr_longlong( second.scene_generation ),
+        wine_dbgstr_longlong( first.scene_generation ) );
     ok( second.pending == 1, "second pending count %u\n", second.pending );
 
     status = commit_surface_state( hwnd, surface, &first, &stale );
