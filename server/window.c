@@ -179,7 +179,6 @@ struct client_surface_transaction
     unsigned int pending;            /* producers which have not completed */
     unsigned int staged : 1;         /* host is mapped into unpublished backing */
     unsigned int prepared : 1;       /* owner snapshot permits a live replay */
-    unsigned int scene_published : 1;/* transaction uses owner publication */
     unsigned int staged_prepare : 1; /* backing needs a post-writer snapshot */
     unsigned int restarting : 1;     /* restart loop owns transaction changes */
     unsigned int restart_pending : 1;/* replay requested during a transition */
@@ -1378,7 +1377,6 @@ static void finish_client_surface_generation( struct window *top )
     cancel_client_surface_timeout( top );
     top->client_surface_transaction.deadline = 0;
     top->client_surface_transaction.phase = CLIENT_SURFACE_PHASE_IDLE;
-    top->client_surface_transaction.scene_published = 0;
     top->client_surface_transaction.pending = 0;
     top->client_surface_transaction.epoch = 0;
     update_client_surface_publication( top );
@@ -1404,7 +1402,7 @@ static int mark_client_surface_generation_ready( struct window *top )
     /* Backends without an owner-managed scene target keep the legacy live
      * behavior: their driver presentation is already visible, so an empty
      * owner prepare/publish round trip cannot add atomicity. */
-    if (!top->client_surface_transaction.staged && !top->client_surface_transaction.scene_published)
+    if (!top->client_surface_transaction.staged && !client_surface_scene_published( top ))
     {
         finish_client_surface_generation( top );
         return 0;
@@ -2014,7 +2012,6 @@ static void restart_client_surface_generation( struct window *top )
         top->client_surface_transaction.restart_pending = 0;
         invalidate_client_surface_scene( top );
         top->client_surface_transaction.phase = CLIENT_SURFACE_PHASE_COMPOSING;
-        top->client_surface_transaction.scene_published = client_surface_scene_published( top );
         top->client_surface_transaction.epoch = top->client_surface_scene_generation;
         top->client_surface_transaction.pending =
             prepare_client_surface_generation( top,
