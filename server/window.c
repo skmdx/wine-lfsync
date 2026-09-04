@@ -58,8 +58,6 @@ struct client_surface_owner
     struct list     entry;
     struct list     surfaces;
     struct process *process;
-    unsigned int    active_count;
-    unsigned int    cached_count;
 };
 
 struct client_surface_ref
@@ -1235,8 +1233,6 @@ static struct client_surface_owner *get_client_surface_owner( struct window *win
         if (owner->process == process) return owner;
     if (!create || !(owner = mem_alloc( sizeof(*owner) ))) return NULL;
     owner->process = (struct process *)grab_object( process );
-    owner->active_count = 0;
-    owner->cached_count = 0;
     list_init( &owner->surfaces );
     list_add_tail( &win->client_surface_owners, &owner->entry );
     return owner;
@@ -1280,7 +1276,7 @@ static struct client_surface_ref *get_client_surface_ref( struct client_surface_
 
 static void release_client_surface_owner( struct client_surface_owner *owner )
 {
-    if (owner->active_count || owner->cached_count || !list_empty( &owner->surfaces )) return;
+    if (!list_empty( &owner->surfaces )) return;
     list_remove( &owner->entry );
     release_object( owner->process );
     free( owner );
@@ -1642,29 +1638,33 @@ static void discard_client_surface_owner( struct window *win, struct client_surf
 {
     struct client_surface_ref *surface, *next;
     struct window *writer_top = NULL;
-    unsigned int removed = owner->active_count + owner->cached_count;
+    unsigned int removed = 0;
 
-    if (removed) begin_client_surface_scene_change( top );
-
-    if (win->client_surface_count >= owner->active_count)
-        win->client_surface_count -= owner->active_count;
-    else win->client_surface_count = 0;
-    if (win->client_surface_cached_count >= owner->cached_count)
-        win->client_surface_cached_count -= owner->cached_count;
-    else win->client_surface_cached_count = 0;
-    owner->active_count = 0;
-    owner->cached_count = 0;
-    if (removed) adjust_client_surface_subtree_count( win, -(int)removed );
+    if (!list_empty( &owner->surfaces )) begin_client_surface_scene_change( top );
     LIST_FOR_EACH_ENTRY_SAFE( surface, next, &owner->surfaces, struct client_surface_ref, entry )
     {
         struct window *released = release_client_surface_writer( surface );
 
+        assert( surface->active || surface->cached );
+        if (surface->active)
+        {
+            assert( win->client_surface_count );
+            win->client_surface_count--;
+            removed++;
+        }
+        if (surface->cached)
+        {
+            assert( win->client_surface_cached_count );
+            win->client_surface_cached_count--;
+            removed++;
+        }
         assert( !released || !writer_top );
         if (released) writer_top = released;
         complete_client_surface_generation( top, surface,
                                             client_surface_transaction_generation( top ) );
         retire_client_surface_ref( surface );
     }
+    if (removed) adjust_client_surface_subtree_count( win, -(int)removed );
     if (removed) update_client_surface_producer( win );
     release_client_surface_owner( owner );
     if (removed) end_client_surface_scene_change( top );
@@ -1807,7 +1807,7 @@ static int notify_client_surface_geometry_ready_recursive( struct window *win, s
          * lifetime of a foreign HWND. */
         if (!owner->process->running_threads)
         {
-            if (owner->active_count || owner->cached_count) removed_surface = 1;
+            if (!list_empty( &owner->surfaces )) removed_surface = 1;
             discard_client_surface_owner( win, owner, top );
             continue;
         }
@@ -4245,31 +4245,27 @@ DECL_HANDLER(set_client_surface_state)
         if (!++client_surface_ref_sequence) ++client_surface_ref_sequence;
         surface->sequence = client_surface_ref_sequence;
         win->client_surface_cached_count++;
-        owner->cached_count++;
         adjust_client_surface_subtree_count( win, 1 );
     }
     if ((req->flags & CLIENT_SURFACE_STATE_UNCACHE) && surface && surface->cached)
     {
         surface->cached = 0;
-        assert( win->client_surface_cached_count && owner->cached_count );
+        assert( win->client_surface_cached_count );
         win->client_surface_cached_count--;
-        owner->cached_count--;
         adjust_client_surface_subtree_count( win, -1 );
     }
     if ((req->flags & CLIENT_SURFACE_STATE_REGISTER) && !surface->active)
     {
         surface->active = 1;
         win->client_surface_count++;
-        owner->active_count++;
         adjust_client_surface_subtree_count( win, 1 );
         if (!is_visible( top )) top->client_surface_dirty = 1;
     }
     if ((req->flags & CLIENT_SURFACE_STATE_UNREGISTER) && surface && surface->active)
     {
         surface->active = 0;
-        assert( win->client_surface_count && owner->active_count );
+        assert( win->client_surface_count );
         win->client_surface_count--;
-        owner->active_count--;
         adjust_client_surface_subtree_count( win, -1 );
     }
     if ((req->flags & CLIENT_SURFACE_STATE_CLAIM) && surface && surface->active &&
