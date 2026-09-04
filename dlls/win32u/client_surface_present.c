@@ -476,7 +476,10 @@ void client_surface_prepare_present_locked( struct client_surface *surface,
     if (present->target == CLIENT_SURFACE_FRAME_TARGET_OFFSCREEN)
     {
         if (external_completion)
+        {
             present->completion.kind = CLIENT_SURFACE_COMPLETION_EXACT;
+            present->completion.external_result = TRUE;
+        }
         else if (client_surface_backend_prepare_completion( surface ))
             present->completion.kind = CLIENT_SURFACE_COMPLETION_SHARED;
     }
@@ -558,7 +561,11 @@ BOOL client_surface_complete_present_locked( struct client_surface *surface,
     }
     if (completed && present->target == CLIENT_SURFACE_FRAME_TARGET_OFFSCREEN)
     {
-        if (present->completion.kind == CLIENT_SURFACE_COMPLETION_EXACT)
+        /* kind identifies the host completion source, while external_result
+         * identifies who consumed it.  A queued shared monitor has already
+         * consumed its one-shot backend event and its supplied result must be
+         * used instead of waiting on that event a second time. */
+        if (present->completion.external_result)
             completed = external_completed;
         else if (present->completion.kind == CLIENT_SURFACE_COMPLETION_SHARED)
             completed = client_surface_backend_wait_completion( surface, timeout );

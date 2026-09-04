@@ -308,6 +308,7 @@ typedef void (*client_surface_completion_release_func)( void *context );
 struct client_surface_completion
 {
     enum client_surface_completion_kind kind;
+    BOOL external_result; /* completion result is supplied by the caller or queued token */
     client_surface_completion_wait_func wait;
     client_surface_completion_release_func release;
     void *context;

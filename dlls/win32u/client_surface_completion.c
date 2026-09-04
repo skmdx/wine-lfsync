@@ -68,6 +68,7 @@ void client_surface_set_present_completion( struct client_surface_frame *present
 {
     assert( present->completion.kind != CLIENT_SURFACE_COMPLETION_NONE );
     assert( wait );
+    present->completion.external_result = TRUE;
     present->completion.wait = wait;
     present->completion.release = release;
     present->completion.context = context;
@@ -156,6 +157,7 @@ void client_surface_defer_present( struct client_surface *surface,
     DWORD elapsed, remaining;
 
     assert( completion.kind != CLIENT_SURFACE_COMPLETION_NONE );
+    assert( completion.external_result );
     assert( present->serial );
     assert( InterlockedCompareExchange( &surface->external_completion_count, 0, 0 ) > 0 );
     assert( completion.wait && completion.release );
