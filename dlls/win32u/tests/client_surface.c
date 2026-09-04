@@ -954,13 +954,13 @@ static void test_notification_identity_aba(void)
     ok( status == STATUS_INVALID_PARAMETER,
         "retired identity was reused before notification removal, status %#x\n", status );
 
-    while (PeekMessageA( &message, NULL, 0, 0, PM_REMOVE ))
-    {
-        TranslateMessage( &message );
-        DispatchMessageA( &message );
-    }
+    /* Process-internal notifications are sent-message work and must bypass
+     * application window and message-range filters.  A posted notification
+     * would remain stranded behind this valid restrictive PeekMessage call. */
+    PeekMessageA( &message, second, WM_USER, WM_USER, PM_NOREMOVE );
     status = set_surface_state( second, surface, CLIENT_SURFACE_STATE_REGISTER, 0, NULL );
-    ok( !status, "removed notification retained identity tombstone, status %#x\n", status );
+    ok( !status, "filtered message pump retained notification identity tombstone, status %#x\n",
+        status );
     set_surface_state( second, surface, CLIENT_SURFACE_STATE_UNREGISTER, 0, NULL );
     DestroyWindow( second );
 }

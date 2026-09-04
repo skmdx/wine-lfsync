@@ -1008,6 +1008,22 @@ static void free_message( struct message *msg )
 }
 
 /* remove (and free) a message from a message list */
+static int is_client_surface_notification( const struct message *msg )
+{
+    return (msg->type == MSG_POSTED || msg->type == MSG_NOTIFY) &&
+           msg->msg == WM_WINE_UPDATEWINDOWSTATE &&
+           (msg->wparam == WINE_UPDATE_CLIENT_SURFACES ||
+            msg->wparam == WINE_DESTROY_CLIENT_SURFACES);
+}
+
+static void release_client_surface_notification( struct msg_queue *queue,
+                                                 const struct message *msg, int delivered )
+{
+    if (is_client_surface_notification( msg ))
+        client_surface_notification_removed( queue->process, msg->lparam,
+                                             msg->wparam, delivered );
+}
+
 static void remove_queue_message( struct msg_queue *queue, struct message *msg,
                                   enum message_kind kind, int delivered )
 {
@@ -1015,14 +1031,11 @@ static void remove_queue_message( struct msg_queue *queue, struct message *msg,
     switch(kind)
     {
     case SEND_MESSAGE:
+        release_client_surface_notification( queue, msg, delivered );
         if (list_empty( &queue->msg_list[kind] )) clear_queue_bits( queue, QS_SENDMESSAGE );
         break;
     case POST_MESSAGE:
-        if (msg->msg == WM_WINE_UPDATEWINDOWSTATE &&
-            (msg->wparam == WINE_UPDATE_CLIENT_SURFACES ||
-             msg->wparam == WINE_DESTROY_CLIENT_SURFACES))
-            client_surface_notification_removed( queue->process, msg->lparam,
-                                                 msg->wparam, delivered );
+        release_client_surface_notification( queue, msg, delivered );
         if (list_empty( &queue->msg_list[kind] ) && !queue->quit_message)
             clear_queue_bits( queue, QS_POSTMESSAGE|QS_ALLPOSTMESSAGE );
         if (msg->msg == WM_HOTKEY && --queue->hotkey_count == 0)
@@ -1034,18 +1047,20 @@ static void remove_queue_message( struct msg_queue *queue, struct message *msg,
 
 static int remove_client_surface_notifications( struct msg_queue *queue )
 {
+    static const enum message_kind kinds[] = {SEND_MESSAGE, POST_MESSAGE};
     struct message *msg, *next;
+    unsigned int i;
     int removed = 0;
 
-    LIST_FOR_EACH_ENTRY_SAFE( msg, next, &queue->msg_list[POST_MESSAGE],
-                              struct message, entry )
+    for (i = 0; i < ARRAY_SIZE(kinds); ++i)
     {
-        if (msg->msg != WM_WINE_UPDATEWINDOWSTATE ||
-            (msg->wparam != WINE_UPDATE_CLIENT_SURFACES &&
-             msg->wparam != WINE_DESTROY_CLIENT_SURFACES))
-            continue;
-        remove_queue_message( queue, msg, POST_MESSAGE, 0 );
-        removed = 1;
+        LIST_FOR_EACH_ENTRY_SAFE( msg, next, &queue->msg_list[kinds[i]],
+                                  struct message, entry )
+        {
+            if (!is_client_surface_notification( msg )) continue;
+            remove_queue_message( queue, msg, kinds[i], 0 );
+            removed = 1;
+        }
     }
     return removed;
 }
@@ -1150,6 +1165,7 @@ static void receive_message( struct msg_queue *queue, struct message *msg,
 
     if (msg->data) set_reply_data_ptr( msg->data, msg->data_size );
 
+    release_client_surface_notification( queue, msg, 1 );
     list_remove( &msg->entry );
     /* put the result on the receiver result stack */
     if (result)
@@ -2891,10 +2907,7 @@ void queue_cleanup_window( struct thread *thread, user_handle_t win )
             struct message *msg = LIST_ENTRY( ptr, struct message, entry );
             if (msg->win == win)
             {
-                if (i == POST_MESSAGE && msg->msg == WM_WINE_UPDATEWINDOWSTATE &&
-                    (msg->wparam == WINE_UPDATE_CLIENT_SURFACES ||
-                     msg->wparam == WINE_DESTROY_CLIENT_SURFACES))
-                    retry = 1;
+                if (is_client_surface_notification( msg )) retry = 1;
                 if (msg->msg == WM_QUIT && !queue->quit_message)
                 {
                     queue->quit_message = 1;
@@ -2979,6 +2992,7 @@ int post_process_message( struct process *process, user_handle_t win, unsigned i
                           lparam_t wparam, lparam_t lparam )
 {
     struct thread *thread, *target = NULL;
+    struct message *msg;
     timeout_t access_time = 0;
 
     LIST_FOR_EACH_ENTRY( thread, &process->thread_list, struct thread, proc_entry )
@@ -2990,12 +3004,26 @@ int post_process_message( struct process *process, user_handle_t win, unsigned i
             access_time = thread->queue->shared->access_time;
         }
     }
-    return target && post_thread_message( target, win, message, wparam, lparam );
+    if (!target || !(msg = mem_alloc( sizeof(*msg) ))) return 0;
+
+    /* A process-local surface can render a foreign HWND.  Queue it as a
+     * send-notify message so the renderer processes the internal callback
+     * before applying any GetMessage/PeekMessage window or range filter. */
+    msg->type      = MSG_NOTIFY;
+    msg->win       = get_user_full_handle( win );
+    msg->msg       = message;
+    msg->wparam    = wparam;
+    msg->lparam    = lparam;
+    msg->result    = NULL;
+    msg->data      = NULL;
+    msg->data_size = 0;
+
+    get_message_defaults( target->queue, &msg->x, &msg->y, &msg->time );
+    list_add_tail( &target->queue->msg_list[SEND_MESSAGE], &msg->entry );
+    set_queue_bits( target->queue, QS_SENDMESSAGE );
+    return 1;
 }
 
-/* Post at most one copy of an idempotent internal process notification.  The
- * renderer may move its message pump between threads, so search every queue
- * before choosing the most recently active one for a new notification. */
 /* send a notify message to a window */
 void send_notify_message( user_handle_t win, unsigned int message, lparam_t wparam, lparam_t lparam )
 {
