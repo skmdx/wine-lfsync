@@ -651,8 +651,26 @@ static BOOL client_surface_update_now( struct client_surface *surface )
     return ret;
 }
 
-static BOOL client_surface_recompose( struct client_surface *surface );
+static BOOL client_surface_recompose( struct client_surface *surface, LONG64 seq );
 static void drain_client_surface_recompose( struct client_surface *surface );
+
+static BOOL request_client_surface_recompose( struct client_surface *surface )
+{
+    InterlockedIncrement64( &surface->recompose_seq );
+    return !InterlockedCompareExchange( &surface->recompose_queued, TRUE, FALSE );
+}
+
+static void complete_client_surface_recompose( struct client_surface *surface, LONG64 seq )
+{
+    LONG64 done;
+
+    for (;;)
+    {
+        done = ReadAcquire64( &surface->recompose_done );
+        if ((UINT64)done >= (UINT64)seq) return;
+        if (InterlockedCompareExchange64( &surface->recompose_done, seq, done ) == done) return;
+    }
+}
 
 static BOOL add_exposed_client_surface_region( HRGN *exposed_region, const RECT *old_rect,
                                                const RECT *new_rect, BOOL visible )
@@ -692,8 +710,7 @@ static BOOL queue_client_surface_recompose( struct client_surface *surface,
 {
     struct client_surface **new_surfaces;
 
-    InterlockedIncrement64( &surface->recompose_requested );
-    if (InterlockedCompareExchange( &surface->recompose_scheduled, TRUE, FALSE )) return TRUE;
+    if (!request_client_surface_recompose( surface )) return TRUE;
 
     if (*count == *size)
     {
@@ -701,7 +718,8 @@ static BOOL queue_client_surface_recompose( struct client_surface *surface,
 
         if (!(new_surfaces = realloc( *surfaces, new_size * sizeof(**surfaces) )))
         {
-            InterlockedExchange( &surface->recompose_scheduled, FALSE );
+            InterlockedExchange( &surface->recompose_queued, FALSE );
+            client_surface_resume_recompose( surface );
             return FALSE;
         }
         *surfaces = new_surfaces;
@@ -963,47 +981,50 @@ void client_surface_release( struct client_surface *surface )
     pthread_mutex_unlock( &surfaces_lock );
 }
 
-static BOOL client_surface_recompose( struct client_surface *surface )
+static BOOL client_surface_recompose( struct client_surface *surface, LONG64 seq )
 {
     struct client_surface_present present;
 
     /* Cached replay reads the same native drawable that a deferred host
      * presentation updates.  Do not let an older cached frame commit the
      * composition epoch ahead of the queued producer. */
-    InterlockedExchange( &surface->recompose_deferred, TRUE );
     if (pthread_mutex_trylock( &surface->completion_lock )) return FALSE;
-    if (InterlockedCompareExchange( &surface->external_completion_count, 0, 0 ))
+    if (InterlockedCompareExchange( &surface->external_completion_count, 0, 0 ) ||
+        surface->native_present_count ||
+        InterlockedCompareExchange( &surface->target_update_waiters, 0, 0 ))
     {
-        /* Keep deferred and scheduled ownership until the completion worker
-         * reaches the last queued causal boundary. */
         pthread_mutex_unlock( &surface->completion_lock );
         return FALSE;
     }
-    InterlockedExchange( &surface->recompose_deferred, FALSE );
     client_surface_prepare_present_locked( surface, &present, TRUE );
     client_surface_end_present_internal( surface, present.generation, NULL, FALSE, &present );
-    client_surface_unlock_present( surface );
+    complete_client_surface_recompose( surface, seq );
+    /* drain_client_surface_recompose() owns scheduling while this lock is
+     * held.  Unlock directly so a request arriving during the replay is
+     * consumed by its loop instead of recursively starting another drain. */
+    pthread_mutex_unlock( &surface->completion_lock );
     return TRUE;
 }
 
 static void drain_client_surface_recompose( struct client_surface *surface )
 {
-    LONG64 requested;
+    LONG64 done, requested;
 
+    InterlockedExchange( &surface->recompose_queued, FALSE );
     for (;;)
     {
-        requested = ReadAcquire64( &surface->recompose_requested );
-        if (!client_surface_recompose( surface )) return;
-        if (requested != ReadAcquire64( &surface->recompose_requested )) continue;
-
-        InterlockedExchange( &surface->recompose_scheduled, FALSE );
-        if (requested == ReadAcquire64( &surface->recompose_requested )) break;
-
-        /* A producer which observes the cleared flag owns the next queue
-         * entry.  Otherwise retain this entry's reference and consume the
-         * latest request without replaying every intermediate generation. */
-        if (InterlockedCompareExchange( &surface->recompose_scheduled, TRUE, FALSE )) break;
+        done = ReadAcquire64( &surface->recompose_done );
+        requested = ReadAcquire64( &surface->recompose_seq );
+        if (done == requested || !client_surface_recompose( surface, requested )) return;
     }
+}
+
+void client_surface_resume_recompose( struct client_surface *surface )
+{
+    if (ReadAcquire64( &surface->recompose_done ) ==
+        ReadAcquire64( &surface->recompose_seq )) return;
+    if (InterlockedCompareExchange( &surface->recompose_queued, TRUE, FALSE )) return;
+    drain_client_surface_recompose( surface );
 }
 
 void recompose_client_surface( HWND hwnd, UINT_PTR identity )
@@ -1036,8 +1057,7 @@ void recompose_client_surface( HWND hwnd, UINT_PTR identity )
         return;
     }
 
-    InterlockedIncrement64( &selected->recompose_requested );
-    if (InterlockedCompareExchange( &selected->recompose_scheduled, TRUE, FALSE ))
+    if (!request_client_surface_recompose( selected ))
     {
         client_surface_release( selected );
         return;

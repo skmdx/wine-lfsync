@@ -361,10 +361,10 @@ struct client_surface
     LONG                               driver_completion_waiters; /* pending shared-monitor mode transitions */
     LONG                               native_present_count; /* native presentation calls currently in flight */
     LONG                               target_update_waiters; /* pending native target mutations */
-    LONG64                             recompose_requested; /* latest requested recomposition generation */
-    LONG64                             recompose_retry_generation; /* newest generation granted one retry */
-    LONG                               recompose_scheduled; /* a recomposition consumer owns a reference */
-    LONG                               recompose_deferred; /* completion owner must reschedule replay */
+    LONG64                             recompose_seq;  /* latest requested cached replay */
+    LONG64                             recompose_done; /* latest completed cached replay */
+    LONG                               recompose_queued; /* a consumer owns the pending request */
+    LONG64                             scene_retry_generation; /* newest server generation granted one retry */
     UINT64                             clip_scene_generation; /* scene owning the cached cross-process clip */
     LONG64                             clip_target_seq;
     HRGN                               clip_region;

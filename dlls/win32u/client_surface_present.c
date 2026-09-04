@@ -257,9 +257,9 @@ static BOOL claim_client_surface_retry( struct client_surface *surface, UINT64 g
     if (!generation) return FALSE;
     for (;;)
     {
-        current = ReadAcquire64( &surface->recompose_retry_generation );
+        current = ReadAcquire64( &surface->scene_retry_generation );
         if ((UINT64)current >= generation) return FALSE;
-        if (InterlockedCompareExchange64( &surface->recompose_retry_generation,
+        if (InterlockedCompareExchange64( &surface->scene_retry_generation,
                                           (LONG64)generation, current ) == current)
             return TRUE;
     }
@@ -439,19 +439,9 @@ void client_surface_lock_present( struct client_surface *surface )
 
 void client_surface_unlock_present( struct client_surface *surface )
 {
-    struct client_surface_geometry geometry;
-
     pthread_mutex_unlock( &surface->completion_lock );
     if (InterlockedCompareExchange( &surface->external_completion_count, 0, 0 )) return;
-    if (!InterlockedExchange( &surface->recompose_deferred, FALSE )) return;
-
-    /* A replay consumer which could not acquire completion_lock transferred
-     * scheduling ownership to this producer.  Drop the old scheduled state
-     * only after the producer releases its causal boundary, then request one
-     * fresh coalesced replay for the current top-level. */
-    InterlockedExchange( &surface->recompose_scheduled, FALSE );
-    client_surface_get_geometry( surface, &geometry );
-    if (geometry.toplevel) client_surface_geometry_ready( geometry.toplevel );
+    client_surface_resume_recompose( surface );
 }
 
 void client_surface_prepare_present_locked( struct client_surface *surface,

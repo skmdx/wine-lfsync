@@ -35,5 +35,6 @@ extern BOOL client_surface_update_present_locked( struct client_surface *surface
 extern BOOL client_surface_end_present_internal( struct client_surface *surface, UINT64 generation,
                                                  const SIZE *expected_size, BOOL new_content,
                                                  struct client_surface_present *present );
+extern void client_surface_resume_recompose( struct client_surface *surface );
 
 #endif /* __WINE_WIN32U_CLIENT_SURFACE_H */
