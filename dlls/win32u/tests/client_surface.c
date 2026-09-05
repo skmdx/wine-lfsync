@@ -1006,6 +1006,107 @@ done:
     if (other) DestroyWindow( other );
 }
 
+static void test_handoff_lost_recovery(void)
+{
+    const UINT_PTR identity = 0x79480000;
+    const UINT flags = CLIENT_SURFACE_STATE_REGISTER | CLIENT_SURFACE_STATE_SCENE_PUBLICATION;
+    struct handoff_binding producer = {0}, owner = {0}, replacement = {0};
+    struct client_surface_handoff_shared *shared;
+    struct client_surface_handoff_slot *slot;
+    void *producer_view = NULL, *owner_view = NULL, *replacement_view = NULL;
+    UINT64 control, generation, old_cookie = 0;
+    BOOL producer_bound = FALSE, owner_bound = FALSE, replacement_bound = FALSE;
+    unsigned int status;
+    HWND hwnd = create_test_window( FALSE );
+
+    ok( !!hwnd, "failed to create handoff recovery window\n" );
+    if (!hwnd) return;
+    status = set_surface_state( hwnd, identity, flags, 0, NULL );
+    ok( !status, "handoff recovery registration status %#x\n", status );
+    status = claim_surface_state( hwnd, identity, NULL );
+    ok( !status, "handoff recovery claim status %#x\n", status );
+    status = get_surface_handoff( hwnd, 0, identity, FALSE, &producer );
+    ok( !status, "handoff recovery producer bind status %#x\n", status );
+    if (status) goto done;
+    producer_bound = TRUE;
+    producer_view = MapViewOfFile( producer.mapping, FILE_MAP_READ | FILE_MAP_WRITE,
+                                   0, 0, producer.size );
+    CloseHandle( producer.mapping );
+    producer.mapping = NULL;
+    ok( !!producer_view, "handoff recovery producer map error %lu\n", GetLastError() );
+    if (!producer_view) goto done;
+
+    status = get_surface_handoff( hwnd, GetCurrentProcessId(), identity, TRUE, &owner );
+    ok( !status, "handoff recovery consumer bind status %#x\n", status );
+    if (status) goto done;
+    owner_bound = TRUE;
+    owner_view = MapViewOfFile( owner.mapping, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, owner.size );
+    CloseHandle( owner.mapping );
+    owner.mapping = NULL;
+    ok( !!owner_view, "handoff recovery consumer map error %lu\n", GetLastError() );
+    if (!owner_view) goto done;
+
+    slot = (void *)((char *)producer_view + producer.offset);
+    control = __atomic_load_n( &slot->control, __ATOMIC_ACQUIRE );
+    generation = client_surface_handoff_generation( control );
+    __atomic_store_n( &slot->control,
+                      client_surface_handoff_control( generation, CLIENT_SURFACE_HANDOFF_LOST ),
+                      __ATOMIC_RELEASE );
+    old_cookie = producer.cookie;
+    status = release_surface_handoff( hwnd, GetCurrentProcessId(), identity,
+                                      owner.cookie, TRUE );
+    ok( !status, "handoff recovery consumer release status %#x\n", status );
+    owner_bound = FALSE;
+    status = release_surface_handoff( hwnd, 0, identity, producer.cookie, FALSE );
+    ok( !status, "handoff recovery producer release status %#x\n", status );
+    producer_bound = FALSE;
+    UnmapViewOfFile( owner_view );
+    owner_view = NULL;
+    UnmapViewOfFile( producer_view );
+    producer_view = NULL;
+
+    status = get_surface_handoff( hwnd, 0, identity, FALSE, &replacement );
+    ok( !status, "handoff recovery replacement bind status %#x\n", status );
+    if (status) goto done;
+    replacement_bound = TRUE;
+    replacement_view = MapViewOfFile( replacement.mapping, FILE_MAP_READ | FILE_MAP_WRITE,
+                                      0, 0, replacement.size );
+    CloseHandle( replacement.mapping );
+    replacement.mapping = NULL;
+    ok( !!replacement_view, "handoff recovery replacement map error %lu\n", GetLastError() );
+    if (replacement_view)
+    {
+        shared = replacement_view;
+        slot = (void *)((char *)replacement_view + replacement.offset);
+        control = __atomic_load_n( &slot->control, __ATOMIC_ACQUIRE );
+        ok( replacement.cookie != old_cookie && slot->cookie == replacement.cookie,
+            "handoff recovery reused stale cookie %s\n", wine_dbgstr_longlong( old_cookie ) );
+        ok( client_surface_handoff_state( control ) == CLIENT_SURFACE_HANDOFF_FREE &&
+            client_surface_handoff_generation( control ),
+            "handoff recovery replacement control %s\n", wine_dbgstr_longlong( control ) );
+        ok( slot->endpoints == CLIENT_SURFACE_HANDOFF_ENDPOINT_PRODUCER,
+            "handoff recovery replacement endpoints %#x\n", slot->endpoints );
+        ok( !(__atomic_load_n( &shared->ready_bitmap[
+                                  (slot - shared->slots) / 64], __ATOMIC_ACQUIRE ) &
+              ((UINT64)1 << ((slot - shared->slots) % 64))),
+            "handoff recovery replacement retained a ready bit\n" );
+    }
+done:
+    if (producer.mapping) CloseHandle( producer.mapping );
+    if (owner.mapping) CloseHandle( owner.mapping );
+    if (replacement.mapping) CloseHandle( replacement.mapping );
+    if (producer_bound) release_surface_handoff( hwnd, 0, identity, producer.cookie, FALSE );
+    if (owner_bound)
+        release_surface_handoff( hwnd, GetCurrentProcessId(), identity, owner.cookie, TRUE );
+    if (replacement_bound)
+        release_surface_handoff( hwnd, 0, identity, replacement.cookie, FALSE );
+    if (producer_view) UnmapViewOfFile( producer_view );
+    if (owner_view) UnmapViewOfFile( owner_view );
+    if (replacement_view) UnmapViewOfFile( replacement_view );
+    set_surface_state( hwnd, identity, CLIENT_SURFACE_STATE_UNREGISTER, 0, NULL );
+    DestroyWindow( hwnd );
+}
+
 #define HANDOFF_EXIT_ID 0x79500000
 
 static void handoff_storage_exit_child( HWND hwnd, HANDLE ready, HANDLE release,
@@ -3317,6 +3418,11 @@ static BOOL run_focused_test_case( const char *name, char **argv )
         test_handoff_storage_process_exit( argv, FALSE );
         return TRUE;
     }
+    if (!strcmp( name, "handoff-lost-recovery" ))
+    {
+        test_handoff_lost_recovery();
+        return TRUE;
+    }
     if (!strcmp( name, "handoff-ready-process-exit" ))
     {
         test_handoff_storage_process_exit( argv, TRUE );
@@ -3444,6 +3550,7 @@ START_TEST(client_surface)
     test_lease_storage();
     trace( "testing client surface generation handoff storage\n" );
     test_handoff_storage();
+    test_handoff_lost_recovery();
     test_handoff_storage_process_exit( argv, FALSE );
     test_handoff_storage_process_exit( argv, TRUE );
     test_handoff_storage_owner_exit( argv, FALSE );

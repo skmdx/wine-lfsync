@@ -1200,22 +1200,34 @@ static BOOL compose_client_surface_handoff(
 
 static void process_client_surface_handoffs(void)
 {
-    struct client_surface_compositor_binding *binding;
+    struct client_surface_compositor_binding **cursor = &client_surface_compositor_bindings;
 
-    for (binding = client_surface_compositor_bindings; binding; binding = binding->next)
+    while (*cursor)
     {
+        struct client_surface_compositor_binding *binding = *cursor;
         ptrdiff_t index = binding->slot - binding->pool->shared->slots;
         UINT64 bitmap = __atomic_load_n( &binding->pool->shared->ready_bitmap[index / 64],
                                          __ATOMIC_ACQUIRE );
         UINT64 control;
 
-        if (!(bitmap & ((UINT64)1 << (index % 64)))) continue;
+        if (!(bitmap & ((UINT64)1 << (index % 64))))
+        {
+            cursor = &binding->next;
+            continue;
+        }
         control = __atomic_load_n( &binding->slot->control, __ATOMIC_ACQUIRE );
         if (client_surface_handoff_state( control ) == CLIENT_SURFACE_HANDOFF_READY)
+        {
             compose_client_surface_handoff( binding, control );
-        else if (client_surface_handoff_state( control ) == CLIENT_SURFACE_HANDOFF_LOST)
+            control = __atomic_load_n( &binding->slot->control, __ATOMIC_ACQUIRE );
+        }
+        if (client_surface_handoff_state( control ) == CLIENT_SURFACE_HANDOFF_LOST)
+        {
             __atomic_fetch_and( &binding->pool->shared->ready_bitmap[index / 64],
                                 ~((LONG64)1 << (index % 64)), __ATOMIC_ACQ_REL );
+            remove_client_surface_compositor_binding( cursor );
+        }
+        else cursor = &binding->next;
     }
 }
 

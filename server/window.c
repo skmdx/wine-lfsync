@@ -2462,6 +2462,8 @@ DECL_HANDLER(get_client_surface_handoff)
 DECL_HANDLER(release_client_surface_handoff)
 {
     struct client_surface_ref *surface;
+    struct client_surface_handoff_slot *slot;
+    user_handle_t refresh = 0;
     int producer_view = !req->owner;
 
     if (producer_view && req->producer && req->producer != current->process->id)
@@ -2497,16 +2499,26 @@ DECL_HANDLER(release_client_surface_handoff)
         set_error( STATUS_INVALID_PARAMETER );
         return;
     }
+    slot = &surface->handoff_pool->shared->slots[surface->handoff_index];
     if (producer_view) surface->handoff_producer_mapped = 0;
     else surface->handoff_consumer_mapped = 0;
-    __atomic_fetch_and( &surface->handoff_pool->shared->slots[surface->handoff_index].endpoints,
+    __atomic_fetch_and( &slot->endpoints,
                         ~(LONG)(producer_view ? CLIENT_SURFACE_HANDOFF_ENDPOINT_PRODUCER :
                                                 CLIENT_SURFACE_HANDOFF_ENDPOINT_CONSUMER),
                         __ATOMIC_RELEASE );
-    if (!surface->active && !surface->cached &&
-        !surface->handoff_producer_mapped && !surface->handoff_consumer_mapped)
+    if (!surface->handoff_producer_mapped && !surface->handoff_consumer_mapped &&
+        ((!surface->active && !surface->cached) ||
+         client_surface_handoff_state( __atomic_load_n( &slot->control, __ATOMIC_ACQUIRE ) ) ==
+             CLIENT_SURFACE_HANDOFF_LOST))
+    {
+        if ((surface->active || surface->cached) && surface->handoff_top)
+            refresh = surface->handoff_top->handle;
         free_client_surface_handoff( surface );
+    }
     free_client_surface_ref_if_unused( surface );
+    if (refresh)
+        post_message_coalesced( refresh, WM_WINE_UPDATEWINDOWSTATE,
+                                WINE_UPDATE_CLIENT_SURFACE_HANDOFFS, 0 );
 }
 
 DECL_HANDLER(complete_client_surface_handoff)
