@@ -410,15 +410,12 @@ static BOOL X11DRV_client_surface_present( struct client_surface *client,
                                          &rect_dst, &rect_src, region ) : TRUE;
     if (ret && (!defer_visible || !backing))
         ret = copy_client_surface( surface, surface->hdc_dst, window, &rect_dst, &rect_src, region );
-    if (ret)
-    {
-        /* A staged generation may aggregate surfaces from several renderer
-         * processes.  Complete this connection's copy before acknowledging
-         * its generation to the server; ordering only the last renderer's
-         * commit event cannot order work submitted on the other connections. */
-        if (flush) XSync( gdi_display, False );
-        else XFlush( gdi_display );
-    }
+    /* A failed copy does not undo earlier native requests.  In particular,
+     * the backing copy may have succeeded before the visible copy failed.
+     * Complete this connection's writes before returning its writer lease,
+     * even when the failed frame will not commit its scene generation. */
+    if (flush) XSync( gdi_display, False );
+    else XFlush( gdi_display );
 
     if (region) NtGdiDeleteObjectApp( region );
     return ret;
