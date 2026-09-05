@@ -192,9 +192,10 @@ static BOOL x11drv_client_surface_prepare_completion( struct client_surface *cli
     {
         /* The caller will still submit the host present.  Retrying with a new
          * monitor could then mistake that unobserved operation for a future
-         * presentation.  An XSync on the GDI connection does not complete a
-         * swap queued on a separate WSI connection.  Without a usable monitor,
-         * do not manufacture completion evidence or authorize composition. */
+         * presentation.  A GDI XSync does not complete asynchronous WSI
+         * presentation, which may also use another connection.  Without a
+         * usable monitor, do not manufacture completion evidence or authorize
+         * composition. */
         surface->completion.broken = TRUE;
         InterlockedExchange( &client->cacheable, FALSE );
         return FALSE;
