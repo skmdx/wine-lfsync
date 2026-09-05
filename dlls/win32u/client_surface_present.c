@@ -301,6 +301,16 @@ BOOL client_surface_end_present_internal( struct client_surface *surface,
     if (compose && offscreen && !present->scene.valid) compose = FALSE;
     guarded = compose && offscreen &&
               client_surface_backend_has_cap( surface, CLIENT_SURFACE_BACKEND_NATIVE_WRITE_LEASE );
+    if (guarded && !NtUserIsWindowVisible( hwnd ))
+    {
+        /* The server cannot admit a writer for a hidden HWND.  Preserve this
+         * completed source for show-time replay without a predictably denied
+         * lease RPC on every hidden frame.  Visibility can race a scene
+         * change, so validate the shared scene just as for a server denial. */
+        composed = client_surface_scene_current( &present->scene );
+        scene_retry = !composed;
+        compose = FALSE;
+    }
     if (compose && (sync || guarded))
     {
         authorized = begin_client_surface_composition( hwnd, surface, present,
