@@ -1019,6 +1019,42 @@ void client_surface_submit_present( struct client_surface *surface,
     client_surface_unlock_present( surface );
 }
 
+static BOOL client_surface_complete_direct_present_locked(
+    struct client_surface *surface, struct client_surface_frame *present )
+{
+    BOOL completed = FALSE;
+
+    /* A DIRECT swap has already made the producer-owned native child visible.
+     * It has no compositor destination, completion token or scene generation
+     * to publish.  Retain only the completed source metadata needed by a
+     * later DIRECT -> STAGED/COMPOSITED transition. */
+    pthread_mutex_lock( &surface->present_lock );
+    if (present->target_seq != surface->target.seq ||
+        present->scene.toplevel != surface->target.toplevel ||
+        !surface->hwnd || !surface->target.valid || surface->target.offscreen ||
+        (!InterlockedCompareExchange( &surface->active, 0, 0 ) &&
+         !InterlockedCompareExchange( &surface->server_cached, 0, 0 )))
+    {
+        TRACE( "discarding direct %s presentation across target state change\n",
+               debugstr_client_surface( surface ) );
+    }
+    else if (present->serial <= surface->composed_serial)
+    {
+        present->result = CLIENT_SURFACE_FRAME_SUPERSEDED;
+        TRACE( "discarding superseded direct presentation %s serial %s, composed %s\n",
+               debugstr_client_surface( surface ), wine_dbgstr_longlong( present->serial ),
+               wine_dbgstr_longlong( surface->composed_serial ) );
+    }
+    else
+    {
+        surface->composed_serial = present->serial;
+        InterlockedExchange( &surface->content_valid, TRUE );
+        completed = TRUE;
+    }
+    pthread_mutex_unlock( &surface->present_lock );
+    return completed;
+}
+
 BOOL client_surface_complete_present_locked( struct client_surface *surface,
                                              struct client_surface_frame *present,
                                              BOOL submitted, BOOL external_completed,
@@ -1086,7 +1122,15 @@ BOOL client_surface_complete_present_locked( struct client_surface *surface,
             client_surface_abandon_handoff_locked( surface, present );
     }
     if (completed && !handed_off && present->result != CLIENT_SURFACE_FRAME_SUPERSEDED)
-        completed = client_surface_end_present_internal( surface, expected_size, TRUE, present );
+    {
+        if (present->target == CLIENT_SURFACE_FRAME_TARGET_ONSCREEN &&
+            present->mode == CLIENT_SURFACE_PRESENTATION_DIRECT &&
+            !present->scene.generation &&
+            present->completion.kind == CLIENT_SURFACE_COMPLETION_NONE)
+            completed = client_surface_complete_direct_present_locked( surface, present );
+        else
+            completed = client_surface_end_present_internal( surface, expected_size, TRUE, present );
+    }
     if (!completed) client_surface_abandon_handoff_locked( surface, present );
     /* A composition failure may still have accepted a completed source; its
      * serial then protects it from invalidation.  Otherwise retire both the
