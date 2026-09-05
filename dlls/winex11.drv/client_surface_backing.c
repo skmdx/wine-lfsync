@@ -70,6 +70,10 @@ struct client_surface_compositor_binding
     unsigned int source_width;
     unsigned int source_height;
     unsigned int source_depth;
+    UINT64 held_control;
+    UINT64 held_generation;
+    UINT64 held_epoch;
+    unsigned int held_frame;
 };
 
 #define CLIENT_SURFACE_COMPOSITOR_FRAME_COUNT 3
@@ -113,10 +117,14 @@ struct client_surface_compositor_target
     unsigned int published_height;
     unsigned int next_frame;
     unsigned int mailbox_frame;
+    unsigned int assembly_frame;
     UINT64 mailbox_publish_generation;
     UINT64 mailbox_publish_epoch;
+    UINT64 assembly_generation;
+    UINT64 assembly_epoch;
     UINT64 scene_epoch;
     BOOL mailbox_pending;
+    BOOL assembly_pending;
     XID present_event;
     unsigned int width;
     unsigned int height;
@@ -626,6 +634,44 @@ static void client_surface_handoff_wake_release( struct client_surface_handoff_s
     client_surface_handoff_futex_wake( &shared->release_sequence );
 }
 
+static void release_client_surface_compositor_handoff(
+    struct client_surface_compositor_binding *binding )
+{
+    UINT64 expected, released;
+
+    if (!binding->held_control) return;
+    expected = client_surface_handoff_control(
+        client_surface_handoff_generation( binding->held_control ),
+        CLIENT_SURFACE_HANDOFF_READING );
+    released = client_surface_handoff_control(
+        client_surface_handoff_generation( binding->held_control ),
+        CLIENT_SURFACE_HANDOFF_RELEASED );
+    __atomic_compare_exchange_n( &binding->slot->control, &expected, released, 0,
+                                 __ATOMIC_RELEASE, __ATOMIC_ACQUIRE );
+    binding->held_control = 0;
+    binding->held_generation = 0;
+    binding->held_epoch = 0;
+    binding->held_frame = 0;
+    client_surface_handoff_wake_release( binding->pool->shared );
+}
+
+static void abort_client_surface_compositor_assembly(
+    struct client_surface_compositor_target *target )
+{
+    struct client_surface_compositor_binding *binding;
+
+    if (!target->assembly_pending) return;
+    for (binding = client_surface_compositor_bindings; binding; binding = binding->next)
+        if (binding->toplevel == target->toplevel &&
+            binding->held_generation == target->assembly_generation &&
+            binding->held_epoch == target->assembly_epoch)
+            release_client_surface_compositor_handoff( binding );
+    target->assembly_pending = FALSE;
+    target->assembly_generation = 0;
+    target->assembly_epoch = 0;
+    target->assembly_frame = 0;
+}
+
 static struct client_surface_compositor_pool *find_client_surface_compositor_pool( UINT64 id )
 {
     struct client_surface_compositor_pool *pool;
@@ -727,6 +773,7 @@ static void remove_client_surface_compositor_binding(
     struct client_surface_compositor_binding *binding = *cursor;
 
     *cursor = binding->next;
+    release_client_surface_compositor_handoff( binding );
     if (binding->source)
     {
         XFreePixmap( client_surface_compositor_display, binding->source );
@@ -822,6 +869,7 @@ static void update_client_surface_compositor_scene(
     unsigned int i;
 
     if (target->scene_epoch == scene_epoch) return;
+    abort_client_surface_compositor_assembly( target );
     for (i = 0; i < ARRAY_SIZE(target->frames); ++i)
     {
         struct client_surface_compositor_frame *frame = &target->frames[i];
@@ -931,6 +979,11 @@ static BOOL update_client_surface_compositor_target( struct client_surface_compo
                  target->frames[1].pixmap == job->pixmaps[1]) ||
                 (target->frames[0].pixmap == job->pixmaps[1] &&
                  target->frames[1].pixmap == job->pixmaps[0]));
+    if (target->assembly_pending &&
+        (target->window != job->destination || target->backing != job->pixmaps[0] ||
+         target->window_width != job->window_width || target->window_height != job->window_height ||
+         target->depth != job->depth || target->visual != job->visual))
+        abort_client_surface_compositor_assembly( target );
     if ((target->window && target->window != job->destination) ||
         (target->frames[0].pixmap && !same_pool))
     {
@@ -1235,33 +1288,24 @@ static BOOL copy_client_surface_handoff_to_frame(
     return TRUE;
 }
 
-static BOOL complete_client_surface_handoff_generation(
-    const struct client_surface_compositor_binding *binding,
-    const struct client_surface_handoff_slot *slot, BOOL *publish )
+static BOOL complete_client_surface_handoff_generation( HWND toplevel, UINT64 generation,
+                                                        UINT64 scene_generation )
 {
     BOOL accepted = FALSE;
     NTSTATUS status;
 
-    SERVER_START_REQ( complete_client_surface_handoff )
+    SERVER_START_REQ( complete_client_surface_handoffs )
     {
-        req->handle = wine_server_user_handle( binding->window );
-        req->producer = binding->process;
-        req->surface = binding->identity;
-        req->cookie = binding->cookie;
-        req->generation = slot->scene_generation;
-        req->scene_generation = slot->scene_epoch;
+        req->handle = wine_server_user_handle( toplevel );
+        req->generation = generation;
+        req->scene_generation = scene_generation;
         status = wine_server_call( req );
-        if (!status)
-        {
-            accepted = reply->accepted;
-            *publish = reply->publish;
-        }
+        if (!status) accepted = reply->accepted;
     }
     SERVER_END_REQ;
-    TRACE( "completed handoff identity %s scene generation %s epoch %s status %#lx accepted %u publish %u\n",
-           wine_dbgstr_longlong( binding->identity ),
-           wine_dbgstr_longlong( slot->scene_generation ),
-           wine_dbgstr_longlong( slot->scene_epoch ), (unsigned long)status, accepted, *publish );
+    TRACE( "completed owner generation %s epoch %s status %#lx accepted %u\n",
+           wine_dbgstr_longlong( generation ), wine_dbgstr_longlong( scene_generation ),
+           (unsigned long)status, accepted );
     return !status && accepted;
 }
 
@@ -1292,11 +1336,87 @@ static struct client_surface_compositor_frame *find_client_surface_pending_publi
 {
     unsigned int i;
 
+    if (target->mailbox_pending && target->mailbox_publish_generation == generation &&
+        target->mailbox_publish_epoch == epoch)
+        return &target->frames[target->mailbox_frame];
     for (i = 0; i < ARRAY_SIZE(target->frames); ++i)
         if (target->frames[i].publish_pending &&
             target->frames[i].publish_generation == generation &&
             target->frames[i].publish_epoch == epoch) return &target->frames[i];
     return NULL;
+}
+
+static BOOL client_surface_handoff_generation_assembled(
+    struct client_surface_compositor_target *target,
+    struct client_surface_compositor_frame *frame, UINT64 generation, UINT64 epoch )
+{
+    struct client_surface_compositor_binding *binding;
+    unsigned int count = 0, frame_index = frame - target->frames;
+
+    if (!target->assembly_pending || target->assembly_generation != generation ||
+        target->assembly_epoch != epoch || target->assembly_frame != frame_index)
+        return FALSE;
+    for (binding = client_surface_compositor_bindings; binding; binding = binding->next)
+    {
+        UINT64 control;
+
+        if (binding->toplevel != target->toplevel) continue;
+        count++;
+        if (!binding->held_control || binding->held_generation != generation ||
+            binding->held_epoch != epoch || binding->held_frame != frame_index)
+            return FALSE;
+        control = __atomic_load_n( &binding->slot->control, __ATOMIC_ACQUIRE );
+        if (control != client_surface_handoff_control(
+                           client_surface_handoff_generation( binding->held_control ),
+                           CLIENT_SURFACE_HANDOFF_READING ))
+            return FALSE;
+    }
+    return !!count;
+}
+
+static BOOL publish_client_surface_handoff_assembly(
+    struct client_surface_compositor_target *target,
+    struct client_surface_compositor_frame *frame, UINT64 generation, UINT64 epoch )
+{
+    BOOL visible = FALSE, queued = FALSE, deferred = FALSE;
+    RECT full = {0, 0, target->window_width, target->window_height};
+
+    if (!complete_client_surface_handoff_generation( target->toplevel, generation, epoch ))
+        goto done;
+
+    note_client_surface_compositor_damage( target, frame, &full );
+#ifdef SONAME_LIBXPRESENT
+    if (usexpresent && !target->mailbox_pending &&
+        count_client_surface_compositor_frames( target ) < CLIENT_SURFACE_COMPOSITOR_MAX_INFLIGHT)
+        visible = queued = submit_client_surface_present( target, frame, generation, epoch, NULL );
+    else if (usexpresent)
+    {
+        target->mailbox_frame = frame - target->frames;
+        target->mailbox_pending = TRUE;
+        target->mailbox_publish_generation = generation;
+        target->mailbox_publish_epoch = epoch;
+        visible = deferred = TRUE;
+    }
+#endif
+    if (!visible)
+        visible = client_surface_copy_on_compositor( frame->pixmap, target->window,
+                                                     0, 0, 0, 0,
+                                                     target->width, target->height );
+    if (visible && !queued && !deferred)
+    {
+        target->published = frame->pixmap;
+        target->published_width = frame->width;
+        target->published_height = frame->height;
+    }
+    if (!queued && !deferred)
+        publish_client_surface_handoff_generation( target->toplevel, generation, epoch, visible );
+
+done:
+    /* XSync in the copy path made every imported source reusable. Keep all
+     * transactional slots in READING until the server has atomically accepted
+     * their complete set and the owner has reserved its single publication. */
+    abort_client_surface_compositor_assembly( target );
+    return visible;
 }
 
 static BOOL compose_client_surface_handoff(
@@ -1311,8 +1431,7 @@ static BOOL compose_client_surface_handoff(
     RECT damage;
     unsigned int destination_width, destination_height, i, source_depth = 0;
     BOOL xfixes_clip;
-    BOOL accepted = FALSE, composed = FALSE, copied = FALSE, dropped = FALSE, publish = FALSE;
-    BOOL deferred_present = FALSE, queued_present = FALSE;
+    BOOL composed = FALSE, copied = FALSE, dropped = FALSE;
 
     if (!__atomic_compare_exchange_n( &slot->control, &expected,
                                       client_surface_handoff_control(
@@ -1401,11 +1520,22 @@ static BOOL compose_client_surface_handoff(
         if (slot->scene_generation)
             previous_publish = find_client_surface_pending_publication(
                 target, slot->scene_generation, slot->scene_epoch );
+        if (slot->scene_generation && !previous_publish && target->assembly_pending &&
+            (target->assembly_generation != slot->scene_generation ||
+             target->assembly_epoch != slot->scene_epoch))
+            abort_client_surface_compositor_assembly( target );
 #ifdef SONAME_LIBXPRESENT
         if (usexpresent)
-            frame = (!slot->scene_generation || previous_publish) ?
-                    get_client_surface_compositor_frame( target ) :
-                    acquire_client_surface_compositor_frame( target, target->backing );
+        {
+            if (!slot->scene_generation || previous_publish)
+                frame = get_client_surface_compositor_frame( target );
+            else if (target->assembly_pending &&
+                     target->assembly_generation == slot->scene_generation &&
+                     target->assembly_epoch == slot->scene_epoch)
+                frame = &target->frames[target->assembly_frame];
+            else
+                frame = acquire_client_surface_compositor_frame( target, target->backing );
+        }
         else
 #endif
         if (target->frames[0].pixmap == target->backing) frame = &target->frames[0];
@@ -1415,10 +1545,18 @@ static BOOL compose_client_surface_handoff(
                           binding, slot, &source, &source_depth ))
             goto release;
 
-        /* Every producer in a transaction writes the owner-selected backing.
-         * The final completion therefore exposes one assembled scene even if
-         * some producers used the legacy conversion fallback.  Full steady
-         * frames may still rotate through the coalescing Present pool. */
+        if (slot->scene_generation && !previous_publish && !target->assembly_pending)
+        {
+            target->assembly_pending = TRUE;
+            target->assembly_generation = slot->scene_generation;
+            target->assembly_epoch = slot->scene_epoch;
+            target->assembly_frame = frame - target->frames;
+        }
+
+        /* Every producer in a transaction is copied into one owner-selected
+         * frame. The owner retains their READING slots until the complete set
+         * can be accepted and exposed as one scene. Full steady frames may
+         * still rotate through the coalescing Present pool. */
         copied = copy_client_surface_handoff_to_frame( target, frame, source, source_depth,
                                                         slot, &damage );
         if (copied)
@@ -1428,48 +1566,16 @@ static BOOL compose_client_surface_handoff(
         }
         if (copied && slot->scene_generation && !previous_publish)
         {
-            accepted = complete_client_surface_handoff_generation( binding, slot, &publish );
-            if (accepted && publish)
-            {
-                BOOL visible = FALSE;
-                RECT full = {0, 0, target->window_width, target->window_height};
-
-                note_client_surface_compositor_damage( target, frame, &full );
-
-#ifdef SONAME_LIBXPRESENT
-                if (usexpresent && !target->mailbox_pending &&
-                    count_client_surface_compositor_frames( target ) <
-                        CLIENT_SURFACE_COMPOSITOR_MAX_INFLIGHT)
-                    visible = queued_present = submit_client_surface_present(
-                        target, frame, slot->scene_generation, slot->scene_epoch, NULL );
-                else if (usexpresent)
-                {
-                    target->mailbox_frame = frame - target->frames;
-                    target->mailbox_pending = TRUE;
-                    if (accepted && publish)
-                    {
-                        target->mailbox_publish_generation = slot->scene_generation;
-                        target->mailbox_publish_epoch = slot->scene_epoch;
-                    }
-                    visible = deferred_present = TRUE;
-                }
-#endif
-                if (!visible)
-                    visible = client_surface_copy_on_compositor( frame->pixmap, target->window,
-                                                                 0, 0, 0, 0,
-                                                                 target->width, target->height );
-                if (visible && !queued_present && !deferred_present)
-                {
-                    target->published = frame->pixmap;
-                    target->published_width = frame->width;
-                    target->published_height = frame->height;
-                }
-                if (!queued_present && !deferred_present)
-                    composed = publish_client_surface_handoff_generation( target->toplevel,
-                        slot->scene_generation, slot->scene_epoch, visible );
-                else composed = visible;
-            }
-            else composed = accepted;
+            assert( !binding->held_control );
+            binding->held_control = control;
+            binding->held_generation = slot->scene_generation;
+            binding->held_epoch = slot->scene_epoch;
+            binding->held_frame = frame - target->frames;
+            composed = TRUE;
+            if (client_surface_handoff_generation_assembled(
+                    target, frame, slot->scene_generation, slot->scene_epoch ))
+                composed = publish_client_surface_handoff_assembly(
+                    target, frame, slot->scene_generation, slot->scene_epoch );
         }
         else if (copied)
         {
@@ -1483,8 +1589,11 @@ static BOOL compose_client_surface_handoff(
             {
                 target->mailbox_frame = frame - target->frames;
                 target->mailbox_pending = TRUE;
-                target->mailbox_publish_generation = 0;
-                target->mailbox_publish_epoch = 0;
+                if (previous_publish != frame)
+                {
+                    target->mailbox_publish_generation = 0;
+                    target->mailbox_publish_epoch = 0;
+                }
                 composed = TRUE;
             }
 #endif
@@ -1501,6 +1610,18 @@ static BOOL compose_client_surface_handoff(
         }
     }
 release:
+    if (!copied && slot->scene_generation && !previous_publish && target &&
+        target->assembly_pending && target->assembly_generation == slot->scene_generation &&
+        target->assembly_epoch == slot->scene_epoch)
+        abort_client_surface_compositor_assembly( target );
+    if (binding->held_control)
+    {
+        TRACE( "held handoff hwnd %p identity %s generation %s scene %s for owner assembly\n",
+               binding->window, wine_dbgstr_longlong( binding->identity ),
+               wine_dbgstr_longlong( client_surface_handoff_generation( control ) ),
+               wine_dbgstr_longlong( slot->scene_generation ) );
+        return composed;
+    }
     /* Once the compositor connection has copied the source into its backing,
      * or rejected it against a newer owner epoch before import, source storage
      * is reusable. A native import/copy failure instead retires the binding. */

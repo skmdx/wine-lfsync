@@ -6443,24 +6443,21 @@ struct release_client_surface_handoff_reply
     struct reply_header __header;
 };
 
-/* Complete one owner-copied scene generation. Steady-state generation zero
- * frames require no server acknowledgement. */
-struct complete_client_surface_handoff_request
+/* Atomically accept one owner-assembled scene generation. All selected
+ * handoffs remain READING until this request has validated the complete set;
+ * steady-state generation zero frames require no server acknowledgement. */
+struct complete_client_surface_handoffs_request
 {
     struct request_header __header;
     user_handle_t  handle;
-    process_id_t   producer;
-    char __pad_20[4];
-    client_ptr_t   surface;
-    unsigned __int64 cookie;
     unsigned __int64 generation;
     unsigned __int64 scene_generation;
 };
-struct complete_client_surface_handoff_reply
+struct complete_client_surface_handoffs_reply
 {
     struct reply_header __header;
     int            accepted;
-    int            publish;
+    char __pad_12[4];
 };
 
 
@@ -6814,7 +6811,7 @@ enum request
     REQ_complete_client_surface_lease,
     REQ_get_client_surface_handoff,
     REQ_release_client_surface_handoff,
-    REQ_complete_client_surface_handoff,
+    REQ_complete_client_surface_handoffs,
     REQ_publish_client_surface_handoff,
     REQ_get_client_surface_handoffs,
     REQ_NB_REQUESTS
@@ -7140,7 +7137,7 @@ union generic_request
     struct complete_client_surface_lease_request complete_client_surface_lease_request;
     struct get_client_surface_handoff_request get_client_surface_handoff_request;
     struct release_client_surface_handoff_request release_client_surface_handoff_request;
-    struct complete_client_surface_handoff_request complete_client_surface_handoff_request;
+    struct complete_client_surface_handoffs_request complete_client_surface_handoffs_request;
     struct publish_client_surface_handoff_request publish_client_surface_handoff_request;
     struct get_client_surface_handoffs_request get_client_surface_handoffs_request;
 };
@@ -7464,11 +7461,11 @@ union generic_reply
     struct complete_client_surface_lease_reply complete_client_surface_lease_reply;
     struct get_client_surface_handoff_reply get_client_surface_handoff_reply;
     struct release_client_surface_handoff_reply release_client_surface_handoff_reply;
-    struct complete_client_surface_handoff_reply complete_client_surface_handoff_reply;
+    struct complete_client_surface_handoffs_reply complete_client_surface_handoffs_reply;
     struct publish_client_surface_handoff_reply publish_client_surface_handoff_reply;
     struct get_client_surface_handoffs_reply get_client_surface_handoffs_reply;
 };
 
-#define SERVER_PROTOCOL_VERSION 994
+#define SERVER_PROTOCOL_VERSION 995
 
 #endif /* __WINE_WINE_SERVER_PROTOCOL_H */

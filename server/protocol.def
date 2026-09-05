@@ -4486,18 +4486,15 @@ enum inproc_sync_type
     unsigned int   owner;        /* release the compositor-owner endpoint */
 @END
 
-/* Complete one owner-copied scene generation. Steady-state generation zero
- * frames require no server acknowledgement. */
-@REQ(complete_client_surface_handoff)
+/* Atomically accept one owner-assembled scene generation. All selected
+ * handoffs remain READING until this request has validated the complete set;
+ * steady-state generation zero frames require no server acknowledgement. */
+@REQ(complete_client_surface_handoffs)
     user_handle_t  handle;
-    process_id_t   producer;
-    client_ptr_t   surface;
-    unsigned __int64 cookie;
     unsigned __int64 generation;
     unsigned __int64 scene_generation;
 @REPLY
     int            accepted;
-    int            publish;
 @END
 
 /* Finish the native owner publication reserved by a generation completion. */

@@ -2524,50 +2524,71 @@ DECL_HANDLER(release_client_surface_handoff)
                                 WINE_UPDATE_CLIENT_SURFACE_HANDOFFS, 0 );
 }
 
-DECL_HANDLER(complete_client_surface_handoff)
+static int validate_client_surface_handoff_generation( struct window *win, struct window *top,
+                                                       unsigned long long generation,
+                                                       unsigned long long scene_generation,
+                                                       unsigned int *count )
 {
-    struct client_surface_handoff_slot *slot;
+    struct client_surface_owner *owner;
     struct client_surface_ref *surface;
-    struct window *top, *win;
+    struct client_surface_handoff_slot *slot;
+    struct window *child;
+    unsigned long long control;
 
-    reply->accepted = reply->publish = 0;
+    if (!win->client_surface_subtree_count || !is_visible( win )) return 1;
+    if ((surface = select_client_surface_producer( win, &owner )))
+    {
+        if (surface->generation != generation || !surface->handoff_pool ||
+            surface->handoff_top != top || surface->handoff_pool->consumer != current->process)
+            return 0;
+        slot = &surface->handoff_pool->shared->slots[surface->handoff_index];
+        control = __atomic_load_n( &slot->control, __ATOMIC_ACQUIRE );
+        if (slot->cookie != surface->handoff_cookie || slot->identity != surface->id ||
+            slot->producer_process != owner->process->id || slot->window != win->handle ||
+            slot->toplevel != top->handle || slot->scene_generation != generation ||
+            slot->scene_epoch != scene_generation ||
+            client_surface_handoff_state( control ) != CLIENT_SURFACE_HANDOFF_READING)
+            return 0;
+        (*count)++;
+    }
+    LIST_FOR_EACH_ENTRY( child, &win->children, struct window, entry )
+        if (!validate_client_surface_handoff_generation( child, top, generation,
+                                                         scene_generation, count ))
+            return 0;
+    return 1;
+}
+
+DECL_HANDLER(complete_client_surface_handoffs)
+{
+    struct window *top, *win;
+    unsigned int count = 0, cleared;
+
+    reply->accepted = 0;
     if (!(win = get_window( req->handle ))) return;
     top = get_toplevel_window( win );
-    if (!(surface = get_client_surface_handoff_ref( win, req->producer,
-                                                    req->surface, 1 ))) return;
-    if (!surface->handoff_pool || surface->handoff_top != top || !req->cookie ||
-        req->cookie != surface->handoff_cookie)
+    if (!top->thread || top->thread->process != current->process)
     {
-        set_error( STATUS_INVALID_PARAMETER );
+        set_error( STATUS_ACCESS_DENIED );
         return;
     }
-    slot = &surface->handoff_pool->shared->slots[surface->handoff_index];
-    if (slot->cookie != req->cookie || slot->identity != req->surface ||
-        slot->scene_generation != req->generation ||
-        slot->scene_epoch != req->scene_generation ||
-        client_surface_handoff_state( __atomic_load_n( &slot->control, __ATOMIC_ACQUIRE ) ) !=
-            CLIENT_SURFACE_HANDOFF_READING)
-    {
-        set_error( STATUS_INVALID_PARAMETER );
+    if (!client_surface_is_composing( top ) || client_surface_is_publishing( top ) ||
+        req->generation != client_surface_transaction_generation( top ) ||
+        req->scene_generation != top->client_surface_scene_generation ||
+        req->scene_generation != top->client_surface_transaction.epoch ||
+        top->client_surface_writer_count || !top->client_surface_transaction.pending ||
+        !validate_client_surface_handoff_generation( top, top, req->generation,
+                                                     req->scene_generation, &count ) ||
+        count != top->client_surface_transaction.pending)
         return;
-    }
-    if (client_surface_is_composing( top ) &&
-        req->generation == client_surface_transaction_generation( top ) &&
-        req->scene_generation == top->client_surface_scene_generation &&
-        (surface->generation == req->generation ||
-         reopen_client_surface_generation( top, win, surface, req->generation )))
-    {
-        reply->accepted = 1;
-        complete_client_surface_generation( top, surface, req->generation );
-        if (client_surface_is_ready( top ) && !client_surface_is_publishing( top ) &&
-            !top->client_surface_writer_count &&
-            top->client_surface_transaction.epoch == top->client_surface_scene_generation)
-        {
-            top->client_surface_transaction.phase = CLIENT_SURFACE_PHASE_PUBLISHING;
-            update_client_surface_publication( top );
-            reply->publish = 1;
-        }
-    }
+
+    cleared = clear_client_surface_subtree_generation( top, req->generation );
+    assert( cleared == count );
+    top->client_surface_transaction.pending = 0;
+    if (!mark_client_surface_generation_ready( top ) || !client_surface_is_ready( top )) return;
+
+    top->client_surface_transaction.phase = CLIENT_SURFACE_PHASE_PUBLISHING;
+    update_client_surface_publication( top );
+    reply->accepted = 1;
 }
 
 DECL_HANDLER(publish_client_surface_handoff)

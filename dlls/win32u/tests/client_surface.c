@@ -793,29 +793,21 @@ static unsigned int release_surface_handoff( HWND hwnd, DWORD producer, UINT_PTR
     return p_wine_server_call( &info );
 }
 
-static unsigned int complete_surface_handoff( HWND hwnd, DWORD producer, UINT_PTR surface,
-                                               UINT64 cookie, UINT64 generation, UINT64 epoch,
-                                               BOOL *accepted, BOOL *publish )
+static unsigned int complete_surface_handoffs( HWND hwnd, UINT64 generation, UINT64 epoch,
+                                               BOOL *accepted )
 {
     struct __server_request_info info = {0};
-    const struct complete_client_surface_handoff_reply *reply =
-        &info.u.reply.complete_client_surface_handoff_reply;
+    const struct complete_client_surface_handoffs_reply *reply =
+        &info.u.reply.complete_client_surface_handoffs_reply;
     unsigned int status;
 
-    info.u.req.complete_client_surface_handoff_request.__header.req =
-        REQ_complete_client_surface_handoff;
-    info.u.req.complete_client_surface_handoff_request.handle = wine_server_user_handle( hwnd );
-    info.u.req.complete_client_surface_handoff_request.producer = producer;
-    info.u.req.complete_client_surface_handoff_request.surface = surface;
-    info.u.req.complete_client_surface_handoff_request.cookie = cookie;
-    info.u.req.complete_client_surface_handoff_request.generation = generation;
-    info.u.req.complete_client_surface_handoff_request.scene_generation = epoch;
+    info.u.req.complete_client_surface_handoffs_request.__header.req =
+        REQ_complete_client_surface_handoffs;
+    info.u.req.complete_client_surface_handoffs_request.handle = wine_server_user_handle( hwnd );
+    info.u.req.complete_client_surface_handoffs_request.generation = generation;
+    info.u.req.complete_client_surface_handoffs_request.scene_generation = epoch;
     status = p_wine_server_call( &info );
-    if (!status)
-    {
-        if (accepted) *accepted = reply->accepted;
-        if (publish) *publish = reply->publish;
-    }
+    if (!status && accepted) *accepted = reply->accepted;
     return status;
 }
 
@@ -829,7 +821,7 @@ static void test_handoff_storage(void)
     HWND hwnd = create_test_window( FALSE ), other = create_test_window( FALSE );
     UINT64 expected, control, generation, old_cookie = 0;
     BOOL producer_bound = FALSE, owner_bound = FALSE;
-    BOOL accepted = TRUE, publish = TRUE;
+    BOOL accepted = TRUE;
     unsigned int status, index;
     void *producer_view = NULL, *owner_view = NULL;
 
@@ -933,13 +925,9 @@ static void test_handoff_storage(void)
     __atomic_fetch_and( &owner_shared->ready_bitmap[index / 64],
                         ~((UINT64)1 << (index % 64)), __ATOMIC_RELEASE );
 
-    status = complete_surface_handoff( hwnd, GetCurrentProcessId(), identity,
-                                       owner.cookie + 1, 0, 0, &accepted, &publish );
-    ok( status == STATUS_INVALID_PARAMETER, "stale handoff completion status %#x\n", status );
-    status = complete_surface_handoff( hwnd, GetCurrentProcessId(), identity,
-                                       owner.cookie, 0, 0, &accepted, &publish );
-    ok( !status && !accepted && !publish,
-        "idle handoff completion status %#x accepted %u publish %u\n", status, accepted, publish );
+    status = complete_surface_handoffs( hwnd, 0, 0, &accepted );
+    ok( !status && !accepted, "idle handoff completion status %#x accepted %u\n",
+        status, accepted );
     expected = control;
     control = client_surface_handoff_control( generation, CLIENT_SURFACE_HANDOFF_RELEASED );
     ok( __atomic_compare_exchange_n( &owner_slot->control, &expected, control, FALSE,
