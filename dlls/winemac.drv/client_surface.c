@@ -117,7 +117,7 @@ struct client_surface *macdrv_CreateClientSurface(HWND hwnd, int pixel_format, B
     macdrv_set_view_hidden(surface->cocoa_view, TRUE);
 
     client_surface_update(&surface->client);
-    macdrv_client_surface_present(&surface->client, 0, 0, FALSE, FALSE);
+    macdrv_client_surface_present(&surface->client, NULL, 0, 0, FALSE, FALSE);
 
     return &surface->client;
 }
