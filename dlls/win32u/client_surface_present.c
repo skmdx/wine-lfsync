@@ -15,6 +15,13 @@
 
 #include <assert.h>
 
+#ifdef __linux__
+#include <limits.h>
+#include <linux/futex.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+#endif
+
 #include "ntstatus.h"
 #include "client_surface.h"
 #include "ntuser_private.h"
@@ -47,6 +54,343 @@ static void client_surface_backend_abandon_completion( struct client_surface *su
 {
     if (surface->backend->completion && surface->backend->completion->abandon)
         surface->backend->completion->abandon( surface );
+}
+
+static void client_surface_handoff_futex_wake( LONG *address )
+{
+#ifdef __linux__
+    syscall( SYS_futex, address, FUTEX_WAKE, INT_MAX, NULL, NULL, 0 );
+#else
+    (void)address;
+#endif
+}
+
+static void client_surface_handoff_wake_ready( struct client_surface_handoff_shared *shared )
+{
+    if (!__atomic_exchange_n( &shared->ready_parked, 0, __ATOMIC_ACQ_REL )) return;
+    __atomic_add_fetch( &shared->ready_sequence, 1, __ATOMIC_RELEASE );
+    client_surface_handoff_futex_wake( &shared->ready_sequence );
+}
+
+static void client_surface_handoff_wait_sequence( LONG *address, LONG sequence, DWORD timeout )
+{
+#ifdef __linux__
+    struct timespec timespec = {timeout / 1000, (timeout % 1000) * 1000000};
+
+    syscall( SYS_futex, address, FUTEX_WAIT, sequence, &timespec, NULL, 0 );
+#else
+    LARGE_INTEGER delay = {.QuadPart = -(LONGLONG)min( timeout, 1 ) * 10000};
+
+    NtDelayExecution( FALSE, &delay );
+#endif
+}
+
+void client_surface_release_handoff( struct client_surface *surface )
+{
+    struct client_surface_handoff_slot *slot = surface->handoff_slot;
+    DWORD start = NtGetTickCount();
+
+    if (!surface->handoff_view) return;
+    while (slot)
+    {
+        UINT64 control = __atomic_load_n( &slot->control, __ATOMIC_ACQUIRE );
+        enum client_surface_handoff_state state = client_surface_handoff_state( control );
+        LONG sequence;
+
+        if (state == CLIENT_SURFACE_HANDOFF_FREE || state == CLIENT_SURFACE_HANDOFF_RELEASED ||
+            state == CLIENT_SURFACE_HANDOFF_LOST)
+            break;
+        if (NtGetTickCount() - start >= CLIENT_SURFACE_PRESENT_TIMEOUT) break;
+        __atomic_store_n( &surface->handoff_shared->release_parked, 1, __ATOMIC_RELEASE );
+        sequence = __atomic_load_n( &surface->handoff_shared->release_sequence, __ATOMIC_ACQUIRE );
+        control = __atomic_load_n( &slot->control, __ATOMIC_ACQUIRE );
+        state = client_surface_handoff_state( control );
+        if (state == CLIENT_SURFACE_HANDOFF_FREE || state == CLIENT_SURFACE_HANDOFF_RELEASED ||
+            state == CLIENT_SURFACE_HANDOFF_LOST)
+            continue;
+        client_surface_handoff_wait_sequence( &surface->handoff_shared->release_sequence,
+                                              sequence, 10 );
+    }
+    SERVER_START_REQ( release_client_surface_handoff )
+    {
+        req->handle = 0;
+        req->producer = 0;
+        req->surface = surface->identity;
+        req->cookie = surface->handoff_cookie;
+        req->owner = 0;
+        wine_server_call( req );
+    }
+    SERVER_END_REQ;
+    NtUnmapViewOfSection( NtCurrentProcess(), surface->handoff_view );
+    surface->handoff_view = NULL;
+    surface->handoff_view_size = 0;
+    surface->handoff_shared = NULL;
+    surface->handoff_slot = NULL;
+    surface->handoff_mapping_id = 0;
+    surface->handoff_cookie = 0;
+}
+
+static BOOL map_client_surface_handoff( struct client_surface *surface )
+{
+    struct client_surface_handoff_shared *shared;
+    struct client_surface_handoff_slot *slot;
+    HANDLE mapping = NULL;
+    SIZE_T offset = 0, size = 0;
+    UINT64 mapping_id = 0, cookie = 0;
+    void *view = NULL;
+    NTSTATUS status;
+
+    if (surface->handoff_view) return TRUE;
+    SERVER_START_REQ( get_client_surface_handoff )
+    {
+        req->handle = wine_server_user_handle( surface->hwnd );
+        req->producer = 0;
+        req->surface = surface->identity;
+        req->owner = 0;
+        status = wine_server_call( req );
+        if (!status)
+        {
+            mapping = wine_server_ptr_handle( reply->mapping );
+            size = reply->size;
+            offset = reply->offset;
+            mapping_id = reply->mapping_id;
+            cookie = reply->cookie;
+        }
+    }
+    SERVER_END_REQ;
+    if (status)
+    {
+        TRACE( "failed to map handoff identity %s, status %#lx\n",
+               wine_dbgstr_longlong( surface->identity ), (unsigned long)status );
+        return FALSE;
+    }
+    status = NtMapViewOfSection( mapping, NtCurrentProcess(), &view, 0, 0, NULL,
+                                 &size, ViewShare, 0, PAGE_READWRITE );
+    NtClose( mapping );
+    if (status) goto release;
+    shared = view;
+    if (size < sizeof(*shared) || offset > size - sizeof(*slot) ||
+        __atomic_load_n( &shared->magic, __ATOMIC_ACQUIRE ) != CLIENT_SURFACE_HANDOFF_MAGIC ||
+        shared->version != CLIENT_SURFACE_HANDOFF_VERSION ||
+        shared->slot_count != CLIENT_SURFACE_HANDOFF_SLOTS || shared->mapping_id != mapping_id)
+        goto failed;
+    slot = (struct client_surface_handoff_slot *)((char *)view + offset);
+    if (slot->cookie != cookie || slot->identity != surface->identity) goto failed;
+    surface->handoff_view = view;
+    surface->handoff_view_size = size;
+    surface->handoff_shared = shared;
+    surface->handoff_slot = slot;
+    surface->handoff_mapping_id = mapping_id;
+    surface->handoff_cookie = cookie;
+    TRACE( "mapped handoff hwnd %p identity %s pool %s cookie %s\n", surface->hwnd,
+           wine_dbgstr_longlong( surface->identity ), wine_dbgstr_longlong( mapping_id ),
+           wine_dbgstr_longlong( cookie ) );
+    return TRUE;
+
+failed:
+    NtUnmapViewOfSection( NtCurrentProcess(), view );
+release:
+    SERVER_START_REQ( release_client_surface_handoff )
+    {
+        req->handle = 0;
+        req->producer = 0;
+        req->surface = surface->identity;
+        req->cookie = cookie;
+        req->owner = 0;
+        wine_server_call( req );
+    }
+    SERVER_END_REQ;
+    return FALSE;
+}
+
+static BOOL acquire_client_surface_handoff( struct client_surface *surface, UINT64 *token )
+{
+    struct client_surface_handoff_slot *slot = surface->handoff_slot;
+    DWORD start = NtGetTickCount();
+
+    for (;;)
+    {
+        UINT64 control = __atomic_load_n( &slot->control, __ATOMIC_ACQUIRE );
+        UINT64 generation = client_surface_handoff_generation( control );
+        enum client_surface_handoff_state state = client_surface_handoff_state( control );
+        LONG sequence;
+
+        if (state == CLIENT_SURFACE_HANDOFF_RELEASED)
+        {
+            UINT64 next_generation = client_surface_handoff_next_generation( generation );
+            UINT64 free;
+
+            free = client_surface_handoff_control( next_generation,
+                                                   CLIENT_SURFACE_HANDOFF_FREE );
+            if (!__atomic_compare_exchange_n( &slot->control, &control, free, 0,
+                                              __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE ))
+                continue;
+            control = free;
+            generation = next_generation;
+            state = CLIENT_SURFACE_HANDOFF_FREE;
+        }
+        if (state == CLIENT_SURFACE_HANDOFF_FREE)
+        {
+            UINT64 submitted = client_surface_handoff_control(
+                generation, CLIENT_SURFACE_HANDOFF_SUBMITTED );
+
+            if (__atomic_compare_exchange_n( &slot->control, &control, submitted, 0,
+                                             __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE ))
+            {
+                TRACE( "submitted handoff identity %s generation %s\n",
+                       wine_dbgstr_longlong( surface->identity ),
+                       wine_dbgstr_longlong( generation ) );
+                *token = submitted;
+                return TRUE;
+            }
+            continue;
+        }
+        if (state == CLIENT_SURFACE_HANDOFF_LOST ||
+            NtGetTickCount() - start >= CLIENT_SURFACE_PRESENT_TIMEOUT)
+            return FALSE;
+        __atomic_store_n( &surface->handoff_shared->release_parked, 1, __ATOMIC_RELEASE );
+        sequence = __atomic_load_n( &surface->handoff_shared->release_sequence, __ATOMIC_ACQUIRE );
+        control = __atomic_load_n( &slot->control, __ATOMIC_ACQUIRE );
+        state = client_surface_handoff_state( control );
+        if (state == CLIENT_SURFACE_HANDOFF_FREE || state == CLIENT_SURFACE_HANDOFF_RELEASED ||
+            state == CLIENT_SURFACE_HANDOFF_LOST)
+            continue;
+        client_surface_handoff_wait_sequence( &surface->handoff_shared->release_sequence,
+                                              sequence, 10 );
+    }
+}
+
+BOOL client_surface_prepare_handoff_locked( struct client_surface *surface,
+                                            struct client_surface_frame *present )
+{
+    struct client_surface_handoff_slot *slot;
+    UINT64 token;
+
+    if (present->target != CLIENT_SURFACE_FRAME_TARGET_OFFSCREEN ||
+        present->mode != CLIENT_SURFACE_PRESENTATION_COMPOSITED ||
+        !present->scene.valid ||
+        !client_surface_backend_has_cap( surface, CLIENT_SURFACE_BACKEND_GENERATION_HANDOFF ) ||
+        !surface->backend->handoff_prepare)
+    {
+        TRACE( "handoff unavailable identity %s target %u mode %u generation %s valid %u cap %u prepare %p\n",
+               wine_dbgstr_longlong( surface->identity ), present->target, present->mode,
+               wine_dbgstr_longlong( present->scene.generation ), present->scene.valid,
+               client_surface_backend_has_cap( surface, CLIENT_SURFACE_BACKEND_GENERATION_HANDOFF ),
+               surface->backend->handoff_prepare );
+        return FALSE;
+    }
+    if (!map_client_surface_handoff( surface )) return FALSE;
+    if ((__atomic_load_n( &surface->handoff_slot->endpoints, __ATOMIC_ACQUIRE ) &
+         CLIENT_SURFACE_HANDOFF_ENDPOINT_CONSUMER) == 0)
+    {
+        TRACE( "handoff identity %s has no compositor endpoint\n",
+               wine_dbgstr_longlong( surface->identity ) );
+        return FALSE;
+    }
+    if (!acquire_client_surface_handoff( surface, &token))
+    {
+        client_surface_release_handoff( surface );
+        return FALSE;
+    }
+    slot = surface->handoff_slot;
+    slot->scene_epoch = present->scene.epoch;
+    slot->scene_generation = present->scene.generation;
+    slot->target_seq = present->target_seq;
+    slot->producer_process = HandleToULong( NtCurrentTeb()->ClientId.UniqueProcess );
+    slot->window = HandleToULong( surface->hwnd );
+    slot->toplevel = HandleToULong( present->scene.toplevel );
+    if (!surface->backend->handoff_prepare( surface, slot ))
+    {
+        UINT64 expected = token;
+        UINT64 free = client_surface_handoff_control(
+            client_surface_handoff_generation( token ), CLIENT_SURFACE_HANDOFF_FREE );
+
+        __atomic_compare_exchange_n( &slot->control, &expected, free, 0,
+                                     __ATOMIC_RELEASE, __ATOMIC_RELAXED );
+        return FALSE;
+    }
+    present->handoff_control = token;
+    return TRUE;
+}
+
+void client_surface_abandon_handoff_locked( struct client_surface *surface,
+                                            struct client_surface_frame *present )
+{
+    UINT64 expected, free;
+
+    if (!present->handoff_control || !surface->handoff_slot) return;
+    expected = present->handoff_control;
+    free = client_surface_handoff_control(
+        client_surface_handoff_generation( expected ), CLIENT_SURFACE_HANDOFF_FREE );
+    __atomic_compare_exchange_n( &surface->handoff_slot->control, &expected, free, 0,
+                                 __ATOMIC_RELEASE, __ATOMIC_RELAXED );
+    present->handoff_control = 0;
+}
+
+BOOL client_surface_publish_handoff_locked( struct client_surface *surface,
+                                            struct client_surface_frame *present )
+{
+    struct client_surface_handoff_slot *slot = surface->handoff_slot;
+    struct client_surface_scene current = {0};
+    UINT64 expected = present->handoff_control;
+    UINT64 ready;
+    ptrdiff_t index;
+    BOOL valid;
+
+    if (!expected || !slot) return FALSE;
+    pthread_mutex_lock( &surface->present_lock );
+    valid = surface->hwnd && surface->target.valid &&
+            present->target_seq == surface->target.seq && present->scene.valid &&
+            slot->scene_epoch == present->scene.epoch &&
+            slot->scene_generation == present->scene.generation &&
+            client_surface_get_scene( surface, &current ) && current.valid &&
+            current.toplevel == present->scene.toplevel &&
+            current.epoch == present->scene.epoch && current.mode == present->scene.mode &&
+            current.authoritative &&
+            (current.generation == present->scene.generation ||
+             (present->scene.generation && !current.generation));
+    if (valid)
+    {
+        /* A producer can submit the next frame while the compositor is still
+         * exposing the preceding topology generation.  Once that publication
+         * completes, the topology epoch and target remain valid but the shared
+         * transaction generation becomes zero.  Retarget this already-complete
+         * source to the steady owner path instead of falling back to the legacy
+         * per-frame transaction and starting the same scene again. */
+        slot->scene_generation = current.generation;
+        ready = client_surface_handoff_control( client_surface_handoff_generation( expected ),
+                                                CLIENT_SURFACE_HANDOFF_READY );
+        valid = __atomic_compare_exchange_n( &slot->control, &expected, ready, 0,
+                                             __ATOMIC_RELEASE, __ATOMIC_ACQUIRE );
+        if (valid)
+        {
+            surface->composed_serial = present->serial;
+            InterlockedExchange( &surface->content_valid, TRUE );
+        }
+    }
+    pthread_mutex_unlock( &surface->present_lock );
+    if (!valid)
+    {
+        TRACE( "rejected handoff identity %s token %s control %s hwnd %p target %u/%u "
+               "scene %u/%s/%s/%u current %u/%s/%s/%u\n",
+               wine_dbgstr_longlong( surface->identity ), wine_dbgstr_longlong( present->handoff_control ),
+               wine_dbgstr_longlong( __atomic_load_n( &slot->control, __ATOMIC_ACQUIRE ) ),
+               surface->hwnd, present->target_seq, surface->target.seq,
+               present->scene.valid, wine_dbgstr_longlong( present->scene.generation ),
+               wine_dbgstr_longlong( present->scene.epoch ), present->scene.mode,
+               current.valid, wine_dbgstr_longlong( current.generation ),
+               wine_dbgstr_longlong( current.epoch ), current.mode );
+        return FALSE;
+    }
+    index = slot - surface->handoff_shared->slots;
+    __atomic_fetch_or( &surface->handoff_shared->ready_bitmap[index / 64],
+                       (LONG64)1 << (index % 64), __ATOMIC_RELEASE );
+    client_surface_handoff_wake_ready( surface->handoff_shared );
+    TRACE( "published handoff identity %s generation %s slot %td\n",
+           wine_dbgstr_longlong( surface->identity ),
+           wine_dbgstr_longlong( client_surface_handoff_generation( ready ) ), index );
+    present->handoff_control = 0;
+    return TRUE;
 }
 
 static BOOL begin_client_surface_composition( HWND hwnd, const struct client_surface *surface,
@@ -535,6 +879,7 @@ void client_surface_prepare_present_locked( struct client_surface *surface,
                       CLIENT_SURFACE_FRAME_TARGET_ONSCREEN;
     if (present->target == CLIENT_SURFACE_FRAME_TARGET_OFFSCREEN)
     {
+        client_surface_prepare_handoff_locked( surface, present );
         if (external_completion)
         {
             present->completion.kind = CLIENT_SURFACE_COMPLETION_EXACT;
@@ -607,6 +952,7 @@ BOOL client_surface_complete_present_locked( struct client_surface *surface,
                                              BOOL submitted, BOOL external_completed,
                                              const SIZE *expected_size, DWORD timeout )
 {
+    BOOL handed_off = FALSE;
     BOOL completed = submitted && present->target != CLIENT_SURFACE_FRAME_TARGET_INVALID;
 
     if (!submitted && present->completion.kind == CLIENT_SURFACE_COMPLETION_EXACT)
@@ -661,8 +1007,14 @@ BOOL client_surface_complete_present_locked( struct client_surface *surface,
         }
         pthread_mutex_unlock( &surface->present_lock );
     }
-    if (completed)
+    if (completed && present->handoff_control)
+    {
+        handed_off = client_surface_publish_handoff_locked( surface, present );
+        if (!handed_off) client_surface_abandon_handoff_locked( surface, present );
+    }
+    if (completed && !handed_off)
         completed = client_surface_end_present_internal( surface, expected_size, TRUE, present );
+    if (!completed) client_surface_abandon_handoff_locked( surface, present );
     /* A composition failure may still have accepted a completed source; its
      * serial then protects it from invalidation.  Otherwise retire both the
      * failed frame and any older cached contents before releasing its token. */

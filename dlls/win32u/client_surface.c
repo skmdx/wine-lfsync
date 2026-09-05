@@ -381,6 +381,7 @@ static void client_surface_detach_locked( struct client_surface *surface )
     client_surface_get_target( surface, &target );
     target.valid = FALSE;
     publish_client_surface_target( surface, &target );
+    client_surface_release_handoff( surface );
 
     if (surface->active)
     {
@@ -708,6 +709,7 @@ static BOOL client_surface_update_present_scene_internal_locked(
               !EqualRect( &next.virtual_rect, &current.virtual_rect ) ||
               !EqualRect( &next.monitor_rect, &current.monitor_rect ) ||
               next.dpi_num != current.dpi_num || next.dpi_den != current.dpi_den;
+    if (next.toplevel != current.toplevel) client_surface_release_handoff( surface );
 
     /* A larger drawable contains pixels for which no completed application
      * frame exists yet.  Do not treat its old intersection as a complete
@@ -1141,6 +1143,7 @@ void client_surface_release( struct client_surface *surface )
 static BOOL client_surface_recompose( struct client_surface *surface, LONG64 seq )
 {
     struct client_surface_frame present;
+    BOOL handed_off = FALSE;
 
     /* Cached replay reads the same native drawable that a deferred host
      * presentation updates.  Do not let an older cached frame commit the
@@ -1154,7 +1157,18 @@ static BOOL client_surface_recompose( struct client_surface *surface, LONG64 seq
         return FALSE;
     }
     client_surface_prepare_present_locked( surface, &present, TRUE );
-    client_surface_end_present_internal( surface, NULL, FALSE, &present );
+    if (present.handoff_control)
+    {
+        /* Cached replay has no new native submission or completion token.
+         * Publish the already completed source through the same generation
+         * slot instead of leaking SUBMITTED and falling back to a producer
+         * copy/RPC transaction. */
+        present.serial = surface->composed_serial;
+        handed_off = client_surface_publish_handoff_locked( surface, &present );
+        if (!handed_off) client_surface_abandon_handoff_locked( surface, &present );
+    }
+    if (!handed_off)
+        client_surface_end_present_internal( surface, NULL, FALSE, &present );
     complete_client_surface_recompose( surface, seq );
     /* drain_client_surface_recompose() owns scheduling while this lock is
      * held.  Unlock directly so a request arriving during the replay is

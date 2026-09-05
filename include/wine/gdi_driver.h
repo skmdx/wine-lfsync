@@ -219,7 +219,7 @@ struct gdi_dc_funcs
 };
 
 /* increment this when changing driver tables or shared driver-facing structures */
-#define WINE_GDI_DRIVER_VERSION 112
+#define WINE_GDI_DRIVER_VERSION 113
 
 #define GDI_PRIORITY_NULL_DRV        0  /* null driver */
 #define GDI_PRIORITY_FONT_DRV      100  /* any font driver */
@@ -272,6 +272,7 @@ enum client_surface_backend_caps
     /* present() only queries the supplied DC; all drawing uses private state. */
     CLIENT_SURFACE_BACKEND_READ_ONLY_DC = 0x04,
     CLIENT_SURFACE_BACKEND_DIRECT_PRESENTATION = 0x08,
+    CLIENT_SURFACE_BACKEND_GENERATION_HANDOFF = 0x10,
 };
 
 struct client_surface_completion_ops
@@ -299,6 +300,9 @@ struct client_surface_backend
      * flush requires host completion before returning, defer_visible keeps a scene generation staged */
     BOOL (*present)( struct client_surface *surface, const struct client_surface_scene *scene,
                      HDC hdc, HRGN surface_region, BOOL flush, BOOL defer_visible );
+    /* Publish immutable native source metadata into an owner-consumed slot. */
+    BOOL (*handoff_prepare)( struct client_surface *surface,
+                             struct client_surface_handoff_slot *slot );
     const struct client_surface_completion_ops *completion;
 };
 
@@ -334,6 +338,7 @@ struct client_surface_frame
     DWORD submission_time;
     LONG64 target_seq;
     enum client_surface_frame_target target;
+    UINT64 handoff_control;
     struct client_surface_completion completion;
     enum client_surface_frame_result result;
 };
@@ -385,6 +390,12 @@ struct client_surface
     LONG64                             clip_target_seq;
     HRGN                               clip_region;
     BOOL                               clip_region_valid;
+    void                              *handoff_view;
+    SIZE_T                             handoff_view_size;
+    struct client_surface_handoff_shared *handoff_shared;
+    struct client_surface_handoff_slot *handoff_slot;
+    UINT64                             handoff_mapping_id;
+    UINT64                             handoff_cookie;
     BOOL                               raw;            /* use the raw physical position and size for the host client surface */
 };
 
