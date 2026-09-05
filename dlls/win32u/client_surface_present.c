@@ -628,6 +628,10 @@ BOOL client_surface_complete_present_locked( struct client_surface *surface,
     }
     if (completed)
         completed = client_surface_end_present_internal( surface, expected_size, TRUE, present );
+    /* A composition failure may still have accepted a completed source; its
+     * serial then protects it from invalidation.  Otherwise retire both the
+     * failed frame and any older cached contents before releasing its token. */
+    if (!completed) client_surface_invalidate_source_locked( surface, present );
     if (present->completion.kind != CLIENT_SURFACE_COMPLETION_NONE)
     {
         BOOL wake = FALSE;

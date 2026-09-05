@@ -360,7 +360,7 @@ struct client_surface
     UINT64                             cache_cost;     /* estimated bytes while on the unused list */
     UINT64                             target_scene_epoch; /* last server scene applied to native target */
     LONG64                             present_serial; /* producer submission order */
-    LONG64                             composed_serial; /* newest producer copied into the host target */
+    LONG64                             composed_serial; /* newest source accepted or invalidated */
     LONG                               external_completion_count; /* causal tokens currently in flight */
     LONG                               driver_completion_count; /* shared native monitor tokens in flight */
     LONG                               driver_completion_waiters; /* pending shared-monitor mode transitions */

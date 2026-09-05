@@ -263,6 +263,25 @@ static void client_surface_uncache_present_locked( struct client_surface *surfac
     if (wake && toplevel) NtUserPostMessage( toplevel, WM_WINE_UPDATEWINDOWSTATE, 0, 0 );
 }
 
+void client_surface_invalidate_source_locked( struct client_surface *surface,
+                                              const struct client_surface_frame *present )
+{
+    pthread_mutex_lock( &surface->present_lock );
+    if (present->serial > surface->composed_serial)
+    {
+        /* A failed or stale presentation may still have changed the native
+         * source.  Its previous completed contents are no longer reusable,
+         * even if a move or resize has since changed the target sequence.
+         * Retire the serial too: an older completion arriving afterwards
+         * must not make that unproven source valid again. */
+        surface->composed_serial = present->serial;
+        InterlockedExchange( &surface->content_valid, FALSE );
+        if (!InterlockedCompareExchange( &surface->active, 0, 0 ))
+            client_surface_uncache_present_locked( surface );
+    }
+    pthread_mutex_unlock( &surface->present_lock );
+}
+
 static void client_surface_wait_driver_completion_locked( struct client_surface *surface )
 {
     while (surface->driver_completion_count)
