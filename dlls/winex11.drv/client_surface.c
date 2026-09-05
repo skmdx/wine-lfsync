@@ -485,37 +485,108 @@ static BOOL X11DRV_client_surface_present( struct client_surface *client,
     return ret;
 }
 
-static BOOL x11drv_client_surface_handoff_clip_full(
+static BOOL x11drv_client_surface_prepare_handoff_clip(
     struct x11drv_client_surface *surface,
-    const struct client_surface_handoff_slot *slot, HRGN surface_region )
+    struct client_surface_handoff_slot *slot, HRGN surface_region )
 {
     struct client_surface *client = &surface->client;
     RECT rect;
-    BOOL full = TRUE;
+    RGNDATA *clip = NULL;
+    HRGN region = 0;
+    HDC hdc = 0;
+    BOOL supported = FALSE, required = FALSE;
+    unsigned int count = 0, i;
 
     if (surface->handoff_clip_valid &&
         surface->handoff_clip_scene_epoch == slot->scene_epoch &&
         surface->handoff_clip_target_seq == slot->target_seq)
-        return surface->handoff_clip_full;
+        goto publish;
 
-    if (surface_region &&
-        (NtGdiGetRgnBox( surface_region, &rect ) != SIMPLEREGION ||
-         !EqualRect( &rect, &client->target.monitor_rect )))
-        full = FALSE;
+    /* Build the exact region used by the legacy native-copy path once per
+     * scene. The rectangles are already in client-surface coordinates; the
+     * owner applies destination as the X clip origin. */
+    if (client->hwnd != client->target.toplevel ||
+        !NtUserGetPresentRect( client->target.toplevel, &rect, -1 /* raw dpi */ ))
+    {
+        DWORD flags = DCX_CACHE | DCX_USESTYLE | DCX_NORESETATTRS |
+                      WINE_DCX_CLIENT_SURFACE;
 
-    /* Exclusive fullscreen deliberately ignores ordinary window clipping.
-     * Otherwise require the exact monitor-DPI SYSRGN to cover the surface.
-     * This keeps arbitrary shapes, clipped ancestors and overlapping siblings
-     * on the conversion fallback until their regions can be transferred. */
-    if (full && !client_window_region_is_full( client->hwnd )) full = FALSE;
+        if (!(hdc = NtUserGetDCEx( client->hwnd, 0, flags ))) goto done;
+        region = get_dc_monitor_region( client->hwnd, hdc );
+        NtUserReleaseDC( client->hwnd, hdc );
+        hdc = 0;
+        if (!region) goto done;
+    }
+    if (surface_region)
+    {
+        int ret;
+
+        if (region) ret = NtGdiCombineRgn( region, region, surface_region, RGN_AND );
+        else if (!(region = NtGdiCreateRectRgn( 0, 0, 0, 0 ))) goto done;
+        else
+        {
+            ret = NtGdiCombineRgn( region, surface_region, 0, RGN_COPY );
+        }
+        if (ret == ERROR) goto done;
+    }
+    if (!region)
+    {
+        supported = TRUE;
+        goto done;
+    }
+    if (!(clip = X11DRV_GetRegionData( region, 0 ))) goto done;
+    count = clip->rdh.nCount;
+    if (count == 1)
+    {
+        const XRectangle *full = (const XRectangle *)clip->Buffer;
+
+        if (!full->x && !full->y && full->width == slot->width &&
+            full->height == slot->height)
+        {
+            supported = TRUE;
+            count = 0;
+            goto done;
+        }
+    }
+    if (count > CLIENT_SURFACE_HANDOFF_MAX_CLIP_RECTS) goto done;
+    for (i = 0; i < count; ++i)
+    {
+        const XRectangle *rect = (const XRectangle *)clip->Buffer + i;
+        struct client_surface_handoff_clip_rect *out = &surface->handoff_clip_rects[i];
+
+        out->x = rect->x;
+        out->y = rect->y;
+        out->width = rect->width;
+        out->height = rect->height;
+    }
+    required = TRUE;
+    supported = TRUE;
+
+done:
+    if (hdc) NtUserReleaseDC( client->hwnd, hdc );
+    free( clip );
+    if (region) NtGdiDeleteObjectApp( region );
 
     surface->handoff_clip_scene_epoch = slot->scene_epoch;
     surface->handoff_clip_target_seq = slot->target_seq;
-    surface->handoff_clip_full = full;
+    surface->handoff_clip_count = count;
+    surface->handoff_clip_supported = supported;
+    surface->handoff_clip_required = required;
     surface->handoff_clip_valid = TRUE;
-    TRACE( "handoff clip hwnd %p destination %s region %p full %u\n", client->hwnd,
-           wine_dbgstr_rect( &client->target.monitor_rect ), surface_region, full );
-    return full;
+    TRACE( "handoff clip hwnd %p destination %s region %p supported %u required %u count %u\n",
+           client->hwnd, wine_dbgstr_rect( &client->target.monitor_rect ), surface_region,
+           supported, required, count );
+
+publish:
+    if (!surface->handoff_clip_supported) return FALSE;
+    slot->clip_count = surface->handoff_clip_count;
+    if (surface->handoff_clip_required)
+    {
+        slot->flags |= CLIENT_SURFACE_HANDOFF_CLIPPED;
+        memcpy( slot->clips, surface->handoff_clip_rects,
+                surface->handoff_clip_count * sizeof(*slot->clips) );
+    }
+    return TRUE;
 }
 
 static BOOL x11drv_client_surface_handoff_prepare(
@@ -527,9 +598,6 @@ static BOOL x11drv_client_surface_handoff_prepare(
     RECT destination = client->target.monitor_rect;
     unsigned int width, height;
 
-    if (!usexcomposite || !x11drv_client_surface_handoff_clip_full(
-                              surface, slot, surface_region ))
-        return FALSE;
     width = source.right - source.left;
     height = source.bottom - source.top;
     if (!width || !height || width != (unsigned int)(destination.right - destination.left) ||
@@ -542,6 +610,9 @@ static BOOL x11drv_client_surface_handoff_prepare(
     slot->width = width;
     slot->height = height;
     SetRect( &slot->damage, 0, 0, width, height );
+    if (!usexcomposite || !x11drv_client_surface_prepare_handoff_clip(
+                              surface, slot, surface_region ))
+        return FALSE;
     return TRUE;
 }
 

@@ -1154,14 +1154,17 @@ static BOOL copy_client_surface_handoff_to_frame(
     const struct client_surface_handoff_slot *slot, const RECT *damage )
 {
     Display *display = client_surface_compositor_display;
+    XRectangle clips[CLIENT_SURFACE_HANDOFF_MAX_CLIP_RECTS];
     RECT catchup = {0};
+    BOOL clipped = !!(slot->flags & CLIENT_SURFACE_HANDOFF_CLIPPED);
     BOOL incoming_full, needs_catchup;
+    unsigned int i;
     int error = 0;
     GC gc;
 
     if (!target->latest || !get_client_surface_compositor_catchup( target, frame, &catchup ))
         return FALSE;
-    incoming_full = damage->left == 0 && damage->top == 0 &&
+    incoming_full = !clipped && damage->left == 0 && damage->top == 0 &&
                     (unsigned int)damage->right >= target->window_width &&
                     (unsigned int)damage->bottom >= target->window_height;
     needs_catchup = !incoming_full && frame->pixmap != target->latest &&
@@ -1176,10 +1179,25 @@ static BOOL copy_client_surface_handoff_to_frame(
                        catchup.left, catchup.top,
                        catchup.right - catchup.left, catchup.bottom - catchup.top,
                        catchup.left, catchup.top );
-        XCopyArea( display, source, frame->pixmap, gc,
-                   slot->damage.left, slot->damage.top,
-                   damage->right - damage->left, damage->bottom - damage->top,
-                   damage->left, damage->top );
+        if (clipped && slot->clip_count)
+        {
+            for (i = 0; i < slot->clip_count; ++i)
+            {
+                clips[i].x = slot->clips[i].x;
+                clips[i].y = slot->clips[i].y;
+                clips[i].width = slot->clips[i].width;
+                clips[i].height = slot->clips[i].height;
+            }
+            XSetClipRectangles( display, gc, slot->destination.left,
+                                slot->destination.top, clips, slot->clip_count, YXBanded );
+        }
+        if (!clipped || slot->clip_count)
+            XCopyArea( display, source, frame->pixmap, gc,
+                       slot->damage.left, slot->damage.top,
+                       slot->damage.right - slot->damage.left,
+                       slot->damage.bottom - slot->damage.top,
+                       slot->destination.left + slot->damage.left,
+                       slot->destination.top + slot->damage.top );
         XFreeGC( display, gc );
     }
     XSync( display, False );
@@ -1263,6 +1281,7 @@ static BOOL compose_client_surface_handoff(
     enum client_surface_handoff_state state;
     Pixmap source = 0;
     RECT damage;
+    unsigned int i;
     BOOL accepted = FALSE, composed = FALSE, copied = FALSE, dropped = FALSE, publish = FALSE;
     BOOL deferred_present = FALSE, queued_present = FALSE;
 
@@ -1309,12 +1328,45 @@ static BOOL compose_client_surface_handoff(
         slot->damage.right > slot->damage.left &&
         slot->damage.bottom > slot->damage.top &&
         (unsigned int)slot->damage.right <= slot->width &&
-        (unsigned int)slot->damage.bottom <= slot->height)
+        (unsigned int)slot->damage.bottom <= slot->height &&
+        slot->clip_count <= CLIENT_SURFACE_HANDOFF_MAX_CLIP_RECTS &&
+        (!!(slot->flags & CLIENT_SURFACE_HANDOFF_CLIPPED) || !slot->clip_count))
     {
         damage = (RECT){slot->destination.left + slot->damage.left,
                         slot->destination.top + slot->damage.top,
                         slot->destination.left + slot->damage.right,
                         slot->destination.top + slot->damage.bottom};
+        if (slot->flags & CLIENT_SURFACE_HANDOFF_CLIPPED)
+        {
+            SetRectEmpty( &damage );
+            for (i = 0; i < slot->clip_count; ++i)
+            {
+                const struct client_surface_handoff_clip_rect *clip = &slot->clips[i];
+                RECT rect;
+
+                if (!clip->width || !clip->height || clip->x < 0 || clip->y < 0 ||
+                    (unsigned int)clip->x + clip->width > slot->width ||
+                    (unsigned int)clip->y + clip->height > slot->height)
+                    break;
+                rect = (RECT){slot->destination.left + clip->x,
+                              slot->destination.top + clip->y,
+                              slot->destination.left + clip->x + clip->width,
+                              slot->destination.top + clip->y + clip->height};
+                if (!i) damage = rect;
+                else
+                {
+                    damage.left = min( damage.left, rect.left );
+                    damage.top = min( damage.top, rect.top );
+                    damage.right = max( damage.right, rect.right );
+                    damage.bottom = max( damage.bottom, rect.bottom );
+                }
+            }
+            if (i != slot->clip_count) goto release;
+            /* An empty explicit clip changes no visible pixels. Keep a
+             * conservative journal entry so a rotated frame still catches up
+             * before it can become the next owner snapshot. */
+            if (!slot->clip_count) damage = slot->destination;
+        }
         if (slot->scene_generation)
             previous_publish = find_client_surface_pending_publication(
                 target, slot->scene_generation, slot->scene_epoch );

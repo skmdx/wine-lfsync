@@ -523,6 +523,9 @@ static BOOL get_client_surface_region( const RECT *monitor_rect,
         NtGdiDeleteObjectApp( clips );
         return FALSE;
     }
+    /* The server snapshot is relative to the owner window, while backend
+     * presentation regions use the client surface as their origin. */
+    NtGdiOffsetRgn( *region, -monitor_rect->left, -monitor_rect->top );
     NtGdiDeleteObjectApp( clips );
     return TRUE;
 }

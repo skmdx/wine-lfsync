@@ -41,10 +41,14 @@ struct x11drv_client_surface
     VisualID source_visual;
     UINT64 handoff_clip_scene_epoch;
     UINT64 handoff_clip_target_seq;
+    struct client_surface_handoff_clip_rect
+        handoff_clip_rects[CLIENT_SURFACE_HANDOFF_MAX_CLIP_RECTS];
+    unsigned int handoff_clip_count;
     BOOL composition_visual_checked;
     BOOL composition_same_visual;
     BOOL handoff_clip_valid;
-    BOOL handoff_clip_full;
+    BOOL handoff_clip_supported;
+    BOOL handoff_clip_required;
     struct x11drv_client_surface_completion completion;
     BOOL manual_redirect;   /* client drawable is manually XComposite redirected */
 
