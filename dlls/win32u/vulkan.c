@@ -769,9 +769,13 @@ static VkResult convert_device_create_info( struct vulkan_physical_device *physi
     /* An offscreen client surface is copied into its top-level window after
      * QueuePresent.  Since QueuePresent is asynchronous, enable the host's
      * presentation-completion primitives internally so that the copy reads
-     * the frame submitted by that call rather than the previous image. */
+     * the frame submitted by that call rather than the previous image.  Do
+     * not add duplicate feature structures when the application supplied its
+     * own (even if it left the corresponding feature disabled). */
     if (device->extensions.has_VK_KHR_swapchain &&
         !device->extensions.has_VK_KHR_present_id && !device->extensions.has_VK_KHR_present_wait &&
+        !find_next_struct( info->pNext, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_FEATURES_KHR ) &&
+        !find_next_struct( info->pNext, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_WAIT_FEATURES_KHR ) &&
         physical_device->extensions.has_VK_KHR_present_id &&
         physical_device->extensions.has_VK_KHR_present_wait)
     {
