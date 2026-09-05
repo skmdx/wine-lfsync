@@ -218,8 +218,8 @@ struct gdi_dc_funcs
     UINT       priority;
 };
 
-/* increment this when you change the DC function table */
-#define WINE_GDI_DRIVER_VERSION 110
+/* increment this when changing driver tables or shared driver-facing structures */
+#define WINE_GDI_DRIVER_VERSION 111
 
 #define GDI_PRIORITY_NULL_DRV        0  /* null driver */
 #define GDI_PRIORITY_FONT_DRV      100  /* any font driver */
