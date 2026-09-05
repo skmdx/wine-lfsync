@@ -302,7 +302,8 @@ struct client_surface_backend
                      HDC hdc, HRGN surface_region, BOOL flush, BOOL defer_visible );
     /* Publish immutable native source metadata into an owner-consumed slot. */
     BOOL (*handoff_prepare)( struct client_surface *surface,
-                             struct client_surface_handoff_slot *slot );
+                             struct client_surface_handoff_slot *slot,
+                             HRGN surface_region );
     const struct client_surface_completion_ops *completion;
 };
 

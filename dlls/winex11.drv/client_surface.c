@@ -23,28 +23,38 @@
 
 WINE_DEFAULT_DEBUG_CHANNEL(x11drv);
 
-static BOOL needs_client_window_clipping( HWND hwnd )
+static BOOL client_window_region_is_full( HWND hwnd )
 {
-    RECT rect, client;
-    UINT ret = 0;
+    RECT rect = {0}, client;
+    UINT ret;
     HRGN region;
     HDC hdc;
 
-    if (NtUserGetPresentRect( hwnd, &client, 0 )) return FALSE;
+    if (NtUserGetPresentRect( hwnd, &client, 0 )) return TRUE;
     if (!NtUserGetClientRect( hwnd, &client, NtUserGetDpiForWindow( hwnd ) )) return FALSE;
     OffsetRect( &client, -client.left, -client.top );
+    NtUserMapWindowPoints( hwnd, 0, (POINT *)&client, 2, 0 /* per-monitor DPI */ );
 
     if (!(hdc = NtUserGetDCEx( hwnd, 0, DCX_CACHE | DCX_USESTYLE ))) return FALSE;
-    if ((region = NtGdiCreateRectRgn( 0, 0, 0, 0 )))
+    if (!(region = NtGdiCreateRectRgn( 0, 0, 0, 0 )))
     {
-        ret = NtGdiGetRandomRgn( hdc, region, SYSRGN );
-        if (ret > 0 && (ret = NtGdiGetRgnBox( region, &rect )) < NULLREGION) ret = 0;
-        if (ret == SIMPLEREGION && EqualRect( &rect, &client )) ret = 0;
-        NtGdiDeleteObjectApp( region );
+        NtUserReleaseDC( hwnd, hdc );
+        return FALSE;
     }
+    ret = NtGdiGetRandomRgn( hdc, region, SYSRGN );
+    if (ret > 0) ret = NtGdiGetRgnBox( region, &rect );
+    NtGdiDeleteObjectApp( region );
     NtUserReleaseDC( hwnd, hdc );
 
-    return ret > 0;
+    TRACE( "hwnd %p client %s SYSRGN %s type %u full %u\n", hwnd,
+           wine_dbgstr_rect( &client ), wine_dbgstr_rect( &rect ), ret,
+           ret == SIMPLEREGION && EqualRect( &rect, &client ) );
+    return ret == SIMPLEREGION && EqualRect( &rect, &client );
+}
+
+static BOOL needs_client_window_clipping( HWND hwnd )
+{
+    return !client_window_region_is_full( hwnd );
 }
 
 static BOOL needs_composited_rendering( HWND hwnd, BOOL raw )
@@ -475,16 +485,50 @@ static BOOL X11DRV_client_surface_present( struct client_surface *client,
     return ret;
 }
 
+static BOOL x11drv_client_surface_handoff_clip_full(
+    struct x11drv_client_surface *surface,
+    const struct client_surface_handoff_slot *slot, HRGN surface_region )
+{
+    struct client_surface *client = &surface->client;
+    RECT rect;
+    BOOL full = TRUE;
+
+    if (surface->handoff_clip_valid &&
+        surface->handoff_clip_scene_epoch == slot->scene_epoch &&
+        surface->handoff_clip_target_seq == slot->target_seq)
+        return surface->handoff_clip_full;
+
+    if (surface_region &&
+        (NtGdiGetRgnBox( surface_region, &rect ) != SIMPLEREGION ||
+         !EqualRect( &rect, &client->target.monitor_rect )))
+        full = FALSE;
+
+    /* Exclusive fullscreen deliberately ignores ordinary window clipping.
+     * Otherwise require the exact monitor-DPI SYSRGN to cover the surface.
+     * This keeps arbitrary shapes, clipped ancestors and overlapping siblings
+     * on the conversion fallback until their regions can be transferred. */
+    if (full && !client_window_region_is_full( client->hwnd )) full = FALSE;
+
+    surface->handoff_clip_scene_epoch = slot->scene_epoch;
+    surface->handoff_clip_target_seq = slot->target_seq;
+    surface->handoff_clip_full = full;
+    surface->handoff_clip_valid = TRUE;
+    TRACE( "handoff clip hwnd %p destination %s region %p full %u\n", client->hwnd,
+           wine_dbgstr_rect( &client->target.monitor_rect ), surface_region, full );
+    return full;
+}
+
 static BOOL x11drv_client_surface_handoff_prepare(
-    struct client_surface *client, struct client_surface_handoff_slot *slot )
+    struct client_surface *client, struct client_surface_handoff_slot *slot,
+    HRGN surface_region )
 {
     struct x11drv_client_surface *surface = impl_from_client_surface( client );
     RECT source = client->raw ? client->target.monitor_rect : client->target.virtual_rect;
     RECT destination = client->target.monitor_rect;
     unsigned int width, height;
 
-    if (!usexcomposite || client->hwnd != client->target.toplevel ||
-        NtUserGetWindowRelative( client->hwnd, GW_CHILD ))
+    if (!usexcomposite || !x11drv_client_surface_handoff_clip_full(
+                              surface, slot, surface_region ))
         return FALSE;
     width = source.right - source.left;
     height = source.bottom - source.top;

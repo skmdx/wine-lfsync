@@ -30,6 +30,11 @@
 
 WINE_DEFAULT_DEBUG_CHANNEL(win);
 
+static BOOL get_cached_client_surface_region( struct client_surface *surface, HWND hwnd,
+                                              const RECT *monitor_rect,
+                                              const struct client_surface_frame *present,
+                                              HRGN *region );
+
 static BOOL client_surface_backend_present( struct client_surface *surface,
                                             const struct client_surface_scene *scene,
                                             HDC hdc, HRGN surface_region,
@@ -264,6 +269,7 @@ BOOL client_surface_prepare_handoff_locked( struct client_surface *surface,
                                             struct client_surface_frame *present )
 {
     struct client_surface_handoff_slot *slot;
+    HRGN surface_region = 0;
     UINT64 token;
 
     if (present->target != CLIENT_SURFACE_FRAME_TARGET_OFFSCREEN ||
@@ -279,6 +285,10 @@ BOOL client_surface_prepare_handoff_locked( struct client_surface *surface,
                surface->backend->handoff_prepare );
         return FALSE;
     }
+    if (!get_cached_client_surface_region( surface, surface->hwnd,
+                                           &surface->target.monitor_rect,
+                                           present, &surface_region ))
+        return FALSE;
     if (!map_client_surface_handoff( surface )) return FALSE;
     if ((__atomic_load_n( &surface->handoff_slot->endpoints, __ATOMIC_ACQUIRE ) &
          CLIENT_SURFACE_HANDOFF_ENDPOINT_CONSUMER) == 0)
@@ -299,7 +309,7 @@ BOOL client_surface_prepare_handoff_locked( struct client_surface *surface,
     slot->producer_process = HandleToULong( NtCurrentTeb()->ClientId.UniqueProcess );
     slot->window = HandleToULong( surface->hwnd );
     slot->toplevel = HandleToULong( present->scene.toplevel );
-    if (!surface->backend->handoff_prepare( surface, slot ))
+    if (!surface->backend->handoff_prepare( surface, slot, surface_region ))
     {
         UINT64 expected = token;
         UINT64 free = client_surface_handoff_control(

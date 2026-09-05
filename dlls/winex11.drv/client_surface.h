@@ -39,8 +39,12 @@ struct x11drv_client_surface
     HWND composition_toplevel;
     GC composition_gc;
     VisualID source_visual;
+    UINT64 handoff_clip_scene_epoch;
+    UINT64 handoff_clip_target_seq;
     BOOL composition_visual_checked;
     BOOL composition_same_visual;
+    BOOL handoff_clip_valid;
+    BOOL handoff_clip_full;
     struct x11drv_client_surface_completion completion;
     BOOL manual_redirect;   /* client drawable is manually XComposite redirected */
 
