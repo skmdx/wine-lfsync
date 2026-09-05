@@ -67,10 +67,18 @@ struct client_surface_compositor_binding
 
 #define CLIENT_SURFACE_COMPOSITOR_FRAME_COUNT 3
 #define CLIENT_SURFACE_COMPOSITOR_MAX_INFLIGHT 2
+#define CLIENT_SURFACE_COMPOSITOR_DAMAGE_HISTORY 64
+
+struct client_surface_compositor_damage
+{
+    UINT64 revision;
+    RECT rect;
+};
 
 struct client_surface_compositor_frame
 {
     Pixmap pixmap;
+    UINT64 revision;
     uint32_t serial;
     uint32_t last_complete_serial;
     unsigned int width;
@@ -90,7 +98,10 @@ struct client_surface_compositor_target
     Window window;
     struct client_surface_compositor_frame frames[CLIENT_SURFACE_COMPOSITOR_FRAME_COUNT];
     Pixmap backing;
+    Pixmap latest;
     Pixmap published;
+    UINT64 revision;
+    struct client_surface_compositor_damage damages[CLIENT_SURFACE_COMPOSITOR_DAMAGE_HISTORY];
     unsigned int published_width;
     unsigned int published_height;
     unsigned int next_frame;
@@ -171,6 +182,47 @@ struct client_surface_compositor_job
 static struct client_surface_compositor_job *client_surface_compositor_head;
 static struct client_surface_compositor_job **client_surface_compositor_tail =
     &client_surface_compositor_head;
+
+static struct client_surface_compositor_frame *get_client_surface_compositor_pixmap(
+    struct client_surface_compositor_target *target, Pixmap pixmap )
+{
+    unsigned int i;
+
+    for (i = 0; i < ARRAY_SIZE(target->frames); ++i)
+        if (target->frames[i].pixmap == pixmap) return &target->frames[i];
+    return NULL;
+}
+
+static void note_client_surface_compositor_damage(
+    struct client_surface_compositor_target *target,
+    struct client_surface_compositor_frame *frame, const RECT *rect )
+{
+    struct client_surface_compositor_damage *damage;
+
+    if (!(++target->revision))
+    {
+        unsigned int i;
+
+        target->revision = 1;
+        memset( target->damages, 0, sizeof(target->damages) );
+        for (i = 0; i < ARRAY_SIZE(target->frames); ++i) target->frames[i].revision = 0;
+    }
+    damage = &target->damages[target->revision % ARRAY_SIZE(target->damages)];
+    damage->revision = target->revision;
+    damage->rect = *rect;
+    frame->revision = target->revision;
+    target->latest = frame->pixmap;
+}
+
+static void note_client_surface_compositor_snapshot(
+    struct client_surface_compositor_target *target, Pixmap pixmap )
+{
+    struct client_surface_compositor_frame *frame;
+    RECT rect = {0, 0, target->window_width, target->window_height};
+
+    if ((frame = get_client_surface_compositor_pixmap( target, pixmap )))
+        note_client_surface_compositor_damage( target, frame, &rect );
+}
 
 #ifdef SONAME_LIBXPRESENT
 
@@ -614,6 +666,11 @@ static BOOL client_surface_present_on_compositor( Window window, Pixmap pixmap,
         return FALSE;
     frame->width = width;
     frame->height = height;
+    /* This entry is published by the owner after legacy writers have
+     * completed.  Treat it as a complete checkpoint so a later partial
+     * handoff can bring another pool entry current without losing pixels
+     * written outside the compositor connection. */
+    note_client_surface_compositor_snapshot( target, pixmap );
     if (!submit_client_surface_present( target, frame, 0, 0, &serial ))
         return FALSE;
     start = NtGetTickCount();
@@ -901,6 +958,7 @@ static BOOL update_client_surface_compositor_target( struct client_surface_compo
     target->window_height = job->window_height;
     target->depth = job->depth;
     target->visual = job->visual;
+    note_client_surface_compositor_snapshot( target, target->backing );
 #ifdef SONAME_LIBXPRESENT
     if (usexpresent && !target->present_event)
     {
@@ -998,6 +1056,88 @@ static BOOL validate_client_surface_pixmap( Pixmap pixmap, unsigned int min_widt
            source_depth == depth;
 }
 
+static BOOL get_client_surface_compositor_catchup(
+    const struct client_surface_compositor_target *target,
+    const struct client_surface_compositor_frame *frame, RECT *rect )
+{
+    UINT64 revision;
+    BOOL initialized = FALSE;
+
+    if (frame->revision == target->revision) return TRUE;
+    if (!frame->revision || frame->revision > target->revision ||
+        target->revision - frame->revision > ARRAY_SIZE(target->damages))
+    {
+        *rect = (RECT){0, 0, target->window_width, target->window_height};
+        return TRUE;
+    }
+
+    for (revision = frame->revision + 1; revision <= target->revision; ++revision)
+    {
+        const struct client_surface_compositor_damage *damage =
+            &target->damages[revision % ARRAY_SIZE(target->damages)];
+
+        if (damage->revision != revision)
+        {
+            *rect = (RECT){0, 0, target->window_width, target->window_height};
+            return TRUE;
+        }
+        if (!initialized)
+        {
+            *rect = damage->rect;
+            initialized = TRUE;
+        }
+        else
+        {
+            rect->left = min( rect->left, damage->rect.left );
+            rect->top = min( rect->top, damage->rect.top );
+            rect->right = max( rect->right, damage->rect.right );
+            rect->bottom = max( rect->bottom, damage->rect.bottom );
+        }
+    }
+    return TRUE;
+}
+
+static BOOL copy_client_surface_handoff_to_frame(
+    struct client_surface_compositor_target *target,
+    struct client_surface_compositor_frame *frame, Pixmap source,
+    const struct client_surface_handoff_slot *slot, const RECT *damage )
+{
+    Display *display = client_surface_compositor_display;
+    RECT catchup = {0};
+    BOOL incoming_full, needs_catchup;
+    int error = 0;
+    GC gc;
+
+    if (!target->latest || !get_client_surface_compositor_catchup( target, frame, &catchup ))
+        return FALSE;
+    incoming_full = damage->left == 0 && damage->top == 0 &&
+                    (unsigned int)damage->right >= target->window_width &&
+                    (unsigned int)damage->bottom >= target->window_height;
+    needs_catchup = !incoming_full && frame->pixmap != target->latest &&
+                    frame->revision != target->revision && !IsRectEmpty( &catchup );
+
+    X11DRV_expect_error( display, client_surface_compositor_error, &error );
+    gc = XCreateGC( display, frame->pixmap, 0, NULL );
+    if (gc)
+    {
+        if (needs_catchup)
+            XCopyArea( display, target->latest, frame->pixmap, gc,
+                       catchup.left, catchup.top,
+                       catchup.right - catchup.left, catchup.bottom - catchup.top,
+                       catchup.left, catchup.top );
+        XCopyArea( display, source, frame->pixmap, gc,
+                   slot->damage.left, slot->damage.top,
+                   damage->right - damage->left, damage->bottom - damage->top,
+                   damage->left, damage->top );
+        XFreeGC( display, gc );
+    }
+    XSync( display, False );
+    X11DRV_check_error();
+    if (!gc || error) return FALSE;
+    if (needs_catchup) frame->revision = target->revision;
+    return TRUE;
+}
+
 static BOOL complete_client_surface_handoff_generation(
     const struct client_surface_compositor_binding *binding,
     const struct client_surface_handoff_slot *slot, BOOL *publish )
@@ -1071,6 +1211,7 @@ static BOOL compose_client_surface_handoff(
     UINT64 expected = control, final;
     enum client_surface_handoff_state state;
     Pixmap source = 0;
+    RECT damage;
     BOOL accepted = FALSE, composed = FALSE, copied = FALSE, dropped = FALSE, publish = FALSE;
     BOOL deferred_present = FALSE, queued_present = FALSE;
 
@@ -1106,20 +1247,29 @@ static BOOL compose_client_surface_handoff(
                         CLIENT_SURFACE_HANDOFF_FULL_DAMAGE) &&
         target->backing && target->frames[0].pixmap && target->frames[1].pixmap &&
         target->window &&
-        slot->destination.left == 0 && slot->destination.top == 0 &&
+        slot->destination.left >= 0 && slot->destination.top >= 0 &&
         slot->destination.right >= slot->destination.left &&
         slot->destination.bottom >= slot->destination.top &&
-        (unsigned int)slot->destination.right <= target->width &&
-        (unsigned int)slot->destination.bottom <= target->height &&
+        (unsigned int)slot->destination.right <= target->window_width &&
+        (unsigned int)slot->destination.bottom <= target->window_height &&
         slot->width == (unsigned int)(slot->destination.right - slot->destination.left) &&
-        slot->height == (unsigned int)(slot->destination.bottom - slot->destination.top))
+        slot->height == (unsigned int)(slot->destination.bottom - slot->destination.top) &&
+        slot->damage.left >= 0 && slot->damage.top >= 0 &&
+        slot->damage.right > slot->damage.left &&
+        slot->damage.bottom > slot->damage.top &&
+        (unsigned int)slot->damage.right <= slot->width &&
+        (unsigned int)slot->damage.bottom <= slot->height)
     {
+        damage = (RECT){slot->destination.left + slot->damage.left,
+                        slot->destination.top + slot->damage.top,
+                        slot->destination.left + slot->damage.right,
+                        slot->destination.top + slot->damage.bottom};
         if (slot->scene_generation)
             previous_publish = find_client_surface_pending_publication(
                 target, slot->scene_generation, slot->scene_epoch );
 #ifdef SONAME_LIBXPRESENT
         if (usexpresent)
-            frame = previous_publish || !slot->scene_generation ?
+            frame = (!slot->scene_generation || previous_publish) ?
                     get_client_surface_compositor_frame( target ) :
                     acquire_client_surface_compositor_frame( target, target->backing );
         else
@@ -1135,21 +1285,21 @@ static BOOL compose_client_surface_handoff(
          * The final completion therefore exposes one assembled scene even if
          * some producers used the legacy conversion fallback.  Full steady
          * frames may still rotate through the coalescing Present pool. */
-        copied = client_surface_copy_on_compositor_unchecked(
-            source, frame->pixmap, 0, 0, slot->destination.left,
-            slot->destination.top, slot->width, slot->height );
+        copied = copy_client_surface_handoff_to_frame( target, frame, source, slot, &damage );
         if (copied)
         {
             frame->width = target->window_width;
             frame->height = target->window_height;
         }
-        if (copied && slot->scene_generation)
+        if (copied && slot->scene_generation && !previous_publish)
         {
-            if (!previous_publish)
-                accepted = complete_client_surface_handoff_generation( binding, slot, &publish );
-            if ((accepted && publish) || previous_publish)
+            accepted = complete_client_surface_handoff_generation( binding, slot, &publish );
+            if (accepted && publish)
             {
                 BOOL visible = FALSE;
+                RECT full = {0, 0, target->window_width, target->window_height};
+
+                note_client_surface_compositor_damage( target, frame, &full );
 
 #ifdef SONAME_LIBXPRESENT
                 if (usexpresent && !target->mailbox_pending &&
@@ -1179,8 +1329,6 @@ static BOOL compose_client_surface_handoff(
                     target->published_width = frame->width;
                     target->published_height = frame->height;
                 }
-                if (visible && previous_publish && !deferred_present)
-                    previous_publish->publish_pending = FALSE;
                 if (!queued_present && !deferred_present)
                     composed = publish_client_surface_handoff_generation( target->toplevel,
                         slot->scene_generation, slot->scene_epoch, visible );
@@ -1190,6 +1338,7 @@ static BOOL compose_client_surface_handoff(
         }
         else if (copied)
         {
+            note_client_surface_compositor_damage( target, frame, &damage );
 #ifdef SONAME_LIBXPRESENT
             if (usexpresent && !target->mailbox_pending &&
                 count_client_surface_compositor_frames( target ) <
