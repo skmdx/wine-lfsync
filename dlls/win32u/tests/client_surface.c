@@ -90,6 +90,16 @@ static unsigned int set_surface_state( HWND hwnd, UINT_PTR surface, UINT flags,
     return set_surface_state_scene( hwnd, surface, flags, generation, 0, state );
 }
 
+static unsigned int set_server_parent( HWND hwnd, HWND parent )
+{
+    struct __server_request_info info = {0};
+
+    info.u.req.set_parent_request.__header.req = REQ_set_parent;
+    info.u.req.set_parent_request.handle = wine_server_user_handle( hwnd );
+    info.u.req.set_parent_request.parent = wine_server_user_handle( parent );
+    return p_wine_server_call( &info );
+}
+
 static unsigned int commit_surface_state( HWND hwnd, UINT_PTR surface,
                                           const struct surface_state *generation,
                                           struct surface_state *state )
@@ -372,8 +382,29 @@ static void test_clip_scene_snapshot(void)
     SetWindowPos( first, HWND_BOTTOM, 10, 10, 50, 40, SWP_NOACTIVATE );
     SetWindowPos( second, HWND_TOP, 20, 10, 50, 40, SWP_NOACTIVATE );
     set_surface_state( first, first_surface, CLIENT_SURFACE_STATE_REGISTER, 0, NULL );
+    claim_surface_state( first, first_surface, NULL );
+    status = get_clip_state( first, &before );
+    ok( !status && !before.count, "initial clip status %#x count %u\n", status, before.count );
+
     set_surface_state( second, second_surface, CLIENT_SURFACE_STATE_REGISTER, 0, NULL );
     set_surface_state( descendant, descendant_surface, CLIENT_SURFACE_STATE_REGISTER, 0, NULL );
+    status = get_clip_state( first, &after );
+    ok( !status, "dormant clip snapshot failed, status %#x\n", status );
+    ok( after.scene_generation == before.scene_generation,
+        "dormant registration changed scene epoch from %s to %s\n",
+        wine_dbgstr_longlong( before.scene_generation ), wine_dbgstr_longlong( after.scene_generation ) );
+    ok( !after.count, "dormant surfaces changed the clip in the same scene, count %u\n", after.count );
+
+    status = claim_surface_state( descendant, descendant_surface, NULL );
+    ok( !status, "descendant claim failed, status %#x\n", status );
+    status = get_clip_state( first, &after );
+    ok( !status && after.count == 1 && clip_state_contains( &after, descendant ),
+        "claimed descendant clip status %#x count %u\n", status, after.count );
+    ok( after.scene_generation != before.scene_generation,
+        "first completed descendant frame did not invalidate the clip scene\n" );
+
+    /* A completed cache also occludes, even when a dormant active surface
+     * exists for the same HWND.  The active surface takes over after claim. */
     set_surface_state( second, duplicate_surface, CLIENT_SURFACE_STATE_CACHE, 0, NULL );
 
     status = get_clip_state( first, &before );
@@ -384,6 +415,11 @@ static void test_clip_scene_snapshot(void)
     ok( before.count == 2, "clip count %u, expected two distinct windows\n", before.count );
     ok( clip_state_contains( &before, second ), "upper sibling missing from clip snapshot\n" );
     ok( clip_state_contains( &before, descendant ), "descendant missing from clip snapshot\n" );
+
+    claim_surface_state( second, second_surface, NULL );
+    status = get_clip_state( first, &after );
+    ok( !status && after.count == before.count,
+        "claiming a cached window duplicated its clip, status %#x count %u\n", status, after.count );
 
     shape = CreateRectRgn( 0, 0, 20, 15 );
     shape_part = CreateRectRgn( 30, 25, 50, 40 );
@@ -427,6 +463,66 @@ static void test_clip_scene_snapshot(void)
     set_surface_state( second, second_surface, CLIENT_SURFACE_STATE_UNREGISTER, 0, NULL );
     set_surface_state( first, first_surface, CLIENT_SURFACE_STATE_UNREGISTER, 0, NULL );
 done:
+    DestroyWindow( parent );
+}
+
+static void test_complex_clip_snapshot(void)
+{
+    const UINT_PTR surface = 0x1235a000;
+    const UINT side = 256, count = side * side;
+    struct __server_request_info info;
+    struct client_surface_clip_window *clips = NULL;
+    struct rectangle *rects = NULL;
+    HWND parent, child = NULL;
+    unsigned int status;
+    UINT x, y, i;
+
+    parent = create_test_window( TRUE );
+    ok( !!parent, "failed to create complex clip parent\n" );
+    if (!parent) return;
+    SetWindowPos( parent, NULL, 10, 10, 2 * side, 2 * side, SWP_NOACTIVATE | SWP_NOZORDER );
+    child = create_test_child( parent, 0 );
+    ok( !!child, "failed to create complex clip child\n" );
+    if (!child) goto done;
+    SetWindowPos( child, NULL, 0, 0, 2 * side, 2 * side, SWP_NOACTIVATE | SWP_NOZORDER );
+    rects = malloc( count * sizeof(*rects) );
+    clips = malloc( count * sizeof(*clips) );
+    ok( !!rects && !!clips, "failed to allocate complex clip data\n" );
+    if (!rects || !clips) goto done;
+    for (y = i = 0; y < side; ++y)
+        for (x = 0; x < side; ++x, ++i)
+            rects[i] = (struct rectangle){2 * x, 2 * y, 2 * x + 1, 2 * y + 1};
+
+    /* Install canonical disjoint rectangles at the server boundary; this
+     * test concerns the clip protocol, not host XShape request sizing. */
+    memset( &info, 0, sizeof(info) );
+    info.u.req.set_window_region_request.__header.req = REQ_set_window_region;
+    info.u.req.set_window_region_request.window = wine_server_user_handle( child );
+    wine_server_add_data( &info, rects, count * sizeof(*rects) );
+    status = p_wine_server_call( &info );
+    ok( !status, "complex region setup failed, status %#x\n", status );
+    if (status) goto done;
+    set_surface_state( child, surface, CLIENT_SURFACE_STATE_REGISTER, 0, NULL );
+    claim_surface_state( child, surface, NULL );
+
+    memset( &info, 0, sizeof(info) );
+    info.u.req.get_client_surface_clip_windows_request.__header.req = REQ_get_client_surface_clip_windows;
+    info.u.req.get_client_surface_clip_windows_request.handle = wine_server_user_handle( parent );
+    info.u.req.get_client_surface_clip_windows_request.dpi.num = 1;
+    info.u.req.get_client_surface_clip_windows_request.dpi.den = 1;
+    wine_server_set_reply( &info, clips, count * sizeof(*clips) );
+    status = p_wine_server_call( &info );
+    ok( !status, "complex clip snapshot failed, status %#x\n", status );
+    ok( info.u.reply.get_client_surface_clip_windows_reply.count == count,
+        "complex clip count %u, expected %u\n", info.u.reply.get_client_surface_clip_windows_reply.count, count );
+    ok( wine_server_reply_size( &info.u.reply ) == count * sizeof(*clips),
+        "rectangle reply truncated at handle count: %u bytes, expected %u\n",
+        wine_server_reply_size( &info.u.reply ), count * (UINT)sizeof(*clips) );
+    set_surface_state( child, surface, CLIENT_SURFACE_STATE_UNREGISTER, 0, NULL );
+done:
+    free( clips );
+    free( rects );
+    if (child) SetWindowRgn( child, NULL, FALSE );
     DestroyWindow( parent );
 }
 
@@ -951,6 +1047,108 @@ static void test_native_backing_barrier(void)
 
     set_surface_state( hwnd, surface, CLIENT_SURFACE_STATE_UNREGISTER, 0, NULL );
     DestroyWindow( hwnd );
+}
+
+static void test_reparent_writer_leases(void)
+{
+    const UINT_PTR first_surface = 0x123d4000, second_surface = 0x123d4001;
+    const UINT_PTR first_barrier = 0x45674000, second_barrier = 0x45674001;
+    struct surface_state state, sealed;
+    HWND first, second, child = NULL;
+    unsigned int status;
+
+    first = create_test_window( TRUE );
+    second = create_test_window( TRUE );
+    ok( !!first && !!second, "failed to create reparent lease parents, error %lu\n", GetLastError() );
+    if (!first || !second) goto done;
+    child = create_test_child( first, 10 );
+    ok( !!child, "failed to create reparent lease child, error %lu\n", GetLastError() );
+    if (!child) goto done;
+
+    status = set_surface_state( child, first_surface, CLIENT_SURFACE_STATE_REGISTER |
+                                CLIENT_SURFACE_STATE_NATIVE_WRITE_LEASE, 0, NULL );
+    ok( !status, "first lease registration failed, status %#x\n", status );
+    claim_surface_state( child, first_surface, &state );
+    status = begin_surface_write_state( child, first_surface, &state, &state );
+    ok( !status && state.compose, "first writer was not admitted, status %#x compose %u\n",
+        status, state.compose );
+
+    ok( SetParent( child, second ) == first, "failed to reparent lease child, error %lu\n", GetLastError() );
+    status = set_surface_state( child, second_surface, CLIENT_SURFACE_STATE_REGISTER |
+                                CLIENT_SURFACE_STATE_NATIVE_WRITE_LEASE, 0, NULL );
+    ok( !status, "second lease registration failed, status %#x\n", status );
+    claim_surface_state( child, second_surface, &state );
+    status = begin_surface_write_state( child, second_surface, &state, &state );
+    ok( !status && state.compose, "second writer was not admitted, status %#x compose %u\n",
+        status, state.compose );
+
+    status = set_surface_state( first, first_barrier, CLIENT_SURFACE_STATE_NATIVE_BARRIER_BEGIN, 0, &sealed );
+    ok( !status && sealed.pending == 1, "old parent lost its writer: status %#x pending %u\n",
+        status, sealed.pending );
+    status = set_surface_state( second, second_barrier, CLIENT_SURFACE_STATE_NATIVE_BARRIER_BEGIN, 0, &sealed );
+    ok( !status && sealed.pending == 1, "new parent lost its writer: status %#x pending %u\n",
+        status, sealed.pending );
+
+    ok( DestroyWindow( child ), "failed to destroy lease child, error %lu\n", GetLastError() );
+    child = NULL;
+    status = set_surface_state( first, first_barrier, CLIENT_SURFACE_STATE_NATIVE_BARRIER_BEGIN, 0, &sealed );
+    ok( !status && !sealed.pending, "old parent retained a destroyed writer: status %#x pending %u\n",
+        status, sealed.pending );
+    status = set_surface_state( first, first_barrier, CLIENT_SURFACE_STATE_NATIVE_BARRIER_END, 0, &sealed );
+    ok( !status && !(sealed.scene_generation & 1), "old parent barrier did not end, status %#x\n", status );
+    status = set_surface_state( second, second_barrier, CLIENT_SURFACE_STATE_NATIVE_BARRIER_BEGIN, 0, &sealed );
+    ok( !status && !sealed.pending, "new parent retained a destroyed writer: status %#x pending %u\n",
+        status, sealed.pending );
+    status = set_surface_state( second, second_barrier, CLIENT_SURFACE_STATE_NATIVE_BARRIER_END, 0, &sealed );
+    ok( !status && !(sealed.scene_generation & 1), "new parent barrier did not end, status %#x\n", status );
+done:
+    if (child) DestroyWindow( child );
+    if (second) DestroyWindow( second );
+    if (first) DestroyWindow( first );
+}
+
+static void test_demoted_native_barrier(void)
+{
+    const UINT_PTR surface = 0x123d6000, barrier = 0x45676000;
+    struct surface_state state, sealed;
+    HWND first, second;
+    unsigned int status;
+
+    first = create_test_window( TRUE );
+    second = create_test_window( TRUE );
+    ok( !!first && !!second, "failed to create demotion parents, error %lu\n", GetLastError() );
+    if (!first || !second) goto done;
+    set_surface_state( first, surface, CLIENT_SURFACE_STATE_REGISTER |
+                       CLIENT_SURFACE_STATE_NATIVE_WRITE_LEASE, 0, NULL );
+    claim_surface_state( first, surface, &state );
+    status = begin_surface_write_state( first, surface, &state, &state );
+    ok( !status && state.compose, "demotion writer not admitted: status %#x compose %u\n",
+        status, state.compose );
+
+    /* SetParent updates the server hierarchy before destroying the former
+     * top-level's native window.  Stop at this server boundary so the test
+     * can finish the writer while the native teardown barrier is sealed. */
+    status = set_server_parent( first, second );
+    ok( !status, "server demotion failed, status %#x\n", status );
+    status = set_surface_state( first, barrier, CLIENT_SURFACE_STATE_NATIVE_BARRIER_BEGIN, 0, &sealed );
+    ok( !status && sealed.toplevel == first && sealed.pending == 1,
+        "native barrier followed new hierarchy: status %#x target %p pending %u\n",
+        status, sealed.toplevel, sealed.pending );
+    status = set_surface_state( first, barrier, CLIENT_SURFACE_STATE_NATIVE_BARRIER_END, 0, NULL );
+    ok( status == STATUS_DEVICE_BUSY, "demoted barrier ignored old writer, status %#x\n", status );
+    set_surface_state( first, surface, CLIENT_SURFACE_STATE_PRESENT_END, 0, NULL );
+    /* Reopen even after a failed expectation so the baseline can clean up. */
+    set_surface_state( first, barrier, CLIENT_SURFACE_STATE_NATIVE_BARRIER_BEGIN, 0, NULL );
+    status = set_surface_state( first, barrier, CLIENT_SURFACE_STATE_NATIVE_BARRIER_END, 0, &sealed );
+    ok( !status && !(sealed.scene_generation & 1) && !sealed.generation,
+        "demoted target retained its own transaction: status %#x scene %s generation %s\n",
+        status, wine_dbgstr_longlong( sealed.scene_generation ), wine_dbgstr_longlong( sealed.generation ) );
+    status = set_server_parent( first, GetDesktopWindow() );
+    ok( !status, "server promotion failed, status %#x\n", status );
+    set_surface_state( first, surface, CLIENT_SURFACE_STATE_UNREGISTER, 0, NULL );
+done:
+    if (first) DestroyWindow( first );
+    if (second) DestroyWindow( second );
 }
 
 static void test_notification_identity_aba(void)
@@ -1870,6 +2068,7 @@ static BOOL run_focused_test_case( const char *name, char **argv )
          test_generation_membership},
         {"clip-scene-snapshot", "client surface clip scene snapshots",
          test_clip_scene_snapshot},
+        {"complex-clip-snapshot", "complex client surface clip snapshot", test_complex_clip_snapshot},
         {"subtree-retirement", "client surface subtree retirement",
          test_subtree_generation_retirement},
         {"generation-aba", "client surface generation ABA exclusion", test_generation_aba},
@@ -1885,6 +2084,8 @@ static BOOL run_focused_test_case( const char *name, char **argv )
          test_backend_capability_isolation},
         {"native-backing-barrier", "native backing destruction barrier",
          test_native_backing_barrier},
+        {"reparent-writer-leases", "writer lease cleanup across reparenting", test_reparent_writer_leases},
+        {"demoted-native-barrier", "native backing barrier after demotion", test_demoted_native_barrier},
         {"notification-filter", "client surface notification filter bypass",
          test_notification_identity_aba},
         {"writer-thread-exit", "writer thread exit lease cleanup", test_writer_thread_exit},
@@ -1998,6 +2199,10 @@ START_TEST(client_surface)
     test_scene_writer_barrier();
     trace( "testing native backing destruction barrier\n" );
     test_native_backing_barrier();
+    trace( "testing writer lease cleanup across reparenting\n" );
+    test_reparent_writer_leases();
+    trace( "testing native backing barrier after demotion\n" );
+    test_demoted_native_barrier();
     trace( "testing client surface notification identity ABA\n" );
     test_notification_identity_aba();
     trace( "testing writer thread exit lease cleanup\n" );
@@ -2008,6 +2213,8 @@ START_TEST(client_surface)
     test_generation_membership();
     trace( "testing client surface clip scene snapshots\n" );
     test_clip_scene_snapshot();
+    trace( "testing complex client surface clip snapshot\n" );
+    test_complex_clip_snapshot();
     trace( "testing client surface subtree retirement\n" );
     test_subtree_generation_retirement();
     trace( "testing concurrent client surface state changes\n" );

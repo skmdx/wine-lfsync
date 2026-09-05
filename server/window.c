@@ -1631,7 +1631,6 @@ static void discard_client_surface_owner( struct window *win, struct client_surf
                                           struct window *top )
 {
     struct client_surface_ref *surface, *next;
-    struct window *writer_top = NULL;
     unsigned int removed = 0;
 
     if (!list_empty( &owner->surfaces )) begin_client_surface_scene_change( top );
@@ -1652,27 +1651,29 @@ static void discard_client_surface_owner( struct window *win, struct client_surf
             win->client_surface_cached_count--;
             removed++;
         }
-        assert( !released || !writer_top );
-        if (released) writer_top = released;
         complete_client_surface_generation( top, surface,
                                             client_surface_transaction_generation( top ) );
         retire_client_surface_ref( surface );
+        /* Reparenting can leave one lease on the old top-level while another
+         * surface of this owner writes the new one.  Each lease owns its own
+         * top-level reference.  The current scene stays odd until all owner
+         * memberships have been removed, so it cannot restart in this loop. */
+        if (released)
+        {
+            if (!released->client_surface_writer_count &&
+                released->client_surface_transaction.restart_pending &&
+                !(released->client_surface_scene_generation & 1))
+            {
+                released->client_surface_transaction.restart_pending = 0;
+                restart_client_surface_generation( released );
+            }
+            release_object( released );
+        }
     }
     if (removed) adjust_client_surface_subtree_count( win, -(int)removed );
     if (removed) update_client_surface_producer( win );
     release_client_surface_owner( owner );
     if (removed) end_client_surface_scene_change( top );
-    if (writer_top)
-    {
-        if (!writer_top->client_surface_writer_count &&
-            writer_top->client_surface_transaction.restart_pending &&
-            !(writer_top->client_surface_scene_generation & 1))
-        {
-            writer_top->client_surface_transaction.restart_pending = 0;
-            restart_client_surface_generation( writer_top );
-        }
-        release_object( writer_top );
-    }
 }
 
 static int discard_client_surface_owners( struct window *win, struct window *top )
@@ -1929,6 +1930,16 @@ static void restart_client_surface_generation( struct window *top )
 {
     int scene_published;
     int prepare_restart;
+
+    /* A writer retains the native top-level it originally targeted across a
+     * reparent.  Releasing that lease must not start an independent scene on
+     * a window which is now a child; the new top-level owns its composition. */
+    if (get_toplevel_window( top ) != top)
+    {
+        top->client_surface_transaction.restart_pending = 0;
+        finish_client_surface_publication( top );
+        return;
+    }
 
     if (!top->client_surface_transaction.staged &&
         (!is_visible( top ) || !has_client_surface( top )))
@@ -4023,13 +4034,17 @@ static int collect_client_surface_clip_subtree( struct window *win, struct ratio
                                                 struct client_surface_clip_window *data,
                                                 unsigned int max_count, unsigned int *count )
 {
+    struct client_surface_owner *owner;
     const struct rectangle *rects;
     struct region *region;
     struct window *child;
     unsigned int i, rect_count;
 
     if (!win->client_surface_subtree_count || !is_visible( win )) return 1;
-    if (win->client_surface_count || win->client_surface_cached_count)
+    /* A dormant registration does not own any pixels or advance the scene
+     * epoch.  Derive occlusion from the same producer choice as composition,
+     * otherwise identical scene tokens can describe different clip regions. */
+    if (select_client_surface_producer( win, &owner ))
     {
         /* A rectangular HWND snapshot over-clips shaped windows and ignores
          * ancestor clipping.  Serialize the exact client-visible region into
@@ -4092,7 +4107,9 @@ DECL_HANDLER(get_client_surface_clip_windows)
     top_visible = top->visible_rect;
     client_to_screen_rect( top->parent, &top_visible );
     map_dpi_rect( top, &top_visible, get_window_dpi( top ), req->dpi );
-    max_count = min( max_count, MAX_USER_HANDLES );
+    /* Entries are region rectangles, not HWNDs.  One shaped producer can
+     * contribute more rectangles than the handle table has slots.  The
+     * caller's reply buffer already bounds the allocation and its product. */
     if (max_count && !(data = mem_alloc( max_count * sizeof(*data) ))) return;
 
     LIST_FOR_EACH_ENTRY( child, &win->children, struct window, entry )
@@ -4152,6 +4169,10 @@ DECL_HANDLER(set_client_surface_state)
         unsigned int barrier_flags = req->flags &
             (CLIENT_SURFACE_STATE_NATIVE_BARRIER_BEGIN | CLIENT_SURFACE_STATE_NATIVE_BARRIER_END);
 
+        /* The native backing belongs to this exact HWND, even after it has
+         * become a child.  Resolving its new root would seal a different
+         * backing and miss writers admitted before the hierarchy changed. */
+        top = win;
         if (req->flags != barrier_flags || !req->surface ||
             !top->thread || top->thread->process != current->process ||
             barrier_flags == (CLIENT_SURFACE_STATE_NATIVE_BARRIER_BEGIN |
