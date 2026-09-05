@@ -34,6 +34,7 @@ struct x11drv_client_surface
     Colormap colormap;
     Window window;
     Pixmap composition_backing;
+    Window composition_window;
     UINT64 composition_scene_epoch;
     HWND composition_toplevel;
     struct x11drv_client_surface_completion completion;

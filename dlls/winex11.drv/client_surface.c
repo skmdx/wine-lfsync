@@ -290,6 +290,31 @@ static BOOL x11drv_client_surface_update( struct client_surface *client,
     return client_surface_update_offscreen( hwnd, surface, target );
 }
 
+static BOOL update_client_surface_composition_targets( struct x11drv_client_surface *surface,
+                                                       const struct client_surface_scene *scene )
+{
+    HWND toplevel = surface->client.target.toplevel;
+
+    /* A granted native writer lease keeps both the backing and its whole
+     * window alive. Replacing either target seals the scene and changes its
+     * epoch, so retain the pair together without taking the owner's lock or
+     * fetching its window property on every steady-state presentation.
+     * Without a backing, keep querying: that lifetime is not covered by the
+     * owner's backing barrier. */
+    if (surface->composition_backing && surface->composition_window &&
+        surface->composition_toplevel == scene->toplevel &&
+        surface->composition_scene_epoch == scene->epoch)
+        return TRUE;
+
+    surface->composition_window = X11DRV_get_whole_window_property( toplevel );
+    surface->composition_backing = 0;
+    if (!surface->composition_window) return FALSE;
+    surface->composition_backing = X11DRV_get_client_surface_backing_property( toplevel );
+    surface->composition_toplevel = scene->toplevel;
+    surface->composition_scene_epoch = scene->epoch;
+    return TRUE;
+}
+
 static BOOL copy_client_surface( struct x11drv_client_surface *surface, HDC hdc_dst, Drawable target,
                                  const RECT *rect_dst, const RECT *rect_src, HRGN region )
 {
@@ -335,16 +360,9 @@ static BOOL X11DRV_client_surface_present( struct client_surface *client,
      * presented while hidden on the stable offscreen composition path. */
     if (!NtUserIsWindowVisible( hwnd )) surface->keep_offscreen = TRUE;
 
-    window = X11DRV_get_whole_window_property( toplevel );
-    if (!window || !surface->hdc_src || !surface->hdc_dst || !surface->hdc_backing) return FALSE;
-    if (!surface->composition_backing ||
-        surface->composition_toplevel != scene->toplevel ||
-        surface->composition_scene_epoch != scene->epoch)
-    {
-        surface->composition_toplevel = scene->toplevel;
-        surface->composition_scene_epoch = scene->epoch;
-        surface->composition_backing = X11DRV_get_client_surface_backing_property( toplevel );
-    }
+    if (!surface->hdc_src || !surface->hdc_dst || !surface->hdc_backing) return FALSE;
+    if (!update_client_surface_composition_targets( surface, scene )) return FALSE;
+    window = surface->composition_window;
     backing = surface->composition_backing;
 
     /* Exclusive fullscreen ignores normal window clipping. */
