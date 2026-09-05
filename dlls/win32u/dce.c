@@ -1258,7 +1258,8 @@ static INT release_dc( HWND hwnd, HDC hdc, BOOL end_paint )
  */
 HDC WINAPI NtUserGetDCEx( HWND hwnd, HRGN clip_rgn, DWORD flags )
 {
-    const DWORD clip_flags = DCX_PARENTCLIP | DCX_CLIPSIBLINGS | DCX_CLIPCHILDREN | DCX_WINDOW;
+    const DWORD clip_flags = DCX_PARENTCLIP | DCX_CLIPSIBLINGS | DCX_CLIPCHILDREN | DCX_WINDOW |
+                            WINE_DCX_CLIENT_SURFACE;
     const DWORD user_flags = clip_flags | DCX_NORESETATTRS; /* flags that can be set by user */
     BOOL force_update = flags & WINE_DCX_FORCEUPDATE;
     BOOL update_vis_rgn = TRUE;

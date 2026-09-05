@@ -34,7 +34,8 @@
 # endif
 #endif
 
-/* Wine-internal NtUserGetDCEx flag. */
+/* Wine-internal NtUserGetDCEx flags. */
+#define WINE_DCX_CLIENT_SURFACE 0x40000000
 #define WINE_DCX_FORCEUPDATE 0x80000000
 
 /* avoid including shellscalingapi.h */

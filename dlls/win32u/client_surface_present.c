@@ -344,7 +344,11 @@ BOOL client_surface_end_present_internal( struct client_surface *surface,
              * foreign HWNDs are refreshed unconditionally by NtUserGetDCEx.
              * Forcing another server fetch here made every local frame pay an
              * avoidable round trip despite a matching scene token. */
-            hdc = NtUserGetDCEx( hwnd, 0, DCX_CACHE | DCX_USESTYLE );
+            /* Keep this DCE distinct from ordinary application DCs, including
+             * subsequent dirty-region refreshes.  A leased composition must
+             * not acquire a native owner lock held by a teardown waiting for
+             * that very lease. */
+            hdc = NtUserGetDCEx( hwnd, 0, DCX_CACHE | DCX_USESTYLE | WINE_DCX_CLIENT_SURFACE );
             if (!hdc)
             {
                 WARN( "failed to acquire composition DC for %s\n", debugstr_client_surface( surface ) );
