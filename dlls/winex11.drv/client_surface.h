@@ -42,6 +42,7 @@ struct x11drv_client_surface
 
     HDC hdc_src;
     HDC hdc_dst;
+    HDC hdc_backing;
 };
 
 extern struct x11drv_client_surface *impl_from_client_surface( struct client_surface *client );

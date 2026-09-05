@@ -103,6 +103,7 @@ static void x11drv_client_surface_destroy( struct client_surface *client )
     x11drv_client_surface_completion_destroy( surface );
     if (surface->colormap != default_colormap) XFreeColormap( gdi_display, surface->colormap );
     if (surface->window) destroy_client_window( hwnd, surface->window );
+    if (surface->hdc_backing) NtGdiDeleteObjectApp( surface->hdc_backing );
     if (surface->hdc_dst) NtGdiDeleteObjectApp( surface->hdc_dst );
     if (surface->hdc_src) NtGdiDeleteObjectApp( surface->hdc_src );
 }
@@ -187,7 +188,7 @@ static BOOL client_surface_update_offscreen( HWND hwnd, struct x11drv_client_sur
             attach_client_window( data, surface->window );
             release_win_data( data );
         }
-        return !offscreen || (surface->hdc_src && surface->hdc_dst);
+        return !offscreen || (surface->hdc_src && surface->hdc_dst && surface->hdc_backing);
     }
     else
     {
@@ -201,6 +202,11 @@ static BOOL client_surface_update_offscreen( HWND hwnd, struct x11drv_client_sur
             pXCompositeUnredirectWindow( gdi_display, surface->window, CompositeRedirectManual );
         surface->manual_redirect = FALSE;
 #endif
+        if (surface->hdc_backing)
+        {
+            NtGdiDeleteObjectApp( surface->hdc_backing );
+            surface->hdc_backing = NULL;
+        }
         if (surface->hdc_dst)
         {
             NtGdiDeleteObjectApp( surface->hdc_dst );
@@ -217,14 +223,16 @@ static BOOL client_surface_update_offscreen( HWND hwnd, struct x11drv_client_sur
         static const WCHAR displayW[] = {'D','I','S','P','L','A','Y', 0};
         UNICODE_STRING device_str = RTL_CONSTANT_STRING(displayW);
         RECT rect = target->virtual_rect;
-        HDC hdc_dst, hdc_src;
+        HDC hdc_dst, hdc_src, hdc_backing;
 
         OffsetRect( &rect, -rect.left, -rect.top );
         hdc_dst = NtGdiOpenDCW( &device_str, NULL, NULL, 0, TRUE, NULL, NULL, NULL );
         hdc_src = NtGdiOpenDCW( &device_str, NULL, NULL, 0, TRUE, NULL, NULL, NULL );
+        hdc_backing = NtGdiOpenDCW( &device_str, NULL, NULL, 0, TRUE, NULL, NULL, NULL );
 
-        if (!hdc_dst || !hdc_src)
+        if (!hdc_dst || !hdc_src || !hdc_backing)
         {
+            if (hdc_backing) NtGdiDeleteObjectApp( hdc_backing );
             if (hdc_dst) NtGdiDeleteObjectApp( hdc_dst );
             if (hdc_src) NtGdiDeleteObjectApp( hdc_src );
             WARN( "failed to allocate offscreen composition DCs for %s\n",
@@ -233,6 +241,7 @@ static BOOL client_surface_update_offscreen( HWND hwnd, struct x11drv_client_sur
         }
         surface->hdc_dst = hdc_dst;
         surface->hdc_src = hdc_src;
+        surface->hdc_backing = hdc_backing;
         set_dc_drawable( surface->hdc_src, surface->window, &rect, IncludeInferiors );
 
 #ifdef SONAME_LIBXCOMPOSITE
@@ -252,9 +261,10 @@ static BOOL client_surface_update_offscreen( HWND hwnd, struct x11drv_client_sur
             else
             {
                 WARN( "failed to redirect client window %lx, X error %d\n", surface->window, error );
+                NtGdiDeleteObjectApp( surface->hdc_backing );
                 NtGdiDeleteObjectApp( surface->hdc_dst );
                 NtGdiDeleteObjectApp( surface->hdc_src );
-                surface->hdc_dst = surface->hdc_src = NULL;
+                surface->hdc_backing = surface->hdc_dst = surface->hdc_src = NULL;
                 return FALSE;
             }
         }
@@ -280,22 +290,22 @@ static BOOL x11drv_client_surface_update( struct client_surface *client,
     return client_surface_update_offscreen( hwnd, surface, target );
 }
 
-static BOOL copy_client_surface( struct x11drv_client_surface *surface, Drawable target,
+static BOOL copy_client_surface( struct x11drv_client_surface *surface, HDC hdc_dst, Drawable target,
                                  const RECT *rect_dst, const RECT *rect_src, HRGN region )
 {
     RECT rect;
 
-    if (get_dc_drawable( surface->hdc_dst, &rect ) != target || !EqualRect( &rect, rect_dst ))
-        set_dc_drawable( surface->hdc_dst, target, rect_dst, IncludeInferiors );
+    if (get_dc_drawable( hdc_dst, &rect ) != target || !EqualRect( &rect, rect_dst ))
+        set_dc_drawable( hdc_dst, target, rect_dst, IncludeInferiors );
     /* RGN_COPY with a null region clears a clip left by an earlier present. */
-    NtGdiExtSelectClipRgn( surface->hdc_dst, region, RGN_COPY );
+    NtGdiExtSelectClipRgn( hdc_dst, region, RGN_COPY );
 
     if (rect_dst->right - rect_dst->left == rect_src->right - rect_src->left &&
         rect_dst->bottom - rect_dst->top == rect_src->bottom - rect_src->top)
-        return NtGdiBitBlt( surface->hdc_dst, 0, 0, rect_dst->right - rect_dst->left,
+        return NtGdiBitBlt( hdc_dst, 0, 0, rect_dst->right - rect_dst->left,
                             rect_dst->bottom - rect_dst->top, surface->hdc_src, 0, 0,
                             SRCCOPY, 0, 0 );
-    return NtGdiStretchBlt( surface->hdc_dst, 0, 0, rect_dst->right - rect_dst->left,
+    return NtGdiStretchBlt( hdc_dst, 0, 0, rect_dst->right - rect_dst->left,
                             rect_dst->bottom - rect_dst->top, surface->hdc_src, 0, 0,
                             rect_src->right - rect_src->left, rect_src->bottom - rect_src->top,
                             SRCCOPY, 0 );
@@ -326,7 +336,7 @@ static BOOL X11DRV_client_surface_present( struct client_surface *client,
     if (!NtUserIsWindowVisible( hwnd )) surface->keep_offscreen = TRUE;
 
     window = X11DRV_get_whole_window_property( toplevel );
-    if (!window || !surface->hdc_src || !surface->hdc_dst) return FALSE;
+    if (!window || !surface->hdc_src || !surface->hdc_dst || !surface->hdc_backing) return FALSE;
     if (!surface->composition_backing ||
         surface->composition_toplevel != scene->toplevel ||
         surface->composition_scene_epoch != scene->epoch)
@@ -376,9 +386,12 @@ static BOOL X11DRV_client_surface_present( struct client_surface *client,
      * Steady frames keep the same backing current, then update the visible
      * region; a live or staged generation becomes visible only in the owner
      * process after all renderer commits have reached the server. */
-    ret = backing ? copy_client_surface( surface, backing, &rect_dst, &rect_src, region ) : TRUE;
+    /* Keep separate destination DCs: rebinding one DC between these drawables
+     * recreates its GC and XRender picture for both copies on every frame. */
+    ret = backing ? copy_client_surface( surface, surface->hdc_backing, backing,
+                                         &rect_dst, &rect_src, region ) : TRUE;
     if (ret && (!defer_visible || !backing))
-        ret = copy_client_surface( surface, window, &rect_dst, &rect_src, region );
+        ret = copy_client_surface( surface, surface->hdc_dst, window, &rect_dst, &rect_src, region );
     if (ret)
     {
         /* A staged generation may aggregate surfaces from several renderer
