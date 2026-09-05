@@ -1098,6 +1098,8 @@ typedef volatile struct
 #define WINDOW_SHM_CLIENT_SURFACE_COMPOSING 0x02
 #define WINDOW_SHM_CLIENT_SURFACE_PUBLISHING 0x04
 #define WINDOW_SHM_CLIENT_SURFACE_PREPARING 0x08
+#define WINDOW_SHM_CLIENT_SURFACE_DIRECT 0x10
+#define WINDOW_SHM_CLIENT_SURFACE_BACKING 0x20
 
 typedef volatile union
 {
@@ -6300,9 +6302,9 @@ struct set_client_surface_state_reply
     unsigned int   ready;
     unsigned int   publish;
     unsigned int   compose;
+    unsigned int   mode;
     unsigned int   active;
     unsigned int   cached;
-    char __pad_60[4];
 };
 #define CLIENT_SURFACE_STATE_REGISTER   0x01
 #define CLIENT_SURFACE_STATE_UNREGISTER 0x02
@@ -6324,6 +6326,8 @@ struct set_client_surface_state_reply
 #define CLIENT_SURFACE_STATE_NATIVE_BARRIER_BEGIN 0x40000
 #define CLIENT_SURFACE_STATE_NATIVE_BARRIER_END   0x80000
 #define CLIENT_SURFACE_STATE_NATIVE_WRITE_LEASE 0x100000
+#define CLIENT_SURFACE_STATE_DIRECT_PRESENTATION 0x200000
+#define CLIENT_SURFACE_STATE_UPDATE_CAPS         0x400000
 
 
 
@@ -7349,6 +7353,6 @@ union generic_reply
     struct complete_client_surface_lease_reply complete_client_surface_lease_reply;
 };
 
-#define SERVER_PROTOCOL_VERSION 981
+#define SERVER_PROTOCOL_VERSION 989
 
 #endif /* __WINE_WINE_SERVER_PROTOCOL_H */

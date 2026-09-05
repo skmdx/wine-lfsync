@@ -103,6 +103,7 @@ struct client_surface_ref
     unsigned int    claimed : 1; /* an active surface which completed a host present */
     unsigned int    scene_publication : 1; /* renderer supports owner scene publication */
     unsigned int    native_write_lease : 1; /* renderer supports native-target write exclusion */
+    unsigned int    direct_presentation : 1; /* renderer can attach its native source directly */
     unsigned int    lease_writer : 1; /* sealed shared claim imported into writer_count */
     unsigned int    notification_pending : 1; /* an update for this identity is queued */
     unsigned int    destroy_state : 2; /* renderer destroy delivery state */
@@ -114,6 +115,10 @@ static struct client_surface_ref *client_surface_ref_index[CLIENT_SURFACE_REF_BU
 static LONG64 seal_client_surface_lease( struct client_surface_ref *surface );
 static void seal_client_surface_leases( struct window *top );
 static void detach_client_surface_lease( struct client_surface_ref *surface );
+static int client_surface_direct_candidate( struct window *top );
+static int client_surface_direct_registration_candidate( struct window *top );
+static int client_surface_direct_eligible( struct window *top );
+static enum client_surface_presentation_mode client_surface_presentation_mode( struct window *top );
 
 static unsigned int client_surface_ref_hash( struct process *process, client_ptr_t id )
 {
@@ -312,6 +317,7 @@ struct window
     unsigned int     client_surface_count; /* active client-rendered surfaces for this window */
     unsigned int     client_surface_cached_count; /* cached client-rendered surfaces owned by this window */
     unsigned int     client_surface_subtree_count; /* active and cached identities in this subtree */
+    unsigned int     client_surface_backing_required; /* owner host backing mode last published */
     unsigned int     client_surface_dirty; /* top-level composition changed while hidden */
     struct client_surface_transaction client_surface_transaction;
     unsigned int     client_surface_writer_count; /* writes which started before a scene cut-over */
@@ -354,6 +360,14 @@ static unsigned long long client_surface_transaction_generation( const struct wi
 
 static void update_client_surface_publication( struct window *top )
 {
+    enum client_surface_presentation_mode mode = client_surface_presentation_mode( top );
+    int direct = mode == CLIENT_SURFACE_PRESENTATION_DIRECT;
+    int backing_required = top->client_surface_subtree_count &&
+                           (top->client_surface_transaction.staged ||
+                            (!client_surface_direct_candidate( top ) &&
+                             !client_surface_direct_registration_candidate( top )));
+    int backing_changed = backing_required != top->client_surface_backing_required;
+
     assert( client_surface_is_composing( top ) == !!top->client_surface_transaction.epoch );
     assert( !client_surface_is_ready( top ) || !top->client_surface_transaction.pending );
     seal_client_surface_leases( top );
@@ -366,9 +380,15 @@ static void update_client_surface_publication( struct window *top )
             (top->client_surface_transaction.staged ? WINDOW_SHM_CLIENT_SURFACE_STAGED : 0) |
             (client_surface_is_composing( top ) ? WINDOW_SHM_CLIENT_SURFACE_COMPOSING : 0) |
             (client_surface_is_publishing( top ) ? WINDOW_SHM_CLIENT_SURFACE_PUBLISHING : 0) |
-            (client_surface_is_preparing( top ) ? WINDOW_SHM_CLIENT_SURFACE_PREPARING : 0);
+            (client_surface_is_preparing( top ) ? WINDOW_SHM_CLIENT_SURFACE_PREPARING : 0) |
+            (direct ? WINDOW_SHM_CLIENT_SURFACE_DIRECT : 0) |
+            (backing_required ? WINDOW_SHM_CLIENT_SURFACE_BACKING : 0);
     }
     SHARED_WRITE_END;
+    top->client_surface_backing_required = backing_required;
+    if (backing_changed && top->handle)
+        post_message_coalesced( top->handle, WM_WINE_UPDATEWINDOWSTATE,
+                                WINE_UPDATE_CLIENT_SURFACE_BACKING, 0 );
 }
 
 /* Once CLOSED wins the same atomic word as acquisition, later writers cannot
@@ -1083,6 +1103,7 @@ static struct window *create_window( struct window *parent, struct window *owner
     win->client_surface_count  = 0;
     win->client_surface_cached_count = 0;
     win->client_surface_subtree_count = 0;
+    win->client_surface_backing_required = 0;
     win->client_surface_dirty  = 0;
     win->client_surface_transaction = (struct client_surface_transaction){0};
     win->client_surface_writer_count = 0;
@@ -1323,9 +1344,7 @@ static void adjust_client_surface_subtree_count( struct window *win, int delta )
         win->client_surface_subtree_count += delta;
         if (win->parent && is_desktop_window( win->parent ) &&
             !!old_count != !!win->client_surface_subtree_count)
-            post_message( win->handle, WM_WINE_UPDATEWINDOWSTATE,
-                          WINE_UPDATE_CLIENT_SURFACE_BACKING,
-                          !!win->client_surface_subtree_count );
+            update_client_surface_publication( win );
         if (!win->parent || !win->is_linked) break;
         win = win->parent;
     }
@@ -1415,6 +1434,7 @@ static struct client_surface_ref *get_client_surface_ref( struct client_surface_
     surface->claimed = 0;
     surface->scene_publication = 0;
     surface->native_write_lease = 0;
+    surface->direct_presentation = 0;
     surface->notification_pending = 0;
     surface->destroy_state = CLIENT_SURFACE_DESTROY_NONE;
     list_add_tail( &owner->surfaces, &surface->entry );
@@ -1460,10 +1480,83 @@ static struct client_surface_ref *select_client_surface_producer( struct window 
     return selected;
 }
 
+static int client_surface_has_visible_descendant_producer( struct window *win )
+{
+    struct client_surface_owner *owner;
+    struct window *child;
+
+    if (!win->client_surface_subtree_count) return 0;
+    if (is_visible( win ) && select_client_surface_producer( win, &owner )) return 1;
+    LIST_FOR_EACH_ENTRY( child, &win->children, struct window, entry )
+        if (client_surface_has_visible_descendant_producer( child )) return 1;
+    return 0;
+}
+
+/* The server decides whether a stable scene has exactly one selected producer.
+ * Backend-local geometry, visual and clipping constraints may still downgrade
+ * this candidate to COMPOSITED.  Restrict the initial direct path to the
+ * owner process: foreign HWNDs have no local win_data with which to attach the
+ * producer's native child window. */
+static int client_surface_direct_candidate( struct window *top )
+{
+    struct client_surface_owner *owner;
+    struct client_surface_ref *selected;
+    struct window *child;
+
+    if (!is_visible( top ) || top->client_surface_subtree_count != 1 ||
+        top->client_surface_count != 1)
+        return 0;
+    if (!(selected = select_client_surface_producer( top, &owner )) ||
+        !selected->active || !selected->claimed || !selected->direct_presentation || !top->thread ||
+        owner->process != top->thread->process)
+        return 0;
+    LIST_FOR_EACH_ENTRY( child, &top->children, struct window, entry )
+        if (client_surface_has_visible_descendant_producer( child ))
+            return 0;
+    return 1;
+}
+
+/* Registration precedes the first producer claim.  Avoid provisioning a
+ * backing in that gap when the sole possible producer is a same-process
+ * DIRECT backend; prepare_present() claims it before the first native swap.
+ * Any second identity, descendant or foreign/non-DIRECT producer removes
+ * this exemption immediately on the topology slow path. */
+static int client_surface_direct_registration_candidate( struct window *top )
+{
+    struct client_surface_owner *owner;
+    struct client_surface_ref *surface;
+
+    if (!is_visible( top ) || !top->thread || top->client_surface_subtree_count != 1 ||
+        top->client_surface_count != 1 || top->client_surface_cached_count)
+        return 0;
+    LIST_FOR_EACH_ENTRY( owner, &top->client_surface_owners,
+                         struct client_surface_owner, entry )
+        LIST_FOR_EACH_ENTRY( surface, &owner->surfaces,
+                             struct client_surface_ref, entry )
+            if (surface->active)
+                return surface->direct_presentation && owner->process == top->thread->process;
+    return 0;
+}
+
+static int client_surface_direct_eligible( struct window *top )
+{
+    return !(top->client_surface_scene_generation & 1) &&
+           !top->client_surface_transaction.staged && !top->client_surface_native_barrier &&
+           client_surface_direct_candidate( top );
+}
+
+static enum client_surface_presentation_mode client_surface_presentation_mode( struct window *top )
+{
+    if (client_surface_direct_eligible( top )) return CLIENT_SURFACE_PRESENTATION_DIRECT;
+    if (top->client_surface_transaction.staged) return CLIENT_SURFACE_PRESENTATION_STAGED;
+    return CLIENT_SURFACE_PRESENTATION_COMPOSITED;
+}
+
 static unsigned int get_client_surface_backend_caps( const struct client_surface_ref *surface )
 {
     return surface->scene_publication |
-           surface->native_write_lease << 1;
+           surface->native_write_lease << 1 |
+           surface->direct_presentation << 2;
 }
 
 static int client_surface_scene_published_recursive( struct window *win,
@@ -1542,6 +1635,16 @@ static int mark_client_surface_generation_ready( struct window *top )
         top->client_surface_transaction.epoch != top->client_surface_scene_generation ||
         (top->client_surface_scene_generation & 1))
         return 0;
+
+    /* DIRECT publishes through the producer's attached native child.  There
+     * is no owner frame to expose after the producer commit, so retire this
+     * transitional generation instead of entering the backing publish loop. */
+    if (!top->client_surface_dirty && !top->client_surface_transaction.staged &&
+        client_surface_direct_eligible( top ))
+    {
+        finish_client_surface_generation( top );
+        return 0;
+    }
 
     /* Backends without an owner-managed scene target keep the legacy live
      * behavior: their driver presentation is already visible, so an empty
@@ -2238,6 +2341,19 @@ static void restart_client_surface_generation( struct window *top )
     if (top->client_surface_transaction.restarting)
     {
         top->client_surface_transaction.restart_pending = 1;
+        return;
+    }
+
+    /* DIRECT publishes through the producer's attached native child.  It has
+     * no owner snapshot, composition generation or backing publication to
+     * restart after a scene change.  Entering PREPARING here would make the
+     * otherwise stable DIRECT scene unreadable while the owner applies a
+     * resize and could recreate the offscreen completion path for that same
+     * drawable. */
+    if (!top->client_surface_dirty && !top->client_surface_transaction.staged &&
+        client_surface_direct_eligible( top ))
+    {
+        finish_client_surface_publication( top );
         return;
     }
     scene_published = client_surface_scene_published( top );
@@ -4428,6 +4544,7 @@ DECL_HANDLER(set_client_surface_state)
     reply->ready = 0;
     reply->publish = 0;
     reply->compose = 0;
+    reply->mode = CLIENT_SURFACE_PRESENTATION_INVALID;
     reply->active = 0;
     reply->cached = 0;
     if (!(win = get_window( req->handle ))) return;
@@ -4487,6 +4604,7 @@ DECL_HANDLER(set_client_surface_state)
         reply->pending = top->client_surface_writer_count;
         reply->staged = top->client_surface_transaction.staged;
         reply->ready = client_surface_is_ready( top );
+        reply->mode = client_surface_presentation_mode( top );
         reply->active = win->client_surface_count;
         reply->cached = win->client_surface_cached_count;
         return;
@@ -4508,10 +4626,12 @@ DECL_HANDLER(set_client_surface_state)
     selected_before = select_client_surface_producer( win, &selected_owner );
     selected_caps_before = selected_before ? get_client_surface_backend_caps( selected_before ) : 0;
 
-    if ((req->flags & (CLIENT_SURFACE_STATE_REGISTER | CLIENT_SURFACE_STATE_CACHE)) && surface)
+    if ((req->flags & (CLIENT_SURFACE_STATE_REGISTER | CLIENT_SURFACE_STATE_CACHE |
+                       CLIENT_SURFACE_STATE_UPDATE_CAPS)) && surface)
     {
         surface->scene_publication = !!(req->flags & CLIENT_SURFACE_STATE_SCENE_PUBLICATION);
         surface->native_write_lease = !!(req->flags & CLIENT_SURFACE_STATE_NATIVE_WRITE_LEASE);
+        surface->direct_presentation = !!(req->flags & CLIENT_SURFACE_STATE_DIRECT_PRESENTATION);
     }
 
     if ((req->flags & CLIENT_SURFACE_STATE_CACHE) && !surface->cached)
@@ -4730,6 +4850,7 @@ DECL_HANDLER(set_client_surface_state)
     reply->pending = top->client_surface_transaction.pending;
     reply->staged = top->client_surface_transaction.staged;
     reply->ready = client_surface_is_ready( top );
+    reply->mode = client_surface_presentation_mode( top );
     reply->active = win->client_surface_count;
     reply->cached = win->client_surface_cached_count;
 }

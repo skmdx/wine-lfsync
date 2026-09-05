@@ -14,6 +14,14 @@
 
 #include "windef.h"
 
+enum client_surface_presentation_mode
+{
+    CLIENT_SURFACE_PRESENTATION_INVALID,
+    CLIENT_SURFACE_PRESENTATION_DIRECT,
+    CLIENT_SURFACE_PRESENTATION_STAGED,
+    CLIENT_SURFACE_PRESENTATION_COMPOSITED,
+};
+
 /* Writable capabilities live in a separate per-process section, never in the
  * read-only session/window mapping. One cache line is reserved per surface. */
 #define CLIENT_SURFACE_LEASE_CLOSED ((LONG64)0x8000000000000000ull)

@@ -2268,7 +2268,7 @@ static LRESULT handle_internal_message( HWND hwnd, UINT msg, WPARAM wparam, LPAR
         else if (wparam == WINE_DESTROY_CLIENT_SURFACES)
             detach_client_surface_identity( lparam );
         else if (wparam == WINE_UPDATE_CLIENT_SURFACE_BACKING)
-            set_window_client_surface_backing( hwnd, !!lparam );
+            update_window_client_surface_backing( hwnd );
         else if (wparam == WINE_PUBLISH_CLIENT_SURFACES)
         {
             UINT64 generation, scene_generation;

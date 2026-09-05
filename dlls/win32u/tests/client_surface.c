@@ -36,6 +36,7 @@ struct surface_state
     UINT ready;
     UINT publish;
     UINT compose;
+    UINT mode;
     UINT active;
     UINT cached;
     BOOL wake;
@@ -50,6 +51,7 @@ struct clip_state
 };
 
 static unsigned int (CDECL *p_wine_server_call)(void *);
+static void pump_messages( DWORD timeout );
 
 static unsigned int set_surface_state_scene( HWND hwnd, UINT_PTR surface, UINT flags,
                                              UINT64 generation, UINT64 scene_generation,
@@ -78,6 +80,7 @@ static unsigned int set_surface_state_scene( HWND hwnd, UINT_PTR surface, UINT f
         state->ready = reply->ready;
         state->publish = reply->publish;
         state->compose = reply->compose;
+        state->mode = reply->mode;
         state->active = reply->active;
         state->cached = reply->cached;
         state->wake = reply->wake;
@@ -251,6 +254,103 @@ static HWND create_test_child( HWND parent, int x )
     return CreateWindowExA( 0, "client_surface_test", "client surface child",
                             WS_CHILD | WS_VISIBLE, x, 10, 50, 40, parent, NULL,
                             GetModuleHandleA( NULL ), NULL );
+}
+
+static void complete_single_surface_generation( HWND hwnd, UINT_PTR surface,
+                                                struct surface_state *state )
+{
+    struct surface_state generation;
+    unsigned int status;
+
+    if (!state->pending && state->mode == CLIENT_SURFACE_PRESENTATION_COMPOSITED)
+    {
+        status = prepare_surface_state( hwnd, state );
+        ok( !status, "surface prepare status %#x\n", status );
+    }
+    generation = *state;
+    if (!generation.pending) return;
+    ok( generation.pending == 1, "unexpected generation pending count %u\n", generation.pending );
+    status = begin_surface_state( hwnd, surface, &generation, state );
+    ok( !status && state->compose, "generation begin status %#x compose %u\n",
+        status, state->compose );
+    status = commit_surface_state( hwnd, surface, &generation, state );
+    ok( !status, "generation commit status %#x\n", status );
+    if (state->ready)
+    {
+        status = publish_surface_state( hwnd, state );
+        ok( !status, "generation publish status %#x\n", status );
+    }
+}
+
+static void test_presentation_modes(void)
+{
+    const UINT_PTR surface = 0x1234d000, child_surface = 0x1234d001;
+    const UINT direct_flags = CLIENT_SURFACE_STATE_REGISTER |
+                              CLIENT_SURFACE_STATE_SCENE_PUBLICATION |
+                              CLIENT_SURFACE_STATE_DIRECT_PRESENTATION;
+    struct surface_state state;
+    HWND hwnd, child = NULL;
+    unsigned int status;
+
+    hwnd = create_test_window( FALSE );
+    ok( !!hwnd, "failed to create presentation mode window, error %lu\n", GetLastError() );
+    if (!hwnd) return;
+    ShowWindow( hwnd, SW_SHOW );
+    pump_messages( 100 );
+
+    status = set_surface_state( hwnd, surface, direct_flags, 0, &state );
+    ok( !status, "direct surface register failed, status %#x\n", status );
+    status = claim_surface_state( hwnd, surface, &state );
+    ok( !status, "direct surface claim failed, status %#x\n", status );
+    complete_single_surface_generation( hwnd, surface, &state );
+    status = set_surface_state( hwnd, surface, 0, 0, &state );
+    ok( !status && state.mode == CLIENT_SURFACE_PRESENTATION_DIRECT,
+        "simple top-level mode %u, expected DIRECT, status %#x\n", state.mode, status );
+
+    child = create_test_child( hwnd, 10 );
+    ok( !!child, "failed to create presentation mode child, error %lu\n", GetLastError() );
+    if (child)
+    {
+        status = set_surface_state( child, child_surface, direct_flags, 0, &state );
+        ok( !status, "child surface register failed, status %#x\n", status );
+        status = claim_surface_state( child, child_surface, &state );
+        ok( !status && state.mode == CLIENT_SURFACE_PRESENTATION_COMPOSITED,
+            "multi-window mode %u, expected COMPOSITED, status %#x\n", state.mode, status );
+        status = set_surface_state( child, child_surface, CLIENT_SURFACE_STATE_UNREGISTER, 0, &state );
+        ok( !status, "child surface unregister failed, status %#x\n", status );
+        DestroyWindow( child );
+        child = NULL;
+        status = set_surface_state( hwnd, surface, 0, 0, &state );
+        ok( !status, "post-child mode query failed, status %#x\n", status );
+        complete_single_surface_generation( hwnd, surface, &state );
+        status = set_surface_state( hwnd, surface, 0, 0, &state );
+        ok( !status && state.mode == CLIENT_SURFACE_PRESENTATION_DIRECT,
+            "post-child mode %u, expected DIRECT, status %#x\n", state.mode, status );
+    }
+
+    ShowWindow( hwnd, SW_HIDE );
+    pump_messages( 100 );
+    status = set_surface_state( hwnd, surface, 0, 0, &state );
+    ok( !status && state.mode == CLIENT_SURFACE_PRESENTATION_COMPOSITED,
+        "hidden idle mode %u, expected COMPOSITED, status %#x\n", state.mode, status );
+    ShowWindow( hwnd, SW_SHOW );
+    status = set_surface_state( hwnd, surface, CLIENT_SURFACE_STATE_STAGED, 0, &state );
+    ok( !status && state.mode == CLIENT_SURFACE_PRESENTATION_STAGED,
+        "show transition mode %u, expected STAGED, status %#x\n", state.mode, status );
+    complete_single_surface_generation( hwnd, surface, &state );
+    status = set_surface_state( hwnd, surface, 0, 0, &state );
+    ok( !status && state.mode == CLIENT_SURFACE_PRESENTATION_DIRECT,
+        "published show mode %u, expected DIRECT, status %#x\n", state.mode, status );
+
+    status = set_surface_state( hwnd, surface,
+                                CLIENT_SURFACE_STATE_REGISTER |
+                                CLIENT_SURFACE_STATE_SCENE_PUBLICATION, 0, &state );
+    ok( !status && state.mode == CLIENT_SURFACE_PRESENTATION_COMPOSITED,
+        "backend without direct capability mode %u, expected COMPOSITED, status %#x\n",
+        state.mode, status );
+    set_surface_state( hwnd, surface, CLIENT_SURFACE_STATE_UNREGISTER, 0, NULL );
+    DestroyWindow( hwnd );
+    pump_messages( 200 );
 }
 
 static void test_generation_membership(void)
@@ -2567,6 +2667,7 @@ static BOOL run_focused_test_case( const char *name, char **argv )
     {
         {"completion-provenance", "client surface completion result provenance",
          test_completion_result_provenance},
+        {"presentation-modes", "client surface presentation modes", test_presentation_modes},
         {"generation-membership", "client surface generation membership",
          test_generation_membership},
         {"clip-scene-snapshot", "client surface clip scene snapshots",
@@ -2609,6 +2710,20 @@ static BOOL run_focused_test_case( const char *name, char **argv )
     };
     unsigned int i;
 
+    if (!strcmp( name, "presentation-modes-destroy-race" ))
+    {
+        trace( "testing presentation mode teardown before present destruction race\n" );
+        test_presentation_modes();
+        test_present_destroy_race();
+        return TRUE;
+    }
+    if (!strcmp( name, "owner-exit-destroy-race" ))
+    {
+        trace( "testing owner teardown before present destruction race\n" );
+        test_owner_exit_and_destroy( argv );
+        test_present_destroy_race();
+        return TRUE;
+    }
     for (i = 0; i < ARRAY_SIZE(cases); ++i)
     {
         if (strcmp( name, cases[i].name )) continue;
@@ -2719,6 +2834,8 @@ START_TEST(client_surface)
     test_lease_writer_thread_exit();
     trace( "testing client surface generations\n" );
     test_generation_aba();
+    trace( "testing client surface presentation modes\n" );
+    test_presentation_modes();
     trace( "testing client surface host publication transaction\n" );
     test_publish_transaction();
     trace( "testing live client surface prepare transaction\n" );

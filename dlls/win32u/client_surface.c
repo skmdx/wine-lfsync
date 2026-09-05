@@ -54,7 +54,7 @@ static BOOL client_surface_backend_update( struct client_surface *surface,
     return !surface->backend->update || surface->backend->update( surface, target );
 }
 
-static unsigned int client_surface_backend_state_flags( const struct client_surface *surface )
+static unsigned int client_surface_backend_state_flags( struct client_surface *surface )
 {
     unsigned int flags = 0;
 
@@ -62,6 +62,9 @@ static unsigned int client_surface_backend_state_flags( const struct client_surf
         flags |= CLIENT_SURFACE_STATE_SCENE_PUBLICATION;
     if (client_surface_backend_has_cap( surface, CLIENT_SURFACE_BACKEND_NATIVE_WRITE_LEASE ))
         flags |= CLIENT_SURFACE_STATE_NATIVE_WRITE_LEASE;
+    if (client_surface_backend_has_cap( surface, CLIENT_SURFACE_BACKEND_DIRECT_PRESENTATION ) &&
+        InterlockedCompareExchange( &surface->direct_ready, 0, 0 ))
+        flags |= CLIENT_SURFACE_STATE_DIRECT_PRESENTATION;
     return flags;
 }
 
@@ -178,6 +181,7 @@ static void publish_client_surface_target( struct client_surface *surface,
     surface->target.monitor_rect = target->monitor_rect;
     surface->target.dpi_num = target->dpi_num;
     surface->target.dpi_den = target->dpi_den;
+    surface->target.mode = target->mode;
     surface->target.offscreen = target->offscreen;
     surface->target.valid = target->valid;
     InterlockedIncrement64( &surface->target.seq );
@@ -252,6 +256,29 @@ HWND client_surface_set_server_state( HWND hwnd, const struct client_surface *su
     return toplevel;
 }
 
+/* DIRECT is a server scene decision, but the native backend owns constraints
+ * which the server cannot observe (DPI transforms and native clipping on X11).
+ * Publish changes only on geometry/lifecycle updates; steady-state presents
+ * consume the shared scene and perform no server request. */
+static void client_surface_update_direct_ready_locked( struct client_surface *surface )
+{
+    BOOL ready = client_surface_backend_has_cap( surface, CLIENT_SURFACE_BACKEND_DIRECT_PRESENTATION ) &&
+                 (!surface->backend->direct_ready || surface->backend->direct_ready( surface ));
+    HWND toplevel;
+    BOOL wake;
+
+    if (InterlockedCompareExchange( &surface->direct_ready, ready, !ready ) == ready) return;
+    if (!InterlockedCompareExchange( &surface->active, 0, 0 ) &&
+        !InterlockedCompareExchange( &surface->server_cached, 0, 0 ))
+        return;
+
+    toplevel = client_surface_set_server_state( surface->hwnd, surface,
+                                                CLIENT_SURFACE_STATE_UPDATE_CAPS |
+                                                client_surface_backend_state_flags( surface ),
+                                                0, 0, &wake );
+    if (wake && toplevel) NtUserPostMessage( toplevel, WM_WINE_UPDATEWINDOWSTATE, 0, 0 );
+}
+
 static void client_surface_uncache_present_locked( struct client_surface *surface )
 {
     HWND toplevel;
@@ -284,7 +311,12 @@ void client_surface_invalidate_source_locked( struct client_surface *surface,
 
 static void client_surface_wait_driver_completion_locked( struct client_surface *surface )
 {
-    while (surface->driver_completion_count)
+    /* DIRECT has no completion monitor, but the native WSI call still owns
+     * the drawable between begin_present() and submit_present().  Shared
+     * monitors also own mutable backend state.  Exact GLX completion cannot
+     * be waited here: an offscreen completion may itself require the pending
+     * show transition to reach the X server. */
+    while (surface->native_present_count || surface->driver_completion_count)
         pthread_cond_wait( &surface->completion_cond, &surface->completion_lock );
 }
 
@@ -305,6 +337,24 @@ static void client_surface_unlock_target( struct client_surface *surface )
     if (!InterlockedDecrement( &surface->target_update_waiters ))
         pthread_cond_broadcast( &surface->completion_cond );
     client_surface_unlock_present( surface );
+}
+
+/* Owner-side geometry changes must not wait for a native present whose host
+ * completion can depend on that owner reaching the window system.  Publish a
+ * coalesced request first, then take the target only when it is immediately
+ * idle.  The current presenter consumes the request when it drops the lock. */
+static BOOL client_surface_trylock_target( struct client_surface *surface )
+{
+    InterlockedExchange( &surface->target_update_pending, TRUE );
+    if (pthread_mutex_trylock( &surface->completion_lock )) return FALSE;
+    if (surface->native_present_count || surface->driver_completion_count)
+    {
+        pthread_mutex_unlock( &surface->completion_lock );
+        return FALSE;
+    }
+    InterlockedExchange( &surface->target_update_pending, FALSE );
+    InterlockedIncrement( &surface->target_update_waiters );
+    return TRUE;
 }
 
 static void client_surface_wait_all_completions_locked( struct client_surface *surface )
@@ -535,6 +585,10 @@ static BOOL read_client_surface_scene( HWND toplevel, struct client_surface_scen
         scene->generation = (window_shm->client_surface_flags & WINDOW_SHM_CLIENT_SURFACE_COMPOSING) ?
                             window_shm->client_surface_generation : 0;
         scene->epoch = window_shm->client_surface_scene_generation;
+        scene->mode = (window_shm->client_surface_flags & WINDOW_SHM_CLIENT_SURFACE_DIRECT) ?
+                      CLIENT_SURFACE_PRESENTATION_DIRECT :
+                      (window_shm->client_surface_flags & WINDOW_SHM_CLIENT_SURFACE_STAGED) ?
+                      CLIENT_SURFACE_PRESENTATION_STAGED : CLIENT_SURFACE_PRESENTATION_COMPOSITED;
         preparing = !!(window_shm->client_surface_flags & WINDOW_SHM_CLIENT_SURFACE_PREPARING);
         if (producer_process) *producer_process = window_shm->client_surface_process;
         if (producer_id) *producer_id = window_shm->client_surface_id;
@@ -548,6 +602,7 @@ BOOL client_surface_get_scene( struct client_surface *surface, struct client_sur
 {
     struct object_lock producer_lock = OBJECT_LOCK_INIT;
     const window_shm_t *producer_shm = NULL;
+    struct client_surface_target target;
     process_id_t producer_process = 0;
     client_ptr_t producer_id = 0;
     HWND hwnd, toplevel;
@@ -560,7 +615,12 @@ BOOL client_surface_get_scene( struct client_surface *surface, struct client_sur
                   !InterlockedCompareExchange( &surface->server_cached, 0, 0 )))
         return FALSE;
 
-    if (!(toplevel = NtUserGetAncestor( hwnd, GA_ROOT ))) return FALSE;
+    /* target writers hold completion_lock across a topology change, so its
+     * seqlock snapshot is the authoritative root for this presentation.
+     * Calling NtUserGetAncestor() here would invert completion_lock and the
+     * process USER lock against concurrent SetWindowPos(). */
+    client_surface_get_target( surface, &target );
+    if (!(toplevel = target.toplevel)) return FALSE;
     if (!read_client_surface_scene( toplevel, scene, &producer_process, &producer_id )) return FALSE;
 
     while (hwnd != toplevel &&
@@ -588,14 +648,18 @@ BOOL client_surface_scene_current( const struct client_surface_scene *scene )
     if (!scene->valid || !scene->toplevel ||
         !read_client_surface_scene( scene->toplevel, &current, NULL, NULL ) || !current.valid)
         return FALSE;
-    return current.generation == scene->generation && current.epoch == scene->epoch;
+    return current.generation == scene->generation && current.epoch == scene->epoch &&
+           current.mode == scene->mode;
 }
 
-BOOL client_surface_update_present_locked( struct client_surface *surface )
+static BOOL client_surface_update_present_scene_internal_locked(
+    struct client_surface *surface, const struct client_surface_scene *requested_scene,
+    BOOL allow_direct_transition )
 {
     struct client_surface_target current, next, invalid;
     RECT old_source_rect, new_source_rect;
-    BOOL changed, ready;
+    struct client_surface_scene scene;
+    BOOL changed, defer_direct, ready, scene_valid;
 
     client_surface_get_target( surface, &current );
     next = current;
@@ -611,6 +675,33 @@ BOOL client_surface_update_present_locked( struct client_surface *surface )
         InterlockedExchange( &surface->content_valid, FALSE );
         return FALSE;
     }
+    client_surface_update_direct_ready_locked( surface );
+    if (requested_scene)
+    {
+        scene = *requested_scene;
+        /* direct_ready can change the server scene before the native update.
+         * Never substitute a second, unrelated snapshot for the one the
+         * frame is about to validate.  The caller can resample and retry. */
+        if (!scene.valid || !client_surface_scene_current( &scene ))
+        {
+            surface->target_scene_epoch = 0;
+            surface->target_scene_mode = CLIENT_SURFACE_PRESENTATION_INVALID;
+            return FALSE;
+        }
+        scene_valid = TRUE;
+    }
+    else
+        scene_valid = client_surface_get_scene( surface, &scene );
+    next.mode = !scene_valid ? current.mode : scene.authoritative ? scene.mode :
+                CLIENT_SURFACE_PRESENTATION_COMPOSITED;
+    /* Reparenting an already presented offscreen drawable may discard its
+     * front buffer.  Keep the last STAGED/COMPOSITED image visible until an
+     * actual producer present is ready to replace it.  Geometry owners still
+     * update an established DIRECT target in place. */
+    defer_direct = !allow_direct_transition &&
+                   next.mode == CLIENT_SURFACE_PRESENTATION_DIRECT &&
+                   current.mode != CLIENT_SURFACE_PRESENTATION_DIRECT;
+    if (defer_direct) next.mode = current.mode;
     old_source_rect = surface->raw ? current.monitor_rect : current.virtual_rect;
     new_source_rect = surface->raw ? next.monitor_rect : next.virtual_rect;
     changed = next.toplevel != current.toplevel ||
@@ -653,12 +744,34 @@ BOOL client_surface_update_present_locked( struct client_surface *surface )
     /* Publish the complete target only after the driver has resized and
      * reparented its native drawable.  Readers can therefore validate one
      * sequence instead of pairing geometry and lifecycle counters. */
-    if (changed || next.offscreen != current.offscreen || next.valid != current.valid)
+    if (changed || next.mode != current.mode || next.offscreen != current.offscreen ||
+        next.valid != current.valid)
     {
         publish_client_surface_target( surface, &next );
         if (changed) InterlockedExchange( &surface->updated, TRUE );
     }
+    if (!defer_direct && scene_valid && client_surface_scene_current( &scene ))
+    {
+        surface->target_scene_epoch = scene.epoch;
+        surface->target_scene_mode = scene.mode;
+    }
+    else
+    {
+        surface->target_scene_epoch = 0;
+        surface->target_scene_mode = CLIENT_SURFACE_PRESENTATION_INVALID;
+    }
     return TRUE;
+}
+
+BOOL client_surface_update_present_scene_locked( struct client_surface *surface,
+                                                  const struct client_surface_scene *scene )
+{
+    return client_surface_update_present_scene_internal_locked( surface, scene, TRUE );
+}
+
+BOOL client_surface_update_present_locked( struct client_surface *surface )
+{
+    return client_surface_update_present_scene_internal_locked( surface, NULL, FALSE );
 }
 
 /* completion_lock is held.  A completed driver wait calls this before
@@ -682,6 +795,16 @@ static BOOL client_surface_update_now( struct client_surface *surface )
     ret = client_surface_update_now_locked( surface );
     client_surface_unlock_target( surface );
     return ret;
+}
+
+void client_surface_apply_pending_update( struct client_surface *surface )
+{
+    if (!InterlockedCompareExchange( &surface->target_update_pending, 0, 0 ) ||
+        !client_surface_trylock_target( surface ))
+        return;
+
+    client_surface_update_now_locked( surface );
+    client_surface_unlock_target( surface );
 }
 
 static BOOL client_surface_recompose( struct client_surface *surface, LONG64 seq );
@@ -837,9 +960,7 @@ void update_client_surfaces( HWND hwnd )
     UINT recompose_count = 0, recompose_size = 0, i;
 
     if (!collect_indexed_client_surfaces( hwnd, &update_surfaces, &update_count, &update_size ))
-    {
         WARN( "failed to allocate client surface update list\n" );
-    }
 
     for (i = 0; i < update_count; ++i)
     {
@@ -848,7 +969,7 @@ void update_client_surfaces( HWND hwnd )
         BOOL visible;
 
         surface = update_surfaces[i];
-        client_surface_lock_target( surface );
+        if (!client_surface_trylock_target( surface )) continue;
         pthread_mutex_lock( &surface->present_lock );
         surface_hwnd = InterlockedCompareExchangePointer( (void **)&surface->hwnd, NULL, NULL );
         if (!surface_hwnd || NtUserGetAncestor( surface_hwnd, GA_ROOT ) != hwnd)
@@ -1237,14 +1358,17 @@ BOOL client_surface_update( struct client_surface *surface )
     scene_valid = client_surface_get_scene( surface, &scene );
     if (scene_valid && surface->target.valid &&
         surface->target.toplevel == scene.toplevel &&
-        surface->target_scene_epoch == scene.epoch)
+        surface->target_scene_epoch == scene.epoch &&
+        surface->target_scene_mode == scene.mode)
         ret = TRUE;
     else if (surface->hwnd)
     {
-        ret = client_surface_update_present_locked( surface );
+        ret = client_surface_update_present_scene_internal_locked( surface, NULL, TRUE );
         scene_valid = client_surface_get_scene( surface, &scene );
-        if (ret && scene_valid)
-            surface->target_scene_epoch = scene.epoch;
+        ret = ret && scene_valid && surface->target.valid &&
+              surface->target.toplevel == scene.toplevel &&
+              surface->target_scene_epoch == scene.epoch &&
+              surface->target_scene_mode == scene.mode;
     }
     pthread_mutex_unlock( &surface->present_lock );
     client_surface_unlock_target( surface );

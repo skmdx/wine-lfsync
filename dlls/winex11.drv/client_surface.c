@@ -47,20 +47,17 @@ static BOOL needs_client_window_clipping( HWND hwnd )
     return ret > 0;
 }
 
-static BOOL needs_offscreen_rendering( HWND hwnd, BOOL raw )
+static BOOL needs_composited_rendering( HWND hwnd, BOOL raw )
 {
-    HWND toplevel = NtUserGetAncestor( hwnd, GA_ROOT );
-
-    /* Owner-managed publication makes the backing Pixmap authoritative for
-     * both Expose repair and multi-surface cut-over.  A directly attached
-     * client window would update only the visible host after the generation
-     * completed, leaving that backing stale.  Keep every participating X11
-     * surface on the composition path while the owner advertises a backing. */
-    if (toplevel && X11DRV_get_client_surface_backing( toplevel )) return TRUE;
     if (!raw && NtUserGetDpiForWindow( hwnd ) != NtUserGetWinMonitorDpi( hwnd, MDT_RAW_DPI )) return TRUE; /* needs DPI scaling */
     if (NtUserGetAncestor( hwnd, GA_PARENT ) != NtUserGetDesktopWindow()) return TRUE; /* child window, needs compositing */
     if (NtUserGetWindowRelative( hwnd, GW_CHILD )) return needs_client_window_clipping( hwnd ); /* window has children, needs compositing */
     return FALSE;
+}
+
+static BOOL x11drv_client_surface_direct_ready( struct client_surface *client )
+{
+    return !needs_composited_rendering( client->hwnd, client->raw );
 }
 
 void set_dc_drawable( HDC hdc, Drawable drawable, const RECT *rect, int mode )
@@ -174,11 +171,21 @@ static BOOL client_surface_update_offscreen( HWND hwnd, struct x11drv_client_sur
     BOOL offscreen, old_offscreen;
     struct x11drv_win_data *data;
 
-    /* A hidden window needs the mapped dummy parent while it renders.  If it
-     * actually presents there, X11DRV_client_surface_present() makes this
-     * choice permanent so showing it cannot discard that completed frame. */
-    offscreen = !NtUserIsWindowVisible( hwnd ) || surface->keep_offscreen ||
-                needs_offscreen_rendering( hwnd, surface->client.raw );
+    /* Visibility and topology are server scene state.  In particular, the
+     * Win32 window can temporarily look unmapped here while its owner thread
+     * is applying the show request which made the server scene DIRECT.  Once
+     * that scene is selected, attach the producer instead of permanently
+     * downgrading it to STAGED.  Backend-local clipping constraints are
+     * advertised separately before the server selects DIRECT. */
+    if (target->mode != CLIENT_SURFACE_PRESENTATION_DIRECT)
+    {
+        if (target->mode == CLIENT_SURFACE_PRESENTATION_STAGED ||
+            !NtUserIsWindowVisible( hwnd ))
+            target->mode = CLIENT_SURFACE_PRESENTATION_STAGED;
+        else
+            target->mode = CLIENT_SURFACE_PRESENTATION_COMPOSITED;
+    }
+    offscreen = target->mode != CLIENT_SURFACE_PRESENTATION_DIRECT;
 
     old_offscreen = surface->client.target.offscreen;
     target->offscreen = offscreen;
@@ -359,11 +366,6 @@ static BOOL X11DRV_client_surface_present( struct client_surface *client,
         return TRUE;
     }
 
-    /* Reparenting or unredirecting this drawable after a hidden presentation
-     * destroys its native back buffer.  Keep only surfaces which really
-     * presented while hidden on the stable offscreen composition path. */
-    if (!NtUserIsWindowVisible( hwnd )) surface->keep_offscreen = TRUE;
-
     if (!surface->hdc_src || !surface->hdc_dst || !surface->hdc_backing) return FALSE;
     if (!update_client_surface_composition_targets( surface, scene )) return FALSE;
     window = surface->composition_window;
@@ -477,9 +479,11 @@ static const struct client_surface_backend x11drv_client_surface_backend =
 {
     .caps = CLIENT_SURFACE_BACKEND_SCENE_PUBLICATION |
             CLIENT_SURFACE_BACKEND_NATIVE_WRITE_LEASE |
-            CLIENT_SURFACE_BACKEND_READ_ONLY_DC,
+            CLIENT_SURFACE_BACKEND_READ_ONLY_DC |
+            CLIENT_SURFACE_BACKEND_DIRECT_PRESENTATION,
     .destroy = x11drv_client_surface_destroy,
     .detach = x11drv_client_surface_detach,
+    .direct_ready = x11drv_client_surface_direct_ready,
     .update = x11drv_client_surface_update,
     .present = X11DRV_client_surface_present,
     .completion = &x11drv_client_surface_completion_ops,

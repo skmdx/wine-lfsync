@@ -443,6 +443,7 @@ void client_surface_lock_present( struct client_surface *surface )
 void client_surface_unlock_present( struct client_surface *surface )
 {
     pthread_mutex_unlock( &surface->completion_lock );
+    client_surface_apply_pending_update( surface );
     if (InterlockedCompareExchange( &surface->external_completion_count, 0, 0 )) return;
     client_surface_resume_recompose( surface );
 }
@@ -471,6 +472,7 @@ void client_surface_prepare_present_locked( struct client_surface *surface,
                                             BOOL external_completion )
 {
     struct client_surface_target target;
+    unsigned int retry;
 
     /* The caller has established submission readiness while acquiring this
      * mutex.  Do not release it here: a multi-surface caller may since have
@@ -492,18 +494,42 @@ void client_surface_prepare_present_locked( struct client_surface *surface,
      * resize queries and X11 target setup part of the steady-state hot path. */
     pthread_mutex_lock( &surface->present_lock );
     client_surface_get_scene( surface, &present->scene );
-    if (surface->hwnd &&
-        (!present->scene.valid || !surface->target.valid ||
-         surface->target.toplevel != present->scene.toplevel ||
-         surface->target_scene_epoch != present->scene.epoch))
+    if (surface->hwnd && InterlockedCompareExchange( &surface->active, 0, 0 ) &&
+        !present->scene.authoritative)
     {
-        client_surface_update_present_locked( surface );
+        BOOL wake = FALSE;
+        HWND toplevel = client_surface_set_server_state( surface->hwnd, surface,
+                                                         CLIENT_SURFACE_STATE_CLAIM,
+                                                         0, 0, &wake );
+
+        if (wake && toplevel)
+            NtUserPostMessage( toplevel, WM_WINE_UPDATEWINDOWSTATE, 0, 0 );
         client_surface_get_scene( surface, &present->scene );
     }
-    if (present->scene.valid && surface->target.valid)
-        surface->target_scene_epoch = present->scene.epoch;
+    for (retry = 0; retry < 2 && surface->hwnd &&
+         (!present->scene.valid || !surface->target.valid ||
+          surface->target.toplevel != present->scene.toplevel ||
+          surface->target_scene_epoch != present->scene.epoch ||
+          surface->target_scene_mode != present->scene.mode); ++retry)
+    {
+        if (present->scene.valid)
+            client_surface_update_present_scene_locked( surface, &present->scene );
+        else
+            client_surface_update_present_locked( surface );
+        client_surface_get_scene( surface, &present->scene );
+    }
     client_surface_get_target( surface, &target );
+    /* Only client_surface_update_present_locked() may mark a server scene as
+     * applied: it does so after validating the exact scene around the native
+     * update.  A resize can advance the seqlock between the caller's sample
+     * and that update.  Do not stamp the newer epoch onto the retained old
+     * target or submit an offscreen completion against a DIRECT scene. */
+    if (!present->scene.valid || target.toplevel != present->scene.toplevel ||
+        surface->target_scene_epoch != present->scene.epoch ||
+        surface->target_scene_mode != present->scene.mode)
+        target.valid = FALSE;
     present->target_seq = target.seq;
+    present->mode = target.mode;
     present->target = !target.valid ? CLIENT_SURFACE_FRAME_TARGET_INVALID :
                       target.offscreen ? CLIENT_SURFACE_FRAME_TARGET_OFFSCREEN :
                       CLIENT_SURFACE_FRAME_TARGET_ONSCREEN;

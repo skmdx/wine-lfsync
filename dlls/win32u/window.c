@@ -4769,10 +4769,18 @@ BOOL prepare_window_client_surfaces( HWND hwnd )
     return update_window_state_flags( hwnd, WINE_SWP_CLIENT_SURFACE_PREPARE );
 }
 
-void set_window_client_surface_backing( HWND hwnd, BOOL enable )
+void update_window_client_surface_backing( HWND hwnd )
 {
-    update_window_state_flags( hwnd, enable ? WINE_SWP_CLIENT_SURFACE_BACKING_ENABLE :
-                                             WINE_SWP_CLIENT_SURFACE_BACKING_DISABLE );
+    struct object_lock lock = OBJECT_LOCK_INIT;
+    const window_shm_t *window_shm = NULL;
+    BOOL enable = FALSE;
+    NTSTATUS status;
+
+    while ((status = get_shared_window( hwnd, &lock, &window_shm )) == STATUS_PENDING)
+        enable = !!(window_shm->client_surface_flags & WINDOW_SHM_CLIENT_SURFACE_BACKING);
+    if (!status)
+        update_window_state_flags( hwnd, enable ? WINE_SWP_CLIENT_SURFACE_BACKING_ENABLE :
+                                                 WINE_SWP_CLIENT_SURFACE_BACKING_DISABLE );
 }
 
 /***********************************************************************
@@ -5298,6 +5306,13 @@ LRESULT destroy_window( HWND hwnd )
         free( children );
     }
 
+    /* Stop client-surface WSI before unlinking the Win32 window changes the
+     * shared scene from DIRECT to COMPOSITED.  Otherwise a racing renderer
+     * can observe that intermediate mode, queue an offscreen GLX completion
+     * against the drawable being destroyed, and retain the Xlib/XCB socket
+     * while native teardown waits for it. */
+    detach_client_surfaces( hwnd );
+
     /* Unlink now so we won't bother with the children later on */
     SERVER_START_REQ( set_parent )
     {
@@ -5338,7 +5353,6 @@ LRESULT destroy_window( HWND hwnd )
         window_surface_release( surface );
     }
 
-    detach_client_surfaces( hwnd );
     if (win->current_drawable) opengl_drawable_release( win->current_drawable );
     if (win->unused_drawable) opengl_drawable_release( win->unused_drawable );
     user_driver->pDestroyWindow( hwnd );

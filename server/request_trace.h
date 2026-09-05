@@ -3567,6 +3567,7 @@ static void dump_set_client_surface_state_reply( const struct set_client_surface
     fprintf( stderr, ", ready=%08x", req->ready );
     fprintf( stderr, ", publish=%08x", req->publish );
     fprintf( stderr, ", compose=%08x", req->compose );
+    fprintf( stderr, ", mode=%08x", req->mode );
     fprintf( stderr, ", active=%08x", req->active );
     fprintf( stderr, ", cached=%08x", req->cached );
 }

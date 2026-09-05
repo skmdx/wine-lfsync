@@ -219,7 +219,7 @@ struct gdi_dc_funcs
 };
 
 /* increment this when changing driver tables or shared driver-facing structures */
-#define WINE_GDI_DRIVER_VERSION 111
+#define WINE_GDI_DRIVER_VERSION 112
 
 #define GDI_PRIORITY_NULL_DRV        0  /* null driver */
 #define GDI_PRIORITY_FONT_DRV      100  /* any font driver */
@@ -251,7 +251,7 @@ struct client_surface;
 struct client_surface_scene;
 
 /* Driver-ready native target.  seq is a seqlock and the sole invalidation
- * token for geometry, offscreen mode, resize, detach and native replacement. */
+ * token for geometry, presentation mode, resize, detach and native replacement. */
 struct client_surface_target
 {
     LONG64 seq;
@@ -260,6 +260,7 @@ struct client_surface_target
     RECT monitor_rect;
     UINT dpi_num;
     UINT dpi_den;
+    enum client_surface_presentation_mode mode;
     LONG offscreen;
     LONG valid;
 };
@@ -270,6 +271,7 @@ enum client_surface_backend_caps
     CLIENT_SURFACE_BACKEND_NATIVE_WRITE_LEASE = 0x02,
     /* present() only queries the supplied DC; all drawing uses private state. */
     CLIENT_SURFACE_BACKEND_READ_ONLY_DC = 0x04,
+    CLIENT_SURFACE_BACKEND_DIRECT_PRESENTATION = 0x08,
 };
 
 struct client_surface_completion_ops
@@ -289,6 +291,8 @@ struct client_surface_backend
     void (*destroy)( struct client_surface *surface );
     /* detach the surface from its window, called from window owner thread */
     void (*detach)( struct client_surface *surface );
+    /* backend-local geometry and clipping allow the server-selected DIRECT mode */
+    BOOL (*direct_ready)( struct client_surface *surface );
     /* prepare target for publication; the backend may select its offscreen mode */
     BOOL (*update)( struct client_surface *surface, struct client_surface_target *target );
     /* present the client surface if necessary, hdc != NULL when offscreen, called from render thread;
@@ -303,6 +307,7 @@ struct client_surface_scene
     UINT64 generation;
     UINT64 epoch;
     HWND toplevel;
+    enum client_surface_presentation_mode mode;
     BOOL valid;
     BOOL authoritative;
 };
@@ -324,6 +329,7 @@ enum client_surface_frame_target
 struct client_surface_frame
 {
     struct client_surface_scene scene;
+    enum client_surface_presentation_mode mode;
     LONG64 serial;
     DWORD submission_time;
     LONG64 target_seq;
@@ -357,10 +363,13 @@ struct client_surface
     struct client_surface_target       target;         /* driver-ready native target snapshot */
     LONG                               active;         /* registered as active with the Wine server */
     LONG                               content_valid;  /* complete content exists at the current size */
+    LONG                               direct_ready;   /* backend-local DIRECT eligibility advertised to server */
     LONG                               cacheable;      /* native completion state is safe to reuse */
     LONG                               server_cached;  /* registered as a cached owner with the Wine server */
+    LONG                               target_update_pending; /* coalesced owner-to-present geometry handoff */
     UINT64                             cache_cost;     /* estimated bytes while on the unused list */
     UINT64                             target_scene_epoch; /* last server scene applied to native target */
+    enum client_surface_presentation_mode target_scene_mode; /* last server mode applied to native target */
     LONG64                             present_serial; /* producer submission order */
     LONG64                             composed_serial; /* newest source accepted or invalidated */
     LONG                               external_completion_count; /* causal tokens currently in flight */

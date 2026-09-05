@@ -1114,6 +1114,8 @@ typedef volatile struct
 #define WINDOW_SHM_CLIENT_SURFACE_COMPOSING 0x02
 #define WINDOW_SHM_CLIENT_SURFACE_PUBLISHING 0x04
 #define WINDOW_SHM_CLIENT_SURFACE_PREPARING 0x08
+#define WINDOW_SHM_CLIENT_SURFACE_DIRECT 0x10
+#define WINDOW_SHM_CLIENT_SURFACE_BACKING 0x20
 
 typedef volatile union
 {
@@ -4385,6 +4387,7 @@ enum inproc_sync_type
     unsigned int   ready;         /* generation is composed and awaits owner publish */
     unsigned int   publish;       /* owner may expose the returned publication token */
     unsigned int   compose;       /* this surface is the selected producer */
+    unsigned int   mode;          /* enum client_surface_presentation_mode */
     unsigned int   active;        /* active surfaces on the requested window */
     unsigned int   cached;        /* cached surfaces on the requested window */
 @END
@@ -4408,6 +4411,8 @@ enum inproc_sync_type
 #define CLIENT_SURFACE_STATE_NATIVE_BARRIER_BEGIN 0x40000
 #define CLIENT_SURFACE_STATE_NATIVE_BARRIER_END   0x80000
 #define CLIENT_SURFACE_STATE_NATIVE_WRITE_LEASE 0x100000
+#define CLIENT_SURFACE_STATE_DIRECT_PRESENTATION 0x200000
+#define CLIENT_SURFACE_STATE_UPDATE_CAPS         0x400000
 
 
 /* Get visible client-surface windows above a target in one stable scene. */
