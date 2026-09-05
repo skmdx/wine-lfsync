@@ -15,12 +15,22 @@
 
 #include "config.h"
 
+#include <assert.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
 
+#ifdef __linux__
+#include <limits.h>
+#include <linux/futex.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+#endif
+
 #include "x11drv.h"
+#include "xcomposite.h"
 #include "xpresent.h"
+#include "wine/server.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(x11drv);
 
@@ -33,10 +43,81 @@ struct x11drv_retired_pixmap
     Pixmap pixmaps[2];
 };
 
+struct client_surface_compositor_pool
+{
+    struct client_surface_compositor_pool *next;
+    struct client_surface_handoff_shared *shared;
+    UINT64 id;
+    SIZE_T size;
+    unsigned int refs;
+};
+
+struct client_surface_compositor_binding
+{
+    struct client_surface_compositor_binding *next;
+    struct client_surface_compositor_pool *pool;
+    struct client_surface_handoff_slot *slot;
+    HWND toplevel;
+    HWND window;
+    process_id_t process;
+    UINT64 identity;
+    UINT64 cookie;
+    UINT64 mark;
+};
+
+#define CLIENT_SURFACE_COMPOSITOR_FRAME_COUNT 3
+#define CLIENT_SURFACE_COMPOSITOR_MAX_INFLIGHT 2
+
+struct client_surface_compositor_frame
+{
+    Pixmap pixmap;
+    uint32_t serial;
+    uint32_t last_complete_serial;
+    unsigned int width;
+    unsigned int height;
+    UINT64 publish_generation;
+    UINT64 publish_epoch;
+    BOOL complete;
+    BOOL idle;
+    BOOL last_complete_success;
+    BOOL publish_pending;
+};
+
+struct client_surface_compositor_target
+{
+    struct client_surface_compositor_target *next;
+    HWND toplevel;
+    Window window;
+    struct client_surface_compositor_frame frames[CLIENT_SURFACE_COMPOSITOR_FRAME_COUNT];
+    Pixmap published;
+    unsigned int published_width;
+    unsigned int published_height;
+    unsigned int next_frame;
+    unsigned int mailbox_frame;
+    UINT64 mailbox_publish_generation;
+    UINT64 mailbox_publish_epoch;
+    BOOL mailbox_pending;
+    XID present_event;
+    unsigned int width;
+    unsigned int height;
+    unsigned int window_width;
+    unsigned int window_height;
+    unsigned int depth;
+    VisualID visual;
+};
+
 static pthread_mutex_t client_surface_compositor_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t client_surface_compositor_cond = PTHREAD_COND_INITIALIZER;
 static Display *client_surface_compositor_display;
 static BOOL client_surface_compositor_started;
+static LONG client_surface_compositor_sequence;
+#if defined(__linux__) && defined(SYS_futex_waitv)
+static BOOL client_surface_compositor_waitv_available = TRUE;
+#endif
+static struct client_surface_compositor_pool *client_surface_compositor_pools;
+static struct client_surface_compositor_binding *client_surface_compositor_bindings;
+static struct client_surface_compositor_target *client_surface_compositor_targets;
+static UINT64 client_surface_compositor_mark;
 
 enum client_surface_compositor_op
 {
@@ -44,6 +125,11 @@ enum client_surface_compositor_op
     CLIENT_SURFACE_COMPOSITOR_COPY,
     CLIENT_SURFACE_COMPOSITOR_FREE_POOL,
     CLIENT_SURFACE_COMPOSITOR_PRESENT,
+    CLIENT_SURFACE_COMPOSITOR_REGISTER_HANDOFF,
+    CLIENT_SURFACE_COMPOSITOR_SWEEP_HANDOFFS,
+    CLIENT_SURFACE_COMPOSITOR_UPDATE_TARGET,
+    CLIENT_SURFACE_COMPOSITOR_REMOVE_TARGET,
+    CLIENT_SURFACE_COMPOSITOR_RESTORE_TARGET,
 };
 
 struct client_surface_compositor_job
@@ -58,8 +144,23 @@ struct client_surface_compositor_job
     int destination_y;
     unsigned int width;
     unsigned int height;
+    unsigned int window_width;
+    unsigned int window_height;
+    unsigned int valid_width;
+    unsigned int valid_height;
     unsigned int depth;
     Pixmap pixmaps[2];
+    void *view;
+    SIZE_T view_size;
+    SIZE_T offset;
+    UINT64 mapping_id;
+    UINT64 cookie;
+    UINT64 identity;
+    UINT64 mark;
+    process_id_t process;
+    HWND handoff_window;
+    HWND handoff_toplevel;
+    VisualID visual;
     BOOL result;
     BOOL complete;
 };
@@ -73,6 +174,19 @@ static struct client_surface_compositor_job **client_surface_compositor_tail =
 static uint32_t client_surface_present_serial;
 static int client_surface_present_opcode;
 
+#endif
+
+static struct client_surface_compositor_target *find_client_surface_compositor_target( HWND toplevel );
+static BOOL publish_client_surface_handoff_generation( HWND toplevel, UINT64 generation,
+                                                       UINT64 scene_generation, BOOL success );
+static BOOL client_surface_present_on_compositor( Window window, Pixmap pixmap,
+                                                  unsigned int width, unsigned int height );
+static BOOL get_client_surface_window_extent( struct x11drv_win_data *data,
+                                              unsigned int *width, unsigned int *height );
+#ifdef SONAME_LIBXPRESENT
+static BOOL wait_client_surface_compositor_pixmap_idle( Pixmap pixmap );
+static void flush_client_surface_compositor_mailbox(
+    struct client_surface_compositor_target *target );
 #endif
 
 static int client_surface_compositor_error( Display *display, XErrorEvent *event, void *arg )
@@ -112,10 +226,9 @@ static BOOL client_surface_compositor_open(void)
     return TRUE;
 }
 
-static BOOL client_surface_copy_on_compositor( Drawable source, Drawable destination,
-                                               int source_x, int source_y,
-                                               int destination_x, int destination_y,
-                                               unsigned int width, unsigned int height )
+static BOOL client_surface_copy_on_compositor_unchecked(
+    Drawable source, Drawable destination, int source_x, int source_y,
+    int destination_x, int destination_y, unsigned int width, unsigned int height )
 {
     Display *display = client_surface_compositor_display;
     int error = 0;
@@ -132,6 +245,18 @@ static BOOL client_surface_copy_on_compositor( Drawable source, Drawable destina
     XSync( display, False );
     X11DRV_check_error();
     return gc && !error;
+}
+
+static BOOL client_surface_copy_on_compositor( Drawable source, Drawable destination,
+                                               int source_x, int source_y,
+                                               int destination_x, int destination_y,
+                                               unsigned int width, unsigned int height )
+{
+#ifdef SONAME_LIBXPRESENT
+    if (usexpresent && !wait_client_surface_compositor_pixmap_idle( destination )) return FALSE;
+#endif
+    return client_surface_copy_on_compositor_unchecked(
+        source, destination, source_x, source_y, destination_x, destination_y, width, height );
 }
 
 static BOOL client_surface_alloc_on_compositor( Drawable drawable, unsigned int width,
@@ -172,28 +297,49 @@ static BOOL client_surface_free_on_compositor( const Pixmap pixmaps[2] )
 
 #ifdef SONAME_LIBXPRESENT
 
-static BOOL wait_client_surface_present_events( Window window, Pixmap pixmap, uint32_t serial )
+static struct client_surface_compositor_target *find_client_surface_compositor_window( Window window )
+{
+    struct client_surface_compositor_target *target;
+
+    for (target = client_surface_compositor_targets; target; target = target->next)
+        if (target->window == window) return target;
+    return NULL;
+}
+
+static struct client_surface_compositor_frame *find_client_surface_compositor_frame(
+    struct client_surface_compositor_target *target, uint32_t serial, Pixmap pixmap )
+{
+    unsigned int i;
+
+    for (i = 0; i < ARRAY_SIZE(target->frames); ++i)
+        if (target->frames[i].serial == serial &&
+            (!pixmap || target->frames[i].pixmap == pixmap)) return &target->frames[i];
+    return NULL;
+}
+
+static void finish_client_surface_compositor_frame(
+    struct client_surface_compositor_target *target,
+    struct client_surface_compositor_frame *frame )
+{
+    if (!frame->serial || !frame->complete || !frame->idle) return;
+    TRACE( "X Present serial %u pixmap %#lx completed and became idle\n",
+           frame->serial, frame->pixmap );
+    frame->serial = 0;
+    frame->complete = frame->idle = FALSE;
+    flush_client_surface_compositor_mailbox( target );
+}
+
+static void process_client_surface_present_events(void)
 {
     Display *display = client_surface_compositor_display;
-    int fd = ConnectionNumber( display );
-    BOOL complete = FALSE, idle = FALSE, skipped = FALSE;
-    DWORD start = NtGetTickCount();
 
-    while ((!complete || !idle) && !skipped)
+    if (!display || !usexpresent) return;
+    while (XPending( display ))
     {
         XEvent event;
-        int timeout, ret;
+        struct client_surface_compositor_target *target = NULL;
+        struct client_surface_compositor_frame *frame = NULL;
 
-        while (!XPending( display ))
-        {
-            struct pollfd pfd = {.fd = fd, .events = POLLIN};
-            DWORD elapsed = NtGetTickCount() - start;
-
-            if (elapsed >= 5000) return FALSE;
-            timeout = 5000 - elapsed;
-            do ret = poll( &pfd, 1, timeout ); while (ret < 0 && errno == EINTR);
-            if (ret <= 0) return FALSE;
-        }
         XNextEvent( display, &event );
         if (event.type != GenericEvent || event.xcookie.extension != client_surface_present_opcode ||
             !pXGetEventData || !pXGetEventData( display, &event ))
@@ -202,68 +348,968 @@ static BOOL wait_client_surface_present_events( Window window, Pixmap pixmap, ui
         {
             XPresentCompleteNotifyEvent *notify = event.xcookie.data;
 
-            if (notify->window == window && notify->serial_number == serial &&
-                notify->kind == PresentCompleteKindPixmap)
+            if (notify->kind == PresentCompleteKindPixmap &&
+                (target = find_client_surface_compositor_window( notify->window )) &&
+                (frame = find_client_surface_compositor_frame( target,
+                                                               notify->serial_number, 0 )))
             {
-                skipped = notify->mode == PresentCompleteModeSkip;
-                complete = !skipped;
+                BOOL success = notify->mode != PresentCompleteModeSkip;
+
+                frame->complete = TRUE;
+                frame->last_complete_serial = frame->serial;
+                frame->last_complete_success = success;
+                if (success)
+                {
+                    target->published = frame->pixmap;
+                    target->published_width = frame->width;
+                    target->published_height = frame->height;
+                }
+                if (frame->publish_pending)
+                {
+                    publish_client_surface_handoff_generation( target->toplevel,
+                        frame->publish_generation, frame->publish_epoch, success );
+                    frame->publish_pending = FALSE;
+                }
             }
         }
         else if (event.xcookie.evtype == PresentIdleNotify)
         {
             XPresentIdleNotifyEvent *notify = event.xcookie.data;
 
-            if (notify->window == window && notify->serial_number == serial &&
-                notify->pixmap == pixmap)
-                idle = TRUE;
+            if ((target = find_client_surface_compositor_window( notify->window )) &&
+                (frame = find_client_surface_compositor_frame( target,
+                    notify->serial_number, notify->pixmap ))) frame->idle = TRUE;
         }
         pXFreeEventData( display, &event );
+        if (target && frame) finish_client_surface_compositor_frame( target, frame );
     }
-    if (skipped) return FALSE;
-    TRACE( "X Present serial %u pixmap %#lx completed and became idle\n", serial, pixmap );
+}
+
+static BOOL wait_client_surface_present_event( DWORD start )
+{
+    Display *display = client_surface_compositor_display;
+    struct pollfd pfd = {.fd = ConnectionNumber( display ), .events = POLLIN};
+    DWORD elapsed = NtGetTickCount() - start;
+    int ret;
+
+    if (elapsed >= 5000) return FALSE;
+    do ret = poll( &pfd, 1, 5000 - elapsed ); while (ret < 0 && errno == EINTR);
+    if (ret <= 0) return FALSE;
+    process_client_surface_present_events();
     return TRUE;
 }
 
-/* Serialize the initial implementation on the dedicated compositor
- * connection.  CompleteNotify is the publication boundary; IdleNotify is a
- * separate storage-reuse boundary even when PresentOptionCopy makes both
- * arrive together. */
-static BOOL client_surface_present_on_compositor( Window window, Pixmap pixmap )
+static struct client_surface_compositor_frame *acquire_client_surface_compositor_frame(
+    struct client_surface_compositor_target *target, Pixmap requested )
+{
+    DWORD start = NtGetTickCount();
+    unsigned int i;
+
+    for (;;)
+    {
+        process_client_surface_present_events();
+        for (i = 0; i < ARRAY_SIZE(target->frames); ++i)
+        {
+            unsigned int index = requested ? i : (target->next_frame + i) % ARRAY_SIZE(target->frames);
+            struct client_surface_compositor_frame *frame = &target->frames[index];
+
+            if (target->mailbox_pending && index == target->mailbox_frame) continue;
+            if ((!requested || frame->pixmap == requested) && !frame->serial)
+            {
+                target->next_frame = (index + 1) % ARRAY_SIZE(target->frames);
+                return frame;
+            }
+        }
+        if (!wait_client_surface_present_event( start )) return NULL;
+    }
+}
+
+static BOOL wait_client_surface_compositor_pixmap_idle( Pixmap pixmap )
+{
+    struct client_surface_compositor_target *target;
+    unsigned int i;
+
+    for (target = client_surface_compositor_targets; target; target = target->next)
+        for (i = 0; i < ARRAY_SIZE(target->frames); ++i)
+            if (target->frames[i].pixmap == pixmap)
+                return !!acquire_client_surface_compositor_frame( target, pixmap );
+    return TRUE;
+}
+
+static unsigned int count_client_surface_compositor_frames(
+    const struct client_surface_compositor_target *target )
+{
+    unsigned int count = 0, i;
+
+    for (i = 0; i < ARRAY_SIZE(target->frames); ++i) count += !!target->frames[i].serial;
+    return count;
+}
+
+static struct client_surface_compositor_frame *get_client_surface_compositor_frame(
+    struct client_surface_compositor_target *target )
+{
+    unsigned int i;
+
+    process_client_surface_present_events();
+    if (target->mailbox_pending) return &target->frames[target->mailbox_frame];
+    for (i = 0; i < ARRAY_SIZE(target->frames); ++i)
+    {
+        unsigned int index = (target->next_frame + i) % ARRAY_SIZE(target->frames);
+
+        if (target->frames[index].serial) continue;
+        target->next_frame = (index + 1) % ARRAY_SIZE(target->frames);
+        return &target->frames[index];
+    }
+    return NULL;
+}
+
+static BOOL submit_client_surface_present( struct client_surface_compositor_target *target,
+                                           struct client_surface_compositor_frame *frame,
+                                           UINT64 publish_generation, UINT64 publish_epoch,
+                                           uint32_t *serial_ret )
 {
     Display *display = client_surface_compositor_display;
-    XID event_id;
     uint32_t serial;
-    BOOL ret = FALSE;
     int error = 0;
 
-    if (!usexpresent) return FALSE;
+    if (!usexpresent || !target->present_event || frame->serial) return FALSE;
     if (!(serial = ++client_surface_present_serial)) serial = ++client_surface_present_serial;
 
+    frame->serial = serial;
+    frame->last_complete_serial = 0;
+    frame->last_complete_success = FALSE;
+    frame->complete = frame->idle = FALSE;
+    frame->publish_generation = publish_generation;
+    frame->publish_epoch = publish_epoch;
+    frame->publish_pending = !!publish_generation;
     X11DRV_expect_error( display, client_surface_compositor_error, &error );
-    event_id = pXPresentSelectInput( display, window,
-                                    PresentCompleteNotifyMask | PresentIdleNotifyMask );
-    pXPresentPixmap( display, window, pixmap, serial, None, None, 0, 0, None,
+    pXPresentPixmap( display, target->window, frame->pixmap, serial, None, None, 0, 0, None,
                      None, None, PresentOptionAsync | PresentOptionCopy,
                      0, 0, 0, NULL, 0 );
     XSync( display, False );
     X11DRV_check_error();
-    if (!error) ret = wait_client_surface_present_events( window, pixmap, serial );
-    pXPresentFreeInput( display, window, event_id );
-    XFlush( display );
-    return ret;
+    if (error)
+    {
+        frame->serial = 0;
+        frame->publish_pending = FALSE;
+        return FALSE;
+    }
+    if (serial_ret) *serial_ret = serial;
+    TRACE( "queued X Present serial %u pixmap %#lx generation %s\n", serial,
+           frame->pixmap, wine_dbgstr_longlong( publish_generation ) );
+    return TRUE;
+}
+
+static void flush_client_surface_compositor_mailbox(
+    struct client_surface_compositor_target *target )
+{
+    struct client_surface_compositor_frame *frame;
+    BOOL copied;
+
+    if (!target->mailbox_pending ||
+        count_client_surface_compositor_frames( target ) >= CLIENT_SURFACE_COMPOSITOR_MAX_INFLIGHT)
+        return;
+    frame = &target->frames[target->mailbox_frame];
+    if (submit_client_surface_present( target, frame,
+                                       target->mailbox_publish_generation,
+                                       target->mailbox_publish_epoch, NULL ))
+    {
+        target->mailbox_pending = FALSE;
+        target->mailbox_publish_generation = 0;
+        target->mailbox_publish_epoch = 0;
+        return;
+    }
+
+    /* A mailbox slot is reserved from generic copies and publications.  If
+     * Present cannot consume it, publish it synchronously rather than leaving
+     * the reservation behind with no X event capable of retrying it. */
+    copied = client_surface_copy_on_compositor( frame->pixmap, target->window,
+                                                0, 0, 0, 0,
+                                                target->width, target->height );
+    if (copied)
+    {
+        target->published = frame->pixmap;
+        target->published_width = frame->width;
+        target->published_height = frame->height;
+    }
+    if (target->mailbox_publish_generation)
+        publish_client_surface_handoff_generation( target->toplevel,
+            target->mailbox_publish_generation, target->mailbox_publish_epoch, copied );
+    target->mailbox_pending = FALSE;
+    target->mailbox_publish_generation = 0;
+    target->mailbox_publish_epoch = 0;
 }
 
 #else
 
-static BOOL client_surface_present_on_compositor( Window window, Pixmap pixmap )
+static void process_client_surface_present_events(void)
 {
-    return FALSE;
 }
 
 #endif
 
+static void client_surface_handoff_futex_wake( LONG *address )
+{
+#ifdef __linux__
+    syscall( SYS_futex, address, FUTEX_WAKE, INT_MAX, NULL, NULL, 0 );
+#else
+    (void)address;
+#endif
+}
+
+static void wake_client_surface_compositor(void)
+{
+    __atomic_add_fetch( &client_surface_compositor_sequence, 1, __ATOMIC_RELEASE );
+    client_surface_handoff_futex_wake( &client_surface_compositor_sequence );
+}
+
+static void client_surface_handoff_wake_release( struct client_surface_handoff_shared *shared )
+{
+    if (!__atomic_exchange_n( &shared->release_parked, 0, __ATOMIC_ACQ_REL )) return;
+    __atomic_add_fetch( &shared->release_sequence, 1, __ATOMIC_RELEASE );
+    client_surface_handoff_futex_wake( &shared->release_sequence );
+}
+
+static struct client_surface_compositor_pool *find_client_surface_compositor_pool( UINT64 id )
+{
+    struct client_surface_compositor_pool *pool;
+
+    for (pool = client_surface_compositor_pools; pool; pool = pool->next)
+        if (pool->id == id) return pool;
+    return NULL;
+}
+
+static struct client_surface_compositor_target *find_client_surface_compositor_target( HWND toplevel )
+{
+    struct client_surface_compositor_target *target;
+
+    for (target = client_surface_compositor_targets; target; target = target->next)
+        if (target->toplevel == toplevel) return target;
+    return NULL;
+}
+
+static BOOL client_surface_compositor_has_present_work(void)
+{
+    struct client_surface_compositor_target *target;
+    unsigned int i;
+
+    for (target = client_surface_compositor_targets; target; target = target->next)
+    {
+        if (target->mailbox_pending) return TRUE;
+        for (i = 0; i < ARRAY_SIZE(target->frames); ++i)
+            if (target->frames[i].serial) return TRUE;
+    }
+    return FALSE;
+}
+
+static BOOL client_surface_present_on_compositor( Window window, Pixmap pixmap,
+                                                  unsigned int width, unsigned int height )
+{
+#ifdef SONAME_LIBXPRESENT
+    struct client_surface_compositor_target *target =
+        find_client_surface_compositor_window( window );
+    struct client_surface_compositor_frame *frame;
+    uint32_t serial;
+    DWORD start;
+
+    if (!usexpresent || !target ||
+        !(frame = acquire_client_surface_compositor_frame( target, pixmap )))
+        return FALSE;
+    frame->width = width;
+    frame->height = height;
+    if (!submit_client_surface_present( target, frame, 0, 0, &serial ))
+        return FALSE;
+    start = NtGetTickCount();
+    while (frame->last_complete_serial != serial)
+        if (!wait_client_surface_present_event( start )) return FALSE;
+    return frame->last_complete_success;
+#else
+    return FALSE;
+#endif
+}
+
+static void release_client_surface_compositor_binding_server(
+    const struct client_surface_compositor_binding *binding )
+{
+    SERVER_START_REQ( release_client_surface_handoff )
+    {
+        req->handle = wine_server_user_handle( binding->toplevel );
+        req->producer = binding->process;
+        req->surface = binding->identity;
+        req->cookie = binding->cookie;
+        req->owner = 1;
+        wine_server_call( req );
+    }
+    SERVER_END_REQ;
+}
+
+static void release_client_surface_compositor_pool( struct client_surface_compositor_pool *pool )
+{
+    struct client_surface_compositor_pool **cursor;
+
+    assert( pool->refs );
+    if (--pool->refs) return;
+    for (cursor = &client_surface_compositor_pools; *cursor; cursor = &(*cursor)->next)
+    {
+        if (*cursor != pool) continue;
+        *cursor = pool->next;
+        NtUnmapViewOfSection( NtCurrentProcess(), pool->shared );
+        free( pool );
+        return;
+    }
+    assert( 0 );
+}
+
+static void remove_client_surface_compositor_binding(
+    struct client_surface_compositor_binding **cursor )
+{
+    struct client_surface_compositor_binding *binding = *cursor;
+
+    *cursor = binding->next;
+    release_client_surface_compositor_binding_server( binding );
+    release_client_surface_compositor_pool( binding->pool );
+    free( binding );
+}
+
+static BOOL register_client_surface_compositor_handoff(
+    struct client_surface_compositor_job *job )
+{
+    struct client_surface_handoff_shared *shared = job->view;
+    struct client_surface_compositor_binding **cursor, *binding;
+    struct client_surface_compositor_pool *pool;
+
+    if (job->view_size < sizeof(*shared) ||
+        job->offset > job->view_size - sizeof(struct client_surface_handoff_slot) ||
+        __atomic_load_n( &shared->magic, __ATOMIC_ACQUIRE ) != CLIENT_SURFACE_HANDOFF_MAGIC ||
+        shared->version != CLIENT_SURFACE_HANDOFF_VERSION ||
+        shared->slot_count != CLIENT_SURFACE_HANDOFF_SLOTS ||
+        shared->mapping_id != job->mapping_id)
+        goto failed;
+
+    for (cursor = &client_surface_compositor_bindings; *cursor; cursor = &(*cursor)->next)
+    {
+        binding = *cursor;
+        if (binding->toplevel != job->handoff_toplevel ||
+            binding->process != job->process || binding->identity != job->identity)
+            continue;
+        if (binding->cookie == job->cookie)
+        {
+            binding->mark = job->mark;
+            NtUnmapViewOfSection( NtCurrentProcess(), job->view );
+            return TRUE;
+        }
+        remove_client_surface_compositor_binding( cursor );
+        break;
+    }
+
+    if (!(pool = find_client_surface_compositor_pool( job->mapping_id )))
+    {
+        if (!(pool = malloc( sizeof(*pool) ))) goto failed;
+        pool->next = client_surface_compositor_pools;
+        pool->shared = shared;
+        pool->id = job->mapping_id;
+        pool->size = job->view_size;
+        pool->refs = 0;
+        client_surface_compositor_pools = pool;
+    }
+    else
+    {
+        NtUnmapViewOfSection( NtCurrentProcess(), job->view );
+        if (job->offset > pool->size - sizeof(struct client_surface_handoff_slot)) return FALSE;
+        shared = pool->shared;
+    }
+    if (!(binding = malloc( sizeof(*binding) )))
+    {
+        if (!pool->refs)
+        {
+            client_surface_compositor_pools = pool->next;
+            NtUnmapViewOfSection( NtCurrentProcess(), pool->shared );
+            free( pool );
+        }
+        return FALSE;
+    }
+    binding->next = client_surface_compositor_bindings;
+    binding->pool = pool;
+    binding->slot = (struct client_surface_handoff_slot *)((char *)shared + job->offset);
+    binding->toplevel = job->handoff_toplevel;
+    binding->window = job->handoff_window;
+    binding->process = job->process;
+    binding->identity = job->identity;
+    binding->cookie = job->cookie;
+    binding->mark = job->mark;
+    pool->refs++;
+    client_surface_compositor_bindings = binding;
+    TRACE( "registered handoff hwnd %p identity %s producer %04x pool %s cookie %s\n",
+           binding->window, wine_dbgstr_longlong( binding->identity ), binding->process,
+           wine_dbgstr_longlong( pool->id ), wine_dbgstr_longlong( binding->cookie ) );
+    return TRUE;
+
+failed:
+    NtUnmapViewOfSection( NtCurrentProcess(), job->view );
+    return FALSE;
+}
+
+static BOOL sweep_client_surface_compositor_handoffs( HWND toplevel, UINT64 mark )
+{
+    struct client_surface_compositor_binding **cursor = &client_surface_compositor_bindings;
+
+    while (*cursor)
+    {
+        struct client_surface_compositor_binding *binding = *cursor;
+
+        if (binding->toplevel == toplevel && binding->mark != mark)
+            remove_client_surface_compositor_binding( cursor );
+        else
+            cursor = &binding->next;
+    }
+    return TRUE;
+}
+
+static void drain_client_surface_compositor_target(
+    struct client_surface_compositor_target *target )
+{
+#ifdef SONAME_LIBXPRESENT
+    DWORD start = NtGetTickCount();
+    unsigned int i;
+
+    for (;;)
+    {
+        BOOL pending = FALSE;
+
+        process_client_surface_present_events();
+        for (i = 0; i < ARRAY_SIZE(target->frames); ++i)
+            pending |= !!target->frames[i].serial;
+        if (!pending) break;
+        if (wait_client_surface_present_event( start )) continue;
+
+        WARN( "timed out draining X Present frames for hwnd %p\n", target->toplevel );
+        for (i = 0; i < ARRAY_SIZE(target->frames); ++i)
+        {
+            struct client_surface_compositor_frame *frame = &target->frames[i];
+            Pixmap pixmap = frame->pixmap;
+
+            if (frame->publish_pending)
+                publish_client_surface_handoff_generation( target->toplevel,
+                    frame->publish_generation, frame->publish_epoch, FALSE );
+            memset( frame, 0, sizeof(*frame) );
+            frame->pixmap = pixmap;
+        }
+        break;
+    }
+    if (target->mailbox_pending && target->mailbox_publish_generation)
+        publish_client_surface_handoff_generation( target->toplevel,
+            target->mailbox_publish_generation, target->mailbox_publish_epoch, FALSE );
+    target->mailbox_pending = FALSE;
+    target->mailbox_publish_generation = 0;
+    target->mailbox_publish_epoch = 0;
+    if (target->present_event)
+    {
+        pXPresentFreeInput( client_surface_compositor_display, target->window,
+                            target->present_event );
+        target->present_event = 0;
+        XFlush( client_surface_compositor_display );
+    }
+#else
+    (void)target;
+#endif
+}
+
+static BOOL update_client_surface_compositor_target( struct client_surface_compositor_job *job )
+{
+    struct client_surface_compositor_target *target;
+    Pixmap old_mailbox = 0;
+    BOOL same_pool;
+
+    if (!(target = find_client_surface_compositor_target( job->handoff_toplevel )))
+    {
+        if (!(target = calloc( 1, sizeof(*target) ))) return FALSE;
+        target->next = client_surface_compositor_targets;
+        target->toplevel = job->handoff_toplevel;
+        client_surface_compositor_targets = target;
+    }
+    same_pool = target->frames[2].pixmap &&
+                ((target->frames[0].pixmap == job->pixmaps[0] &&
+                 target->frames[1].pixmap == job->pixmaps[1]) ||
+                (target->frames[0].pixmap == job->pixmaps[1] &&
+                 target->frames[1].pixmap == job->pixmaps[0]));
+    if ((target->window && target->window != job->destination) ||
+        (target->frames[0].pixmap && !same_pool))
+    {
+        drain_client_surface_compositor_target( target );
+        old_mailbox = target->frames[2].pixmap;
+    }
+    target->window = job->destination;
+    if (!same_pool)
+    {
+        int error = 0;
+
+        if (old_mailbox) XFreePixmap( client_surface_compositor_display, old_mailbox );
+        memset( target->frames, 0, sizeof(target->frames) );
+        target->frames[0].pixmap = job->pixmaps[0];
+        target->frames[1].pixmap = job->pixmaps[1];
+        X11DRV_expect_error( client_surface_compositor_display,
+                             client_surface_compositor_error, &error );
+        target->frames[2].pixmap = XCreatePixmap( client_surface_compositor_display,
+            target->window, job->width, job->height, job->depth );
+        XSync( client_surface_compositor_display, False );
+        X11DRV_check_error();
+        if (error || !target->frames[2].pixmap)
+        {
+            target->frames[2].pixmap = 0;
+            return FALSE;
+        }
+        target->published = job->pixmaps[0];
+        target->published_width = job->valid_width;
+        target->published_height = job->valid_height;
+        target->next_frame = 0;
+        target->mailbox_pending = FALSE;
+    }
+    target->width = job->width;
+    target->height = job->height;
+    target->window_width = job->window_width;
+    target->window_height = job->window_height;
+    target->depth = job->depth;
+    target->visual = job->visual;
+#ifdef SONAME_LIBXPRESENT
+    if (usexpresent && !target->present_event)
+    {
+        int error = 0;
+
+        X11DRV_expect_error( client_surface_compositor_display,
+                             client_surface_compositor_error, &error );
+        target->present_event = pXPresentSelectInput(
+            client_surface_compositor_display, target->window,
+            PresentCompleteNotifyMask | PresentIdleNotifyMask );
+        XSync( client_surface_compositor_display, False );
+        X11DRV_check_error();
+        if (error) target->present_event = 0;
+    }
+#endif
+    return TRUE;
+}
+
+static BOOL remove_client_surface_compositor_target( HWND toplevel )
+{
+    struct client_surface_compositor_target **cursor;
+
+    sweep_client_surface_compositor_handoffs( toplevel, 0 );
+    for (cursor = &client_surface_compositor_targets; *cursor; cursor = &(*cursor)->next)
+    {
+        struct client_surface_compositor_target *target = *cursor;
+
+        if (target->toplevel != toplevel) continue;
+        drain_client_surface_compositor_target( target );
+        if (target->frames[2].pixmap)
+        {
+            XFreePixmap( client_surface_compositor_display, target->frames[2].pixmap );
+            XSync( client_surface_compositor_display, False );
+        }
+        *cursor = target->next;
+        free( target );
+        return TRUE;
+    }
+    return TRUE;
+}
+
+static BOOL restore_client_surface_compositor_target(
+    struct client_surface_compositor_job *job )
+{
+    struct client_surface_compositor_target *target =
+        find_client_surface_compositor_target( job->handoff_toplevel );
+
+    process_client_surface_present_events();
+    if (!target || !target->published || !target->window ||
+        target->window_width != job->window_width ||
+        target->window_height != job->window_height ||
+        target->published_width < job->window_width ||
+        target->published_height < job->window_height)
+        return FALSE;
+    job->valid_width = target->published_width;
+    job->valid_height = target->published_height;
+    return client_surface_copy_on_compositor( target->published, target->window,
+                                              job->source_x, job->source_y,
+                                              job->destination_x, job->destination_y,
+                                              job->width, job->height );
+}
+
+static BOOL import_client_surface_pixmap( Drawable source, Pixmap *pixmap )
+{
+#ifdef SONAME_LIBXCOMPOSITE
+    int error = 0;
+
+    if (!usexcomposite) return FALSE;
+    X11DRV_expect_error( client_surface_compositor_display,
+                         client_surface_compositor_error, &error );
+    *pixmap = pXCompositeNameWindowPixmap( client_surface_compositor_display, source );
+    XSync( client_surface_compositor_display, False );
+    X11DRV_check_error();
+    return *pixmap && !error;
+#else
+    return FALSE;
+#endif
+}
+
+static BOOL validate_client_surface_pixmap( Pixmap pixmap, unsigned int min_width,
+                                            unsigned int min_height, unsigned int depth )
+{
+    Window root;
+    unsigned int width, height, border, source_depth;
+    int x, y, error = 0;
+    BOOL ret;
+
+    X11DRV_expect_error( client_surface_compositor_display,
+                         client_surface_compositor_error, &error );
+    ret = XGetGeometry( client_surface_compositor_display, pixmap, &root, &x, &y,
+                        &width, &height, &border, &source_depth );
+    XSync( client_surface_compositor_display, False );
+    X11DRV_check_error();
+    return ret && !error && width >= min_width && height >= min_height &&
+           source_depth == depth;
+}
+
+static BOOL complete_client_surface_handoff_generation(
+    const struct client_surface_compositor_binding *binding,
+    const struct client_surface_handoff_slot *slot, BOOL *publish )
+{
+    BOOL accepted = FALSE;
+    NTSTATUS status;
+
+    SERVER_START_REQ( complete_client_surface_handoff )
+    {
+        req->handle = wine_server_user_handle( binding->window );
+        req->producer = binding->process;
+        req->surface = binding->identity;
+        req->cookie = binding->cookie;
+        req->generation = slot->scene_generation;
+        req->scene_generation = slot->scene_epoch;
+        status = wine_server_call( req );
+        if (!status)
+        {
+            accepted = reply->accepted;
+            *publish = reply->publish;
+        }
+    }
+    SERVER_END_REQ;
+    TRACE( "completed handoff identity %s scene generation %s epoch %s status %#lx accepted %u publish %u\n",
+           wine_dbgstr_longlong( binding->identity ),
+           wine_dbgstr_longlong( slot->scene_generation ),
+           wine_dbgstr_longlong( slot->scene_epoch ), (unsigned long)status, accepted, *publish );
+    return !status && accepted;
+}
+
+static BOOL publish_client_surface_handoff_generation( HWND toplevel, UINT64 generation,
+                                                       UINT64 scene_generation, BOOL success )
+{
+    BOOL accepted = FALSE;
+    NTSTATUS status;
+
+    SERVER_START_REQ( publish_client_surface_handoff )
+    {
+        req->handle = wine_server_user_handle( toplevel );
+        req->generation = generation;
+        req->scene_generation = scene_generation;
+        req->success = success;
+        status = wine_server_call( req );
+        if (!status) accepted = reply->accepted;
+    }
+    SERVER_END_REQ;
+    TRACE( "published owner generation %s epoch %s status %#lx accepted %u success %u\n",
+           wine_dbgstr_longlong( generation ), wine_dbgstr_longlong( scene_generation ),
+           (unsigned long)status, accepted, success );
+    return !status && accepted && success;
+}
+
+static struct client_surface_compositor_frame *find_client_surface_pending_publication(
+    struct client_surface_compositor_target *target, UINT64 generation, UINT64 epoch )
+{
+    unsigned int i;
+
+    for (i = 0; i < ARRAY_SIZE(target->frames); ++i)
+        if (target->frames[i].publish_pending &&
+            target->frames[i].publish_generation == generation &&
+            target->frames[i].publish_epoch == epoch) return &target->frames[i];
+    return NULL;
+}
+
+static BOOL compose_client_surface_handoff(
+    struct client_surface_compositor_binding *binding, UINT64 control )
+{
+    struct client_surface_handoff_slot *slot = binding->slot;
+    struct client_surface_compositor_target *target;
+    struct client_surface_compositor_frame *frame = NULL, *previous_publish = NULL;
+    UINT64 expected = control, final;
+    enum client_surface_handoff_state state;
+    Pixmap source = 0;
+    BOOL accepted = FALSE, composed = FALSE, copied = FALSE, publish = FALSE;
+    BOOL deferred_present = FALSE, queued_present = FALSE;
+
+    if (!__atomic_compare_exchange_n( &slot->control, &expected,
+                                      client_surface_handoff_control(
+                                          client_surface_handoff_generation( control ),
+                                          CLIENT_SURFACE_HANDOFF_READING ),
+                                      0, __ATOMIC_ACQUIRE, __ATOMIC_ACQUIRE ))
+        return FALSE;
+    /* Clear this generation's ready bit while READING still prevents the
+     * producer from reusing the slot.  Clearing after RELEASED could erase a
+     * newer READY generation published by a racing producer. */
+    __atomic_fetch_and( &binding->pool->shared->ready_bitmap[
+                            (slot - binding->pool->shared->slots) / 64],
+                        ~((LONG64)1 << ((slot - binding->pool->shared->slots) % 64)),
+                        __ATOMIC_ACQ_REL );
+    TRACE( "reading handoff hwnd %p identity %s generation %s\n", binding->window,
+           wine_dbgstr_longlong( binding->identity ),
+           wine_dbgstr_longlong( client_surface_handoff_generation( control ) ) );
+    if (slot->cookie == binding->cookie && slot->identity == binding->identity &&
+        slot->producer_process == binding->process &&
+        slot->window == wine_server_user_handle( binding->window ) &&
+        slot->toplevel == wine_server_user_handle( binding->toplevel ) &&
+        (slot->flags & (CLIENT_SURFACE_HANDOFF_NATIVE_X11 |
+                        CLIENT_SURFACE_HANDOFF_FULL_DAMAGE)) ==
+                       (CLIENT_SURFACE_HANDOFF_NATIVE_X11 |
+                        CLIENT_SURFACE_HANDOFF_FULL_DAMAGE) &&
+        (target = find_client_surface_compositor_target( binding->toplevel )) &&
+        target->frames[0].pixmap && target->frames[1].pixmap && target->window &&
+        slot->destination.left == 0 && slot->destination.top == 0 &&
+        slot->destination.right >= slot->destination.left &&
+        slot->destination.bottom >= slot->destination.top &&
+        (unsigned int)slot->destination.right <= target->width &&
+        (unsigned int)slot->destination.bottom <= target->height &&
+        slot->width == (unsigned int)(slot->destination.right - slot->destination.left) &&
+        slot->height == (unsigned int)(slot->destination.bottom - slot->destination.top) &&
+        import_client_surface_pixmap( slot->source, &source ) &&
+        validate_client_surface_pixmap( source, slot->width, slot->height, target->depth )
+#ifdef SONAME_LIBXPRESENT
+        && (!usexpresent || (frame = get_client_surface_compositor_frame( target )))
+#endif
+        )
+    {
+#ifndef SONAME_LIBXPRESENT
+        frame = &target->frames[0];
+#else
+        if (!usexpresent) frame = &target->frames[0];
+#endif
+        /* get_client_surface_compositor_frame() exclusively reserves either
+         * an idle frame or the writable mailbox for this compositor thread. */
+        copied = client_surface_copy_on_compositor_unchecked(
+            source, frame->pixmap, 0, 0, slot->destination.left,
+            slot->destination.top, slot->width, slot->height );
+        if (copied)
+        {
+            frame->width = slot->width;
+            frame->height = slot->height;
+        }
+        if (copied && slot->scene_generation)
+        {
+            previous_publish = find_client_surface_pending_publication(
+                target, slot->scene_generation, slot->scene_epoch );
+            if (!previous_publish)
+                accepted = complete_client_surface_handoff_generation( binding, slot, &publish );
+            if ((accepted && publish) || previous_publish)
+            {
+                BOOL visible = FALSE;
+
+#ifdef SONAME_LIBXPRESENT
+                if (usexpresent && !target->mailbox_pending &&
+                    count_client_surface_compositor_frames( target ) <
+                        CLIENT_SURFACE_COMPOSITOR_MAX_INFLIGHT)
+                    visible = queued_present = submit_client_surface_present(
+                        target, frame, slot->scene_generation, slot->scene_epoch, NULL );
+                else if (usexpresent)
+                {
+                    target->mailbox_frame = frame - target->frames;
+                    target->mailbox_pending = TRUE;
+                    if (accepted && publish)
+                    {
+                        target->mailbox_publish_generation = slot->scene_generation;
+                        target->mailbox_publish_epoch = slot->scene_epoch;
+                    }
+                    visible = deferred_present = TRUE;
+                }
+#endif
+                if (!visible)
+                    visible = client_surface_copy_on_compositor( frame->pixmap, target->window,
+                                                                 0, 0, 0, 0,
+                                                                 target->width, target->height );
+                if (visible && !queued_present && !deferred_present)
+                {
+                    target->published = frame->pixmap;
+                    target->published_width = frame->width;
+                    target->published_height = frame->height;
+                }
+                if (visible && previous_publish && !deferred_present)
+                    previous_publish->publish_pending = FALSE;
+                if (visible && !queued_present && !deferred_present)
+                    composed = publish_client_surface_handoff_generation( target->toplevel,
+                        slot->scene_generation, slot->scene_epoch, TRUE );
+                else
+                    composed = visible;
+            }
+            else composed = accepted;
+        }
+        else if (copied)
+        {
+#ifdef SONAME_LIBXPRESENT
+            if (usexpresent && !target->mailbox_pending &&
+                count_client_surface_compositor_frames( target ) <
+                    CLIENT_SURFACE_COMPOSITOR_MAX_INFLIGHT)
+                composed = submit_client_surface_present( target, frame, 0, 0, NULL );
+            else if (usexpresent)
+            {
+                target->mailbox_frame = frame - target->frames;
+                target->mailbox_pending = TRUE;
+                target->mailbox_publish_generation = 0;
+                target->mailbox_publish_epoch = 0;
+                composed = TRUE;
+            }
+#endif
+            if (!composed)
+                composed = client_surface_copy_on_compositor( frame->pixmap, target->window,
+                                                              0, 0, 0, 0,
+                                                              target->width, target->height );
+            if (composed && !frame->serial && !target->mailbox_pending)
+            {
+                target->published = frame->pixmap;
+                target->published_width = frame->width;
+                target->published_height = frame->height;
+            }
+        }
+    }
+    if (source)
+    {
+        XFreePixmap( client_surface_compositor_display, source );
+        XSync( client_surface_compositor_display, False );
+    }
+
+    /* Once the compositor connection has copied the source into its backing,
+     * source storage is reusable even if a racing scene invalidates the
+     * owner-side commit or visible publication. */
+    state = copied ? CLIENT_SURFACE_HANDOFF_RELEASED : CLIENT_SURFACE_HANDOFF_LOST;
+    expected = client_surface_handoff_control( client_surface_handoff_generation( control ),
+                                               CLIENT_SURFACE_HANDOFF_READING );
+    final = client_surface_handoff_control( client_surface_handoff_generation( control ), state );
+    __atomic_compare_exchange_n( &slot->control, &expected, final, 0,
+                                 __ATOMIC_RELEASE, __ATOMIC_RELAXED );
+    client_surface_handoff_wake_release( binding->pool->shared );
+    TRACE( "%s handoff hwnd %p identity %s generation %s scene %s composed %u\n",
+           state == CLIENT_SURFACE_HANDOFF_RELEASED ? "released" : "lost", binding->window,
+           wine_dbgstr_longlong( binding->identity ),
+           wine_dbgstr_longlong( client_surface_handoff_generation( control ) ),
+           wine_dbgstr_longlong( slot->scene_generation ), composed );
+    return composed;
+}
+
+static void process_client_surface_handoffs(void)
+{
+    struct client_surface_compositor_binding *binding;
+
+    for (binding = client_surface_compositor_bindings; binding; binding = binding->next)
+    {
+        ptrdiff_t index = binding->slot - binding->pool->shared->slots;
+        UINT64 bitmap = __atomic_load_n( &binding->pool->shared->ready_bitmap[index / 64],
+                                         __ATOMIC_ACQUIRE );
+        UINT64 control;
+
+        if (!(bitmap & ((UINT64)1 << (index % 64)))) continue;
+        control = __atomic_load_n( &binding->slot->control, __ATOMIC_ACQUIRE );
+        if (client_surface_handoff_state( control ) == CLIENT_SURFACE_HANDOFF_READY)
+            compose_client_surface_handoff( binding, control );
+        else if (client_surface_handoff_state( control ) == CLIENT_SURFACE_HANDOFF_LOST)
+            __atomic_fetch_and( &binding->pool->shared->ready_bitmap[index / 64],
+                                ~((LONG64)1 << (index % 64)), __ATOMIC_ACQ_REL );
+    }
+}
+
+static void wait_client_surface_compositor_work(void)
+{
+#if defined(__linux__) && defined(SYS_futex_waitv)
+    struct futex_waitv waiters[CLIENT_SURFACE_HANDOFF_MAX_POOLS_PER_CONSUMER + 1] = {0};
+    struct timespec present_timeout, *timeout = NULL;
+    struct client_surface_compositor_pool *pool;
+    unsigned int count = 1;
+    int ret;
+
+    if (client_surface_compositor_waitv_available)
+    {
+        waiters[0].uaddr = (uintptr_t)&client_surface_compositor_sequence;
+        waiters[0].val = __atomic_load_n( &client_surface_compositor_sequence, __ATOMIC_ACQUIRE );
+        waiters[0].flags = FUTEX_32;
+        for (pool = client_surface_compositor_pools; pool; pool = pool->next)
+        {
+            assert( count < ARRAY_SIZE(waiters) );
+            __atomic_store_n( &pool->shared->ready_parked, 1, __ATOMIC_RELEASE );
+            waiters[count].uaddr = (uintptr_t)&pool->shared->ready_sequence;
+            waiters[count].val = __atomic_load_n( &pool->shared->ready_sequence, __ATOMIC_ACQUIRE );
+            waiters[count++].flags = FUTEX_32;
+        }
+
+        /* Publish every parked flag before the final state and queue checks.  A
+         * producer racing either check changes its sequence and makes waitv return
+         * immediately; a producer preceding publication is found by this scan. */
+        process_client_surface_handoffs();
+        process_client_surface_present_events();
+        pthread_mutex_lock( &client_surface_compositor_mutex );
+        if (client_surface_compositor_head)
+        {
+            pthread_mutex_unlock( &client_surface_compositor_mutex );
+            return;
+        }
+        pthread_mutex_unlock( &client_surface_compositor_mutex );
+
+        /* X Present events and futex readiness cannot be waited by one kernel
+         * primitive.  Poll the X connection only while a submitted frame is
+         * outstanding; an idle compositor still sleeps indefinitely on the
+         * lfsync-style producer/job sequences. */
+        if (client_surface_compositor_has_present_work())
+        {
+            clock_gettime( CLOCK_MONOTONIC, &present_timeout );
+            present_timeout.tv_nsec += 10000000;
+            if (present_timeout.tv_nsec >= 1000000000)
+            {
+                present_timeout.tv_sec++;
+                present_timeout.tv_nsec -= 1000000000;
+            }
+            timeout = &present_timeout;
+        }
+        do ret = syscall( SYS_futex_waitv, waiters, count, 0, timeout, CLOCK_MONOTONIC );
+        while (ret < 0 && errno == EINTR);
+        if (ret >= 0 || errno == EAGAIN || errno == ETIMEDOUT) return;
+        client_surface_compositor_waitv_available = FALSE;
+        if (errno != ENOSYS) WARN( "futex_waitv failed, error %d\n", errno );
+    }
+#endif
+
+    /* Non-Linux and pre-futex_waitv kernels retain a bounded compatibility
+     * wait.  Normal Linux operation has no periodic compositor wakeup. */
+    pthread_mutex_lock( &client_surface_compositor_mutex );
+    if (!client_surface_compositor_head)
+    {
+        struct timespec timeout;
+
+        clock_gettime( CLOCK_REALTIME, &timeout );
+        timeout.tv_nsec += 10000000;
+        if (timeout.tv_nsec >= 1000000000)
+        {
+            timeout.tv_sec++;
+            timeout.tv_nsec -= 1000000000;
+        }
+        pthread_cond_timedwait( &client_surface_compositor_cond,
+                                &client_surface_compositor_mutex, &timeout );
+    }
+    pthread_mutex_unlock( &client_surface_compositor_mutex );
+}
+
 static BOOL execute_client_surface_compositor_job( struct client_surface_compositor_job *job )
 {
+    if (job->op == CLIENT_SURFACE_COMPOSITOR_REGISTER_HANDOFF)
+        return register_client_surface_compositor_handoff( job );
+    if (job->op == CLIENT_SURFACE_COMPOSITOR_SWEEP_HANDOFFS)
+        return sweep_client_surface_compositor_handoffs( job->handoff_toplevel, job->mark );
+    if (job->op == CLIENT_SURFACE_COMPOSITOR_UPDATE_TARGET)
+        return update_client_surface_compositor_target( job );
+    if (job->op == CLIENT_SURFACE_COMPOSITOR_REMOVE_TARGET)
+        return remove_client_surface_compositor_target( job->handoff_toplevel );
+    if (job->op == CLIENT_SURFACE_COMPOSITOR_RESTORE_TARGET)
+        return restore_client_surface_compositor_target( job );
     if (!client_surface_compositor_open()) return FALSE;
     switch (job->op)
     {
@@ -273,7 +1319,8 @@ static BOOL execute_client_surface_compositor_job( struct client_surface_composi
     case CLIENT_SURFACE_COMPOSITOR_FREE_POOL:
         return client_surface_free_on_compositor( job->pixmaps );
     case CLIENT_SURFACE_COMPOSITOR_PRESENT:
-        return client_surface_present_on_compositor( job->destination, job->source );
+        return client_surface_present_on_compositor( job->destination, job->source,
+                                                      job->width, job->height );
     case CLIENT_SURFACE_COMPOSITOR_COPY:
         break;
     default:
@@ -294,9 +1341,15 @@ static void client_surface_compositor_thread( void *context )
         struct client_surface_compositor_job *job;
 
         pthread_mutex_lock( &client_surface_compositor_mutex );
-        while (!(job = client_surface_compositor_head))
-            pthread_cond_wait( &client_surface_compositor_cond,
-                               &client_surface_compositor_mutex );
+        job = client_surface_compositor_head;
+        if (!job)
+        {
+            pthread_mutex_unlock( &client_surface_compositor_mutex );
+            process_client_surface_present_events();
+            process_client_surface_handoffs();
+            wait_client_surface_compositor_work();
+            continue;
+        }
         client_surface_compositor_head = job->next;
         if (!client_surface_compositor_head)
             client_surface_compositor_tail = &client_surface_compositor_head;
@@ -335,6 +1388,7 @@ static BOOL submit_client_surface_compositor_job( struct client_surface_composit
     }
     *client_surface_compositor_tail = job;
     client_surface_compositor_tail = &job->next;
+    wake_client_surface_compositor();
     pthread_cond_broadcast( &client_surface_compositor_cond );
     while (!job->complete)
         pthread_cond_wait( &client_surface_compositor_cond,
@@ -402,16 +1456,182 @@ static BOOL client_surface_backing_copy( Drawable source, Drawable destination,
                                              width, height );
 }
 
-static BOOL client_surface_backing_present( Window window, Pixmap pixmap )
+static BOOL client_surface_backing_present( Window window, Pixmap pixmap,
+                                            unsigned int width, unsigned int height )
 {
     struct client_surface_compositor_job job =
     {
         .op = CLIENT_SURFACE_COMPOSITOR_PRESENT,
         .source = pixmap,
         .destination = window,
+        .width = width,
+        .height = height,
     };
 
     return submit_client_surface_compositor_job( &job );
+}
+
+static BOOL update_client_surface_backing_target( struct x11drv_win_data *data )
+{
+    struct client_surface_compositor_job job;
+    unsigned int window_width, window_height;
+
+    if (!get_client_surface_window_extent( data, &window_width, &window_height )) return FALSE;
+    job = (struct client_surface_compositor_job)
+    {
+        .op = CLIENT_SURFACE_COMPOSITOR_UPDATE_TARGET,
+        .pixmaps = {data->client_surface_backing, data->client_surface_backing_spare},
+        .destination = data->whole_window,
+        .width = data->client_surface_backing_width,
+        .height = data->client_surface_backing_height,
+        .window_width = window_width,
+        .window_height = window_height,
+        .valid_width = data->client_surface_backing_valid ?
+                       data->client_surface_backing_valid_width : 0,
+        .valid_height = data->client_surface_backing_valid ?
+                        data->client_surface_backing_valid_height : 0,
+        .depth = data->vis.depth,
+        .handoff_toplevel = data->hwnd,
+        .visual = data->vis.visualid,
+    };
+
+    return submit_client_surface_compositor_job( &job );
+}
+
+static void remove_client_surface_backing_target( HWND toplevel )
+{
+    struct client_surface_compositor_job job =
+    {
+        .op = CLIENT_SURFACE_COMPOSITOR_REMOVE_TARGET,
+        .handoff_toplevel = toplevel,
+    };
+
+    submit_client_surface_compositor_job( &job );
+}
+
+static BOOL register_client_surface_handoff( HWND toplevel,
+                                             const struct client_surface_handoff_desc *desc,
+                                             UINT64 mark )
+{
+    struct client_surface_compositor_job job =
+    {
+        .op = CLIENT_SURFACE_COMPOSITOR_REGISTER_HANDOFF,
+        .process = desc->process,
+        .identity = desc->surface,
+        .mark = mark,
+        .handoff_window = wine_server_ptr_handle( desc->handle ),
+        .handoff_toplevel = toplevel,
+    };
+    HANDLE mapping = NULL;
+    SIZE_T size;
+    NTSTATUS status;
+
+    SERVER_START_REQ( get_client_surface_handoff )
+    {
+        req->handle = desc->handle;
+        req->producer = desc->process;
+        req->surface = desc->surface;
+        req->owner = 1;
+        status = wine_server_call( req );
+        if (!status)
+        {
+            mapping = wine_server_ptr_handle( reply->mapping );
+            job.view_size = reply->size;
+            job.offset = reply->offset;
+            job.mapping_id = reply->mapping_id;
+            job.cookie = reply->cookie;
+        }
+    }
+    SERVER_END_REQ;
+    if (status) return FALSE;
+    size = job.view_size;
+    status = NtMapViewOfSection( mapping, NtCurrentProcess(), &job.view, 0, 0, NULL,
+                                 &size, ViewShare, 0, PAGE_READWRITE );
+    NtClose( mapping );
+    if (status) goto release;
+    job.view_size = size;
+    if (submit_client_surface_compositor_job( &job )) return TRUE;
+    if (!job.complete) NtUnmapViewOfSection( NtCurrentProcess(), job.view );
+
+release:
+    SERVER_START_REQ( release_client_surface_handoff )
+    {
+        req->handle = wine_server_user_handle( toplevel );
+        req->producer = desc->process;
+        req->surface = desc->surface;
+        req->cookie = job.cookie;
+        req->owner = 1;
+        wine_server_call( req );
+    }
+    SERVER_END_REQ;
+    return FALSE;
+}
+
+static BOOL refresh_client_surface_handoffs( HWND toplevel )
+{
+    struct client_surface_handoff_desc *descs = NULL;
+    UINT size = 8, count = 0, i;
+    UINT64 scene_generation = 0, current_generation = 0;
+    UINT64 mark = InterlockedIncrement64( (LONG64 *)&client_surface_compositor_mark );
+    NTSTATUS status;
+
+    if (!mark) mark = InterlockedIncrement64( (LONG64 *)&client_surface_compositor_mark );
+    for (;;)
+    {
+        struct client_surface_handoff_desc *next;
+        data_size_t reply_size = 0;
+
+        if (!(next = realloc( descs, size * sizeof(*descs) ))) goto failed;
+        descs = next;
+        SERVER_START_REQ( get_client_surface_handoffs )
+        {
+            req->handle = wine_server_user_handle( toplevel );
+            wine_server_set_reply( req, descs, size * sizeof(*descs) );
+            status = wine_server_call( req );
+            if (!status)
+            {
+                count = reply->count;
+                scene_generation = reply->scene_generation;
+                reply_size = wine_server_reply_size( reply );
+            }
+        }
+        SERVER_END_REQ;
+        if (status) goto failed;
+        if (count > size)
+        {
+            size = count;
+            continue;
+        }
+        if (reply_size != count * sizeof(*descs) || (scene_generation & 1)) goto failed;
+        break;
+    }
+    for (i = 0; i < count; ++i)
+        if (!register_client_surface_handoff( toplevel, &descs[i], mark )) goto failed;
+
+    SERVER_START_REQ( get_client_surface_handoffs )
+    {
+        req->handle = wine_server_user_handle( toplevel );
+        status = wine_server_call( req );
+        if (!status) current_generation = reply->scene_generation;
+    }
+    SERVER_END_REQ;
+    if (status || current_generation != scene_generation) goto failed;
+    {
+        struct client_surface_compositor_job job =
+        {
+            .op = CLIENT_SURFACE_COMPOSITOR_SWEEP_HANDOFFS,
+            .handoff_toplevel = toplevel,
+            .mark = mark,
+        };
+
+        if (!submit_client_surface_compositor_job( &job )) goto failed;
+    }
+    free( descs );
+    return TRUE;
+
+failed:
+    free( descs );
+    return FALSE;
 }
 
 static unsigned int client_surface_backing_extent( int size )
@@ -442,6 +1662,8 @@ void X11DRV_client_surface_backing_destroy( struct x11drv_win_data *data )
     struct x11drv_retired_pixmap *retired, *next;
 
     NtUserRemoveProp( data->hwnd, client_surface_backing_prop );
+    if (data->client_surface_backing || data->client_surface_retired)
+        remove_client_surface_backing_target( data->hwnd );
     if (data->client_surface_backing || data->client_surface_backing_spare)
         client_surface_backing_free( data->client_surface_backing,
                                      data->client_surface_backing_spare );
@@ -501,6 +1723,8 @@ BOOL X11DRV_client_surface_backing_ensure( struct x11drv_win_data *data )
             data->client_surface_backing_valid_height =
                 min( data->client_surface_backing_valid_height, window_height );
         }
+        update_client_surface_backing_target( data );
+        refresh_client_surface_handoffs( data->hwnd );
         return TRUE;
     }
 
@@ -568,6 +1792,8 @@ BOOL X11DRV_client_surface_backing_ensure( struct x11drv_win_data *data )
         data->client_surface_backing_valid_width = window_width;
         data->client_surface_backing_valid_height = window_height;
     }
+    update_client_surface_backing_target( data );
+    refresh_client_surface_handoffs( data->hwnd );
     return TRUE;
 }
 
@@ -595,6 +1821,8 @@ BOOL X11DRV_client_surface_backing_snapshot( struct x11drv_win_data *data, BOOL 
     data->client_surface_backing_spare = previous;
     TRACE( "rotated client-surface frame pool to %#lx (idle %#lx)\n",
            data->client_surface_backing, data->client_surface_backing_spare );
+    update_client_surface_backing_target( data );
+    refresh_client_surface_handoffs( data->hwnd );
     data->client_surface_backing_valid = FALSE;
     data->client_surface_backing_valid_width = 0;
     data->client_surface_backing_valid_height = 0;
@@ -617,7 +1845,8 @@ BOOL X11DRV_client_surface_backing_publish( struct x11drv_win_data *data )
     width = min( data->client_surface_backing_width, window_width );
     height = min( data->client_surface_backing_height, window_height );
     if (width != window_width || height != window_height) return FALSE;
-    if (!client_surface_backing_present( data->whole_window, data->client_surface_backing ))
+    if (!client_surface_backing_present( data->whole_window, data->client_surface_backing,
+                                         width, height ))
     {
         TRACE( "falling back to XCopyArea publication for pixmap %#lx\n",
                data->client_surface_backing );
@@ -634,12 +1863,40 @@ BOOL X11DRV_client_surface_backing_publish( struct x11drv_win_data *data )
 BOOL X11DRV_client_surface_backing_restore( struct x11drv_win_data *data,
                                            Window window, const RECT *rect )
 {
+    struct client_surface_compositor_job job;
+    unsigned int window_width, window_height;
+
     if (window != data->whole_window || !data->client_surface_backing ||
-        !data->client_surface_backing_valid || IsRectEmpty( rect ))
+        IsRectEmpty( rect ))
         return FALSE;
+    if (!get_client_surface_window_extent( data, &window_width, &window_height )) return FALSE;
     if (rect->left < 0 || rect->top < 0 ||
-        (unsigned int)rect->right > data->client_surface_backing_valid_width ||
-        (unsigned int)rect->bottom > data->client_surface_backing_valid_height)
+        (unsigned int)rect->right > window_width ||
+        (unsigned int)rect->bottom > window_height)
+        return FALSE;
+    job = (struct client_surface_compositor_job)
+    {
+        .op = CLIENT_SURFACE_COMPOSITOR_RESTORE_TARGET,
+        .source_x = rect->left,
+        .source_y = rect->top,
+        .destination_x = rect->left,
+        .destination_y = rect->top,
+        .width = rect->right - rect->left,
+        .height = rect->bottom - rect->top,
+        .window_width = window_width,
+        .window_height = window_height,
+        .handoff_toplevel = data->hwnd,
+    };
+    if (submit_client_surface_compositor_job( &job ))
+    {
+        data->client_surface_backing_valid = TRUE;
+        data->client_surface_backing_valid_width = window_width;
+        data->client_surface_backing_valid_height = window_height;
+        return TRUE;
+    }
+    if (!data->client_surface_backing_valid ||
+        window_width > data->client_surface_backing_valid_width ||
+        window_height > data->client_surface_backing_valid_height)
         return FALSE;
     return client_surface_backing_copy_area( data->client_surface_backing,
                                              data->whole_window,

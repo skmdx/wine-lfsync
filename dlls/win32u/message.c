@@ -2285,6 +2285,8 @@ static LRESULT handle_internal_message( HWND hwnd, UINT msg, WPARAM wparam, LPAR
                 prepare_window_client_surfaces( hwnd ))
                 client_surface_end_prepare( hwnd, scene_generation );
         }
+        else if (wparam == WINE_UPDATE_CLIENT_SURFACE_HANDOFFS)
+            update_window_state( hwnd );
         else update_window_state( hwnd );
         return 0;
     case WM_WINE_SETPIXELFORMAT:

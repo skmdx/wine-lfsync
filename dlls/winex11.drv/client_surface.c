@@ -475,17 +475,45 @@ static BOOL X11DRV_client_surface_present( struct client_surface *client,
     return ret;
 }
 
+static BOOL x11drv_client_surface_handoff_prepare(
+    struct client_surface *client, struct client_surface_handoff_slot *slot )
+{
+    struct x11drv_client_surface *surface = impl_from_client_surface( client );
+    RECT source = client->raw ? client->target.monitor_rect : client->target.virtual_rect;
+    RECT destination = client->target.monitor_rect;
+    unsigned int width, height;
+
+    if (!usexcomposite || client->hwnd != client->target.toplevel ||
+        NtUserGetWindowRelative( client->hwnd, GW_CHILD ))
+        return FALSE;
+    width = source.right - source.left;
+    height = source.bottom - source.top;
+    if (!width || !height || width != (unsigned int)(destination.right - destination.left) ||
+        height != (unsigned int)(destination.bottom - destination.top))
+        return FALSE;
+    slot->source = surface->window;
+    slot->source_visual = surface->source_visual;
+    slot->flags = CLIENT_SURFACE_HANDOFF_NATIVE_X11 | CLIENT_SURFACE_HANDOFF_FULL_DAMAGE;
+    slot->destination = destination;
+    slot->width = width;
+    slot->height = height;
+    SetRect( &slot->damage, 0, 0, width, height );
+    return TRUE;
+}
+
 static const struct client_surface_backend x11drv_client_surface_backend =
 {
     .caps = CLIENT_SURFACE_BACKEND_SCENE_PUBLICATION |
             CLIENT_SURFACE_BACKEND_NATIVE_WRITE_LEASE |
             CLIENT_SURFACE_BACKEND_READ_ONLY_DC |
-            CLIENT_SURFACE_BACKEND_DIRECT_PRESENTATION,
+            CLIENT_SURFACE_BACKEND_DIRECT_PRESENTATION |
+            CLIENT_SURFACE_BACKEND_GENERATION_HANDOFF,
     .destroy = x11drv_client_surface_destroy,
     .detach = x11drv_client_surface_detach,
     .direct_ready = x11drv_client_surface_direct_ready,
     .update = x11drv_client_surface_update,
     .present = X11DRV_client_surface_present,
+    .handoff_prepare = x11drv_client_surface_handoff_prepare,
     .completion = &x11drv_client_surface_completion_ops,
 };
 
