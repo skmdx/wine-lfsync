@@ -192,12 +192,12 @@ static BOOL x11drv_client_surface_prepare_completion( struct client_surface *cli
     {
         /* The caller will still submit the host present.  Retrying with a new
          * monitor could then mistake that unobserved operation for a future
-         * presentation.  Keep the shared monitor disabled, but return a
-         * completion token whose wait path supplies an ordered XSync fallback
-         * for servers without usable XDamage. */
+         * presentation.  An XSync on the GDI connection does not complete a
+         * swap queued on a separate WSI connection.  Without a usable monitor,
+         * do not manufacture completion evidence or authorize composition. */
         surface->completion.broken = TRUE;
         InterlockedExchange( &client->cacheable, FALSE );
-        return TRUE;
+        return FALSE;
     }
     do
     {
@@ -216,7 +216,8 @@ static BOOL x11drv_client_surface_prepare_completion( struct client_surface *cli
     } while (1);
     return TRUE;
 #else
-    return TRUE;
+    InterlockedExchange( &client->cacheable, FALSE );
+    return FALSE;
 #endif
 }
 
@@ -255,11 +256,7 @@ static BOOL x11drv_client_surface_wait_completion( struct client_surface *client
     struct x11drv_client_surface *surface = impl_from_client_surface( client );
     DWORD start = NtGetTickCount();
 
-    if (!surface->completion.damage)
-    {
-        XSync( gdi_display, False );
-        return TRUE;
-    }
+    if (!surface->completion.damage) return FALSE;
     for (;;)
     {
         DWORD elapsed, remaining;
@@ -328,8 +325,7 @@ static BOOL x11drv_client_surface_wait_completion( struct client_surface *client
         }
     }
 #else
-    XSync( gdi_display, False );
-    return TRUE;
+    return FALSE;
 #endif
 }
 

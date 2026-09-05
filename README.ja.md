@@ -79,6 +79,8 @@ winex11 の EGL backend は、ウィンドウ寸法の更新を表す `GL_FLUSH_
 
 GLX は `GLX_OML_sync_control` が利用できる場合に swap buffer count、EGL は `EGL_ANDROID_get_frame_timestamps` が利用できる場合に frame ID と display-present timestamp を使い、そのpresent固有の完了を確認します。Vulkan は上記のpresent IDを使います。exact tokenを利用できない経路だけが、期限付きのXDamage monitorへfallbackします。XDamageにはpresent serialがないため、失敗したhost callや期限切れの遅延eventを次フレームの証拠として再利用せず、monitorとそのnative surfaceを再利用不能にします。
 
+exact tokenも有効なXDamage monitorもない場合、オフスクリーン合成の完了は認定しません。GDI接続の`XSync()`だけでは別のWSI接続から投入したpresentの完了を保証できないためです。未確認フレームを合成・commitせず、新しい描画の合成には有効な完了手段またはnative drawableの再作成が必要です。
+
 使用を終えた client surface は、最後の完成フレームを再利用できるよう process-local LRU に残しますが、native drawable、DC、および server の cached membership を無制限に保持しないよう最大64 surfaceかつ推定256MiBに制限します。4K surfaceを個数上限まで保持して数GiBへ増えることはありません。追い出し時には server membership を先に retireし、残っている再合成参照が解放された時点でnative resourceを破棄します。完了monitorが因果性を失ったsurfaceはLRUへ戻さず、そのdrawableの解放時に破棄します。
 
 WGL の pixel format はプロセス内の `WND` だけでなく wineserver のウィンドウ状態として保持します。別プロセスが所有する HWND を描画する場合にも同じ形式を取得できます。また、active と cached の client surface 所有者を描画プロセス単位で追跡し、geometry-ready 通知を実際に再合成できるプロセスのキューへ送ります。終了済み描画プロセスの所有情報は自動的に破棄します。
