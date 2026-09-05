@@ -6376,6 +6376,20 @@ struct release_client_surface_lease_reply
     struct reply_header __header;
 };
 
+/* Acknowledge a CLOSED writer after its native work has completed and its
+ * shared identity was cleared. This does not retire or reopen the binding. */
+struct complete_client_surface_lease_request
+{
+    struct request_header __header;
+    char __pad_12[4];
+    client_ptr_t surface;
+    unsigned __int64 cookie;
+};
+struct complete_client_surface_lease_reply
+{
+    struct reply_header __header;
+};
+
 
 enum request
 {
@@ -6692,6 +6706,7 @@ enum request
     REQ_get_client_surface_clip_windows,
     REQ_get_client_surface_lease,
     REQ_release_client_surface_lease,
+    REQ_complete_client_surface_lease,
     REQ_NB_REQUESTS
 };
 
@@ -7012,6 +7027,7 @@ union generic_request
     struct get_client_surface_clip_windows_request get_client_surface_clip_windows_request;
     struct get_client_surface_lease_request get_client_surface_lease_request;
     struct release_client_surface_lease_request release_client_surface_lease_request;
+    struct complete_client_surface_lease_request complete_client_surface_lease_request;
 };
 union generic_reply
 {
@@ -7330,8 +7346,9 @@ union generic_reply
     struct get_client_surface_clip_windows_reply get_client_surface_clip_windows_reply;
     struct get_client_surface_lease_reply get_client_surface_lease_reply;
     struct release_client_surface_lease_reply release_client_surface_lease_reply;
+    struct complete_client_surface_lease_reply complete_client_surface_lease_reply;
 };
 
-#define SERVER_PROTOCOL_VERSION 980
+#define SERVER_PROTOCOL_VERSION 981
 
 #endif /* __WINE_WINE_SERVER_PROTOCOL_H */

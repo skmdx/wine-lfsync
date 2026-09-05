@@ -93,6 +93,8 @@ struct client_surface_ref
     struct client_surface_lease_pool *lease_pool;
     unsigned int lease_index;
     UINT64 lease_cookie; /* authoritative, never trust the writable copy */
+    struct list lease_entry; /* binding on the exact native root, even after reparent */
+    struct window *lease_top; /* grabbed until binding release */
     client_ptr_t    id;
     unsigned long long generation;
     unsigned long long sequence;
@@ -101,12 +103,17 @@ struct client_surface_ref
     unsigned int    claimed : 1; /* an active surface which completed a host present */
     unsigned int    scene_publication : 1; /* renderer supports owner scene publication */
     unsigned int    native_write_lease : 1; /* renderer supports native-target write exclusion */
+    unsigned int    lease_writer : 1; /* sealed shared claim imported into writer_count */
     unsigned int    notification_pending : 1; /* an update for this identity is queued */
     unsigned int    destroy_state : 2; /* renderer destroy delivery state */
 };
 
 #define CLIENT_SURFACE_REF_BUCKETS 256
 static struct client_surface_ref *client_surface_ref_index[CLIENT_SURFACE_REF_BUCKETS];
+
+static LONG64 seal_client_surface_lease( struct client_surface_ref *surface );
+static void seal_client_surface_leases( struct window *top );
+static void detach_client_surface_lease( struct client_surface_ref *surface );
 
 static unsigned int client_surface_ref_hash( struct process *process, client_ptr_t id )
 {
@@ -170,9 +177,7 @@ static void free_client_surface_ref_if_unused( struct client_surface_ref *surfac
 static void retire_client_surface_ref( struct client_surface_ref *surface )
 {
     assert( !surface->writer_thread && !surface->writer_top );
-    if (surface->lease_pool)
-        __atomic_fetch_or( &surface->lease_pool->slots[surface->lease_index].control,
-                           CLIENT_SURFACE_LEASE_CLOSED, __ATOMIC_SEQ_CST );
+    seal_client_surface_lease( surface );
     list_remove( &surface->entry );
     surface->active = surface->cached = surface->claimed = 0;
     surface->owner = NULL;
@@ -238,6 +243,7 @@ static void free_client_surface_lease( struct client_surface_ref *surface )
     if (!pool) return;
     __atomic_store_n( &pool->slots[surface->lease_index].control, CLIENT_SURFACE_LEASE_CLOSED,
                       __ATOMIC_SEQ_CST );
+    detach_client_surface_lease( surface );
     pool->used[surface->lease_index] = 0;
     surface->lease_pool = NULL;
     surface->lease_cookie = 0;
@@ -309,6 +315,7 @@ struct window
     unsigned int     client_surface_dirty; /* top-level composition changed while hidden */
     struct client_surface_transaction client_surface_transaction;
     unsigned int     client_surface_writer_count; /* writes which started before a scene cut-over */
+    struct list      client_surface_leases; /* scoped bindings retaining this exact native root */
     client_ptr_t     client_surface_native_barrier; /* owner token sealing native target replacement */
     unsigned long long client_surface_scene_generation; /* even when the scene is stable */
     unsigned int     client_surface_scene_change_depth;
@@ -349,6 +356,7 @@ static void update_client_surface_publication( struct window *top )
 {
     assert( client_surface_is_composing( top ) == !!top->client_surface_transaction.epoch );
     assert( !client_surface_is_ready( top ) || !top->client_surface_transaction.pending );
+    seal_client_surface_leases( top );
 
     SHARED_WRITE_BEGIN( top->shared, window_shm_t )
     {
@@ -361,6 +369,57 @@ static void update_client_surface_publication( struct window *top )
             (client_surface_is_preparing( top ) ? WINDOW_SHM_CLIENT_SURFACE_PREPARING : 0);
     }
     SHARED_WRITE_END;
+}
+
+/* Once CLOSED wins the same atomic word as acquisition, later writers cannot
+ * enter. Import a claimed slot exactly once into the existing native barrier.
+ * A subsequent local clear does not acknowledge native completion to the server;
+ * keep the count until the explicit completion request (or binding release). */
+static LONG64 seal_client_surface_lease( struct client_surface_ref *surface )
+{
+    LONG64 control;
+
+    if (!surface->lease_pool) return CLIENT_SURFACE_LEASE_CLOSED;
+    control = __atomic_fetch_or( &surface->lease_pool->slots[surface->lease_index].control,
+                                 CLIENT_SURFACE_LEASE_CLOSED, __ATOMIC_SEQ_CST );
+    if ((control & ~CLIENT_SURFACE_LEASE_CLOSED) && surface->lease_top && !surface->lease_writer)
+    {
+        surface->lease_writer = 1;
+        surface->lease_top->client_surface_writer_count++;
+    }
+    return control;
+}
+
+static void seal_client_surface_leases( struct window *top )
+{
+    struct client_surface_ref *surface;
+
+    LIST_FOR_EACH_ENTRY( surface, &top->client_surface_leases, struct client_surface_ref, lease_entry )
+        seal_client_surface_lease( surface );
+}
+
+static void attach_client_surface_lease( struct client_surface_ref *surface, struct window *top )
+{
+    assert( surface->lease_pool && !surface->lease_top && !surface->lease_writer );
+    surface->lease_top = (struct window *)grab_object( top );
+    list_add_tail( &top->client_surface_leases, &surface->lease_entry );
+}
+
+static void complete_client_surface_lease_writer( struct client_surface_ref *surface )
+{
+    if (!surface->lease_writer) return;
+    assert( surface->lease_top && surface->lease_top->client_surface_writer_count );
+    surface->lease_top->client_surface_writer_count--;
+    surface->lease_writer = 0;
+}
+
+static void detach_client_surface_lease( struct client_surface_ref *surface )
+{
+    if (!surface->lease_top) return;
+    assert( !surface->lease_writer );
+    list_remove( &surface->lease_entry );
+    release_object( surface->lease_top );
+    surface->lease_top = NULL;
 }
 
 static void window_dump( struct object *obj, int verbose );
@@ -1027,6 +1086,7 @@ static struct window *create_window( struct window *parent, struct window *owner
     win->client_surface_dirty  = 0;
     win->client_surface_transaction = (struct client_surface_transaction){0};
     win->client_surface_writer_count = 0;
+    list_init( &win->client_surface_leases );
     win->client_surface_native_barrier = 0;
     win->client_surface_scene_generation = 0;
     win->client_surface_scene_change_depth = 0;
@@ -1345,6 +1405,9 @@ static struct client_surface_ref *get_client_surface_ref( struct client_surface_
     surface->lease_pool = NULL;
     surface->lease_index = 0;
     surface->lease_cookie = 0;
+    surface->lease_top = NULL;
+    surface->lease_writer = 0;
+    list_init( &surface->lease_entry );
     surface->generation = 0;
     surface->sequence = 0;
     surface->active = 0;
@@ -1590,6 +1653,17 @@ static struct window *release_client_surface_writer( struct client_surface_ref *
     return top;
 }
 
+static void resume_client_surface_lease_top( struct window *top )
+{
+    if (top && top->handle && !top->client_surface_writer_count &&
+        top->client_surface_transaction.restart_pending &&
+        !(top->client_surface_scene_generation & 1))
+    {
+        top->client_surface_transaction.restart_pending = 0;
+        restart_client_surface_generation( top );
+    }
+}
+
 /* A rendering thread can terminate after the server grants a writer lease
  * but before userspace sends PRESENT_END.  Release those leases before its
  * windows and queue are torn down so a foreign owner cannot wait forever at
@@ -1604,6 +1678,13 @@ void cleanup_thread_client_surface_writers( struct thread *thread )
     {
         for (surface = client_surface_ref_index[bucket]; surface; surface = surface->index_next)
         {
+            /* A dead thread must not admit another writer through its shared
+             * slot. Sealing is not native completion: a surviving renderer
+             * must still acknowledge completion before this count is drained. */
+            if (surface->process == thread->process && surface->lease_pool &&
+                (__atomic_load_n( &surface->lease_pool->slots[surface->lease_index].control,
+                                  __ATOMIC_SEQ_CST ) & ~CLIENT_SURFACE_LEASE_CLOSED) == thread->id)
+                seal_client_surface_lease( surface );
             if (surface->writer_thread != thread) continue;
             top = release_client_surface_writer( surface );
             if (!top->client_surface_writer_count && top->client_surface_transaction.restart_pending &&
@@ -1832,6 +1913,8 @@ void cleanup_process_client_surfaces( struct process *process )
     {
         for (surface = client_surface_ref_index[bucket]; surface; surface = next)
         {
+            struct window *lease_top;
+
             next = surface->index_next;
             if (surface->process != process)
                 continue;
@@ -1843,8 +1926,16 @@ void cleanup_process_client_surfaces( struct process *process )
                 process->client_surface_destroy_count--;
                 surface->destroy_state = CLIENT_SURFACE_DESTROY_NONE;
             }
+            lease_top = surface->lease_top ? (struct window *)grab_object( surface->lease_top ) : NULL;
+            /* Shared admission is still disabled. This is storage/accounting
+             * cleanup, not proof that the native display connection finished
+             * its work. Native process-death draining is required before a
+             * driver can use these capabilities for actual target writes. */
+            complete_client_surface_lease_writer( surface );
             free_client_surface_lease( surface );
             free_client_surface_ref_if_unused( surface );
+            resume_client_surface_lease_top( lease_top );
+            if (lease_top) release_object( lease_top );
         }
     }
     assert( !process->client_surface_destroy_count );
@@ -1884,6 +1975,7 @@ DECL_HANDLER(get_client_surface_lease)
         if (created) free_client_surface_lease( surface );
         return;
     }
+    if (created) attach_client_surface_lease( surface, get_toplevel_window( win ) );
     reply->mapping_id = surface->lease_pool->id;
     reply->size = sizeof(struct client_surface_lease) * CLIENT_SURFACE_LEASE_SLOTS;
     reply->offset = sizeof(struct client_surface_lease) * surface->lease_index;
@@ -1893,21 +1985,42 @@ DECL_HANDLER(get_client_surface_lease)
 DECL_HANDLER(release_client_surface_lease)
 {
     struct client_surface_ref *surface = find_indexed_client_surface_ref( current->process, req->surface );
+    struct window *top;
 
     if (!surface || !surface->lease_pool || !req->cookie || req->cookie != surface->lease_cookie)
     {
         set_error( STATUS_INVALID_PARAMETER );
         return;
     }
-    if (__atomic_fetch_or( &surface->lease_pool->slots[surface->lease_index].control,
-                           CLIENT_SURFACE_LEASE_CLOSED, __ATOMIC_SEQ_CST ) &
-        ~CLIENT_SURFACE_LEASE_CLOSED)
+    if (seal_client_surface_lease( surface ) & ~CLIENT_SURFACE_LEASE_CLOSED)
     {
         set_error( STATUS_DEVICE_BUSY );
         return;
     }
+    top = surface->lease_top ? (struct window *)grab_object( surface->lease_top ) : NULL;
+    complete_client_surface_lease_writer( surface );
     free_client_surface_lease( surface );
     free_client_surface_ref_if_unused( surface );
+    resume_client_surface_lease_top( top );
+    if (top) release_object( top );
+}
+
+DECL_HANDLER(complete_client_surface_lease)
+{
+    struct client_surface_ref *surface = find_indexed_client_surface_ref( current->process, req->surface );
+
+    if (!surface || !surface->lease_pool || !req->cookie || req->cookie != surface->lease_cookie)
+    {
+        set_error( STATUS_INVALID_PARAMETER );
+        return;
+    }
+    if (seal_client_surface_lease( surface ) & ~CLIENT_SURFACE_LEASE_CLOSED)
+    {
+        set_error( STATUS_DEVICE_BUSY );
+        return;
+    }
+    complete_client_surface_lease_writer( surface );
+    resume_client_surface_lease_top( surface->lease_top );
 }
 
 static unsigned int prepare_client_surface_generation( struct window *win, unsigned long long generation )
@@ -2085,6 +2198,8 @@ static void restart_client_surface_generation( struct window *top )
 {
     int scene_published;
     int prepare_restart;
+
+    seal_client_surface_leases( top );
 
     /* A writer retains the native top-level it originally targeted across a
      * reparent.  Releasing that lease must not start an independent scene on
@@ -4462,6 +4577,7 @@ DECL_HANDLER(set_client_surface_state)
     if (owner) release_client_surface_owner( owner );
     if (req->flags & CLIENT_SURFACE_STATE_STAGED)
     {
+        seal_client_surface_leases( top );
         /* A show transition starts a new staged episode.  Retire a live replay
          * first, but preserve the absolute deadline across staged restarts. */
         if (!top->client_surface_transaction.staged && client_surface_is_composing( top ))
@@ -4546,7 +4662,8 @@ DECL_HANDLER(set_client_surface_state)
 
         if (compose && (req->flags & CLIENT_SURFACE_STATE_PRESENT_WRITE_LEASE))
         {
-            if (!surface->native_write_lease || surface->writer_thread) compose = 0;
+            seal_client_surface_lease( surface );
+            if (!surface->native_write_lease || surface->writer_thread || surface->lease_writer) compose = 0;
             else
             {
                 surface->writer_thread = (struct thread *)grab_object( current );

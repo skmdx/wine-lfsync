@@ -684,6 +684,194 @@ static unsigned int release_surface_lease( UINT_PTR surface, UINT64 cookie )
     return p_wine_server_call( &info );
 }
 
+static unsigned int complete_surface_lease( UINT_PTR surface, UINT64 cookie )
+{
+    struct __server_request_info info = {0};
+
+    info.u.req.complete_client_surface_lease_request.__header.req = REQ_complete_client_surface_lease;
+    info.u.req.complete_client_surface_lease_request.surface = surface;
+    info.u.req.complete_client_surface_lease_request.cookie = cookie;
+    return p_wine_server_call( &info );
+}
+
+static struct client_surface_lease *map_test_surface_lease( HWND hwnd, UINT_PTR identity,
+                                                           struct lease_binding *binding, void **view )
+{
+    unsigned int status;
+
+    *view = NULL;
+    status = set_surface_state( hwnd, identity, CLIENT_SURFACE_STATE_REGISTER |
+                                CLIENT_SURFACE_STATE_NATIVE_WRITE_LEASE, 0, NULL );
+    ok( !status, "lease register status %#x\n", status );
+    if (status) return NULL;
+    status = get_surface_lease( hwnd, identity, binding );
+    ok( !status, "lease bind status %#x\n", status );
+    if (status) return NULL;
+    *view = MapViewOfFile( binding->mapping, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, binding->size );
+    CloseHandle( binding->mapping );
+    ok( !!*view, "lease map error %lu\n", GetLastError() );
+    if (!*view)
+    {
+        release_surface_lease( identity, binding->cookie );
+        return NULL;
+    }
+    return (struct client_surface_lease *)((char *)*view + binding->offset);
+}
+
+static void test_lease_root_barriers(void)
+{
+    const UINT_PTR first_id = 0x79200000, second_id = 0x79200001;
+    const UINT_PTR first_barrier = 0x79210000, second_barrier = 0x79210001;
+    struct client_surface_lease *slots[2] = {0};
+    struct lease_binding bindings[2];
+    struct surface_state state;
+    HWND first = create_test_window( FALSE ), second = create_test_window( FALSE ), child = NULL;
+    void *views[2] = {0};
+    unsigned int status;
+    LONG64 expected;
+
+    ok( first && second, "failed to create shared barrier roots\n" );
+    if (!first || !second) goto done;
+    child = create_test_child( first, 10 );
+    ok( !!child, "failed to create shared barrier child\n" );
+    if (!child) goto done;
+    slots[0] = map_test_surface_lease( child, first_id, &bindings[0], &views[0] );
+    if (!slots[0]) goto done;
+    /* No production admission exists yet. Explicitly open this synthetic
+     * control word, claim it by CAS, and test the actual server drain protocol.
+     * No native copy is submitted by these protocol-only writers. */
+    __atomic_store_n( &slots[0]->control, 0, __ATOMIC_SEQ_CST );
+    expected = 0;
+    ok( __atomic_compare_exchange_n( &slots[0]->control, &expected, GetCurrentThreadId(),
+                                     0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST ), "first claim failed\n" );
+    status = set_server_parent( child, second );
+    ok( !status, "shared writer reparent status %#x\n", status );
+    ok( slots[0]->control == (CLIENT_SURFACE_LEASE_CLOSED | GetCurrentThreadId()),
+        "reparent did not seal old-root writer\n" );
+    slots[1] = map_test_surface_lease( child, second_id, &bindings[1], &views[1] );
+    if (!slots[1]) goto done;
+    __atomic_store_n( &slots[1]->control, GetCurrentThreadId(), __ATOMIC_SEQ_CST );
+    status = set_server_parent( first, second );
+    ok( !status, "native root demotion status %#x\n", status );
+
+    status = set_surface_state( first, first_barrier, CLIENT_SURFACE_STATE_NATIVE_BARRIER_BEGIN, 0, &state );
+    ok( !status && state.pending == 1, "demoted root missed its writer: status %#x pending %u\n",
+        status, state.pending );
+    status = set_surface_state( second, second_barrier, CLIENT_SURFACE_STATE_NATIVE_BARRIER_BEGIN, 0, &state );
+    ok( !status && state.pending == 1, "new root count includes wrong writers: status %#x pending %u\n",
+        status, state.pending );
+    status = set_surface_state( first, first_barrier, CLIENT_SURFACE_STATE_NATIVE_BARRIER_END, 0, NULL );
+    ok( status == STATUS_DEVICE_BUSY, "busy old root reopened, status %#x\n", status );
+    status = complete_surface_lease( first_id, bindings[0].cookie );
+    ok( status == STATUS_DEVICE_BUSY, "nonempty shared writer ACK accepted, status %#x\n", status );
+    __atomic_fetch_and( &slots[0]->control, CLIENT_SURFACE_LEASE_CLOSED, __ATOMIC_SEQ_CST );
+    status = set_surface_state( first, first_barrier, CLIENT_SURFACE_STATE_NATIVE_BARRIER_BEGIN, 0, &state );
+    ok( !status && state.pending == 1, "local clear alone drained server barrier: status %#x pending %u\n",
+        status, state.pending );
+    status = complete_surface_lease( first_id, bindings[0].cookie + 1 );
+    ok( status == STATUS_INVALID_PARAMETER, "wrong cookie completed writer, status %#x\n", status );
+    status = complete_surface_lease( first_id, bindings[0].cookie );
+    ok( !status, "old-root completion status %#x\n", status );
+    status = complete_surface_lease( first_id, bindings[0].cookie );
+    ok( !status, "duplicate completion status %#x\n", status );
+    status = set_surface_state( first, first_barrier, CLIENT_SURFACE_STATE_NATIVE_BARRIER_BEGIN, 0, &state );
+    ok( !status && !state.pending, "ACK did not drain old root: status %#x pending %u\n", status, state.pending );
+    status = set_surface_state( second, second_barrier, CLIENT_SURFACE_STATE_NATIVE_BARRIER_BEGIN, 0, &state );
+    ok( !status && state.pending == 1, "old-root ACK drained new-root writer: status %#x pending %u\n",
+        status, state.pending );
+    status = set_surface_state( child, second_id, CLIENT_SURFACE_STATE_UNREGISTER, 0, NULL );
+    ok( !status, "retire claimed membership status %#x\n", status );
+    status = set_surface_state( second, second_barrier, CLIENT_SURFACE_STATE_NATIVE_BARRIER_BEGIN, 0, &state );
+    ok( !status && state.pending == 1, "retirement dropped shared writer: status %#x pending %u\n",
+        status, state.pending );
+    status = release_surface_lease( second_id, bindings[1].cookie );
+    ok( status == STATUS_DEVICE_BUSY, "retired busy binding released, status %#x\n", status );
+    __atomic_fetch_and( &slots[1]->control, CLIENT_SURFACE_LEASE_CLOSED, __ATOMIC_SEQ_CST );
+    status = release_surface_lease( second_id, bindings[1].cookie );
+    ok( !status, "retired binding ACK status %#x\n", status );
+    slots[1] = NULL;
+    status = set_surface_state( second, second_barrier, CLIENT_SURFACE_STATE_NATIVE_BARRIER_BEGIN, 0, &state );
+    ok( !status && !state.pending, "binding ACK did not drain new root: status %#x pending %u\n", status, state.pending );
+    status = set_surface_state( first, first_barrier, CLIENT_SURFACE_STATE_NATIVE_BARRIER_END, 0, NULL );
+    ok( !status, "old native barrier end status %#x\n", status );
+    status = set_surface_state( second, second_barrier, CLIENT_SURFACE_STATE_NATIVE_BARRIER_END, 0, NULL );
+    ok( !status, "new native barrier end status %#x\n", status );
+done:
+    if (slots[0])
+    {
+        __atomic_store_n( &slots[0]->control, CLIENT_SURFACE_LEASE_CLOSED, __ATOMIC_SEQ_CST );
+        release_surface_lease( first_id, bindings[0].cookie );
+    }
+    if (slots[1])
+    {
+        __atomic_store_n( &slots[1]->control, CLIENT_SURFACE_LEASE_CLOSED, __ATOMIC_SEQ_CST );
+        release_surface_lease( second_id, bindings[1].cookie );
+    }
+    if (first) set_surface_state( first, first_barrier, CLIENT_SURFACE_STATE_NATIVE_BARRIER_END, 0, NULL );
+    if (second) set_surface_state( second, second_barrier, CLIENT_SURFACE_STATE_NATIVE_BARRIER_END, 0, NULL );
+    if (views[0]) UnmapViewOfFile( views[0] );
+    if (views[1]) UnmapViewOfFile( views[1] );
+    if (child) DestroyWindow( child );
+    if (first) DestroyWindow( first );
+    if (second) DestroyWindow( second );
+}
+
+static DWORD WINAPI lease_claim_and_exit( void *arg )
+{
+    struct client_surface_lease *slot = arg;
+    LONG64 expected = 0;
+
+    return !__atomic_compare_exchange_n( &slot->control, &expected, GetCurrentThreadId(),
+                                         0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST );
+}
+
+static void test_lease_writer_thread_exit(void)
+{
+    const UINT_PTR identity = 0x79300000, barrier = 0x79310000;
+    struct lease_binding binding;
+    struct client_surface_lease *slot;
+    struct surface_state state;
+    HWND hwnd = create_test_window( FALSE );
+    void *view = NULL;
+    HANDLE thread;
+    DWORD tid, code;
+    unsigned int status;
+
+    ok( !!hwnd, "failed to create thread-exit root\n" );
+    if (!hwnd) return;
+    slot = map_test_surface_lease( hwnd, identity, &binding, &view );
+    if (!slot) goto done;
+    __atomic_store_n( &slot->control, 0, __ATOMIC_SEQ_CST );
+    thread = CreateThread( NULL, 0, lease_claim_and_exit, slot, 0, &tid );
+    ok( !!thread, "claim thread creation error %lu\n", GetLastError() );
+    if (!thread) goto release;
+    ok( WaitForSingleObject( thread, 10000 ) == WAIT_OBJECT_0, "claim thread exit timed out\n" );
+    GetExitCodeThread( thread, &code );
+    ok( !code, "claim thread CAS failed, code %lu\n", code );
+    CloseHandle( thread );
+    ok( slot->control == (CLIENT_SURFACE_LEASE_CLOSED | tid), "thread exit failed to seal claim\n" );
+    status = set_surface_state( hwnd, barrier, CLIENT_SURFACE_STATE_NATIVE_BARRIER_BEGIN, 0, &state );
+    ok( !status && state.pending == 1, "thread death acknowledged native completion: status %#x pending %u\n",
+        status, state.pending );
+    status = complete_surface_lease( identity, binding.cookie );
+    ok( status == STATUS_DEVICE_BUSY, "dead nonempty claim completed, status %#x\n", status );
+    /* The synthetic worker issued no native work. A real renderer may clear
+     * this word from another thread only after proving that work completed. */
+    __atomic_fetch_and( &slot->control, CLIENT_SURFACE_LEASE_CLOSED, __ATOMIC_SEQ_CST );
+    status = complete_surface_lease( identity, binding.cookie );
+    ok( !status, "surviving thread completion status %#x\n", status );
+    status = set_surface_state( hwnd, barrier, CLIENT_SURFACE_STATE_NATIVE_BARRIER_BEGIN, 0, &state );
+    ok( !status && !state.pending, "surviving ACK did not drain: status %#x pending %u\n", status, state.pending );
+release:
+    __atomic_store_n( &slot->control, CLIENT_SURFACE_LEASE_CLOSED, __ATOMIC_SEQ_CST );
+    release_surface_lease( identity, binding.cookie );
+    set_surface_state( hwnd, barrier, CLIENT_SURFACE_STATE_NATIVE_BARRIER_END, 0, NULL );
+done:
+    if (view) UnmapViewOfFile( view );
+    set_surface_state( hwnd, identity, CLIENT_SURFACE_STATE_UNREGISTER, 0, NULL );
+    DestroyWindow( hwnd );
+}
+
 static void test_lease_storage(void)
 {
     NTSTATUS (WINAPI *query_process)( HANDLE, PROCESSINFOCLASS, void *, ULONG, ULONG * ) =
@@ -853,7 +1041,7 @@ done:
 #define LEASE_PARENT_ID 0x79100000
 #define LEASE_CHILD_ID  0x79100001
 
-static void lease_storage_child( HWND hwnd, HANDLE ready, HANDLE release )
+static void lease_storage_child( HWND hwnd, HANDLE ready, HANDLE release, BOOL claimed )
 {
     struct lease_binding binding;
     unsigned int status;
@@ -872,6 +1060,12 @@ static void lease_storage_child( HWND hwnd, HANDLE ready, HANDLE release )
         view = MapViewOfFile( binding.mapping, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, binding.size );
         ok( !!view, "child map lease section error %lu\n", GetLastError() );
         CloseHandle( binding.mapping );
+        if (view && claimed)
+        {
+            struct client_surface_lease *slot = (void *)((char *)view + binding.offset);
+            /* Synthetic accounting test only; no native target write occurs. */
+            __atomic_store_n( &slot->control, GetCurrentThreadId(), __ATOMIC_SEQ_CST );
+        }
     }
     SetEvent( ready );
     ok( WaitForSingleObject( release, 10000 ) == WAIT_OBJECT_0, "child release timed out\n" );
@@ -879,7 +1073,7 @@ static void lease_storage_child( HWND hwnd, HANDLE ready, HANDLE release )
      * thread/process cleanup must retire the foreign-HWND membership and pool. */
 }
 
-static void test_lease_storage_process_exit( char **argv )
+static void test_lease_storage_process_exit( char **argv, BOOL claimed )
 {
     SECURITY_ATTRIBUTES attr = {sizeof(attr), NULL, TRUE};
     STARTUPINFOA startup = {.cb = sizeof(startup)};
@@ -904,7 +1098,7 @@ static void test_lease_storage_process_exit( char **argv )
     release = CreateEventA( &attr, TRUE, FALSE, NULL );
     ok( ready && release, "failed to create lease process events\n" );
     if (!ready || !release) goto release_binding;
-    sprintf( command, "\"%s\" %s lease_storage_child %p %p %p", argv[0], argv[1], hwnd, ready, release );
+    sprintf( command, "\"%s\" %s lease_storage_child %p %p %p %u", argv[0], argv[1], hwnd, ready, release, claimed );
     if (!CreateProcessA( NULL, command, NULL, NULL, TRUE, 0, NULL, NULL, &startup, &process ))
     {
         ok( 0, "lease child CreateProcess error %lu\n", GetLastError() );
@@ -916,12 +1110,26 @@ static void test_lease_storage_process_exit( char **argv )
     if (!status) CloseHandle( foreign.mapping );
     status = set_surface_state( hwnd, 0, 0, 0, &state );
     ok( !status && state.active == 2, "parent/child memberships status %#x active %u\n", status, state.active );
+    if (claimed)
+    {
+        status = set_surface_state( hwnd, LEASE_PARENT_ID, CLIENT_SURFACE_STATE_NATIVE_BARRIER_BEGIN, 0, &state );
+        ok( !status && state.pending == 1, "child claim was not counted: status %#x pending %u\n",
+            status, state.pending );
+    }
     SetEvent( release );
     wait_child_process( &process );
     CloseHandle( process.hThread );
     CloseHandle( process.hProcess );
     status = set_surface_state( hwnd, 0, 0, 0, &state );
     ok( !status && state.active == 1, "child leaked membership status %#x active %u\n", status, state.active );
+    if (claimed)
+    {
+        status = set_surface_state( hwnd, LEASE_PARENT_ID, CLIENT_SURFACE_STATE_NATIVE_BARRIER_BEGIN, 0, &state );
+        ok( !status && !state.pending, "dead synthetic child leaked writer accounting: status %#x pending %u\n",
+            status, state.pending );
+        status = set_surface_state( hwnd, LEASE_PARENT_ID, CLIENT_SURFACE_STATE_NATIVE_BARRIER_END, 0, NULL );
+        ok( !status, "parent barrier did not end after child cleanup, status %#x\n", status );
+    }
     status = get_surface_lease( hwnd, LEASE_PARENT_ID, &again );
     ok( !status, "parent binding lost after child exit, status %#x\n", status );
     if (!status)
@@ -2382,6 +2590,8 @@ static BOOL run_focused_test_case( const char *name, char **argv )
         {"reparent-writer-leases", "writer lease cleanup across reparenting", test_reparent_writer_leases},
         {"demoted-native-barrier", "native backing barrier after demotion", test_demoted_native_barrier},
         {"lease-storage", "scoped client surface lease storage", test_lease_storage},
+        {"lease-root-barriers", "shared writer barriers on exact native roots", test_lease_root_barriers},
+        {"lease-writer-thread-exit", "shared writer sealing on thread exit", test_lease_writer_thread_exit},
         {"notification-filter", "client surface notification filter bypass",
          test_notification_identity_aba},
         {"writer-thread-exit", "writer thread exit lease cleanup", test_writer_thread_exit},
@@ -2414,7 +2624,12 @@ static BOOL run_focused_test_case( const char *name, char **argv )
     }
     if (!strcmp( name, "lease-storage-process-exit" ))
     {
-        test_lease_storage_process_exit( argv );
+        test_lease_storage_process_exit( argv, FALSE );
+        return TRUE;
+    }
+    if (!strcmp( name, "lease-storage-claimed-process-exit" ))
+    {
+        test_lease_storage_process_exit( argv, TRUE );
         return TRUE;
     }
     if (!strcmp( name, "owner-exit-destroy" ))
@@ -2448,7 +2663,7 @@ START_TEST(client_surface)
         sscanf( argv[3], "%p", &hwnd );
         sscanf( argv[4], "%p", &ready );
         sscanf( argv[5], "%p", &release );
-        lease_storage_child( hwnd, ready, release );
+        lease_storage_child( hwnd, ready, release, argc > 6 && atoi( argv[6] ) );
         return;
     }
 
@@ -2498,7 +2713,10 @@ START_TEST(client_surface)
     test_completion_result_provenance();
     trace( "testing scoped client surface lease storage\n" );
     test_lease_storage();
-    test_lease_storage_process_exit( argv );
+    test_lease_storage_process_exit( argv, FALSE );
+    test_lease_storage_process_exit( argv, TRUE );
+    test_lease_root_barriers();
+    test_lease_writer_thread_exit();
     trace( "testing client surface generations\n" );
     test_generation_aba();
     trace( "testing client surface host publication transaction\n" );

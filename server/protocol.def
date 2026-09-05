@@ -4440,3 +4440,10 @@ enum inproc_sync_type
     client_ptr_t surface;
     unsigned __int64 cookie;
 @END
+
+/* Acknowledge a CLOSED writer after its native work has completed and its
+ * shared identity was cleared. This does not retire or reopen the binding. */
+@REQ(complete_client_surface_lease)
+    client_ptr_t surface;
+    unsigned __int64 cookie;
+@END

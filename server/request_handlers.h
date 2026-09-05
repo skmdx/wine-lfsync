@@ -320,6 +320,7 @@ DECL_HANDLER(set_client_surface_state);
 DECL_HANDLER(get_client_surface_clip_windows);
 DECL_HANDLER(get_client_surface_lease);
 DECL_HANDLER(release_client_surface_lease);
+DECL_HANDLER(complete_client_surface_lease);
 
 typedef void (*req_handler)( const void *req, void *reply );
 static const req_handler req_handlers[REQ_NB_REQUESTS] =
@@ -637,6 +638,7 @@ static const req_handler req_handlers[REQ_NB_REQUESTS] =
     (req_handler)req_get_client_surface_clip_windows,
     (req_handler)req_get_client_surface_lease,
     (req_handler)req_release_client_surface_lease,
+    (req_handler)req_complete_client_surface_lease,
 };
 
 C_ASSERT( sizeof(abstime_t) == 8 );
@@ -2447,3 +2449,6 @@ C_ASSERT( sizeof(struct get_client_surface_lease_reply) == 40 );
 C_ASSERT( offsetof(struct release_client_surface_lease_request, surface) == 16 );
 C_ASSERT( offsetof(struct release_client_surface_lease_request, cookie) == 24 );
 C_ASSERT( sizeof(struct release_client_surface_lease_request) == 32 );
+C_ASSERT( offsetof(struct complete_client_surface_lease_request, surface) == 16 );
+C_ASSERT( offsetof(struct complete_client_surface_lease_request, cookie) == 24 );
+C_ASSERT( sizeof(struct complete_client_surface_lease_request) == 32 );

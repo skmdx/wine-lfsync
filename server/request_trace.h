@@ -3606,6 +3606,12 @@ static void dump_release_client_surface_lease_request( const struct release_clie
     dump_uint64( ", cookie=", &req->cookie );
 }
 
+static void dump_complete_client_surface_lease_request( const struct complete_client_surface_lease_request *req )
+{
+    dump_uint64( " surface=", &req->surface );
+    dump_uint64( ", cookie=", &req->cookie );
+}
+
 typedef void (*dump_func)( const void *req );
 
 static const dump_func req_dumpers[REQ_NB_REQUESTS] =
@@ -3923,6 +3929,7 @@ static const dump_func req_dumpers[REQ_NB_REQUESTS] =
     (dump_func)dump_get_client_surface_clip_windows_request,
     (dump_func)dump_get_client_surface_lease_request,
     (dump_func)dump_release_client_surface_lease_request,
+    (dump_func)dump_complete_client_surface_lease_request,
 };
 
 static const dump_func reply_dumpers[REQ_NB_REQUESTS] =
@@ -4239,6 +4246,7 @@ static const dump_func reply_dumpers[REQ_NB_REQUESTS] =
     (dump_func)dump_set_client_surface_state_reply,
     (dump_func)dump_get_client_surface_clip_windows_reply,
     (dump_func)dump_get_client_surface_lease_reply,
+    NULL,
     NULL,
 };
 
@@ -4557,6 +4565,7 @@ static const char * const req_names[REQ_NB_REQUESTS] =
     "get_client_surface_clip_windows",
     "get_client_surface_lease",
     "release_client_surface_lease",
+    "complete_client_surface_lease",
 };
 
 static const struct
