@@ -89,6 +89,7 @@ struct client_surface_compositor_target
     HWND toplevel;
     Window window;
     struct client_surface_compositor_frame frames[CLIENT_SURFACE_COMPOSITOR_FRAME_COUNT];
+    Pixmap backing;
     Pixmap published;
     unsigned int published_width;
     unsigned int published_height;
@@ -412,30 +413,12 @@ static struct client_surface_compositor_frame *acquire_client_surface_compositor
         process_client_surface_present_events();
         for (i = 0; i < ARRAY_SIZE(target->frames); ++i)
         {
-            unsigned int index = requested ? i : (target->next_frame + i) % ARRAY_SIZE(target->frames);
-            struct client_surface_compositor_frame *frame = &target->frames[index];
+            struct client_surface_compositor_frame *frame = &target->frames[i];
 
-            if (target->mailbox_pending && index == target->mailbox_frame) continue;
-            if ((!requested || frame->pixmap == requested) && !frame->serial)
-            {
-                target->next_frame = (index + 1) % ARRAY_SIZE(target->frames);
-                return frame;
-            }
+            if (frame->pixmap == requested && !frame->serial) return frame;
         }
         if (!wait_client_surface_present_event( start )) return NULL;
     }
-}
-
-static BOOL wait_client_surface_compositor_pixmap_idle( Pixmap pixmap )
-{
-    struct client_surface_compositor_target *target;
-    unsigned int i;
-
-    for (target = client_surface_compositor_targets; target; target = target->next)
-        for (i = 0; i < ARRAY_SIZE(target->frames); ++i)
-            if (target->frames[i].pixmap == pixmap)
-                return !!acquire_client_surface_compositor_frame( target, pixmap );
-    return TRUE;
 }
 
 static unsigned int count_client_surface_compositor_frames(
@@ -463,6 +446,18 @@ static struct client_surface_compositor_frame *get_client_surface_compositor_fra
         return &target->frames[index];
     }
     return NULL;
+}
+
+static BOOL wait_client_surface_compositor_pixmap_idle( Pixmap pixmap )
+{
+    struct client_surface_compositor_target *target;
+    unsigned int i;
+
+    for (target = client_surface_compositor_targets; target; target = target->next)
+        for (i = 0; i < ARRAY_SIZE(target->frames); ++i)
+            if (target->frames[i].pixmap == pixmap)
+                return !!acquire_client_surface_compositor_frame( target, pixmap );
+    return TRUE;
 }
 
 static BOOL submit_client_surface_present( struct client_surface_compositor_target *target,
@@ -899,6 +894,7 @@ static BOOL update_client_surface_compositor_target( struct client_surface_compo
         target->next_frame = 0;
         target->mailbox_pending = FALSE;
     }
+    target->backing = job->pixmaps[0];
     target->width = job->width;
     target->height = job->height;
     target->window_width = job->window_width;
@@ -1108,40 +1104,47 @@ static BOOL compose_client_surface_handoff(
                         CLIENT_SURFACE_HANDOFF_FULL_DAMAGE)) ==
                        (CLIENT_SURFACE_HANDOFF_NATIVE_X11 |
                         CLIENT_SURFACE_HANDOFF_FULL_DAMAGE) &&
-        target->frames[0].pixmap && target->frames[1].pixmap && target->window &&
+        target->backing && target->frames[0].pixmap && target->frames[1].pixmap &&
+        target->window &&
         slot->destination.left == 0 && slot->destination.top == 0 &&
         slot->destination.right >= slot->destination.left &&
         slot->destination.bottom >= slot->destination.top &&
         (unsigned int)slot->destination.right <= target->width &&
         (unsigned int)slot->destination.bottom <= target->height &&
         slot->width == (unsigned int)(slot->destination.right - slot->destination.left) &&
-        slot->height == (unsigned int)(slot->destination.bottom - slot->destination.top) &&
-        import_client_surface_pixmap( slot->source, &source ) &&
-        validate_client_surface_pixmap( source, slot->width, slot->height, target->depth )
-#ifdef SONAME_LIBXPRESENT
-        && (!usexpresent || (frame = get_client_surface_compositor_frame( target )))
-#endif
-        )
+        slot->height == (unsigned int)(slot->destination.bottom - slot->destination.top))
     {
-#ifndef SONAME_LIBXPRESENT
-        frame = &target->frames[0];
-#else
-        if (!usexpresent) frame = &target->frames[0];
+        if (slot->scene_generation)
+            previous_publish = find_client_surface_pending_publication(
+                target, slot->scene_generation, slot->scene_epoch );
+#ifdef SONAME_LIBXPRESENT
+        if (usexpresent)
+            frame = previous_publish || !slot->scene_generation ?
+                    get_client_surface_compositor_frame( target ) :
+                    acquire_client_surface_compositor_frame( target, target->backing );
+        else
 #endif
-        /* get_client_surface_compositor_frame() exclusively reserves either
-         * an idle frame or the writable mailbox for this compositor thread. */
+        if (target->frames[0].pixmap == target->backing) frame = &target->frames[0];
+        else if (target->frames[1].pixmap == target->backing) frame = &target->frames[1];
+
+        if (!frame || !import_client_surface_pixmap( slot->source, &source ) ||
+            !validate_client_surface_pixmap( source, slot->width, slot->height, target->depth ))
+            goto release;
+
+        /* Every producer in a transaction writes the owner-selected backing.
+         * The final completion therefore exposes one assembled scene even if
+         * some producers used the legacy conversion fallback.  Full steady
+         * frames may still rotate through the coalescing Present pool. */
         copied = client_surface_copy_on_compositor_unchecked(
             source, frame->pixmap, 0, 0, slot->destination.left,
             slot->destination.top, slot->width, slot->height );
         if (copied)
         {
-            frame->width = slot->width;
-            frame->height = slot->height;
+            frame->width = target->window_width;
+            frame->height = target->window_height;
         }
         if (copied && slot->scene_generation)
         {
-            previous_publish = find_client_surface_pending_publication(
-                target, slot->scene_generation, slot->scene_epoch );
             if (!previous_publish)
                 accepted = complete_client_surface_handoff_generation( binding, slot, &publish );
             if ((accepted && publish) || previous_publish)
@@ -1178,11 +1181,10 @@ static BOOL compose_client_surface_handoff(
                 }
                 if (visible && previous_publish && !deferred_present)
                     previous_publish->publish_pending = FALSE;
-                if (visible && !queued_present && !deferred_present)
+                if (!queued_present && !deferred_present)
                     composed = publish_client_surface_handoff_generation( target->toplevel,
-                        slot->scene_generation, slot->scene_epoch, TRUE );
-                else
-                    composed = visible;
+                        slot->scene_generation, slot->scene_epoch, visible );
+                else composed = visible;
             }
             else composed = accepted;
         }
