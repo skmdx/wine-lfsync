@@ -37,6 +37,10 @@ struct x11drv_client_surface
     Window composition_window;
     UINT64 composition_scene_epoch;
     HWND composition_toplevel;
+    GC composition_gc;
+    VisualID source_visual;
+    BOOL composition_visual_checked;
+    BOOL composition_same_visual;
     struct x11drv_client_surface_completion completion;
     BOOL keep_offscreen;    /* preserve a drawable which was used while hidden */
     BOOL manual_redirect;   /* client drawable is manually XComposite redirected */

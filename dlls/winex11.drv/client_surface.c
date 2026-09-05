@@ -101,6 +101,7 @@ static void x11drv_client_surface_destroy( struct client_surface *client )
     TRACE( "%s\n", debugstr_client_surface( client ) );
 
     x11drv_client_surface_completion_destroy( surface );
+    if (surface->composition_gc) XFreeGC( gdi_display, surface->composition_gc );
     if (surface->colormap != default_colormap) XFreeColormap( gdi_display, surface->colormap );
     if (surface->window) destroy_client_window( hwnd, surface->window );
     if (surface->hdc_backing) NtGdiDeleteObjectApp( surface->hdc_backing );
@@ -307,6 +308,7 @@ static BOOL update_client_surface_composition_targets( struct x11drv_client_surf
         return TRUE;
 
     surface->composition_window = X11DRV_get_whole_window_property( toplevel );
+    surface->composition_visual_checked = FALSE;
     surface->composition_backing = 0;
     if (!surface->composition_window) return FALSE;
     surface->composition_backing = X11DRV_get_client_surface_backing_property( toplevel );
@@ -348,6 +350,8 @@ static BOOL X11DRV_client_surface_present( struct client_surface *client,
     Pixmap backing;
     BOOL ret;
     HRGN region;
+    RGNDATA *clip = NULL;
+    BOOL native_copy;
 
     if (!hdc)
     {
@@ -396,9 +400,14 @@ static BOOL X11DRV_client_surface_present( struct client_surface *client,
      * clips the source to the stale extent and publishes an unpainted tail. */
     SetRect( &rect_src_dc, 0, 0, rect_src.right - rect_src.left,
              rect_src.bottom - rect_src.top );
-    if (get_dc_drawable( surface->hdc_src, &rect ) != surface->window ||
-        !EqualRect( &rect, &rect_src_dc ))
-        set_dc_drawable( surface->hdc_src, surface->window, &rect_src_dc, IncludeInferiors );
+    native_copy = surface->source_visual == default_visual.visualid &&
+                  rect_dst.right - rect_dst.left == rect_src_dc.right &&
+                  rect_dst.bottom - rect_dst.top == rect_src_dc.bottom;
+    if (native_copy && region && !(clip = X11DRV_GetRegionData( region, 0 )))
+    {
+        NtGdiDeleteObjectApp( region );
+        return FALSE;
+    }
 
     /* Scene generations are never written into the visible host piecemeal.
      * Steady frames keep the same backing current, then update the visible
@@ -406,10 +415,52 @@ static BOOL X11DRV_client_surface_present( struct client_surface *client,
      * process after all renderer commits have reached the server. */
     /* Keep separate destination DCs: rebinding one DC between these drawables
      * recreates its GC and XRender picture for both copies on every frame. */
-    ret = backing ? copy_client_surface( surface, surface->hdc_backing, backing,
+    /* The composition operation is a native source-to-target copy, not an
+     * application DC operation. Keep its GC on the surface and apply the
+     * already resolved clip directly. This also keeps GDI dispatch out of
+     * the native write interval for the unscaled, same-visual case. Check
+     * the target only after acquiring the native lease, and recheck whenever
+     * its scene changes. Scaling / format conversion still uses GDI. */
+    if (native_copy && !surface->composition_visual_checked)
+    {
+        XWindowAttributes attrs;
+        surface->composition_same_visual = XGetWindowAttributes( gdi_display, window, &attrs ) &&
+                                           XVisualIDFromVisual( attrs.visual ) == surface->source_visual;
+        surface->composition_visual_checked = TRUE;
+    }
+    native_copy = native_copy && surface->composition_same_visual;
+    if (native_copy && !surface->composition_gc)
+    {
+        XGCValues values = {.function = GXcopy, .graphics_exposures = False,
+                           .subwindow_mode = IncludeInferiors};
+        surface->composition_gc = XCreateGC( gdi_display, root_window,
+                                             GCFunction | GCGraphicsExposures | GCSubwindowMode, &values );
+        native_copy = !!surface->composition_gc;
+    }
+    if (native_copy)
+    {
+        if (clip)
+            XSetClipRectangles( gdi_display, surface->composition_gc, rect_dst.left, rect_dst.top,
+                                (XRectangle *)clip->Buffer, clip->rdh.nCount, YXBanded );
+        else XSetClipMask( gdi_display, surface->composition_gc, None );
+        if (backing)
+            XCopyArea( gdi_display, surface->window, backing, surface->composition_gc,
+                       0, 0, rect_src_dc.right, rect_src_dc.bottom, rect_dst.left, rect_dst.top );
+        if (!defer_visible || !backing)
+            XCopyArea( gdi_display, surface->window, window, surface->composition_gc,
+                       0, 0, rect_src_dc.right, rect_src_dc.bottom, rect_dst.left, rect_dst.top );
+        ret = TRUE;
+    }
+    else
+    {
+        if (get_dc_drawable( surface->hdc_src, &rect ) != surface->window ||
+            !EqualRect( &rect, &rect_src_dc ))
+            set_dc_drawable( surface->hdc_src, surface->window, &rect_src_dc, IncludeInferiors );
+        ret = backing ? copy_client_surface( surface, surface->hdc_backing, backing,
                                          &rect_dst, &rect_src, region ) : TRUE;
-    if (ret && (!defer_visible || !backing))
-        ret = copy_client_surface( surface, surface->hdc_dst, window, &rect_dst, &rect_src, region );
+        if (ret && (!defer_visible || !backing))
+            ret = copy_client_surface( surface, surface->hdc_dst, window, &rect_dst, &rect_src, region );
+    }
     /* A failed copy does not undo earlier native requests.  In particular,
      * the backing copy may have succeeded before the visible copy failed.
      * Complete this connection's writes before returning its writer lease,
@@ -417,6 +468,7 @@ static BOOL X11DRV_client_surface_present( struct client_surface *client,
     if (flush) XSync( gdi_display, False );
     else XFlush( gdi_display );
 
+    free( clip );
     if (region) NtGdiDeleteObjectApp( region );
     return ret;
 }
@@ -459,6 +511,7 @@ struct client_surface *X11DRV_CreateClientSurface( HWND hwnd, int format, BOOL r
 
     if (!(surface = client_surface_create( sizeof(*surface), &x11drv_client_surface_backend, hwnd, format, raw ))) goto failed;
     surface->colormap = colormap;
+    surface->source_visual = visual.visualid;
     if (!x11drv_client_surface_completion_init( surface )) goto failed;
     rect = raw ? surface->client.target.monitor_rect : surface->client.target.virtual_rect;
     if (!(surface->window = create_client_window( hwnd, rect, &visual, colormap ))) goto failed;
