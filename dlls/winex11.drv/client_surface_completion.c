@@ -266,8 +266,9 @@ static BOOL x11drv_client_surface_wait_completion( struct client_surface *client
         pthread_mutex_lock( &xdamage_lock );
         if (take_client_surface_damage_locked( surface ))
         {
-            pXDamageSubtract( xdamage_display, surface->completion.damage, None, None );
-            XFlush( xdamage_display );
+            /* Leave the region nonempty until prepare resets and synchronizes
+             * it before the next submission. Rearming here would add a redundant
+             * request and allow unrelated updates to generate more notifications. */
             pthread_mutex_unlock( &xdamage_lock );
             return TRUE;
         }
