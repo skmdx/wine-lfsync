@@ -1144,6 +1144,176 @@ done:
     DestroyWindow( hwnd );
 }
 
+#define HANDOFF_OWNER_EXIT_ID 0x79600000
+
+struct handoff_owner_exit_shared
+{
+    HWND hwnd;
+};
+
+static void handoff_storage_owner_exit_child( HANDLE mapping, HANDLE window_ready,
+                                               HANDLE binding_ready, HANDLE owner_ready,
+                                               HANDLE release, DWORD producer, UINT_PTR identity )
+{
+    struct handoff_owner_exit_shared *state;
+    struct handoff_binding binding = {0};
+    HWND hwnd = NULL;
+    void *view = NULL;
+    unsigned int status;
+
+    state = MapViewOfFile( mapping, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, sizeof(*state) );
+    ok( !!state, "owner-exit child shared map error %lu\n", GetLastError() );
+    if (!state)
+    {
+        SetEvent( window_ready );
+        SetEvent( owner_ready );
+        return;
+    }
+    hwnd = create_test_window( FALSE );
+    ok( !!hwnd, "owner-exit child failed to create window, error %lu\n", GetLastError() );
+    state->hwnd = hwnd;
+    SetEvent( window_ready );
+    ok( WaitForSingleObject( binding_ready, 10000 ) == WAIT_OBJECT_0,
+        "owner-exit child binding wait timed out\n" );
+    if (!hwnd) goto done;
+
+    status = get_surface_handoff( hwnd, producer, identity, TRUE, &binding );
+    ok( !status, "owner-exit child consumer bind status %#x\n", status );
+    if (status) goto done;
+    view = MapViewOfFile( binding.mapping, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, binding.size );
+    CloseHandle( binding.mapping );
+    binding.mapping = NULL;
+    ok( !!view, "owner-exit child consumer map error %lu\n", GetLastError() );
+done:
+    SetEvent( owner_ready );
+    ok( WaitForSingleObject( release, 10000 ) == WAIT_OBJECT_0,
+        "owner-exit child release timed out\n" );
+    /* Deliberately omit endpoint release, unmap, and window destruction. */
+}
+
+static void test_handoff_storage_owner_exit( char **argv, BOOL completed )
+{
+    SECURITY_ATTRIBUTES attr = {sizeof(attr), NULL, TRUE};
+    STARTUPINFOA startup = {.cb = sizeof(startup)};
+    PROCESS_INFORMATION process = {0};
+    struct handoff_owner_exit_shared *state = NULL;
+    struct handoff_binding producer = {0};
+    struct client_surface_handoff_shared *shared;
+    struct client_surface_handoff_slot *slot = NULL;
+    HANDLE mapping = NULL, window_ready = NULL, binding_ready = NULL;
+    HANDLE owner_ready = NULL, release = NULL;
+    UINT64 expected, generation, control;
+    UINT_PTR identity = HANDOFF_OWNER_EXIT_ID + completed;
+    unsigned int status, index = 0;
+    char command[MAX_PATH * 2];
+    void *view = NULL;
+    HWND hwnd = NULL;
+
+    mapping = CreateFileMappingA( INVALID_HANDLE_VALUE, &attr, PAGE_READWRITE, 0,
+                                  sizeof(*state), NULL );
+    window_ready = CreateEventA( &attr, TRUE, FALSE, NULL );
+    binding_ready = CreateEventA( &attr, TRUE, FALSE, NULL );
+    owner_ready = CreateEventA( &attr, TRUE, FALSE, NULL );
+    release = CreateEventA( &attr, TRUE, FALSE, NULL );
+    ok( mapping && window_ready && binding_ready && owner_ready && release,
+        "failed to create owner-exit handoff synchronization objects\n" );
+    if (!mapping || !window_ready || !binding_ready || !owner_ready || !release) goto done;
+    state = MapViewOfFile( mapping, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, sizeof(*state) );
+    ok( !!state, "owner-exit parent shared map error %lu\n", GetLastError() );
+    if (!state) goto done;
+
+    sprintf( command, "\"%s\" %s handoff_storage_owner_exit_child %p %p %p %p %p %lu %Ix",
+             argv[0], argv[1], mapping, window_ready, binding_ready, owner_ready, release,
+             GetCurrentProcessId(), identity );
+    if (!CreateProcessA( NULL, command, NULL, NULL, TRUE, 0, NULL, NULL, &startup, &process ))
+    {
+        ok( 0, "handoff owner-exit child CreateProcess error %lu\n", GetLastError() );
+        goto done;
+    }
+    ok( WaitForSingleObject( window_ready, 10000 ) == WAIT_OBJECT_0,
+        "handoff owner-exit child did not create its window\n" );
+    hwnd = state->hwnd;
+    ok( hwnd && IsWindow( hwnd ), "owner-exit child returned invalid window %p\n", hwnd );
+    if (!hwnd || !IsWindow( hwnd )) goto release_child;
+
+    status = set_surface_state( hwnd, identity,
+                                CLIENT_SURFACE_STATE_REGISTER |
+                                CLIENT_SURFACE_STATE_SCENE_PUBLICATION, 0, NULL );
+    ok( !status, "owner-exit producer registration status %#x\n", status );
+    status = claim_surface_state( hwnd, identity, NULL );
+    ok( !status, "owner-exit producer claim status %#x\n", status );
+    status = get_surface_handoff( hwnd, 0, identity, FALSE, &producer );
+    ok( !status, "owner-exit producer bind status %#x\n", status );
+    if (status) goto release_child;
+    view = MapViewOfFile( producer.mapping, FILE_MAP_READ | FILE_MAP_WRITE,
+                          0, 0, producer.size );
+    CloseHandle( producer.mapping );
+    producer.mapping = NULL;
+    ok( !!view, "owner-exit producer map error %lu\n", GetLastError() );
+    if (!view) goto release_child;
+
+    SetEvent( binding_ready );
+    ok( WaitForSingleObject( owner_ready, 10000 ) == WAIT_OBJECT_0,
+        "handoff owner-exit consumer did not become ready\n" );
+    shared = view;
+    slot = (void *)((char *)view + producer.offset);
+    index = slot - shared->slots;
+    ok( slot->endpoints == (CLIENT_SURFACE_HANDOFF_ENDPOINT_PRODUCER |
+                            CLIENT_SURFACE_HANDOFF_ENDPOINT_CONSUMER),
+        "owner-exit endpoints before exit %#x\n", slot->endpoints );
+    expected = __atomic_load_n( &slot->control, __ATOMIC_ACQUIRE );
+    generation = client_surface_handoff_generation( expected );
+    control = client_surface_handoff_control( generation, CLIENT_SURFACE_HANDOFF_SUBMITTED );
+    ok( client_surface_handoff_state( expected ) == CLIENT_SURFACE_HANDOFF_FREE &&
+        __atomic_compare_exchange_n( &slot->control, &expected, control, FALSE,
+                                     __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE ),
+        "owner-exit FREE -> SUBMITTED transition failed\n" );
+    if (completed)
+    {
+        expected = control;
+        control = client_surface_handoff_control( generation, CLIENT_SURFACE_HANDOFF_READY );
+        ok( __atomic_compare_exchange_n( &slot->control, &expected, control, FALSE,
+                                         __ATOMIC_RELEASE, __ATOMIC_ACQUIRE ),
+            "owner-exit SUBMITTED -> READY transition failed\n" );
+        __atomic_fetch_or( &shared->ready_bitmap[index / 64],
+                           (UINT64)1 << (index % 64), __ATOMIC_RELEASE );
+    }
+
+release_child:
+    SetEvent( binding_ready );
+    SetEvent( release );
+    wait_child_process( &process );
+    CloseHandle( process.hThread );
+    CloseHandle( process.hProcess );
+    process.hProcess = NULL;
+    if (slot)
+    {
+        control = __atomic_load_n( &slot->control, __ATOMIC_ACQUIRE );
+        ok( client_surface_handoff_state( control ) == CLIENT_SURFACE_HANDOFF_LOST,
+            "owner exit left handoff state %u\n", client_surface_handoff_state( control ) );
+        ok( !slot->endpoints, "owner exit left endpoints %#x\n", slot->endpoints );
+        ok( !(__atomic_load_n( &shared->ready_bitmap[index / 64], __ATOMIC_ACQUIRE ) &
+              ((UINT64)1 << (index % 64))), "owner exit left a ready bit set\n" );
+    }
+done:
+    if (process.hProcess)
+    {
+        SetEvent( binding_ready );
+        SetEvent( release );
+        wait_child_process( &process );
+        CloseHandle( process.hThread );
+        CloseHandle( process.hProcess );
+    }
+    if (producer.mapping) CloseHandle( producer.mapping );
+    if (view) UnmapViewOfFile( view );
+    if (state) UnmapViewOfFile( state );
+    if (mapping) CloseHandle( mapping );
+    if (window_ready) CloseHandle( window_ready );
+    if (binding_ready) CloseHandle( binding_ready );
+    if (owner_ready) CloseHandle( owner_ready );
+    if (release) CloseHandle( release );
+}
+
 struct lease_binding
 {
     HANDLE mapping;
@@ -3152,6 +3322,16 @@ static BOOL run_focused_test_case( const char *name, char **argv )
         test_handoff_storage_process_exit( argv, TRUE );
         return TRUE;
     }
+    if (!strcmp( name, "handoff-owner-submitted-process-exit" ))
+    {
+        test_handoff_storage_owner_exit( argv, FALSE );
+        return TRUE;
+    }
+    if (!strcmp( name, "handoff-owner-ready-process-exit" ))
+    {
+        test_handoff_storage_owner_exit( argv, TRUE );
+        return TRUE;
+    }
     if (!strcmp( name, "lease-storage-claimed-process-exit" ))
     {
         test_lease_storage_process_exit( argv, TRUE );
@@ -3199,6 +3379,20 @@ START_TEST(client_surface)
         sscanf( argv[4], "%p", &ready );
         sscanf( argv[5], "%p", &release );
         handoff_storage_exit_child( hwnd, ready, release, atoi( argv[6] ) );
+        return;
+    }
+    if (argc > 9 && !strcmp( argv[2], "handoff_storage_owner_exit_child" ))
+    {
+        HANDLE mapping, window_ready, binding_ready, owner_ready, release;
+
+        sscanf( argv[3], "%p", &mapping );
+        sscanf( argv[4], "%p", &window_ready );
+        sscanf( argv[5], "%p", &binding_ready );
+        sscanf( argv[6], "%p", &owner_ready );
+        sscanf( argv[7], "%p", &release );
+        handoff_storage_owner_exit_child( mapping, window_ready, binding_ready, owner_ready,
+                                          release, strtoul( argv[8], NULL, 10 ),
+                                          strtoull( argv[9], NULL, 16 ) );
         return;
     }
 
@@ -3252,6 +3446,8 @@ START_TEST(client_surface)
     test_handoff_storage();
     test_handoff_storage_process_exit( argv, FALSE );
     test_handoff_storage_process_exit( argv, TRUE );
+    test_handoff_storage_owner_exit( argv, FALSE );
+    test_handoff_storage_owner_exit( argv, TRUE );
     test_lease_storage_process_exit( argv, FALSE );
     test_lease_storage_process_exit( argv, TRUE );
     test_lease_root_barriers();
