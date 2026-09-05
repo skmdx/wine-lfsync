@@ -277,6 +277,13 @@ struct client_surface_clip_window
     struct rectangle rect;
 };
 
+struct client_surface_handoff_desc
+{
+    user_handle_t   handle;
+    process_id_t    process;
+    client_ptr_t    surface;
+};
+
 
 struct async_data
 {
@@ -6394,6 +6401,100 @@ struct complete_client_surface_lease_reply
     struct reply_header __header;
 };
 
+/* Map the generation handoff bound to a selected producer. The producer
+ * endpoint is restricted to the caller's own surface; the owner endpoint is
+ * available only to the process owning the top-level window. */
+struct get_client_surface_handoff_request
+{
+    struct request_header __header;
+    user_handle_t  handle;
+    process_id_t   producer;
+    char __pad_20[4];
+    client_ptr_t   surface;
+    unsigned int   owner;
+    char __pad_36[4];
+};
+struct get_client_surface_handoff_reply
+{
+    struct reply_header __header;
+    obj_handle_t   mapping;
+    unsigned int   size;
+    unsigned int   offset;
+    char __pad_20[4];
+    unsigned __int64 mapping_id;
+    unsigned __int64 cookie;
+};
+
+/* Drop one producer or owner view. The binding is not reusable until both
+ * sides have released it or their processes have exited. */
+struct release_client_surface_handoff_request
+{
+    struct request_header __header;
+    user_handle_t  handle;
+    process_id_t   producer;
+    char __pad_20[4];
+    client_ptr_t   surface;
+    unsigned __int64 cookie;
+    unsigned int   owner;
+    char __pad_44[4];
+};
+struct release_client_surface_handoff_reply
+{
+    struct reply_header __header;
+};
+
+/* Complete one owner-copied scene generation. Steady-state generation zero
+ * frames require no server acknowledgement. */
+struct complete_client_surface_handoff_request
+{
+    struct request_header __header;
+    user_handle_t  handle;
+    process_id_t   producer;
+    char __pad_20[4];
+    client_ptr_t   surface;
+    unsigned __int64 cookie;
+    unsigned __int64 generation;
+    unsigned __int64 scene_generation;
+};
+struct complete_client_surface_handoff_reply
+{
+    struct reply_header __header;
+    int            accepted;
+    int            publish;
+};
+
+
+struct publish_client_surface_handoff_request
+{
+    struct request_header __header;
+    user_handle_t  handle;
+    unsigned __int64 generation;
+    unsigned __int64 scene_generation;
+    int            success;
+    char __pad_36[4];
+};
+struct publish_client_surface_handoff_reply
+{
+    struct reply_header __header;
+    int            accepted;
+    char __pad_12[4];
+};
+
+
+struct get_client_surface_handoffs_request
+{
+    struct request_header __header;
+    user_handle_t  handle;
+};
+struct get_client_surface_handoffs_reply
+{
+    struct reply_header __header;
+    int            count;
+    char __pad_12[4];
+    unsigned __int64 scene_generation;
+    /* VARARG(handoffs,bytes); */
+};
+
 
 enum request
 {
@@ -6711,6 +6812,11 @@ enum request
     REQ_get_client_surface_lease,
     REQ_release_client_surface_lease,
     REQ_complete_client_surface_lease,
+    REQ_get_client_surface_handoff,
+    REQ_release_client_surface_handoff,
+    REQ_complete_client_surface_handoff,
+    REQ_publish_client_surface_handoff,
+    REQ_get_client_surface_handoffs,
     REQ_NB_REQUESTS
 };
 
@@ -7032,6 +7138,11 @@ union generic_request
     struct get_client_surface_lease_request get_client_surface_lease_request;
     struct release_client_surface_lease_request release_client_surface_lease_request;
     struct complete_client_surface_lease_request complete_client_surface_lease_request;
+    struct get_client_surface_handoff_request get_client_surface_handoff_request;
+    struct release_client_surface_handoff_request release_client_surface_handoff_request;
+    struct complete_client_surface_handoff_request complete_client_surface_handoff_request;
+    struct publish_client_surface_handoff_request publish_client_surface_handoff_request;
+    struct get_client_surface_handoffs_request get_client_surface_handoffs_request;
 };
 union generic_reply
 {
@@ -7351,8 +7462,13 @@ union generic_reply
     struct get_client_surface_lease_reply get_client_surface_lease_reply;
     struct release_client_surface_lease_reply release_client_surface_lease_reply;
     struct complete_client_surface_lease_reply complete_client_surface_lease_reply;
+    struct get_client_surface_handoff_reply get_client_surface_handoff_reply;
+    struct release_client_surface_handoff_reply release_client_surface_handoff_reply;
+    struct complete_client_surface_handoff_reply complete_client_surface_handoff_reply;
+    struct publish_client_surface_handoff_reply publish_client_surface_handoff_reply;
+    struct get_client_surface_handoffs_reply get_client_surface_handoffs_reply;
 };
 
-#define SERVER_PROTOCOL_VERSION 989
+#define SERVER_PROTOCOL_VERSION 994
 
 #endif /* __WINE_WINE_SERVER_PROTOCOL_H */

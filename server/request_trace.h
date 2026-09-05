@@ -3613,6 +3613,73 @@ static void dump_complete_client_surface_lease_request( const struct complete_cl
     dump_uint64( ", cookie=", &req->cookie );
 }
 
+static void dump_get_client_surface_handoff_request( const struct get_client_surface_handoff_request *req )
+{
+    fprintf( stderr, " handle=%08x", req->handle );
+    fprintf( stderr, ", producer=%04x", req->producer );
+    dump_uint64( ", surface=", &req->surface );
+    fprintf( stderr, ", owner=%08x", req->owner );
+}
+
+static void dump_get_client_surface_handoff_reply( const struct get_client_surface_handoff_reply *req )
+{
+    fprintf( stderr, " mapping=%04x", req->mapping );
+    fprintf( stderr, ", size=%08x", req->size );
+    fprintf( stderr, ", offset=%08x", req->offset );
+    dump_uint64( ", mapping_id=", &req->mapping_id );
+    dump_uint64( ", cookie=", &req->cookie );
+}
+
+static void dump_release_client_surface_handoff_request( const struct release_client_surface_handoff_request *req )
+{
+    fprintf( stderr, " handle=%08x", req->handle );
+    fprintf( stderr, ", producer=%04x", req->producer );
+    dump_uint64( ", surface=", &req->surface );
+    dump_uint64( ", cookie=", &req->cookie );
+    fprintf( stderr, ", owner=%08x", req->owner );
+}
+
+static void dump_complete_client_surface_handoff_request( const struct complete_client_surface_handoff_request *req )
+{
+    fprintf( stderr, " handle=%08x", req->handle );
+    fprintf( stderr, ", producer=%04x", req->producer );
+    dump_uint64( ", surface=", &req->surface );
+    dump_uint64( ", cookie=", &req->cookie );
+    dump_uint64( ", generation=", &req->generation );
+    dump_uint64( ", scene_generation=", &req->scene_generation );
+}
+
+static void dump_complete_client_surface_handoff_reply( const struct complete_client_surface_handoff_reply *req )
+{
+    fprintf( stderr, " accepted=%d", req->accepted );
+    fprintf( stderr, ", publish=%d", req->publish );
+}
+
+static void dump_publish_client_surface_handoff_request( const struct publish_client_surface_handoff_request *req )
+{
+    fprintf( stderr, " handle=%08x", req->handle );
+    dump_uint64( ", generation=", &req->generation );
+    dump_uint64( ", scene_generation=", &req->scene_generation );
+    fprintf( stderr, ", success=%d", req->success );
+}
+
+static void dump_publish_client_surface_handoff_reply( const struct publish_client_surface_handoff_reply *req )
+{
+    fprintf( stderr, " accepted=%d", req->accepted );
+}
+
+static void dump_get_client_surface_handoffs_request( const struct get_client_surface_handoffs_request *req )
+{
+    fprintf( stderr, " handle=%08x", req->handle );
+}
+
+static void dump_get_client_surface_handoffs_reply( const struct get_client_surface_handoffs_reply *req )
+{
+    fprintf( stderr, " count=%d", req->count );
+    dump_uint64( ", scene_generation=", &req->scene_generation );
+    dump_varargs_bytes( ", handoffs=", cur_size );
+}
+
 typedef void (*dump_func)( const void *req );
 
 static const dump_func req_dumpers[REQ_NB_REQUESTS] =
@@ -3931,6 +3998,11 @@ static const dump_func req_dumpers[REQ_NB_REQUESTS] =
     (dump_func)dump_get_client_surface_lease_request,
     (dump_func)dump_release_client_surface_lease_request,
     (dump_func)dump_complete_client_surface_lease_request,
+    (dump_func)dump_get_client_surface_handoff_request,
+    (dump_func)dump_release_client_surface_handoff_request,
+    (dump_func)dump_complete_client_surface_handoff_request,
+    (dump_func)dump_publish_client_surface_handoff_request,
+    (dump_func)dump_get_client_surface_handoffs_request,
 };
 
 static const dump_func reply_dumpers[REQ_NB_REQUESTS] =
@@ -4249,6 +4321,11 @@ static const dump_func reply_dumpers[REQ_NB_REQUESTS] =
     (dump_func)dump_get_client_surface_lease_reply,
     NULL,
     NULL,
+    (dump_func)dump_get_client_surface_handoff_reply,
+    NULL,
+    (dump_func)dump_complete_client_surface_handoff_reply,
+    (dump_func)dump_publish_client_surface_handoff_reply,
+    (dump_func)dump_get_client_surface_handoffs_reply,
 };
 
 static const char * const req_names[REQ_NB_REQUESTS] =
@@ -4567,6 +4644,11 @@ static const char * const req_names[REQ_NB_REQUESTS] =
     "get_client_surface_lease",
     "release_client_surface_lease",
     "complete_client_surface_lease",
+    "get_client_surface_handoff",
+    "release_client_surface_handoff",
+    "complete_client_surface_handoff",
+    "publish_client_surface_handoff",
+    "get_client_surface_handoffs",
 };
 
 static const struct

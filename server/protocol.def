@@ -293,6 +293,13 @@ struct client_surface_clip_window
     struct rectangle rect;
 };
 
+struct client_surface_handoff_desc
+{
+    user_handle_t   handle;
+    process_id_t    process;
+    client_ptr_t    surface;
+};
+
 /* structure for parameters of async I/O calls */
 struct async_data
 {
@@ -4451,4 +4458,63 @@ enum inproc_sync_type
 @REQ(complete_client_surface_lease)
     client_ptr_t surface;
     unsigned __int64 cookie;
+@END
+
+/* Map the generation handoff bound to a selected producer. The producer
+ * endpoint is restricted to the caller's own surface; the owner endpoint is
+ * available only to the process owning the top-level window. */
+@REQ(get_client_surface_handoff)
+    user_handle_t  handle;
+    process_id_t   producer;
+    client_ptr_t   surface;
+    unsigned int   owner;        /* request the compositor-owner endpoint */
+@REPLY
+    obj_handle_t   mapping;
+    unsigned int   size;
+    unsigned int   offset;
+    unsigned __int64 mapping_id;
+    unsigned __int64 cookie;
+@END
+
+/* Drop one producer or owner view. The binding is not reusable until both
+ * sides have released it or their processes have exited. */
+@REQ(release_client_surface_handoff)
+    user_handle_t  handle;
+    process_id_t   producer;
+    client_ptr_t   surface;
+    unsigned __int64 cookie;
+    unsigned int   owner;        /* release the compositor-owner endpoint */
+@END
+
+/* Complete one owner-copied scene generation. Steady-state generation zero
+ * frames require no server acknowledgement. */
+@REQ(complete_client_surface_handoff)
+    user_handle_t  handle;
+    process_id_t   producer;
+    client_ptr_t   surface;
+    unsigned __int64 cookie;
+    unsigned __int64 generation;
+    unsigned __int64 scene_generation;
+@REPLY
+    int            accepted;
+    int            publish;
+@END
+
+/* Finish the native owner publication reserved by a generation completion. */
+@REQ(publish_client_surface_handoff)
+    user_handle_t  handle;
+    unsigned __int64 generation;
+    unsigned __int64 scene_generation;
+    int            success;
+@REPLY
+    int            accepted;
+@END
+
+/* Enumerate the selected producers in one stable top-level scene. */
+@REQ(get_client_surface_handoffs)
+    user_handle_t  handle;
+@REPLY
+    int            count;
+    unsigned __int64 scene_generation;
+    VARARG(handoffs,bytes); /* client_surface_handoff_desc entries */
 @END

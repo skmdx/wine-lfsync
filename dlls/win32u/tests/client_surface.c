@@ -745,6 +745,267 @@ static void test_subtree_generation_retirement(void)
     DestroyWindow( parent );
 }
 
+struct handoff_binding
+{
+    HANDLE mapping;
+    UINT size, offset;
+    UINT64 mapping_id, cookie;
+};
+
+static unsigned int get_surface_handoff( HWND hwnd, DWORD producer, UINT_PTR surface,
+                                         BOOL owner, struct handoff_binding *binding )
+{
+    struct __server_request_info info = {0};
+    const struct get_client_surface_handoff_reply *reply =
+        &info.u.reply.get_client_surface_handoff_reply;
+    unsigned int status;
+
+    memset( binding, 0, sizeof(*binding) );
+    info.u.req.get_client_surface_handoff_request.__header.req = REQ_get_client_surface_handoff;
+    info.u.req.get_client_surface_handoff_request.handle = wine_server_user_handle( hwnd );
+    info.u.req.get_client_surface_handoff_request.producer = producer;
+    info.u.req.get_client_surface_handoff_request.surface = surface;
+    info.u.req.get_client_surface_handoff_request.owner = owner;
+    status = p_wine_server_call( &info );
+    if (!status)
+    {
+        binding->mapping = wine_server_ptr_handle( reply->mapping );
+        binding->size = reply->size;
+        binding->offset = reply->offset;
+        binding->mapping_id = reply->mapping_id;
+        binding->cookie = reply->cookie;
+    }
+    return status;
+}
+
+static unsigned int release_surface_handoff( HWND hwnd, DWORD producer, UINT_PTR surface,
+                                              UINT64 cookie, BOOL owner )
+{
+    struct __server_request_info info = {0};
+
+    info.u.req.release_client_surface_handoff_request.__header.req =
+        REQ_release_client_surface_handoff;
+    info.u.req.release_client_surface_handoff_request.handle = wine_server_user_handle( hwnd );
+    info.u.req.release_client_surface_handoff_request.producer = producer;
+    info.u.req.release_client_surface_handoff_request.surface = surface;
+    info.u.req.release_client_surface_handoff_request.cookie = cookie;
+    info.u.req.release_client_surface_handoff_request.owner = owner;
+    return p_wine_server_call( &info );
+}
+
+static unsigned int complete_surface_handoff( HWND hwnd, DWORD producer, UINT_PTR surface,
+                                               UINT64 cookie, UINT64 generation, UINT64 epoch,
+                                               BOOL *accepted, BOOL *publish )
+{
+    struct __server_request_info info = {0};
+    const struct complete_client_surface_handoff_reply *reply =
+        &info.u.reply.complete_client_surface_handoff_reply;
+    unsigned int status;
+
+    info.u.req.complete_client_surface_handoff_request.__header.req =
+        REQ_complete_client_surface_handoff;
+    info.u.req.complete_client_surface_handoff_request.handle = wine_server_user_handle( hwnd );
+    info.u.req.complete_client_surface_handoff_request.producer = producer;
+    info.u.req.complete_client_surface_handoff_request.surface = surface;
+    info.u.req.complete_client_surface_handoff_request.cookie = cookie;
+    info.u.req.complete_client_surface_handoff_request.generation = generation;
+    info.u.req.complete_client_surface_handoff_request.scene_generation = epoch;
+    status = p_wine_server_call( &info );
+    if (!status)
+    {
+        if (accepted) *accepted = reply->accepted;
+        if (publish) *publish = reply->publish;
+    }
+    return status;
+}
+
+static void test_handoff_storage(void)
+{
+    const UINT_PTR identity = 0x79400000;
+    const UINT flags = CLIENT_SURFACE_STATE_REGISTER | CLIENT_SURFACE_STATE_SCENE_PUBLICATION;
+    struct handoff_binding producer = {0}, owner = {0}, replacement = {0}, denied;
+    struct client_surface_handoff_shared *producer_shared = NULL, *owner_shared = NULL;
+    struct client_surface_handoff_slot *producer_slot = NULL, *owner_slot = NULL;
+    HWND hwnd = create_test_window( FALSE ), other = create_test_window( FALSE );
+    UINT64 expected, control, generation, old_cookie = 0;
+    BOOL producer_bound = FALSE, owner_bound = FALSE;
+    BOOL accepted = TRUE, publish = TRUE;
+    unsigned int status, index;
+    void *producer_view = NULL, *owner_view = NULL;
+
+    ok( hwnd && other, "failed to create handoff storage windows\n" );
+    if (!hwnd || !other) goto done;
+    status = set_surface_state( hwnd, identity, flags, 0, NULL );
+    ok( !status, "handoff registration status %#x\n", status );
+    if (status) goto done;
+    status = claim_surface_state( hwnd, identity, NULL );
+    ok( !status, "handoff claim status %#x\n", status );
+    if (status) goto unregister;
+    status = get_surface_handoff( hwnd, GetCurrentProcessId() + 1, identity, FALSE, &denied );
+    ok( status == STATUS_ACCESS_DENIED, "foreign producer endpoint status %#x\n", status );
+    if (!status) CloseHandle( denied.mapping );
+
+    status = get_surface_handoff( hwnd, 0, identity, FALSE, &producer );
+    ok( !status, "producer handoff bind status %#x\n", status );
+    if (status) goto unregister;
+    producer_bound = TRUE;
+    producer_view = MapViewOfFile( producer.mapping, FILE_MAP_READ | FILE_MAP_WRITE,
+                                   0, 0, producer.size );
+    CloseHandle( producer.mapping );
+    producer.mapping = NULL;
+    ok( !!producer_view, "producer handoff map error %lu\n", GetLastError() );
+    if (!producer_view) goto unregister;
+
+    status = get_surface_handoff( hwnd, GetCurrentProcessId(), identity, TRUE, &owner );
+    ok( !status, "owner handoff bind status %#x\n", status );
+    if (status) goto unregister;
+    owner_bound = TRUE;
+    owner_view = MapViewOfFile( owner.mapping, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, owner.size );
+    CloseHandle( owner.mapping );
+    owner.mapping = NULL;
+    ok( !!owner_view, "owner handoff map error %lu\n", GetLastError() );
+    if (!owner_view) goto unregister;
+
+    ok( producer.size == sizeof(*producer_shared) && producer.size == owner.size &&
+        producer.offset == owner.offset && producer.mapping_id == owner.mapping_id &&
+        producer.cookie == owner.cookie && producer.cookie && producer.mapping_id,
+        "producer/owner handoff bindings differ\n" );
+    ok( producer.offset >= offsetof(struct client_surface_handoff_shared, slots) &&
+        producer.offset + sizeof(*producer_slot) <= producer.size && !(producer.offset % 64),
+        "invalid handoff slot layout size %u offset %u\n", producer.size, producer.offset );
+    producer_shared = producer_view;
+    owner_shared = owner_view;
+    producer_slot = (void *)((char *)producer_view + producer.offset);
+    owner_slot = (void *)((char *)owner_view + owner.offset);
+    index = producer_slot - producer_shared->slots;
+    ok( producer_shared->magic == CLIENT_SURFACE_HANDOFF_MAGIC &&
+        producer_shared->version == CLIENT_SURFACE_HANDOFF_VERSION &&
+        producer_shared->slot_count == CLIENT_SURFACE_HANDOFF_SLOTS &&
+        producer_shared->mapping_id == producer.mapping_id,
+        "invalid producer handoff header\n" );
+    ok( owner_shared->magic == CLIENT_SURFACE_HANDOFF_MAGIC &&
+        owner_shared->mapping_id == producer.mapping_id,
+        "owner mapped a different handoff pool\n" );
+    ok( producer_slot->cookie == producer.cookie && producer_slot->identity == identity &&
+        producer_slot->producer_process == GetCurrentProcessId() &&
+        producer_slot->window == HandleToUlong( hwnd ) && producer_slot->toplevel == HandleToUlong( hwnd ),
+        "invalid initialized handoff identity\n" );
+    ok( producer_slot->endpoints == (CLIENT_SURFACE_HANDOFF_ENDPOINT_PRODUCER |
+                                     CLIENT_SURFACE_HANDOFF_ENDPOINT_CONSUMER),
+        "handoff endpoints %#x\n", producer_slot->endpoints );
+    control = __atomic_load_n( &producer_slot->control, __ATOMIC_ACQUIRE );
+    generation = client_surface_handoff_generation( control );
+    ok( generation && client_surface_handoff_state( control ) == CLIENT_SURFACE_HANDOFF_FREE,
+        "new handoff control %s\n", wine_dbgstr_longlong( control ) );
+    ok( client_surface_handoff_next_generation( ~(UINT64)0 >>
+                                                CLIENT_SURFACE_HANDOFF_GENERATION_SHIFT ) == 1,
+        "handoff generation wrap did not skip zero\n" );
+
+    expected = control;
+    control = client_surface_handoff_control( generation, CLIENT_SURFACE_HANDOFF_SUBMITTED );
+    ok( __atomic_compare_exchange_n( &producer_slot->control, &expected, control, FALSE,
+                                     __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE ),
+        "FREE -> SUBMITTED transition failed\n" );
+    expected = client_surface_handoff_control( generation, CLIENT_SURFACE_HANDOFF_FREE );
+    ok( !__atomic_compare_exchange_n( &producer_slot->control, &expected,
+                                      client_surface_handoff_control( generation,
+                                                                      CLIENT_SURFACE_HANDOFF_READING ),
+                                      FALSE, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE ),
+        "stale FREE token bypassed SUBMITTED\n" );
+    producer_slot->source = 0x12345678;
+    producer_slot->scene_generation = 0;
+    producer_slot->scene_epoch = 0;
+    expected = control;
+    control = client_surface_handoff_control( generation, CLIENT_SURFACE_HANDOFF_READY );
+    ok( __atomic_compare_exchange_n( &producer_slot->control, &expected, control, FALSE,
+                                     __ATOMIC_RELEASE, __ATOMIC_ACQUIRE ),
+        "SUBMITTED -> READY transition failed\n" );
+    __atomic_fetch_or( &producer_shared->ready_bitmap[index / 64],
+                       (UINT64)1 << (index % 64), __ATOMIC_RELEASE );
+    ok( owner_slot->source == 0x12345678 &&
+        (__atomic_load_n( &owner_shared->ready_bitmap[index / 64], __ATOMIC_ACQUIRE ) &
+         ((UINT64)1 << (index % 64))), "owner did not observe READY payload\n" );
+    expected = control;
+    control = client_surface_handoff_control( generation, CLIENT_SURFACE_HANDOFF_READING );
+    ok( __atomic_compare_exchange_n( &owner_slot->control, &expected, control, FALSE,
+                                     __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE ),
+        "READY -> READING transition failed\n" );
+    __atomic_fetch_and( &owner_shared->ready_bitmap[index / 64],
+                        ~((UINT64)1 << (index % 64)), __ATOMIC_RELEASE );
+
+    status = complete_surface_handoff( hwnd, GetCurrentProcessId(), identity,
+                                       owner.cookie + 1, 0, 0, &accepted, &publish );
+    ok( status == STATUS_INVALID_PARAMETER, "stale handoff completion status %#x\n", status );
+    status = complete_surface_handoff( hwnd, GetCurrentProcessId(), identity,
+                                       owner.cookie, 0, 0, &accepted, &publish );
+    ok( !status && !accepted && !publish,
+        "idle handoff completion status %#x accepted %u publish %u\n", status, accepted, publish );
+    expected = control;
+    control = client_surface_handoff_control( generation, CLIENT_SURFACE_HANDOFF_RELEASED );
+    ok( __atomic_compare_exchange_n( &owner_slot->control, &expected, control, FALSE,
+                                     __ATOMIC_RELEASE, __ATOMIC_ACQUIRE ),
+        "READING -> RELEASED transition failed\n" );
+    expected = control;
+    control = client_surface_handoff_control( client_surface_handoff_next_generation( generation ),
+                                              CLIENT_SURFACE_HANDOFF_FREE );
+    ok( __atomic_compare_exchange_n( &producer_slot->control, &expected, control, FALSE,
+                                     __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE ),
+        "RELEASED -> FREE transition failed\n" );
+
+    old_cookie = producer.cookie;
+    status = release_surface_handoff( hwnd, 0, identity, old_cookie + 1, FALSE );
+    ok( status == STATUS_INVALID_PARAMETER, "wrong producer release status %#x\n", status );
+    status = set_surface_state( hwnd, identity, CLIENT_SURFACE_STATE_UNREGISTER, 0, NULL );
+    ok( !status, "handoff unregister status %#x\n", status );
+    ok( client_surface_handoff_state( __atomic_load_n( &producer_slot->control,
+                                                       __ATOMIC_ACQUIRE ) ) ==
+        CLIENT_SURFACE_HANDOFF_LOST, "unregister did not mark the handoff LOST\n" );
+    status = release_surface_handoff( hwnd, 0, identity, old_cookie, FALSE );
+    ok( !status, "producer handoff release status %#x\n", status );
+    producer_bound = FALSE;
+    ok( owner_slot->endpoints == CLIENT_SURFACE_HANDOFF_ENDPOINT_CONSUMER,
+        "producer endpoint release left %#x\n", owner_slot->endpoints );
+    status = release_surface_handoff( hwnd, GetCurrentProcessId(), identity, old_cookie, TRUE );
+    ok( !status, "owner handoff release status %#x\n", status );
+    owner_bound = FALSE;
+    ok( !owner_slot->endpoints, "owner endpoint release left %#x\n", owner_slot->endpoints );
+    ok( !(__atomic_load_n( &owner_shared->ready_bitmap[index / 64], __ATOMIC_ACQUIRE ) &
+          ((UINT64)1 << (index % 64))), "retired handoff left a ready bit set\n" );
+
+    status = set_surface_state( other, identity, flags, 0, NULL );
+    ok( !status, "handoff identity reuse registration status %#x\n", status );
+    status = get_surface_handoff( other, 0, identity, FALSE, &replacement );
+    ok( !status, "replacement handoff bind status %#x\n", status );
+    if (!status)
+    {
+        CloseHandle( replacement.mapping );
+        replacement.mapping = NULL;
+        ok( replacement.cookie != old_cookie,
+            "replacement handoff reused cookie %s\n", wine_dbgstr_longlong( old_cookie ) );
+        status = release_surface_handoff( other, 0, identity, old_cookie, FALSE );
+        ok( status == STATUS_INVALID_PARAMETER, "stale cookie released replacement, status %#x\n", status );
+        status = release_surface_handoff( other, 0, identity, replacement.cookie, FALSE );
+        ok( !status, "replacement handoff release status %#x\n", status );
+    }
+    set_surface_state( other, identity, CLIENT_SURFACE_STATE_UNREGISTER, 0, NULL );
+    goto done;
+
+unregister:
+    set_surface_state( hwnd, identity, CLIENT_SURFACE_STATE_UNREGISTER, 0, NULL );
+done:
+    if (producer.mapping) CloseHandle( producer.mapping );
+    if (owner.mapping) CloseHandle( owner.mapping );
+    if (replacement.mapping) CloseHandle( replacement.mapping );
+    if (producer_bound)
+        release_surface_handoff( hwnd, 0, identity, producer.cookie, FALSE );
+    if (owner_bound)
+        release_surface_handoff( hwnd, GetCurrentProcessId(), identity, owner.cookie, TRUE );
+    if (producer_view) UnmapViewOfFile( producer_view );
+    if (owner_view) UnmapViewOfFile( owner_view );
+    if (hwnd) DestroyWindow( hwnd );
+    if (other) DestroyWindow( other );
+}
+
 struct lease_binding
 {
     HANDLE mapping;
@@ -2690,6 +2951,7 @@ static BOOL run_focused_test_case( const char *name, char **argv )
          test_native_backing_barrier},
         {"reparent-writer-leases", "writer lease cleanup across reparenting", test_reparent_writer_leases},
         {"demoted-native-barrier", "native backing barrier after demotion", test_demoted_native_barrier},
+        {"handoff-storage", "client surface generation handoff storage", test_handoff_storage},
         {"lease-storage", "scoped client surface lease storage", test_lease_storage},
         {"lease-root-barriers", "shared writer barriers on exact native roots", test_lease_root_barriers},
         {"lease-writer-thread-exit", "shared writer sealing on thread exit", test_lease_writer_thread_exit},
@@ -2828,6 +3090,8 @@ START_TEST(client_surface)
     test_completion_result_provenance();
     trace( "testing scoped client surface lease storage\n" );
     test_lease_storage();
+    trace( "testing client surface generation handoff storage\n" );
+    test_handoff_storage();
     test_lease_storage_process_exit( argv, FALSE );
     test_lease_storage_process_exit( argv, TRUE );
     test_lease_root_barriers();
