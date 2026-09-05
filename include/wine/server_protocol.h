@@ -6354,53 +6354,6 @@ struct get_client_surface_clip_windows_reply
     /* VARARG(windows,bytes); */
 };
 
-/* Bind one closed writable capability to an existing process-owned identity.
- * Repeated queries return the same binding; release is explicit, not per handle. */
-struct get_client_surface_lease_request
-{
-    struct request_header __header;
-    user_handle_t handle;
-    client_ptr_t surface;
-};
-struct get_client_surface_lease_reply
-{
-    struct reply_header __header;
-    obj_handle_t mapping;
-    unsigned int size;
-    unsigned int offset;
-    char __pad_20[4];
-    unsigned __int64 mapping_id;
-    unsigned __int64 cookie;
-};
-
-/* Release a binding after all process-local users have dropped it. The HWND
- * may already be gone; cookie prevents a stale ACK retiring a newer binding. */
-struct release_client_surface_lease_request
-{
-    struct request_header __header;
-    char __pad_12[4];
-    client_ptr_t surface;
-    unsigned __int64 cookie;
-};
-struct release_client_surface_lease_reply
-{
-    struct reply_header __header;
-};
-
-/* Acknowledge a CLOSED writer after its native work has completed and its
- * shared identity was cleared. This does not retire or reopen the binding. */
-struct complete_client_surface_lease_request
-{
-    struct request_header __header;
-    char __pad_12[4];
-    client_ptr_t surface;
-    unsigned __int64 cookie;
-};
-struct complete_client_surface_lease_reply
-{
-    struct reply_header __header;
-};
-
 /* Map the generation handoff bound to a selected producer. The producer
  * endpoint is restricted to the caller's own surface; the owner endpoint is
  * available only to the process owning the top-level window. */
@@ -6806,9 +6759,6 @@ enum request
     REQ_alpc_create_port,
     REQ_set_client_surface_state,
     REQ_get_client_surface_clip_windows,
-    REQ_get_client_surface_lease,
-    REQ_release_client_surface_lease,
-    REQ_complete_client_surface_lease,
     REQ_get_client_surface_handoff,
     REQ_release_client_surface_handoff,
     REQ_complete_client_surface_handoffs,
@@ -7132,9 +7082,6 @@ union generic_request
     struct alpc_create_port_request alpc_create_port_request;
     struct set_client_surface_state_request set_client_surface_state_request;
     struct get_client_surface_clip_windows_request get_client_surface_clip_windows_request;
-    struct get_client_surface_lease_request get_client_surface_lease_request;
-    struct release_client_surface_lease_request release_client_surface_lease_request;
-    struct complete_client_surface_lease_request complete_client_surface_lease_request;
     struct get_client_surface_handoff_request get_client_surface_handoff_request;
     struct release_client_surface_handoff_request release_client_surface_handoff_request;
     struct complete_client_surface_handoffs_request complete_client_surface_handoffs_request;
@@ -7456,9 +7403,6 @@ union generic_reply
     struct alpc_create_port_reply alpc_create_port_reply;
     struct set_client_surface_state_reply set_client_surface_state_reply;
     struct get_client_surface_clip_windows_reply get_client_surface_clip_windows_reply;
-    struct get_client_surface_lease_reply get_client_surface_lease_reply;
-    struct release_client_surface_lease_reply release_client_surface_lease_reply;
-    struct complete_client_surface_lease_reply complete_client_surface_lease_reply;
     struct get_client_surface_handoff_reply get_client_surface_handoff_reply;
     struct release_client_surface_handoff_reply release_client_surface_handoff_reply;
     struct complete_client_surface_handoffs_reply complete_client_surface_handoffs_reply;
@@ -7466,6 +7410,6 @@ union generic_reply
     struct get_client_surface_handoffs_reply get_client_surface_handoffs_reply;
 };
 
-#define SERVER_PROTOCOL_VERSION 995
+#define SERVER_PROTOCOL_VERSION 996
 
 #endif /* __WINE_WINE_SERVER_PROTOCOL_H */

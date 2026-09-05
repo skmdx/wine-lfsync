@@ -4433,33 +4433,6 @@ enum inproc_sync_type
     VARARG(windows,bytes);        /* client_surface_clip_window entries */
 @END
 
-/* Bind one closed writable capability to an existing process-owned identity.
- * Repeated queries return the same binding; release is explicit, not per handle. */
-@REQ(get_client_surface_lease)
-    user_handle_t handle;
-    client_ptr_t surface;
-@REPLY
-    obj_handle_t mapping;
-    unsigned int size;
-    unsigned int offset;
-    unsigned __int64 mapping_id;
-    unsigned __int64 cookie;
-@END
-
-/* Release a binding after all process-local users have dropped it. The HWND
- * may already be gone; cookie prevents a stale ACK retiring a newer binding. */
-@REQ(release_client_surface_lease)
-    client_ptr_t surface;
-    unsigned __int64 cookie;
-@END
-
-/* Acknowledge a CLOSED writer after its native work has completed and its
- * shared identity was cleared. This does not retire or reopen the binding. */
-@REQ(complete_client_surface_lease)
-    client_ptr_t surface;
-    unsigned __int64 cookie;
-@END
-
 /* Map the generation handoff bound to a selected producer. The producer
  * endpoint is restricted to the caller's own surface; the owner endpoint is
  * available only to the process owning the top-level window. */

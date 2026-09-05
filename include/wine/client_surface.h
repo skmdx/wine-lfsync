@@ -132,23 +132,6 @@ struct DECLSPEC_ALIGN(64) client_surface_handoff_shared
 
 C_ASSERT( offsetof(struct client_surface_handoff_shared, slots) % 64 == 0 );
 
-/* Writable capabilities live in a separate per-process section, never in the
- * read-only session/window mapping. One cache line is reserved per surface. */
-#define CLIENT_SURFACE_LEASE_CLOSED ((LONG64)0x8000000000000000ull)
-#define CLIENT_SURFACE_LEASE_SLOTS 1024
-
-struct DECLSPEC_ALIGN(64) client_surface_lease
-{
-    LONG64 control;
-    UINT64 cookie;
-    UINT64 identity;
-    UINT64 scene_epoch;
-    UINT toplevel;
-    UINT reserved[7];
-};
-
-C_ASSERT( sizeof(struct client_surface_lease) == 64 );
-
 enum client_surface_completion_kind
 {
     CLIENT_SURFACE_COMPLETION_NONE,
