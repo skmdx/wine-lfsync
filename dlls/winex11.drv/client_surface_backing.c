@@ -66,6 +66,7 @@ struct client_surface_compositor_binding
     UINT64 cookie;
     UINT64 mark;
     UINT64 source_target_seq;
+    VisualID source_visual;
     unsigned int source_width;
     unsigned int source_height;
     unsigned int source_depth;
@@ -969,6 +970,9 @@ static BOOL update_client_surface_compositor_target( struct client_surface_compo
     target->window_height = job->window_height;
     target->depth = job->depth;
     target->visual = job->visual;
+    TRACE( "updated compositor target hwnd %p window %#lx size %ux%u depth %u visual %#lx\n",
+           target->toplevel, target->window, target->window_width, target->window_height,
+           target->depth, target->visual );
     note_client_surface_compositor_snapshot( target, target->backing );
 #ifdef SONAME_LIBXPRESENT
     if (usexpresent && !target->present_event)
@@ -1050,41 +1054,44 @@ static BOOL import_client_surface_pixmap( Drawable source, Pixmap *pixmap )
 }
 
 static BOOL validate_client_surface_pixmap( Pixmap pixmap, unsigned int min_width,
-                                            unsigned int min_height, unsigned int depth )
+                                            unsigned int min_height,
+                                            unsigned int *source_depth )
 {
     Window root;
-    unsigned int width, height, border, source_depth;
+    unsigned int width, height, border, pixmap_depth;
     int x, y, error = 0;
     BOOL ret;
 
     X11DRV_expect_error( client_surface_compositor_display,
                          client_surface_compositor_error, &error );
     ret = XGetGeometry( client_surface_compositor_display, pixmap, &root, &x, &y,
-                        &width, &height, &border, &source_depth );
+                        &width, &height, &border, &pixmap_depth );
     XSync( client_surface_compositor_display, False );
     X11DRV_check_error();
-    return ret && !error && width >= min_width && height >= min_height &&
-           source_depth == depth;
+    if (!ret || error || width < min_width || height < min_height) return FALSE;
+    *source_depth = pixmap_depth;
+    return TRUE;
 }
 
 static BOOL get_client_surface_compositor_source(
     struct client_surface_compositor_binding *binding,
-    const struct client_surface_handoff_slot *slot, unsigned int depth,
-    Pixmap *source )
+    const struct client_surface_handoff_slot *slot, Pixmap *source,
+    unsigned int *source_depth )
 {
     Pixmap imported = 0;
 
     if (binding->source && binding->source_window == slot->source &&
         binding->source_target_seq == slot->target_seq &&
         binding->source_width == slot->width && binding->source_height == slot->height &&
-        binding->source_depth == depth)
+        binding->source_visual == slot->source_visual)
     {
         *source = binding->source;
+        *source_depth = binding->source_depth;
         return TRUE;
     }
 
     if (!import_client_surface_pixmap( slot->source, &imported ) ||
-        !validate_client_surface_pixmap( imported, slot->width, slot->height, depth ))
+        !validate_client_surface_pixmap( imported, slot->width, slot->height, source_depth ))
     {
         if (imported)
         {
@@ -1097,13 +1104,15 @@ static BOOL get_client_surface_compositor_source(
     binding->source = imported;
     binding->source_window = slot->source;
     binding->source_target_seq = slot->target_seq;
+    binding->source_visual = slot->source_visual;
     binding->source_width = slot->width;
     binding->source_height = slot->height;
-    binding->source_depth = depth;
+    binding->source_depth = *source_depth;
     *source = imported;
-    TRACE( "retained source pixmap %#lx for hwnd %p identity %s target %s\n",
+    TRACE( "retained source pixmap %#lx for hwnd %p identity %s target %s depth %u visual %#lx\n",
            imported, binding->window, wine_dbgstr_longlong( binding->identity ),
-           wine_dbgstr_longlong( slot->target_seq ) );
+           wine_dbgstr_longlong( slot->target_seq ), binding->source_depth,
+           binding->source_visual );
     return TRUE;
 }
 
@@ -1150,14 +1159,16 @@ static BOOL get_client_surface_compositor_catchup(
 
 static BOOL copy_client_surface_handoff_to_frame(
     struct client_surface_compositor_target *target,
-    struct client_surface_compositor_frame *frame, Pixmap source,
+    struct client_surface_compositor_frame *frame, Pixmap source, unsigned int source_depth,
     const struct client_surface_handoff_slot *slot, const RECT *damage )
 {
     Display *display = client_surface_compositor_display;
     XRectangle clips[CLIENT_SURFACE_HANDOFF_MAX_CLIP_RECTS];
     RECT catchup = {0};
     BOOL clipped = !!(slot->flags & CLIENT_SURFACE_HANDOFF_CLIPPED);
-    BOOL incoming_full, needs_catchup;
+    BOOL incoming_full, needs_catchup, native, overlay_copied = TRUE;
+    unsigned int destination_width = slot->destination.right - slot->destination.left;
+    unsigned int destination_height = slot->destination.bottom - slot->destination.top;
     unsigned int i;
     int error = 0;
     GC gc;
@@ -1169,6 +1180,17 @@ static BOOL copy_client_surface_handoff_to_frame(
                     (unsigned int)damage->bottom >= target->window_height;
     needs_catchup = !incoming_full && frame->pixmap != target->latest &&
                     frame->revision != target->revision && !IsRectEmpty( &catchup );
+    native = source_depth == target->depth && slot->source_visual == target->visual &&
+             slot->width == destination_width && slot->height == destination_height;
+
+    if (clipped)
+        for (i = 0; i < slot->clip_count; ++i)
+        {
+            clips[i].x = slot->clips[i].x;
+            clips[i].y = slot->clips[i].y;
+            clips[i].width = slot->clips[i].width;
+            clips[i].height = slot->clips[i].height;
+        }
 
     X11DRV_expect_error( display, client_surface_compositor_error, &error );
     gc = XCreateGC( display, frame->pixmap, 0, NULL );
@@ -1179,30 +1201,27 @@ static BOOL copy_client_surface_handoff_to_frame(
                        catchup.left, catchup.top,
                        catchup.right - catchup.left, catchup.bottom - catchup.top,
                        catchup.left, catchup.top );
-        if (clipped && slot->clip_count)
+        if ((!clipped || slot->clip_count) && native)
         {
-            for (i = 0; i < slot->clip_count; ++i)
-            {
-                clips[i].x = slot->clips[i].x;
-                clips[i].y = slot->clips[i].y;
-                clips[i].width = slot->clips[i].width;
-                clips[i].height = slot->clips[i].height;
-            }
-            XSetClipRectangles( display, gc, slot->destination.left,
-                                slot->destination.top, clips, slot->clip_count, YXBanded );
-        }
-        if (!clipped || slot->clip_count)
+            if (clipped)
+                XSetClipRectangles( display, gc, slot->destination.left,
+                                    slot->destination.top, clips, slot->clip_count, YXBanded );
             XCopyArea( display, source, frame->pixmap, gc,
                        slot->damage.left, slot->damage.top,
                        slot->damage.right - slot->damage.left,
                        slot->damage.bottom - slot->damage.top,
-                       slot->destination.left + slot->damage.left,
-                       slot->destination.top + slot->damage.top );
+                       slot->destination.left, slot->destination.top );
+        }
+        else if (!clipped || slot->clip_count)
+            overlay_copied = X11DRV_XRender_CopyClientSurface(
+                display, source, slot->source_visual, frame->pixmap, target->visual,
+                slot->width, slot->height, &slot->destination,
+                clipped ? clips : NULL, clipped ? slot->clip_count : 0 );
         XFreeGC( display, gc );
     }
     XSync( display, False );
     X11DRV_check_error();
-    if (!gc || error) return FALSE;
+    if (!gc || error || !overlay_copied) return FALSE;
     if (needs_catchup) frame->revision = target->revision;
     return TRUE;
 }
@@ -1281,7 +1300,7 @@ static BOOL compose_client_surface_handoff(
     enum client_surface_handoff_state state;
     Pixmap source = 0;
     RECT damage;
-    unsigned int i;
+    unsigned int destination_width, destination_height, i, source_depth = 0;
     BOOL accepted = FALSE, composed = FALSE, copied = FALSE, dropped = FALSE, publish = FALSE;
     BOOL deferred_present = FALSE, queued_present = FALSE;
 
@@ -1307,6 +1326,10 @@ static BOOL compose_client_surface_handoff(
         dropped = TRUE;
         goto release;
     }
+    destination_width = slot->destination.right > slot->destination.left ?
+                        slot->destination.right - slot->destination.left : 0;
+    destination_height = slot->destination.bottom > slot->destination.top ?
+                         slot->destination.bottom - slot->destination.top : 0;
     if (slot->cookie == binding->cookie && slot->identity == binding->identity &&
         slot->producer_process == binding->process &&
         slot->window == wine_server_user_handle( binding->window ) &&
@@ -1318,24 +1341,17 @@ static BOOL compose_client_surface_handoff(
         target->backing && target->frames[0].pixmap && target->frames[1].pixmap &&
         target->window &&
         slot->destination.left >= 0 && slot->destination.top >= 0 &&
-        slot->destination.right >= slot->destination.left &&
-        slot->destination.bottom >= slot->destination.top &&
+        destination_width && destination_height &&
         (unsigned int)slot->destination.right <= target->window_width &&
         (unsigned int)slot->destination.bottom <= target->window_height &&
-        slot->width == (unsigned int)(slot->destination.right - slot->destination.left) &&
-        slot->height == (unsigned int)(slot->destination.bottom - slot->destination.top) &&
-        slot->damage.left >= 0 && slot->damage.top >= 0 &&
-        slot->damage.right > slot->damage.left &&
-        slot->damage.bottom > slot->damage.top &&
-        (unsigned int)slot->damage.right <= slot->width &&
-        (unsigned int)slot->damage.bottom <= slot->height &&
+        slot->width && slot->height && slot->source_visual &&
+        !slot->damage.left && !slot->damage.top &&
+        (unsigned int)slot->damage.right == slot->width &&
+        (unsigned int)slot->damage.bottom == slot->height &&
         slot->clip_count <= CLIENT_SURFACE_HANDOFF_MAX_CLIP_RECTS &&
         (!!(slot->flags & CLIENT_SURFACE_HANDOFF_CLIPPED) || !slot->clip_count))
     {
-        damage = (RECT){slot->destination.left + slot->damage.left,
-                        slot->destination.top + slot->damage.top,
-                        slot->destination.left + slot->damage.right,
-                        slot->destination.top + slot->damage.bottom};
+        damage = slot->destination;
         if (slot->flags & CLIENT_SURFACE_HANDOFF_CLIPPED)
         {
             SetRectEmpty( &damage );
@@ -1345,8 +1361,8 @@ static BOOL compose_client_surface_handoff(
                 RECT rect;
 
                 if (!clip->width || !clip->height || clip->x < 0 || clip->y < 0 ||
-                    (unsigned int)clip->x + clip->width > slot->width ||
-                    (unsigned int)clip->y + clip->height > slot->height)
+                    (unsigned int)clip->x + clip->width > destination_width ||
+                    (unsigned int)clip->y + clip->height > destination_height)
                     break;
                 rect = (RECT){slot->destination.left + clip->x,
                               slot->destination.top + clip->y,
@@ -1381,14 +1397,15 @@ static BOOL compose_client_surface_handoff(
         else if (target->frames[1].pixmap == target->backing) frame = &target->frames[1];
 
         if (!frame || !get_client_surface_compositor_source(
-                          binding, slot, target->depth, &source ))
+                          binding, slot, &source, &source_depth ))
             goto release;
 
         /* Every producer in a transaction writes the owner-selected backing.
          * The final completion therefore exposes one assembled scene even if
          * some producers used the legacy conversion fallback.  Full steady
          * frames may still rotate through the coalescing Present pool. */
-        copied = copy_client_surface_handoff_to_frame( target, frame, source, slot, &damage );
+        copied = copy_client_surface_handoff_to_frame( target, frame, source, source_depth,
+                                                        slot, &damage );
         if (copied)
         {
             frame->width = target->window_width;

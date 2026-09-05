@@ -290,6 +290,15 @@ extern BOOL client_side_graphics;
 extern BOOL client_side_with_render;
 extern BOOL shape_layered_windows;
 extern const struct gdi_dc_funcs *X11DRV_XRender_Init(void);
+extern BOOL X11DRV_XRender_ClientSurfaceAvailable( BOOL scaling );
+extern BOOL X11DRV_XRender_CopyClientSurface( Display *display, Drawable source,
+                                              VisualID source_visual, Drawable destination,
+                                              VisualID destination_visual,
+                                              unsigned int source_width,
+                                              unsigned int source_height,
+                                              const RECT *destination_rect,
+                                              const XRectangle *clips,
+                                              unsigned int clip_count );
 
 extern BOOL visual_from_pixel_format( int format, XVisualInfo *visual );
 

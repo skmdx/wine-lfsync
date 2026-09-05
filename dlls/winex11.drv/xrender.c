@@ -169,6 +169,7 @@ static INT mru = -1;
 #define INIT_CACHE_SIZE 10
 
 static void *xrender_handle;
+static BOOL xrender_available;
 
 #define MAKE_FUNCPTR(f) static typeof(f) * p##f;
 MAKE_FUNCPTR(XRenderAddGlyphs)
@@ -377,6 +378,7 @@ const struct gdi_dc_funcs *X11DRV_XRender_Init(void)
     }
     glyphsetCache[i-1].next = -1;
 
+    xrender_available = TRUE;
     return &xrender_funcs;
 }
 
@@ -447,7 +449,9 @@ static enum wxr_format get_xrender_format_from_bitmapinfo( const BITMAPINFO *inf
 }
 
 /* Set the x/y scaling and x/y offsets in the transformation matrix of the source picture */
-static void set_xrender_transformation(Picture src_pict, double xscale, double yscale, int xoffset, int yoffset)
+static void set_xrender_transformation( Display *display, Picture src_pict,
+                                        double xscale, double yscale,
+                                        int xoffset, int yoffset )
 {
 #ifdef HAVE_XRENDERSETPICTURETRANSFORM
     XTransform xform = {{
@@ -456,8 +460,88 @@ static void set_xrender_transformation(Picture src_pict, double xscale, double y
         { XDoubleToFixed(0), XDoubleToFixed(0), XDoubleToFixed(1) }
     }};
 
-    pXRenderSetPictureTransform(gdi_display, src_pict, &xform);
+    pXRenderSetPictureTransform( display, src_pict, &xform );
 #endif
+}
+
+BOOL X11DRV_XRender_ClientSurfaceAvailable( BOOL scaling )
+{
+    if (!xrender_available || !pXRenderComposite || !pXRenderCreatePicture ||
+        !pXRenderFindVisualFormat ||
+        !pXRenderFreePicture || !pXRenderSetPictureClipRectangles)
+        return FALSE;
+#ifdef HAVE_XRENDERSETPICTURETRANSFORM
+    if (scaling && (!pXRenderSetPictureTransform || !pXRenderSetPictureFilter)) return FALSE;
+#else
+    if (scaling) return FALSE;
+#endif
+    return TRUE;
+}
+
+BOOL X11DRV_XRender_CopyClientSurface( Display *display, Drawable source,
+                                       VisualID source_visual_id, Drawable destination,
+                                       VisualID destination_visual_id,
+                                       unsigned int source_width,
+                                       unsigned int source_height,
+                                       const RECT *destination_rect,
+                                       const XRectangle *clips,
+                                       unsigned int clip_count )
+{
+    unsigned int destination_width, destination_height;
+    BOOL scaling;
+    XRenderPictFormat *source_format, *destination_format;
+    XVisualInfo source_template = {.visualid = source_visual_id};
+    XVisualInfo destination_template = {.visualid = destination_visual_id};
+    XVisualInfo *source_visual = NULL, *destination_visual = NULL;
+    Picture source_picture = 0, destination_picture = 0;
+    int count;
+    BOOL ret = FALSE;
+
+    if (!destination_rect || !source_visual_id || !destination_visual_id ||
+        (clip_count && !clips) || destination_rect->right <= destination_rect->left ||
+        destination_rect->bottom <= destination_rect->top)
+        return FALSE;
+    destination_width = destination_rect->right - destination_rect->left;
+    destination_height = destination_rect->bottom - destination_rect->top;
+    scaling = source_width != destination_width || source_height != destination_height;
+    if (!source_width || !source_height ||
+        !X11DRV_XRender_ClientSurfaceAvailable( scaling ))
+        return FALSE;
+    if (!(source_visual = XGetVisualInfo( display, VisualIDMask,
+                                          &source_template, &count )) || !count)
+        goto done;
+    if (!(destination_visual = XGetVisualInfo( display, VisualIDMask,
+                                               &destination_template, &count )) || !count)
+        goto done;
+    if (!(source_format = pXRenderFindVisualFormat( display, source_visual->visual )) ||
+        !(destination_format = pXRenderFindVisualFormat( display, destination_visual->visual )))
+        goto done;
+    if (!(source_picture = pXRenderCreatePicture( display, source, source_format, 0, NULL )) ||
+        !(destination_picture = pXRenderCreatePicture( display, destination,
+                                                       destination_format, 0, NULL )))
+        goto done;
+    if (clip_count)
+        pXRenderSetPictureClipRectangles( display, destination_picture,
+                                          destination_rect->left, destination_rect->top,
+                                          clips, clip_count );
+    if (scaling)
+    {
+        set_xrender_transformation( display, source_picture,
+                                    source_width / (double)destination_width,
+                                    source_height / (double)destination_height, 0, 0 );
+        pXRenderSetPictureFilter( display, source_picture, FilterBilinear, NULL, 0 );
+    }
+    pXRenderComposite( display, PictOpSrc, source_picture, None, destination_picture,
+                       0, 0, 0, 0, destination_rect->left, destination_rect->top,
+                       destination_width, destination_height );
+    ret = TRUE;
+
+done:
+    if (destination_picture) pXRenderFreePicture( display, destination_picture );
+    if (source_picture) pXRenderFreePicture( display, source_picture );
+    if (destination_visual) XFree( destination_visual );
+    if (source_visual) XFree( source_visual );
+    return ret;
 }
 
 static void update_xrender_clipping( struct xrender_physdev *dev, HRGN rgn )
@@ -1336,7 +1420,7 @@ static BOOL xrenderdrv_ExtTextOut( PHYSDEV dev, INT x, INT y, UINT flags,
             get_xrender_color( physdev, bg_color, &bg );
         }
 
-        set_xrender_transformation( pict, 1, 1, 0, 0 );
+        set_xrender_transformation( gdi_display, pict, 1, 1, 0, 0 );
         pXRenderFillRectangle( gdi_display, PictOpSrc, pict, &bg,
                                physdev->x11dev->dc_rect.left + lprect->left,
                                physdev->x11dev->dc_rect.top + lprect->top,
@@ -1427,7 +1511,7 @@ static BOOL xrenderdrv_ExtTextOut( PHYSDEV dev, INT x, INT y, UINT flags,
     }
 
     /* Make sure we don't have any transforms set from a previous call */
-    set_xrender_transformation(pict, 1, 1, 0, 0);
+    set_xrender_transformation( gdi_display, pict, 1, 1, 0, 0 );
     pXRenderCompositeText16(gdi_display, render_op,
                             tile_pict,
                             pict,
@@ -1504,13 +1588,13 @@ static void xrender_blit( int op, Picture src_pict, Picture mask_pict, Picture d
          */
         x_offset = (xscale < 0) ? -width_dst : 0;
         y_offset = (yscale < 0) ? -height_dst : 0;
-        set_xrender_transformation(src_pict, xscale, yscale, x_src, y_src);
+        set_xrender_transformation( gdi_display, src_pict, xscale, yscale, x_src, y_src );
     }
     else
     {
         x_offset = x_src;
         y_offset = y_src;
-        set_xrender_transformation(src_pict, 1, 1, 0, 0);
+        set_xrender_transformation( gdi_display, src_pict, 1, 1, 0, 0 );
     }
     if (client_side_graphics) pXRenderSetPictureFilter( gdi_display, src_pict, FilterBilinear, 0, 0 );
     pXRenderComposite( gdi_display, op, src_pict, mask_pict, dst_pict,
@@ -1567,13 +1651,13 @@ static void xrender_mono_blit( Picture src_pict, Picture dst_pict,
          */
         x_offset = (xscale < 0) ? -width_dst : 0;
         y_offset = (yscale < 0) ? -height_dst : 0;
-        set_xrender_transformation(src_pict, xscale, yscale, x_src, y_src);
+        set_xrender_transformation( gdi_display, src_pict, xscale, yscale, x_src, y_src );
     }
     else
     {
         x_offset = x_src;
         y_offset = y_src;
-        set_xrender_transformation(src_pict, 1, 1, 0, 0);
+        set_xrender_transformation( gdi_display, src_pict, 1, 1, 0, 0 );
     }
     pXRenderComposite(gdi_display, PictOpOver, tile_pict, src_pict, dst_pict,
                       0, 0, x_offset, y_offset, x_dst, y_dst, width_dst, height_dst );
@@ -2262,6 +2346,23 @@ const struct gdi_dc_funcs *X11DRV_XRender_Init(void)
 {
     TRACE("XRender support not compiled in.\n");
     return NULL;
+}
+
+BOOL X11DRV_XRender_ClientSurfaceAvailable( BOOL scaling )
+{
+    return FALSE;
+}
+
+BOOL X11DRV_XRender_CopyClientSurface( Display *display, Drawable source,
+                                       VisualID source_visual, Drawable destination,
+                                       VisualID destination_visual,
+                                       unsigned int source_width,
+                                       unsigned int source_height,
+                                       const RECT *destination_rect,
+                                       const XRectangle *clips,
+                                       unsigned int clip_count )
+{
+    return FALSE;
 }
 
 #endif /* SONAME_LIBXRENDER */

@@ -539,9 +539,10 @@ static BOOL x11drv_client_surface_prepare_handoff_clip(
     if (count == 1)
     {
         const XRectangle *full = (const XRectangle *)clip->Buffer;
+        unsigned int width = slot->destination.right - slot->destination.left;
+        unsigned int height = slot->destination.bottom - slot->destination.top;
 
-        if (!full->x && !full->y && full->width == slot->width &&
-            full->height == slot->height)
+        if (!full->x && !full->y && full->width == width && full->height == height)
         {
             supported = TRUE;
             count = 0;
@@ -573,9 +574,10 @@ done:
     surface->handoff_clip_supported = supported;
     surface->handoff_clip_required = required;
     surface->handoff_clip_valid = TRUE;
-    TRACE( "handoff clip hwnd %p destination %s region %p supported %u required %u count %u\n",
-           client->hwnd, wine_dbgstr_rect( &client->target.monitor_rect ), surface_region,
-           supported, required, count );
+    TRACE( "handoff clip hwnd %p source %ux%u visual %#lx destination %s region %p "
+           "supported %u required %u count %u\n", client->hwnd, slot->width, slot->height,
+           slot->source_visual, wine_dbgstr_rect( &client->target.monitor_rect ),
+           surface_region, supported, required, count );
 
 publish:
     if (!surface->handoff_clip_supported) return FALSE;
@@ -596,12 +598,19 @@ static BOOL x11drv_client_surface_handoff_prepare(
     struct x11drv_client_surface *surface = impl_from_client_surface( client );
     RECT source = client->raw ? client->target.monitor_rect : client->target.virtual_rect;
     RECT destination = client->target.monitor_rect;
-    unsigned int width, height;
+    unsigned int width, height, destination_width, destination_height;
 
+    if (source.right <= source.left || source.bottom <= source.top ||
+        destination.right <= destination.left || destination.bottom <= destination.top)
+        return FALSE;
     width = source.right - source.left;
     height = source.bottom - source.top;
-    if (!width || !height || width != (unsigned int)(destination.right - destination.left) ||
-        height != (unsigned int)(destination.bottom - destination.top))
+    destination_width = destination.right - destination.left;
+    destination_height = destination.bottom - destination.top;
+    if ((width != destination_width || height != destination_height ||
+         surface->source_visual != default_visual.visualid) &&
+        !X11DRV_XRender_ClientSurfaceAvailable(
+            width != destination_width || height != destination_height ))
         return FALSE;
     slot->source = surface->window;
     slot->source_visual = surface->source_visual;

@@ -508,11 +508,12 @@ static BOOL x11drv_egl_describe_pixel_format( int format, struct wgl_pixel_forma
     XVisualInfo visual;
 
     if (!p_egl_describe_pixel_format( format, pf )) return FALSE;
-    if (!visual_from_pixel_format( format, &visual ) || visual.depth != default_visual.depth)
+    if (!visual_from_pixel_format( format, &visual ) ||
+        (visual.depth != default_visual.depth &&
+         !X11DRV_XRender_ClientSurfaceAvailable( FALSE )))
     {
-        /* Forbid drawing to windows with formats whose depth does not match the screen depth
-         * so that we can copy child windows on-screen using XCopyArea().
-         * See x11drv_init_pixel_formats() for the same logic with GLX. */
+        /* A compositor without XRender still requires XCopyArea-compatible
+         * source and destination depths. */
         pf->pfd.dwFlags &= ~PFD_DRAW_TO_WINDOW;
     }
 
@@ -810,14 +811,10 @@ static UINT x11drv_init_pixel_formats( UINT *onscreen_count )
              * The second run we only set offscreen formats. */
             if(!run && visinfo)
             {
-                /* We implement child window rendering using offscreen buffers (using composite or an XPixmap).
-                 * The contents is copied to the destination using XCopyArea. For the copying to work
-                 * the depth of the source and destination window should be the same. In general this should
-                 * not be a problem for OpenGL as drivers only advertise formats with a similar depth (or no depth).
-                 * As of the introduction of composition managers at least Nvidia now also offers ARGB visuals
-                 * with a depth of 32 in addition to the default 24 bit. In order to prevent BadMatch errors we only
-                 * list formats with the same depth. */
-                if(visinfo->depth != default_visual.depth)
+                /* Without XRender, child composition still falls back to
+                 * XCopyArea and therefore requires matching depths. */
+                if (visinfo->depth != default_visual.depth &&
+                    !X11DRV_XRender_ClientSurfaceAvailable( FALSE ))
                 {
                     XFree(visinfo);
                     continue;
