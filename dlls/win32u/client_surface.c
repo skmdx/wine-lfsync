@@ -595,7 +595,13 @@ static BOOL read_client_surface_scene( HWND toplevel, struct client_surface_scen
         if (producer_id) *producer_id = window_shm->client_surface_id;
     }
     if (status) return FALSE;
-    scene->valid = !preparing && !(scene->epoch & 1);
+    /* A publication which started in an older epoch remains COMPOSING until
+     * the owner ACK arrives, but it is not a valid target for newer frames.
+     * Treat that interval like the odd seqlock phase.  Otherwise a resize
+     * storm can keep feeding the compositor frames which the server must
+     * reject, delaying the one Present completion needed to start repair. */
+    scene->valid = !preparing && !(scene->epoch & 1) &&
+                   (!scene->generation || scene->generation == scene->epoch);
     return TRUE;
 }
 

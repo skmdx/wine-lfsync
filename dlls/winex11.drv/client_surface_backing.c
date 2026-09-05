@@ -96,6 +96,7 @@ struct client_surface_compositor_target
     unsigned int mailbox_frame;
     UINT64 mailbox_publish_generation;
     UINT64 mailbox_publish_epoch;
+    UINT64 scene_epoch;
     BOOL mailbox_pending;
     XID present_event;
     unsigned int width;
@@ -157,6 +158,7 @@ struct client_surface_compositor_job
     UINT64 cookie;
     UINT64 identity;
     UINT64 mark;
+    UINT64 scene_epoch;
     process_id_t process;
     HWND handoff_window;
     HWND handoff_toplevel;
@@ -749,9 +751,40 @@ failed:
     return FALSE;
 }
 
-static BOOL sweep_client_surface_compositor_handoffs( HWND toplevel, UINT64 mark )
+static void update_client_surface_compositor_scene(
+    struct client_surface_compositor_target *target, UINT64 scene_epoch )
+{
+#ifdef SONAME_LIBXPRESENT
+    unsigned int i;
+
+    if (target->scene_epoch == scene_epoch) return;
+    for (i = 0; i < ARRAY_SIZE(target->frames); ++i)
+    {
+        struct client_surface_compositor_frame *frame = &target->frames[i];
+
+        if (!frame->publish_pending || frame->publish_epoch == scene_epoch) continue;
+        publish_client_surface_handoff_generation( target->toplevel,
+            frame->publish_generation, frame->publish_epoch, FALSE );
+        frame->publish_pending = FALSE;
+    }
+    if (target->mailbox_pending && target->mailbox_publish_generation &&
+        target->mailbox_publish_epoch != scene_epoch)
+    {
+        publish_client_surface_handoff_generation( target->toplevel,
+            target->mailbox_publish_generation, target->mailbox_publish_epoch, FALSE );
+        target->mailbox_pending = FALSE;
+        target->mailbox_publish_generation = 0;
+        target->mailbox_publish_epoch = 0;
+    }
+#endif
+    target->scene_epoch = scene_epoch;
+}
+
+static BOOL sweep_client_surface_compositor_handoffs( HWND toplevel, UINT64 mark,
+                                                       UINT64 scene_epoch )
 {
     struct client_surface_compositor_binding **cursor = &client_surface_compositor_bindings;
+    struct client_surface_compositor_target *target;
 
     while (*cursor)
     {
@@ -762,6 +795,8 @@ static BOOL sweep_client_surface_compositor_handoffs( HWND toplevel, UINT64 mark
         else
             cursor = &binding->next;
     }
+    if ((target = find_client_surface_compositor_target( toplevel )))
+        update_client_surface_compositor_scene( target, scene_epoch );
     return TRUE;
 }
 
@@ -892,7 +927,7 @@ static BOOL remove_client_surface_compositor_target( HWND toplevel )
 {
     struct client_surface_compositor_target **cursor;
 
-    sweep_client_surface_compositor_handoffs( toplevel, 0 );
+    sweep_client_surface_compositor_handoffs( toplevel, 0, 0 );
     for (cursor = &client_surface_compositor_targets; *cursor; cursor = &(*cursor)->next)
     {
         struct client_surface_compositor_target *target = *cursor;
@@ -1040,7 +1075,7 @@ static BOOL compose_client_surface_handoff(
     UINT64 expected = control, final;
     enum client_surface_handoff_state state;
     Pixmap source = 0;
-    BOOL accepted = FALSE, composed = FALSE, copied = FALSE, publish = FALSE;
+    BOOL accepted = FALSE, composed = FALSE, copied = FALSE, dropped = FALSE, publish = FALSE;
     BOOL deferred_present = FALSE, queued_present = FALSE;
 
     if (!__atomic_compare_exchange_n( &slot->control, &expected,
@@ -1059,6 +1094,12 @@ static BOOL compose_client_surface_handoff(
     TRACE( "reading handoff hwnd %p identity %s generation %s\n", binding->window,
            wine_dbgstr_longlong( binding->identity ),
            wine_dbgstr_longlong( client_surface_handoff_generation( control ) ) );
+    target = find_client_surface_compositor_target( binding->toplevel );
+    if (!target || target->scene_epoch != slot->scene_epoch)
+    {
+        dropped = TRUE;
+        goto release;
+    }
     if (slot->cookie == binding->cookie && slot->identity == binding->identity &&
         slot->producer_process == binding->process &&
         slot->window == wine_server_user_handle( binding->window ) &&
@@ -1067,7 +1108,6 @@ static BOOL compose_client_surface_handoff(
                         CLIENT_SURFACE_HANDOFF_FULL_DAMAGE)) ==
                        (CLIENT_SURFACE_HANDOFF_NATIVE_X11 |
                         CLIENT_SURFACE_HANDOFF_FULL_DAMAGE) &&
-        (target = find_client_surface_compositor_target( binding->toplevel )) &&
         target->frames[0].pixmap && target->frames[1].pixmap && target->window &&
         slot->destination.left == 0 && slot->destination.top == 0 &&
         slot->destination.right >= slot->destination.left &&
@@ -1174,6 +1214,7 @@ static BOOL compose_client_surface_handoff(
             }
         }
     }
+release:
     if (source)
     {
         XFreePixmap( client_surface_compositor_display, source );
@@ -1181,9 +1222,9 @@ static BOOL compose_client_surface_handoff(
     }
 
     /* Once the compositor connection has copied the source into its backing,
-     * source storage is reusable even if a racing scene invalidates the
-     * owner-side commit or visible publication. */
-    state = copied ? CLIENT_SURFACE_HANDOFF_RELEASED : CLIENT_SURFACE_HANDOFF_LOST;
+     * or rejected it against a newer owner epoch before import, source storage
+     * is reusable. A native import/copy failure instead retires the binding. */
+    state = copied || dropped ? CLIENT_SURFACE_HANDOFF_RELEASED : CLIENT_SURFACE_HANDOFF_LOST;
     expected = client_surface_handoff_control( client_surface_handoff_generation( control ),
                                                CLIENT_SURFACE_HANDOFF_READING );
     final = client_surface_handoff_control( client_surface_handoff_generation( control ), state );
@@ -1315,7 +1356,8 @@ static BOOL execute_client_surface_compositor_job( struct client_surface_composi
     if (job->op == CLIENT_SURFACE_COMPOSITOR_REGISTER_HANDOFF)
         return register_client_surface_compositor_handoff( job );
     if (job->op == CLIENT_SURFACE_COMPOSITOR_SWEEP_HANDOFFS)
-        return sweep_client_surface_compositor_handoffs( job->handoff_toplevel, job->mark );
+        return sweep_client_surface_compositor_handoffs( job->handoff_toplevel, job->mark,
+                                                          job->scene_epoch );
     if (job->op == CLIENT_SURFACE_COMPOSITOR_UPDATE_TARGET)
         return update_client_surface_compositor_target( job );
     if (job->op == CLIENT_SURFACE_COMPOSITOR_REMOVE_TARGET)
@@ -1634,6 +1676,7 @@ static BOOL refresh_client_surface_handoffs( HWND toplevel )
             .op = CLIENT_SURFACE_COMPOSITOR_SWEEP_HANDOFFS,
             .handoff_toplevel = toplevel,
             .mark = mark,
+            .scene_epoch = scene_generation,
         };
 
         if (!submit_client_surface_compositor_job( &job )) goto failed;

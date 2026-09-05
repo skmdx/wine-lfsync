@@ -1593,6 +1593,9 @@ static void invalidate_client_surface_scene( struct window *top )
     assert( !(top->client_surface_scene_generation & 1) );
     top->client_surface_scene_generation += 2;
     update_client_surface_publication( top );
+    if (top->handle)
+        post_message_coalesced( top->handle, WM_WINE_UPDATEWINDOWSTATE,
+                                WINE_UPDATE_CLIENT_SURFACE_HANDOFFS, 0 );
 }
 
 static struct client_surface_owner *get_client_surface_owner( struct window *win,
