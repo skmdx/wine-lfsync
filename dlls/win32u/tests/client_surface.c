@@ -1006,6 +1006,144 @@ done:
     if (other) DestroyWindow( other );
 }
 
+#define HANDOFF_EXIT_ID 0x79500000
+
+static void handoff_storage_exit_child( HWND hwnd, HANDLE ready, HANDLE release,
+                                        BOOL completed )
+{
+    struct handoff_binding binding;
+    struct client_surface_handoff_shared *shared;
+    struct client_surface_handoff_slot *slot;
+    UINT64 expected, generation, control;
+    unsigned int status, index;
+    void *view = NULL;
+
+    status = set_surface_state( hwnd, HANDOFF_EXIT_ID,
+                                CLIENT_SURFACE_STATE_REGISTER |
+                                CLIENT_SURFACE_STATE_SCENE_PUBLICATION, 0, NULL );
+    ok( !status, "exit child handoff registration status %#x\n", status );
+    status = claim_surface_state( hwnd, HANDOFF_EXIT_ID, NULL );
+    ok( !status, "exit child handoff claim status %#x\n", status );
+    status = get_surface_handoff( hwnd, 0, HANDOFF_EXIT_ID, FALSE, &binding );
+    ok( !status, "exit child producer bind status %#x\n", status );
+    if (status) goto done;
+    view = MapViewOfFile( binding.mapping, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, binding.size );
+    CloseHandle( binding.mapping );
+    ok( !!view, "exit child producer map error %lu\n", GetLastError() );
+    if (!view) goto done;
+    shared = view;
+    slot = (void *)((char *)view + binding.offset);
+    index = slot - shared->slots;
+    expected = __atomic_load_n( &slot->control, __ATOMIC_ACQUIRE );
+    generation = client_surface_handoff_generation( expected );
+    control = client_surface_handoff_control( generation, CLIENT_SURFACE_HANDOFF_SUBMITTED );
+    ok( client_surface_handoff_state( expected ) == CLIENT_SURFACE_HANDOFF_FREE &&
+        __atomic_compare_exchange_n( &slot->control, &expected, control, FALSE,
+                                     __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE ),
+        "exit child FREE -> SUBMITTED transition failed\n" );
+    if (completed)
+    {
+        expected = control;
+        control = client_surface_handoff_control( generation, CLIENT_SURFACE_HANDOFF_READY );
+        ok( __atomic_compare_exchange_n( &slot->control, &expected, control, FALSE,
+                                         __ATOMIC_RELEASE, __ATOMIC_ACQUIRE ),
+            "exit child SUBMITTED -> READY transition failed\n" );
+        __atomic_fetch_or( &shared->ready_bitmap[index / 64],
+                           (UINT64)1 << (index % 64), __ATOMIC_RELEASE );
+    }
+done:
+    SetEvent( ready );
+    ok( WaitForSingleObject( release, 10000 ) == WAIT_OBJECT_0,
+        "exit child release timed out\n" );
+    /* Deliberately omit endpoint release, unmap and unregister. */
+}
+
+static void test_handoff_storage_process_exit( char **argv, BOOL completed )
+{
+    SECURITY_ATTRIBUTES attr = {sizeof(attr), NULL, TRUE};
+    STARTUPINFOA startup = {.cb = sizeof(startup)};
+    PROCESS_INFORMATION process = {0};
+    struct handoff_binding owner = {0};
+    struct client_surface_handoff_shared *shared;
+    struct client_surface_handoff_slot *slot = NULL;
+    struct surface_state state;
+    HWND hwnd = create_test_window( FALSE );
+    HANDLE ready = NULL, release = NULL;
+    UINT64 control;
+    unsigned int status, index = 0;
+    char command[MAX_PATH * 2];
+    void *view = NULL;
+
+    ok( !!hwnd, "failed to create handoff process-exit window\n" );
+    if (!hwnd) return;
+    ready = CreateEventA( &attr, TRUE, FALSE, NULL );
+    release = CreateEventA( &attr, TRUE, FALSE, NULL );
+    ok( ready && release, "failed to create handoff process-exit events\n" );
+    if (!ready || !release) goto done;
+    sprintf( command, "\"%s\" %s handoff_storage_exit_child %p %p %p %u",
+             argv[0], argv[1], hwnd, ready, release, completed );
+    if (!CreateProcessA( NULL, command, NULL, NULL, TRUE, 0, NULL, NULL, &startup, &process ))
+    {
+        ok( 0, "handoff exit child CreateProcess error %lu\n", GetLastError() );
+        goto done;
+    }
+    ok( WaitForSingleObject( ready, 10000 ) == WAIT_OBJECT_0,
+        "handoff exit child did not become ready\n" );
+    status = get_surface_handoff( hwnd, process.dwProcessId, HANDOFF_EXIT_ID, TRUE, &owner );
+    ok( !status, "exit child owner bind status %#x\n", status );
+    if (!status)
+    {
+        view = MapViewOfFile( owner.mapping, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, owner.size );
+        CloseHandle( owner.mapping );
+        owner.mapping = NULL;
+        ok( !!view, "exit child owner map error %lu\n", GetLastError() );
+    }
+    if (view)
+    {
+        shared = view;
+        slot = (void *)((char *)view + owner.offset);
+        index = slot - shared->slots;
+        control = __atomic_load_n( &slot->control, __ATOMIC_ACQUIRE );
+        ok( client_surface_handoff_state( control ) ==
+            (completed ? CLIENT_SURFACE_HANDOFF_READY : CLIENT_SURFACE_HANDOFF_SUBMITTED),
+            "exit child pre-exit state %u\n", client_surface_handoff_state( control ) );
+        ok( slot->endpoints == (CLIENT_SURFACE_HANDOFF_ENDPOINT_PRODUCER |
+                                CLIENT_SURFACE_HANDOFF_ENDPOINT_CONSUMER),
+            "exit child endpoints before exit %#x\n", slot->endpoints );
+    }
+    SetEvent( release );
+    wait_child_process( &process );
+    CloseHandle( process.hThread );
+    CloseHandle( process.hProcess );
+    process.hProcess = NULL;
+    if (slot)
+    {
+        control = __atomic_load_n( &slot->control, __ATOMIC_ACQUIRE );
+        ok( client_surface_handoff_state( control ) == CLIENT_SURFACE_HANDOFF_LOST,
+            "producer exit left handoff state %u\n", client_surface_handoff_state( control ) );
+        ok( !slot->endpoints, "producer exit left endpoints %#x\n", slot->endpoints );
+        ok( !(__atomic_load_n( &shared->ready_bitmap[index / 64], __ATOMIC_ACQUIRE ) &
+              ((UINT64)1 << (index % 64))), "producer exit left a ready bit set\n" );
+    }
+    status = set_surface_state( hwnd, 0, 0, 0, &state );
+    ok( !status && !state.active && !state.cached,
+        "producer exit left memberships: status %#x active %u cached %u\n",
+        status, state.active, state.cached );
+done:
+    if (process.hProcess)
+    {
+        SetEvent( release );
+        wait_child_process( &process );
+        CloseHandle( process.hThread );
+        CloseHandle( process.hProcess );
+    }
+    if (owner.mapping) CloseHandle( owner.mapping );
+    if (view) UnmapViewOfFile( view );
+    if (ready) CloseHandle( ready );
+    if (release) CloseHandle( release );
+    DestroyWindow( hwnd );
+}
+
 struct lease_binding
 {
     HANDLE mapping;
@@ -3004,6 +3142,16 @@ static BOOL run_focused_test_case( const char *name, char **argv )
         test_lease_storage_process_exit( argv, FALSE );
         return TRUE;
     }
+    if (!strcmp( name, "handoff-submitted-process-exit" ))
+    {
+        test_handoff_storage_process_exit( argv, FALSE );
+        return TRUE;
+    }
+    if (!strcmp( name, "handoff-ready-process-exit" ))
+    {
+        test_handoff_storage_process_exit( argv, TRUE );
+        return TRUE;
+    }
     if (!strcmp( name, "lease-storage-claimed-process-exit" ))
     {
         test_lease_storage_process_exit( argv, TRUE );
@@ -3041,6 +3189,16 @@ START_TEST(client_surface)
         sscanf( argv[4], "%p", &ready );
         sscanf( argv[5], "%p", &release );
         lease_storage_child( hwnd, ready, release, argc > 6 && atoi( argv[6] ) );
+        return;
+    }
+    if (argc > 6 && !strcmp( argv[2], "handoff_storage_exit_child" ))
+    {
+        HANDLE ready, release;
+
+        sscanf( argv[3], "%p", &hwnd );
+        sscanf( argv[4], "%p", &ready );
+        sscanf( argv[5], "%p", &release );
+        handoff_storage_exit_child( hwnd, ready, release, atoi( argv[6] ) );
         return;
     }
 
@@ -3092,6 +3250,8 @@ START_TEST(client_surface)
     test_lease_storage();
     trace( "testing client surface generation handoff storage\n" );
     test_handoff_storage();
+    test_handoff_storage_process_exit( argv, FALSE );
+    test_handoff_storage_process_exit( argv, TRUE );
     test_lease_storage_process_exit( argv, FALSE );
     test_lease_storage_process_exit( argv, TRUE );
     test_lease_root_barriers();
