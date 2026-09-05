@@ -2191,6 +2191,10 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
         if (surface_locked_count && present_surfaces[i] == present_surfaces[surface_locked_count - 1])
             continue;
         client_surface_lock_present( present_surfaces[i] );
+        /* A completion wait releases its mutex.  Wait before taking any
+         * later surface locks, otherwise another queue can take this mutex
+         * and block on a later one while we wait to reacquire this one. */
+        client_surface_wait_present_locked( present_surfaces[i], use_internal_present_wait );
         present_surfaces[surface_locked_count++] = present_surfaces[i];
     }
     for (uint32_t i = 0; i < present_info->swapchainCount; i++)

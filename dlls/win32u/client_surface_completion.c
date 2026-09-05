@@ -85,7 +85,7 @@ static BOOL wait_for_completion_job_locked( struct client_surface *surface )
     abstime.tv_nsec %= 1000000000;
 
     while (list_empty( &surface->completion_queue ) && !ret)
-        ret = pthread_cond_timedwait( &surface->completion_cond,
+        ret = pthread_cond_timedwait( &surface->completion_queue_cond,
                                      &surface->completion_lock, &abstime );
     return !list_empty( &surface->completion_queue );
 }
@@ -214,7 +214,10 @@ void client_surface_defer_present( struct client_surface *surface,
         client_surface_add_ref( surface );
         start_worker = TRUE;
     }
-    else pthread_cond_signal( &surface->completion_cond );
+    /* Only this surface's worker waits on the queue condition.  Submission
+     * readiness notifications must neither steal its enqueue signal nor
+     * wake it repeatedly before there is a job to consume. */
+    else pthread_cond_signal( &surface->completion_queue_cond );
     pthread_mutex_unlock( &surface->completion_lock );
 
     if (start_worker)

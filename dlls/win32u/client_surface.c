@@ -364,6 +364,7 @@ static void client_surface_release_locked( struct client_surface *surface )
         assert( !surface->target_update_waiters );
         client_surface_backend_destroy( surface );
         pthread_mutex_destroy( &surface->completion_wait_lock );
+        pthread_cond_destroy( &surface->completion_queue_cond );
         pthread_cond_destroy( &surface->completion_cond );
         pthread_mutex_destroy( &surface->completion_lock );
         pthread_mutex_destroy( &surface->present_lock );
@@ -933,8 +934,17 @@ void *client_surface_create( UINT size, const struct client_surface_backend *bac
         free( surface );
         return NULL;
     }
+    if (pthread_cond_init( &surface->completion_queue_cond, NULL ))
+    {
+        pthread_cond_destroy( &surface->completion_cond );
+        pthread_mutex_destroy( &surface->completion_lock );
+        pthread_mutex_destroy( &surface->present_lock );
+        free( surface );
+        return NULL;
+    }
     if (pthread_mutex_init( &surface->completion_wait_lock, NULL ))
     {
+        pthread_cond_destroy( &surface->completion_queue_cond );
         pthread_cond_destroy( &surface->completion_cond );
         pthread_mutex_destroy( &surface->completion_lock );
         pthread_mutex_destroy( &surface->present_lock );
@@ -970,6 +980,19 @@ void client_surface_add_ref( struct client_surface *surface )
 
 void client_surface_release( struct client_surface *surface )
 {
+    LONG ref = ReadAcquire( &surface->ref );
+
+    /* Registry operations can wait for this surface's completion FIFO while
+     * holding surfaces_lock.  A worker must be able to release one job's
+     * reference before consuming the next job, even during that wait.
+     * Only the final release needs to serialize list and index removal. */
+    while (ref > 1)
+    {
+        LONG previous = InterlockedCompareExchange( &surface->ref, ref - 1, ref );
+        if (previous == ref) return;
+        ref = previous;
+    }
+
     pthread_mutex_lock( &surfaces_lock );
     client_surface_release_locked( surface );
     pthread_mutex_unlock( &surfaces_lock );

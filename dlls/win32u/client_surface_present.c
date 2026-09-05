@@ -424,31 +424,42 @@ void client_surface_unlock_present( struct client_surface *surface )
     client_surface_resume_recompose( surface );
 }
 
+void client_surface_wait_present_locked( struct client_surface *surface, BOOL external_completion )
+{
+    /* Exact IDs may overlap each other, but a shared driver monitor has no
+     * per-frame identity.  Drain exact work before arming that monitor, and
+     * do not submit any new frame until an armed monitor has been consumed. */
+    if (!external_completion) surface->driver_completion_waiters++;
+    /* Every wake releases and reacquires completion_lock.  Recheck native
+     * submission and target-writer intent together with completion mode: a
+     * producer which drained the old token may already have begun its next
+     * native call before another producer reacquires this mutex. */
+    while (InterlockedCompareExchange( &surface->target_update_waiters, 0, 0 ) ||
+           surface->native_present_count ||
+           (external_completion ? surface->driver_completion_count || surface->driver_completion_waiters :
+                                  InterlockedCompareExchange( &surface->external_completion_count, 0, 0 )))
+        pthread_cond_wait( &surface->completion_cond, &surface->completion_lock );
+    if (!external_completion && !--surface->driver_completion_waiters)
+        pthread_cond_broadcast( &surface->completion_cond );
+}
+
 void client_surface_prepare_present_locked( struct client_surface *surface,
                                             struct client_surface_frame *present,
                                             BOOL external_completion )
 {
     struct client_surface_target target;
 
-    while (InterlockedCompareExchange( &surface->target_update_waiters, 0, 0 ) ||
-           surface->native_present_count)
-        pthread_cond_wait( &surface->completion_cond, &surface->completion_lock );
-
-    /* Exact IDs may overlap each other, but a shared driver monitor has no
-     * per-frame identity.  Drain exact work before arming that monitor, and
-     * do not submit any new frame until an armed monitor has been consumed. */
-    if (!external_completion)
+    /* The caller has established submission readiness while acquiring this
+     * mutex.  Do not release it here: a multi-surface caller may since have
+     * acquired later mutexes in the global surface order. */
+    assert( !surface->native_present_count );
+    if (external_completion)
     {
-        surface->driver_completion_waiters++;
-        while (InterlockedCompareExchange( &surface->external_completion_count, 0, 0 ))
-            pthread_cond_wait( &surface->completion_cond, &surface->completion_lock );
-        if (!--surface->driver_completion_waiters)
-            pthread_cond_broadcast( &surface->completion_cond );
+        assert( !surface->driver_completion_count );
     }
     else
     {
-        while (surface->driver_completion_count || surface->driver_completion_waiters)
-            pthread_cond_wait( &surface->completion_cond, &surface->completion_lock );
+        assert( !InterlockedCompareExchange( &surface->external_completion_count, 0, 0 ) );
     }
 
     memset( present, 0, sizeof(*present) );
@@ -491,6 +502,7 @@ void client_surface_prepare_present( struct client_surface *surface,
                                      BOOL external_completion )
 {
     client_surface_lock_present( surface );
+    client_surface_wait_present_locked( surface, external_completion );
     client_surface_prepare_present_locked( surface, present, external_completion );
 }
 

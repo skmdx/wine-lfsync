@@ -343,7 +343,8 @@ struct client_surface
     HWND                               indexed_toplevel;
     pthread_mutex_t                    present_lock;   /* serializes driver operations for this surface */
     pthread_mutex_t                    completion_lock; /* protects host completion state and deferred FIFO */
-    pthread_cond_t                     completion_cond; /* completion-mode and FIFO handoff */
+    pthread_cond_t                     completion_cond; /* completion-mode and target handoff */
+    pthread_cond_t                     completion_queue_cond; /* wakes only the surface's FIFO worker */
     pthread_mutex_t                    completion_wait_lock; /* serializes backend waits, including inline fallback */
     struct list                        completion_queue;
     BOOL                               completion_worker_active;
