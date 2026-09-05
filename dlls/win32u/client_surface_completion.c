@@ -35,6 +35,22 @@ struct client_surface_completion_job
 #define CLIENT_SURFACE_COMPLETION_WORKER_IDLE_TIMEOUT_MS 100
 static LONG client_surface_deferred_present_count;
 
+static BOOL client_surface_reserve_completion_slot(void)
+{
+    LONG count = ReadAcquire( &client_surface_deferred_present_count );
+
+    while (count < CLIENT_SURFACE_MAX_PROCESS_DEFERRED_PRESENTS)
+    {
+        LONG previous = InterlockedCompareExchange( &client_surface_deferred_present_count, count + 1, count );
+        if (previous == count) return TRUE;
+        count = previous;
+    }
+    /* A rejected reservation must not temporarily consume a slot: its
+     * rollback could otherwise make another caller wait inline even after
+     * a real completion has freed capacity. */
+    return FALSE;
+}
+
 BOOL client_surface_wait_present_completion( struct client_surface *surface,
                                              const struct client_surface_frame *present,
                                              DWORD timeout )
@@ -173,10 +189,8 @@ void client_surface_defer_present( struct client_surface *surface,
         completion.release( completion.context );
         return;
     }
-    if (InterlockedIncrement( &client_surface_deferred_present_count ) >
-        CLIENT_SURFACE_MAX_PROCESS_DEFERRED_PRESENTS)
+    if (!client_surface_reserve_completion_slot())
     {
-        InterlockedDecrement( &client_surface_deferred_present_count );
         free( job );
         elapsed = NtGetTickCount() - present->submission_time;
         remaining = elapsed < CLIENT_SURFACE_PRESENT_TIMEOUT ?
