@@ -46,6 +46,7 @@
 #include "x11drv.h"
 #include "winreg.h"
 #include "xcomposite.h"
+#include "xpresent.h"
 #include "wine/server.h"
 #include "wine/debug.h"
 #include "wine/list.h"
@@ -67,6 +68,7 @@ Window root_window;
 BOOL usexvidmode = TRUE;
 BOOL usexrandr = TRUE;
 BOOL usexcomposite = TRUE;
+BOOL usexpresent = FALSE;
 BOOL use_egl = TRUE;
 BOOL use_take_focus = TRUE;
 BOOL use_primary_selection = FALSE;
@@ -566,6 +568,56 @@ sym_not_found:
 }
 #endif /* defined(SONAME_LIBXCOMPOSITE) */
 
+#ifdef SONAME_LIBXPRESENT
+
+#define MAKE_FUNCPTR(f) typeof(f) * p##f;
+MAKE_FUNCPTR(XPresentQueryExtension)
+MAKE_FUNCPTR(XPresentQueryVersion)
+MAKE_FUNCPTR(XPresentPixmap)
+MAKE_FUNCPTR(XPresentSelectInput)
+MAKE_FUNCPTR(XPresentFreeInput)
+MAKE_FUNCPTR(XPresentQueryCapabilities)
+#undef MAKE_FUNCPTR
+
+static void X11DRV_XPresent_Init(void)
+{
+    void *handle = dlopen( SONAME_LIBXPRESENT, RTLD_NOW );
+    int major_opcode, event_base, error_base;
+    int major, minor;
+
+    if (!handle)
+    {
+        TRACE( "Unable to open %s, X Present disabled\n", SONAME_LIBXPRESENT );
+        return;
+    }
+
+#define LOAD_FUNCPTR(f) if (!(p##f = dlsym( handle, #f ))) goto failed
+    LOAD_FUNCPTR(XPresentQueryExtension);
+    LOAD_FUNCPTR(XPresentQueryVersion);
+    LOAD_FUNCPTR(XPresentPixmap);
+    LOAD_FUNCPTR(XPresentSelectInput);
+    LOAD_FUNCPTR(XPresentFreeInput);
+    LOAD_FUNCPTR(XPresentQueryCapabilities);
+#undef LOAD_FUNCPTR
+
+    if (!pXPresentQueryExtension( gdi_display, &major_opcode, &event_base, &error_base ) ||
+        !pXPresentQueryVersion( gdi_display, &major, &minor ))
+    {
+        TRACE( "X Present extension could not be queried; disabled\n" );
+        goto failed;
+    }
+    usexpresent = TRUE;
+    TRACE( "X Present %d.%d is up and running opcode %d error_base %d\n",
+           major, minor, major_opcode, error_base );
+    return;
+
+failed:
+    TRACE( "Unable to initialize %s, X Present disabled\n", SONAME_LIBXPRESENT );
+    dlclose( handle );
+}
+
+#endif
+
 static void init_visuals( Display *display, int screen )
 {
     int count;
@@ -689,6 +741,9 @@ NTSTATUS __wine_unix_lib_init(void)
     X11DRV_XRandR_Init();
 #ifdef SONAME_LIBXCOMPOSITE
     X11DRV_XComposite_Init();
+#endif
+#ifdef SONAME_LIBXPRESENT
+    X11DRV_XPresent_Init();
 #endif
     x11drv_xinput2_load();
 

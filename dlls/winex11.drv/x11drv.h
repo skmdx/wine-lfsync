@@ -472,6 +472,7 @@ extern BOOL use_primary_selection;
 extern BOOL use_system_cursors;
 extern BOOL grab_fullscreen;
 extern BOOL usexcomposite;
+extern BOOL usexpresent;
 extern BOOL managed_mode;
 extern BOOL private_color_map;
 extern int primary_monitor;
@@ -704,6 +705,7 @@ struct x11drv_win_data
     unsigned long wm_normal_hints_serial;/* serial of last pending WM_NORMAL_HINTS request */
     unsigned long client_surface_opacity; /* desired _NET_WM_WINDOW_OPACITY value */
     Pixmap         client_surface_backing;
+    Pixmap         client_surface_backing_spare;
     GC             client_surface_gc;
     unsigned int   client_surface_backing_width;
     unsigned int   client_surface_backing_height;

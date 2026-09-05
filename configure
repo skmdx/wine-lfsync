@@ -982,6 +982,7 @@ with_xfixes
 with_xinerama
 with_xinput
 with_xinput2
+with_xpresent
 with_xrandr
 with_xrender
 with_xshape
@@ -2655,6 +2656,7 @@ Optional Packages:
   --without-xinerama      do not use Xinerama (legacy multi-monitor support)
   --without-xinput        do not use the Xinput extension
   --without-xinput2       do not use the Xinput 2 extension
+  --without-xpresent      do not use the X Present extension
   --without-xrandr        do not use Xrandr (multi-monitor support)
   --without-xrender       do not use the Xrender extension
   --without-xshape        do not use the Xshape extension
@@ -4612,6 +4614,13 @@ fi
 if test ${with_xinput2+y}
 then :
   withval=$with_xinput2; if test "x$withval" = "xno"; then ac_cv_header_X11_extensions_XInput2_h=no; fi
+fi
+
+
+# Check whether --with-xpresent was given.
+if test ${with_xpresent+y}
+then :
+  withval=$with_xpresent; if test "x$withval" = "xno"; then ac_cv_header_X11_extensions_Xpresent_h=no; fi
 fi
 
 
@@ -16713,6 +16722,86 @@ esac
 
 fi
 
+                ac_fn_c_check_header_compile "$LINENO" "X11/extensions/Xpresent.h" "ac_cv_header_X11_extensions_Xpresent_h" "$xlib_includes
+"
+if test "x$ac_cv_header_X11_extensions_Xpresent_h" = xyes
+then :
+  { printf '%s\n' "$as_me:${as_lineno-$LINENO}: checking for -lXpresent" >&5
+printf %s "checking for -lXpresent... " >&6; }
+if test ${ac_cv_lib_soname_Xpresent+y}
+then :
+  printf %s "(cached) " >&6
+else case e in #(
+  e) ac_check_soname_save_LIBS=$LIBS
+LIBS="-lXpresent $X_LIBS $LIBS"
+  cat confdefs.h - <<_ACEOF >conftest.$ac_ext
+/* end confdefs.h.  */
+
+/* Override any GCC internal prototype to avoid an error.
+   Use char because int might match the return type of a GCC
+   builtin and then its argument prototype would still apply.
+   The 'extern "C"' is for builds by C++ compilers;
+   although this is not generally supported in C code supporting it here
+   has little cost and some practical benefit (sr 110532).  */
+#ifdef __cplusplus
+extern "C"
+#endif
+char XPresentQueryExtension (void);
+int
+main (void)
+{
+return XPresentQueryExtension ();
+  ;
+  return 0;
+}
+_ACEOF
+if ac_fn_c_try_link "$LINENO"
+then :
+  case "$LIBEXT" in
+    dll) ac_cv_lib_soname_Xpresent=`$ac_cv_path_LDD conftest.exe | grep "Xpresent" | sed -e "s/dll.*/dll/"';2,$d'` ;;
+    dylib) ac_cv_lib_soname_Xpresent=`$OTOOL -L conftest$ac_exeext | grep "libXpresent\\.[0-9A-Za-z.]*dylib" | sed -e "s/^.*\/\(libXpresent\.[0-9A-Za-z.]*dylib\).*$/\1/"';2,$d'` ;;
+    *) ac_cv_lib_soname_Xpresent=`$READELF -d conftest$ac_exeext | grep "NEEDED.*libXpresent\\.$LIBEXT" | sed -e "s/^.*\\[\\(libXpresent\\.$LIBEXT[^	 ]*\\)\\].*$/\1/"';2,$d'`
+       if ${ac_cv_lib_soname_Xpresent:+false} :
+then :
+  ac_cv_lib_soname_Xpresent=`$LDD conftest$ac_exeext | grep "libXpresent\\.$LIBEXT" | sed -e "s/^.*\(libXpresent\.$LIBEXT[^	 ]*\).*$/\1/"';2,$d'`
+fi ;;
+  esac
+else case e in #(
+  e) ac_cv_lib_soname_Xpresent= ;;
+esac
+fi
+rm -f core conftest.err conftest.$ac_objext conftest.beam \
+    conftest$ac_exeext conftest.$ac_ext
+  LIBS=$ac_check_soname_save_LIBS ;;
+esac
+fi
+if ${ac_cv_lib_soname_Xpresent:+false} :
+then :
+  { printf '%s\n' "$as_me:${as_lineno-$LINENO}: result: not found" >&5
+printf '%s\n' "not found" >&6; }
+
+else case e in #(
+  e) { printf '%s\n' "$as_me:${as_lineno-$LINENO}: result: $ac_cv_lib_soname_Xpresent" >&5
+printf '%s\n' "$ac_cv_lib_soname_Xpresent" >&6; }
+
+printf '%s\n' "#define SONAME_LIBXPRESENT \"$ac_cv_lib_soname_Xpresent\"" >>confdefs.h
+
+        ;;
+esac
+fi
+fi
+
+        if test "x$ac_cv_lib_soname_Xpresent" = "x"
+then :
+  case "x$with_xpresent" in
+  x)   as_fn_append wine_notices "|libXpresent ${notice_platform}development files not found, X Present won't be supported." ;;
+  xno) ;;
+  *)   as_fn_error $? "libXpresent ${notice_platform}development files not found, X Present won't be supported.
+This is an error since --with-xpresent was requested." "$LINENO" 5 ;;
+esac
+
+fi
+
                 ac_fn_c_check_member "$LINENO" "XICCallback" "callback" "ac_cv_member_XICCallback_callback" "$xlib_includes
 "
 if test "x$ac_cv_member_XICCallback_callback" = xyes
@@ -25205,4 +25294,3 @@ IFS="$ac_save_IFS"
 printf '%s\n' "
 $as_me: Finished.  Do '${MAKE-make}' to compile Wine.
 " >&6
-
