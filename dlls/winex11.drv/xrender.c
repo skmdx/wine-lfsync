@@ -485,7 +485,8 @@ BOOL X11DRV_XRender_CopyClientSurface( Display *display, Drawable source,
                                        unsigned int source_height,
                                        const RECT *destination_rect,
                                        const XRectangle *clips,
-                                       unsigned int clip_count )
+                                       unsigned int clip_count,
+                                       XID clip_region )
 {
     unsigned int destination_width, destination_height;
     BOOL scaling;
@@ -498,7 +499,8 @@ BOOL X11DRV_XRender_CopyClientSurface( Display *display, Drawable source,
     BOOL ret = FALSE;
 
     if (!destination_rect || !source_visual_id || !destination_visual_id ||
-        (clip_count && !clips) || destination_rect->right <= destination_rect->left ||
+        (clip_count && !clips) || (clip_count && clip_region) ||
+        destination_rect->right <= destination_rect->left ||
         destination_rect->bottom <= destination_rect->top)
         return FALSE;
     destination_width = destination_rect->right - destination_rect->left;
@@ -520,7 +522,14 @@ BOOL X11DRV_XRender_CopyClientSurface( Display *display, Drawable source,
         !(destination_picture = pXRenderCreatePicture( display, destination,
                                                        destination_format, 0, NULL )))
         goto done;
-    if (clip_count)
+    if (clip_region)
+    {
+        if (!X11DRV_XFixes_SetClientSurfacePictureClip(
+                display, destination_picture, destination_rect->left,
+                destination_rect->top, clip_region ))
+            goto done;
+    }
+    else if (clip_count)
         pXRenderSetPictureClipRectangles( display, destination_picture,
                                           destination_rect->left, destination_rect->top,
                                           clips, clip_count );
@@ -2360,7 +2369,8 @@ BOOL X11DRV_XRender_CopyClientSurface( Display *display, Drawable source,
                                        unsigned int source_height,
                                        const RECT *destination_rect,
                                        const XRectangle *clips,
-                                       unsigned int clip_count )
+                                       unsigned int clip_count,
+                                       XID clip_region )
 {
     return FALSE;
 }

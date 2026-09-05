@@ -298,7 +298,17 @@ extern BOOL X11DRV_XRender_CopyClientSurface( Display *display, Drawable source,
                                               unsigned int source_height,
                                               const RECT *destination_rect,
                                               const XRectangle *clips,
-                                              unsigned int clip_count );
+                                              unsigned int clip_count,
+                                              XID clip_region );
+extern BOOL X11DRV_XFixes_ClientSurfaceAvailable(void);
+extern BOOL X11DRV_XFixes_UpdateClientSurfaceRegion( Display *display, XID *region,
+                                                     const XRectangle *rects,
+                                                     unsigned int count );
+extern void X11DRV_XFixes_DestroyClientSurfaceRegion( Display *display, XID region );
+extern BOOL X11DRV_XFixes_SetClientSurfaceGCClip( Display *display, GC gc,
+                                                  int x, int y, XID region );
+extern BOOL X11DRV_XFixes_SetClientSurfacePictureClip( Display *display, XID picture,
+                                                       int x, int y, XID region );
 
 extern BOOL visual_from_pixel_format( int format, XVisualInfo *visual );
 

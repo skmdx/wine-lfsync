@@ -1166,6 +1166,8 @@ static BOOL copy_client_surface_handoff_to_frame(
     XRectangle clips[CLIENT_SURFACE_HANDOFF_MAX_CLIP_RECTS];
     RECT catchup = {0};
     BOOL clipped = !!(slot->flags & CLIENT_SURFACE_HANDOFF_CLIPPED);
+    BOOL xfixes_clip = !!(slot->flags & CLIENT_SURFACE_HANDOFF_XFIXES_CLIP);
+    BOOL copy_visible = !clipped || xfixes_clip || slot->clip_count;
     BOOL incoming_full, needs_catchup, native, overlay_copied = TRUE;
     unsigned int destination_width = slot->destination.right - slot->destination.left;
     unsigned int destination_height = slot->destination.bottom - slot->destination.top;
@@ -1183,7 +1185,7 @@ static BOOL copy_client_surface_handoff_to_frame(
     native = source_depth == target->depth && slot->source_visual == target->visual &&
              slot->width == destination_width && slot->height == destination_height;
 
-    if (clipped)
+    if (clipped && !xfixes_clip)
         for (i = 0; i < slot->clip_count; ++i)
         {
             clips[i].x = slot->clips[i].x;
@@ -1201,22 +1203,29 @@ static BOOL copy_client_surface_handoff_to_frame(
                        catchup.left, catchup.top,
                        catchup.right - catchup.left, catchup.bottom - catchup.top,
                        catchup.left, catchup.top );
-        if ((!clipped || slot->clip_count) && native)
+        if (copy_visible && native)
         {
-            if (clipped)
+            if (xfixes_clip)
+                overlay_copied = X11DRV_XFixes_SetClientSurfaceGCClip(
+                    display, gc, slot->destination.left,
+                    slot->destination.top, slot->clip_region );
+            else if (clipped)
                 XSetClipRectangles( display, gc, slot->destination.left,
                                     slot->destination.top, clips, slot->clip_count, YXBanded );
-            XCopyArea( display, source, frame->pixmap, gc,
-                       slot->damage.left, slot->damage.top,
-                       slot->damage.right - slot->damage.left,
-                       slot->damage.bottom - slot->damage.top,
-                       slot->destination.left, slot->destination.top );
+            if (overlay_copied)
+                XCopyArea( display, source, frame->pixmap, gc,
+                           slot->damage.left, slot->damage.top,
+                           slot->damage.right - slot->damage.left,
+                           slot->damage.bottom - slot->damage.top,
+                           slot->destination.left, slot->destination.top );
         }
-        else if (!clipped || slot->clip_count)
+        else if (copy_visible)
             overlay_copied = X11DRV_XRender_CopyClientSurface(
                 display, source, slot->source_visual, frame->pixmap, target->visual,
                 slot->width, slot->height, &slot->destination,
-                clipped ? clips : NULL, clipped ? slot->clip_count : 0 );
+                clipped && !xfixes_clip ? clips : NULL,
+                clipped && !xfixes_clip ? slot->clip_count : 0,
+                xfixes_clip ? slot->clip_region : 0 );
         XFreeGC( display, gc );
     }
     XSync( display, False );
@@ -1301,6 +1310,7 @@ static BOOL compose_client_surface_handoff(
     Pixmap source = 0;
     RECT damage;
     unsigned int destination_width, destination_height, i, source_depth = 0;
+    BOOL xfixes_clip;
     BOOL accepted = FALSE, composed = FALSE, copied = FALSE, dropped = FALSE, publish = FALSE;
     BOOL deferred_present = FALSE, queued_present = FALSE;
 
@@ -1330,6 +1340,7 @@ static BOOL compose_client_surface_handoff(
                         slot->destination.right - slot->destination.left : 0;
     destination_height = slot->destination.bottom > slot->destination.top ?
                          slot->destination.bottom - slot->destination.top : 0;
+    xfixes_clip = !!(slot->flags & CLIENT_SURFACE_HANDOFF_XFIXES_CLIP);
     if (slot->cookie == binding->cookie && slot->identity == binding->identity &&
         slot->producer_process == binding->process &&
         slot->window == wine_server_user_handle( binding->window ) &&
@@ -1349,10 +1360,14 @@ static BOOL compose_client_surface_handoff(
         (unsigned int)slot->damage.right == slot->width &&
         (unsigned int)slot->damage.bottom == slot->height &&
         slot->clip_count <= CLIENT_SURFACE_HANDOFF_MAX_CLIP_RECTS &&
-        (!!(slot->flags & CLIENT_SURFACE_HANDOFF_CLIPPED) || !slot->clip_count))
+        (!!(slot->flags & CLIENT_SURFACE_HANDOFF_CLIPPED) || !slot->clip_count) &&
+        ((!xfixes_clip && !slot->clip_region) ||
+         (xfixes_clip && (slot->flags & CLIENT_SURFACE_HANDOFF_CLIPPED) &&
+          !slot->clip_count && slot->clip_region &&
+          X11DRV_XFixes_ClientSurfaceAvailable())))
     {
         damage = slot->destination;
-        if (slot->flags & CLIENT_SURFACE_HANDOFF_CLIPPED)
+        if ((slot->flags & CLIENT_SURFACE_HANDOFF_CLIPPED) && !xfixes_clip)
         {
             SetRectEmpty( &damage );
             for (i = 0; i < slot->clip_count; ++i)

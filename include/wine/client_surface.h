@@ -40,12 +40,13 @@ enum client_surface_handoff_state
 /* futex_waitv accepts 128 waiters.  Reserve one for local compositor jobs. */
 #define CLIENT_SURFACE_HANDOFF_MAX_POOLS_PER_CONSUMER 127
 #define CLIENT_SURFACE_HANDOFF_MAGIC ((UINT64)0x57435348414e444full)
-#define CLIENT_SURFACE_HANDOFF_VERSION 2
+#define CLIENT_SURFACE_HANDOFF_VERSION 3
 #define CLIENT_SURFACE_HANDOFF_MAX_CLIP_RECTS 16
 
 #define CLIENT_SURFACE_HANDOFF_NATIVE_X11 0x0001
 #define CLIENT_SURFACE_HANDOFF_FULL_DAMAGE 0x0002
 #define CLIENT_SURFACE_HANDOFF_CLIPPED 0x0004
+#define CLIENT_SURFACE_HANDOFF_XFIXES_CLIP 0x0008
 #define CLIENT_SURFACE_HANDOFF_ENDPOINT_PRODUCER 0x0001
 #define CLIENT_SURFACE_HANDOFF_ENDPOINT_CONSUMER 0x0002
 
@@ -104,10 +105,12 @@ struct DECLSPEC_ALIGN(64) client_surface_handoff_slot
     RECT damage;
     LONG endpoints;
     UINT clip_count;
+    UINT64 clip_region;
     struct client_surface_handoff_clip_rect clips[CLIENT_SURFACE_HANDOFF_MAX_CLIP_RECTS];
+    UINT64 reserved[7];
 };
 
-C_ASSERT( sizeof(struct client_surface_handoff_slot) == 256 );
+C_ASSERT( sizeof(struct client_surface_handoff_slot) == 320 );
 
 /* One mapping is shared by one producer/owner process pair. There is a single
  * owner-side consumer, so the lfsync-style parked claim cannot strand another

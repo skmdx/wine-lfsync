@@ -108,6 +108,7 @@ static void x11drv_client_surface_destroy( struct client_surface *client )
     TRACE( "%s\n", debugstr_client_surface( client ) );
 
     x11drv_client_surface_completion_destroy( surface );
+    X11DRV_XFixes_DestroyClientSurfaceRegion( gdi_display, surface->handoff_clip_region );
     if (surface->composition_gc) XFreeGC( gdi_display, surface->composition_gc );
     if (surface->colormap != default_colormap) XFreeColormap( gdi_display, surface->colormap );
     if (surface->window) destroy_client_window( hwnd, surface->window );
@@ -494,7 +495,7 @@ static BOOL x11drv_client_surface_prepare_handoff_clip(
     RGNDATA *clip = NULL;
     HRGN region = 0;
     HDC hdc = 0;
-    BOOL supported = FALSE, required = FALSE;
+    BOOL supported = FALSE, required = FALSE, xfixes = FALSE;
     unsigned int count = 0, i;
 
     if (surface->handoff_clip_valid &&
@@ -549,7 +550,18 @@ static BOOL x11drv_client_surface_prepare_handoff_clip(
             goto done;
         }
     }
-    if (count > CLIENT_SURFACE_HANDOFF_MAX_CLIP_RECTS) goto done;
+    if (count > CLIENT_SURFACE_HANDOFF_MAX_CLIP_RECTS)
+    {
+        if (!X11DRV_XFixes_UpdateClientSurfaceRegion(
+                gdi_display, &surface->handoff_clip_region,
+                (const XRectangle *)clip->Buffer, count ))
+            goto done;
+        count = 0;
+        xfixes = TRUE;
+        required = TRUE;
+        supported = TRUE;
+        goto done;
+    }
     for (i = 0; i < count; ++i)
     {
         const XRectangle *rect = (const XRectangle *)clip->Buffer + i;
@@ -573,20 +585,28 @@ done:
     surface->handoff_clip_count = count;
     surface->handoff_clip_supported = supported;
     surface->handoff_clip_required = required;
+    surface->handoff_clip_xfixes = xfixes;
     surface->handoff_clip_valid = TRUE;
     TRACE( "handoff clip hwnd %p source %ux%u visual %#lx destination %s region %p "
-           "supported %u required %u count %u\n", client->hwnd, slot->width, slot->height,
+           "supported %u required %u xfixes %u count %u\n", client->hwnd, slot->width, slot->height,
            slot->source_visual, wine_dbgstr_rect( &client->target.monitor_rect ),
-           surface_region, supported, required, count );
+           surface_region, supported, required, xfixes, count );
 
 publish:
     if (!surface->handoff_clip_supported) return FALSE;
     slot->clip_count = surface->handoff_clip_count;
+    slot->clip_region = 0;
     if (surface->handoff_clip_required)
     {
         slot->flags |= CLIENT_SURFACE_HANDOFF_CLIPPED;
-        memcpy( slot->clips, surface->handoff_clip_rects,
-                surface->handoff_clip_count * sizeof(*slot->clips) );
+        if (surface->handoff_clip_xfixes)
+        {
+            slot->flags |= CLIENT_SURFACE_HANDOFF_XFIXES_CLIP;
+            slot->clip_region = surface->handoff_clip_region;
+        }
+        else
+            memcpy( slot->clips, surface->handoff_clip_rects,
+                    surface->handoff_clip_count * sizeof(*slot->clips) );
     }
     return TRUE;
 }
