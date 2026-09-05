@@ -358,7 +358,16 @@ BOOL client_surface_end_present_internal( struct client_surface *surface,
              * subsequent dirty-region refreshes.  A leased composition must
              * not acquire a native owner lock held by a teardown waiting for
              * that very lease. */
-            hdc = NtUserGetDCEx( hwnd, 0, DCX_CACHE | DCX_USESTYLE | WINE_DCX_CLIENT_SURFACE );
+            DWORD flags = DCX_CACHE | DCX_USESTYLE | WINE_DCX_CLIENT_SURFACE;
+
+            /* A region-only backend leaves the borrowed DC unchanged. Avoid
+             * resetting all GDI state (fonts, pens, mapping, driver objects)
+             * on each frame just to query SYSRGN. Other backends retain the
+             * normal reset contract. The private composition cache key still
+             * separates this DCE from application drawing DCs. */
+            if (client_surface_backend_has_cap( surface, CLIENT_SURFACE_BACKEND_READ_ONLY_DC ))
+                flags |= DCX_NORESETATTRS;
+            hdc = NtUserGetDCEx( hwnd, 0, flags );
             if (!hdc)
             {
                 WARN( "failed to acquire composition DC for %s\n", debugstr_client_surface( surface ) );

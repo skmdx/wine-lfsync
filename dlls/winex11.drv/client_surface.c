@@ -424,7 +424,8 @@ static BOOL X11DRV_client_surface_present( struct client_surface *client,
 static const struct client_surface_backend x11drv_client_surface_backend =
 {
     .caps = CLIENT_SURFACE_BACKEND_SCENE_PUBLICATION |
-            CLIENT_SURFACE_BACKEND_NATIVE_WRITE_LEASE,
+            CLIENT_SURFACE_BACKEND_NATIVE_WRITE_LEASE |
+            CLIENT_SURFACE_BACKEND_READ_ONLY_DC,
     .destroy = x11drv_client_surface_destroy,
     .detach = x11drv_client_surface_detach,
     .update = x11drv_client_surface_update,

@@ -268,6 +268,8 @@ enum client_surface_backend_caps
 {
     CLIENT_SURFACE_BACKEND_SCENE_PUBLICATION = 0x01,
     CLIENT_SURFACE_BACKEND_NATIVE_WRITE_LEASE = 0x02,
+    /* present() only queries the supplied DC; all drawing uses private state. */
+    CLIENT_SURFACE_BACKEND_READ_ONLY_DC = 0x04,
 };
 
 struct client_surface_completion_ops
