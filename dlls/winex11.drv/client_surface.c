@@ -343,9 +343,19 @@ static BOOL X11DRV_client_surface_present( struct client_surface *client,
 
     if (surface_region)
     {
-        if (region) NtGdiCombineRgn( region, region, surface_region, RGN_AND );
-        else if ((region = NtGdiCreateRectRgn( 0, 0, 0, 0 )))
-            NtGdiCombineRgn( region, surface_region, 0, RGN_COPY );
+        int ret;
+
+        if (region) ret = NtGdiCombineRgn( region, region, surface_region, RGN_AND );
+        else
+        {
+            if (!(region = NtGdiCreateRectRgn( 0, 0, 0, 0 ))) return FALSE;
+            ret = NtGdiCombineRgn( region, surface_region, 0, RGN_COPY );
+        }
+        if (ret == ERROR)
+        {
+            NtGdiDeleteObjectApp( region );
+            return FALSE;
+        }
     }
 
     rect_src = surface->client.raw ? client->target.monitor_rect : client->target.virtual_rect;
