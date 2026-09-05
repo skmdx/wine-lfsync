@@ -887,7 +887,16 @@ static void x11drv_surface_destroy( struct opengl_drawable *base )
 
     TRACE( "drawable %s\n", debugstr_opengl_drawable( base ) );
 
-    if (gl->drawable) pglXDestroyWindow( gdi_display, gl->drawable );
+    if (gl->drawable)
+    {
+        /* The last reference can belong to a completion worker. DRI3 teardown
+         * sends raw XCB requests, whose socket-return callback takes the Xlib
+         * display lock. Establish the same order as context creation before
+         * entering the driver, just as for completion counter queries. */
+        XLockDisplay( gdi_display );
+        pglXDestroyWindow( gdi_display, gl->drawable );
+        XUnlockDisplay( gdi_display );
+    }
 }
 
 static BOOL set_swap_interval( struct gl_drawable *gl, int interval )
