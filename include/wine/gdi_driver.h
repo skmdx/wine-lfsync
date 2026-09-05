@@ -219,7 +219,7 @@ struct gdi_dc_funcs
 };
 
 /* increment this when changing driver tables or shared driver-facing structures */
-#define WINE_GDI_DRIVER_VERSION 114
+#define WINE_GDI_DRIVER_VERSION 115
 
 #define GDI_PRIORITY_NULL_DRV        0  /* null driver */
 #define GDI_PRIORITY_FONT_DRV      100  /* any font driver */
@@ -273,6 +273,9 @@ enum client_surface_backend_caps
     CLIENT_SURFACE_BACKEND_READ_ONLY_DC = 0x04,
     CLIENT_SURFACE_BACKEND_DIRECT_PRESENTATION = 0x08,
     CLIENT_SURFACE_BACKEND_GENERATION_HANDOFF = 0x10,
+    /* Offscreen presentation is owner-only; present() must never write an
+     * owner native target when generation handoff is unavailable. */
+    CLIENT_SURFACE_BACKEND_OWNER_COMPOSITOR = 0x20,
 };
 
 struct client_surface_completion_ops

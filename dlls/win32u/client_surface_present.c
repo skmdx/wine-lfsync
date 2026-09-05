@@ -702,6 +702,19 @@ BOOL client_surface_end_present_internal( struct client_surface *surface,
     }
     source_valid = compose && new_content;
     if (compose && offscreen && !present->scene.valid) compose = FALSE;
+    if (compose && offscreen &&
+        client_surface_backend_has_cap( surface, CLIENT_SURFACE_BACKEND_OWNER_COMPOSITOR ))
+    {
+        /* This backend never submits work to an owner-owned native target.
+         * Hidden frames remain reusable source content; a visible handoff
+         * failure is rejected and retried through the scene slow path. */
+        if (present->mode == CLIENT_SURFACE_PRESENTATION_STAGED ||
+            !NtUserIsWindowVisible( hwnd ))
+            composed = client_surface_scene_current( &present->scene );
+        else
+            scene_retry = TRUE;
+        compose = FALSE;
+    }
     guarded = compose && offscreen &&
               client_surface_backend_has_cap( surface, CLIENT_SURFACE_BACKEND_NATIVE_WRITE_LEASE );
     if (guarded && !NtUserIsWindowVisible( hwnd ))

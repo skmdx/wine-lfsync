@@ -661,6 +661,22 @@ static const struct client_surface_backend x11drv_client_surface_backend =
     .completion = &x11drv_client_surface_completion_ops,
 };
 
+static const struct client_surface_backend x11drv_client_surface_owner_backend =
+{
+    .caps = CLIENT_SURFACE_BACKEND_SCENE_PUBLICATION |
+            CLIENT_SURFACE_BACKEND_READ_ONLY_DC |
+            CLIENT_SURFACE_BACKEND_DIRECT_PRESENTATION |
+            CLIENT_SURFACE_BACKEND_GENERATION_HANDOFF |
+            CLIENT_SURFACE_BACKEND_OWNER_COMPOSITOR,
+    .destroy = x11drv_client_surface_destroy,
+    .detach = x11drv_client_surface_detach,
+    .direct_ready = x11drv_client_surface_direct_ready,
+    .update = x11drv_client_surface_update,
+    .present = X11DRV_client_surface_present,
+    .handoff_prepare = x11drv_client_surface_handoff_prepare,
+    .completion = &x11drv_client_surface_completion_ops,
+};
+
 static int visual_class_alloc( int class )
 {
     return class == PseudoColor || class == GrayScale || class == DirectColor ? AllocAll : AllocNone;
@@ -668,30 +684,38 @@ static int visual_class_alloc( int class )
 
 struct x11drv_client_surface *impl_from_client_surface( struct client_surface *client )
 {
-    assert( client->backend == &x11drv_client_surface_backend );
+    assert( client->backend == &x11drv_client_surface_backend ||
+            client->backend == &x11drv_client_surface_owner_backend );
     return CONTAINING_RECORD( client, struct x11drv_client_surface, client );
 }
 
 struct client_surface *X11DRV_CreateClientSurface( HWND hwnd, int format, BOOL raw )
 {
     struct x11drv_client_surface *surface;
+    const struct client_surface_backend *backend = &x11drv_client_surface_backend;
     XVisualInfo visual = default_visual;
     Colormap colormap;
     RECT rect;
 
     if (format && !visual_from_pixel_format( format, &visual )) return NULL;
 
+    if (usexcomposite && X11DRV_XRender_ClientSurfaceAvailable( TRUE ) &&
+        X11DRV_XFixes_ClientSurfaceAvailable())
+        backend = &x11drv_client_surface_owner_backend;
+
     if (visual.visualid == default_visual.visualid) colormap = default_colormap;
     else colormap = XCreateColormap( gdi_display, get_dummy_parent(), visual.visual, visual_class_alloc( visual.class ) );
     if (!colormap) return NULL;
 
-    if (!(surface = client_surface_create( sizeof(*surface), &x11drv_client_surface_backend, hwnd, format, raw ))) goto failed;
+    if (!(surface = client_surface_create( sizeof(*surface), backend, hwnd, format, raw ))) goto failed;
     surface->colormap = colormap;
     surface->source_visual = visual.visualid;
     if (!x11drv_client_surface_completion_init( surface )) goto failed;
     rect = raw ? surface->client.target.monitor_rect : surface->client.target.virtual_rect;
     if (!(surface->window = create_client_window( hwnd, rect, &visual, colormap ))) goto failed;
-    TRACE( "Created %s for client window %lx\n", debugstr_client_surface( &surface->client ), surface->window );
+    TRACE( "Created %s for client window %lx, owner compositor %u\n",
+           debugstr_client_surface( &surface->client ), surface->window,
+           backend == &x11drv_client_surface_owner_backend );
     return &surface->client;
 
 failed:
