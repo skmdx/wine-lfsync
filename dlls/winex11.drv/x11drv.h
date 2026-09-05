@@ -706,7 +706,6 @@ struct x11drv_win_data
     unsigned long client_surface_opacity; /* desired _NET_WM_WINDOW_OPACITY value */
     Pixmap         client_surface_backing;
     Pixmap         client_surface_backing_spare;
-    GC             client_surface_gc;
     unsigned int   client_surface_backing_width;
     unsigned int   client_surface_backing_height;
     unsigned int   client_surface_backing_valid_width;

@@ -33,14 +33,49 @@ struct x11drv_retired_pixmap
     Pixmap pixmaps[2];
 };
 
+static pthread_mutex_t client_surface_compositor_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t client_surface_compositor_cond = PTHREAD_COND_INITIALIZER;
+static Display *client_surface_compositor_display;
+static BOOL client_surface_compositor_started;
+
+enum client_surface_compositor_op
+{
+    CLIENT_SURFACE_COMPOSITOR_ALLOC_POOL,
+    CLIENT_SURFACE_COMPOSITOR_COPY,
+    CLIENT_SURFACE_COMPOSITOR_FREE_POOL,
+    CLIENT_SURFACE_COMPOSITOR_PRESENT,
+};
+
+struct client_surface_compositor_job
+{
+    struct client_surface_compositor_job *next;
+    enum client_surface_compositor_op op;
+    Drawable source;
+    Drawable destination;
+    int source_x;
+    int source_y;
+    int destination_x;
+    int destination_y;
+    unsigned int width;
+    unsigned int height;
+    unsigned int depth;
+    Pixmap pixmaps[2];
+    BOOL result;
+    BOOL complete;
+};
+
+static struct client_surface_compositor_job *client_surface_compositor_head;
+static struct client_surface_compositor_job **client_surface_compositor_tail =
+    &client_surface_compositor_head;
+
 #ifdef SONAME_LIBXPRESENT
 
-static pthread_mutex_t client_surface_compositor_mutex = PTHREAD_MUTEX_INITIALIZER;
-static Display *client_surface_compositor_display;
 static uint32_t client_surface_present_serial;
 static int client_surface_present_opcode;
 
-static int client_surface_present_error( Display *display, XErrorEvent *event, void *arg )
+#endif
+
+static int client_surface_compositor_error( Display *display, XErrorEvent *event, void *arg )
 {
     int *error = arg;
 
@@ -50,24 +85,92 @@ static int client_surface_present_error( Display *display, XErrorEvent *event, v
 
 static BOOL client_surface_compositor_open(void)
 {
-    int event_base, error_base, major, minor;
     Display *display;
 
     if (client_surface_compositor_display) return TRUE;
-    if (!pXGetEventData || !pXFreeEventData) return FALSE;
-    if (!(display = XOpenDisplay( NULL ))) return FALSE;
+    if (!(display = XOpenDisplay( DisplayString( gdi_display ) ))) return FALSE;
     fcntl( ConnectionNumber( display ), F_SETFD, FD_CLOEXEC );
-    if (!pXPresentQueryExtension( display, &client_surface_present_opcode,
-                                  &event_base, &error_base ) ||
-        !pXPresentQueryVersion( display, &major, &minor ))
+
+#ifdef SONAME_LIBXPRESENT
+    if (usexpresent)
     {
-        XCloseDisplay( display );
-        return FALSE;
+        int event_base, error_base, major, minor;
+
+        if (!pXGetEventData || !pXFreeEventData ||
+            !pXPresentQueryExtension( display, &client_surface_present_opcode,
+                                      &event_base, &error_base ) ||
+            !pXPresentQueryVersion( display, &major, &minor ))
+            usexpresent = FALSE;
+        else
+            TRACE( "client-surface compositor connection opened with X Present %d.%d\n",
+                   major, minor );
     }
+#endif
+
     client_surface_compositor_display = display;
-    TRACE( "client-surface compositor connection opened with X Present %d.%d\n", major, minor );
+    if (!usexpresent) TRACE( "client-surface compositor connection opened with XCopy fallback\n" );
     return TRUE;
 }
+
+static BOOL client_surface_copy_on_compositor( Drawable source, Drawable destination,
+                                               int source_x, int source_y,
+                                               int destination_x, int destination_y,
+                                               unsigned int width, unsigned int height )
+{
+    Display *display = client_surface_compositor_display;
+    int error = 0;
+    GC gc;
+
+    X11DRV_expect_error( display, client_surface_compositor_error, &error );
+    gc = XCreateGC( display, destination, 0, NULL );
+    if (gc)
+    {
+        XCopyArea( display, source, destination, gc, source_x, source_y,
+                   width, height, destination_x, destination_y );
+        XFreeGC( display, gc );
+    }
+    XSync( display, False );
+    X11DRV_check_error();
+    return gc && !error;
+}
+
+static BOOL client_surface_alloc_on_compositor( Drawable drawable, unsigned int width,
+                                                unsigned int height, unsigned int depth,
+                                                Pixmap pixmaps[2] )
+{
+    Display *display = client_surface_compositor_display;
+    int error = 0;
+
+    X11DRV_expect_error( display, client_surface_compositor_error, &error );
+    pixmaps[0] = XCreatePixmap( display, drawable, width, height, depth );
+    pixmaps[1] = XCreatePixmap( display, drawable, width, height, depth );
+    XSync( display, False );
+    X11DRV_check_error();
+    if (!error) return TRUE;
+
+    X11DRV_expect_error( display, client_surface_compositor_error, &error );
+    XFreePixmap( display, pixmaps[0] );
+    XFreePixmap( display, pixmaps[1] );
+    XSync( display, False );
+    X11DRV_check_error();
+    pixmaps[0] = pixmaps[1] = 0;
+    return FALSE;
+}
+
+static BOOL client_surface_free_on_compositor( const Pixmap pixmaps[2] )
+{
+    Display *display = client_surface_compositor_display;
+    int error = 0;
+
+    X11DRV_expect_error( display, client_surface_compositor_error, &error );
+    if (pixmaps[0]) XFreePixmap( display, pixmaps[0] );
+    if (pixmaps[1]) XFreePixmap( display, pixmaps[1] );
+    XSync( display, False );
+    X11DRV_check_error();
+    return !error;
+}
+
+#ifdef SONAME_LIBXPRESENT
 
 static BOOL wait_client_surface_present_events( Window window, Pixmap pixmap, uint32_t serial )
 {
@@ -125,21 +228,18 @@ static BOOL wait_client_surface_present_events( Window window, Pixmap pixmap, ui
  * connection.  CompleteNotify is the publication boundary; IdleNotify is a
  * separate storage-reuse boundary even when PresentOptionCopy makes both
  * arrive together. */
-static BOOL client_surface_backing_present( Window window, Pixmap pixmap )
+static BOOL client_surface_present_on_compositor( Window window, Pixmap pixmap )
 {
-    Display *display;
+    Display *display = client_surface_compositor_display;
     XID event_id;
     uint32_t serial;
     BOOL ret = FALSE;
     int error = 0;
 
     if (!usexpresent) return FALSE;
-    pthread_mutex_lock( &client_surface_compositor_mutex );
-    if (!client_surface_compositor_open()) goto done;
-    display = client_surface_compositor_display;
     if (!(serial = ++client_surface_present_serial)) serial = ++client_surface_present_serial;
 
-    X11DRV_expect_error( display, client_surface_present_error, &error );
+    X11DRV_expect_error( display, client_surface_compositor_error, &error );
     event_id = pXPresentSelectInput( display, window,
                                     PresentCompleteNotifyMask | PresentIdleNotifyMask );
     pXPresentPixmap( display, window, pixmap, serial, None, None, 0, 0, None,
@@ -150,20 +250,169 @@ static BOOL client_surface_backing_present( Window window, Pixmap pixmap )
     if (!error) ret = wait_client_surface_present_events( window, pixmap, serial );
     pXPresentFreeInput( display, window, event_id );
     XFlush( display );
-
-done:
-    pthread_mutex_unlock( &client_surface_compositor_mutex );
     return ret;
 }
 
 #else
 
-static BOOL client_surface_backing_present( Window window, Pixmap pixmap )
+static BOOL client_surface_present_on_compositor( Window window, Pixmap pixmap )
 {
     return FALSE;
 }
 
 #endif
+
+static BOOL execute_client_surface_compositor_job( struct client_surface_compositor_job *job )
+{
+    if (!client_surface_compositor_open()) return FALSE;
+    switch (job->op)
+    {
+    case CLIENT_SURFACE_COMPOSITOR_ALLOC_POOL:
+        return client_surface_alloc_on_compositor( job->destination, job->width,
+                                                   job->height, job->depth, job->pixmaps );
+    case CLIENT_SURFACE_COMPOSITOR_FREE_POOL:
+        return client_surface_free_on_compositor( job->pixmaps );
+    case CLIENT_SURFACE_COMPOSITOR_PRESENT:
+        return client_surface_present_on_compositor( job->destination, job->source );
+    case CLIENT_SURFACE_COMPOSITOR_COPY:
+        break;
+    default:
+        return FALSE;
+    }
+    return client_surface_copy_on_compositor( job->source, job->destination,
+                                              job->source_x, job->source_y,
+                                              job->destination_x, job->destination_y,
+                                              job->width, job->height );
+}
+
+static void client_surface_compositor_thread( void *context )
+{
+    (void)context;
+
+    for (;;)
+    {
+        struct client_surface_compositor_job *job;
+
+        pthread_mutex_lock( &client_surface_compositor_mutex );
+        while (!(job = client_surface_compositor_head))
+            pthread_cond_wait( &client_surface_compositor_cond,
+                               &client_surface_compositor_mutex );
+        client_surface_compositor_head = job->next;
+        if (!client_surface_compositor_head)
+            client_surface_compositor_tail = &client_surface_compositor_head;
+        pthread_mutex_unlock( &client_surface_compositor_mutex );
+
+        job->result = execute_client_surface_compositor_job( job );
+
+        pthread_mutex_lock( &client_surface_compositor_mutex );
+        job->complete = TRUE;
+        pthread_cond_broadcast( &client_surface_compositor_cond );
+        pthread_mutex_unlock( &client_surface_compositor_mutex );
+    }
+}
+
+static BOOL submit_client_surface_compositor_job( struct client_surface_compositor_job *job )
+{
+    HANDLE thread;
+    NTSTATUS status;
+
+    job->next = NULL;
+    job->complete = FALSE;
+    pthread_mutex_lock( &client_surface_compositor_mutex );
+    if (!client_surface_compositor_started)
+    {
+        status = PsCreateSystemThread( &thread, THREAD_ALL_ACCESS, NULL, 0, NULL,
+                                       client_surface_compositor_thread, NULL );
+        if (status)
+        {
+            pthread_mutex_unlock( &client_surface_compositor_mutex );
+            WARN( "failed to create client-surface compositor, status %#lx\n",
+                  (unsigned long)status );
+            return FALSE;
+        }
+        NtClose( thread );
+        client_surface_compositor_started = TRUE;
+    }
+    *client_surface_compositor_tail = job;
+    client_surface_compositor_tail = &job->next;
+    pthread_cond_broadcast( &client_surface_compositor_cond );
+    while (!job->complete)
+        pthread_cond_wait( &client_surface_compositor_cond,
+                           &client_surface_compositor_mutex );
+    pthread_mutex_unlock( &client_surface_compositor_mutex );
+    return job->result;
+}
+
+static BOOL client_surface_backing_copy_area( Drawable source, Drawable destination,
+                                              int source_x, int source_y,
+                                              int destination_x, int destination_y,
+                                              unsigned int width, unsigned int height )
+{
+    struct client_surface_compositor_job job =
+    {
+        .op = CLIENT_SURFACE_COMPOSITOR_COPY,
+        .source = source,
+        .destination = destination,
+        .source_x = source_x,
+        .source_y = source_y,
+        .destination_x = destination_x,
+        .destination_y = destination_y,
+        .width = width,
+        .height = height,
+    };
+
+    return submit_client_surface_compositor_job( &job );
+}
+
+static BOOL client_surface_backing_alloc( Drawable drawable, unsigned int width,
+                                          unsigned int height, unsigned int depth,
+                                          Pixmap *first, Pixmap *second )
+{
+    struct client_surface_compositor_job job =
+    {
+        .op = CLIENT_SURFACE_COMPOSITOR_ALLOC_POOL,
+        .destination = drawable,
+        .width = width,
+        .height = height,
+        .depth = depth,
+    };
+
+    if (!submit_client_surface_compositor_job( &job )) return FALSE;
+    *first = job.pixmaps[0];
+    *second = job.pixmaps[1];
+    return TRUE;
+}
+
+static void client_surface_backing_free( Pixmap first, Pixmap second )
+{
+    struct client_surface_compositor_job job =
+    {
+        .op = CLIENT_SURFACE_COMPOSITOR_FREE_POOL,
+        .pixmaps = {first, second},
+    };
+
+    if (!submit_client_surface_compositor_job( &job ))
+        WARN( "failed to release client-surface frame pool %#lx/%#lx\n", first, second );
+}
+
+static BOOL client_surface_backing_copy( Drawable source, Drawable destination,
+                                         unsigned int width, unsigned int height )
+{
+    return client_surface_backing_copy_area( source, destination, 0, 0, 0, 0,
+                                             width, height );
+}
+
+static BOOL client_surface_backing_present( Window window, Pixmap pixmap )
+{
+    struct client_surface_compositor_job job =
+    {
+        .op = CLIENT_SURFACE_COMPOSITOR_PRESENT,
+        .source = pixmap,
+        .destination = window,
+    };
+
+    return submit_client_surface_compositor_job( &job );
+}
 
 static unsigned int client_surface_backing_extent( int size )
 {
@@ -188,34 +437,22 @@ static BOOL get_client_surface_window_extent( struct x11drv_win_data *data,
                          width, height, &border, &depth );
 }
 
-static int client_surface_backing_error( Display *display, XErrorEvent *event, void *arg )
-{
-    int *error = arg;
-
-    *error = event->error_code;
-    return 1;
-}
-
 void X11DRV_client_surface_backing_destroy( struct x11drv_win_data *data )
 {
     struct x11drv_retired_pixmap *retired, *next;
 
     NtUserRemoveProp( data->hwnd, client_surface_backing_prop );
-    if (data->client_surface_backing)
-        XFreePixmap( data->display, data->client_surface_backing );
-    if (data->client_surface_backing_spare)
-        XFreePixmap( data->display, data->client_surface_backing_spare );
-    if (data->client_surface_gc) XFreeGC( data->display, data->client_surface_gc );
+    if (data->client_surface_backing || data->client_surface_backing_spare)
+        client_surface_backing_free( data->client_surface_backing,
+                                     data->client_surface_backing_spare );
     for (retired = data->client_surface_retired; retired; retired = next)
     {
         next = retired->next;
-        if (retired->pixmaps[0]) XFreePixmap( data->display, retired->pixmaps[0] );
-        if (retired->pixmaps[1]) XFreePixmap( data->display, retired->pixmaps[1] );
+        client_surface_backing_free( retired->pixmaps[0], retired->pixmaps[1] );
         free( retired );
     }
     data->client_surface_backing = 0;
     data->client_surface_backing_spare = 0;
-    data->client_surface_gc = 0;
     data->client_surface_backing_width = 0;
     data->client_surface_backing_height = 0;
     data->client_surface_backing_valid_width = 0;
@@ -234,10 +471,8 @@ BOOL X11DRV_client_surface_backing_ensure( struct x11drv_win_data *data )
     struct x11drv_retired_pixmap *retired = NULL;
     unsigned int width, height, window_width, window_height;
     unsigned int old_valid_width, old_valid_height;
-    BOOL new_gc, old_valid, valid;
-    int error = 0;
+    BOOL old_valid, valid;
     Pixmap pixmap, spare;
-    GC gc;
 
     if (!data->whole_window) return FALSE;
     if (!get_client_surface_window_extent( data, &window_width, &window_height )) return FALSE;
@@ -287,48 +522,29 @@ BOOL X11DRV_client_surface_backing_ensure( struct x11drv_win_data *data )
     data->client_surface_backing_valid_height = 0;
 
     if (data->client_surface_backing && !(retired = malloc( sizeof(*retired) ))) return FALSE;
-    pixmap = XCreatePixmap( data->display, data->whole_window, width, height, data->vis.depth );
-    spare = pixmap ? XCreatePixmap( data->display, data->whole_window, width, height,
-                                    data->vis.depth ) : 0;
-    gc = data->client_surface_gc;
-    new_gc = !gc;
-    if (!pixmap || !spare || (!gc && !(gc = XCreateGC( data->display, pixmap, 0, NULL ))))
+    if (!client_surface_backing_alloc( data->whole_window, width, height,
+                                       data->vis.depth, &pixmap, &spare ))
     {
-        if (pixmap) XFreePixmap( data->display, pixmap );
-        if (spare) XFreePixmap( data->display, spare );
         free( retired );
         return FALSE;
     }
-
-    X11DRV_expect_error( data->display, client_surface_backing_error, &error );
-    XCopyArea( data->display, data->whole_window, pixmap, gc, 0, 0,
-               min( window_width, width ), min( window_height, height ), 0, 0 );
-    XCopyArea( data->display, data->whole_window, spare, gc, 0, 0,
-               min( window_width, width ), min( window_height, height ), 0, 0 );
-    if (data->client_surface_backing && old_valid)
-    {
-        XCopyArea( data->display, data->client_surface_backing, pixmap, gc, 0, 0,
-                   old_valid_width, old_valid_height, 0, 0 );
-        XCopyArea( data->display, data->client_surface_backing, spare, gc, 0, 0,
-                   old_valid_width, old_valid_height, 0, 0 );
-    }
-    XSync( data->display, False );
-    X11DRV_check_error();
 
     /* The HWND property is the renderer-visible capability for this backing.
      * Commit it before replacing local state.  Otherwise a failed property
      * allocation could make the owner publish one Pixmap while renderers keep
      * writing the old one. */
-    if (error || !NtUserSetProp( data->hwnd, client_surface_backing_prop, (HANDLE)pixmap ))
+    if (!client_surface_backing_copy( data->whole_window, pixmap,
+                                      min( window_width, width ), min( window_height, height ) ) ||
+        !client_surface_backing_copy( data->whole_window, spare,
+                                      min( window_width, width ), min( window_height, height ) ) ||
+        (data->client_surface_backing && old_valid &&
+         (!client_surface_backing_copy( data->client_surface_backing, pixmap,
+                                        old_valid_width, old_valid_height ) ||
+          !client_surface_backing_copy( data->client_surface_backing, spare,
+                                        old_valid_width, old_valid_height ))) ||
+        !NtUserSetProp( data->hwnd, client_surface_backing_prop, (HANDLE)pixmap ))
     {
-        int cleanup_error = 0;
-
-        X11DRV_expect_error( data->display, client_surface_backing_error, &cleanup_error );
-        XFreePixmap( data->display, pixmap );
-        XFreePixmap( data->display, spare );
-        if (new_gc) XFreeGC( data->display, gc );
-        XSync( data->display, False );
-        X11DRV_check_error();
+        client_surface_backing_free( pixmap, spare );
         free( retired );
         return FALSE;
     }
@@ -343,7 +559,6 @@ BOOL X11DRV_client_surface_backing_ensure( struct x11drv_win_data *data )
 
     data->client_surface_backing = pixmap;
     data->client_surface_backing_spare = spare;
-    data->client_surface_gc = gc;
     data->client_surface_backing_width = width;
     data->client_surface_backing_height = height;
     valid = old_valid && old_valid_width >= window_width && old_valid_height >= window_height;
@@ -360,19 +575,17 @@ BOOL X11DRV_client_surface_backing_snapshot( struct x11drv_win_data *data, BOOL 
 {
     unsigned int width, height, window_width, window_height;
     Pixmap previous;
-    int error = 0;
 
     if (!X11DRV_client_surface_backing_ensure( data )) return FALSE;
     if (!get_client_surface_window_extent( data, &window_width, &window_height )) return FALSE;
     width = min( data->client_surface_backing_width, window_width );
     height = min( data->client_surface_backing_height, window_height );
-    X11DRV_expect_error( data->display, client_surface_backing_error, &error );
-    XCopyArea( data->display, data->whole_window, data->client_surface_backing_spare,
-               data->client_surface_gc,
-               0, 0, width, height, 0, 0 );
+    /* The compositor uses another X connection.  Establish all preceding
+     * owner-window drawing before it snapshots that drawable. */
     XSync( data->display, False );
-    X11DRV_check_error();
-    if (error) return FALSE;
+    if (!client_surface_backing_copy( data->whole_window,
+                                      data->client_surface_backing_spare, width, height ))
+        return FALSE;
     if (width != window_width || height != window_height) return FALSE;
     if (!NtUserSetProp( data->hwnd, client_surface_backing_prop,
                         (HANDLE)data->client_surface_backing_spare ))
@@ -397,9 +610,8 @@ BOOL X11DRV_client_surface_backing_snapshot( struct x11drv_win_data *data, BOOL 
 BOOL X11DRV_client_surface_backing_publish( struct x11drv_win_data *data )
 {
     unsigned int width, height, window_width, window_height;
-    int error = 0;
 
-    if (!data->whole_window || !data->client_surface_backing || !data->client_surface_gc)
+    if (!data->whole_window || !data->client_surface_backing)
         return FALSE;
     if (!get_client_surface_window_extent( data, &window_width, &window_height )) return FALSE;
     width = min( data->client_surface_backing_width, window_width );
@@ -409,12 +621,9 @@ BOOL X11DRV_client_surface_backing_publish( struct x11drv_win_data *data )
     {
         TRACE( "falling back to XCopyArea publication for pixmap %#lx\n",
                data->client_surface_backing );
-        X11DRV_expect_error( data->display, client_surface_backing_error, &error );
-        XCopyArea( data->display, data->client_surface_backing, data->whole_window,
-                   data->client_surface_gc, 0, 0, width, height, 0, 0 );
-        XSync( data->display, False );
-        X11DRV_check_error();
-        if (error) return FALSE;
+        if (!client_surface_backing_copy( data->client_surface_backing,
+                                          data->whole_window, width, height ))
+            return FALSE;
     }
     data->client_surface_backing_valid = TRUE;
     data->client_surface_backing_valid_width = window_width;
@@ -426,18 +635,18 @@ BOOL X11DRV_client_surface_backing_restore( struct x11drv_win_data *data,
                                            Window window, const RECT *rect )
 {
     if (window != data->whole_window || !data->client_surface_backing ||
-        !data->client_surface_gc || !data->client_surface_backing_valid || IsRectEmpty( rect ))
+        !data->client_surface_backing_valid || IsRectEmpty( rect ))
         return FALSE;
     if (rect->left < 0 || rect->top < 0 ||
         (unsigned int)rect->right > data->client_surface_backing_valid_width ||
         (unsigned int)rect->bottom > data->client_surface_backing_valid_height)
         return FALSE;
-    XCopyArea( data->display, data->client_surface_backing, data->whole_window,
-               data->client_surface_gc,
-               rect->left, rect->top, rect->right - rect->left, rect->bottom - rect->top,
-               rect->left, rect->top );
-    XFlush( data->display );
-    return TRUE;
+    return client_surface_backing_copy_area( data->client_surface_backing,
+                                             data->whole_window,
+                                             rect->left, rect->top,
+                                             rect->left, rect->top,
+                                             rect->right - rect->left,
+                                             rect->bottom - rect->top );
 }
 
 Pixmap X11DRV_get_client_surface_backing( HWND hwnd )
