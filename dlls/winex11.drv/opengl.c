@@ -1456,10 +1456,17 @@ static BOOL wait_glx_swap_serial( struct gl_drawable *gl, INT64 target_sbc, DWOR
     DWORD delay_ms = 1;
     DWORD start = NtGetTickCount();
     INT64 ust, msc, sbc;
+    Bool ret;
 
     for (;;)
     {
-        if (!pglXGetSyncValuesOML( gdi_display, gl->drawable, &ust, &msc, &sbc )) return FALSE;
+        /* A direct-rendering GLX driver may send XCB requests. Take the display
+         * lock first, matching X11DRV_expect_error(), or XCB's socket-return
+         * callback can wait for a display lock held by another XCB sender. */
+        XLockDisplay( gdi_display );
+        ret = pglXGetSyncValuesOML( gdi_display, gl->drawable, &ust, &msc, &sbc );
+        XUnlockDisplay( gdi_display );
+        if (!ret) return FALSE;
         if (sbc >= target_sbc) return TRUE;
         if (NtGetTickCount() - start >= timeout) return FALSE;
         delay.QuadPart = -(LONGLONG)delay_ms * 10000;
@@ -1505,9 +1512,9 @@ static BOOL x11drv_surface_swap( struct opengl_drawable *base )
     client_surface_begin_present( base->client );
     if (present.completion.kind == CLIENT_SURFACE_COMPLETION_EXACT)
     {
-        /* The swap buffer count identifies this exact GLX presentation.  Poll
-         * it with a deadline instead of using the unbounded WaitForSbc call or
-         * accepting unrelated XDamage on the drawable as completion proof. */
+        /* The swap buffer count identifies this exact GLX presentation, unlike
+         * unrelated XDamage on the drawable. The polling deadline bounds retries,
+         * but cannot bound the native query itself. */
         funcs->p_glFlush();
         target_sbc = pglXSwapBuffersMscOML( gdi_display, gl->drawable, 0, 0, 0 );
         submitted = target_sbc >= 0;
