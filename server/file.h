@@ -180,6 +180,8 @@ extern struct mapping *create_fd_mapping( struct object *root, struct unicode_st
                                           unsigned int attr, const struct security_descriptor *sd );
 extern struct object *create_user_data_mapping( struct object *root, struct unicode_str name,
                                                 unsigned int attr, const struct security_descriptor *sd );
+extern struct object *create_shared_data_mapping( mem_size_t size, void **ptr );
+extern void release_shared_data_mapping( struct object *obj, void *ptr );
 extern struct mapping *create_session_mapping( struct object *root, struct unicode_str name,
                                                unsigned int attr, const struct security_descriptor *sd );
 extern void set_session_mapping( struct mapping *mapping );

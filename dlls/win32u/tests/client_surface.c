@@ -15,6 +15,7 @@
 #include "ntstatus.h"
 #define WIN32_NO_STATUS
 #include "windows.h"
+#include "winternl.h"
 #include "wine/server.h"
 #include "wine/test.h"
 #include "wine/wgl.h"
@@ -642,6 +643,300 @@ static void test_subtree_generation_retirement(void)
         state.staged, state.wake, status );
     set_surface_state( first, first_surface, CLIENT_SURFACE_STATE_UNREGISTER, 0, NULL );
     DestroyWindow( parent );
+}
+
+struct lease_binding
+{
+    HANDLE mapping;
+    UINT size, offset;
+    UINT64 mapping_id, cookie;
+};
+
+static unsigned int get_surface_lease( HWND hwnd, UINT_PTR surface, struct lease_binding *binding )
+{
+    struct __server_request_info info = {0};
+    const struct get_client_surface_lease_reply *reply = &info.u.reply.get_client_surface_lease_reply;
+    unsigned int status;
+
+    memset( binding, 0, sizeof(*binding) );
+    info.u.req.get_client_surface_lease_request.__header.req = REQ_get_client_surface_lease;
+    info.u.req.get_client_surface_lease_request.handle = wine_server_user_handle( hwnd );
+    info.u.req.get_client_surface_lease_request.surface = surface;
+    status = p_wine_server_call( &info );
+    if (!status)
+    {
+        binding->mapping = wine_server_ptr_handle( reply->mapping );
+        binding->size = reply->size;
+        binding->offset = reply->offset;
+        binding->mapping_id = reply->mapping_id;
+        binding->cookie = reply->cookie;
+    }
+    return status;
+}
+
+static unsigned int release_surface_lease( UINT_PTR surface, UINT64 cookie )
+{
+    struct __server_request_info info = {0};
+
+    info.u.req.release_client_surface_lease_request.__header.req = REQ_release_client_surface_lease;
+    info.u.req.release_client_surface_lease_request.surface = surface;
+    info.u.req.release_client_surface_lease_request.cookie = cookie;
+    return p_wine_server_call( &info );
+}
+
+static void test_lease_storage(void)
+{
+    NTSTATUS (WINAPI *query_process)( HANDLE, PROCESSINFOCLASS, void *, ULONG, ULONG * ) =
+        (void *)GetProcAddress( GetModuleHandleA( "ntdll.dll" ), "NtQueryInformationProcess" );
+    const UINT_PTR identity = 0x79000000;
+    const UINT flags = CLIENT_SURFACE_STATE_REGISTER | CLIENT_SURFACE_STATE_NATIVE_WRITE_LEASE |
+                       CLIENT_SURFACE_STATE_SCENE_PUBLICATION;
+    struct lease_binding first, again, replacement, *bindings;
+    struct client_surface_lease *slot;
+    HWND hwnd = create_test_window( FALSE ), other = create_test_window( FALSE );
+    char *view = NULL;
+    unsigned int status, i, count = 0;
+    DWORD handles_before = 0, handles_after = 0;
+
+    ok( hwnd && other, "failed to create lease storage windows\n" );
+    if (!hwnd || !other) goto done;
+    status = get_surface_lease( hwnd, identity, &first );
+    ok( status == STATUS_INVALID_PARAMETER, "unregistered lease status %#x\n", status );
+    status = set_surface_state( hwnd, identity, CLIENT_SURFACE_STATE_REGISTER, 0, NULL );
+    ok( !status, "register unsupported producer status %#x\n", status );
+    status = get_surface_lease( hwnd, identity, &first );
+    ok( status == STATUS_INVALID_PARAMETER, "unsupported producer lease status %#x\n", status );
+    status = set_surface_state( hwnd, identity, flags, 0, NULL );
+    ok( !status, "register native writer status %#x\n", status );
+    status = get_surface_lease( hwnd, identity, &first );
+    ok( !status, "get native writer storage status %#x\n", status );
+    if (status) goto unregister;
+    ok( first.size == CLIENT_SURFACE_LEASE_SLOTS * sizeof(*slot) &&
+        first.offset + sizeof(*slot) <= first.size && !(first.offset % sizeof(*slot)) &&
+        first.cookie && first.mapping_id, "invalid lease layout or identity\n" );
+    view = MapViewOfFile( first.mapping, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, first.size );
+    ok( !!view, "map lease section failed, error %lu\n", GetLastError() );
+    CloseHandle( first.mapping );
+    if (!view)
+    {
+        release_surface_lease( identity, first.cookie );
+        goto unregister;
+    }
+    slot = (struct client_surface_lease *)(view + first.offset);
+    ok( slot->control == CLIENT_SURFACE_LEASE_CLOSED && slot->cookie == first.cookie &&
+        slot->identity == identity, "new capability is not closed or has wrong identity\n" );
+    status = get_surface_lease( other, identity, &again );
+    ok( status == STATUS_INVALID_PARAMETER, "wrong HWND admitted storage, status %#x\n", status );
+    status = get_surface_lease( hwnd, identity, &again );
+    ok( !status, "repeat query status %#x\n", status );
+    if (!status)
+    {
+        ok( again.mapping_id == first.mapping_id && again.offset == first.offset &&
+            again.cookie == first.cookie, "repeat query replaced the binding\n" );
+        CloseHandle( again.mapping );
+    }
+    status = release_surface_lease( identity, first.cookie + 1 );
+    ok( status == STATUS_INVALID_PARAMETER, "wrong cookie retired binding, status %#x\n", status );
+    /* This deliberately mutates the writable view. The server must observe the
+     * same word and refuse reuse while a native writer could still own it. */
+    __atomic_store_n( &slot->control, GetCurrentThreadId(), __ATOMIC_SEQ_CST );
+    status = release_surface_lease( identity, first.cookie );
+    ok( status == STATUS_DEVICE_BUSY, "busy binding released, status %#x\n", status );
+    ok( slot->control == (CLIENT_SURFACE_LEASE_CLOSED | GetCurrentThreadId()),
+        "server did not preserve and seal the shared writer word\n" );
+    __atomic_store_n( &slot->control, CLIENT_SURFACE_LEASE_CLOSED, __ATOMIC_SEQ_CST );
+    slot->cookie = 0; /* validation must use the server-owned cookie */
+    status = release_surface_lease( identity, first.cookie );
+    ok( !status, "release of mapped binding status %#x\n", status );
+    status = get_surface_lease( hwnd, identity, &replacement );
+    ok( !status, "replacement binding status %#x\n", status );
+    if (status) goto unregister;
+    CloseHandle( replacement.mapping );
+    ok( replacement.mapping_id == first.mapping_id && replacement.offset == first.offset &&
+        replacement.cookie != first.cookie, "slot was not safely reused with a new cookie\n" );
+    ok( slot->control == CLIENT_SURFACE_LEASE_CLOSED && slot->cookie == replacement.cookie,
+        "existing mapped view does not observe the replacement binding\n" );
+    status = release_surface_lease( identity, first.cookie );
+    ok( status == STATUS_INVALID_PARAMETER, "stale ACK retired new binding, status %#x\n", status );
+    status = set_surface_state( hwnd, identity, CLIENT_SURFACE_STATE_UNREGISTER, 0, NULL );
+    ok( !status, "unregister while mapped status %#x\n", status );
+    status = set_surface_state( other, identity, flags, 0, NULL );
+    ok( status == STATUS_INVALID_PARAMETER, "unacknowledged identity was reused, status %#x\n", status );
+    status = release_surface_lease( identity, replacement.cookie );
+    ok( !status, "release retired identity without HWND status %#x\n", status );
+    status = set_surface_state( other, identity, flags, 0, NULL );
+    ok( !status, "released identity cannot be reused, status %#x\n", status );
+    set_surface_state( other, identity, CLIENT_SURFACE_STATE_UNREGISTER, 0, NULL );
+    UnmapViewOfFile( view );
+    view = NULL;
+
+    /* Cross a pool boundary, release everything, and verify all slots are
+     * reused without unbounded section handles or new mapping identities. */
+    bindings = calloc( CLIENT_SURFACE_LEASE_SLOTS + 1, sizeof(*bindings) );
+    ok( !!bindings, "failed to allocate binding test data\n" );
+    if (!bindings) goto done;
+    status = query_process( GetCurrentProcess(), ProcessHandleCount, &handles_before,
+                            sizeof(handles_before), NULL );
+    ok( !status, "query initial handle count status %#x\n", status );
+    for (i = 0; i <= CLIENT_SURFACE_LEASE_SLOTS; ++i)
+    {
+        status = set_surface_state( hwnd, identity + i, flags, 0, NULL );
+        ok( !status, "pool register %u status %#x\n", i, status );
+        if (status) break;
+        status = get_surface_lease( hwnd, identity + i, &bindings[i] );
+        ok( !status, "pool binding %u status %#x\n", i, status );
+        if (status)
+        {
+            set_surface_state( hwnd, identity + i, CLIENT_SURFACE_STATE_UNREGISTER, 0, NULL );
+            break;
+        }
+        CloseHandle( bindings[i].mapping );
+        ++count;
+    }
+    if (count > CLIENT_SURFACE_LEASE_SLOTS)
+        ok( bindings[0].mapping_id != bindings[CLIENT_SURFACE_LEASE_SLOTS].mapping_id,
+            "pool overflow reused a live slot\n" );
+    for (i = 0; i < count; ++i)
+    {
+        set_surface_state( hwnd, identity + i, CLIENT_SURFACE_STATE_UNREGISTER, 0, NULL );
+        status = release_surface_lease( identity + i, bindings[i].cookie );
+        ok( !status, "pool binding release %u status %#x\n", i, status );
+    }
+    if (count)
+    {
+        set_surface_state( hwnd, identity, flags, 0, NULL );
+        status = get_surface_lease( hwnd, identity, &again );
+        ok( !status, "reuse drained pool status %#x\n", status );
+        if (!status)
+        {
+            ok( again.mapping_id == bindings[0].mapping_id && again.offset == bindings[0].offset &&
+                again.cookie != bindings[0].cookie, "drained pool not reused safely\n" );
+            CloseHandle( again.mapping );
+            release_surface_lease( identity, again.cookie );
+        }
+        set_surface_state( hwnd, identity, CLIENT_SURFACE_STATE_UNREGISTER, 0, NULL );
+    }
+    free( bindings );
+    set_surface_state( other, identity, flags, 0, NULL );
+    status = get_surface_lease( other, identity, &again );
+    ok( !status, "bind before HWND destruction status %#x\n", status );
+    if (!status)
+    {
+        char *retained = MapViewOfFile( again.mapping, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, again.size );
+        ok( !!retained, "map retained destroy view error %lu\n", GetLastError() );
+        CloseHandle( again.mapping );
+        DestroyWindow( other );
+        other = NULL;
+        if (retained)
+        {
+            slot = (struct client_surface_lease *)(retained + again.offset);
+            ok( slot->control == CLIENT_SURFACE_LEASE_CLOSED, "destroyed HWND left capability open\n" );
+            UnmapViewOfFile( retained );
+        }
+        status = release_surface_lease( identity, again.cookie );
+        ok( !status, "release binding after HWND destruction status %#x\n", status );
+    }
+    status = query_process( GetCurrentProcess(), ProcessHandleCount, &handles_after,
+                            sizeof(handles_after), NULL );
+    ok( !status, "query final handle count status %#x\n", status );
+    ok( handles_after <= handles_before + 4, "lease handles grew from %lu to %lu\n",
+        handles_before, handles_after );
+    goto done;
+unregister:
+    set_surface_state( hwnd, identity, CLIENT_SURFACE_STATE_UNREGISTER, 0, NULL );
+done:
+    if (view) UnmapViewOfFile( view );
+    if (hwnd) DestroyWindow( hwnd );
+    if (other) DestroyWindow( other );
+}
+
+#define LEASE_PARENT_ID 0x79100000
+#define LEASE_CHILD_ID  0x79100001
+
+static void lease_storage_child( HWND hwnd, HANDLE ready, HANDLE release )
+{
+    struct lease_binding binding;
+    unsigned int status;
+    void *view = NULL;
+
+    status = get_surface_lease( hwnd, LEASE_PARENT_ID, &binding );
+    ok( status == STATUS_INVALID_PARAMETER, "child mapped parent capability, status %#x\n", status );
+    if (!status) CloseHandle( binding.mapping );
+    status = set_surface_state( hwnd, LEASE_CHILD_ID, CLIENT_SURFACE_STATE_REGISTER |
+                                CLIENT_SURFACE_STATE_NATIVE_WRITE_LEASE, 0, NULL );
+    ok( !status, "child register status %#x\n", status );
+    status = get_surface_lease( hwnd, LEASE_CHILD_ID, &binding );
+    ok( !status, "child lease binding status %#x\n", status );
+    if (!status)
+    {
+        view = MapViewOfFile( binding.mapping, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, binding.size );
+        ok( !!view, "child map lease section error %lu\n", GetLastError() );
+        CloseHandle( binding.mapping );
+    }
+    SetEvent( ready );
+    ok( WaitForSingleObject( release, 10000 ) == WAIT_OBJECT_0, "child release timed out\n" );
+    /* Deliberately omit unregister, binding ACK and UnmapViewOfFile. The final
+     * thread/process cleanup must retire the foreign-HWND membership and pool. */
+}
+
+static void test_lease_storage_process_exit( char **argv )
+{
+    SECURITY_ATTRIBUTES attr = {sizeof(attr), NULL, TRUE};
+    STARTUPINFOA startup = {.cb = sizeof(startup)};
+    PROCESS_INFORMATION process;
+    struct lease_binding own, foreign, again;
+    struct surface_state state;
+    HWND hwnd = create_test_window( FALSE );
+    HANDLE ready = NULL, release = NULL;
+    unsigned int status;
+    char command[MAX_PATH * 2];
+
+    ok( !!hwnd, "failed to create lease process window\n" );
+    if (!hwnd) return;
+    status = set_surface_state( hwnd, LEASE_PARENT_ID, CLIENT_SURFACE_STATE_REGISTER |
+                                CLIENT_SURFACE_STATE_NATIVE_WRITE_LEASE, 0, NULL );
+    ok( !status, "parent registration status %#x\n", status );
+    status = get_surface_lease( hwnd, LEASE_PARENT_ID, &own );
+    ok( !status, "parent binding status %#x\n", status );
+    if (status) goto done;
+    CloseHandle( own.mapping );
+    ready = CreateEventA( &attr, TRUE, FALSE, NULL );
+    release = CreateEventA( &attr, TRUE, FALSE, NULL );
+    ok( ready && release, "failed to create lease process events\n" );
+    if (!ready || !release) goto release_binding;
+    sprintf( command, "\"%s\" %s lease_storage_child %p %p %p", argv[0], argv[1], hwnd, ready, release );
+    if (!CreateProcessA( NULL, command, NULL, NULL, TRUE, 0, NULL, NULL, &startup, &process ))
+    {
+        ok( 0, "lease child CreateProcess error %lu\n", GetLastError() );
+        goto release_binding;
+    }
+    ok( WaitForSingleObject( ready, 10000 ) == WAIT_OBJECT_0, "lease child did not become ready\n" );
+    status = get_surface_lease( hwnd, LEASE_CHILD_ID, &foreign );
+    ok( status == STATUS_INVALID_PARAMETER, "parent mapped child capability, status %#x\n", status );
+    if (!status) CloseHandle( foreign.mapping );
+    status = set_surface_state( hwnd, 0, 0, 0, &state );
+    ok( !status && state.active == 2, "parent/child memberships status %#x active %u\n", status, state.active );
+    SetEvent( release );
+    wait_child_process( &process );
+    CloseHandle( process.hThread );
+    CloseHandle( process.hProcess );
+    status = set_surface_state( hwnd, 0, 0, 0, &state );
+    ok( !status && state.active == 1, "child leaked membership status %#x active %u\n", status, state.active );
+    status = get_surface_lease( hwnd, LEASE_PARENT_ID, &again );
+    ok( !status, "parent binding lost after child exit, status %#x\n", status );
+    if (!status)
+    {
+        ok( again.mapping_id == own.mapping_id && again.cookie == own.cookie,
+            "child cleanup changed parent capability\n" );
+        CloseHandle( again.mapping );
+    }
+release_binding:
+    release_surface_lease( LEASE_PARENT_ID, own.cookie );
+done:
+    if (ready) CloseHandle( ready );
+    if (release) CloseHandle( release );
+    set_surface_state( hwnd, LEASE_PARENT_ID, CLIENT_SURFACE_STATE_UNREGISTER, 0, NULL );
+    DestroyWindow( hwnd );
 }
 
 static void test_generation_aba(void)
@@ -2086,6 +2381,7 @@ static BOOL run_focused_test_case( const char *name, char **argv )
          test_native_backing_barrier},
         {"reparent-writer-leases", "writer lease cleanup across reparenting", test_reparent_writer_leases},
         {"demoted-native-barrier", "native backing barrier after demotion", test_demoted_native_barrier},
+        {"lease-storage", "scoped client surface lease storage", test_lease_storage},
         {"notification-filter", "client surface notification filter bypass",
          test_notification_identity_aba},
         {"writer-thread-exit", "writer thread exit lease cleanup", test_writer_thread_exit},
@@ -2116,6 +2412,11 @@ static BOOL run_focused_test_case( const char *name, char **argv )
         test_cross_process_pixel_format( argv );
         return TRUE;
     }
+    if (!strcmp( name, "lease-storage-process-exit" ))
+    {
+        test_lease_storage_process_exit( argv );
+        return TRUE;
+    }
     if (!strcmp( name, "owner-exit-destroy" ))
     {
         trace( "testing owner exit and window destruction\n" );
@@ -2138,6 +2439,16 @@ START_TEST(client_surface)
     if (!p_wine_server_call)
     {
         win_skip( "Wine server interface is unavailable\n" );
+        return;
+    }
+
+    if (argc > 5 && !strcmp( argv[2], "lease_storage_child" ))
+    {
+        HANDLE ready, release;
+        sscanf( argv[3], "%p", &hwnd );
+        sscanf( argv[4], "%p", &ready );
+        sscanf( argv[5], "%p", &release );
+        lease_storage_child( hwnd, ready, release );
         return;
     }
 
@@ -2185,6 +2496,9 @@ START_TEST(client_surface)
     GetDesktopWindow();
     trace( "testing client surface completion result provenance\n" );
     test_completion_result_provenance();
+    trace( "testing scoped client surface lease storage\n" );
+    test_lease_storage();
+    test_lease_storage_process_exit( argv );
     trace( "testing client surface generations\n" );
     test_generation_aba();
     trace( "testing client surface host publication transaction\n" );

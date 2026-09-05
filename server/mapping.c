@@ -1500,6 +1500,37 @@ struct object *create_user_data_mapping( struct object *root, struct unicode_str
     return &mapping->obj;
 }
 
+/* An unnamed, server-mapped writable section. Only explicitly allocated client
+ * handles expose it; callers must not put globally shared authority in it. */
+struct object *create_shared_data_mapping( mem_size_t size, void **ptr )
+{
+    struct mapping *mapping;
+    struct mapping_init_data data = { .size = size, .flags = SEC_COMMIT,
+                                      .file_access = FILE_READ_DATA | FILE_WRITE_DATA };
+    struct object_params params = { .ops = &mapping_ops, .init_data = &data };
+
+    *ptr = NULL;
+    if (!(mapping = create_named_object( &params ))) return NULL;
+    if ((*ptr = mmap( NULL, mapping->size, PROT_READ | PROT_WRITE, MAP_SHARED,
+                      get_unix_fd( mapping->fd ), 0 )) == MAP_FAILED)
+    {
+        *ptr = NULL;
+        file_set_error();
+        release_object( mapping );
+        return NULL;
+    }
+    return &mapping->obj;
+}
+
+void release_shared_data_mapping( struct object *obj, void *ptr )
+{
+    struct mapping *mapping = (struct mapping *)obj;
+
+    assert( obj->ops == &mapping_ops );
+    munmap( ptr, mapping->size );
+    release_object( obj );
+}
+
 /* create a file mapping */
 DECL_HANDLER(create_mapping)
 {

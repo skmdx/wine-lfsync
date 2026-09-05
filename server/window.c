@@ -30,11 +30,13 @@
 
 #include "object.h"
 #include "file.h"
+#include "handle.h"
 #include "request.h"
 #include "thread.h"
 #include "process.h"
 #include "user.h"
 #include "unicode.h"
+#include "wine/client_surface.h"
 
 static const struct ratio no_dpi;
 
@@ -60,6 +62,19 @@ struct client_surface_owner
     struct process *process;
 };
 
+struct client_surface_lease_pool
+{
+    struct list entry;
+    struct process *process; /* removed by cleanup_process_client_surfaces */
+    struct object *mapping;
+    struct client_surface_lease *slots;
+    UINT64 id;
+    unsigned char used[CLIENT_SURFACE_LEASE_SLOTS];
+};
+
+static struct list client_surface_lease_pools = LIST_INIT( client_surface_lease_pools );
+static UINT64 client_surface_lease_serial;
+
 enum client_surface_destroy_state
 {
     CLIENT_SURFACE_DESTROY_NONE,
@@ -75,6 +90,9 @@ struct client_surface_ref
     struct process *process; /* queue callback keeps this valid for a retired tombstone */
     struct thread *writer_thread; /* grabbed thread owning the native-target write lease */
     struct window  *writer_top; /* grabbed top-level owning the native-target write lease */
+    struct client_surface_lease_pool *lease_pool;
+    unsigned int lease_index;
+    UINT64 lease_cookie; /* authoritative, never trust the writable copy */
     client_ptr_t    id;
     unsigned long long generation;
     unsigned long long sequence;
@@ -136,7 +154,7 @@ static void remove_client_surface_ref_index( struct client_surface_ref *surface 
 
 static void free_client_surface_ref_if_unused( struct client_surface_ref *surface )
 {
-    if (surface->owner || surface->notification_pending ||
+    if (surface->owner || surface->lease_pool || surface->notification_pending ||
         surface->destroy_state != CLIENT_SURFACE_DESTROY_NONE)
         return;
 
@@ -152,10 +170,79 @@ static void free_client_surface_ref_if_unused( struct client_surface_ref *surfac
 static void retire_client_surface_ref( struct client_surface_ref *surface )
 {
     assert( !surface->writer_thread && !surface->writer_top );
+    if (surface->lease_pool)
+        __atomic_fetch_or( &surface->lease_pool->slots[surface->lease_index].control,
+                           CLIENT_SURFACE_LEASE_CLOSED, __ATOMIC_SEQ_CST );
     list_remove( &surface->entry );
     surface->active = surface->cached = surface->claimed = 0;
     surface->owner = NULL;
     free_client_surface_ref_if_unused( surface );
+}
+
+static int alloc_client_surface_lease( struct client_surface_ref *surface )
+{
+    struct client_surface_lease_pool *pool;
+    struct client_surface_lease *slot;
+    unsigned int i;
+    void *ptr;
+
+    /* IDs never wrap onto a still mapped capability. Exhaustion keeps the
+     * caller on the existing RPC path instead of permitting a native ABA. */
+    if (client_surface_lease_serial >= ~(UINT64)0 - 1)
+    {
+        set_error( STATUS_NO_MEMORY );
+        return 0;
+    }
+    LIST_FOR_EACH_ENTRY( pool, &client_surface_lease_pools, struct client_surface_lease_pool, entry )
+    {
+        if (pool->process != surface->process) continue;
+        for (i = 0; i < CLIENT_SURFACE_LEASE_SLOTS; ++i)
+            if (!pool->used[i]) goto found;
+    }
+    if (!(pool = mem_alloc( sizeof(*pool) ))) return 0;
+    if (!(pool->mapping = create_shared_data_mapping(
+              sizeof(struct client_surface_lease) * CLIENT_SURFACE_LEASE_SLOTS, &ptr )))
+    {
+        free( pool );
+        return 0;
+    }
+    pool->slots = ptr;
+    pool->process = surface->process;
+    pool->id = ++client_surface_lease_serial;
+    memset( pool->used, 0, sizeof(pool->used) );
+    for (i = 0; i < CLIENT_SURFACE_LEASE_SLOTS; ++i)
+        pool->slots[i].control = CLIENT_SURFACE_LEASE_CLOSED;
+    list_add_tail( &client_surface_lease_pools, &pool->entry );
+    i = 0;
+found:
+    pool->used[i] = 1;
+    surface->lease_pool = pool;
+    surface->lease_index = i;
+    surface->lease_cookie = ++client_surface_lease_serial;
+    slot = &pool->slots[i];
+    /* Storage/lifetime foundation only. Admission remains closed until the
+     * server scene and writer-drain protocol explicitly enables a fast path. */
+    __atomic_store_n( &slot->control, CLIENT_SURFACE_LEASE_CLOSED, __ATOMIC_SEQ_CST );
+    slot->cookie = surface->lease_cookie;
+    slot->identity = surface->id;
+    slot->scene_epoch = 0;
+    slot->toplevel = 0;
+    memset( slot->reserved, 0, sizeof(slot->reserved) );
+    return 1;
+}
+
+static void free_client_surface_lease( struct client_surface_ref *surface )
+{
+    struct client_surface_lease_pool *pool = surface->lease_pool;
+
+    if (!pool) return;
+    __atomic_store_n( &pool->slots[surface->lease_index].control, CLIENT_SURFACE_LEASE_CLOSED,
+                      __ATOMIC_SEQ_CST );
+    pool->used[surface->lease_index] = 0;
+    surface->lease_pool = NULL;
+    surface->lease_cookie = 0;
+    /* Keep the pool until process exit: allocation is bounded by peak live
+     * bindings, and existing client views need no remapping on slot reuse. */
 }
 
 
@@ -1255,6 +1342,9 @@ static struct client_surface_ref *get_client_surface_ref( struct client_surface_
     surface->writer_thread = NULL;
     surface->writer_top = NULL;
     surface->id = id;
+    surface->lease_pool = NULL;
+    surface->lease_index = 0;
+    surface->lease_cookie = 0;
     surface->generation = 0;
     surface->sequence = 0;
     surface->active = 0;
@@ -1712,6 +1802,7 @@ static int discard_client_surface_owners( struct window *win, struct window *top
 void cleanup_process_client_surfaces( struct process *process )
 {
     struct client_surface_ref *surface, *next;
+    struct client_surface_lease_pool *pool, *pool_next;
     user_handle_t handle = 0;
     struct client_surface_owner *owner;
     struct window *win, *top;
@@ -1744,15 +1835,79 @@ void cleanup_process_client_surfaces( struct process *process )
             next = surface->index_next;
             if (surface->process != process)
                 continue;
-            assert( !surface->owner && !surface->notification_pending &&
-                    surface->destroy_state == CLIENT_SURFACE_DESTROY_PENDING );
-            assert( process->client_surface_destroy_count );
-            process->client_surface_destroy_count--;
-            surface->destroy_state = CLIENT_SURFACE_DESTROY_NONE;
+            assert( !surface->owner && !surface->notification_pending );
+            if (surface->destroy_state != CLIENT_SURFACE_DESTROY_NONE)
+            {
+                assert( surface->destroy_state == CLIENT_SURFACE_DESTROY_PENDING );
+                assert( process->client_surface_destroy_count );
+                process->client_surface_destroy_count--;
+                surface->destroy_state = CLIENT_SURFACE_DESTROY_NONE;
+            }
+            free_client_surface_lease( surface );
             free_client_surface_ref_if_unused( surface );
         }
     }
     assert( !process->client_surface_destroy_count );
+    LIST_FOR_EACH_ENTRY_SAFE( pool, pool_next, &client_surface_lease_pools,
+                              struct client_surface_lease_pool, entry )
+    {
+        if (pool->process != process) continue;
+        list_remove( &pool->entry );
+        release_shared_data_mapping( pool->mapping, pool->slots );
+        free( pool );
+    }
+}
+
+DECL_HANDLER(get_client_surface_lease)
+{
+    struct window *win;
+    struct client_surface_owner *owner;
+    struct client_surface_ref *surface;
+    int created;
+
+    reply->mapping = 0;
+    reply->size = reply->offset = 0;
+    reply->mapping_id = reply->cookie = 0;
+    if (!(win = get_window( req->handle ))) return;
+    owner = get_client_surface_owner( win, current->process, 0 );
+    surface = get_client_surface_ref( owner, req->surface, 0 );
+    if (!surface || !surface->native_write_lease || (!surface->active && !surface->cached))
+    {
+        set_error( STATUS_INVALID_PARAMETER );
+        return;
+    }
+    created = !surface->lease_pool;
+    if (created && !alloc_client_surface_lease( surface )) return;
+    if (!(reply->mapping = alloc_handle( current->process, surface->lease_pool->mapping,
+                                         SECTION_MAP_READ | SECTION_MAP_WRITE, 0 )))
+    {
+        if (created) free_client_surface_lease( surface );
+        return;
+    }
+    reply->mapping_id = surface->lease_pool->id;
+    reply->size = sizeof(struct client_surface_lease) * CLIENT_SURFACE_LEASE_SLOTS;
+    reply->offset = sizeof(struct client_surface_lease) * surface->lease_index;
+    reply->cookie = surface->lease_cookie;
+}
+
+DECL_HANDLER(release_client_surface_lease)
+{
+    struct client_surface_ref *surface = find_indexed_client_surface_ref( current->process, req->surface );
+
+    if (!surface || !surface->lease_pool || !req->cookie || req->cookie != surface->lease_cookie)
+    {
+        set_error( STATUS_INVALID_PARAMETER );
+        return;
+    }
+    if (__atomic_fetch_or( &surface->lease_pool->slots[surface->lease_index].control,
+                           CLIENT_SURFACE_LEASE_CLOSED, __ATOMIC_SEQ_CST ) &
+        ~CLIENT_SURFACE_LEASE_CLOSED)
+    {
+        set_error( STATUS_DEVICE_BUSY );
+        return;
+    }
+    free_client_surface_lease( surface );
+    free_client_surface_ref_if_unused( surface );
 }
 
 static unsigned int prepare_client_surface_generation( struct window *win, unsigned long long generation )

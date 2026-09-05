@@ -3585,6 +3585,27 @@ static void dump_get_client_surface_clip_windows_reply( const struct get_client_
     dump_varargs_bytes( ", windows=", cur_size );
 }
 
+static void dump_get_client_surface_lease_request( const struct get_client_surface_lease_request *req )
+{
+    fprintf( stderr, " handle=%08x", req->handle );
+    dump_uint64( ", surface=", &req->surface );
+}
+
+static void dump_get_client_surface_lease_reply( const struct get_client_surface_lease_reply *req )
+{
+    fprintf( stderr, " mapping=%04x", req->mapping );
+    fprintf( stderr, ", size=%08x", req->size );
+    fprintf( stderr, ", offset=%08x", req->offset );
+    dump_uint64( ", mapping_id=", &req->mapping_id );
+    dump_uint64( ", cookie=", &req->cookie );
+}
+
+static void dump_release_client_surface_lease_request( const struct release_client_surface_lease_request *req )
+{
+    dump_uint64( " surface=", &req->surface );
+    dump_uint64( ", cookie=", &req->cookie );
+}
+
 typedef void (*dump_func)( const void *req );
 
 static const dump_func req_dumpers[REQ_NB_REQUESTS] =
@@ -3900,6 +3921,8 @@ static const dump_func req_dumpers[REQ_NB_REQUESTS] =
     (dump_func)dump_alpc_create_port_request,
     (dump_func)dump_set_client_surface_state_request,
     (dump_func)dump_get_client_surface_clip_windows_request,
+    (dump_func)dump_get_client_surface_lease_request,
+    (dump_func)dump_release_client_surface_lease_request,
 };
 
 static const dump_func reply_dumpers[REQ_NB_REQUESTS] =
@@ -4215,6 +4238,8 @@ static const dump_func reply_dumpers[REQ_NB_REQUESTS] =
     (dump_func)dump_alpc_create_port_reply,
     (dump_func)dump_set_client_surface_state_reply,
     (dump_func)dump_get_client_surface_clip_windows_reply,
+    (dump_func)dump_get_client_surface_lease_reply,
+    NULL,
 };
 
 static const char * const req_names[REQ_NB_REQUESTS] =
@@ -4530,6 +4555,8 @@ static const char * const req_names[REQ_NB_REQUESTS] =
     "alpc_create_port",
     "set_client_surface_state",
     "get_client_surface_clip_windows",
+    "get_client_surface_lease",
+    "release_client_surface_lease",
 };
 
 static const struct
