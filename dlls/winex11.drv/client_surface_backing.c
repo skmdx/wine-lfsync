@@ -57,12 +57,18 @@ struct client_surface_compositor_binding
     struct client_surface_compositor_binding *next;
     struct client_surface_compositor_pool *pool;
     struct client_surface_handoff_slot *slot;
+    Pixmap source;
+    Drawable source_window;
     HWND toplevel;
     HWND window;
     process_id_t process;
     UINT64 identity;
     UINT64 cookie;
     UINT64 mark;
+    UINT64 source_target_seq;
+    unsigned int source_width;
+    unsigned int source_height;
+    unsigned int source_depth;
 };
 
 #define CLIENT_SURFACE_COMPOSITOR_FRAME_COUNT 3
@@ -720,6 +726,11 @@ static void remove_client_surface_compositor_binding(
     struct client_surface_compositor_binding *binding = *cursor;
 
     *cursor = binding->next;
+    if (binding->source)
+    {
+        XFreePixmap( client_surface_compositor_display, binding->source );
+        XSync( client_surface_compositor_display, False );
+    }
     release_client_surface_compositor_binding_server( binding );
     release_client_surface_compositor_pool( binding->pool );
     free( binding );
@@ -772,7 +783,7 @@ static BOOL register_client_surface_compositor_handoff(
         if (job->offset > pool->size - sizeof(struct client_surface_handoff_slot)) return FALSE;
         shared = pool->shared;
     }
-    if (!(binding = malloc( sizeof(*binding) )))
+    if (!(binding = calloc( 1, sizeof(*binding) )))
     {
         if (!pool->refs)
         {
@@ -1056,6 +1067,46 @@ static BOOL validate_client_surface_pixmap( Pixmap pixmap, unsigned int min_widt
            source_depth == depth;
 }
 
+static BOOL get_client_surface_compositor_source(
+    struct client_surface_compositor_binding *binding,
+    const struct client_surface_handoff_slot *slot, unsigned int depth,
+    Pixmap *source )
+{
+    Pixmap imported = 0;
+
+    if (binding->source && binding->source_window == slot->source &&
+        binding->source_target_seq == slot->target_seq &&
+        binding->source_width == slot->width && binding->source_height == slot->height &&
+        binding->source_depth == depth)
+    {
+        *source = binding->source;
+        return TRUE;
+    }
+
+    if (!import_client_surface_pixmap( slot->source, &imported ) ||
+        !validate_client_surface_pixmap( imported, slot->width, slot->height, depth ))
+    {
+        if (imported)
+        {
+            XFreePixmap( client_surface_compositor_display, imported );
+            XSync( client_surface_compositor_display, False );
+        }
+        return FALSE;
+    }
+    if (binding->source) XFreePixmap( client_surface_compositor_display, binding->source );
+    binding->source = imported;
+    binding->source_window = slot->source;
+    binding->source_target_seq = slot->target_seq;
+    binding->source_width = slot->width;
+    binding->source_height = slot->height;
+    binding->source_depth = depth;
+    *source = imported;
+    TRACE( "retained source pixmap %#lx for hwnd %p identity %s target %s\n",
+           imported, binding->window, wine_dbgstr_longlong( binding->identity ),
+           wine_dbgstr_longlong( slot->target_seq ) );
+    return TRUE;
+}
+
 static BOOL get_client_surface_compositor_catchup(
     const struct client_surface_compositor_target *target,
     const struct client_surface_compositor_frame *frame, RECT *rect )
@@ -1277,8 +1328,8 @@ static BOOL compose_client_surface_handoff(
         if (target->frames[0].pixmap == target->backing) frame = &target->frames[0];
         else if (target->frames[1].pixmap == target->backing) frame = &target->frames[1];
 
-        if (!frame || !import_client_surface_pixmap( slot->source, &source ) ||
-            !validate_client_surface_pixmap( source, slot->width, slot->height, target->depth ))
+        if (!frame || !get_client_surface_compositor_source(
+                          binding, slot, target->depth, &source ))
             goto release;
 
         /* Every producer in a transaction writes the owner-selected backing.
@@ -1366,12 +1417,6 @@ static BOOL compose_client_surface_handoff(
         }
     }
 release:
-    if (source)
-    {
-        XFreePixmap( client_surface_compositor_display, source );
-        XSync( client_surface_compositor_display, False );
-    }
-
     /* Once the compositor connection has copied the source into its backing,
      * or rejected it against a newer owner epoch before import, source storage
      * is reusable. A native import/copy failure instead retires the binding. */
