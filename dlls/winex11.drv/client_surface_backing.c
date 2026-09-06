@@ -1635,7 +1635,12 @@ static BOOL compose_client_surface_handoff(
                 if (!clip->width || !clip->height || clip->x < 0 || clip->y < 0 ||
                     (unsigned int)clip->x + clip->width > destination_width ||
                     (unsigned int)clip->y + clip->height > destination_height)
+                {
+                    WARN( "invalid handoff clip %d,%d %ux%u for destination %ux%u, identity %s\n",
+                          clip->x, clip->y, clip->width, clip->height,
+                          destination_width, destination_height, wine_dbgstr_longlong( binding->identity ) );
                     break;
+                }
                 rect = (RECT){slot->destination.left + clip->x,
                               slot->destination.top + clip->y,
                               slot->destination.left + clip->x + clip->width,

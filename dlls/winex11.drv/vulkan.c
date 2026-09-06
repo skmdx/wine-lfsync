@@ -73,6 +73,26 @@ static VkBool32 X11DRV_get_physical_device_presentation_support( struct vulkan_p
                                                                       default_visual.visual->visualid );
 }
 
+static BOOL X11DRV_vulkan_surface_needs_snapshot( struct client_surface *client )
+{
+    return !usexcomposite;
+}
+
+static BOOL X11DRV_vulkan_surface_snapshot( struct client_surface *client,
+                                           struct client_surface_frame *present,
+                                           const void *pixels, uint32_t width, uint32_t height,
+                                           VkFormat format )
+{
+    struct x11drv_client_surface *surface = impl_from_client_surface( client );
+    BOOL bgra = format == VK_FORMAT_B8G8R8A8_UNORM || format == VK_FORMAT_B8G8R8A8_SRGB;
+
+    if (!x11drv_client_surface_snapshot( client, pixels, width, height, TRUE, bgra )) return FALSE;
+    if (present->handoff_control) client->handoff_slot->source = surface->snapshot;
+    TRACE( "captured Vulkan snapshot %#lx size %ux%u format %u for %s\n",
+           surface->snapshot, width, height, format, debugstr_client_surface( client ) );
+    return TRUE;
+}
+
 static void X11DRV_map_instance_extensions( struct vulkan_instance_extensions *extensions )
 {
     if (extensions->has_VK_KHR_win32_surface) extensions->has_VK_KHR_xlib_surface = 1;
@@ -92,6 +112,8 @@ static void X11DRV_map_device_extensions( struct vulkan_device_extensions *exten
 static const struct vulkan_driver_funcs x11drv_vulkan_driver_funcs =
 {
     .p_vulkan_surface_create = X11DRV_vulkan_surface_create,
+    .p_vulkan_surface_needs_snapshot = X11DRV_vulkan_surface_needs_snapshot,
+    .p_vulkan_surface_snapshot = X11DRV_vulkan_surface_snapshot,
     .p_get_physical_device_presentation_support = X11DRV_get_physical_device_presentation_support,
     .p_map_instance_extensions = X11DRV_map_instance_extensions,
     .p_map_device_extensions = X11DRV_map_device_extensions,

@@ -125,8 +125,8 @@ static VkResult create_device(VkPhysicalDevice vk_physical_device,
     return vkCreateDevice(vk_physical_device, &create_info, NULL, vk_device);
 }
 
-static VkResult create_swapchain(VkPhysicalDevice physical_device, VkSurfaceKHR surface,
-        VkDevice device, HWND hwnd, VkSwapchainKHR *swapchain)
+static VkResult create_swapchain_usage(VkPhysicalDevice physical_device, VkSurfaceKHR surface,
+        VkDevice device, HWND hwnd, VkImageUsageFlags usage, VkSwapchainKHR *swapchain)
 {
     VkSwapchainCreateInfoKHR create_info = {.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR};
     VkSurfaceCapabilitiesKHR capabilities;
@@ -150,7 +150,7 @@ static VkResult create_swapchain(VkPhysicalDevice physical_device, VkSurfaceKHR 
     create_info.imageExtent.width = max(client_rect.right - client_rect.left, capabilities.minImageExtent.width);
     create_info.imageExtent.height = max(client_rect.bottom - client_rect.top, capabilities.minImageExtent.height);
     create_info.imageArrayLayers = 1;
-    create_info.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+    create_info.imageUsage = usage;
     create_info.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
     create_info.preTransform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
     create_info.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
@@ -158,6 +158,13 @@ static VkResult create_swapchain(VkPhysicalDevice physical_device, VkSurfaceKHR 
     create_info.clipped = VK_TRUE;
 
     return vkCreateSwapchainKHR(device, &create_info, NULL, swapchain);
+}
+
+static VkResult create_swapchain(VkPhysicalDevice physical_device, VkSurfaceKHR surface,
+        VkDevice device, HWND hwnd, VkSwapchainKHR *swapchain)
+{
+    return create_swapchain_usage(physical_device, surface, device, hwnd,
+            VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, swapchain);
 }
 
 static void test_instance_version(void)
@@ -1072,6 +1079,188 @@ done:
     }
 }
 
+static void test_win32_surface_pixels(VkInstance instance, VkPhysicalDevice physical_device,
+        VkDevice device, VkQueue queue, VkCommandBuffer command_buffer)
+{
+    VkWin32SurfaceCreateInfoKHR surface_info = {.sType = VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR};
+    VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    VkFenceCreateInfo fence_info = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+    VkSemaphoreCreateInfo semaphore_info = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+    VkPresentInfoKHR present = {.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
+    VkSubmitInfo submit = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    struct multi_swapchain data[2] = {{0}};
+    VkSwapchainKHR swapchains[2];
+    uint32_t indices[2];
+    VkResult results[2], vr;
+    VkFence fence = VK_NULL_HANDLE;
+    VkSemaphore rendered = VK_NULL_HANDLE;
+    PIXELFORMATDESCRIPTOR pfd = {.nSize = sizeof(pfd), .nVersion = 1,
+                                .dwFlags = PFD_DRAW_TO_WINDOW | PFD_SUPPORT_OPENGL,
+                                .iPixelType = PFD_TYPE_RGBA, .cColorBits = 24};
+    HWND parent;
+    unsigned int i, round;
+    HDC dc[2] = {0};
+
+    parent = CreateWindowExW(WS_EX_TOPMOST, L"static", L"Vulkan composition pixels",
+            WS_POPUP | WS_VISIBLE, 80, 80, 256, 128, NULL, NULL, NULL, NULL);
+    ok(!!parent, "Failed to create composition parent, error %lu.\n", GetLastError());
+    if (!parent) return;
+    vr = vkCreateFence(device, &fence_info, NULL, &fence);
+    ok(vr == VK_SUCCESS, "Create fence failed, vr %d.\n", vr);
+    if (vr) goto done;
+    vr = vkCreateSemaphore(device, &semaphore_info, NULL, &rendered);
+    ok(vr == VK_SUCCESS, "Create render semaphore failed, vr %d.\n", vr);
+    if (vr) goto done;
+    for (i = 0; i < ARRAY_SIZE(data); ++i)
+    {
+        data[i].hwnd = CreateWindowW(L"static", L"Vulkan child", WS_CHILD | WS_VISIBLE,
+                i * 128, 0, 128, 128, parent, NULL, NULL, NULL);
+        ok(!!data[i].hwnd, "Failed to create child %u.\n", i);
+        if (!data[i].hwnd) goto done;
+        /* Read native presentation pixels instead of a separate GDI DIB. */
+        dc[i] = GetDC(data[i].hwnd);
+        ok(!!dc[i], "Failed to get child DC.\n");
+        if (!dc[i]) goto done;
+        ok(SetPixelFormat(dc[i], ChoosePixelFormat(dc[i], &pfd), &pfd), "Failed to set readback pixel format.\n");
+        ReleaseDC(data[i].hwnd, dc[i]);
+        dc[i] = NULL;
+        surface_info.hwnd = data[i].hwnd;
+        vr = vkCreateWin32SurfaceKHR(instance, &surface_info, NULL, &data[i].surface);
+        ok(vr == VK_SUCCESS, "Create child surface %u failed, vr %d.\n", i, vr);
+        if (vr) goto done;
+        vr = create_swapchain_usage(physical_device, data[i].surface, device, data[i].hwnd,
+                VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, &data[i].swapchain);
+        ok(vr == VK_SUCCESS, "Create child swapchain %u failed, vr %d.\n", i, vr);
+        if (vr) goto done;
+        vr = vkGetSwapchainImagesKHR(device, data[i].swapchain, &data[i].image_count, NULL);
+        ok(vr == VK_SUCCESS, "Get child image count %u failed, vr %d.\n", i, vr);
+        if (vr || !data[i].image_count) goto done;
+        data[i].images = malloc(data[i].image_count * sizeof(*data[i].images));
+        ok(!!data[i].images, "Failed to allocate child image handles.\n");
+        if (!data[i].images) goto done;
+        vr = vkGetSwapchainImagesKHR(device, data[i].swapchain, &data[i].image_count, data[i].images);
+        ok(vr == VK_SUCCESS, "Get child images %u failed, vr %d.\n", i, vr);
+        if (vr) goto done;
+        swapchains[i] = data[i].swapchain;
+    }
+    /* Apply the initial window geometry and paint before checking steady
+     * multi-swapchain publication. */
+    {
+        MSG message;
+
+        UpdateWindow(parent);
+        while (PeekMessageW(&message, NULL, 0, 0, PM_REMOVE))
+        {
+            TranslateMessage(&message);
+            DispatchMessageW(&message);
+        }
+    }
+    for (i = 0; i < ARRAY_SIZE(data); ++i)
+    {
+        dc[i] = GetDC(data[i].hwnd);
+        ok(!!dc[i], "Failed to get readback DC.\n");
+        if (!dc[i]) goto done;
+    }
+    for (round = 0; round < 4; ++round)
+    {
+        COLORREF colors[2] = {CLR_INVALID, CLR_INVALID};
+        COLORREF expected[2] = {round & 1 ? RGB(0,0,255) : RGB(255,0,0),
+                                round & 1 ? RGB(255,0,255) : RGB(0,255,0)};
+        DWORD start;
+        MSG message;
+
+        for (i = 0; i < ARRAY_SIZE(data); ++i)
+        {
+            vkResetFences(device, 1, &fence);
+            vr = vkAcquireNextImageKHR(device, data[i].swapchain, UINT64_MAX, VK_NULL_HANDLE, fence, &indices[i]);
+            ok(vr == VK_SUCCESS, "Round %u child %u acquire failed, vr %d.\n", round, i, vr);
+            if (vr) goto done;
+            vr = vkWaitForFences(device, 1, &fence, VK_TRUE, UINT64_MAX);
+            ok(vr == VK_SUCCESS, "Wait acquire failed, vr %d.\n", vr);
+            if (vr) goto done;
+        }
+        vkResetCommandBuffer(command_buffer, 0);
+        vr = vkBeginCommandBuffer(command_buffer, &begin);
+        ok(vr == VK_SUCCESS, "Begin clear commands failed, vr %d.\n", vr);
+        if (vr) goto done;
+        for (i = 0; i < ARRAY_SIZE(data); ++i)
+        {
+            VkImageMemoryBarrier barrier = {.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+                                            .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+                                            .oldLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+                                            .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                                            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                                            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                                            .image = data[i].images[indices[i]],
+                                            .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
+            VkClearColorValue color = {{GetRValue(expected[i]) / 255.0f,
+                                       GetGValue(expected[i]) / 255.0f,
+                                       GetBValue(expected[i]) / 255.0f, 1.0f}};
+
+            vkCmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                    VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &barrier);
+            vkCmdClearColorImage(command_buffer, barrier.image, barrier.newLayout, &color, 1, &barrier.subresourceRange);
+            barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            barrier.dstAccessMask = 0;
+            barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+            barrier.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+            vkCmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                    VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0, NULL, 0, NULL, 1, &barrier);
+        }
+        vr = vkEndCommandBuffer(command_buffer);
+        ok(vr == VK_SUCCESS, "End clear commands failed, vr %d.\n", vr);
+        if (vr) goto done;
+        submit.commandBufferCount = 1;
+        submit.pCommandBuffers = &command_buffer;
+        submit.signalSemaphoreCount = 1;
+        submit.pSignalSemaphores = &rendered;
+        vr = vkQueueSubmit(queue, 1, &submit, VK_NULL_HANDLE);
+        ok(vr == VK_SUCCESS, "Submit clear failed, vr %d.\n", vr);
+        if (vr) goto done;
+        present.waitSemaphoreCount = 1;
+        present.pWaitSemaphores = &rendered;
+        present.swapchainCount = ARRAY_SIZE(data);
+        present.pSwapchains = swapchains;
+        present.pImageIndices = indices;
+        present.pResults = results;
+        vr = vkQueuePresentKHR(queue, &present);
+        ok(vr == VK_SUCCESS, "Round %u composition present failed, vr %d.\n", round, vr);
+        for (i = 0; i < ARRAY_SIZE(data); ++i)
+            ok(results[i] == VK_SUCCESS, "Child %u present failed, vr %d.\n", i, results[i]);
+        vkQueueWaitIdle(queue);
+
+        start = GetTickCount();
+        do
+        {
+            while (PeekMessageW(&message, NULL, 0, 0, PM_REMOVE))
+            {
+                TranslateMessage(&message);
+                DispatchMessageW(&message);
+            }
+            for (i = 0; i < ARRAY_SIZE(data); ++i) colors[i] = GetPixel(dc[i], 64, 64);
+            if (colors[0] == expected[0] && colors[1] == expected[1]) break;
+            Sleep(1);
+        } while (GetTickCount() - start < 5000);
+        for (i = 0; i < ARRAY_SIZE(data); ++i)
+            ok(colors[i] == expected[i], "Round %u child %u pixel %#lx, expected %#lx.\n",
+                    round, i, colors[i], expected[i]);
+        trace("Composition round %u pixels %#lx/%#lx.\n", round, colors[0], colors[1]);
+    }
+done:
+    vkQueueWaitIdle(queue);
+    if (rendered) vkDestroySemaphore(device, rendered, NULL);
+    if (fence) vkDestroyFence(device, fence, NULL);
+    for (i = 0; i < ARRAY_SIZE(data); ++i)
+    {
+        free(data[i].images);
+        if (data[i].swapchain) vkDestroySwapchainKHR(device, data[i].swapchain, NULL);
+        if (data[i].surface) vkDestroySurfaceKHR(instance, data[i].surface, NULL);
+        if (dc[i]) ReleaseDC(data[i].hwnd, dc[i]);
+        if (data[i].hwnd) DestroyWindow(data[i].hwnd);
+    }
+    DestroyWindow(parent);
+}
+
 static void test_win32_surface(VkInstance instance, VkPhysicalDevice physical_device)
 {
     static const char *const device_extensions[] = {"VK_KHR_swapchain", "VK_KHR_device_group"};
@@ -1088,6 +1277,9 @@ static void test_win32_surface(VkInstance instance, VkPhysicalDevice physical_de
     VkQueue queue;
     VkResult vr;
     HWND hwnd;
+    char **argv;
+    int argc = winetest_get_mainargs(&argv);
+    BOOL pixels_only = argc > 2 && !strcmp(argv[2], "composition-pixels");
 
     vr = create_device(physical_device, ARRAY_SIZE(device_extensions), device_extensions, NULL, &device);
     if (vr != VK_SUCCESS) /* Wine testbot is missing VK_KHR_device_group */
@@ -1107,6 +1299,8 @@ static void test_win32_surface(VkInstance instance, VkPhysicalDevice physical_de
     allocate_info.commandBufferCount = 1;
     vr = vkAllocateCommandBuffers(device, &allocate_info, &command_buffer);
     ok(vr == VK_SUCCESS, "Got unexpected vr %d.\n", vr);
+
+    if (pixels_only) goto composition_pixels;
 
     /* test NULL window */
 
@@ -1357,10 +1551,15 @@ static void test_win32_surface(VkInstance instance, VkPhysicalDevice physical_de
     test_win32_surface_multi_swapchain(instance, physical_device, device, queue, command_buffer);
     winetest_pop_context();
 
+composition_pixels:
+    winetest_push_context("composition-pixels");
+    test_win32_surface_pixels(instance, physical_device, device, queue, command_buffer);
+    winetest_pop_context();
+
     vkDestroyCommandPool(device, command_pool, NULL);
     vkDestroyDevice(device, NULL);
 
-    test_present_timing(instance, physical_device);
+    if (!pixels_only) test_present_timing(instance, physical_device);
 }
 
 static uint32_t find_memory_type(VkPhysicalDevice vk_physical_device, VkMemoryPropertyFlagBits flags, uint32_t mask)
@@ -2018,6 +2217,13 @@ START_TEST(vulkan)
     int argc;
 
     argc = winetest_get_mainargs(&argv);
+
+    if (argc > 2 && !strcmp(argv[2], "composition-pixels"))
+    {
+        for_each_device_instance(ARRAY_SIZE(test_win32_surface_extensions), test_win32_surface_extensions,
+                test_win32_surface, NULL);
+        return;
+    }
 
     if (argc > 3 && !strcmp(argv[2], "resource"))
     {

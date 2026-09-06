@@ -151,11 +151,29 @@ static struct surface *surface_from_handle( VkSurfaceKHR handle )
     return CONTAINING_RECORD( obj, struct surface, obj );
 }
 
+struct swapchain_snapshot
+{
+    VkImage *images;
+    VkSemaphore *semaphores;
+    uint32_t image_count;
+    VkBuffer buffer;
+    VkDeviceMemory memory;
+    void *pixels;
+    VkCommandPool pool;
+    VkCommandBuffer command;
+    uint32_t queue_family;
+    VkFence fence;
+};
+
 struct swapchain
 {
     struct vulkan_swapchain obj;
     struct surface *surface;
     VkExtent2D extents;
+    VkExtent2D host_extents;
+    VkFormat format;
+    BOOL needs_snapshot;
+    struct swapchain_snapshot snapshot;
     pthread_mutex_t present_lock;
     pthread_cond_t completion_cond;
     unsigned int completion_refs;
@@ -1927,6 +1945,200 @@ static int compare_client_surface_ptrs( const void *left, const void *right )
     return (a > b) - (a < b);
 }
 
+static void destroy_swapchain_snapshot( struct vulkan_device *device, struct swapchain_snapshot *snapshot )
+{
+    unsigned int i;
+
+    if (snapshot->pool) device->p_vkDestroyCommandPool( device->host.device, snapshot->pool, NULL );
+    if (snapshot->fence) device->p_vkDestroyFence( device->host.device, snapshot->fence, NULL );
+    if (snapshot->semaphores)
+        for (i = 0; i < snapshot->image_count; ++i)
+            if (snapshot->semaphores[i])
+                device->p_vkDestroySemaphore( device->host.device, snapshot->semaphores[i], NULL );
+    if (snapshot->pixels) device->p_vkUnmapMemory( device->host.device, snapshot->memory );
+    if (snapshot->buffer) device->p_vkDestroyBuffer( device->host.device, snapshot->buffer, NULL );
+    if (snapshot->memory) device->p_vkFreeMemory( device->host.device, snapshot->memory, NULL );
+    free( snapshot->semaphores );
+    free( snapshot->images );
+    memset( snapshot, 0, sizeof(*snapshot) );
+}
+
+static VkResult prepare_swapchain_snapshot( struct vulkan_queue *queue, struct swapchain *swapchain )
+{
+    struct vulkan_device *device = queue->device;
+    struct swapchain_snapshot *snapshot = &swapchain->snapshot;
+    const VkPhysicalDeviceMemoryProperties *properties = &device->physical_device->memory_properties;
+    VkCommandPoolCreateInfo pool_info = {.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+                                        .queueFamilyIndex = queue->info.queueFamilyIndex};
+    VkCommandBufferAllocateInfo command_info = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+                                               .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY, .commandBufferCount = 1};
+    VkBufferCreateInfo buffer_info = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+                                     .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT};
+    VkMemoryAllocateInfo memory_info = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    VkSemaphoreCreateInfo semaphore_info = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+    VkFenceCreateInfo fence_info = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+    VkMemoryRequirements requirements;
+    unsigned int i;
+    VkResult res;
+
+    if (!snapshot->buffer)
+    {
+        if ((res = device->p_vkGetSwapchainImagesKHR( device->host.device, swapchain->obj.host.swapchain,
+                                                     &snapshot->image_count, NULL ))) goto failed;
+        if (!(snapshot->images = calloc( snapshot->image_count, sizeof(*snapshot->images) )) ||
+            !(snapshot->semaphores = calloc( snapshot->image_count, sizeof(*snapshot->semaphores) )))
+        {
+            res = VK_ERROR_OUT_OF_HOST_MEMORY;
+            goto failed;
+        }
+        if ((res = device->p_vkGetSwapchainImagesKHR( device->host.device, swapchain->obj.host.swapchain,
+                                                     &snapshot->image_count, snapshot->images ))) goto failed;
+        for (i = 0; i < snapshot->image_count; ++i)
+            if ((res = device->p_vkCreateSemaphore( device->host.device, &semaphore_info,
+                                                    NULL, &snapshot->semaphores[i] ))) goto failed;
+        buffer_info.size = (VkDeviceSize)swapchain->host_extents.width * swapchain->host_extents.height * 4;
+        if ((res = device->p_vkCreateBuffer( device->host.device, &buffer_info, NULL, &snapshot->buffer ))) goto failed;
+        device->p_vkGetBufferMemoryRequirements( device->host.device, snapshot->buffer, &requirements );
+        for (i = 0; i < properties->memoryTypeCount; ++i)
+            if ((requirements.memoryTypeBits & (1u << i)) &&
+                (properties->memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)) break;
+        if (i == properties->memoryTypeCount)
+        {
+            res = VK_ERROR_OUT_OF_DEVICE_MEMORY;
+            goto failed;
+        }
+        memory_info.allocationSize = requirements.size;
+        memory_info.memoryTypeIndex = i;
+        if ((res = device->p_vkAllocateMemory( device->host.device, &memory_info, NULL, &snapshot->memory )) ||
+            (res = device->p_vkBindBufferMemory( device->host.device, snapshot->buffer, snapshot->memory, 0 )) ||
+            (res = device->p_vkMapMemory( device->host.device, snapshot->memory, 0, VK_WHOLE_SIZE,
+                                         0, &snapshot->pixels )) ||
+            (res = device->p_vkCreateFence( device->host.device, &fence_info, NULL, &snapshot->fence ))) goto failed;
+    }
+    if (snapshot->pool && snapshot->queue_family != queue->info.queueFamilyIndex)
+    {
+        device->p_vkDestroyCommandPool( device->host.device, snapshot->pool, NULL );
+        snapshot->pool = 0;
+    }
+    if (!snapshot->pool)
+    {
+        if ((res = device->p_vkCreateCommandPool( device->host.device, &pool_info, NULL, &snapshot->pool ))) goto failed;
+        snapshot->queue_family = queue->info.queueFamilyIndex;
+        command_info.commandPool = snapshot->pool;
+        if ((res = device->p_vkAllocateCommandBuffers( device->host.device, &command_info, &snapshot->command ))) goto failed;
+    }
+    return device->p_vkResetCommandPool( device->host.device, snapshot->pool, 0 );
+
+failed:
+    destroy_swapchain_snapshot( device, snapshot );
+    return res;
+}
+
+static VkResult snapshot_vulkan_present( struct vulkan_queue *queue, VkPresentInfoKHR *present_info,
+                                         const VkSwapchainKHR *client_swapchains,
+                                         struct client_surface_frame *presents )
+{
+    struct vulkan_device *device = queue->device;
+    VkCommandBuffer commands_buffer[16], *commands = commands_buffer;
+    VkPipelineStageFlags stages_buffer[16], *stages = stages_buffer;
+    VkSubmitInfo submit = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    struct swapchain_snapshot *first = NULL;
+    VkSemaphore *semaphore = NULL;
+    unsigned int i, count = 0;
+    VkResult res = VK_SUCCESS;
+
+    if (present_info->swapchainCount > ARRAY_SIZE(commands_buffer) &&
+        !(commands = malloc( present_info->swapchainCount * sizeof(*commands) )))
+        return VK_ERROR_OUT_OF_HOST_MEMORY;
+    if (present_info->waitSemaphoreCount > ARRAY_SIZE(stages_buffer) &&
+        !(stages = malloc( present_info->waitSemaphoreCount * sizeof(*stages) )))
+    {
+        res = VK_ERROR_OUT_OF_HOST_MEMORY;
+        goto done;
+    }
+    for (i = 0; i < present_info->swapchainCount; ++i)
+    {
+        struct swapchain *swapchain = swapchain_from_handle( client_swapchains[i] );
+        struct swapchain_snapshot *snapshot = &swapchain->snapshot;
+        VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+                                          .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
+        VkImageMemoryBarrier image = {.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+                                      .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
+                                      .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+                                      .oldLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+                                      .newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                      .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                                      .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                                      .subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1}};
+        VkBufferMemoryBarrier buffer = {.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+                                        .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+                                        .dstAccessMask = VK_ACCESS_HOST_READ_BIT,
+                                        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                                        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                                        .size = VK_WHOLE_SIZE};
+        VkBufferImageCopy copy = {.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+                                  .imageExtent = {swapchain->host_extents.width, swapchain->host_extents.height, 1}};
+
+        if (!swapchain->needs_snapshot || presents[i].target != CLIENT_SURFACE_FRAME_TARGET_OFFSCREEN) continue;
+        if ((res = prepare_swapchain_snapshot( queue, swapchain ))) goto done;
+        image.image = snapshot->images[present_info->pImageIndices[i]];
+        buffer.buffer = snapshot->buffer;
+        if ((res = device->p_vkBeginCommandBuffer( snapshot->command, &begin ))) goto done;
+        device->p_vkCmdPipelineBarrier( snapshot->command, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                        VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &image );
+        device->p_vkCmdCopyImageToBuffer( snapshot->command, image.image, image.newLayout, snapshot->buffer, 1, &copy );
+        image.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        image.dstAccessMask = 0;
+        image.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        image.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+        device->p_vkCmdPipelineBarrier( snapshot->command, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                        VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                                        0, 0, NULL, 1, &buffer, 1, &image );
+        if ((res = device->p_vkEndCommandBuffer( snapshot->command ))) goto done;
+        commands[count++] = snapshot->command;
+        if (!first)
+        {
+            first = snapshot;
+            semaphore = &snapshot->semaphores[present_info->pImageIndices[i]];
+        }
+    }
+    if (!count) goto done;
+
+    /* Consume the application's waits once, before reading any swapchain.
+     * The replacement semaphore belongs to an acquired image; reacquiring
+     * that image guarantees its previous presentation wait has finished. */
+    for (i = 0; i < present_info->waitSemaphoreCount; ++i) stages[i] = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+    submit.waitSemaphoreCount = present_info->waitSemaphoreCount;
+    submit.pWaitSemaphores = present_info->pWaitSemaphores;
+    submit.pWaitDstStageMask = stages;
+    submit.commandBufferCount = count;
+    submit.pCommandBuffers = commands;
+    submit.signalSemaphoreCount = 1;
+    submit.pSignalSemaphores = semaphore;
+    if ((res = device->p_vkResetFences( device->host.device, 1, &first->fence )) ||
+        (res = device->p_vkQueueSubmit( queue->host.queue, 1, &submit, first->fence ))) goto done;
+    present_info->waitSemaphoreCount = 1;
+    present_info->pWaitSemaphores = semaphore;
+    if ((res = device->p_vkWaitForFences( device->host.device, 1, &first->fence, VK_TRUE, UINT64_MAX ))) goto done;
+    for (i = 0; i < present_info->swapchainCount; ++i)
+    {
+        struct swapchain *swapchain = swapchain_from_handle( client_swapchains[i] );
+        struct swapchain_snapshot *snapshot = &swapchain->snapshot;
+        VkMappedMemoryRange range = {.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
+                                     .memory = snapshot->memory, .size = VK_WHOLE_SIZE};
+
+        if (!swapchain->needs_snapshot || presents[i].target != CLIENT_SURFACE_FRAME_TARGET_OFFSCREEN) continue;
+        if (device->p_vkInvalidateMappedMemoryRanges( device->host.device, 1, &range ) ||
+            !driver_funcs->p_vulkan_surface_snapshot( swapchain->surface->client, &presents[i], snapshot->pixels,
+                swapchain->host_extents.width, swapchain->host_extents.height, swapchain->format ))
+            presents[i].result = CLIENT_SURFACE_FRAME_COMPLETION_FAILED;
+    }
+done:
+    if (stages != stages_buffer) free( stages );
+    if (commands != commands_buffer) free( commands );
+    return res;
+}
+
 static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwapchainCreateInfoKHR *create_info,
                                              const VkAllocationCallbacks *allocator, VkSwapchainKHR *ret )
 {
@@ -1939,6 +2151,8 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
     VkSwapchainCreateInfoKHR create_info_host = *create_info;
     VkSurfaceCapabilitiesKHR capabilities;
     VkSwapchainKHR host_swapchain;
+    BOOL needs_snapshot = driver_funcs->p_vulkan_surface_needs_snapshot &&
+                          driver_funcs->p_vulkan_surface_needs_snapshot( surface->client );
     struct ratio raw_dpi;
     RECT client_rect;
     VkResult res;
@@ -1955,6 +2169,24 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
     /* Windows allows client rect to be empty, but host Vulkan often doesn't, adjust extents back to the host capabilities */
     res = instance->p_vkGetPhysicalDeviceSurfaceCapabilitiesKHR( physical_device->host.physical_device, surface->obj.host.surface, &capabilities );
     if (res) return res;
+
+    if (needs_snapshot)
+    {
+        if (!(capabilities.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) ||
+            (create_info->flags & VK_SWAPCHAIN_CREATE_PROTECTED_BIT_KHR))
+            return VK_ERROR_FEATURE_NOT_PRESENT;
+        switch (create_info->imageFormat)
+        {
+        case VK_FORMAT_R8G8B8A8_UNORM:
+        case VK_FORMAT_R8G8B8A8_SRGB:
+        case VK_FORMAT_B8G8R8A8_UNORM:
+        case VK_FORMAT_B8G8R8A8_SRGB:
+            break;
+        default:
+            return VK_ERROR_FORMAT_NOT_SUPPORTED;
+        }
+        create_info_host.imageUsage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+    }
 
     create_info_host.imageExtent.width = max( create_info_host.imageExtent.width, capabilities.minImageExtent.width );
     create_info_host.imageExtent.height = max( create_info_host.imageExtent.height, capabilities.minImageExtent.height );
@@ -1996,6 +2228,9 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
     vulkan_object_init( &swapchain->obj.obj, host_swapchain );
     swapchain->surface = surface;
     swapchain->extents = create_info->imageExtent;
+    swapchain->host_extents = create_info_host.imageExtent;
+    swapchain->format = create_info->imageFormat;
+    swapchain->needs_snapshot = needs_snapshot;
     instance->p_insert_object( instance, &swapchain->obj.obj );
 
     *ret = swapchain->obj.client.swapchain;
@@ -2017,6 +2252,7 @@ static void win32u_vkDestroySwapchainKHR( VkDevice client_device, VkSwapchainKHR
         pthread_cond_wait( &swapchain->completion_cond, &swapchain->present_lock );
     pthread_mutex_unlock( &swapchain->present_lock );
 
+    destroy_swapchain_snapshot( device, &swapchain->snapshot );
     device->p_vkDestroySwapchainKHR( device->host.device, swapchain->obj.host.swapchain, NULL );
     instance->p_remove_object( instance, &swapchain->obj.obj );
 
@@ -2113,7 +2349,7 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
     struct vulkan_device *device = queue->device;
     const VkSwapchainKHR *client_swapchains;
     uint32_t locked_count = 0, surface_locked_count = 0;
-    BOOL use_internal_present_wait;
+    BOOL use_internal_present_wait, have_snapshots = FALSE;
     VkResult res;
 
     TRACE( "queue %p, present_info %p\n", queue, present_info );
@@ -2170,6 +2406,7 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
         struct swapchain *swapchain = swapchain_from_handle( present_info->pSwapchains[i] );
         swapchains[i] = swapchain->obj.host.swapchain;
         present_surfaces[i] = swapchain->surface->client;
+        client_surface_prepare_scene( present_surfaces[i] );
         if (use_internal_present_wait) present_swapchains[i] = swapchain;
     }
 
@@ -2198,7 +2435,9 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
         /* A completion wait releases its mutex.  Wait before taking any
          * later surface locks, otherwise another queue can take this mutex
          * and block on a later one while we wait to reacquire this one. */
-        client_surface_wait_present_locked( present_surfaces[i], use_internal_present_wait );
+        client_surface_wait_present_locked( present_surfaces[i], use_internal_present_wait ||
+            (driver_funcs->p_vulkan_surface_needs_snapshot &&
+             driver_funcs->p_vulkan_surface_needs_snapshot( present_surfaces[i] )) );
         present_surfaces[surface_locked_count++] = present_surfaces[i];
     }
     for (uint32_t i = 0; i < present_info->swapchainCount; i++)
@@ -2206,7 +2445,9 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
         struct swapchain *swapchain = swapchain_from_handle( client_swapchains[i] );
 
         client_surface_prepare_present_locked( swapchain->surface->client, &presents[i],
-                                               use_internal_present_wait );
+                                               use_internal_present_wait || swapchain->needs_snapshot );
+        have_snapshots |= swapchain->needs_snapshot &&
+                          presents[i].target == CLIENT_SURFACE_FRAME_TARGET_OFFSCREEN;
     }
 
     if (use_internal_present_wait)
@@ -2231,7 +2472,10 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
         }
     }
 
-    res = device->p_vkQueuePresentKHR( queue->host.queue, present_info );
+    res = have_snapshots ? snapshot_vulkan_present( queue, present_info, client_swapchains, presents ) : VK_SUCCESS;
+    if (!res) res = device->p_vkQueuePresentKHR( queue->host.queue, present_info );
+    else if (present_info->pResults)
+        for (uint32_t i = 0; i < present_info->swapchainCount; ++i) present_info->pResults[i] = res;
 
     /* Allocate producer serials before releasing either ordering domain.
      * This records host submission order even when another queue targets the
@@ -2254,8 +2498,17 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
         struct surface *surface = swapchain->surface;
         SIZE expected_size = {swapchain->extents.width, swapchain->extents.height};
         BOOL compose = swapchain_res >= VK_SUCCESS;
+        BOOL snapshot_completed = swapchain->needs_snapshot &&
+                                  presents[i].target == CLIENT_SURFACE_FRAME_TARGET_OFFSCREEN;
         RECT client_rect;
 
+        if (snapshot_completed && presents[i].result == CLIENT_SURFACE_FRAME_COMPLETION_FAILED)
+        {
+            WARN( "Failed to capture swapchain %p for owner composition\n", swapchain );
+            if (present_info->pResults) present_info->pResults[i] = VK_ERROR_SURFACE_LOST_KHR;
+            if (res >= VK_SUCCESS) res = VK_ERROR_SURFACE_LOST_KHR;
+            compose = FALSE;
+        }
         if (compose && !get_surface_rect( surface->hwnd, &client_rect,
                                           get_dpi_for_window( surface->hwnd ) ))
         {
@@ -2283,7 +2536,7 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
         }
 
         if (compose && presents[i].completion.kind == CLIENT_SURFACE_COMPLETION_EXACT &&
-            use_internal_present_wait)
+            use_internal_present_wait && !snapshot_completed)
         {
             struct vulkan_present_completion *completion;
 
@@ -2302,13 +2555,13 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
 
         {
             BOOL completed;
-            BOOL external_completed = FALSE;
+            BOOL external_completed = snapshot_completed;
             DWORD elapsed = NtGetTickCount() - presents[i].submission_time;
             DWORD remaining = elapsed < CLIENT_SURFACE_PRESENT_TIMEOUT ?
                               CLIENT_SURFACE_PRESENT_TIMEOUT - elapsed : 0;
 
             if (compose && presents[i].completion.kind == CLIENT_SURFACE_COMPLETION_EXACT &&
-                use_internal_present_wait)
+                use_internal_present_wait && !snapshot_completed)
             {
                 struct vulkan_present_completion fallback = {device, swapchain, present_ids[i]};
 

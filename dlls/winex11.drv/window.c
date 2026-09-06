@@ -604,21 +604,33 @@ static void set_empty_window_input_shape( struct x11drv_win_data *data )
 }
 
 /* Keep a logically visible host window mapped and drawable while withholding
- * it from the screen.  Renderers commit into the owner backing, then the owner
- * copies that complete scene before unredirecting the host. */
+ * it from the screen until the owner compositor publishes the complete scene. */
 static BOOL prepare_client_surface_staging( struct x11drv_win_data *data )
 {
-#ifdef SONAME_LIBXCOMPOSITE
-    int error = 0;
-
-    if (!usexcomposite) return FALSE;
+    int error = BadAccess;
 
     if (!data->client_surface_redirected && !data->client_surface_opacity_staged)
     {
-        X11DRV_expect_error( data->display, client_surface_redirect_error, &error );
-        pXCompositeRedirectWindow( data->display, data->whole_window, CompositeRedirectManual );
-        XSync( data->display, False );
-        X11DRV_check_error();
+#ifdef SONAME_LIBXCOMPOSITE
+        if (usexcomposite)
+        {
+            error = 0;
+            X11DRV_expect_error( data->display, client_surface_redirect_error, &error );
+            pXCompositeRedirectWindow( data->display, data->whole_window, CompositeRedirectManual );
+            XSync( data->display, False );
+            X11DRV_check_error();
+        }
+        else
+#endif
+        {
+            char selection[32];
+
+            /* A missing client library does not imply that the window manager
+             * cannot keep an opacity-staged window drawable. */
+            snprintf( selection, sizeof(selection), "_NET_WM_CM_S%d", DefaultScreen( data->display ) );
+            if (!XGetSelectionOwner( data->display, XInternAtom( data->display, selection, False ) ))
+                return FALSE;
+        }
         if (!error) data->client_surface_redirected = TRUE;
         else if (error == BadAccess)
         {
@@ -634,9 +646,6 @@ static BOOL prepare_client_surface_staging( struct x11drv_win_data *data )
     }
     set_empty_window_input_shape( data );
     return TRUE;
-#else
-    return FALSE;
-#endif
 }
 
 static void finish_client_surface_staging( struct x11drv_win_data *data )

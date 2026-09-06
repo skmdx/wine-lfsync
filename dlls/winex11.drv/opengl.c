@@ -1531,7 +1531,7 @@ static BOOL snapshot_client_surface( struct opengl_drawable *base, struct client
     funcs->p_glReadBuffer( read_buffer );
     funcs->p_glBindFramebuffer( GL_READ_FRAMEBUFFER, framebuffer );
 
-    ret = x11drv_client_surface_snapshot( base->client, pixels, size.cx, size.cy );
+    ret = x11drv_client_surface_snapshot( base->client, pixels, size.cx, size.cy, FALSE, FALSE );
     free( pixels );
     if (ret && present->handoff_control)
         base->client->handoff_slot->source = surface->snapshot;

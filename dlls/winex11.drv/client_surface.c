@@ -326,6 +326,20 @@ static BOOL x11drv_client_surface_prepare_handoff_clip(
         supported = TRUE;
         goto done;
     }
+    /* CS_PARENTDC can supply a visible region larger than this producer.
+     * The native drawable used to clip that implicitly. A transferred source
+     * must describe only pixels inside its own destination rectangle. */
+    {
+        HRGN bounds = NtGdiCreateRectRgn( 0, 0,
+                slot->destination.right - slot->destination.left,
+                slot->destination.bottom - slot->destination.top );
+        int ret;
+
+        if (!bounds) goto done;
+        ret = NtGdiCombineRgn( region, region, bounds, RGN_AND );
+        NtGdiDeleteObjectApp( bounds );
+        if (ret == ERROR) goto done;
+    }
     if (!(clip = X11DRV_GetRegionData( region, 0 ))) goto done;
     count = clip->rdh.nCount;
     if (count == 1)
@@ -422,7 +436,8 @@ static unsigned long snapshot_component( BYTE value, unsigned long mask )
 }
 
 BOOL x11drv_client_surface_snapshot( struct client_surface *client, const BYTE *pixels,
-                                     unsigned int width, unsigned int height )
+                                     unsigned int width, unsigned int height,
+                                     BOOL top_down, BOOL bgra )
 {
     struct x11drv_client_surface *surface = impl_from_client_surface( client );
     XImage *image;
@@ -447,7 +462,15 @@ BOOL x11drv_client_surface_snapshot( struct client_surface *client, const BYTE *
     {
         for (y = 0; y < height; ++y)
         {
-            BYTE *row = (BYTE *)image->data + (SIZE_T)(height - y - 1) * image->bytes_per_line;
+            BYTE *row = (BYTE *)image->data +
+                        (SIZE_T)(top_down ? y : height - y - 1) * image->bytes_per_line;
+
+            if (bgra)
+            {
+                memcpy( row, pixels, (SIZE_T)width * 4 );
+                pixels += (SIZE_T)width * 4;
+                continue;
+            }
 
             for (x = 0; x < width; ++x, pixels += 4, row += 4)
             {
@@ -461,10 +484,10 @@ BOOL x11drv_client_surface_snapshot( struct client_surface *client, const BYTE *
     else
         for (y = 0; y < height; ++y)
             for (x = 0; x < width; ++x, pixels += 4)
-                XPutPixel( image, x, height - y - 1,
-                           snapshot_component( pixels[0], default_visual.red_mask ) |
+                XPutPixel( image, x, top_down ? y : height - y - 1,
+                           snapshot_component( pixels[bgra ? 2 : 0], default_visual.red_mask ) |
                            snapshot_component( pixels[1], default_visual.green_mask ) |
-                           snapshot_component( pixels[2], default_visual.blue_mask ) |
+                           snapshot_component( pixels[bgra ? 0 : 2], default_visual.blue_mask ) |
                            snapshot_component( pixels[3], alpha ) );
 
     X11DRV_expect_error( gdi_display, client_surface_clip_error, &error );
