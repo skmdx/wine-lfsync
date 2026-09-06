@@ -450,7 +450,7 @@ BOOL client_surface_publish_handoff_locked( struct client_surface *surface,
     }
     index = slot - surface->handoff_shared->slots;
     __atomic_fetch_or( &surface->handoff_shared->ready_bitmap[index / 64],
-                       (LONG64)1 << (index % 64), __ATOMIC_RELEASE );
+                       (UINT64)1 << (index % 64), __ATOMIC_RELEASE );
     client_surface_handoff_wake_ready( surface->handoff_shared );
     TRACE( "published handoff identity %s generation %s slot %td\n",
            wine_dbgstr_longlong( surface->identity ),

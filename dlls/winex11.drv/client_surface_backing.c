@@ -1581,7 +1581,7 @@ static BOOL compose_client_surface_handoff(
      * newer READY generation published by a racing producer. */
     __atomic_fetch_and( &binding->pool->shared->ready_bitmap[
                             (slot - binding->pool->shared->slots) / 64],
-                        ~((LONG64)1 << ((slot - binding->pool->shared->slots) % 64)),
+                        ~((UINT64)1 << ((slot - binding->pool->shared->slots) % 64)),
                         __ATOMIC_ACQ_REL );
     TRACE( "reading handoff hwnd %p identity %s generation %s\n", binding->window,
            wine_dbgstr_longlong( binding->identity ),
@@ -1801,7 +1801,7 @@ static void process_client_surface_handoffs(void)
         if (client_surface_handoff_state( control ) == CLIENT_SURFACE_HANDOFF_LOST)
         {
             __atomic_fetch_and( &binding->pool->shared->ready_bitmap[index / 64],
-                                ~((LONG64)1 << (index % 64)), __ATOMIC_ACQ_REL );
+                                ~((UINT64)1 << (index % 64)), __ATOMIC_ACQ_REL );
             remove_client_surface_compositor_binding( cursor );
         }
         else cursor = &binding->next;

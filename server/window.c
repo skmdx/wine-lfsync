@@ -218,7 +218,7 @@ static void signal_client_surface_handoff_ready( struct client_surface_handoff_p
                                                  unsigned int index )
 {
     __atomic_fetch_or( &pool->shared->ready_bitmap[index / 64],
-                       (LONG64)1 << (index % 64), __ATOMIC_RELEASE );
+                       (UINT64)1 << (index % 64), __ATOMIC_RELEASE );
     wake_client_surface_handoff( pool, 1 );
 }
 
@@ -251,7 +251,7 @@ static void free_client_surface_handoff( struct client_surface_ref *surface )
     assert( !surface->handoff_producer_mapped && !surface->handoff_consumer_mapped );
     mark_client_surface_handoff_lost( surface );
     __atomic_fetch_and( &pool->shared->ready_bitmap[surface->handoff_index / 64],
-                        ~((LONG64)1 << (surface->handoff_index % 64)), __ATOMIC_ACQ_REL );
+                        ~((UINT64)1 << (surface->handoff_index % 64)), __ATOMIC_ACQ_REL );
     __atomic_store_n( &pool->shared->slots[surface->handoff_index].endpoints, 0,
                       __ATOMIC_RELEASE );
     pool->used[surface->handoff_index] = 0;
@@ -418,7 +418,7 @@ static int alloc_client_surface_handoff( struct client_surface_ref *surface,
 found:
     pool->used[i] = 1;
     __atomic_fetch_and( &pool->shared->ready_bitmap[i / 64],
-                        ~((LONG64)1 << (i % 64)), __ATOMIC_ACQ_REL );
+                        ~((UINT64)1 << (i % 64)), __ATOMIC_ACQ_REL );
     surface->handoff_pool = pool;
     surface->handoff_top = (struct window *)grab_object( top );
     surface->handoff_index = i;
