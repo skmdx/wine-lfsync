@@ -1133,7 +1133,10 @@ static BOOL import_client_surface_pixmap( Drawable source, Pixmap *pixmap )
     *pixmap = pXCompositeNameWindowPixmap( client_surface_compositor_display, source );
     XSync( client_surface_compositor_display, False );
     X11DRV_check_error();
-    return *pixmap && !error;
+    /* Xlib allocates the XID before the server validates the source window.
+     * If the producer died before import, no Pixmap exists to free. */
+    if (error) *pixmap = 0;
+    return !!*pixmap;
 #else
     return FALSE;
 #endif
