@@ -2243,6 +2243,73 @@ done:
     DestroyWindow( hwnd );
 }
 
+static void test_handoff_bitmap_boundary(void)
+{
+    PIXELFORMATDESCRIPTOR pfd = {sizeof(pfd), 1, PFD_DRAW_TO_WINDOW | PFD_SUPPORT_OPENGL |
+                                PFD_DOUBLEBUFFER, PFD_TYPE_RGBA, 24};
+    HWND windows[65] = {0};
+    HDC dcs[ARRAY_SIZE(windows)] = {0};
+    HGLRC contexts[ARRAY_SIZE(windows)] = {0};
+    BOOL (WINAPI *swap_interval)( int );
+    struct surface_state state;
+    COLORREF color;
+    unsigned int i;
+    int format;
+
+    if (!register_present_test_class()) return;
+    /* Keep real producers alive together so the shared pool reaches bit 63
+     * and the next bitmap word instead of recycling the first slot. */
+    for (i = 0; i < ARRAY_SIZE(windows); ++i)
+    {
+        windows[i] = CreateWindowExA( WS_EX_LAYERED | WS_EX_TOPMOST, "client_surface_present_race",
+                                      "handoff bitmap boundary", WS_POPUP, 720, 240, 32, 32,
+                                      NULL, NULL, GetModuleHandleA( NULL ), NULL );
+        ok( !!windows[i], "window %u creation failed, error %lu\n", i, GetLastError() );
+        if (!windows[i]) goto done;
+        ok( SetLayeredWindowAttributes( windows[i], 0, 255, LWA_ALPHA ),
+            "window %u alpha initialization failed, error %lu\n", i, GetLastError() );
+        dcs[i] = GetDC( windows[i] );
+        format = dcs[i] ? ChoosePixelFormat( dcs[i], &pfd ) : 0;
+        if (!dcs[i] || !format || !SetPixelFormat( dcs[i], format, &pfd ) ||
+            !(contexts[i] = wglCreateContext( dcs[i] )) || !wglMakeCurrent( dcs[i], contexts[i] ))
+        {
+            if (!i) win_skip( "OpenGL setup failed, error %lu\n", GetLastError() );
+            else ok( FALSE, "OpenGL setup %u failed, error %lu\n", i, GetLastError() );
+            goto done;
+        }
+        swap_interval = (void *)wglGetProcAddress( "wglSwapIntervalEXT" );
+        if (swap_interval) swap_interval( 0 );
+        glViewport( 0, 0, 32, 32 );
+        glClearColor( (i + 1) * 3 / 255.0f, 0.5f, 0.25f, 1 );
+        glClear( GL_COLOR_BUFFER_BIT );
+        ok( SwapBuffers( dcs[i] ), "hidden present %u failed, error %lu\n", i, GetLastError() );
+        pump_messages( 10 );
+    }
+    for (i = 0; i < ARRAY_SIZE(windows); ++i)
+    {
+        ShowWindow( windows[i], SW_SHOWNA );
+        if (!wait_for_surface_idle( windows[i], 7000, &state ))
+        {
+            ok( FALSE, "surface %u did not become idle\n", i );
+            goto done;
+        }
+        color = GetPixel( dcs[i], 16, 16 );
+        ok( color_matches( color, (i + 1) * 3, 128, 64 ),
+            "surface %u has unexpected destination pixel %#lx\n", i, color );
+        if (!color_matches( color, (i + 1) * 3, 128, 64 )) goto done;
+        ShowWindow( windows[i], SW_HIDE );
+    }
+done:
+    wglMakeCurrent( NULL, NULL );
+    for (i = 0; i < ARRAY_SIZE(windows); ++i)
+    {
+        if (contexts[i]) wglDeleteContext( contexts[i] );
+        if (dcs[i]) ReleaseDC( windows[i], dcs[i] );
+        if (windows[i]) DestroyWindow( windows[i] );
+    }
+    pump_messages( 20 );
+}
+
 static void test_grow64_present_completion(void)
 {
     PIXELFORMATDESCRIPTOR pfd = {sizeof(pfd), 1, PFD_DRAW_TO_WINDOW | PFD_SUPPORT_OPENGL |
@@ -2560,6 +2627,7 @@ static BOOL run_focused_test_case( const char *name, char **argv )
         {"concurrent-state", "concurrent client surface state changes",
          test_concurrent_state_changes},
         {"hidden-present-resize", "hidden present and resize", test_hidden_present_resize},
+        {"handoff-bitmap", "real WGL handoff bitmap boundary", test_handoff_bitmap_boundary},
         {"grow64-completion", "64x64 grow presentation completion",
          test_grow64_present_completion},
         {"paced-completion", "paced hidden client surface presents",
@@ -2760,6 +2828,8 @@ START_TEST(client_surface)
     test_cross_process_pixel_format( argv );
     trace( "testing hidden present and resize\n" );
     test_hidden_present_resize();
+    trace( "testing real WGL handoff bitmap boundary\n" );
+    test_handoff_bitmap_boundary();
     trace( "testing 64x64 grow presentation completion\n" );
     test_grow64_present_completion();
 }

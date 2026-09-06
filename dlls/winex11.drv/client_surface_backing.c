@@ -1570,6 +1570,11 @@ static BOOL compose_client_surface_handoff(
     BOOL xfixes_clip, pixmap_clip;
     BOOL composed = FALSE, copied = FALSE, dropped = FALSE;
 
+    /* A producer can observe the new even scene before the GUI thread's
+     * topology job reaches this connection. Keep that frame READY until its
+     * owner target is installed; it is not an obsolete frame to release. */
+    target = find_client_surface_compositor_target( binding->toplevel );
+    if (!target || target->scene_epoch < slot->scene_epoch) return FALSE;
     if (!__atomic_compare_exchange_n( &slot->control, &expected,
                                       client_surface_handoff_control(
                                           client_surface_handoff_generation( control ),
@@ -1586,8 +1591,7 @@ static BOOL compose_client_surface_handoff(
     TRACE( "reading handoff hwnd %p identity %s generation %s\n", binding->window,
            wine_dbgstr_longlong( binding->identity ),
            wine_dbgstr_longlong( client_surface_handoff_generation( control ) ) );
-    target = find_client_surface_compositor_target( binding->toplevel );
-    if (!target || target->scene_epoch != slot->scene_epoch)
+    if (target->scene_epoch != slot->scene_epoch)
     {
         dropped = TRUE;
         goto release;

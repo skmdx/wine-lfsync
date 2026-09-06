@@ -314,7 +314,8 @@ BOOL client_surface_prepare_handoff_locked( struct client_surface *surface,
     UINT64 token;
 
     if (present->target != CLIENT_SURFACE_FRAME_TARGET_OFFSCREEN ||
-        present->mode != CLIENT_SURFACE_PRESENTATION_COMPOSITED ||
+        (present->mode != CLIENT_SURFACE_PRESENTATION_COMPOSITED &&
+         (present->mode != CLIENT_SURFACE_PRESENTATION_STAGED || !present->scene.generation)) ||
         !present->scene.valid ||
         !client_surface_backend_has_cap( surface, CLIENT_SURFACE_BACKEND_GENERATION_HANDOFF ) ||
         !surface->backend->handoff_prepare)
@@ -716,8 +717,7 @@ BOOL client_surface_end_present_internal( struct client_surface *surface,
         /* This backend never submits work to an owner-owned native target.
          * Hidden frames remain reusable source content; a visible handoff
          * failure is rejected and retried through the scene slow path. */
-        if (present->mode == CLIENT_SURFACE_PRESENTATION_STAGED ||
-            !NtUserIsWindowVisible( hwnd ))
+        if (!NtUserIsWindowVisible( hwnd ))
             composed = client_surface_scene_current( &present->scene );
         else
             scene_retry = TRUE;

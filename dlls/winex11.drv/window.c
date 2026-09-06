@@ -3540,6 +3540,9 @@ void X11DRV_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_hint, UIN
         {
             client_surface_set_staged( hwnd );
             data->client_surface_staged = TRUE;
+            /* STAGED publishes the new scene epoch. Install it on the owner
+             * connection before consuming cached producer frames. */
+            X11DRV_client_surface_backing_ensure( data );
         }
         else
         {
