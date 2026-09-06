@@ -103,6 +103,15 @@ static void client_surface_handoff_wait_sequence( LONG *address, LONG sequence, 
 #endif
 }
 
+static void client_surface_handoff_wake_release( struct client_surface_handoff_shared *shared )
+{
+    if (!__atomic_exchange_n( &shared->release_parked, 0, __ATOMIC_ACQ_REL )) return;
+    __atomic_add_fetch( &shared->release_sequence, 1, __ATOMIC_RELEASE );
+#ifdef __linux__
+    syscall( SYS_futex, &shared->release_sequence, FUTEX_WAKE, INT_MAX, NULL, NULL, 0 );
+#endif
+}
+
 void client_surface_release_handoff( struct client_surface *surface )
 {
     struct client_surface_handoff_slot *slot;
@@ -112,9 +121,14 @@ void client_surface_release_handoff( struct client_surface *surface )
     if (!surface->handoff_view) return;
     /* Exact WSI completions may finish on a worker after a target update has
      * detached this mapping.  Keep the view and producer endpoint alive until
-     * those frames have either published or abandoned their SUBMITTED token. */
-    if (InterlockedCompareExchange( &surface->external_completion_count, 0, 0 ))
+     * those frames have either published or abandoned their SUBMITTED token.
+     * A source-capacity waiter also retains the view while its lock is dropped. */
+    if (surface->handoff_waiters || InterlockedCompareExchange( &surface->external_completion_count, 0, 0 ))
     {
+        if (surface->handoff_waiters)
+            TRACE( "retaining handoff mapping identity %s cookie %s for %u source waiters\n",
+                   wine_dbgstr_longlong( surface->identity ), wine_dbgstr_longlong( surface->handoff_cookie ),
+                   surface->handoff_waiters );
         surface->handoff_release_pending = TRUE;
         return;
     }
@@ -951,6 +965,22 @@ void client_surface_unlock_present( struct client_surface *surface )
     client_surface_resume_recompose( surface );
 }
 
+static BOOL client_surface_handoff_write_available( const struct client_surface *surface )
+{
+    unsigned int i;
+
+    if (!surface->handoff_slot) return TRUE;
+    for (i = 0; i < CLIENT_SURFACE_SOURCE_FRAME_COUNT; ++i)
+    {
+        enum client_surface_handoff_state state = client_surface_handoff_state(
+            __atomic_load_n( &surface->handoff_slot[i].control, __ATOMIC_ACQUIRE ) );
+
+        if (state == CLIENT_SURFACE_HANDOFF_FREE || state == CLIENT_SURFACE_HANDOFF_RELEASED ||
+            state == CLIENT_SURFACE_HANDOFF_LOST) return TRUE;
+    }
+    return FALSE;
+}
+
 void client_surface_wait_present_locked( struct client_surface *surface, BOOL external_completion )
 {
     if (surface->backend->handoff_serialize && surface->backend->handoff_serialize( surface ))
@@ -963,14 +993,41 @@ void client_surface_wait_present_locked( struct client_surface *surface, BOOL ex
      * submission and target-writer intent together with completion mode: a
      * producer which drained the old token may already have begun its next
      * native call before another producer reacquires this mutex. */
-    while (InterlockedCompareExchange( &surface->target_update_waiters, 0, 0 ) ||
-           surface->native_present_count ||
-           (external_completion ? surface->driver_completion_count || surface->driver_completion_waiters ||
-                                  (surface->backend->handoff_serialize &&
-                                   surface->backend->handoff_serialize( surface ) &&
-                                   InterlockedCompareExchange( &surface->external_completion_count, 0, 0 )) :
-                                  InterlockedCompareExchange( &surface->external_completion_count, 0, 0 )))
-        pthread_cond_wait( &surface->completion_cond, &surface->completion_lock );
+    for (;;)
+    {
+        struct client_surface_handoff_shared *shared;
+        LONG sequence;
+
+        while (InterlockedCompareExchange( &surface->target_update_waiters, 0, 0 ) ||
+               surface->native_present_count ||
+               (external_completion ? surface->driver_completion_count || surface->driver_completion_waiters ||
+                                      (surface->backend->handoff_serialize &&
+                                       surface->backend->handoff_serialize( surface ) &&
+                                       InterlockedCompareExchange( &surface->external_completion_count, 0, 0 )) :
+                                      InterlockedCompareExchange( &surface->external_completion_count, 0, 0 )))
+            pthread_cond_wait( &surface->completion_cond, &surface->completion_lock );
+        if (!external_completion || !InterlockedCompareExchange( &surface->external_completion_count, 0, 0 ) ||
+            client_surface_handoff_write_available( surface )) break;
+
+        /* Independent GPU writes only need one returned image, not a drain
+         * of every completion. Wait on the owner's release notification with
+         * the completion mutex dropped so those writes can become READY.
+         * Retain the view even if the final callback or a target update asks
+         * to detach it while this thread sleeps on its shared sequence. */
+        shared = surface->handoff_shared;
+        ++surface->handoff_waiters;
+        __atomic_store_n( &shared->release_parked, 1, __ATOMIC_RELEASE );
+        sequence = __atomic_load_n( &shared->release_sequence, __ATOMIC_ACQUIRE );
+        if (!client_surface_handoff_write_available( surface ))
+        {
+            pthread_mutex_unlock( &surface->completion_lock );
+            client_surface_handoff_wait_sequence( &shared->release_sequence, sequence, 10 );
+            pthread_mutex_lock( &surface->completion_lock );
+        }
+        if (!--surface->handoff_waiters && surface->handoff_release_pending &&
+            !InterlockedCompareExchange( &surface->external_completion_count, 0, 0 ))
+            client_surface_release_handoff( surface );
+    }
     if (!external_completion && !--surface->driver_completion_waiters)
         pthread_cond_broadcast( &surface->completion_cond );
 }
@@ -1064,13 +1121,22 @@ void client_surface_prepare_present( struct client_surface *surface,
                                      BOOL external_completion )
 {
     unsigned long long start = TRACE_ON(csperf) ? client_surface_perf_time() : 0;
+    unsigned long long scene, locked, ready;
+    LONG pending_before, pending_after;
 
     client_surface_prepare_scene( surface );
+    scene = start ? client_surface_perf_time() : 0;
     client_surface_lock_present( surface );
+    locked = start ? client_surface_perf_time() : 0;
+    pending_before = start ? InterlockedCompareExchange( &surface->external_completion_count, 0, 0 ) : 0;
     client_surface_wait_present_locked( surface, external_completion );
+    ready = start ? client_surface_perf_time() : 0;
+    pending_after = start ? InterlockedCompareExchange( &surface->external_completion_count, 0, 0 ) : 0;
     client_surface_prepare_present_locked( surface, present, external_completion );
-    TRACE_(csperf)( "ticks=%llu event=prepare identity=%s begin=%llu\n",
-                   client_surface_perf_time(), wine_dbgstr_longlong( surface->identity ), start );
+    TRACE_(csperf)( "ticks=%llu event=prepare identity=%s begin=%llu scene=%llu locked=%llu ready=%llu "
+                   "pending_before=%d pending_after=%d\n", client_surface_perf_time(),
+                   wine_dbgstr_longlong( surface->identity ), start, scene, locked, ready,
+                   pending_before, pending_after );
 }
 
 static void client_surface_begin_present_locked( struct client_surface *surface )
@@ -1342,6 +1408,11 @@ BOOL client_surface_complete_present_locked( struct client_surface *surface,
         }
         memset( &present->completion, 0, sizeof(present->completion) );
         if (release_handoff) client_surface_release_handoff( surface );
+        /* An abandoned image or the last completion can also satisfy the
+         * source waiter, without an owner copy producing a release wake. */
+        if (surface->handoff_waiters && (client_surface_handoff_write_available( surface ) ||
+            !InterlockedCompareExchange( &surface->external_completion_count, 0, 0 )))
+            client_surface_handoff_wake_release( surface->handoff_shared );
         if (wake) pthread_cond_broadcast( &surface->completion_cond );
     }
     return completed;

@@ -469,27 +469,12 @@ static BOOL x11drv_client_surface_handoff_prepare(
 static BOOL x11drv_client_surface_handoff_serialize( struct client_surface *client )
 {
     struct x11drv_client_surface *surface = impl_from_client_surface( client );
-    unsigned int i;
 
-    if (surface->direct_snapshot)
-    {
-        if (!client->handoff_slot) return FALSE;
-        for (i = 0; i < CLIENT_SURFACE_SOURCE_FRAME_COUNT; ++i)
-        {
-            enum client_surface_handoff_state state = client_surface_handoff_state(
-                __atomic_load_n( &client->handoff_slot[i].control, __ATOMIC_ACQUIRE ) );
-
-            if (state == CLIENT_SURFACE_HANDOFF_FREE || state == CLIENT_SURFACE_HANDOFF_RELEASED)
-                return FALSE;
-        }
-        /* Unlike a native WSI token, SUBMITTED already owns a GPU write into
-         * this slot. Drain completion with the common mutex released before
-         * acquire could supersede that still-busy storage. */
-        return TRUE;
-    }
     /* A host Present completion does not retain an old mutable X window's
-     * pixels. Freeze it before permitting another offscreen native swap. */
-    return usexcomposite && client->target.offscreen;
+     * pixels. Freeze it before permitting another offscreen native swap.
+     * Independent snapshots instead wait for one writable source in the
+     * common code; filling their storage does not require a full drain. */
+    return usexcomposite && !surface->direct_snapshot && client->target.offscreen;
 }
 
 static BOOL x11drv_client_surface_handoff_complete( struct client_surface *client,

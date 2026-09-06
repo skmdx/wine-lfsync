@@ -501,6 +501,7 @@ static void client_surface_release_locked( struct client_surface *surface )
         assert( list_empty( &surface->completion_queue ) );
         assert( !surface->completion_worker_active );
         assert( !surface->external_completion_count );
+        assert( !surface->handoff_waiters );
         assert( !surface->driver_completion_count );
         assert( !surface->driver_completion_waiters );
         assert( !surface->native_present_count );

@@ -219,7 +219,7 @@ struct gdi_dc_funcs
 };
 
 /* increment this when changing driver tables or shared driver-facing structures */
-#define WINE_GDI_DRIVER_VERSION 118
+#define WINE_GDI_DRIVER_VERSION 119
 
 #define GDI_PRIORITY_NULL_DRV        0  /* null driver */
 #define GDI_PRIORITY_FONT_DRV      100  /* any font driver */
@@ -424,6 +424,7 @@ struct client_surface
     UINT64                             handoff_mapping_id;
     UINT64                             handoff_cookie;
     BOOL                               handoff_release_pending;
+    unsigned int                       handoff_waiters; /* unlocked waits retaining the mapped view */
     int                                handoff_ready_fd;
     BOOL                               raw;            /* use the raw physical position and size for the host client surface */
 };
