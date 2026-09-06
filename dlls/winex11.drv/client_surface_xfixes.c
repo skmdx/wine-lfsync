@@ -86,9 +86,9 @@ BOOL X11DRV_XFixes_UpdateClientSurfaceRegion( Display *display, XID *region,
     old_region = *region;
     X11DRV_expect_error( display, client_surface_xfixes_error, &error );
     if (old_region)
-        pXFixesSetRegion( display, old_region, rects, count );
+        pXFixesSetRegion( display, old_region, (XRectangle *)rects, count );
     else
-        *region = pXFixesCreateRegion( display, rects, count );
+        *region = pXFixesCreateRegion( display, (XRectangle *)rects, count );
     XSync( display, False );
     X11DRV_check_error();
     if (error && !old_region) *region = 0;
