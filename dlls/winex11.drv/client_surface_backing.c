@@ -688,7 +688,8 @@ static struct client_surface_compositor_frame *get_client_surface_compositor_fra
     {
         unsigned int index = (target->next_frame + i) % ARRAY_SIZE(target->frames);
 
-        if (target->frames[index].serial) continue;
+        if (target->frames[index].serial ||
+            (target->assembly_pending && index == target->assembly_frame)) continue;
         target->next_frame = (index + 1) % ARRAY_SIZE(target->frames);
         return &target->frames[index];
     }
@@ -2087,10 +2088,9 @@ static BOOL compose_client_surface_handoff(
     target = find_client_surface_compositor_target( binding->toplevel );
     if (!target || target->copy_frame || target->quiescing || !target->scene.valid ||
         (!replay && target->scene.epoch < slot->scene_epoch)) return FALSE;
-    if ((replay || (slot->flags & CLIENT_SURFACE_HANDOFF_INDEPENDENT)) &&
-        (!client_surface_get_toplevel_scene( binding->toplevel, &current ) ||
-         current.epoch != target->scene.epoch ||
-         current.mode == CLIENT_SURFACE_PRESENTATION_DIRECT)) return FALSE;
+    if (!client_surface_get_toplevel_scene( binding->toplevel, &current ) ||
+        current.epoch != target->scene.epoch ||
+        current.mode == CLIENT_SURFACE_PRESENTATION_DIRECT) return FALSE;
     if (client_surface_pending_batch_count == ARRAY_SIZE(client_surface_pending_batches)) return FALSE;
     if (!__atomic_compare_exchange_n( &slot->control, &expected,
                                       client_surface_handoff_control(
@@ -2116,11 +2116,12 @@ static BOOL compose_client_surface_handoff(
     if (replay) slot->flags |= CLIENT_SURFACE_HANDOFF_INDEPENDENT;
     trace_client_surface_source( replay ? "replay_claim" : "claim", binding, control, slot->source_sequence,
                                  target->window, 0, TRUE );
-    if (slot->flags & CLIENT_SURFACE_HANDOFF_INDEPENDENT)
-    {
-        slot->scene_epoch = current.epoch;
-        slot->scene_generation = current.generation;
-    }
+    if (slot->flags & CLIENT_SURFACE_HANDOFF_INDEPENDENT) slot->scene_epoch = current.epoch;
+    /* Publication may have completed since this snapshot was submitted.
+     * Use the owner's current transaction for the same immutable layout;
+     * a late source must not reopen an already published assembly. Native
+     * sources from an older layout still fail the epoch check below. */
+    if (slot->scene_epoch == current.epoch) slot->scene_generation = current.generation;
     generation = slot->scene_generation;
     epoch = slot->scene_epoch;
     /* Cold source validation opens its own X error scope. Finish earlier
@@ -2227,7 +2228,7 @@ static BOOL compose_client_surface_handoff(
         if (slot->scene_generation)
             previous_publish = find_client_surface_pending_publication(
                 target, slot->scene_generation, slot->scene_epoch );
-        if (slot->scene_generation && !previous_publish && target->assembly_pending &&
+        if (!previous_publish && target->assembly_pending &&
             (target->assembly_generation != slot->scene_generation ||
              target->assembly_epoch != slot->scene_epoch))
             finish_client_surface_compositor_assembly( target, TRUE );
