@@ -2239,6 +2239,7 @@ struct present_race_context
     volatile LONG stop;
     LONG setup_error;
     LONG presents;
+    BOOL unpaced;
     char renderer[128];
 };
 
@@ -2253,6 +2254,7 @@ static void pump_messages( DWORD timeout )
         {
             TranslateMessage( &message );
             DispatchMessageA( &message );
+            if ((LONG)(end - GetTickCount()) <= 0) break;
         }
         Sleep( 10 );
     } while ((LONG)(end - GetTickCount()) > 0);
@@ -2598,6 +2600,11 @@ static DWORD WINAPI present_race_thread( void *arg )
         const char *renderer = (const char *)glGetString( GL_RENDERER );
 
         if (renderer) lstrcpynA( context->renderer, renderer, ARRAY_SIZE(context->renderer) );
+        if (context->unpaced)
+        {
+            BOOL (WINAPI *swap_interval)( int ) = (void *)wglGetProcAddress( "wglSwapIntervalEXT" );
+            if (swap_interval) swap_interval( 0 );
+        }
     }
     SetEvent( context->ready );
 
@@ -2672,6 +2679,92 @@ static void test_present_destroy_race(void)
         CloseHandle( thread );
         CloseHandle( context.ready );
     }
+}
+
+static void test_native_reparent_race(void)
+{
+    struct present_race_context context = {.unpaced = TRUE};
+    HWND parents[2] = {0};
+    HANDLE thread = NULL;
+    DWORD start, status, longest = 0;
+    unsigned int i;
+    BOOL destroyed = FALSE;
+
+    if (!register_present_test_class()) return;
+    for (i = 0; i < ARRAY_SIZE(parents); ++i)
+    {
+        parents[i] = CreateWindowA( "client_surface_present_race", "handoff reparent owner",
+                                    WS_POPUP | WS_VISIBLE, 20 + 350 * i, 20, 320, 240,
+                                    NULL, NULL, GetModuleHandleA( NULL ), NULL );
+        ok( !!parents[i], "failed to create owner %u, error %lu\n", i, GetLastError() );
+        if (!parents[i]) goto done;
+    }
+    /* This same-process child exercises native WSI completion and the owner
+     * compositor while the window thread reparents and destroys the HWND. */
+    context.hwnd = CreateWindowA( "client_surface_present_race", "handoff reparent source",
+                                  WS_CHILD | WS_VISIBLE, 0, 0, 3840, 2160, parents[0],
+                                  NULL, GetModuleHandleA( NULL ), NULL );
+    ok( !!context.hwnd, "failed to create handoff child, error %lu\n", GetLastError() );
+    if (!context.hwnd) goto done;
+    context.ready = CreateEventA( NULL, TRUE, FALSE, NULL );
+    thread = context.ready ? CreateThread( NULL, 0, present_race_thread, &context, 0, NULL ) : NULL;
+    ok( !!context.ready && !!thread, "failed to create handoff race objects, error %lu\n", GetLastError() );
+    if (!thread) goto done;
+    start = GetTickCount();
+    while ((status = WaitForSingleObject( context.ready, 0 )) == WAIT_TIMEOUT &&
+           GetTickCount() - start < 10000) pump_messages( 1 );
+    ok( status == WAIT_OBJECT_0, "handoff context setup timed out\n" );
+    if (status != WAIT_OBJECT_0) goto done;
+    if (context.setup_error)
+    {
+        win_skip( "handoff OpenGL setup failed, error %ld\n", context.setup_error );
+        goto done;
+    }
+    start = GetTickCount();
+    while (InterlockedCompareExchange( &context.presents, 0, 0 ) < 8 &&
+           GetTickCount() - start < 5000) pump_messages( 1 );
+    ok( context.presents >= 8, "handoff producer did not start, presents %ld\n", context.presents );
+    for (i = 0; i < 16; ++i)
+    {
+        HWND parent = parents[(i + 1) % ARRAY_SIZE(parents)];
+        LONG before = InterlockedCompareExchange( &context.presents, 0, 0 );
+        DWORD elapsed;
+
+        start = GetTickCount();
+        ok( !!SetParent( context.hwnd, parent ), "reparent %u failed, error %lu\n", i, GetLastError() );
+        elapsed = GetTickCount() - start;
+        longest = max( longest, elapsed );
+        ok( elapsed < 5000, "reparent %u blocked for %lu ms\n", i, elapsed );
+        ok( GetAncestor( context.hwnd, GA_PARENT ) == parent, "reparent %u left the old owner\n", i );
+        start = GetTickCount();
+        do pump_messages( 1 );
+        while (InterlockedCompareExchange( &context.presents, 0, 0 ) <= before &&
+               GetTickCount() - start < 5000);
+        ok( InterlockedCompareExchange( &context.presents, 0, 0 ) > before,
+            "producer stopped after reparent %u\n", i );
+        if (InterlockedCompareExchange( &context.presents, 0, 0 ) <= before) break;
+    }
+    trace( "native reparent renderer %s, presents %ld, longest GUI mutation %lu ms\n",
+           context.renderer, context.presents, longest );
+    destroyed = DestroyWindow( context.hwnd );
+    ok( destroyed, "failed to destroy handoff child, error %lu\n", GetLastError() );
+done:
+    InterlockedExchange( &context.stop, 1 );
+    if (thread)
+    {
+        start = GetTickCount();
+        while ((status = WaitForSingleObject( thread, 0 )) == WAIT_TIMEOUT &&
+               GetTickCount() - start < 10000) pump_messages( 1 );
+        ok( status == WAIT_OBJECT_0, "handoff reparent thread timed out\n" );
+        /* A timed-out thread still owns the stack context; end the failed
+         * test process instead of continuing with a dangling context. */
+        if (status != WAIT_OBJECT_0) ExitProcess( 1 );
+        CloseHandle( thread );
+    }
+    if (context.ready) CloseHandle( context.ready );
+    if (context.hwnd && !destroyed) DestroyWindow( context.hwnd );
+    for (i = 0; i < ARRAY_SIZE(parents); ++i)
+        if (parents[i]) DestroyWindow( parents[i] );
 }
 
 static void test_owner_exit_and_destroy( char **argv )
@@ -2763,6 +2856,7 @@ static BOOL run_focused_test_case( const char *name, char **argv )
          test_paced_present_completion},
         {"present-destroy-race", "present and window destruction race",
          test_present_destroy_race},
+        {"native-reparent-race", "native WSI and owner reparent race", test_native_reparent_race},
     };
     unsigned int i;
 
