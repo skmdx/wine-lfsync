@@ -155,7 +155,17 @@ static BOOL map_client_surface_handoff( struct client_surface *surface )
     NTSTATUS status;
 
     if (surface->handoff_release_pending) return FALSE;
-    if (surface->handoff_view) return TRUE;
+    if (surface->handoff_view)
+    {
+        if (client_surface_handoff_state( __atomic_load_n( &surface->handoff_slot->control,
+                                                          __ATOMIC_ACQUIRE ) ) != CLIENT_SURFACE_HANDOFF_LOST)
+            return TRUE;
+        /* A lost owner binding has already dropped its consumer endpoint.
+         * Retire our view before testing endpoints, or that test prevents us
+         * from ever reaching acquire() and releasing the obsolete mapping. */
+        client_surface_release_handoff( surface );
+        if (surface->handoff_view) return FALSE;
+    }
     SERVER_START_REQ( get_client_surface_handoff )
     {
         req->handle = wine_server_user_handle( surface->hwnd );
