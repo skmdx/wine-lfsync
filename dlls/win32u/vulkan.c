@@ -146,12 +146,27 @@ struct surface
     struct vulkan_surface obj;
     struct client_surface *client;
     HWND hwnd;
+    LONG refs;
 };
 
 static struct surface *surface_from_handle( VkSurfaceKHR handle )
 {
     struct vulkan_surface *obj = vulkan_surface_from_handle( handle );
     return CONTAINING_RECORD( obj, struct surface, obj );
+}
+
+struct device
+{
+    pthread_mutex_t retirement_lock;
+    pthread_cond_t retirement_cond;
+    struct list retired_swapchains;
+    BOOL retirement_worker;
+    struct vulkan_device obj;
+};
+
+static struct device *impl_from_vulkan_device( struct vulkan_device *device )
+{
+    return CONTAINING_RECORD( device, struct device, obj );
 }
 
 struct vulkan_snapshot_fence
@@ -180,6 +195,7 @@ struct swapchain_snapshot
 struct swapchain
 {
     struct vulkan_swapchain obj;
+    struct list retirement_entry;
     struct surface *surface;
     VkExtent2D extents;
     VkExtent2D host_extents;
@@ -909,6 +925,7 @@ static VkResult win32u_vkCreateDevice( VkPhysicalDevice client_physical_device, 
     struct vulkan_instance *instance = physical_device->instance;
     VkDevice host_device, client_device = *client_device_ptr;
     struct vulkan_device *device;
+    struct device *impl;
     unsigned int queue_count, i;
     struct mempool pool = {0};
     VkResult res;
@@ -925,7 +942,20 @@ static VkResult win32u_vkCreateDevice( VkPhysicalDevice client_physical_device, 
     /* We need to cache all queues within the device as each requires wrapping since queues are dispatchable objects. */
     for (queue_count = 0, i = 0; i < create_info->queueCreateInfoCount; i++) queue_count += create_info->pQueueCreateInfos[i].queueCount;
 
-    if (!(device = calloc( 1, offsetof(struct vulkan_device, queues[queue_count]) ))) return VK_ERROR_OUT_OF_HOST_MEMORY;
+    if (!(impl = calloc( 1, offsetof(struct device, obj.queues[queue_count]) ))) return VK_ERROR_OUT_OF_HOST_MEMORY;
+    if (pthread_mutex_init( &impl->retirement_lock, NULL ))
+    {
+        free( impl );
+        return VK_ERROR_OUT_OF_HOST_MEMORY;
+    }
+    if (pthread_cond_init( &impl->retirement_cond, NULL ))
+    {
+        pthread_mutex_destroy( &impl->retirement_lock );
+        free( impl );
+        return VK_ERROR_OUT_OF_HOST_MEMORY;
+    }
+    list_init( &impl->retired_swapchains );
+    device = &impl->obj;
     device->extensions = client_device->extensions;
 
     if ((res = convert_device_create_info( physical_device, create_info, &pool, device ))) goto failed;
@@ -951,7 +981,9 @@ failed:
     if (res)
     {
         WARN( "Failed to create device, res %d\n", res );
-        free( device );
+        pthread_cond_destroy( &impl->retirement_cond );
+        pthread_mutex_destroy( &impl->retirement_lock );
+        free( impl );
     }
     mem_free( &pool );
     return res;
@@ -960,17 +992,31 @@ failed:
 static void win32u_vkDestroyDevice( VkDevice client_device, const VkAllocationCallbacks *allocator )
 {
     struct vulkan_device *device = vulkan_device_from_handle( client_device );
-    struct vulkan_instance *instance = device->physical_device->instance;
+    struct vulkan_instance *instance;
+    struct device *impl;
     unsigned int i;
 
     if (!device) return;
+
+    instance = device->physical_device->instance;
+    impl = impl_from_vulkan_device( device );
+    /* Retired copies retain the device and their host surfaces. Device
+     * teardown is the final drain; individual window/swapchain destruction
+     * does not wait for another surface's GPU work. */
+    pthread_mutex_lock( &impl->retirement_lock );
+    while (impl->retirement_worker)
+        pthread_cond_wait( &impl->retirement_cond, &impl->retirement_lock );
+    assert( list_empty( &impl->retired_swapchains ) );
+    pthread_mutex_unlock( &impl->retirement_lock );
 
     device->p_vkDestroyDevice( device->host.device, NULL /* pAllocator */ );
     for (i = 0; i < device->queue_count; i++)
         instance->p_remove_object( instance, &device->queues[i].obj );
     instance->p_remove_object( instance, &device->obj );
 
-    free( device );
+    pthread_cond_destroy( &impl->retirement_cond );
+    pthread_mutex_destroy( &impl->retirement_lock );
+    free( impl );
 }
 
 static VkQueue device_find_queue( VkDevice client_device, const VkDeviceQueueInfo2 *info )
@@ -1690,12 +1736,23 @@ static VkResult win32u_vkCreateWin32SurfaceKHR( VkInstance client_instance, cons
 
     vulkan_object_init( &surface->obj.obj, host_surface );
     surface->obj.instance = instance;
+    surface->refs = 1;
     instance->p_insert_object( instance, &surface->obj.obj );
 
     if (dummy) NtUserDestroyWindow( dummy );
 
     *ret = surface->obj.client.surface;
     return VK_SUCCESS;
+}
+
+static void release_surface( struct surface *surface )
+{
+    struct vulkan_instance *instance = surface->obj.instance;
+
+    if (InterlockedDecrement( &surface->refs )) return;
+    instance->p_vkDestroySurfaceKHR( instance->host.instance, surface->obj.host.surface, NULL );
+    client_surface_release( surface->client );
+    free( surface );
 }
 
 static void win32u_vkDestroySurfaceKHR( VkInstance client_instance, VkSurfaceKHR client_surface,
@@ -1709,13 +1766,9 @@ static void win32u_vkDestroySurfaceKHR( VkInstance client_instance, VkSurfaceKHR
     TRACE( "instance %p, handle 0x%s, allocator %p\n", instance, wine_dbgstr_longlong( client_surface ), allocator );
     if (allocator) FIXME( "Support for allocation callbacks not implemented yet\n" );
 
-    instance->p_vkDestroySurfaceKHR( instance->host.instance, surface->obj.host.surface, NULL /* allocator */ );
     use_window_client_surface( surface->client, FALSE );
-    client_surface_release( surface->client );
-
     instance->p_remove_object( instance, &surface->obj.obj );
-
-    free( surface );
+    release_surface( surface );
 }
 
 static BOOL get_surface_rect( HWND hwnd, RECT *rect, struct ratio dpi )
@@ -2089,14 +2142,10 @@ static void destroy_swapchain_snapshot( struct vulkan_device *device, struct swa
 {
     unsigned int i;
 
-    /* Swapchain destruction requires the application to finish operations
-     * using its images. Drain any private copy too, outside surface locks;
-     * an expired publication deadline never authorizes GPU storage reuse. */
+    /* The retiring swapchain has checked completion of every private copy.
+     * Partial initialization has not submitted any work. */
     if (snapshot->pending)
-    {
-        device->p_vkWaitForFences( device->host.device, 1, &snapshot->pending->fence, VK_TRUE, UINT64_MAX );
         release_snapshot_fence( snapshot->pending );
-    }
     if (snapshot->pool) device->p_vkDestroyCommandPool( device->host.device, snapshot->pool, NULL );
     if (snapshot->semaphores)
         for (i = 0; i < snapshot->image_count; ++i)
@@ -2420,6 +2469,7 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
     }
     vulkan_object_init( &swapchain->obj.obj, host_swapchain );
     swapchain->surface = surface;
+    InterlockedIncrement( &surface->refs );
     swapchain->extents = create_info->imageExtent;
     swapchain->host_extents = create_info_host.imageExtent;
     swapchain->format = create_info->imageFormat;
@@ -2434,29 +2484,131 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
     return VK_SUCCESS;
 }
 
+static BOOL destroy_swapchain( struct vulkan_device *device, struct swapchain *swapchain )
+{
+    unsigned int i;
+    BOOL busy;
+
+    pthread_mutex_lock( &swapchain->present_lock );
+    busy = !!swapchain->completion_refs;
+    pthread_mutex_unlock( &swapchain->present_lock );
+    if (busy) return FALSE;
+
+    for (i = 0; i < ARRAY_SIZE(swapchain->snapshots); ++i)
+    {
+        struct vulkan_snapshot_fence *pending = swapchain->snapshots[i].pending;
+        VkResult res;
+
+        if (!pending) continue;
+        res = device->p_vkGetFenceStatus( device->host.device, pending->fence );
+        /* Timeout, allocation failure and unknown errors do not authorize
+         * freeing storage which the GPU may still access. */
+        if (res != VK_SUCCESS && res != VK_ERROR_DEVICE_LOST) return FALSE;
+    }
+
+    TRACE( "destroying retired swapchain %p after its private copies\n", swapchain );
+    for (i = 0; i < ARRAY_SIZE(swapchain->snapshots); ++i)
+        destroy_swapchain_snapshot( device, &swapchain->snapshots[i] );
+    device->p_vkDestroySwapchainKHR( device->host.device, swapchain->obj.host.swapchain, NULL );
+    release_surface( swapchain->surface );
+
+    pthread_cond_destroy( &swapchain->completion_cond );
+    pthread_mutex_destroy( &swapchain->present_lock );
+    free( swapchain );
+    return TRUE;
+}
+
+#define MAX_SWAPCHAIN_RETIREMENT_WORKERS 64
+static LONG swapchain_retirement_workers;
+
+static void retire_swapchains( struct device *device, BOOL worker )
+{
+    struct swapchain *swapchain, *next;
+    struct list pending = LIST_INIT(pending), retry = LIST_INIT(retry);
+
+    pthread_mutex_lock( &device->retirement_lock );
+    while (!list_empty( &device->retired_swapchains ))
+    {
+        struct timespec deadline;
+
+        list_move_tail( &pending, &device->retired_swapchains );
+        pthread_mutex_unlock( &device->retirement_lock );
+        /* No state mutex spans a host call. One stalled copy cannot hold
+         * up reclamation of completed swapchains on another queue. */
+        LIST_FOR_EACH_ENTRY_SAFE( swapchain, next, &pending, struct swapchain, retirement_entry )
+        {
+            list_remove( &swapchain->retirement_entry );
+            if (!destroy_swapchain( &device->obj, swapchain ))
+                list_add_tail( &retry, &swapchain->retirement_entry );
+        }
+        pthread_mutex_lock( &device->retirement_lock );
+        list_move_tail( &device->retired_swapchains, &retry );
+        if (list_empty( &device->retired_swapchains )) break;
+        clock_gettime( CLOCK_REALTIME, &deadline );
+        deadline.tv_nsec += 10000000;
+        deadline.tv_sec += deadline.tv_nsec / 1000000000;
+        deadline.tv_nsec %= 1000000000;
+        pthread_cond_timedwait( &device->retirement_cond, &device->retirement_lock, &deadline );
+    }
+    device->retirement_worker = FALSE;
+    pthread_cond_broadcast( &device->retirement_cond );
+    pthread_mutex_unlock( &device->retirement_lock );
+    if (worker) InterlockedDecrement( &swapchain_retirement_workers );
+}
+
+static void swapchain_retirement_thread( void *context )
+{
+    retire_swapchains( context, TRUE );
+}
+
 static void win32u_vkDestroySwapchainKHR( VkDevice client_device, VkSwapchainKHR client_swapchain,
                                           const VkAllocationCallbacks *allocator )
 {
     struct vulkan_device *device = vulkan_device_from_handle( client_device );
     struct vulkan_instance *instance = device->physical_device->instance;
+    struct device *impl = impl_from_vulkan_device( device );
     struct swapchain *swapchain = swapchain_from_handle( client_swapchain );
+    LONG count;
+    HANDLE thread;
+    NTSTATUS status;
 
     if (allocator) FIXME( "Support for allocation callbacks not implemented yet\n" );
     if (!swapchain) return;
 
-    pthread_mutex_lock( &swapchain->present_lock );
-    while (swapchain->completion_refs)
-        pthread_cond_wait( &swapchain->completion_cond, &swapchain->present_lock );
-    pthread_mutex_unlock( &swapchain->present_lock );
-
-    for (unsigned int i = 0; i < ARRAY_SIZE(swapchain->snapshots); ++i)
-        destroy_swapchain_snapshot( device, &swapchain->snapshots[i] );
-    device->p_vkDestroySwapchainKHR( device->host.device, swapchain->obj.host.swapchain, NULL );
     instance->p_remove_object( instance, &swapchain->obj.obj );
+    if (destroy_swapchain( device, swapchain )) return;
+    TRACE( "quarantining swapchain %p with pending private copies\n", swapchain );
+    pthread_mutex_lock( &impl->retirement_lock );
+    list_add_tail( &impl->retired_swapchains, &swapchain->retirement_entry );
+    if (impl->retirement_worker)
+    {
+        pthread_cond_signal( &impl->retirement_cond );
+        pthread_mutex_unlock( &impl->retirement_lock );
+        return;
+    }
+    impl->retirement_worker = TRUE;
+    pthread_mutex_unlock( &impl->retirement_lock );
 
-    pthread_cond_destroy( &swapchain->completion_cond );
-    pthread_mutex_destroy( &swapchain->present_lock );
-    free( swapchain );
+    count = ReadAcquire( &swapchain_retirement_workers );
+    while (count < MAX_SWAPCHAIN_RETIREMENT_WORKERS)
+    {
+        LONG previous = InterlockedCompareExchange( &swapchain_retirement_workers, count + 1, count );
+
+        if (previous != count) { count = previous; continue; }
+        status = PsCreateSystemThread( &thread, THREAD_ALL_ACCESS, NULL, 0, NULL,
+                                       swapchain_retirement_thread, impl );
+        if (!status)
+        {
+            NtClose( thread );
+            return;
+        }
+        InterlockedDecrement( &swapchain_retirement_workers );
+        WARN( "Failed to create swapchain retirement worker, status %#lx\n", (unsigned long)status );
+        break;
+    }
+    /* Thread exhaustion provides backpressure instead of freeing live GPU
+     * resources or allocating an unbounded number of waiting threads. */
+    retire_swapchains( impl, FALSE );
 }
 
 static VkResult win32u_vkAcquireNextImage2KHR( VkDevice client_device, const VkAcquireNextImageInfoKHR *acquire_info,
