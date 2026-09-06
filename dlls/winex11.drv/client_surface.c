@@ -699,8 +699,14 @@ struct client_surface *X11DRV_CreateClientSurface( HWND hwnd, int format, BOOL r
 
     if (format && !visual_from_pixel_format( format, &visual )) return NULL;
 
-    if (usexcomposite && X11DRV_XRender_ClientSurfaceAvailable( TRUE ) &&
-        X11DRV_XFixes_ClientSurfaceAvailable())
+    /* XComposite is the ownership primitive: it lets the owner connection
+     * retain the producer source.  XRender is required only for conversion
+     * or scaling, and core X11 handles ordinary same-visual copies.  XFixes
+     * remains a backend-lifetime requirement because a later topology can
+     * produce a clip too large for the fixed shared handoff slot; falling back
+     * to producer writes would target a different backing than the owner's
+     * frame pool. */
+    if (usexcomposite && X11DRV_XFixes_ClientSurfaceAvailable())
         backend = &x11drv_client_surface_owner_backend;
 
     if (visual.visualid == default_visual.visualid) colormap = default_colormap;
