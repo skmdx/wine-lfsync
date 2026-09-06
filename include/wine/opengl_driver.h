@@ -119,7 +119,7 @@ struct __GLsync
 #include "wine/gdi_driver.h"
 
 /* Wine internal opengl driver version, needs to be bumped upon opengl_funcs changes. */
-#define WINE_OPENGL_DRIVER_VERSION 40
+#define WINE_OPENGL_DRIVER_VERSION 42
 
 struct opengl_drawable;
 
@@ -225,6 +225,9 @@ struct opengl_drawable_funcs
     void (*flush)( struct opengl_drawable *iface, UINT flags );
     /* swap and present the drawable buffers, called from render thread */
     BOOL (*swap)( struct opengl_drawable *iface );
+    /* Optional presentation of COLOR_ATTACHMENT0 from a resolved internal FBO.
+     * Called in the internal context, with default gamma and virtual dimensions. */
+    BOOL (*swap_framebuffer)( struct opengl_drawable *iface, GLuint framebuffer );
 };
 
 /* flags for opengl_drawable flush */

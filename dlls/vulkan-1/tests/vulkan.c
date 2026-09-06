@@ -1080,7 +1080,7 @@ done:
 }
 
 static void test_win32_surface_pixels(VkInstance instance, VkPhysicalDevice physical_device,
-        VkDevice device, VkQueue queue, VkCommandBuffer command_buffer)
+        VkDevice device, VkQueue queue, VkCommandBuffer command_buffer, BOOL incremental)
 {
     VkWin32SurfaceCreateInfoKHR surface_info = {.sType = VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR};
     VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
@@ -1094,6 +1094,13 @@ static void test_win32_surface_pixels(VkInstance instance, VkPhysicalDevice phys
     VkResult results[2], vr;
     VkFence fence = VK_NULL_HANDLE;
     VkSemaphore rendered = VK_NULL_HANDLE;
+    VkBuffer upload = VK_NULL_HANDLE;
+    VkDeviceMemory upload_memory = VK_NULL_HANDLE;
+    DWORD *upload_pixels = NULL;
+    VkRectLayerKHR rectangle = {{32, 32}, {64, 64}, 0};
+    VkPresentRegionKHR regions[2] = {{1, &rectangle}, {1, &rectangle}};
+    VkPresentRegionsKHR present_regions = {.sType = VK_STRUCTURE_TYPE_PRESENT_REGIONS_KHR,
+                                           .swapchainCount = 2, .pRegions = regions};
     PIXELFORMATDESCRIPTOR pfd = {.nSize = sizeof(pfd), .nVersion = 1,
                                 .dwFlags = PFD_DRAW_TO_WINDOW | PFD_SUPPORT_OPENGL,
                                 .iPixelType = PFD_TYPE_RGBA, .cColorBits = 24};
@@ -1105,6 +1112,42 @@ static void test_win32_surface_pixels(VkInstance instance, VkPhysicalDevice phys
             WS_POPUP | WS_VISIBLE, 80, 80, 256, 128, NULL, NULL, NULL, NULL);
     ok(!!parent, "Failed to create composition parent, error %lu.\n", GetLastError());
     if (!parent) return;
+    if (incremental)
+    {
+        VkBufferCreateInfo buffer_info = {.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+            .size = 2 * 64 * 64 * 4, .usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT};
+        VkMemoryAllocateInfo alloc = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+        VkPhysicalDeviceMemoryProperties properties;
+        VkMemoryRequirements requirements;
+        unsigned int type;
+
+        vr = vkCreateBuffer(device, &buffer_info, NULL, &upload);
+        ok(vr == VK_SUCCESS, "Create partial upload buffer failed, vr %d.\n", vr);
+        if (vr) goto done;
+        vkGetBufferMemoryRequirements(device, upload, &requirements);
+        vkGetPhysicalDeviceMemoryProperties(physical_device, &properties);
+        for (type = 0; type < properties.memoryTypeCount; ++type)
+            if ((requirements.memoryTypeBits & (1u << type)) &&
+                (properties.memoryTypes[type].propertyFlags &
+                    (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) ==
+                    (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) break;
+        if (type == properties.memoryTypeCount)
+        {
+            skip("No coherent upload memory for partial presentation.\n");
+            goto done;
+        }
+        alloc.memoryTypeIndex = type;
+        alloc.allocationSize = requirements.size;
+        vr = vkAllocateMemory(device, &alloc, NULL, &upload_memory);
+        ok(vr == VK_SUCCESS, "Allocate partial upload memory failed, vr %d.\n", vr);
+        if (vr) goto done;
+        vr = vkBindBufferMemory(device, upload, upload_memory, 0);
+        ok(vr == VK_SUCCESS, "Bind partial upload memory failed, vr %d.\n", vr);
+        if (vr) goto done;
+        vr = vkMapMemory(device, upload_memory, 0, VK_WHOLE_SIZE, 0, (void **)&upload_pixels);
+        ok(vr == VK_SUCCESS, "Map partial upload memory failed, vr %d.\n", vr);
+        if (vr) goto done;
+    }
     vr = vkCreateFence(device, &fence_info, NULL, &fence);
     ok(vr == VK_SUCCESS, "Create fence failed, vr %d.\n", vr);
     if (vr) goto done;
@@ -1161,7 +1204,7 @@ static void test_win32_surface_pixels(VkInstance instance, VkPhysicalDevice phys
         ok(!!dc[i], "Failed to get readback DC.\n");
         if (!dc[i]) goto done;
     }
-    for (round = 0; round < 4; ++round)
+    for (round = 0; round < (incremental ? 8 : 4); ++round)
     {
         COLORREF colors[2] = {CLR_INVALID, CLR_INVALID};
         COLORREF expected[2] = {round & 1 ? RGB(0,0,255) : RGB(255,0,0),
@@ -1197,9 +1240,28 @@ static void test_win32_surface_pixels(VkInstance instance, VkPhysicalDevice phys
                                        GetGValue(expected[i]) / 255.0f,
                                        GetBValue(expected[i]) / 255.0f, 1.0f}};
 
+            if (incremental) color = (VkClearColorValue){{1, 1, 1, 1}};
+
             vkCmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
                     VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &barrier);
             vkCmdClearColorImage(command_buffer, barrier.image, barrier.newLayout, &color, 1, &barrier.subresourceRange);
+            if (incremental)
+            {
+                VkBufferImageCopy copy = {.bufferOffset = i * 64 * 64 * 4,
+                    .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+                    .imageOffset = {32, 32, 0}, .imageExtent = {64, 64, 1}};
+                unsigned int pixel;
+                DWORD bgra = 0xff000000 | GetRValue(expected[i]) << 16 |
+                             GetGValue(expected[i]) << 8 | GetBValue(expected[i]);
+
+                for (pixel = 0; pixel < 64 * 64; ++pixel) upload_pixels[i * 64 * 64 + pixel] = bgra;
+                barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+                barrier.oldLayout = barrier.newLayout;
+                vkCmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                    VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &barrier);
+                vkCmdCopyBufferToImage(command_buffer, upload, barrier.image,
+                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+            }
             barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
             barrier.dstAccessMask = 0;
             barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
@@ -1223,6 +1285,10 @@ static void test_win32_surface_pixels(VkInstance instance, VkPhysicalDevice phys
         present.pSwapchains = swapchains;
         present.pImageIndices = indices;
         present.pResults = results;
+        /* Every source image contains a full white background and a colored
+         * center. Only the center changes after the first frame, including
+         * when acquire rotates among images and owner output buffers. */
+        present.pNext = incremental && round ? &present_regions : NULL;
         vr = vkQueuePresentKHR(queue, &present);
         ok(vr == VK_SUCCESS, "Round %u composition present failed, vr %d.\n", round, vr);
         for (i = 0; i < ARRAY_SIZE(data); ++i)
@@ -1242,12 +1308,24 @@ static void test_win32_surface_pixels(VkInstance instance, VkPhysicalDevice phys
             Sleep(1);
         } while (GetTickCount() - start < 5000);
         for (i = 0; i < ARRAY_SIZE(data); ++i)
+        {
             ok(colors[i] == expected[i], "Round %u child %u pixel %#lx, expected %#lx.\n",
                     round, i, colors[i], expected[i]);
+            if (incremental)
+            {
+                COLORREF background = GetPixel(dc[i], 8, 8);
+
+                ok(background == RGB(255,255,255),
+                    "Round %u child %u background %#lx, expected white.\n", round, i, background);
+            }
+        }
         trace("Composition round %u pixels %#lx/%#lx.\n", round, colors[0], colors[1]);
     }
 done:
     vkQueueWaitIdle(queue);
+    if (upload_pixels) vkUnmapMemory(device, upload_memory);
+    if (upload) vkDestroyBuffer(device, upload, NULL);
+    if (upload_memory) vkFreeMemory(device, upload_memory, NULL);
     if (rendered) vkDestroySemaphore(device, rendered, NULL);
     if (fence) vkDestroyFence(device, fence, NULL);
     for (i = 0; i < ARRAY_SIZE(data); ++i)
@@ -1263,7 +1341,8 @@ done:
 
 static void test_win32_surface(VkInstance instance, VkPhysicalDevice physical_device)
 {
-    static const char *const device_extensions[] = {"VK_KHR_swapchain", "VK_KHR_device_group"};
+    static const char *const device_extensions[] = {"VK_KHR_swapchain", "VK_KHR_device_group",
+                                                   "VK_KHR_incremental_present"};
 
     VkCommandBufferAllocateInfo allocate_info = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
     VkWin32SurfaceCreateInfoKHR create_info = {.sType = VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR};
@@ -1280,10 +1359,14 @@ static void test_win32_surface(VkInstance instance, VkPhysicalDevice physical_de
     char **argv;
     int argc = winetest_get_mainargs(&argv);
     BOOL pixels_only = argc > 2 && !strcmp(argv[2], "composition-pixels");
+    BOOL incremental;
 
     vr = create_device(physical_device, ARRAY_SIZE(device_extensions), device_extensions, NULL, &device);
-    if (vr != VK_SUCCESS) /* Wine testbot is missing VK_KHR_device_group */
+    incremental = vr == VK_SUCCESS;
+    if (vr != VK_SUCCESS)
         vr = create_device(physical_device, ARRAY_SIZE(device_extensions) - 1, device_extensions, NULL, &device);
+    if (vr != VK_SUCCESS) /* Wine testbot is missing VK_KHR_device_group */
+        vr = create_device(physical_device, 1, device_extensions, NULL, &device);
     ok(vr == VK_SUCCESS, "Got unexpected vr %d.\n", vr);
 
     find_queue_family(physical_device, VK_QUEUE_GRAPHICS_BIT, &queue_family_index);
@@ -1553,8 +1636,15 @@ static void test_win32_surface(VkInstance instance, VkPhysicalDevice physical_de
 
 composition_pixels:
     winetest_push_context("composition-pixels");
-    test_win32_surface_pixels(instance, physical_device, device, queue, command_buffer);
+    test_win32_surface_pixels(instance, physical_device, device, queue, command_buffer, FALSE);
     winetest_pop_context();
+    if (incremental)
+    {
+        winetest_push_context("incremental-composition-pixels");
+        test_win32_surface_pixels(instance, physical_device, device, queue, command_buffer, TRUE);
+        winetest_pop_context();
+    }
+    else skip("VK_KHR_incremental_present is unavailable.\n");
 
     vkDestroyCommandPool(device, command_pool, NULL);
     vkDestroyDevice(device, NULL);

@@ -36,11 +36,13 @@ enum client_surface_handoff_state
 #define CLIENT_SURFACE_HANDOFF_STATE_MASK ((UINT64)((1u << CLIENT_SURFACE_HANDOFF_STATE_BITS) - 1))
 #define CLIENT_SURFACE_HANDOFF_GENERATION_SHIFT CLIENT_SURFACE_HANDOFF_STATE_BITS
 #define CLIENT_SURFACE_HANDOFF_SLOTS 1024
+#define CLIENT_SURFACE_SOURCE_FRAME_COUNT 2
 #define CLIENT_SURFACE_HANDOFF_BITMAP_WORDS (CLIENT_SURFACE_HANDOFF_SLOTS / 64)
-/* futex_waitv accepts 128 waiters.  Reserve one for local compositor jobs. */
-#define CLIENT_SURFACE_HANDOFF_MAX_POOLS_PER_CONSUMER 127
+/* Bound mapped metadata and notification descriptors independently of the
+ * host's wait primitive. Each binding reserves two of the 1024 slots. */
+#define CLIENT_SURFACE_HANDOFF_MAX_POOLS_PER_CONSUMER 512
 #define CLIENT_SURFACE_HANDOFF_MAGIC ((UINT64)0x57435348414e444full)
-#define CLIENT_SURFACE_HANDOFF_VERSION 5
+#define CLIENT_SURFACE_HANDOFF_VERSION 8
 #define CLIENT_SURFACE_HANDOFF_MAX_CLIP_RECTS 16
 
 #define CLIENT_SURFACE_HANDOFF_NATIVE_X11 0x0001
@@ -50,6 +52,9 @@ enum client_surface_handoff_state
 #define CLIENT_SURFACE_HANDOFF_PIXMAP_CLIP 0x0010
 /* Producer-owned snapshot: copy while READING, without retaining its XID. */
 #define CLIENT_SURFACE_HANDOFF_COPY_SOURCE 0x0020
+/* Completed independent image. Placement is selected from the owner's current
+ * scene after validating this binding and the image's actual dimensions. */
+#define CLIENT_SURFACE_HANDOFF_INDEPENDENT 0x0040
 #define CLIENT_SURFACE_HANDOFF_ENDPOINT_PRODUCER 0x0001
 #define CLIENT_SURFACE_HANDOFF_ENDPOINT_CONSUMER 0x0002
 
@@ -110,7 +115,9 @@ struct DECLSPEC_ALIGN(64) client_surface_handoff_slot
     UINT clip_count;
     UINT64 clip_region;
     struct client_surface_handoff_clip_rect clips[CLIENT_SURFACE_HANDOFF_MAX_CLIP_RECTS];
-    UINT64 reserved[7];
+    UINT64 source_sequence;
+    UINT64 damage_base_sequence;
+    UINT64 reserved[5];
 };
 
 C_ASSERT( sizeof(struct client_surface_handoff_slot) == 320 );
@@ -144,6 +151,10 @@ enum client_surface_completion_kind
 
 typedef BOOL (*client_surface_completion_wait_func)( void *context, DWORD timeout );
 typedef void (*client_surface_completion_release_func)( void *context );
+struct client_surface;
+struct client_surface_frame;
+typedef BOOL (*client_surface_completion_resolve_func)( void *context,
+    struct client_surface *surface, struct client_surface_frame *frame );
 
 struct client_surface_completion
 {
@@ -151,6 +162,9 @@ struct client_surface_completion
     BOOL external_result; /* completion result is supplied by the caller or queued token */
     client_surface_completion_wait_func wait;
     client_surface_completion_release_func release;
+    /* Consume completed private storage under the surface submission lock.
+     * Unlike wait(), this may update the native source of the current frame. */
+    client_surface_completion_resolve_func resolve;
     void *context;
 };
 

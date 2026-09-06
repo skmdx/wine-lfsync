@@ -784,6 +784,8 @@ static unsigned int release_surface_handoff( HWND hwnd, DWORD producer, UINT_PTR
 }
 
 static unsigned int complete_surface_handoffs( HWND hwnd, UINT64 generation, UINT64 epoch,
+                                               const struct client_surface_handoff_receipt *receipts,
+                                               unsigned int count,
                                                BOOL *accepted )
 {
     struct __server_request_info info = {0};
@@ -796,9 +798,111 @@ static unsigned int complete_surface_handoffs( HWND hwnd, UINT64 generation, UIN
     info.u.req.complete_client_surface_handoffs_request.handle = wine_server_user_handle( hwnd );
     info.u.req.complete_client_surface_handoffs_request.generation = generation;
     info.u.req.complete_client_surface_handoffs_request.scene_generation = epoch;
+    if (count) wine_server_add_data( &info, receipts, count * sizeof(*receipts) );
     status = p_wine_server_call( &info );
     if (!status && accepted) *accepted = reply->accepted;
     return status;
+}
+
+static void test_handoff_receipts(void)
+{
+    const UINT_PTR identity = 0x79580000;
+    struct handoff_binding producer = {0}, owner = {0};
+    struct client_surface_handoff_receipt receipt;
+    struct client_surface_handoff_slot *slots;
+    struct surface_state state, before;
+    struct __server_request_info info = {0};
+    HWND hwnd = create_test_window( FALSE );
+    unsigned int status;
+    void *view = NULL;
+    BOOL accepted;
+
+    ok( !!hwnd, "failed to create receipt window\n" );
+    if (!hwnd) return;
+    status = set_surface_state( hwnd, identity,
+        CLIENT_SURFACE_STATE_REGISTER | CLIENT_SURFACE_STATE_SCENE_PUBLICATION, 0, NULL );
+    ok( !status, "receipt registration status %#x\n", status );
+    status = claim_surface_state( hwnd, identity, NULL );
+    ok( !status, "receipt claim status %#x\n", status );
+    status = get_surface_handoff( hwnd, 0, identity, FALSE, &producer );
+    ok( !status, "receipt producer bind status %#x\n", status );
+    if (status) goto done;
+    view = MapViewOfFile( producer.mapping, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, producer.size );
+    ok( !!view, "receipt source mapping failed %lu\n", GetLastError() );
+    if (!view) goto done;
+    slots = (void *)((char *)view + producer.offset);
+    ok( producer.offset + CLIENT_SURFACE_SOURCE_FRAME_COUNT * sizeof(*slots) <= producer.size,
+        "independent source images exceed their mapping\n" );
+    ok( slots[1].cookie == producer.cookie && slots[1].identity == identity,
+        "second source image has an unrelated identity\n" );
+    status = get_surface_handoff( hwnd, GetCurrentProcessId(), identity, TRUE, &owner );
+    ok( !status, "receipt owner bind status %#x\n", status );
+    if (status) goto done;
+    ShowWindow( hwnd, SW_SHOW );
+    status = set_surface_state( hwnd, 0, CLIENT_SURFACE_STATE_STAGED, 0, &state );
+    ok( !status && state.staged && state.pending == 1,
+        "receipt scene status %#x staged %u pending %u\n", status, state.staged, state.pending );
+
+    /* The owner has finished reading image 1. Its receipt must remain usable
+     * even after that image has been returned and reserved for newer work. */
+    receipt = (struct client_surface_handoff_receipt){
+        .handle = wine_server_user_handle( hwnd ), .process = GetCurrentProcessId(),
+        .surface = identity, .cookie = producer.cookie, .source_generation = 7, .buffer_index = 1,
+    };
+    __atomic_store_n( &slots[1].control,
+        client_surface_handoff_control( 8, CLIENT_SURFACE_HANDOFF_SUBMITTED ), __ATOMIC_RELEASE );
+    ok( client_surface_handoff_state( __atomic_load_n( &slots[0].control, __ATOMIC_ACQUIRE ) ) ==
+        CLIENT_SURFACE_HANDOFF_FREE, "reserving image 1 changed image 0\n" );
+    status = complete_surface_handoffs( hwnd, state.generation, state.scene_generation, NULL, 0, &accepted );
+    ok( !status && !accepted, "missing receipt accepted, status %#x\n", status );
+    ++receipt.cookie;
+    status = complete_surface_handoffs( hwnd, state.generation, state.scene_generation, &receipt, 1, &accepted );
+    ok( !status && !accepted, "stale binding receipt accepted, status %#x\n", status );
+    --receipt.cookie;
+    receipt.buffer_index = CLIENT_SURFACE_SOURCE_FRAME_COUNT;
+    status = complete_surface_handoffs( hwnd, state.generation, state.scene_generation, &receipt, 1, &accepted );
+    ok( !status && !accepted, "out-of-range source receipt accepted, status %#x\n", status );
+    receipt.buffer_index = 1;
+
+    before = state;
+    info.u.req.cancel_client_surface_handoffs_request.__header.req = REQ_cancel_client_surface_handoffs;
+    info.u.req.cancel_client_surface_handoffs_request.handle = wine_server_user_handle( hwnd );
+    info.u.req.cancel_client_surface_handoffs_request.generation = state.generation;
+    info.u.req.cancel_client_surface_handoffs_request.scene_generation = state.scene_generation;
+    status = p_wine_server_call( &info );
+    ok( !status, "assembly cancellation status %#x\n", status );
+    status = set_surface_state( hwnd, 0, 0, 0, &state );
+    ok( !status && state.scene_generation != before.scene_generation && state.pending == 1,
+        "cancel did not request a complete replay, status %#x pending %u\n", status, state.pending );
+    status = complete_surface_handoffs( hwnd, before.generation, before.scene_generation, &receipt, 1, &accepted );
+    ok( !status && !accepted, "cancelled scene accepted a late receipt, status %#x\n", status );
+    status = complete_surface_handoffs( hwnd, state.generation, state.scene_generation, &receipt, 1, &accepted );
+    ok( !status && accepted, "returned source receipt rejected, status %#x accepted %u\n", status, accepted );
+    status = complete_surface_handoffs( hwnd, state.generation, state.scene_generation, &receipt, 1, &accepted );
+    ok( !status && !accepted, "publication ticket reserved twice, status %#x\n", status );
+    before = state;
+    status = set_surface_state( hwnd, 0, CLIENT_SURFACE_STATE_FAILED, 0, NULL );
+    ok( !status, "failed native publication status %#x\n", status );
+    status = set_surface_state_scene( hwnd, 0, CLIENT_SURFACE_STATE_PUBLISH_COMMIT,
+        before.generation, before.scene_generation, &state );
+    ok( !status && state.staged && state.scene_generation != before.scene_generation,
+        "late ACK exposed failed publication, status %#x staged %u\n", status, state.staged );
+    status = set_surface_state( hwnd, 0, CLIENT_SURFACE_STATE_GEOMETRY_READY, 0, &state );
+    ok( !status && state.staged && state.pending == 1,
+        "failed publication did not restart on owner activity, status %#x pending %u\n", status, state.pending );
+    status = complete_surface_handoffs( hwnd, state.generation, state.scene_generation, &receipt, 1, &accepted );
+    ok( !status && accepted, "replacement publication receipt rejected, status %#x\n", status );
+    status = set_surface_state_scene( hwnd, 0, CLIENT_SURFACE_STATE_PUBLISH_COMMIT,
+        state.generation, state.scene_generation, &state );
+    ok( !status && !state.staged, "receipt publication failed, status %#x staged %u\n", status, state.staged );
+done:
+    set_surface_state( hwnd, identity, CLIENT_SURFACE_STATE_UNREGISTER, 0, NULL );
+    if (producer.cookie) release_surface_handoff( hwnd, 0, identity, producer.cookie, FALSE );
+    if (owner.cookie) release_surface_handoff( hwnd, GetCurrentProcessId(), identity, owner.cookie, TRUE );
+    if (view) UnmapViewOfFile( view );
+    if (producer.mapping) CloseHandle( producer.mapping );
+    if (owner.mapping) CloseHandle( owner.mapping );
+    DestroyWindow( hwnd );
 }
 
 static void test_handoff_storage(void)
@@ -915,7 +1019,7 @@ static void test_handoff_storage(void)
     __atomic_fetch_and( &owner_shared->ready_bitmap[index / 64],
                         ~((UINT64)1 << (index % 64)), __ATOMIC_RELEASE );
 
-    status = complete_surface_handoffs( hwnd, 0, 0, &accepted );
+    status = complete_surface_handoffs( hwnd, 0, 0, NULL, 0, &accepted );
     ok( !status && !accepted, "idle handoff completion status %#x accepted %u\n",
         status, accepted );
     expected = control;
@@ -988,7 +1092,7 @@ static void test_handoff_lost_recovery(void)
 {
     const UINT_PTR identity = 0x79480000;
     const UINT flags = CLIENT_SURFACE_STATE_REGISTER | CLIENT_SURFACE_STATE_SCENE_PUBLICATION;
-    struct handoff_binding producer = {0}, owner = {0}, replacement = {0};
+    struct handoff_binding producer = {0}, owner = {0}, replacement = {0}, pending = {0};
     struct client_surface_handoff_shared *shared;
     struct client_surface_handoff_slot *slot;
     void *producer_view = NULL, *owner_view = NULL, *replacement_view = NULL;
@@ -1025,9 +1129,10 @@ static void test_handoff_lost_recovery(void)
     if (!owner_view) goto done;
 
     slot = (void *)((char *)producer_view + producer.offset);
-    control = __atomic_load_n( &slot->control, __ATOMIC_ACQUIRE );
+    /* A failure in either independent storage slot retires the binding. */
+    control = __atomic_load_n( &slot[CLIENT_SURFACE_SOURCE_FRAME_COUNT - 1].control, __ATOMIC_ACQUIRE );
     generation = client_surface_handoff_generation( control );
-    __atomic_store_n( &slot->control,
+    __atomic_store_n( &slot[CLIENT_SURFACE_SOURCE_FRAME_COUNT - 1].control,
                       client_surface_handoff_control( generation, CLIENT_SURFACE_HANDOFF_LOST ),
                       __ATOMIC_RELEASE );
     old_cookie = producer.cookie;
@@ -1035,6 +1140,13 @@ static void test_handoff_lost_recovery(void)
                                       owner.cookie, TRUE );
     ok( !status, "handoff recovery consumer release status %#x\n", status );
     owner_bound = FALSE;
+    status = get_surface_handoff( hwnd, GetCurrentProcessId(), identity, TRUE, &pending );
+    ok( status == STATUS_DEVICE_BUSY, "reacquired lost binding while producer still mapped, status %#x\n", status );
+    if (!status)
+    {
+        CloseHandle( pending.mapping );
+        release_surface_handoff( hwnd, GetCurrentProcessId(), identity, pending.cookie, TRUE );
+    }
     status = release_surface_handoff( hwnd, 0, identity, producer.cookie, FALSE );
     ok( !status, "handoff recovery producer release status %#x\n", status );
     producer_bound = FALSE;
@@ -1933,7 +2045,8 @@ static void test_concurrent_state_changes(void)
     DestroyWindow( hwnd );
 }
 
-static void owner_exit_child( HWND hwnd, HANDLE ready, HANDLE release, BOOL create_queue )
+static void owner_exit_child( HWND hwnd, HANDLE ready, HANDLE release, BOOL create_queue,
+                              BOOL scene_publication )
 {
     MSG message;
     unsigned int i, status;
@@ -1941,7 +2054,8 @@ static void owner_exit_child( HWND hwnd, HANDLE ready, HANDLE release, BOOL crea
     for (i = 0; i < OWNER_SURFACES; ++i)
     {
         status = set_surface_state( hwnd, 0x30000000 + i,
-                                    CLIENT_SURFACE_STATE_REGISTER | CLIENT_SURFACE_STATE_CACHE,
+                                    CLIENT_SURFACE_STATE_REGISTER | CLIENT_SURFACE_STATE_CACHE |
+                                    (scene_publication ? CLIENT_SURFACE_STATE_SCENE_PUBLICATION : 0),
                                     0, NULL );
         ok( !status, "owner register %u failed, status %#x\n", i, status );
     }
@@ -2029,8 +2143,8 @@ static BOOL run_child( char **argv, const char *mode, HWND hwnd, DWORD delay )
             Sleep( 1200 );
             status = set_surface_state( hwnd, 0, 0, 0, &state );
             ok( !status, "stalled owner state query failed, status %#x\n", status );
-            ok( !state.staged && !state.pending,
-                "stalled owner blocked publication deadline: staged %u pending %u\n",
+            ok( state.staged && !state.pending,
+                "stalled owner exposed an incomplete scene: staged %u pending %u\n",
                 state.staged, state.pending );
         }
         SetEvent( release );
@@ -2620,6 +2734,7 @@ static BOOL run_focused_test_case( const char *name, char **argv )
          test_native_backing_barrier},
         {"demoted-native-barrier", "native backing barrier after demotion", test_demoted_native_barrier},
         {"handoff-storage", "client surface generation handoff storage", test_handoff_storage},
+        {"handoff-receipts", "source-independent assembly receipts", test_handoff_receipts},
         {"notification-filter", "client surface notification filter bypass",
          test_notification_identity_aba},
         {"late-present-cutover", "late client surface publication cut-over",
@@ -2748,7 +2863,8 @@ START_TEST(client_surface)
         sscanf( argv[3], "%p", &hwnd );
         sscanf( argv[4], "%p", &ready );
         sscanf( argv[5], "%p", &release );
-        owner_exit_child( hwnd, ready, release, strcmp( argv[2], "owner_no_queue" ) );
+        owner_exit_child( hwnd, ready, release, strcmp( argv[2], "owner_no_queue" ),
+                          !strcmp( argv[2], "owner_stalled" ) );
         return;
     }
     if (argc > 4 && !strcmp( argv[2], "destroy_race" ))
@@ -2785,6 +2901,7 @@ START_TEST(client_surface)
     test_completion_result_provenance();
     trace( "testing client surface generation handoff storage\n" );
     test_handoff_storage();
+    test_handoff_receipts();
     test_handoff_lost_recovery();
     test_handoff_storage_process_exit( argv, FALSE );
     test_handoff_storage_process_exit( argv, TRUE );

@@ -219,7 +219,7 @@ struct gdi_dc_funcs
 };
 
 /* increment this when changing driver tables or shared driver-facing structures */
-#define WINE_GDI_DRIVER_VERSION 115
+#define WINE_GDI_DRIVER_VERSION 117
 
 #define GDI_PRIORITY_NULL_DRV        0  /* null driver */
 #define GDI_PRIORITY_FONT_DRV      100  /* any font driver */
@@ -275,6 +275,7 @@ enum client_surface_backend_caps
     /* Offscreen presentation is owner-only; present() must never write an
      * owner native target when generation handoff is unavailable. */
     CLIENT_SURFACE_BACKEND_OWNER_COMPOSITOR = 0x20,
+    CLIENT_SURFACE_BACKEND_OWNER_SCENE_PLAN = 0x40,
 };
 
 struct client_surface_completion_ops
@@ -306,6 +307,11 @@ struct client_surface_backend
     BOOL (*handoff_prepare)( struct client_surface *surface,
                              struct client_surface_handoff_slot *slot,
                              HRGN surface_region );
+    /* Freeze a completed mutable native drawable into this slot's independent
+     * storage before READY. The slot is still producer-private here. */
+    BOOL (*handoff_complete)( struct client_surface *surface,
+                              struct client_surface_handoff_slot *slot );
+    BOOL (*handoff_serialize)( struct client_surface *surface );
     const struct client_surface_completion_ops *completion;
 };
 
@@ -342,12 +348,29 @@ struct client_surface_frame
     LONG64 target_seq;
     enum client_surface_frame_target target;
     UINT64 handoff_control;
+    unsigned int handoff_index;
+    RECT damage;
+    UINT64 damage_base_sequence;
+    SIZE source_size; /* independently frozen image, valid after external completion */
     struct client_surface_completion completion;
     enum client_surface_frame_result result;
 };
 
 /* Backend completion and publication must share one bounded wait contract. */
 #define CLIENT_SURFACE_PRESENT_TIMEOUT 5000
+
+enum client_surface_memory_class
+{
+    CLIENT_SURFACE_MEMORY_SOURCE,
+    CLIENT_SURFACE_MEMORY_STAGING,
+    CLIENT_SURFACE_MEMORY_OUTPUT,
+    CLIENT_SURFACE_MEMORY_CLASS_COUNT,
+};
+
+W32KAPI void client_surface_fail_scene( HWND hwnd );
+
+W32KAPI BOOL client_surface_reserve_memory( enum client_surface_memory_class type, UINT64 bytes );
+W32KAPI void client_surface_release_memory( enum client_surface_memory_class type, UINT64 bytes );
 
 struct client_surface
 {
@@ -397,9 +420,11 @@ struct client_surface
     SIZE_T                             handoff_view_size;
     struct client_surface_handoff_shared *handoff_shared;
     struct client_surface_handoff_slot *handoff_slot;
+    unsigned int next_handoff;
     UINT64                             handoff_mapping_id;
     UINT64                             handoff_cookie;
     BOOL                               handoff_release_pending;
+    int                                handoff_ready_fd;
     BOOL                               raw;            /* use the raw physical position and size for the host client surface */
 };
 
@@ -447,6 +472,9 @@ W32KAPI BOOL client_surface_complete_present_locked( struct client_surface *surf
                                                      BOOL submitted, BOOL external_completed,
                                                      const SIZE *expected_size, DWORD timeout );
 W32KAPI void client_surface_geometry_ready( HWND hwnd );
+W32KAPI BOOL client_surface_get_toplevel_scene( HWND toplevel, struct client_surface_scene *scene );
+W32KAPI BOOL client_surface_get_scene_member( HWND toplevel, HWND hwnd, UINT64 epoch,
+                                              struct client_surface_target *target, HRGN *region );
 W32KAPI void client_surface_set_staged( HWND hwnd );
 W32KAPI void client_surface_bypass_staging( HWND hwnd );
 W32KAPI BOOL client_surface_begin_native_barrier( HWND hwnd, UINT_PTR token );

@@ -3426,10 +3426,12 @@ void X11DRV_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_hint, UIN
     BOOL prepare_client_surface = !!(swp_flags & WINE_SWP_CLIENT_SURFACE_PREPARE);
     BOOL enable_client_surface_backing = !!(swp_flags & WINE_SWP_CLIENT_SURFACE_BACKING_ENABLE);
     BOOL disable_client_surface_backing = !!(swp_flags & WINE_SWP_CLIENT_SURFACE_BACKING_DISABLE);
+    BOOL owner_update;
 
     if ((is_managed = is_window_managed( hwnd, swp_flags, fullscreen ))) make_owner_managed( hwnd );
 
     if (!(data = get_win_data( hwnd ))) return;
+    owner_update = X11DRV_client_surface_backing_begin_update( data );
     if (is_managed) window_set_managed( data, TRUE );
 
     old_rects = data->rects;
@@ -3480,6 +3482,7 @@ void X11DRV_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_hint, UIN
     {
         if (client_surface_pending || prepare_client_surface || publish_client_surface)
             client_surface_bypass_staging( hwnd );
+        if (owner_update) X11DRV_client_surface_backing_end_update( data );
         release_win_data( data );
         return;
     }
@@ -3520,14 +3523,16 @@ void X11DRV_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_hint, UIN
 
     window_set_wm_state( data, get_desired_wm_state( new_style, new_rects ), activate );
     if (prepare_client_surface && !X11DRV_client_surface_backing_snapshot( data, TRUE ))
-        client_surface_bypass_staging( hwnd );
+        client_surface_fail_scene( hwnd );
     if (publish_client_surface)
     {
         /* The server keeps the live or staged token active until this X
          * request has completed.  This is the native linearization point for
          * publication. */
-        if (!X11DRV_client_surface_backing_publish( data )) client_surface_bypass_staging( hwnd );
-        if (data->client_surface_redirected || data->client_surface_opacity_staged)
+        BOOL published = X11DRV_client_surface_backing_publish( data );
+
+        if (!published) client_surface_fail_scene( hwnd );
+        if (published && (data->client_surface_redirected || data->client_surface_opacity_staged))
             finish_client_surface_staging( data );
         XSync( data->display, False );
     }
@@ -3546,8 +3551,7 @@ void X11DRV_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_hint, UIN
         }
         else
         {
-            client_surface_bypass_staging( hwnd );
-            finish_client_surface_staging( data );
+            client_surface_fail_scene( hwnd );
         }
     }
     else if (win32_visible && !client_surface_pending &&
@@ -3571,6 +3575,7 @@ void X11DRV_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_hint, UIN
     /* if window was fullscreen and is being hidden, release cursor clipping */
     was_fullscreen &= data->desired_state.wm_state != NormalState;
 
+    if (owner_update) X11DRV_client_surface_backing_end_update( data );
     XFlush( data->display );  /* make sure changes are done before we start painting again */
     release_win_data( data );
 
@@ -3669,7 +3674,10 @@ void X11DRV_SetWindowRgn( HWND hwnd, HRGN hrgn, BOOL redraw )
 
     if ((data = get_win_data( hwnd )))
     {
+        BOOL owner_update = X11DRV_client_surface_backing_begin_update( data );
+
         sync_window_region( data, hrgn );
+        if (owner_update) X11DRV_client_surface_backing_end_update( data );
         release_win_data( data );
     }
     else if (X11DRV_get_whole_window( hwnd ))

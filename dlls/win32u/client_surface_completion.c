@@ -70,7 +70,9 @@ BOOL client_surface_wait_present_completion( struct client_surface *surface,
     elapsed = NtGetTickCount() - start;
     timeout = elapsed < timeout ? timeout - elapsed : 0;
     client_surface_get_target( surface, &target );
-    completed = present->target != CLIENT_SURFACE_FRAME_TARGET_INVALID && target.valid &&
+    /* The owner may still be preparing a scene. That prevents publication,
+     * but does not invalidate a completion for this unchanged native target. */
+    completed = target.valid &&
                 present->target_seq == target.seq &&
                 present->completion.wait( present->completion.context, timeout );
     pthread_mutex_unlock( &surface->completion_wait_lock );

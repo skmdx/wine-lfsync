@@ -285,6 +285,18 @@ struct client_surface_handoff_desc
 };
 
 
+struct client_surface_handoff_receipt
+{
+    user_handle_t handle;
+    process_id_t process;
+    client_ptr_t surface;
+    unsigned __int64 cookie;
+    unsigned __int64 source_generation;
+    unsigned int buffer_index;
+    unsigned int __pad;
+};
+
+
 struct async_data
 {
     obj_handle_t    handle;
@@ -6332,6 +6344,7 @@ struct set_client_surface_state_reply
 #define CLIENT_SURFACE_STATE_NATIVE_BARRIER_END   0x80000
 #define CLIENT_SURFACE_STATE_DIRECT_PRESENTATION 0x200000
 #define CLIENT_SURFACE_STATE_UPDATE_CAPS         0x400000
+#define CLIENT_SURFACE_STATE_FAILED              0x800000
 
 
 
@@ -6375,6 +6388,25 @@ struct get_client_surface_handoff_reply
     unsigned __int64 cookie;
 };
 
+
+struct get_client_surface_handoff_event_request
+{
+    struct request_header __header;
+    user_handle_t  handle;
+    process_id_t   producer;
+    char __pad_20[4];
+    client_ptr_t   surface;
+    unsigned __int64 cookie;
+    unsigned int   owner;
+    char __pad_44[4];
+};
+struct get_client_surface_handoff_event_reply
+{
+    struct reply_header __header;
+    obj_handle_t   event;
+    char __pad_12[4];
+};
+
 /* Drop one producer or owner view. The binding is not reusable until both
  * sides have released it or their processes have exited. */
 struct release_client_surface_handoff_request
@@ -6393,21 +6425,35 @@ struct release_client_surface_handoff_reply
     struct reply_header __header;
 };
 
-/* Atomically accept one owner-assembled scene generation. All selected
- * handoffs remain READING until this request has validated the complete set;
- * steady-state generation zero frames require no server acknowledgement. */
+/* Atomically accept owner-owned copies for one immutable scene roster.
+ * Receipts are sorted by window handle. Producer slots may already have
+ * advanced; their storage lifetime is independent of this transaction. */
 struct complete_client_surface_handoffs_request
 {
     struct request_header __header;
     user_handle_t  handle;
     unsigned __int64 generation;
     unsigned __int64 scene_generation;
+    /* VARARG(receipts,bytes); */
 };
 struct complete_client_surface_handoffs_reply
 {
     struct reply_header __header;
     int            accepted;
     char __pad_12[4];
+};
+
+
+struct cancel_client_surface_handoffs_request
+{
+    struct request_header __header;
+    user_handle_t handle;
+    unsigned __int64 generation;
+    unsigned __int64 scene_generation;
+};
+struct cancel_client_surface_handoffs_reply
+{
+    struct reply_header __header;
 };
 
 
@@ -6757,8 +6803,10 @@ enum request
     REQ_set_client_surface_state,
     REQ_get_client_surface_clip_windows,
     REQ_get_client_surface_handoff,
+    REQ_get_client_surface_handoff_event,
     REQ_release_client_surface_handoff,
     REQ_complete_client_surface_handoffs,
+    REQ_cancel_client_surface_handoffs,
     REQ_publish_client_surface_handoff,
     REQ_get_client_surface_handoffs,
     REQ_NB_REQUESTS
@@ -7080,8 +7128,10 @@ union generic_request
     struct set_client_surface_state_request set_client_surface_state_request;
     struct get_client_surface_clip_windows_request get_client_surface_clip_windows_request;
     struct get_client_surface_handoff_request get_client_surface_handoff_request;
+    struct get_client_surface_handoff_event_request get_client_surface_handoff_event_request;
     struct release_client_surface_handoff_request release_client_surface_handoff_request;
     struct complete_client_surface_handoffs_request complete_client_surface_handoffs_request;
+    struct cancel_client_surface_handoffs_request cancel_client_surface_handoffs_request;
     struct publish_client_surface_handoff_request publish_client_surface_handoff_request;
     struct get_client_surface_handoffs_request get_client_surface_handoffs_request;
 };
@@ -7401,12 +7451,14 @@ union generic_reply
     struct set_client_surface_state_reply set_client_surface_state_reply;
     struct get_client_surface_clip_windows_reply get_client_surface_clip_windows_reply;
     struct get_client_surface_handoff_reply get_client_surface_handoff_reply;
+    struct get_client_surface_handoff_event_reply get_client_surface_handoff_event_reply;
     struct release_client_surface_handoff_reply release_client_surface_handoff_reply;
     struct complete_client_surface_handoffs_reply complete_client_surface_handoffs_reply;
+    struct cancel_client_surface_handoffs_reply cancel_client_surface_handoffs_reply;
     struct publish_client_surface_handoff_reply publish_client_surface_handoff_reply;
     struct get_client_surface_handoffs_reply get_client_surface_handoffs_reply;
 };
 
-#define SERVER_PROTOCOL_VERSION 997
+#define SERVER_PROTOCOL_VERSION 1002
 
 #endif /* __WINE_WINE_SERVER_PROTOCOL_H */

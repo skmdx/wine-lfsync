@@ -3603,6 +3603,20 @@ static void dump_get_client_surface_handoff_reply( const struct get_client_surfa
     dump_uint64( ", cookie=", &req->cookie );
 }
 
+static void dump_get_client_surface_handoff_event_request( const struct get_client_surface_handoff_event_request *req )
+{
+    fprintf( stderr, " handle=%08x", req->handle );
+    fprintf( stderr, ", producer=%04x", req->producer );
+    dump_uint64( ", surface=", &req->surface );
+    dump_uint64( ", cookie=", &req->cookie );
+    fprintf( stderr, ", owner=%08x", req->owner );
+}
+
+static void dump_get_client_surface_handoff_event_reply( const struct get_client_surface_handoff_event_reply *req )
+{
+    fprintf( stderr, " event=%04x", req->event );
+}
+
 static void dump_release_client_surface_handoff_request( const struct release_client_surface_handoff_request *req )
 {
     fprintf( stderr, " handle=%08x", req->handle );
@@ -3617,11 +3631,19 @@ static void dump_complete_client_surface_handoffs_request( const struct complete
     fprintf( stderr, " handle=%08x", req->handle );
     dump_uint64( ", generation=", &req->generation );
     dump_uint64( ", scene_generation=", &req->scene_generation );
+    dump_varargs_bytes( ", receipts=", cur_size );
 }
 
 static void dump_complete_client_surface_handoffs_reply( const struct complete_client_surface_handoffs_reply *req )
 {
     fprintf( stderr, " accepted=%d", req->accepted );
+}
+
+static void dump_cancel_client_surface_handoffs_request( const struct cancel_client_surface_handoffs_request *req )
+{
+    fprintf( stderr, " handle=%08x", req->handle );
+    dump_uint64( ", generation=", &req->generation );
+    dump_uint64( ", scene_generation=", &req->scene_generation );
 }
 
 static void dump_publish_client_surface_handoff_request( const struct publish_client_surface_handoff_request *req )
@@ -3965,8 +3987,10 @@ static const dump_func req_dumpers[REQ_NB_REQUESTS] =
     (dump_func)dump_set_client_surface_state_request,
     (dump_func)dump_get_client_surface_clip_windows_request,
     (dump_func)dump_get_client_surface_handoff_request,
+    (dump_func)dump_get_client_surface_handoff_event_request,
     (dump_func)dump_release_client_surface_handoff_request,
     (dump_func)dump_complete_client_surface_handoffs_request,
+    (dump_func)dump_cancel_client_surface_handoffs_request,
     (dump_func)dump_publish_client_surface_handoff_request,
     (dump_func)dump_get_client_surface_handoffs_request,
 };
@@ -4285,8 +4309,10 @@ static const dump_func reply_dumpers[REQ_NB_REQUESTS] =
     (dump_func)dump_set_client_surface_state_reply,
     (dump_func)dump_get_client_surface_clip_windows_reply,
     (dump_func)dump_get_client_surface_handoff_reply,
+    (dump_func)dump_get_client_surface_handoff_event_reply,
     NULL,
     (dump_func)dump_complete_client_surface_handoffs_reply,
+    NULL,
     (dump_func)dump_publish_client_surface_handoff_reply,
     (dump_func)dump_get_client_surface_handoffs_reply,
 };
@@ -4605,8 +4631,10 @@ static const char * const req_names[REQ_NB_REQUESTS] =
     "set_client_surface_state",
     "get_client_surface_clip_windows",
     "get_client_surface_handoff",
+    "get_client_surface_handoff_event",
     "release_client_surface_handoff",
     "complete_client_surface_handoffs",
+    "cancel_client_surface_handoffs",
     "publish_client_surface_handoff",
     "get_client_surface_handoffs",
 };

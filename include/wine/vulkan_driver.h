@@ -89,7 +89,7 @@ struct VkDevice_T
 #include "wine/list.h"
 
 /* Wine internal vulkan driver version, needs to be bumped upon vulkan_funcs changes. */
-#define WINE_VULKAN_DRIVER_VERSION 49
+#define WINE_VULKAN_DRIVER_VERSION 50
 
 struct vulkan_object
 {

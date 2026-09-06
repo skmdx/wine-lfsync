@@ -28,6 +28,8 @@ extern void client_surface_get_geometry( const struct client_surface *surface,
                                          struct client_surface_geometry *geometry );
 extern void client_surface_get_target( const struct client_surface *surface,
                                        struct client_surface_target *target );
+extern BOOL get_client_surface_rects( HWND toplevel, HWND hwnd,
+                                      struct client_surface_target *target );
 extern BOOL client_surface_get_scene( struct client_surface *surface,
                                       struct client_surface_scene *scene );
 extern BOOL client_surface_scene_current( const struct client_surface_scene *scene );
@@ -44,7 +46,7 @@ extern void client_surface_resume_recompose( struct client_surface *surface );
 extern BOOL client_surface_prepare_handoff_locked( struct client_surface *surface,
                                                     struct client_surface_frame *present );
 extern BOOL client_surface_publish_handoff_locked( struct client_surface *surface,
-                                                    struct client_surface_frame *present );
+                                                    struct client_surface_frame *present, BOOL source_frozen );
 extern void client_surface_abandon_handoff_locked( struct client_surface *surface,
                                                    struct client_surface_frame *present );
 extern void client_surface_release_handoff( struct client_surface *surface );

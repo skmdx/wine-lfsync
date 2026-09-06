@@ -104,13 +104,30 @@ static void x11drv_client_surface_destroy( struct client_surface *client )
 {
     struct x11drv_client_surface *surface = impl_from_client_surface( client );
     HWND hwnd = client->hwnd;
+    unsigned int i;
 
     TRACE( "%s\n", debugstr_client_surface( client ) );
 
     x11drv_client_surface_completion_destroy( surface );
-    X11DRV_XFixes_DestroyClientSurfaceRegion( gdi_display, surface->handoff_clip_region );
-    if (surface->handoff_clip_mask) XFreePixmap( gdi_display, surface->handoff_clip_mask );
+    free( surface->snapshot_pixels );
+    client_surface_release_memory( CLIENT_SURFACE_MEMORY_STAGING, surface->snapshot_pixels_size );
+    if (surface->snapshot_import) XFreePixmap( gdi_display, surface->snapshot_import );
+    for (i = 0; i < ARRAY_SIZE(surface->sources); ++i)
+    {
+        if (surface->sources[i].image) surface->sources[i].release_image( surface->sources[i].image );
+        if (surface->sources[i].gc) XFreeGC( gdi_display, surface->sources[i].gc );
+        if (surface->sources[i].pixmap) XFreePixmap( gdi_display, surface->sources[i].pixmap );
+        client_surface_release_memory( CLIENT_SURFACE_MEMORY_SOURCE, surface->sources[i].bytes );
+    }
+    if (surface->snapshot_image)
+    {
+        client_surface_release_memory( CLIENT_SURFACE_MEMORY_STAGING,
+            (UINT64)surface->snapshot_image->bytes_per_line * surface->snapshot_image->height );
+        XDestroyImage( surface->snapshot_image );
+    }
+    if (surface->snapshot_gc) XFreeGC( gdi_display, surface->snapshot_gc );
     if (surface->snapshot) XFreePixmap( gdi_display, surface->snapshot );
+    client_surface_release_memory( CLIENT_SURFACE_MEMORY_SOURCE, surface->snapshot_bytes );
     if (surface->colormap != default_colormap) XFreeColormap( gdi_display, surface->colormap );
     if (surface->window) destroy_client_window( hwnd, surface->window );
 }
@@ -241,189 +258,64 @@ static int client_surface_clip_error( Display *display, XErrorEvent *event, void
     return TRUE;
 }
 
-static BOOL client_surface_create_clip_mask( struct x11drv_client_surface *surface,
-                                             const XRectangle *rects, unsigned int count,
-                                             unsigned int width, unsigned int height )
+static void discard_client_surface_source( Pixmap *pixmap, GC *gc, UINT64 *bytes )
 {
-    Pixmap mask;
-    XGCValues values = {.foreground = 0, .graphics_exposures = False};
-    GC gc;
     int error = 0;
 
-    /* The producer owns this mask until the same slot is released. Allocate a
-     * new mask for a new scene; never mutate a mask held by an owner GC. */
+    /* Xlib may return handles before the server reports BadAlloc. Consume
+     * cleanup errors locally and never cache a failed allocation for reuse. */
     X11DRV_expect_error( gdi_display, client_surface_clip_error, &error );
-    mask = XCreatePixmap( gdi_display, root_window, width, height, 1 );
-    gc = XCreateGC( gdi_display, mask, GCForeground | GCGraphicsExposures, &values );
-    if (gc)
-    {
-        XFillRectangle( gdi_display, mask, gc, 0, 0, width, height );
-        XSetForeground( gdi_display, gc, 1 );
-        XFillRectangles( gdi_display, mask, gc, (XRectangle *)rects, count );
-        XFreeGC( gdi_display, gc );
-    }
+    if (*gc) XFreeGC( gdi_display, *gc );
+    if (*pixmap) XFreePixmap( gdi_display, *pixmap );
     XSync( gdi_display, False );
     X11DRV_check_error();
-    if (error || !gc || !mask)
-    {
-        X11DRV_expect_error( gdi_display, client_surface_clip_error, &error );
-        if (mask) XFreePixmap( gdi_display, mask );
-        XSync( gdi_display, False );
-        X11DRV_check_error();
-        return FALSE;
-    }
-    if (surface->handoff_clip_mask) XFreePixmap( gdi_display, surface->handoff_clip_mask );
-    surface->handoff_clip_mask = mask;
-    return TRUE;
+    *gc = NULL;
+    *pixmap = 0;
+    client_surface_release_memory( CLIENT_SURFACE_MEMORY_SOURCE, *bytes );
+    *bytes = 0;
 }
 
-static BOOL x11drv_client_surface_prepare_handoff_clip(
-    struct x11drv_client_surface *surface,
-    struct client_surface_handoff_slot *slot, HRGN surface_region )
+struct x11drv_client_source_frame *x11drv_client_surface_get_source(
+    struct client_surface *client, unsigned int index, unsigned int width,
+    unsigned int height, unsigned int depth )
 {
-    struct client_surface *client = &surface->client;
-    RECT rect;
-    RGNDATA *clip = NULL;
-    HRGN region = 0;
-    HDC hdc = 0;
-    BOOL supported = FALSE, required = FALSE, xfixes = FALSE, pixmap = FALSE;
-    unsigned int count = 0, i;
+    struct x11drv_client_surface *surface = impl_from_client_surface( client );
+    struct x11drv_client_source_frame *frame = &surface->sources[index];
+    UINT64 bytes = (UINT64)width * height * (depth > 16 ? 4 : depth > 8 ? 2 : 1);
+    struct x11drv_client_source_frame next = {.width = width, .height = height, .depth = depth, .bytes = bytes};
+    BOOL preserve = frame->pixmap && frame->pixmap == surface->gpu_snapshot &&
+                    frame->width >= width && frame->height >= height && frame->depth == depth;
+    int error = 0;
 
-    if (surface->handoff_clip_valid &&
-        surface->handoff_clip_scene_epoch == slot->scene_epoch &&
-        surface->handoff_clip_target_seq == slot->target_seq)
-        goto publish;
-
-    /* Build the exact region used by the legacy native-copy path once per
-     * scene. The rectangles are already in client-surface coordinates; the
-     * owner applies destination as the X clip origin. */
-    if (client->hwnd != client->target.toplevel ||
-        !NtUserGetPresentRect( client->target.toplevel, &rect, -1 /* raw dpi */ ))
+    assert( index < ARRAY_SIZE(surface->sources) );
+    /* A timed-out completion returns the control token, but does not make
+     * storage that the GPU is still writing reusable. */
+    if (frame->image && frame->image_ready && !frame->image_ready( frame->image )) return NULL;
+    if (frame->pixmap && frame->width == width && frame->height == height && frame->depth == depth)
+        return frame;
+    if (!client_surface_reserve_memory( CLIENT_SURFACE_MEMORY_SOURCE, bytes )) return NULL;
+    X11DRV_expect_error( gdi_display, client_surface_clip_error, &error );
+    next.pixmap = XCreatePixmap( gdi_display, root_window, width, height, depth );
+    if (preserve && (next.gc = XCreateGC( gdi_display, next.pixmap, 0, NULL )))
+        XCopyArea( gdi_display, frame->pixmap, next.pixmap, next.gc, 0, 0, width, height, 0, 0 );
+    XSync( gdi_display, False );
+    X11DRV_check_error();
+    if (error || !next.pixmap || (preserve && !next.gc))
     {
-        DWORD flags = DCX_CACHE | DCX_USESTYLE | DCX_NORESETATTRS |
-                      WINE_DCX_CLIENT_SURFACE;
-
-        if (!(hdc = NtUserGetDCEx( client->hwnd, 0, flags ))) goto done;
-        region = get_dc_monitor_region( client->hwnd, hdc );
-        NtUserReleaseDC( client->hwnd, hdc );
-        hdc = 0;
-        if (!region) goto done;
+        discard_client_surface_source( &next.pixmap, &next.gc, &next.bytes );
+        return NULL;
     }
-    if (surface_region)
+    if (frame->pixmap == surface->gpu_snapshot)
     {
-        int ret;
-
-        if (region) ret = NtGdiCombineRgn( region, region, surface_region, RGN_AND );
-        else if (!(region = NtGdiCreateRectRgn( 0, 0, 0, 0 ))) goto done;
-        else
-        {
-            ret = NtGdiCombineRgn( region, surface_region, 0, RGN_COPY );
-        }
-        if (ret == ERROR) goto done;
+        surface->gpu_snapshot = preserve ? next.pixmap : 0;
+        surface->gpu_snapshot_size = (SIZE){width, height};
     }
-    if (!region)
-    {
-        supported = TRUE;
-        goto done;
-    }
-    /* CS_PARENTDC can supply a visible region larger than this producer.
-     * The native drawable used to clip that implicitly. A transferred source
-     * must describe only pixels inside its own destination rectangle. */
-    {
-        HRGN bounds = NtGdiCreateRectRgn( 0, 0,
-                slot->destination.right - slot->destination.left,
-                slot->destination.bottom - slot->destination.top );
-        int ret;
-
-        if (!bounds) goto done;
-        ret = NtGdiCombineRgn( region, region, bounds, RGN_AND );
-        NtGdiDeleteObjectApp( bounds );
-        if (ret == ERROR) goto done;
-    }
-    if (!(clip = X11DRV_GetRegionData( region, 0 ))) goto done;
-    count = clip->rdh.nCount;
-    if (count == 1)
-    {
-        const XRectangle *full = (const XRectangle *)clip->Buffer;
-        unsigned int width = slot->destination.right - slot->destination.left;
-        unsigned int height = slot->destination.bottom - slot->destination.top;
-
-        if (!full->x && !full->y && full->width == width && full->height == height)
-        {
-            supported = TRUE;
-            count = 0;
-            goto done;
-        }
-    }
-    if (count > CLIENT_SURFACE_HANDOFF_MAX_CLIP_RECTS)
-    {
-        xfixes = X11DRV_XFixes_UpdateClientSurfaceRegion(
-                gdi_display, &surface->handoff_clip_region,
-                (const XRectangle *)clip->Buffer, count );
-        if (!xfixes && !client_surface_create_clip_mask(
-                surface, (const XRectangle *)clip->Buffer, count,
-                slot->destination.right - slot->destination.left,
-                slot->destination.bottom - slot->destination.top ))
-            goto done;
-        count = 0;
-        pixmap = !xfixes;
-        required = TRUE;
-        supported = TRUE;
-        goto done;
-    }
-    for (i = 0; i < count; ++i)
-    {
-        const XRectangle *rect = (const XRectangle *)clip->Buffer + i;
-        struct client_surface_handoff_clip_rect *out = &surface->handoff_clip_rects[i];
-
-        out->x = rect->x;
-        out->y = rect->y;
-        out->width = rect->width;
-        out->height = rect->height;
-    }
-    required = TRUE;
-    supported = TRUE;
-
-done:
-    if (hdc) NtUserReleaseDC( client->hwnd, hdc );
-    free( clip );
-    if (region) NtGdiDeleteObjectApp( region );
-
-    surface->handoff_clip_scene_epoch = slot->scene_epoch;
-    surface->handoff_clip_target_seq = slot->target_seq;
-    surface->handoff_clip_count = count;
-    surface->handoff_clip_supported = supported;
-    surface->handoff_clip_required = required;
-    surface->handoff_clip_xfixes = xfixes;
-    surface->handoff_clip_pixmap = pixmap;
-    surface->handoff_clip_valid = TRUE;
-    TRACE( "handoff clip hwnd %p source %ux%u visual %#lx destination %s region %p "
-           "supported %u required %u xfixes %u count %u\n", client->hwnd, slot->width, slot->height,
-           slot->source_visual, wine_dbgstr_rect( &client->target.monitor_rect ),
-           surface_region, supported, required, xfixes, count );
-
-publish:
-    if (!surface->handoff_clip_supported) return FALSE;
-    slot->clip_count = surface->handoff_clip_count;
-    slot->clip_region = 0;
-    if (surface->handoff_clip_required)
-    {
-        slot->flags |= CLIENT_SURFACE_HANDOFF_CLIPPED;
-        if (surface->handoff_clip_xfixes)
-        {
-            slot->flags |= CLIENT_SURFACE_HANDOFF_XFIXES_CLIP;
-            slot->clip_region = surface->handoff_clip_region;
-        }
-        else if (surface->handoff_clip_pixmap)
-        {
-            slot->flags |= CLIENT_SURFACE_HANDOFF_PIXMAP_CLIP;
-            slot->clip_region = surface->handoff_clip_mask;
-        }
-        else
-            memcpy( slot->clips, surface->handoff_clip_rects,
-                    surface->handoff_clip_count * sizeof(*slot->clips) );
-    }
-    return TRUE;
+    if (frame->image) frame->release_image( frame->image );
+    if (frame->gc) XFreeGC( gdi_display, frame->gc );
+    if (frame->pixmap) XFreePixmap( gdi_display, frame->pixmap );
+    client_surface_release_memory( CLIENT_SURFACE_MEMORY_SOURCE, frame->bytes );
+    *frame = next;
+    return frame;
 }
 
 static unsigned long snapshot_component( BYTE value, unsigned long mask )
@@ -447,14 +339,31 @@ BOOL x11drv_client_surface_snapshot( struct client_surface *client, const BYTE *
                           ~(default_visual.red_mask | default_visual.green_mask | default_visual.blue_mask);
     int error = 0;
 
-    if (!(image = XCreateImage( gdi_display, default_visual.visual, default_visual.depth,
-                                ZPixmap, 0, NULL, width, height, 32, 0 )))
-        return FALSE;
-    if (image->bytes_per_line <= 0 || height > ~(SIZE_T)0 / image->bytes_per_line ||
-        !(image->data = calloc( height, image->bytes_per_line )))
+    image = surface->snapshot_image;
+    if (!image || image->width != width || image->height != height)
     {
-        XDestroyImage( image );
-        return FALSE;
+        if (!(image = XCreateImage( gdi_display, default_visual.visual, default_visual.depth,
+                                ZPixmap, 0, NULL, width, height, 32, 0 )))
+            return FALSE;
+        if (image->bytes_per_line <= 0 || height > ~(SIZE_T)0 / image->bytes_per_line ||
+            !client_surface_reserve_memory( CLIENT_SURFACE_MEMORY_STAGING, (UINT64)height * image->bytes_per_line ))
+        {
+            XDestroyImage( image );
+            return FALSE;
+        }
+        if (!(image->data = calloc( height, image->bytes_per_line )))
+        {
+            client_surface_release_memory( CLIENT_SURFACE_MEMORY_STAGING, (UINT64)height * image->bytes_per_line );
+            XDestroyImage( image );
+            return FALSE;
+        }
+        if (surface->snapshot_image)
+        {
+            client_surface_release_memory( CLIENT_SURFACE_MEMORY_STAGING,
+                (UINT64)surface->snapshot_image->bytes_per_line * surface->snapshot_image->height );
+            XDestroyImage( surface->snapshot_image );
+        }
+        surface->snapshot_image = image;
     }
     if (image->bits_per_pixel == 32 && image->byte_order == LSBFirst &&
         default_visual.red_mask == 0xff0000 && default_visual.green_mask == 0xff00 &&
@@ -493,22 +402,39 @@ BOOL x11drv_client_surface_snapshot( struct client_surface *client, const BYTE *
     X11DRV_expect_error( gdi_display, client_surface_clip_error, &error );
     if (!surface->snapshot || surface->snapshot_size.cx != width || surface->snapshot_size.cy != height)
     {
+        UINT64 bytes = (UINT64)width * height * (default_visual.depth > 16 ? 4 : default_visual.depth > 8 ? 2 : 1);
+
+        if (!client_surface_reserve_memory( CLIENT_SURFACE_MEMORY_SOURCE, bytes ))
+        {
+            X11DRV_check_error();
+            return FALSE;
+        }
+        if (surface->snapshot_gc) XFreeGC( gdi_display, surface->snapshot_gc );
+        surface->snapshot_gc = NULL;
         if (surface->snapshot) XFreePixmap( gdi_display, surface->snapshot );
+        client_surface_release_memory( CLIENT_SURFACE_MEMORY_SOURCE, surface->snapshot_bytes );
+        surface->snapshot_bytes = bytes;
         surface->snapshot = XCreatePixmap( gdi_display, root_window, width, height, default_visual.depth );
         surface->snapshot_size = (SIZE){width, height};
     }
-    gc = XCreateGC( gdi_display, surface->snapshot, 0, NULL );
+    if (!(gc = surface->snapshot_gc))
+        gc = surface->snapshot_gc = XCreateGC( gdi_display, surface->snapshot, 0, NULL );
     if (gc)
     {
         XPutImage( gdi_display, surface->snapshot, gc, image, 0, 0, 0, 0, width, height );
-        XFreeGC( gdi_display, gc );
     }
     XSync( gdi_display, False );
     X11DRV_check_error();
-    XDestroyImage( image );
+    if (!gc || error)
+    {
+        discard_client_surface_source( &surface->snapshot, &surface->snapshot_gc,
+                                        &surface->snapshot_bytes );
+        return FALSE;
+    }
     TRACE( "uploaded producer snapshot %#lx from visual %#lx to %#lx\n",
            surface->snapshot, surface->source_visual, default_visual.visualid );
-    return gc && !error;
+    surface->gpu_snapshot = 0;
+    return TRUE;
 }
 
 static BOOL x11drv_client_surface_handoff_prepare(
@@ -525,15 +451,119 @@ static BOOL x11drv_client_surface_handoff_prepare(
         return FALSE;
     width = source.right - source.left;
     height = source.bottom - source.top;
-    slot->source = usexcomposite ? surface->window : surface->snapshot;
-    slot->source_visual = usexcomposite ? surface->source_visual : default_visual.visualid;
+    slot->source = usexcomposite && !surface->direct_snapshot ? surface->window : surface->snapshot;
+    if (surface->gpu_snapshot) slot->source = surface->gpu_snapshot;
+    slot->source_visual = usexcomposite && !surface->direct_snapshot ? surface->source_visual : default_visual.visualid;
     slot->flags = CLIENT_SURFACE_HANDOFF_NATIVE_X11 | CLIENT_SURFACE_HANDOFF_FULL_DAMAGE;
     slot->destination = destination;
     slot->width = width;
     slot->height = height;
     SetRect( &slot->damage, 0, 0, width, height );
-    if (!usexcomposite) slot->flags |= CLIENT_SURFACE_HANDOFF_COPY_SOURCE;
-    return x11drv_client_surface_prepare_handoff_clip( surface, slot, surface_region );
+    if (!usexcomposite || surface->direct_snapshot) slot->flags |= CLIENT_SURFACE_HANDOFF_COPY_SOURCE;
+    surface->sources[slot - client->handoff_slot].gpu_control = 0;
+    slot->clip_count = 0;
+    slot->clip_region = 0;
+    return TRUE;
+}
+
+static BOOL x11drv_client_surface_handoff_serialize( struct client_surface *client )
+{
+    struct x11drv_client_surface *surface = impl_from_client_surface( client );
+    unsigned int i;
+
+    if (surface->direct_snapshot)
+    {
+        if (!client->handoff_slot) return FALSE;
+        for (i = 0; i < CLIENT_SURFACE_SOURCE_FRAME_COUNT; ++i)
+        {
+            enum client_surface_handoff_state state = client_surface_handoff_state(
+                __atomic_load_n( &client->handoff_slot[i].control, __ATOMIC_ACQUIRE ) );
+
+            if (state == CLIENT_SURFACE_HANDOFF_FREE || state == CLIENT_SURFACE_HANDOFF_RELEASED)
+                return FALSE;
+        }
+        /* Unlike a native WSI token, SUBMITTED already owns a GPU write into
+         * this slot. Drain completion with the common mutex released before
+         * acquire could supersede that still-busy storage. */
+        return TRUE;
+    }
+    /* A host Present completion does not retain an old mutable X window's
+     * pixels. Freeze it before permitting another offscreen native swap. */
+    return usexcomposite && client->target.offscreen;
+}
+
+static BOOL x11drv_client_surface_handoff_complete( struct client_surface *client,
+                                                   struct client_surface_handoff_slot *slot )
+{
+    struct x11drv_client_surface *surface = impl_from_client_surface( client );
+    unsigned int index = slot - client->handoff_slot;
+    struct x11drv_client_source_frame *frame = &surface->sources[index];
+    BOOL native = usexcomposite && !surface->direct_snapshot;
+    unsigned int depth = native ? surface->source_depth : default_visual.depth;
+    Pixmap source = surface->snapshot;
+    int error = 0;
+
+    assert( index < ARRAY_SIZE(surface->sources) );
+    if (frame->gpu_control && frame->gpu_control == __atomic_load_n( &slot->control, __ATOMIC_ACQUIRE ))
+    {
+        surface->gpu_snapshot = slot->source = frame->pixmap;
+        surface->gpu_snapshot_size = (SIZE){slot->width, slot->height};
+        slot->source_visual = default_visual.visualid;
+        slot->flags |= CLIENT_SURFACE_HANDOFF_COPY_SOURCE;
+        return TRUE;
+    }
+    if (!(frame = x11drv_client_surface_get_source( client, index, slot->width, slot->height, depth )))
+        return FALSE;
+    if (surface->gpu_snapshot && surface->gpu_snapshot_size.cx >= slot->width &&
+        surface->gpu_snapshot_size.cy >= slot->height)
+        source = surface->gpu_snapshot;
+    X11DRV_expect_error( gdi_display, client_surface_clip_error, &error );
+#ifdef SONAME_LIBXCOMPOSITE
+    if (native)
+    {
+        if (!surface->snapshot_import || surface->snapshot_import_seq != slot->target_seq)
+        {
+            if (surface->snapshot_import) XFreePixmap( gdi_display, surface->snapshot_import );
+            surface->snapshot_import = pXCompositeNameWindowPixmap( gdi_display, surface->window );
+            surface->snapshot_import_seq = slot->target_seq;
+            XSync( gdi_display, False );
+            X11DRV_check_error();
+            if (error)
+            {
+                /* NameWindowPixmap allocates an XID before the server checks
+                 * the source. An unsuccessful name must never be freed. */
+                surface->snapshot_import = 0;
+                return FALSE;
+            }
+            X11DRV_expect_error( gdi_display, client_surface_clip_error, &error );
+        }
+        source = surface->snapshot_import;
+    }
+#endif
+    if (!frame->gc) frame->gc = XCreateGC( gdi_display, frame->pixmap, 0, NULL );
+    if (source && frame->gc)
+        XCopyArea( gdi_display, source, frame->pixmap, frame->gc, 0, 0, slot->width, slot->height, 0, 0 );
+    /* This boundary proves the source image is immutable before READY, not
+     * merely that its copy request was queued. The other slot remains usable
+     * while the owner reads this independent pixmap. */
+    XSync( gdi_display, False );
+    X11DRV_check_error();
+    if (error || !source || !frame->gc)
+    {
+        if (frame->pixmap == surface->gpu_snapshot) surface->gpu_snapshot = 0;
+        if (frame->image) frame->release_image( frame->image );
+        frame->image = NULL;
+        discard_client_surface_source( &frame->pixmap, &frame->gc, &frame->bytes );
+        return FALSE;
+    }
+    if (source == surface->gpu_snapshot)
+    {
+        surface->gpu_snapshot = frame->pixmap;
+        surface->gpu_snapshot_size = (SIZE){slot->width, slot->height};
+    }
+    slot->source = frame->pixmap;
+    slot->flags |= CLIENT_SURFACE_HANDOFF_COPY_SOURCE;
+    return TRUE;
 }
 
 static const struct client_surface_backend x11drv_client_surface_backend =
@@ -542,12 +572,15 @@ static const struct client_surface_backend x11drv_client_surface_backend =
             CLIENT_SURFACE_BACKEND_READ_ONLY_DC |
             CLIENT_SURFACE_BACKEND_DIRECT_PRESENTATION |
             CLIENT_SURFACE_BACKEND_GENERATION_HANDOFF |
-            CLIENT_SURFACE_BACKEND_OWNER_COMPOSITOR,
+            CLIENT_SURFACE_BACKEND_OWNER_COMPOSITOR |
+            CLIENT_SURFACE_BACKEND_OWNER_SCENE_PLAN,
     .destroy = x11drv_client_surface_destroy,
     .detach = x11drv_client_surface_detach,
     .direct_ready = x11drv_client_surface_direct_ready,
     .update = x11drv_client_surface_update,
     .handoff_prepare = x11drv_client_surface_handoff_prepare,
+    .handoff_complete = x11drv_client_surface_handoff_complete,
+    .handoff_serialize = x11drv_client_surface_handoff_serialize,
     .completion = &x11drv_client_surface_completion_ops,
 };
 
@@ -581,6 +614,7 @@ struct client_surface *X11DRV_CreateClientSurface( HWND hwnd, int format, BOOL r
     if (!(surface = client_surface_create( sizeof(*surface), backend, hwnd, format, raw ))) goto failed;
     surface->colormap = colormap;
     surface->source_visual = visual.visualid;
+    surface->source_depth = visual.depth;
     if (!x11drv_client_surface_completion_init( surface )) goto failed;
     rect = raw ? surface->client.target.monitor_rect : surface->client.target.virtual_rect;
     if (!(surface->window = create_client_window( hwnd, rect, &visual, colormap ))) goto failed;

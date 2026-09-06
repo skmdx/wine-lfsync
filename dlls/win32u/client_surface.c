@@ -32,6 +32,44 @@ static struct list unused_surfaces = LIST_INIT( unused_surfaces ); /* owning unu
 static unsigned int unused_surface_count;
 static UINT64 unused_surface_bytes;
 
+/* Explicitly allocated client-surface images share a process budget. Native
+ * WSI allocations are owned by the host driver and are not estimated here.
+ * Retired storage stays charged until its real completion permits release. */
+#define CLIENT_SURFACE_IMAGE_MEMORY_LIMIT ((UINT64)1024 * 1024 * 1024)
+static pthread_mutex_t image_memory_lock = PTHREAD_MUTEX_INITIALIZER;
+static UINT64 image_memory[CLIENT_SURFACE_MEMORY_CLASS_COUNT], image_memory_total;
+
+BOOL client_surface_reserve_memory( enum client_surface_memory_class type, UINT64 bytes )
+{
+    BOOL ret;
+
+    assert( type < CLIENT_SURFACE_MEMORY_CLASS_COUNT );
+    pthread_mutex_lock( &image_memory_lock );
+    ret = bytes <= CLIENT_SURFACE_IMAGE_MEMORY_LIMIT - image_memory_total;
+    if (ret)
+    {
+        image_memory[type] += bytes;
+        image_memory_total += bytes;
+    }
+    TRACE( "image reservation class %u bytes %s accepted %u source %s staging %s output %s\n",
+           type, wine_dbgstr_longlong( bytes ), ret,
+           wine_dbgstr_longlong( image_memory[CLIENT_SURFACE_MEMORY_SOURCE] ),
+           wine_dbgstr_longlong( image_memory[CLIENT_SURFACE_MEMORY_STAGING] ),
+           wine_dbgstr_longlong( image_memory[CLIENT_SURFACE_MEMORY_OUTPUT] ) );
+    pthread_mutex_unlock( &image_memory_lock );
+    return ret;
+}
+
+void client_surface_release_memory( enum client_surface_memory_class type, UINT64 bytes )
+{
+    assert( type < CLIENT_SURFACE_MEMORY_CLASS_COUNT );
+    pthread_mutex_lock( &image_memory_lock );
+    assert( image_memory[type] >= bytes && image_memory_total >= bytes );
+    image_memory[type] -= bytes;
+    image_memory_total -= bytes;
+    pthread_mutex_unlock( &image_memory_lock );
+}
+
 #define CLIENT_SURFACE_INDEX_BUCKETS 256
 static struct client_surface *client_surface_identity_index[CLIENT_SURFACE_INDEX_BUCKETS];
 static struct client_surface *client_surface_toplevel_index[CLIENT_SURFACE_INDEX_BUCKETS];
@@ -543,7 +581,7 @@ done:
     pthread_mutex_unlock( &surfaces_lock );
 }
 
-static BOOL get_client_surface_rects( HWND toplevel, HWND hwnd,
+BOOL get_client_surface_rects( HWND toplevel, HWND hwnd,
                                       struct client_surface_target *target )
 {
     struct ratio dpi = get_dpi_for_window( hwnd ), raw_dpi;
@@ -638,6 +676,11 @@ static BOOL read_client_surface_scene( HWND toplevel, struct client_surface_scen
     scene->valid = !preparing && !(scene->epoch & 1) &&
                    (!scene->generation || scene->generation == scene->epoch);
     return TRUE;
+}
+
+BOOL client_surface_get_toplevel_scene( HWND toplevel, struct client_surface_scene *scene )
+{
+    return read_client_surface_scene( toplevel, scene, NULL, NULL ) && scene->valid;
 }
 
 BOOL client_surface_get_scene( struct client_surface *surface, struct client_surface_scene *scene )
@@ -1135,6 +1178,7 @@ void *client_surface_create( UINT size, const struct client_surface_backend *bac
         return NULL;
     }
     surface->backend = backend;
+    surface->handoff_ready_fd = -1;
     surface->ref = 1;
     surface->hwnd = hwnd;
     surface->format = format;
@@ -1205,7 +1249,7 @@ static BOOL client_surface_recompose( struct client_surface *surface, LONG64 seq
          * slot instead of leaking SUBMITTED and falling back to a producer
          * copy/RPC transaction. */
         present.serial = surface->composed_serial;
-        handed_off = client_surface_publish_handoff_locked( surface, &present );
+        handed_off = client_surface_publish_handoff_locked( surface, &present, FALSE );
         if (!handed_off) client_surface_abandon_handoff_locked( surface, &present );
     }
     if (!handed_off)
@@ -1304,6 +1348,11 @@ void client_surface_set_staged( HWND hwnd )
 void client_surface_bypass_staging( HWND hwnd )
 {
     client_surface_set_server_state( hwnd, NULL, CLIENT_SURFACE_STATE_BYPASS, 0, 0, NULL );
+}
+
+void client_surface_fail_scene( HWND hwnd )
+{
+    client_surface_set_server_state( hwnd, NULL, CLIENT_SURFACE_STATE_FAILED, 0, 0, NULL );
 }
 
 BOOL client_surface_begin_native_barrier( HWND hwnd, UINT_PTR token )

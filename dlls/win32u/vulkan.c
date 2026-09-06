@@ -26,12 +26,15 @@
 
 #include <assert.h>
 #include <dlfcn.h>
+#include <errno.h>
 #include <pthread.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "ntstatus.h"
 #include "win32u_private.h"
 #include "ntuser_private.h"
+#include "client_surface.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(vulkan);
 
@@ -151,6 +154,13 @@ static struct surface *surface_from_handle( VkSurfaceKHR handle )
     return CONTAINING_RECORD( obj, struct surface, obj );
 }
 
+struct vulkan_snapshot_fence
+{
+    struct vulkan_device *device;
+    VkFence fence;
+    LONG refs;
+};
+
 struct swapchain_snapshot
 {
     VkImage *images;
@@ -158,11 +168,13 @@ struct swapchain_snapshot
     uint32_t image_count;
     VkBuffer buffer;
     VkDeviceMemory memory;
+    UINT64 memory_bytes;
     void *pixels;
     VkCommandPool pool;
     VkCommandBuffer command;
     uint32_t queue_family;
-    VkFence fence;
+    struct vulkan_snapshot_fence *pending;
+    BOOL busy;
 };
 
 struct swapchain
@@ -173,11 +185,14 @@ struct swapchain
     VkExtent2D host_extents;
     VkFormat format;
     BOOL needs_snapshot;
-    struct swapchain_snapshot snapshot;
+    struct swapchain_snapshot snapshots[2];
+    unsigned int next_snapshot;
     pthread_mutex_t present_lock;
     pthread_cond_t completion_cond;
     unsigned int completion_refs;
     uint64_t next_present_id;
+    UINT64 last_source_sequence;
+    BOOL incremental_damage;
 };
 
 static struct swapchain *swapchain_from_handle( VkSwapchainKHR handle )
@@ -191,6 +206,19 @@ struct vulkan_present_completion
     struct vulkan_device *device;
     struct swapchain *swapchain;
     uint64_t present_id;
+};
+
+struct vulkan_snapshot_completion
+{
+    struct vulkan_device *device;
+    struct swapchain *swapchain;
+    struct swapchain_snapshot *snapshot;
+};
+
+struct vulkan_snapshot_reservation
+{
+    struct swapchain_snapshot *snapshot;
+    BOOL required;
 };
 
 static BOOL wait_vulkan_present_completion( void *context, DWORD timeout )
@@ -1945,12 +1973,131 @@ static int compare_client_surface_ptrs( const void *left, const void *right )
     return (a > b) - (a < b);
 }
 
+static void release_snapshot_fence( struct vulkan_snapshot_fence *pending )
+{
+    if (!pending || InterlockedDecrement( &pending->refs )) return;
+    pending->device->p_vkDestroyFence( pending->device->host.device, pending->fence, NULL );
+    free( pending );
+}
+
+static void release_snapshot_reservation( struct swapchain *swapchain, struct swapchain_snapshot *snapshot )
+{
+    pthread_mutex_lock( &swapchain->present_lock );
+    assert( snapshot->busy && swapchain->completion_refs );
+    snapshot->busy = FALSE;
+    --swapchain->completion_refs;
+    pthread_cond_broadcast( &swapchain->completion_cond );
+    pthread_mutex_unlock( &swapchain->present_lock );
+}
+
+static VkResult acquire_snapshot_reservation( struct vulkan_device *device, struct swapchain *swapchain,
+                                              struct swapchain_snapshot **ret )
+{
+    struct swapchain_snapshot *snapshot = NULL;
+    struct timespec deadline;
+    DWORD start = NtGetTickCount();
+    unsigned int i;
+    VkResult res;
+
+    /* Reserve storage before acquiring any surface submission mutex. The
+     * previous completion owns this storage through its CPU upload, but it
+     * must not prevent window geometry and unrelated surfaces from moving. */
+    clock_gettime( CLOCK_REALTIME, &deadline );
+    deadline.tv_sec += CLIENT_SURFACE_PRESENT_TIMEOUT / 1000;
+    pthread_mutex_lock( &swapchain->present_lock );
+    for (;;)
+    {
+        for (i = 0; i < ARRAY_SIZE(swapchain->snapshots); ++i)
+        {
+            unsigned int index = (swapchain->next_snapshot + i) % ARRAY_SIZE(swapchain->snapshots);
+
+            if (swapchain->snapshots[index].busy) continue;
+            snapshot = &swapchain->snapshots[index];
+            swapchain->next_snapshot = (index + 1) % ARRAY_SIZE(swapchain->snapshots);
+            break;
+        }
+        if (snapshot) break;
+        if (pthread_cond_timedwait( &swapchain->completion_cond, &swapchain->present_lock,
+                                    &deadline ) == ETIMEDOUT)
+        {
+            pthread_mutex_unlock( &swapchain->present_lock );
+            return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+        }
+    }
+    snapshot->busy = TRUE;
+    ++swapchain->completion_refs;
+    pthread_mutex_unlock( &swapchain->present_lock );
+
+    /* A stale or timed-out completion may have returned without reading the
+     * GPU result. Its storage remains quarantined until the submission fence
+     * completes; neither the buffer nor command pool may be reset earlier. */
+    if (snapshot->pending)
+    {
+        DWORD elapsed = NtGetTickCount() - start;
+        DWORD remaining = elapsed < CLIENT_SURFACE_PRESENT_TIMEOUT ? CLIENT_SURFACE_PRESENT_TIMEOUT - elapsed : 0;
+
+        res = device->p_vkWaitForFences( device->host.device, 1, &snapshot->pending->fence,
+                                        VK_TRUE, (uint64_t)remaining * 1000000 );
+        if (res)
+        {
+            release_snapshot_reservation( swapchain, snapshot );
+            /* The bounded staging allocation is still occupied. Keep it
+             * alive, including on timeout, rather than recycling GPU work. */
+            return res == VK_TIMEOUT ? VK_ERROR_OUT_OF_DEVICE_MEMORY : res;
+        }
+        release_snapshot_fence( snapshot->pending );
+        snapshot->pending = NULL;
+    }
+    *ret = snapshot;
+    return VK_SUCCESS;
+}
+
+static BOOL wait_vulkan_snapshot( void *context, DWORD timeout )
+{
+    struct vulkan_snapshot_completion *completion = context;
+    struct vulkan_device *device = completion->device;
+    struct swapchain_snapshot *snapshot = completion->snapshot;
+
+    return device->p_vkWaitForFences( device->host.device, 1, &snapshot->pending->fence,
+                                     VK_TRUE, (uint64_t)timeout * 1000000 ) == VK_SUCCESS;
+}
+
+static BOOL resolve_vulkan_snapshot( void *context, struct client_surface *surface,
+                                      struct client_surface_frame *present )
+{
+    struct vulkan_snapshot_completion *completion = context;
+    struct vulkan_device *device = completion->device;
+    struct swapchain *swapchain = completion->swapchain;
+    struct swapchain_snapshot *snapshot = completion->snapshot;
+    VkMappedMemoryRange range = {.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
+                                 .memory = snapshot->memory, .size = VK_WHOLE_SIZE};
+
+    return !device->p_vkInvalidateMappedMemoryRanges( device->host.device, 1, &range ) &&
+           driver_funcs->p_vulkan_surface_snapshot( surface, present, snapshot->pixels,
+               swapchain->host_extents.width, swapchain->host_extents.height, swapchain->format );
+}
+
+static void release_vulkan_snapshot( void *context )
+{
+    struct vulkan_snapshot_completion *completion = context;
+
+    release_snapshot_reservation( completion->swapchain, completion->snapshot );
+    free( completion );
+}
+
 static void destroy_swapchain_snapshot( struct vulkan_device *device, struct swapchain_snapshot *snapshot )
 {
     unsigned int i;
 
+    /* Swapchain destruction requires the application to finish operations
+     * using its images. Drain any private copy too, outside surface locks;
+     * an expired publication deadline never authorizes GPU storage reuse. */
+    if (snapshot->pending)
+    {
+        device->p_vkWaitForFences( device->host.device, 1, &snapshot->pending->fence, VK_TRUE, UINT64_MAX );
+        release_snapshot_fence( snapshot->pending );
+    }
     if (snapshot->pool) device->p_vkDestroyCommandPool( device->host.device, snapshot->pool, NULL );
-    if (snapshot->fence) device->p_vkDestroyFence( device->host.device, snapshot->fence, NULL );
     if (snapshot->semaphores)
         for (i = 0; i < snapshot->image_count; ++i)
             if (snapshot->semaphores[i])
@@ -1958,15 +2105,16 @@ static void destroy_swapchain_snapshot( struct vulkan_device *device, struct swa
     if (snapshot->pixels) device->p_vkUnmapMemory( device->host.device, snapshot->memory );
     if (snapshot->buffer) device->p_vkDestroyBuffer( device->host.device, snapshot->buffer, NULL );
     if (snapshot->memory) device->p_vkFreeMemory( device->host.device, snapshot->memory, NULL );
+    client_surface_release_memory( CLIENT_SURFACE_MEMORY_STAGING, snapshot->memory_bytes );
     free( snapshot->semaphores );
     free( snapshot->images );
     memset( snapshot, 0, sizeof(*snapshot) );
 }
 
-static VkResult prepare_swapchain_snapshot( struct vulkan_queue *queue, struct swapchain *swapchain )
+static VkResult prepare_swapchain_snapshot( struct vulkan_queue *queue, struct swapchain *swapchain,
+                                           struct swapchain_snapshot *snapshot )
 {
     struct vulkan_device *device = queue->device;
-    struct swapchain_snapshot *snapshot = &swapchain->snapshot;
     const VkPhysicalDeviceMemoryProperties *properties = &device->physical_device->memory_properties;
     VkCommandPoolCreateInfo pool_info = {.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
                                         .queueFamilyIndex = queue->info.queueFamilyIndex};
@@ -1976,7 +2124,6 @@ static VkResult prepare_swapchain_snapshot( struct vulkan_queue *queue, struct s
                                      .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT};
     VkMemoryAllocateInfo memory_info = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
     VkSemaphoreCreateInfo semaphore_info = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
-    VkFenceCreateInfo fence_info = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
     VkMemoryRequirements requirements;
     unsigned int i;
     VkResult res;
@@ -2009,11 +2156,16 @@ static VkResult prepare_swapchain_snapshot( struct vulkan_queue *queue, struct s
         }
         memory_info.allocationSize = requirements.size;
         memory_info.memoryTypeIndex = i;
+        if (!client_surface_reserve_memory( CLIENT_SURFACE_MEMORY_STAGING, requirements.size ))
+        {
+            res = VK_ERROR_OUT_OF_DEVICE_MEMORY;
+            goto failed;
+        }
+        snapshot->memory_bytes = requirements.size;
         if ((res = device->p_vkAllocateMemory( device->host.device, &memory_info, NULL, &snapshot->memory )) ||
             (res = device->p_vkBindBufferMemory( device->host.device, snapshot->buffer, snapshot->memory, 0 )) ||
             (res = device->p_vkMapMemory( device->host.device, snapshot->memory, 0, VK_WHOLE_SIZE,
-                                         0, &snapshot->pixels )) ||
-            (res = device->p_vkCreateFence( device->host.device, &fence_info, NULL, &snapshot->fence ))) goto failed;
+                                         0, &snapshot->pixels ))) goto failed;
     }
     if (snapshot->pool && snapshot->queue_family != queue->info.queueFamilyIndex)
     {
@@ -2030,19 +2182,34 @@ static VkResult prepare_swapchain_snapshot( struct vulkan_queue *queue, struct s
     return device->p_vkResetCommandPool( device->host.device, snapshot->pool, 0 );
 
 failed:
-    destroy_swapchain_snapshot( device, snapshot );
+    /* Only fresh storage may lose its image semaphores on allocation failure.
+     * An earlier host Present may still be consuming those semaphores after
+     * the readback fence has completed. */
+    if (!snapshot->pixels)
+    {
+        destroy_swapchain_snapshot( device, snapshot );
+        snapshot->busy = TRUE;
+    }
+    else if (snapshot->pool)
+    {
+        device->p_vkDestroyCommandPool( device->host.device, snapshot->pool, NULL );
+        snapshot->pool = 0;
+        snapshot->command = 0;
+    }
     return res;
 }
 
 static VkResult snapshot_vulkan_present( struct vulkan_queue *queue, VkPresentInfoKHR *present_info,
                                          const VkSwapchainKHR *client_swapchains,
-                                         struct client_surface_frame *presents )
+                                         struct client_surface_frame *presents,
+                                         struct vulkan_snapshot_reservation *reservations )
 {
     struct vulkan_device *device = queue->device;
     VkCommandBuffer commands_buffer[16], *commands = commands_buffer;
     VkPipelineStageFlags stages_buffer[16], *stages = stages_buffer;
     VkSubmitInfo submit = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO};
-    struct swapchain_snapshot *first = NULL;
+    VkFenceCreateInfo fence_info = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+    struct vulkan_snapshot_fence *pending = NULL;
     VkSemaphore *semaphore = NULL;
     unsigned int i, count = 0;
     VkResult res = VK_SUCCESS;
@@ -2056,10 +2223,20 @@ static VkResult snapshot_vulkan_present( struct vulkan_queue *queue, VkPresentIn
         res = VK_ERROR_OUT_OF_HOST_MEMORY;
         goto done;
     }
+    if (!(pending = calloc( 1, sizeof(*pending) )))
+    {
+        res = VK_ERROR_OUT_OF_HOST_MEMORY;
+        goto done;
+    }
+    pending->device = device;
+    pending->refs = 1;
+    if ((res = device->p_vkCreateFence( device->host.device, &fence_info, NULL, &pending->fence )))
+        goto done;
     for (i = 0; i < present_info->swapchainCount; ++i)
     {
         struct swapchain *swapchain = swapchain_from_handle( client_swapchains[i] );
-        struct swapchain_snapshot *snapshot = &swapchain->snapshot;
+        struct swapchain_snapshot *snapshot = reservations[i].snapshot;
+        struct vulkan_snapshot_completion *completion;
         VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
                                           .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
         VkImageMemoryBarrier image = {.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
@@ -2080,7 +2257,19 @@ static VkResult snapshot_vulkan_present( struct vulkan_queue *queue, VkPresentIn
                                   .imageExtent = {swapchain->host_extents.width, swapchain->host_extents.height, 1}};
 
         if (!swapchain->needs_snapshot || presents[i].target != CLIENT_SURFACE_FRAME_TARGET_OFFSCREEN) continue;
-        if ((res = prepare_swapchain_snapshot( queue, swapchain ))) goto done;
+        assert( snapshot && snapshot->busy );
+        if ((res = prepare_swapchain_snapshot( queue, swapchain, snapshot ))) goto done;
+        if (!(completion = malloc( sizeof(*completion) )))
+        {
+            res = VK_ERROR_OUT_OF_HOST_MEMORY;
+            goto done;
+        }
+        completion->device = device;
+        completion->swapchain = swapchain;
+        completion->snapshot = snapshot;
+        client_surface_set_present_completion( &presents[i], wait_vulkan_snapshot,
+                                               release_vulkan_snapshot, completion );
+        presents[i].completion.resolve = resolve_vulkan_snapshot;
         image.image = snapshot->images[present_info->pImageIndices[i]];
         buffer.buffer = snapshot->buffer;
         if ((res = device->p_vkBeginCommandBuffer( snapshot->command, &begin ))) goto done;
@@ -2096,11 +2285,8 @@ static VkResult snapshot_vulkan_present( struct vulkan_queue *queue, VkPresentIn
                                         0, 0, NULL, 1, &buffer, 1, &image );
         if ((res = device->p_vkEndCommandBuffer( snapshot->command ))) goto done;
         commands[count++] = snapshot->command;
-        if (!first)
-        {
-            first = snapshot;
+        if (!semaphore)
             semaphore = &snapshot->semaphores[present_info->pImageIndices[i]];
-        }
     }
     if (!count) goto done;
 
@@ -2115,25 +2301,32 @@ static VkResult snapshot_vulkan_present( struct vulkan_queue *queue, VkPresentIn
     submit.pCommandBuffers = commands;
     submit.signalSemaphoreCount = 1;
     submit.pSignalSemaphores = semaphore;
-    if ((res = device->p_vkResetFences( device->host.device, 1, &first->fence )) ||
-        (res = device->p_vkQueueSubmit( queue->host.queue, 1, &submit, first->fence ))) goto done;
+    if ((res = device->p_vkQueueSubmit( queue->host.queue, 1, &submit, pending->fence ))) goto done;
     present_info->waitSemaphoreCount = 1;
     present_info->pWaitSemaphores = semaphore;
-    if ((res = device->p_vkWaitForFences( device->host.device, 1, &first->fence, VK_TRUE, UINT64_MAX ))) goto done;
     for (i = 0; i < present_info->swapchainCount; ++i)
     {
-        struct swapchain *swapchain = swapchain_from_handle( client_swapchains[i] );
-        struct swapchain_snapshot *snapshot = &swapchain->snapshot;
-        VkMappedMemoryRange range = {.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
-                                     .memory = snapshot->memory, .size = VK_WHOLE_SIZE};
+        struct swapchain_snapshot *snapshot = reservations[i].snapshot;
 
-        if (!swapchain->needs_snapshot || presents[i].target != CLIENT_SURFACE_FRAME_TARGET_OFFSCREEN) continue;
-        if (device->p_vkInvalidateMappedMemoryRanges( device->host.device, 1, &range ) ||
-            !driver_funcs->p_vulkan_surface_snapshot( swapchain->surface->client, &presents[i], snapshot->pixels,
-                swapchain->host_extents.width, swapchain->host_extents.height, swapchain->format ))
-            presents[i].result = CLIENT_SURFACE_FRAME_COMPLETION_FAILED;
+        if (!presents[i].completion.resolve) continue;
+        assert( !snapshot->pending );
+        snapshot->pending = pending;
+        InterlockedIncrement( &pending->refs );
     }
 done:
+    if (res)
+        for (i = 0; i < present_info->swapchainCount; ++i)
+        {
+            struct client_surface_completion *completion = &presents[i].completion;
+
+            if (!completion->resolve) continue;
+            free( completion->context );
+            completion->wait = NULL;
+            completion->release = NULL;
+            completion->resolve = NULL;
+            completion->context = NULL;
+        }
+    release_snapshot_fence( pending );
     if (stages != stages_buffer) free( stages );
     if (commands != commands_buffer) free( commands );
     return res;
@@ -2231,6 +2424,10 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
     swapchain->host_extents = create_info_host.imageExtent;
     swapchain->format = create_info->imageFormat;
     swapchain->needs_snapshot = needs_snapshot;
+    swapchain->incremental_damage = create_info->preTransform == VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR &&
+                                   create_info->imageArrayLayers == 1 &&
+                                   swapchain->extents.width == swapchain->host_extents.width &&
+                                   swapchain->extents.height == swapchain->host_extents.height;
     instance->p_insert_object( instance, &swapchain->obj.obj );
 
     *ret = swapchain->obj.client.swapchain;
@@ -2252,7 +2449,8 @@ static void win32u_vkDestroySwapchainKHR( VkDevice client_device, VkSwapchainKHR
         pthread_cond_wait( &swapchain->completion_cond, &swapchain->present_lock );
     pthread_mutex_unlock( &swapchain->present_lock );
 
-    destroy_swapchain_snapshot( device, &swapchain->snapshot );
+    for (unsigned int i = 0; i < ARRAY_SIZE(swapchain->snapshots); ++i)
+        destroy_swapchain_snapshot( device, &swapchain->snapshots[i] );
     device->p_vkDestroySwapchainKHR( device->host.device, swapchain->obj.host.swapchain, NULL );
     instance->p_remove_object( instance, &swapchain->obj.obj );
 
@@ -2336,6 +2534,35 @@ static VkResult win32u_vkAcquireNextImageKHR( VkDevice client_device, VkSwapchai
     return res;
 }
 
+static void set_vulkan_present_damage( struct swapchain *swapchain, struct client_surface_frame *frame,
+                                      const VkPresentRegionKHR *region )
+{
+    RECT damage = {0};
+    unsigned int i;
+
+    /* Incremental regions are relative to the previous presentation of this
+     * swapchain. Name that source explicitly; the owner falls back to a full
+     * image if it skipped the base, changed scene, or needs scaling. */
+    if (!swapchain->incremental_damage || !swapchain->last_source_sequence ||
+        !region || !region->rectangleCount || !region->pRectangles) return;
+    for (i = 0; i < region->rectangleCount; ++i)
+    {
+        const VkRectLayerKHR *rect = &region->pRectangles[i];
+        RECT next;
+
+        if (rect->layer || rect->offset.x < 0 || rect->offset.y < 0 ||
+            rect->offset.x > swapchain->extents.width || rect->offset.y > swapchain->extents.height ||
+            rect->extent.width > swapchain->extents.width - rect->offset.x ||
+            rect->extent.height > swapchain->extents.height - rect->offset.y) return;
+        SetRect( &next, rect->offset.x, rect->offset.y,
+                 rect->offset.x + rect->extent.width, rect->offset.y + rect->extent.height );
+        union_rect( &damage, &damage, &next );
+    }
+    if (IsRectEmpty( &damage )) return;
+    frame->damage = damage;
+    frame->damage_base_sequence = swapchain->last_source_sequence;
+}
+
 static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentInfoKHR *client_present_info )
 {
     VkPresentInfoKHR *present_info = (VkPresentInfoKHR *)client_present_info; /* cast away const, it has been copied in the thunks */
@@ -2344,12 +2571,15 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
     struct swapchain *present_swapchains_buffer[16], **present_swapchains = present_swapchains_buffer;
     struct client_surface *present_surfaces_buffer[16], **present_surfaces = present_surfaces_buffer;
     struct client_surface_frame presents_buffer[16], *presents = presents_buffer;
+    struct vulkan_snapshot_reservation reservations_buffer[16] = {{0}}, *reservations = reservations_buffer;
     uint64_t present_ids_buffer[16], *present_ids = present_ids_buffer;
     VkPresentIdKHR present_id_info = {VK_STRUCTURE_TYPE_PRESENT_ID_KHR};
     struct vulkan_device *device = queue->device;
-    const VkSwapchainKHR *client_swapchains;
+    const VkSwapchainKHR *client_swapchains = present_info->pSwapchains;
+    const VkPresentRegionsKHR *regions = find_next_struct( present_info->pNext,
+                                                          VK_STRUCTURE_TYPE_PRESENT_REGIONS_KHR );
     uint32_t locked_count = 0, surface_locked_count = 0;
-    BOOL use_internal_present_wait, have_snapshots = FALSE;
+    BOOL use_internal_present_wait, have_snapshots = FALSE, reserve_more;
     VkResult res;
 
     TRACE( "queue %p, present_info %p\n", queue, present_info );
@@ -2384,7 +2614,7 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
         if (swapchains != swapchains_buffer) free( swapchains );
         return VK_ERROR_OUT_OF_HOST_MEMORY;
     }
-    if (use_internal_present_wait && present_info->swapchainCount > ARRAY_SIZE(present_swapchains_buffer) &&
+    if (present_info->swapchainCount > ARRAY_SIZE(present_swapchains_buffer) &&
         !(present_swapchains = malloc( present_info->swapchainCount * sizeof(*present_swapchains) )))
     {
         if (present_ids != present_ids_buffer) free( present_ids );
@@ -2392,6 +2622,13 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
         if (presents != presents_buffer) free( presents );
         if (swapchains != swapchains_buffer) free( swapchains );
         return VK_ERROR_OUT_OF_HOST_MEMORY;
+    }
+
+    if (present_info->swapchainCount > ARRAY_SIZE(reservations_buffer) &&
+        !(reservations = calloc( present_info->swapchainCount, sizeof(*reservations) )))
+    {
+        res = VK_ERROR_OUT_OF_HOST_MEMORY;
+        goto done;
     }
 
     for (uint32_t i = 0; i < present_info->waitSemaphoreCount; i++)
@@ -2407,10 +2644,12 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
         swapchains[i] = swapchain->obj.host.swapchain;
         present_surfaces[i] = swapchain->surface->client;
         client_surface_prepare_scene( present_surfaces[i] );
-        if (use_internal_present_wait) present_swapchains[i] = swapchain;
+        present_swapchains[i] = swapchain;
     }
 
-    client_swapchains = present_info->pSwapchains;
+    if (present_info->swapchainCount > 1)
+        qsort( present_swapchains, present_info->swapchainCount,
+               sizeof(*present_swapchains), compare_swapchain_ptrs );
     present_info->pSwapchains = swapchains;
     if (use_internal_present_wait)
     {
@@ -2419,6 +2658,27 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
         present_id_info.pPresentIds = present_ids;
         present_info->pNext = &present_id_info;
     }
+
+reserve_snapshots:
+    for (uint32_t i = 0; i < present_info->swapchainCount; ++i)
+    {
+        struct swapchain *swapchain = present_swapchains[i];
+        struct client_surface_target target;
+        unsigned int index;
+
+        if (!swapchain->needs_snapshot) continue;
+        for (index = 0; index < present_info->swapchainCount; ++index)
+            if (swapchain_from_handle( client_swapchains[index] ) == swapchain) break;
+        assert( index < present_info->swapchainCount );
+        if (reservations[index].snapshot) continue;
+        client_surface_get_target( swapchain->surface->client, &target );
+        if (!reservations[index].required && !target.offscreen) continue;
+        if (!(res = acquire_snapshot_reservation( device, swapchain, &reservations[index].snapshot ))) continue;
+        if (present_info->pResults)
+            for (uint32_t j = 0; j < present_info->swapchainCount; ++j) present_info->pResults[j] = res;
+        goto done;
+    }
+    have_snapshots = reserve_more = FALSE;
 
     /* Completion ordering is per client surface.  Acquire locks in a stable
      * order across queues; exact external IDs release them after submission,
@@ -2448,6 +2708,30 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
                                                use_internal_present_wait || swapchain->needs_snapshot );
         have_snapshots |= swapchain->needs_snapshot &&
                           presents[i].target == CLIENT_SURFACE_FRAME_TARGET_OFFSCREEN;
+        if (swapchain->needs_snapshot && presents[i].target == CLIENT_SURFACE_FRAME_TARGET_OFFSCREEN &&
+            !reservations[i].snapshot)
+            reserve_more = reservations[i].required = TRUE;
+    }
+    if (reserve_more)
+    {
+        /* A scene may become offscreen between the lock-free inspection and
+         * preparation. Cancel only our unsubmitted tokens, then reserve its
+         * independent staging storage outside every surface lock. DIRECT
+         * calls never wait for a staging buffer they will not use. */
+        for (uint32_t i = 0; i < present_info->swapchainCount; ++i)
+        {
+            struct client_surface *surface = swapchain_from_handle( client_swapchains[i] )->surface->client;
+
+            pthread_mutex_lock( &surface->present_lock );
+            client_surface_abandon_handoff_locked( surface, &presents[i] );
+            if (presents[i].completion.kind == CLIENT_SURFACE_COMPLETION_SHARED &&
+                surface->backend->completion && surface->backend->completion->abandon)
+                surface->backend->completion->abandon( surface );
+            pthread_mutex_unlock( &surface->present_lock );
+        }
+        while (surface_locked_count)
+            client_surface_unlock_present( present_surfaces[--surface_locked_count] );
+        goto reserve_snapshots;
     }
 
     if (use_internal_present_wait)
@@ -2472,7 +2756,8 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
         }
     }
 
-    res = have_snapshots ? snapshot_vulkan_present( queue, present_info, client_swapchains, presents ) : VK_SUCCESS;
+    res = have_snapshots ? snapshot_vulkan_present( queue, present_info, client_swapchains,
+                                                   presents, reservations ) : VK_SUCCESS;
     if (!res) res = device->p_vkQueuePresentKHR( queue->host.queue, present_info );
     else if (present_info->pResults)
         for (uint32_t i = 0; i < present_info->swapchainCount; ++i) present_info->pResults[i] = res;
@@ -2485,11 +2770,28 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
         struct swapchain *swapchain = swapchain_from_handle( client_swapchains[i] );
 
         client_surface_submit_present_locked( swapchain->surface->client, &presents[i] );
+        if ((present_info->pResults ? present_info->pResults[i] : res) >= VK_SUCCESS)
+        {
+            if (regions && regions->swapchainCount == present_info->swapchainCount)
+                set_vulkan_present_damage( swapchain, &presents[i], &regions->pRegions[i] );
+            swapchain->last_source_sequence = presents[i].serial;
+        }
+        else swapchain->last_source_sequence = 0;
     }
     while (locked_count)
         pthread_mutex_unlock( &present_swapchains[--locked_count]->present_lock );
     while (surface_locked_count)
         client_surface_unlock_present( present_surfaces[--surface_locked_count] );
+
+    for (uint32_t i = 0; i < present_info->swapchainCount; ++i)
+    {
+        struct swapchain *swapchain = swapchain_from_handle( client_swapchains[i] );
+
+        if (reservations[i].snapshot && !presents[i].completion.resolve)
+            release_snapshot_reservation( swapchain, reservations[i].snapshot );
+        /* A successful snapshot is now owned by its completion context. */
+        reservations[i].snapshot = NULL;
+    }
 
     for (uint32_t i = 0; i < present_info->swapchainCount; i++)
     {
@@ -2498,17 +2800,10 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
         struct surface *surface = swapchain->surface;
         SIZE expected_size = {swapchain->extents.width, swapchain->extents.height};
         BOOL compose = swapchain_res >= VK_SUCCESS;
-        BOOL snapshot_completed = swapchain->needs_snapshot &&
-                                  presents[i].target == CLIENT_SURFACE_FRAME_TARGET_OFFSCREEN;
+        BOOL snapshot_completed = !!presents[i].completion.resolve;
+        struct client_surface_completion completion = presents[i].completion;
         RECT client_rect;
 
-        if (snapshot_completed && presents[i].result == CLIENT_SURFACE_FRAME_COMPLETION_FAILED)
-        {
-            WARN( "Failed to capture swapchain %p for owner composition\n", swapchain );
-            if (present_info->pResults) present_info->pResults[i] = VK_ERROR_SURFACE_LOST_KHR;
-            if (res >= VK_SUCCESS) res = VK_ERROR_SURFACE_LOST_KHR;
-            compose = FALSE;
-        }
         if (compose && !get_surface_rect( surface->hwnd, &client_rect,
                                           get_dpi_for_window( surface->hwnd ) ))
         {
@@ -2535,6 +2830,11 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
              * extent. */
         }
 
+        if (compose && snapshot_completed)
+        {
+            client_surface_defer_present( surface->client, &presents[i], &expected_size );
+            continue;
+        }
         if (compose && presents[i].completion.kind == CLIENT_SURFACE_COMPLETION_EXACT &&
             use_internal_present_wait && !snapshot_completed)
         {
@@ -2555,7 +2855,7 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
 
         {
             BOOL completed;
-            BOOL external_completed = snapshot_completed;
+            BOOL external_completed = FALSE;
             DWORD elapsed = NtGetTickCount() - presents[i].submission_time;
             DWORD remaining = elapsed < CLIENT_SURFACE_PRESENT_TIMEOUT ?
                               CLIENT_SURFACE_PRESENT_TIMEOUT - elapsed : 0;
@@ -2588,8 +2888,16 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
                 }
             }
         }
+        if (snapshot_completed) completion.release( completion.context );
     }
 
+done:
+    if (reservations)
+        for (uint32_t i = 0; i < present_info->swapchainCount; ++i)
+            if (reservations[i].snapshot)
+                release_snapshot_reservation( swapchain_from_handle( client_swapchains[i] ),
+                                               reservations[i].snapshot );
+    if (reservations != reservations_buffer) free( reservations );
     if (present_swapchains != present_swapchains_buffer) free( present_swapchains );
     if (present_ids != present_ids_buffer) free( present_ids );
     if (present_surfaces != present_surfaces_buffer) free( present_surfaces );

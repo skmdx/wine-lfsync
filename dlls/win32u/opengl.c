@@ -183,12 +183,19 @@ void opengl_drawable_release( struct opengl_drawable *drawable )
     }
 }
 
+static BOOL framebuffer_surface_needs_resize( struct opengl_drawable *drawable );
+
 static void opengl_drawable_flush( struct opengl_drawable *drawable, int interval, UINT flags )
 {
     if (!is_client_surface_window( drawable->client, 0 )) return;
 
+    /* Explicit storage must observe foreign-owner geometry before the next
+     * GL command. Updating only at SwapBuffers discards a one-frame repaint
+     * into the old FBO, then resizes (and clears) it after presentation. */
+    if (drawable->read_fbo) client_surface_update( drawable->client );
     if (client_surface_get_size( drawable->client, &drawable->virtual_size, &drawable->monitor_size ))
         flags |= GL_FLUSH_UPDATED;
+    if (framebuffer_surface_needs_resize( drawable )) flags |= GL_FLUSH_UPDATED;
 
     if (interval != drawable->interval)
     {
@@ -400,6 +407,9 @@ struct framebuffer_surface
 {
     struct opengl_drawable  base;
     struct opengl_drawable *target;         /* driver drawable to present to */
+    SIZE                   storage_size;
+    UINT64                 storage_bytes;
+    BOOL                   storage_valid;
 };
 
 static const struct opengl_drawable_funcs framebuffer_surface_funcs;
@@ -407,6 +417,45 @@ static const struct opengl_drawable_funcs framebuffer_surface_funcs;
 static struct framebuffer_surface *framebuffer_from_opengl_drawable( struct opengl_drawable *base )
 {
     return CONTAINING_RECORD( base, struct framebuffer_surface, base );
+}
+
+static BOOL framebuffer_surface_needs_resize( struct opengl_drawable *drawable )
+{
+    struct framebuffer_surface *surface;
+
+    if (drawable->funcs != &framebuffer_surface_funcs) return FALSE;
+    surface = framebuffer_from_opengl_drawable( drawable );
+    return !surface->storage_valid || surface->storage_size.cx != drawable->virtual_size.cx ||
+           surface->storage_size.cy != drawable->virtual_size.cy;
+}
+
+static UINT64 framebuffer_surface_storage_size( struct framebuffer_surface *surface, SIZE size )
+{
+    const struct wgl_pixel_format *desc = pixel_formats + surface->base.format - 1;
+    const PIXELFORMATDESCRIPTOR *pfd = &desc->pfd;
+    UINT64 color_bits = pfd->cRedBits + pfd->cGreenBits + pfd->cBlueBits + pfd->cAlphaBits;
+    UINT64 color_bytes = 4, depth_bytes = 0, bytes;
+    unsigned int count = (surface->base.doublebuffer ? 2 : 1) * (surface->base.stereo ? 2 : 1);
+
+    /* Account logical GL storage, conservatively rounding RGB formats to the
+     * corresponding RGBA size. Driver tiling and implicit storage renaming
+     * are opaque, just as for native WSI; this is not a VRAM-residency query. */
+    while (color_bytes * 8 < color_bits) color_bytes *= 2;
+    if (pfd->cDepthBits) depth_bytes = pfd->cDepthBits + pfd->cStencilBits > 32 ? 8 : 4;
+    bytes = color_bytes * count + depth_bytes;
+    if (desc->sample_buffers) bytes *= 1 + max( 1, desc->samples );
+    if (size.cx <= 0 || size.cy <= 0 || (UINT64)size.cx > ~(UINT64)0 / size.cy / bytes)
+        return ~(UINT64)0;
+    return bytes * size.cx * size.cy;
+}
+
+static BOOL reserve_framebuffer_surface_storage( struct framebuffer_surface *surface, UINT64 bytes )
+{
+    if (bytes <= surface->storage_bytes) return TRUE;
+    if (!client_surface_reserve_memory( CLIENT_SURFACE_MEMORY_SOURCE, bytes - surface->storage_bytes ))
+        return FALSE;
+    surface->storage_bytes = bytes;
+    return TRUE;
 }
 
 static struct opengl_drawable *get_target( struct opengl_drawable *drawable )
@@ -561,13 +610,14 @@ static void destroy_framebuffer_attachment( struct opengl_drawable *drawable, GL
 static GLuint create_framebuffer( struct opengl_drawable *drawable, const struct wgl_pixel_format *desc, SIZE size )
 {
     const struct opengl_funcs *funcs = &display_funcs;
-    GLuint count = 1, fbo, name;
-    GLenum ret;
+    GLuint count = 1, fbo, name, colors[4] = {0}, depth = 0;
+    GLenum ret, error;
 
     if (drawable->doublebuffer) count *= 2;
     if (drawable->stereo) count *= 2;
 
     funcs->p_glGenFramebuffers( 1, &fbo );
+    if (!fbo) return 0;
     funcs->p_glBindFramebuffer( GL_FRAMEBUFFER, fbo );
 
     for (GLuint i = 0; i < count; i++)
@@ -575,12 +625,14 @@ static GLuint create_framebuffer( struct opengl_drawable *drawable, const struct
         if (desc->samples)
         {
             funcs->p_glGenRenderbuffers( 1, &name );
+            colors[i] = name;
             init_framebuffer_attachment( drawable, fbo, GL_COLOR_ATTACHMENT0 + i, GL_RENDERBUFFER, name, desc, size );
             funcs->p_glFramebufferRenderbuffer( GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0 + i, GL_RENDERBUFFER, name );
         }
         else
         {
             funcs->p_glGenTextures( 1, &name );
+            colors[i] = name;
             init_framebuffer_attachment( drawable, fbo, GL_COLOR_ATTACHMENT0 + i, GL_TEXTURE, name, desc, size );
             funcs->p_glFramebufferTexture( GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0 + i, name, 0 );
         }
@@ -590,6 +642,7 @@ static GLuint create_framebuffer( struct opengl_drawable *drawable, const struct
     if (desc->pfd.cDepthBits)
     {
         funcs->p_glGenRenderbuffers( 1, &name );
+        depth = name;
         init_framebuffer_attachment( drawable, fbo, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, name, desc, size );
         funcs->p_glFramebufferRenderbuffer( GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, name );
         if (desc->pfd.cStencilBits) funcs->p_glFramebufferRenderbuffer( GL_FRAMEBUFFER, GL_STENCIL_ATTACHMENT, GL_RENDERBUFFER, name );
@@ -601,15 +654,24 @@ static GLuint create_framebuffer( struct opengl_drawable *drawable, const struct
     TRACE( "drawable %p created framebuffer %u\n", drawable, fbo );
 
     ret = funcs->p_glCheckFramebufferStatus( GL_FRAMEBUFFER );
-    if (ret != GL_FRAMEBUFFER_COMPLETE) WARN( "glCheckFramebufferStatus returned %#x\n", ret );
+    error = funcs->p_glGetError();
+    if (ret != GL_FRAMEBUFFER_COMPLETE || error)
+    {
+        WARN( "Failed to allocate framebuffer, status %#x error %#x\n", ret, error );
+        if (desc->samples) funcs->p_glDeleteRenderbuffers( count, colors );
+        else funcs->p_glDeleteTextures( count, colors );
+        if (depth) funcs->p_glDeleteRenderbuffers( 1, &depth );
+        funcs->p_glDeleteFramebuffers( 1, &fbo );
+        return 0;
+    }
     return fbo;
 }
 
-static void resize_framebuffer( struct opengl_drawable *drawable, const struct wgl_pixel_format *desc, GLuint fbo, SIZE size )
+static BOOL resize_framebuffer( struct opengl_drawable *drawable, const struct wgl_pixel_format *desc, GLuint fbo, SIZE size )
 {
     const struct opengl_funcs *funcs = &display_funcs;
     GLuint count = 1;
-    GLenum ret;
+    GLenum ret, error;
 
     if (drawable->doublebuffer) count *= 2;
     if (drawable->stereo) count *= 2;
@@ -620,8 +682,11 @@ static void resize_framebuffer( struct opengl_drawable *drawable, const struct w
     if (desc->pfd.cDepthBits) resize_framebuffer_attachment( drawable, fbo, GL_DEPTH_ATTACHMENT, desc, size );
 
     ret = funcs->p_glCheckFramebufferStatus( GL_FRAMEBUFFER );
-    if (ret != GL_FRAMEBUFFER_COMPLETE) WARN( "glCheckFramebufferStatus returned %#x\n", ret );
+    error = funcs->p_glGetError();
+    if (ret != GL_FRAMEBUFFER_COMPLETE || error)
+        WARN( "Failed to resize framebuffer, status %#x error %#x\n", ret, error );
     TRACE( "drawable %p/%u resized buffers to %s\n", drawable, fbo, wine_dbgstr_point( (POINT *)&size ) );
+    return ret == GL_FRAMEBUFFER_COMPLETE && !error;
 }
 
 static void destroy_framebuffer( struct opengl_drawable *drawable, const struct wgl_pixel_format *desc, GLuint fbo )
@@ -651,9 +716,10 @@ static void framebuffer_surface_destroy( struct opengl_drawable *drawable )
 
     make_null_context_current( surface->target );
 
-    if (drawable->draw_fbo != drawable->read_fbo)
+    if (drawable->draw_fbo && drawable->draw_fbo != drawable->read_fbo)
         destroy_framebuffer( drawable, &draw_desc, drawable->draw_fbo );
-    destroy_framebuffer( drawable, &read_desc, drawable->read_fbo );
+    if (drawable->read_fbo) destroy_framebuffer( drawable, &read_desc, drawable->read_fbo );
+    client_surface_release_memory( CLIENT_SURFACE_MEMORY_SOURCE, surface->storage_bytes );
 
     make_client_context_current();
 
@@ -714,6 +780,24 @@ static void blit_framebuffer_surface( struct opengl_drawable *drawable )
     if (drawable->srgb) funcs->p_glDisable( GL_FRAMEBUFFER_SRGB );
 }
 
+static BOOL present_framebuffer_surface( struct opengl_drawable *drawable )
+{
+    struct framebuffer_surface *surface = framebuffer_from_opengl_drawable( drawable );
+    struct opengl_drawable *target = surface->target;
+
+    if (!surface->storage_valid) return FALSE;
+
+    if (target->funcs->swap_framebuffer && drawable->read_fbo == drawable->draw_fbo &&
+        use_default_gamma_ramp())
+    {
+        if (!is_client_surface_window( target->client, 0 )) return FALSE;
+        client_surface_update( target->client );
+        return target->funcs->swap_framebuffer( target, drawable->read_fbo );
+    }
+    blit_framebuffer_surface( drawable );
+    return opengl_drawable_swap( target );
+}
+
 static void framebuffer_surface_flush( struct opengl_drawable *drawable, UINT flags )
 {
     struct framebuffer_surface *surface = framebuffer_from_opengl_drawable( drawable );
@@ -722,20 +806,29 @@ static void framebuffer_surface_flush( struct opengl_drawable *drawable, UINT fl
 
     if (flags & (GL_FLUSH_UPDATED | GL_FLUSH_PRESENT)) make_null_context_current( surface->target );
 
-    if (flags & GL_FLUSH_UPDATED)
+    if ((flags & GL_FLUSH_UPDATED) && framebuffer_surface_needs_resize( drawable ))
     {
         struct wgl_pixel_format draw_desc = pixel_formats[drawable->format - 1], read_desc = draw_desc;
         SIZE size = drawable->virtual_size;
+        UINT64 bytes = framebuffer_surface_storage_size( surface, size );
 
         read_desc.samples = read_desc.sample_buffers = 0;
-
-        TRACE( "Resizing drawable %p/%u to %s\n", drawable, drawable->read_fbo, wine_dbgstr_point( (POINT *)&size ) );
-        resize_framebuffer( drawable, &read_desc, drawable->read_fbo, size );
-
-        if (drawable->draw_fbo != drawable->read_fbo)
+        surface->storage_valid = reserve_framebuffer_surface_storage( surface, bytes );
+        if (surface->storage_valid)
         {
-            TRACE( "Resizing drawable %p/%u to %s\n", drawable, drawable->draw_fbo, wine_dbgstr_point( (POINT *)&size ) );
-            resize_framebuffer( drawable, &draw_desc, drawable->draw_fbo, size );
+            /* On failure, some attachments may retain the old allocation.
+             * Keep max(old,new) charged and reject presentation until every
+             * attachment has been recreated successfully on a later draw. */
+            surface->storage_valid = resize_framebuffer( drawable, &read_desc, drawable->read_fbo, size );
+            if (drawable->draw_fbo != drawable->read_fbo)
+                surface->storage_valid = resize_framebuffer( drawable, &draw_desc, drawable->draw_fbo, size ) &&
+                                         surface->storage_valid;
+            if (surface->storage_valid)
+            {
+                client_surface_release_memory( CLIENT_SURFACE_MEMORY_SOURCE, surface->storage_bytes - bytes );
+                surface->storage_bytes = bytes;
+                surface->storage_size = size;
+            }
         }
     }
 
@@ -746,8 +839,7 @@ static void framebuffer_surface_flush( struct opengl_drawable *drawable, UINT fl
 
         if (flags & GL_FLUSH_PRESENT)
         {
-            blit_framebuffer_surface( drawable );
-            opengl_drawable_swap( surface->target );
+            present_framebuffer_surface( drawable );
         }
     }
 
@@ -762,6 +854,11 @@ static BOOL framebuffer_surface_swap( struct opengl_drawable *drawable )
 
     TRACE( "%s\n", debugstr_opengl_drawable( drawable ) );
 
+    if (!surface->storage_valid)
+    {
+        RtlSetLastWin32Error( ERROR_NOT_ENOUGH_MEMORY );
+        return FALSE;
+    }
     if (drawable->doublebuffer || surface->target) make_null_context_current( surface->target );
 
     if (drawable->doublebuffer)
@@ -802,8 +899,7 @@ static BOOL framebuffer_surface_swap( struct opengl_drawable *drawable )
 
     if (surface->target)
     {
-        blit_framebuffer_surface( drawable );
-        ret = opengl_drawable_swap( surface->target );
+        ret = present_framebuffer_surface( drawable );
     }
 
     make_client_context_current();
@@ -825,6 +921,13 @@ static struct opengl_drawable *framebuffer_surface_create( int format, struct cl
 
     if (!(surface = opengl_drawable_create( sizeof(*surface), &framebuffer_surface_funcs, format, client ))) return NULL;
     if ((surface->target = target)) opengl_drawable_add_ref( surface->target );
+    if (!reserve_framebuffer_surface_storage( surface,
+                                              framebuffer_surface_storage_size( surface, surface->base.virtual_size ) ))
+    {
+        opengl_drawable_release( &surface->base );
+        RtlSetLastWin32Error( ERROR_NOT_ENOUGH_MEMORY );
+        return NULL;
+    }
 
     opengl_drawable_map_buffer( &surface->base, GL_FRONT_LEFT, GL_COLOR_ATTACHMENT0 );
     opengl_drawable_map_buffer( &surface->base, GL_FRONT, GL_COLOR_ATTACHMENT0 ); /* only front left */
@@ -855,6 +958,15 @@ static struct opengl_drawable *framebuffer_surface_create( int format, struct cl
     if (!surface->base.draw_fbo) ERR( "Failed to create draw framebuffer object\n" );
 
     make_client_context_current();
+
+    if (!surface->base.read_fbo || !surface->base.draw_fbo)
+    {
+        opengl_drawable_release( &surface->base );
+        RtlSetLastWin32Error( ERROR_NOT_ENOUGH_MEMORY );
+        return NULL;
+    }
+    surface->storage_size = surface->base.virtual_size;
+    surface->storage_valid = TRUE;
 
     return &surface->base;
 }

@@ -87,7 +87,7 @@ static BOOL X11DRV_vulkan_surface_snapshot( struct client_surface *client,
     BOOL bgra = format == VK_FORMAT_B8G8R8A8_UNORM || format == VK_FORMAT_B8G8R8A8_SRGB;
 
     if (!x11drv_client_surface_snapshot( client, pixels, width, height, TRUE, bgra )) return FALSE;
-    if (present->handoff_control) client->handoff_slot->source = surface->snapshot;
+    if (present->handoff_control) client->handoff_slot[present->handoff_index].source = surface->snapshot;
     TRACE( "captured Vulkan snapshot %#lx size %ux%u format %u for %s\n",
            surface->snapshot, width, height, format, debugstr_client_surface( client ) );
     return TRUE;

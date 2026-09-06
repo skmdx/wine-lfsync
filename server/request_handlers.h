@@ -319,8 +319,10 @@ DECL_HANDLER(alpc_create_port);
 DECL_HANDLER(set_client_surface_state);
 DECL_HANDLER(get_client_surface_clip_windows);
 DECL_HANDLER(get_client_surface_handoff);
+DECL_HANDLER(get_client_surface_handoff_event);
 DECL_HANDLER(release_client_surface_handoff);
 DECL_HANDLER(complete_client_surface_handoffs);
+DECL_HANDLER(cancel_client_surface_handoffs);
 DECL_HANDLER(publish_client_surface_handoff);
 DECL_HANDLER(get_client_surface_handoffs);
 
@@ -639,8 +641,10 @@ static const req_handler req_handlers[REQ_NB_REQUESTS] =
     (req_handler)req_set_client_surface_state,
     (req_handler)req_get_client_surface_clip_windows,
     (req_handler)req_get_client_surface_handoff,
+    (req_handler)req_get_client_surface_handoff_event,
     (req_handler)req_release_client_surface_handoff,
     (req_handler)req_complete_client_surface_handoffs,
+    (req_handler)req_cancel_client_surface_handoffs,
     (req_handler)req_publish_client_surface_handoff,
     (req_handler)req_get_client_surface_handoffs,
 };
@@ -2453,6 +2457,14 @@ C_ASSERT( offsetof(struct get_client_surface_handoff_reply, offset) == 16 );
 C_ASSERT( offsetof(struct get_client_surface_handoff_reply, mapping_id) == 24 );
 C_ASSERT( offsetof(struct get_client_surface_handoff_reply, cookie) == 32 );
 C_ASSERT( sizeof(struct get_client_surface_handoff_reply) == 40 );
+C_ASSERT( offsetof(struct get_client_surface_handoff_event_request, handle) == 12 );
+C_ASSERT( offsetof(struct get_client_surface_handoff_event_request, producer) == 16 );
+C_ASSERT( offsetof(struct get_client_surface_handoff_event_request, surface) == 24 );
+C_ASSERT( offsetof(struct get_client_surface_handoff_event_request, cookie) == 32 );
+C_ASSERT( offsetof(struct get_client_surface_handoff_event_request, owner) == 40 );
+C_ASSERT( sizeof(struct get_client_surface_handoff_event_request) == 48 );
+C_ASSERT( offsetof(struct get_client_surface_handoff_event_reply, event) == 8 );
+C_ASSERT( sizeof(struct get_client_surface_handoff_event_reply) == 16 );
 C_ASSERT( offsetof(struct release_client_surface_handoff_request, handle) == 12 );
 C_ASSERT( offsetof(struct release_client_surface_handoff_request, producer) == 16 );
 C_ASSERT( offsetof(struct release_client_surface_handoff_request, surface) == 24 );
@@ -2465,6 +2477,10 @@ C_ASSERT( offsetof(struct complete_client_surface_handoffs_request, scene_genera
 C_ASSERT( sizeof(struct complete_client_surface_handoffs_request) == 32 );
 C_ASSERT( offsetof(struct complete_client_surface_handoffs_reply, accepted) == 8 );
 C_ASSERT( sizeof(struct complete_client_surface_handoffs_reply) == 16 );
+C_ASSERT( offsetof(struct cancel_client_surface_handoffs_request, handle) == 12 );
+C_ASSERT( offsetof(struct cancel_client_surface_handoffs_request, generation) == 16 );
+C_ASSERT( offsetof(struct cancel_client_surface_handoffs_request, scene_generation) == 24 );
+C_ASSERT( sizeof(struct cancel_client_surface_handoffs_request) == 32 );
 C_ASSERT( offsetof(struct publish_client_surface_handoff_request, handle) == 12 );
 C_ASSERT( offsetof(struct publish_client_surface_handoff_request, generation) == 16 );
 C_ASSERT( offsetof(struct publish_client_surface_handoff_request, scene_generation) == 24 );

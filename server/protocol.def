@@ -300,6 +300,18 @@ struct client_surface_handoff_desc
     client_ptr_t    surface;
 };
 
+/* Owner attestation for pixels already copied out of producer storage. */
+struct client_surface_handoff_receipt
+{
+    user_handle_t handle;
+    process_id_t process;
+    client_ptr_t surface;
+    unsigned __int64 cookie;
+    unsigned __int64 source_generation;
+    unsigned int buffer_index;
+    unsigned int __pad;
+};
+
 /* structure for parameters of async I/O calls */
 struct async_data
 {
@@ -4417,6 +4429,7 @@ enum inproc_sync_type
 #define CLIENT_SURFACE_STATE_NATIVE_BARRIER_END   0x80000
 #define CLIENT_SURFACE_STATE_DIRECT_PRESENTATION 0x200000
 #define CLIENT_SURFACE_STATE_UPDATE_CAPS         0x400000
+#define CLIENT_SURFACE_STATE_FAILED              0x800000
 
 
 /* Get visible client-surface windows above a target in one stable scene. */
@@ -4446,6 +4459,17 @@ enum inproc_sync_type
     unsigned __int64 cookie;
 @END
 
+/* Get a pollable notification endpoint for an already mapped binding. */
+@REQ(get_client_surface_handoff_event)
+    user_handle_t  handle;
+    process_id_t   producer;
+    client_ptr_t   surface;
+    unsigned __int64 cookie;
+    unsigned int   owner;
+@REPLY
+    obj_handle_t   event;
+@END
+
 /* Drop one producer or owner view. The binding is not reusable until both
  * sides have released it or their processes have exited. */
 @REQ(release_client_surface_handoff)
@@ -4456,15 +4480,23 @@ enum inproc_sync_type
     unsigned int   owner;        /* release the compositor-owner endpoint */
 @END
 
-/* Atomically accept one owner-assembled scene generation. All selected
- * handoffs remain READING until this request has validated the complete set;
- * steady-state generation zero frames require no server acknowledgement. */
+/* Atomically accept owner-owned copies for one immutable scene roster.
+ * Receipts are sorted by window handle. Producer slots may already have
+ * advanced; their storage lifetime is independent of this transaction. */
 @REQ(complete_client_surface_handoffs)
     user_handle_t  handle;
     unsigned __int64 generation;
     unsigned __int64 scene_generation;
+    VARARG(receipts,bytes); /* client_surface_handoff_receipt entries */
 @REPLY
     int            accepted;
+@END
+
+/* Discard an incomplete private assembly and request an entire new scene. */
+@REQ(cancel_client_surface_handoffs)
+    user_handle_t handle;
+    unsigned __int64 generation;
+    unsigned __int64 scene_generation;
 @END
 
 /* Finish the native owner publication reserved by a generation completion. */

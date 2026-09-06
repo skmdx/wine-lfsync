@@ -27,6 +27,18 @@ struct x11drv_client_surface_completion
     BOOL cond_initialized;
 };
 
+struct x11drv_client_source_frame
+{
+    Pixmap pixmap;
+    GC gc;
+    unsigned int width, height, depth;
+    UINT64 bytes;
+    void *image;
+    void (*release_image)( void *image );
+    BOOL (*image_ready)( void *image );
+    UINT64 gpu_control;
+};
+
 struct x11drv_client_surface
 {
     struct client_surface client;
@@ -35,19 +47,19 @@ struct x11drv_client_surface
     Window window;
     Pixmap snapshot;
     SIZE snapshot_size;
+    XImage *snapshot_image;
+    GC snapshot_gc;
+    UINT64 snapshot_bytes;
+    BYTE *snapshot_pixels;
+    SIZE_T snapshot_pixels_size;
     VisualID source_visual;
-    UINT64 handoff_clip_scene_epoch;
-    UINT64 handoff_clip_target_seq;
-    XID handoff_clip_region;
-    Pixmap handoff_clip_mask;
-    struct client_surface_handoff_clip_rect
-        handoff_clip_rects[CLIENT_SURFACE_HANDOFF_MAX_CLIP_RECTS];
-    unsigned int handoff_clip_count;
-    BOOL handoff_clip_valid;
-    BOOL handoff_clip_supported;
-    BOOL handoff_clip_required;
-    BOOL handoff_clip_xfixes;
-    BOOL handoff_clip_pixmap;
+    unsigned int source_depth;
+    Pixmap snapshot_import;
+    UINT64 snapshot_import_seq;
+    BOOL direct_snapshot;
+    Pixmap gpu_snapshot;
+    SIZE gpu_snapshot_size;
+    struct x11drv_client_source_frame sources[CLIENT_SURFACE_SOURCE_FRAME_COUNT];
     struct x11drv_client_surface_completion completion;
     BOOL manual_redirect;   /* client drawable is manually XComposite redirected */
 
@@ -60,5 +72,8 @@ extern void x11drv_client_surface_completion_destroy( struct x11drv_client_surfa
 extern BOOL x11drv_client_surface_snapshot( struct client_surface *client, const BYTE *pixels,
                                             unsigned int width, unsigned int height,
                                             BOOL top_down, BOOL bgra );
+extern struct x11drv_client_source_frame *x11drv_client_surface_get_source(
+    struct client_surface *client, unsigned int index, unsigned int width,
+    unsigned int height, unsigned int depth );
 
 #endif /* __WINE_X11DRV_CLIENT_SURFACE_H */

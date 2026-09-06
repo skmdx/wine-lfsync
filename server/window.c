@@ -22,12 +22,16 @@
 
 #include <assert.h>
 #include <stdarg.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/socket.h>
 
 #ifdef __linux__
 #include <limits.h>
 #include <linux/futex.h>
 #include <sys/syscall.h>
-#include <unistd.h>
+#include <sys/eventfd.h>
 #endif
 
 #include "ntstatus.h"
@@ -77,6 +81,9 @@ struct client_surface_handoff_pool
     struct object *mapping;
     struct client_surface_handoff_shared *shared;
     UINT64 id;
+    struct file *ready_read;
+    struct file *ready_write;
+    int ready_fd;
     unsigned char used[CLIENT_SURFACE_HANDOFF_SLOTS];
 };
 
@@ -211,7 +218,20 @@ static void wake_client_surface_handoff( struct client_surface_handoff_pool *poo
      * waker which claims that publication owns the sequence increment. */
     if (!__atomic_exchange_n( parked, 0, __ATOMIC_ACQ_REL )) return;
     __atomic_add_fetch( sequence, 1, __ATOMIC_RELEASE );
-    client_surface_handoff_futex_wake( sequence );
+    if (ready)
+    {
+        UINT64 value = 1;
+        int ret;
+
+        do
+#ifdef __linux__
+            ret = write( pool->ready_fd, &value, sizeof(value) );
+#else
+            ret = send( pool->ready_fd, &value, sizeof(value), 0 );
+#endif
+        while (ret < 0 && errno == EINTR);
+    }
+    else client_surface_handoff_futex_wake( sequence );
 }
 
 static void signal_client_surface_handoff_ready( struct client_surface_handoff_pool *pool,
@@ -222,39 +242,60 @@ static void signal_client_surface_handoff_ready( struct client_surface_handoff_p
     wake_client_surface_handoff( pool, 1 );
 }
 
+static int is_client_surface_handoff_lost( const struct client_surface_ref *surface )
+{
+    unsigned int i;
+
+    if (!surface->handoff_pool) return 0;
+    for (i = 0; i < CLIENT_SURFACE_SOURCE_FRAME_COUNT; ++i)
+        if (client_surface_handoff_state( __atomic_load_n(
+                &surface->handoff_pool->shared->slots[surface->handoff_index + i].control,
+                __ATOMIC_ACQUIRE ) ) == CLIENT_SURFACE_HANDOFF_LOST) return 1;
+    return 0;
+}
+
 static void mark_client_surface_handoff_lost( struct client_surface_ref *surface )
 {
     struct client_surface_handoff_slot *slot;
     UINT64 control;
+    unsigned int i;
 
     if (!surface->handoff_pool) return;
-    slot = &surface->handoff_pool->shared->slots[surface->handoff_index];
-    control = __atomic_load_n( &slot->control, __ATOMIC_ACQUIRE );
-    for (;;)
+    for (i = 0; i < CLIENT_SURFACE_SOURCE_FRAME_COUNT; ++i)
     {
-        UINT64 lost = client_surface_handoff_control(
-            client_surface_handoff_generation( control ), CLIENT_SURFACE_HANDOFF_LOST );
+        slot = &surface->handoff_pool->shared->slots[surface->handoff_index + i];
+        control = __atomic_load_n( &slot->control, __ATOMIC_ACQUIRE );
+        for (;;)
+        {
+            UINT64 lost = client_surface_handoff_control(
+                client_surface_handoff_generation( control ), CLIENT_SURFACE_HANDOFF_LOST );
 
-        if (client_surface_handoff_state( control ) == CLIENT_SURFACE_HANDOFF_LOST) break;
-        if (__atomic_compare_exchange_n( &slot->control, &control, lost, 0,
-                                         __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE )) break;
+            if (client_surface_handoff_state( control ) == CLIENT_SURFACE_HANDOFF_LOST) break;
+            if (__atomic_compare_exchange_n( &slot->control, &control, lost, 0,
+                                             __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE )) break;
+        }
+        signal_client_surface_handoff_ready( surface->handoff_pool, surface->handoff_index + i );
     }
-    signal_client_surface_handoff_ready( surface->handoff_pool, surface->handoff_index );
     wake_client_surface_handoff( surface->handoff_pool, 0 );
 }
 
 static void free_client_surface_handoff( struct client_surface_ref *surface )
 {
     struct client_surface_handoff_pool *pool = surface->handoff_pool;
+    unsigned int i;
 
     if (!pool) return;
     assert( !surface->handoff_producer_mapped && !surface->handoff_consumer_mapped );
     mark_client_surface_handoff_lost( surface );
-    __atomic_fetch_and( &pool->shared->ready_bitmap[surface->handoff_index / 64],
-                        ~((UINT64)1 << (surface->handoff_index % 64)), __ATOMIC_ACQ_REL );
-    __atomic_store_n( &pool->shared->slots[surface->handoff_index].endpoints, 0,
-                      __ATOMIC_RELEASE );
-    pool->used[surface->handoff_index] = 0;
+    for (i = 0; i < CLIENT_SURFACE_SOURCE_FRAME_COUNT; ++i)
+    {
+        unsigned int index = surface->handoff_index + i;
+
+        __atomic_fetch_and( &pool->shared->ready_bitmap[index / 64],
+                            ~((UINT64)1 << (index % 64)), __ATOMIC_ACQ_REL );
+        __atomic_store_n( &pool->shared->slots[index].endpoints, 0, __ATOMIC_RELEASE );
+        pool->used[index] = 0;
+    }
     if (surface->handoff_top) release_object( surface->handoff_top );
     surface->handoff_pool = NULL;
     surface->handoff_top = NULL;
@@ -275,6 +316,7 @@ static struct client_surface_handoff_pool *create_client_surface_handoff_pool(
 {
     struct client_surface_handoff_pool *pool, *cursor;
     unsigned int count = 0;
+    int fds[2];
     void *ptr;
 
     if (client_surface_handoff_serial == ~(UINT64)0)
@@ -291,9 +333,52 @@ static struct client_surface_handoff_pool *create_client_surface_handoff_pool(
             return NULL;
         }
     if (!(pool = mem_alloc( sizeof(*pool) ))) return NULL;
+#ifdef __linux__
+    fds[0] = eventfd( 0, EFD_CLOEXEC | EFD_NONBLOCK );
+    fds[1] = fds[0] < 0 ? -1 : fcntl( fds[0], F_DUPFD_CLOEXEC, 0 );
+#else
+    if (socketpair( AF_UNIX, SOCK_DGRAM, 0, fds )) fds[0] = fds[1] = -1;
+    if (fds[0] >= 0)
+    {
+        if (fcntl( fds[0], F_SETFD, FD_CLOEXEC ) < 0 ||
+            fcntl( fds[1], F_SETFD, FD_CLOEXEC ) < 0 ||
+            fcntl( fds[0], F_SETFL, O_NONBLOCK ) < 0 ||
+            fcntl( fds[1], F_SETFL, O_NONBLOCK ) < 0)
+        {
+            int saved_errno = errno;
+
+            close( fds[0] );
+            close( fds[1] );
+            fds[0] = fds[1] = -1;
+            errno = saved_errno;
+        }
+    }
+#endif
+    if (fds[0] < 0 || fds[1] < 0)
+    {
+        file_set_error();
+        if (fds[0] >= 0) close( fds[0] );
+        free( pool );
+        return NULL;
+    }
+    pool->ready_fd = fds[1];
+    if (!(pool->ready_read = create_file_for_fd( fds[0], FILE_GENERIC_READ, FILE_SHARE_READ )))
+    {
+        close( fds[1] );
+        free( pool );
+        return NULL;
+    }
+    if (!(pool->ready_write = create_file_for_fd( fds[1], FILE_GENERIC_WRITE, FILE_SHARE_WRITE )))
+    {
+        release_object( pool->ready_read );
+        free( pool );
+        return NULL;
+    }
     if (!(pool->mapping = create_shared_data_mapping(
               sizeof(struct client_surface_handoff_shared), &ptr )))
     {
+        release_object( pool->ready_write );
+        release_object( pool->ready_read );
         free( pool );
         return NULL;
     }
@@ -394,7 +479,7 @@ static int alloc_client_surface_handoff( struct client_surface_ref *surface,
     struct client_surface_handoff_pool *pool;
     struct client_surface_handoff_slot *slot;
     struct process *consumer;
-    unsigned int i;
+    unsigned int i, j;
 
     if (!top->thread || !(consumer = top->thread->process))
     {
@@ -410,31 +495,34 @@ static int alloc_client_surface_handoff( struct client_surface_ref *surface,
                          struct client_surface_handoff_pool, entry )
     {
         if (pool->producer != surface->process || pool->consumer != consumer) continue;
-        for (i = 0; i < CLIENT_SURFACE_HANDOFF_SLOTS; ++i)
+        for (i = 0; i < CLIENT_SURFACE_HANDOFF_SLOTS; i += CLIENT_SURFACE_SOURCE_FRAME_COUNT)
             if (!pool->used[i]) goto found;
     }
     if (!(pool = create_client_surface_handoff_pool( surface->process, consumer ))) return 0;
     i = 0;
 found:
-    pool->used[i] = 1;
-    __atomic_fetch_and( &pool->shared->ready_bitmap[i / 64],
-                        ~((UINT64)1 << (i % 64)), __ATOMIC_ACQ_REL );
     surface->handoff_pool = pool;
     surface->handoff_top = (struct window *)grab_object( top );
     surface->handoff_index = i;
     surface->handoff_cookie = ++client_surface_handoff_serial;
     surface->handoff_producer_mapped = 0;
     surface->handoff_consumer_mapped = 0;
-    slot = &pool->shared->slots[i];
-    memset( slot, 0, sizeof(*slot) );
-    slot->cookie = surface->handoff_cookie;
-    slot->identity = surface->id;
-    slot->producer_process = surface->process->id;
-    slot->window = win->handle;
-    slot->toplevel = top->handle;
-    __atomic_store_n( &slot->control,
-                      client_surface_handoff_control( 1, CLIENT_SURFACE_HANDOFF_FREE ),
-                      __ATOMIC_RELEASE );
+    for (j = 0; j < CLIENT_SURFACE_SOURCE_FRAME_COUNT; ++j)
+    {
+        pool->used[i + j] = 1;
+        __atomic_fetch_and( &pool->shared->ready_bitmap[(i + j) / 64],
+                            ~((UINT64)1 << ((i + j) % 64)), __ATOMIC_ACQ_REL );
+        slot = &pool->shared->slots[i + j];
+        memset( slot, 0, sizeof(*slot) );
+        slot->cookie = surface->handoff_cookie;
+        slot->identity = surface->id;
+        slot->producer_process = surface->process->id;
+        slot->window = win->handle;
+        slot->toplevel = top->handle;
+        __atomic_store_n( &slot->control,
+                          client_surface_handoff_control( 1, CLIENT_SURFACE_HANDOFF_FREE ),
+                          __ATOMIC_RELEASE );
+    }
     return 1;
 }
 
@@ -1718,6 +1806,18 @@ static int mark_client_surface_generation_ready( struct window *top )
     return 1;
 }
 
+static void fail_client_surface_publication( struct window *top )
+{
+    clear_client_surface_subtree_generation( top, client_surface_transaction_generation( top ) );
+    finish_client_surface_generation( top );
+    top->client_surface_transaction.prepared = 0;
+    /* Keep staging and the last complete output. A failed copy, skipped
+     * Present, or elapsed deadline proves neither a complete scene nor its
+     * publication. A new epoch lets subsequent geometry/renderer activity
+     * rebuild the scene; late ACKs cannot expose the rejected output. */
+    invalidate_client_surface_scene( top );
+}
+
 static void client_surface_publication_timeout( void *private )
 {
     struct window *top = private;
@@ -1727,6 +1827,11 @@ static void client_surface_publication_timeout( void *private )
                  top->client_surface_transaction.epoch != top->client_surface_scene_generation;
 
     top->client_surface_transaction.timeout = NULL;
+    if (top->handle && client_surface_scene_published( top ))
+    {
+        fail_client_surface_publication( top );
+        return;
+    }
     if (client_surface_is_preparing( top ))
     {
         if (!top->handle) return;
@@ -2034,6 +2139,8 @@ void cleanup_process_client_surfaces( struct process *process )
         if (handoff_pool->producer != process && handoff_pool->consumer != process) continue;
         list_remove( &handoff_pool->entry );
         release_shared_data_mapping( handoff_pool->mapping, handoff_pool->shared );
+        release_object( handoff_pool->ready_write );
+        release_object( handoff_pool->ready_read );
         free( handoff_pool );
     }
 }
@@ -2085,6 +2192,7 @@ DECL_HANDLER(get_client_surface_handoff)
     struct client_surface_handoff_slot *slot;
     struct window *top, *win;
     int producer_view = !req->owner;
+    unsigned int i;
 
     reply->mapping = 0;
     reply->size = reply->offset = 0;
@@ -2093,8 +2201,12 @@ DECL_HANDLER(get_client_surface_handoff)
     top = get_toplevel_window( win );
     if (!(surface = get_client_surface_handoff_ref( win, req->producer, req->surface,
                                                     req->owner ))) return;
-    if (surface->handoff_pool && surface->handoff_top != top)
+    if (surface->handoff_pool &&
+        (surface->handoff_top != top || is_client_surface_handoff_lost( surface )))
     {
+        /* Do not reacquire an endpoint of a failed binding while its peer
+         * is retiring it. Otherwise both sides can repeatedly remap the
+         * same LOST cookie and prevent its final release forever. */
         retire_client_surface_handoff( surface );
         if (surface->handoff_producer_mapped || surface->handoff_consumer_mapped)
         {
@@ -2109,14 +2221,34 @@ DECL_HANDLER(get_client_surface_handoff)
     if (producer_view) surface->handoff_producer_mapped = 1;
     else surface->handoff_consumer_mapped = 1;
     slot = &surface->handoff_pool->shared->slots[surface->handoff_index];
-    __atomic_fetch_or( &slot->endpoints,
-                       producer_view ? CLIENT_SURFACE_HANDOFF_ENDPOINT_PRODUCER :
-                                       CLIENT_SURFACE_HANDOFF_ENDPOINT_CONSUMER,
-                       __ATOMIC_RELEASE );
+    for (i = 0; i < CLIENT_SURFACE_SOURCE_FRAME_COUNT; ++i)
+        __atomic_fetch_or( &slot[i].endpoints,
+                           producer_view ? CLIENT_SURFACE_HANDOFF_ENDPOINT_PRODUCER :
+                                           CLIENT_SURFACE_HANDOFF_ENDPOINT_CONSUMER,
+                           __ATOMIC_RELEASE );
     reply->mapping_id = surface->handoff_pool->id;
     reply->size = sizeof(*surface->handoff_pool->shared);
     reply->offset = (char *)slot - (char *)surface->handoff_pool->shared;
     reply->cookie = surface->handoff_cookie;
+}
+
+DECL_HANDLER(get_client_surface_handoff_event)
+{
+    struct client_surface_ref *surface;
+    struct window *win;
+
+    if (!(win = get_window( req->handle ))) return;
+    if (!(surface = get_client_surface_handoff_ref( win, req->producer, req->surface,
+                                                    req->owner ))) return;
+    if (!surface->handoff_pool || surface->handoff_cookie != req->cookie ||
+        surface->handoff_top != get_toplevel_window( win ))
+    {
+        set_error( STATUS_INVALID_HANDLE );
+        return;
+    }
+    reply->event = alloc_handle( current->process,
+        req->owner ? surface->handoff_pool->ready_read : surface->handoff_pool->ready_write,
+        req->owner ? FILE_GENERIC_READ : FILE_GENERIC_WRITE, 0 );
 }
 
 DECL_HANDLER(release_client_surface_handoff)
@@ -2124,6 +2256,7 @@ DECL_HANDLER(release_client_surface_handoff)
     struct client_surface_ref *surface;
     struct client_surface_handoff_slot *slot;
     user_handle_t refresh = 0;
+    unsigned int i;
     int producer_view = !req->owner;
 
     if (producer_view && req->producer && req->producer != current->process->id)
@@ -2162,14 +2295,14 @@ DECL_HANDLER(release_client_surface_handoff)
     slot = &surface->handoff_pool->shared->slots[surface->handoff_index];
     if (producer_view) surface->handoff_producer_mapped = 0;
     else surface->handoff_consumer_mapped = 0;
-    __atomic_fetch_and( &slot->endpoints,
-                        ~(LONG)(producer_view ? CLIENT_SURFACE_HANDOFF_ENDPOINT_PRODUCER :
-                                                CLIENT_SURFACE_HANDOFF_ENDPOINT_CONSUMER),
-                        __ATOMIC_RELEASE );
+    for (i = 0; i < CLIENT_SURFACE_SOURCE_FRAME_COUNT; ++i)
+        __atomic_fetch_and( &slot[i].endpoints,
+                            ~(LONG)(producer_view ? CLIENT_SURFACE_HANDOFF_ENDPOINT_PRODUCER :
+                                                    CLIENT_SURFACE_HANDOFF_ENDPOINT_CONSUMER),
+                            __ATOMIC_RELEASE );
     if (!surface->handoff_producer_mapped && !surface->handoff_consumer_mapped &&
         ((!surface->active && !surface->cached) ||
-         client_surface_handoff_state( __atomic_load_n( &slot->control, __ATOMIC_ACQUIRE ) ) ==
-             CLIENT_SURFACE_HANDOFF_LOST))
+         is_client_surface_handoff_lost( surface )))
     {
         if ((surface->active || surface->cached) && surface->handoff_top)
             refresh = surface->handoff_top->handle;
@@ -2184,33 +2317,41 @@ DECL_HANDLER(release_client_surface_handoff)
 static int validate_client_surface_handoff_generation( struct window *win, struct window *top,
                                                        unsigned long long generation,
                                                        unsigned long long scene_generation,
+                                                       const struct client_surface_handoff_receipt *receipts,
+                                                       unsigned int receipt_count,
                                                        unsigned int *count )
 {
     struct client_surface_owner *owner;
     struct client_surface_ref *surface;
-    struct client_surface_handoff_slot *slot;
     struct window *child;
-    unsigned long long control;
 
     if (!win->client_surface_subtree_count || !is_visible( win )) return 1;
     if ((surface = select_client_surface_producer( win, &owner )))
     {
+        const struct client_surface_handoff_receipt *receipt;
+        unsigned int low = 0, high = receipt_count;
+
         if (surface->generation != generation || !surface->handoff_pool ||
             surface->handoff_top != top || surface->handoff_pool->consumer != current->process)
             return 0;
-        slot = &surface->handoff_pool->shared->slots[surface->handoff_index];
-        control = __atomic_load_n( &slot->control, __ATOMIC_ACQUIRE );
-        if (slot->cookie != surface->handoff_cookie || slot->identity != surface->id ||
-            slot->producer_process != owner->process->id || slot->window != win->handle ||
-            slot->toplevel != top->handle || slot->scene_generation != generation ||
-            slot->scene_epoch != scene_generation ||
-            client_surface_handoff_state( control ) != CLIENT_SURFACE_HANDOFF_READING)
+        while (low < high)
+        {
+            unsigned int mid = low + (high - low) / 2;
+
+            if (receipts[mid].handle < win->handle) low = mid + 1;
+            else high = mid;
+        }
+        if (low == receipt_count) return 0;
+        receipt = &receipts[low];
+        if (receipt->handle != win->handle || receipt->process != owner->process->id ||
+            receipt->surface != surface->id || receipt->cookie != surface->handoff_cookie ||
+            !receipt->source_generation || receipt->buffer_index >= CLIENT_SURFACE_SOURCE_FRAME_COUNT)
             return 0;
         (*count)++;
     }
     LIST_FOR_EACH_ENTRY( child, &win->children, struct window, entry )
         if (!validate_client_surface_handoff_generation( child, top, generation,
-                                                         scene_generation, count ))
+                                                         scene_generation, receipts, receipt_count, count ))
             return 0;
     return 1;
 }
@@ -2218,7 +2359,8 @@ static int validate_client_surface_handoff_generation( struct window *win, struc
 DECL_HANDLER(complete_client_surface_handoffs)
 {
     struct window *top, *win;
-    unsigned int count = 0, cleared;
+    const struct client_surface_handoff_receipt *receipts = get_req_data();
+    unsigned int count = 0, cleared, i, receipt_count = get_req_data_size() / sizeof(*receipts);
 
     reply->accepted = 0;
     if (!(win = get_window( req->handle ))) return;
@@ -2228,13 +2370,25 @@ DECL_HANDLER(complete_client_surface_handoffs)
         set_error( STATUS_ACCESS_DENIED );
         return;
     }
+    if (get_req_data_size() % sizeof(*receipts))
+    {
+        set_error( STATUS_INVALID_PARAMETER );
+        return;
+    }
+    for (i = 1; i < receipt_count; ++i)
+        if (receipts[i - 1].handle >= receipts[i].handle)
+        {
+            set_error( STATUS_INVALID_PARAMETER );
+            return;
+        }
     if (!client_surface_is_composing( top ) || client_surface_is_publishing( top ) ||
         req->generation != client_surface_transaction_generation( top ) ||
         req->scene_generation != top->client_surface_scene_generation ||
         req->scene_generation != top->client_surface_transaction.epoch ||
         !top->client_surface_transaction.pending ||
+        receipt_count != top->client_surface_transaction.pending ||
         !validate_client_surface_handoff_generation( top, top, req->generation,
-                                                     req->scene_generation, &count ) ||
+                                                     req->scene_generation, receipts, receipt_count, &count ) ||
         count != top->client_surface_transaction.pending)
         return;
 
@@ -2246,6 +2400,27 @@ DECL_HANDLER(complete_client_surface_handoffs)
     top->client_surface_transaction.phase = CLIENT_SURFACE_PHASE_PUBLISHING;
     update_client_surface_publication( top );
     reply->accepted = 1;
+}
+
+DECL_HANDLER(cancel_client_surface_handoffs)
+{
+    struct window *top, *win = get_window( req->handle );
+
+    if (!win) return;
+    top = get_toplevel_window( win );
+    if (!top->thread || top->thread->process != current->process)
+    {
+        set_error( STATUS_ACCESS_DENIED );
+        return;
+    }
+    if (top->client_surface_transaction.phase != CLIENT_SURFACE_PHASE_COMPOSING ||
+        req->generation != client_surface_transaction_generation( top ) ||
+        req->scene_generation != top->client_surface_scene_generation) return;
+    /* Released producer images need a new replay request if their receipts
+     * are discarded. Never turn a partial output into a completed scene just
+     * because its private assembly was cancelled. */
+    begin_client_surface_scene_change( top );
+    end_client_surface_scene_change( top );
 }
 
 DECL_HANDLER(publish_client_surface_handoff)
@@ -2268,8 +2443,13 @@ DECL_HANDLER(publish_client_surface_handoff)
 
     invalidated = top->client_surface_transaction.epoch != top->client_surface_scene_generation;
     reply->accepted = 1;
+    if (!req->success)
+    {
+        fail_client_surface_publication( top );
+        return;
+    }
     finish_client_surface_publication( top );
-    if ((!req->success || invalidated) && is_visible( top ) && has_client_surface( top ))
+    if (invalidated && is_visible( top ) && has_client_surface( top ))
         restart_client_surface_generation( top );
 }
 
@@ -4732,6 +4912,14 @@ DECL_HANDLER(set_client_surface_state)
     if (!(win = get_window( req->handle ))) return;
     top = get_toplevel_window( win );
     was_pending = top->client_surface_dirty;
+    if (req->flags & CLIENT_SURFACE_STATE_FAILED)
+    {
+        if (req->flags != CLIENT_SURFACE_STATE_FAILED || !top->thread ||
+            top->thread->process != current->process)
+            set_error( STATUS_ACCESS_DENIED );
+        else fail_client_surface_publication( top );
+        return;
+    }
     if (req->flags & (CLIENT_SURFACE_STATE_NATIVE_BARRIER_BEGIN |
                       CLIENT_SURFACE_STATE_NATIVE_BARRIER_END))
     {
