@@ -863,6 +863,7 @@ static void finish_client_surface_compositor_assembly(
          * regions of its private frame.  Remove it from the damage lineage so
          * its next use starts with a full copy of the last complete frame. */
         assert( frame->pixmap != target->latest );
+        assert( frame->pixmap != target->published );
         frame->revision = 0;
         TRACE( "aborted owner assembly generation %s epoch %s pixmap %#lx\n",
                wine_dbgstr_longlong( target->assembly_generation ),
@@ -885,7 +886,10 @@ static struct client_surface_compositor_frame *acquire_client_surface_compositor
         unsigned int index = (target->next_frame + i) % ARRAY_SIZE(target->frames);
         struct client_surface_compositor_frame *frame = &target->frames[index];
 
-        if (frame->serial || frame->pixmap == target->latest ||
+        /* A GUI snapshot may have advanced latest while published still
+         * names the previous visible image. Keep both checkpoints intact
+         * until the new assembly has completed and become visible. */
+        if (frame->serial || frame->pixmap == target->latest || frame->pixmap == target->published ||
             (target->mailbox_pending && index == target->mailbox_frame))
             continue;
         target->next_frame = (index + 1) % ARRAY_SIZE(target->frames);
