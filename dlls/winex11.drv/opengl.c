@@ -509,11 +509,10 @@ static BOOL x11drv_egl_describe_pixel_format( int format, struct wgl_pixel_forma
 
     if (!p_egl_describe_pixel_format( format, pf )) return FALSE;
     if (!visual_from_pixel_format( format, &visual ) ||
-        (visual.depth != default_visual.depth &&
+        (visual.depth != default_visual.depth && !usexcomposite &&
          !X11DRV_XRender_ClientSurfaceAvailable( FALSE )))
     {
-        /* A compositor without XRender still requires XCopyArea-compatible
-         * source and destination depths. */
+        /* Only the legacy path lacks owner-side software conversion. */
         pf->pfd.dwFlags &= ~PFD_DRAW_TO_WINDOW;
     }
 
@@ -811,9 +810,9 @@ static UINT x11drv_init_pixel_formats( UINT *onscreen_count )
              * The second run we only set offscreen formats. */
             if(!run && visinfo)
             {
-                /* Without XRender, child composition still falls back to
-                 * XCopyArea and therefore requires matching depths. */
-                if (visinfo->depth != default_visual.depth &&
+                /* Only the legacy path requires XCopyArea-compatible depths
+                 * when XRender is unavailable. */
+                if (visinfo->depth != default_visual.depth && !usexcomposite &&
                     !X11DRV_XRender_ClientSurfaceAvailable( FALSE ))
                 {
                     XFree(visinfo);

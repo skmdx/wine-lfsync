@@ -486,7 +486,7 @@ BOOL X11DRV_XRender_CopyClientSurface( Display *display, Drawable source,
                                        const RECT *destination_rect,
                                        const XRectangle *clips,
                                        unsigned int clip_count,
-                                       XID clip_region )
+                                       XID clip_region, Pixmap clip_mask )
 {
     unsigned int destination_width, destination_height;
     BOOL scaling;
@@ -495,11 +495,14 @@ BOOL X11DRV_XRender_CopyClientSurface( Display *display, Drawable source,
     XVisualInfo destination_template = {.visualid = destination_visual_id};
     XVisualInfo *source_visual = NULL, *destination_visual = NULL;
     Picture source_picture = 0, destination_picture = 0;
+    XRenderPictureAttributes attributes = {0};
+    unsigned long attribute_mask = 0;
     int count;
     BOOL ret = FALSE;
 
     if (!destination_rect || !source_visual_id || !destination_visual_id ||
-        (clip_count && !clips) || (clip_count && clip_region) ||
+        (clip_count && !clips) || (clip_count && (clip_region || clip_mask)) ||
+        (clip_region && clip_mask) ||
         destination_rect->right <= destination_rect->left ||
         destination_rect->bottom <= destination_rect->top)
         return FALSE;
@@ -518,9 +521,16 @@ BOOL X11DRV_XRender_CopyClientSurface( Display *display, Drawable source,
     if (!(source_format = pXRenderFindVisualFormat( display, source_visual->visual )) ||
         !(destination_format = pXRenderFindVisualFormat( display, destination_visual->visual )))
         goto done;
+    if (clip_mask)
+    {
+        attributes.clip_x_origin = destination_rect->left;
+        attributes.clip_y_origin = destination_rect->top;
+        attributes.clip_mask = clip_mask;
+        attribute_mask = CPClipXOrigin | CPClipYOrigin | CPClipMask;
+    }
     if (!(source_picture = pXRenderCreatePicture( display, source, source_format, 0, NULL )) ||
         !(destination_picture = pXRenderCreatePicture( display, destination,
-                                                       destination_format, 0, NULL )))
+                                                       destination_format, attribute_mask, &attributes )))
         goto done;
     if (clip_region)
     {
@@ -2370,7 +2380,7 @@ BOOL X11DRV_XRender_CopyClientSurface( Display *display, Drawable source,
                                        const RECT *destination_rect,
                                        const XRectangle *clips,
                                        unsigned int clip_count,
-                                       XID clip_region )
+                                       XID clip_region, Pixmap clip_mask )
 {
     return FALSE;
 }

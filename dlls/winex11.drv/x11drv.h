@@ -299,7 +299,7 @@ extern BOOL X11DRV_XRender_CopyClientSurface( Display *display, Drawable source,
                                               const RECT *destination_rect,
                                               const XRectangle *clips,
                                               unsigned int clip_count,
-                                              XID clip_region );
+                                              XID clip_region, Pixmap clip_mask );
 extern BOOL X11DRV_XFixes_ClientSurfaceAvailable(void);
 extern BOOL X11DRV_XFixes_UpdateClientSurfaceRegion( Display *display, XID *region,
                                                      const XRectangle *rects,

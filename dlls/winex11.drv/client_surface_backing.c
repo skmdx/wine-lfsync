@@ -1253,6 +1253,88 @@ static BOOL get_client_surface_compositor_catchup(
     return TRUE;
 }
 
+static unsigned long convert_client_surface_component( unsigned long pixel,
+                                                        unsigned long source_mask,
+                                                        unsigned long destination_mask )
+{
+    unsigned int source_shift = 0, destination_shift = 0;
+    UINT64 value, source_max, destination_max;
+
+    if (!destination_mask) return 0;
+    if (!source_mask) return destination_mask;
+    while (!(source_mask & (1ul << source_shift))) ++source_shift;
+    while (!(destination_mask & (1ul << destination_shift))) ++destination_shift;
+    source_max = source_mask >> source_shift;
+    destination_max = destination_mask >> destination_shift;
+    value = (pixel & source_mask) >> source_shift;
+    return ((value * destination_max + source_max / 2) / source_max) << destination_shift;
+}
+
+static BOOL copy_client_surface_image( Display *display, Pixmap source, Pixmap destination,
+                                       GC gc, VisualID source_id, VisualID destination_id,
+                                       unsigned int source_width, unsigned int source_height,
+                                       const RECT *rect )
+{
+    XVisualInfo source_template = {.visualid = source_id};
+    XVisualInfo destination_template = {.visualid = destination_id};
+    XVisualInfo *source_visual = NULL, *destination_visual = NULL;
+    XImage *input = NULL, *output = NULL;
+    unsigned int width = rect->right - rect->left, height = rect->bottom - rect->top;
+    unsigned int x, y, source_y;
+    unsigned long source_alpha, destination_alpha;
+    int count;
+    BOOL ret = FALSE;
+
+    /* Keep the exceptional conversion path on the owner connection too.
+     * The caller holds READING until its final XSync, covering both readback
+     * and upload. The destination GC carries the exact scene clip. */
+    if (!(source_visual = XGetVisualInfo( display, VisualIDMask, &source_template, &count )) ||
+        !count || (source_visual->class != TrueColor && source_visual->class != DirectColor))
+        goto done;
+    if (!(destination_visual = XGetVisualInfo( display, VisualIDMask, &destination_template, &count )) ||
+        !count || (destination_visual->class != TrueColor && destination_visual->class != DirectColor))
+        goto done;
+    if (!(input = XGetImage( display, source, 0, 0, source_width, source_height,
+                             AllPlanes, ZPixmap )))
+        goto done;
+    if (!(output = XCreateImage( display, destination_visual->visual, destination_visual->depth,
+                                ZPixmap, 0, NULL, width, height, 32, 0 )))
+        goto done;
+    if (output->bytes_per_line <= 0 || height > ~(SIZE_T)0 / output->bytes_per_line ||
+        !(output->data = calloc( height, output->bytes_per_line )))
+        goto done;
+    source_alpha = ((1ull << source_visual->depth) - 1) &
+                   ~(source_visual->red_mask | source_visual->green_mask | source_visual->blue_mask);
+    destination_alpha = ((1ull << destination_visual->depth) - 1) &
+                        ~(destination_visual->red_mask | destination_visual->green_mask |
+                          destination_visual->blue_mask);
+    for (y = 0; y < height; ++y)
+    {
+        source_y = (UINT64)y * source_height / height;
+        for (x = 0; x < width; ++x)
+        {
+            unsigned long pixel = XGetPixel( input, (UINT64)x * source_width / width, source_y );
+            unsigned long converted =
+                convert_client_surface_component( pixel, source_visual->red_mask, destination_visual->red_mask ) |
+                convert_client_surface_component( pixel, source_visual->green_mask, destination_visual->green_mask ) |
+                convert_client_surface_component( pixel, source_visual->blue_mask, destination_visual->blue_mask ) |
+                convert_client_surface_component( pixel, source_alpha, destination_alpha );
+
+            XPutPixel( output, x, y, converted );
+        }
+    }
+    XPutImage( display, destination, gc, output, 0, 0, rect->left, rect->top, width, height );
+    TRACE( "software owner copy %ux%u to %ux%u visual %#lx -> %#lx\n",
+           source_width, source_height, width, height, source_id, destination_id );
+    ret = TRUE;
+done:
+    if (output) XDestroyImage( output );
+    if (input) XDestroyImage( input );
+    if (destination_visual) XFree( destination_visual );
+    if (source_visual) XFree( source_visual );
+    return ret;
+}
+
 static BOOL copy_client_surface_handoff_to_frame(
     struct client_surface_compositor_target *target,
     struct client_surface_compositor_frame *frame, Pixmap source, unsigned int source_depth,
@@ -1263,7 +1345,8 @@ static BOOL copy_client_surface_handoff_to_frame(
     RECT catchup = {0};
     BOOL clipped = !!(slot->flags & CLIENT_SURFACE_HANDOFF_CLIPPED);
     BOOL xfixes_clip = !!(slot->flags & CLIENT_SURFACE_HANDOFF_XFIXES_CLIP);
-    BOOL copy_visible = !clipped || xfixes_clip || slot->clip_count;
+    BOOL pixmap_clip = !!(slot->flags & CLIENT_SURFACE_HANDOFF_PIXMAP_CLIP);
+    BOOL copy_visible = !clipped || xfixes_clip || pixmap_clip || slot->clip_count;
     BOOL incoming_full, needs_catchup, native, overlay_copied = TRUE;
     unsigned int destination_width = slot->destination.right - slot->destination.left;
     unsigned int destination_height = slot->destination.bottom - slot->destination.top;
@@ -1281,7 +1364,7 @@ static BOOL copy_client_surface_handoff_to_frame(
     native = source_depth == target->depth && slot->source_visual == target->visual &&
              slot->width == destination_width && slot->height == destination_height;
 
-    if (clipped && !xfixes_clip)
+    if (clipped && !xfixes_clip && !pixmap_clip)
         for (i = 0; i < slot->clip_count; ++i)
         {
             clips[i].x = slot->clips[i].x;
@@ -1299,29 +1382,40 @@ static BOOL copy_client_surface_handoff_to_frame(
                        catchup.left, catchup.top,
                        catchup.right - catchup.left, catchup.bottom - catchup.top,
                        catchup.left, catchup.top );
-        if (copy_visible && native)
+        if (copy_visible)
         {
             if (xfixes_clip)
                 overlay_copied = X11DRV_XFixes_SetClientSurfaceGCClip(
                     display, gc, slot->destination.left,
                     slot->destination.top, slot->clip_region );
+            else if (pixmap_clip)
+            {
+                XSetClipOrigin( display, gc, slot->destination.left, slot->destination.top );
+                XSetClipMask( display, gc, slot->clip_region );
+            }
             else if (clipped)
                 XSetClipRectangles( display, gc, slot->destination.left,
                                     slot->destination.top, clips, slot->clip_count, YXBanded );
-            if (overlay_copied)
+            if (overlay_copied && native)
                 XCopyArea( display, source, frame->pixmap, gc,
                            slot->damage.left, slot->damage.top,
                            slot->damage.right - slot->damage.left,
                            slot->damage.bottom - slot->damage.top,
                            slot->destination.left, slot->destination.top );
+            else if (overlay_copied)
+            {
+                overlay_copied = X11DRV_XRender_CopyClientSurface(
+                    display, source, slot->source_visual, frame->pixmap, target->visual,
+                    slot->width, slot->height, &slot->destination,
+                    clipped && !xfixes_clip && !pixmap_clip ? clips : NULL,
+                    clipped && !xfixes_clip && !pixmap_clip ? slot->clip_count : 0,
+                    xfixes_clip ? slot->clip_region : 0, pixmap_clip ? slot->clip_region : 0 );
+                if (!overlay_copied)
+                    overlay_copied = copy_client_surface_image(
+                        display, source, frame->pixmap, gc, slot->source_visual, target->visual,
+                        slot->width, slot->height, &slot->destination );
+            }
         }
-        else if (copy_visible)
-            overlay_copied = X11DRV_XRender_CopyClientSurface(
-                display, source, slot->source_visual, frame->pixmap, target->visual,
-                slot->width, slot->height, &slot->destination,
-                clipped && !xfixes_clip ? clips : NULL,
-                clipped && !xfixes_clip ? slot->clip_count : 0,
-                xfixes_clip ? slot->clip_region : 0 );
         XFreeGC( display, gc );
     }
     XSync( display, False );
@@ -1473,7 +1567,7 @@ static BOOL compose_client_surface_handoff(
     Pixmap source = 0;
     RECT damage;
     unsigned int destination_width, destination_height, i, source_depth = 0;
-    BOOL xfixes_clip;
+    BOOL xfixes_clip, pixmap_clip;
     BOOL composed = FALSE, copied = FALSE, dropped = FALSE;
 
     if (!__atomic_compare_exchange_n( &slot->control, &expected,
@@ -1503,6 +1597,7 @@ static BOOL compose_client_surface_handoff(
     destination_height = slot->destination.bottom > slot->destination.top ?
                          slot->destination.bottom - slot->destination.top : 0;
     xfixes_clip = !!(slot->flags & CLIENT_SURFACE_HANDOFF_XFIXES_CLIP);
+    pixmap_clip = !!(slot->flags & CLIENT_SURFACE_HANDOFF_PIXMAP_CLIP);
     if (slot->cookie == binding->cookie && slot->identity == binding->identity &&
         slot->producer_process == binding->process &&
         slot->window == wine_server_user_handle( binding->window ) &&
@@ -1523,13 +1618,13 @@ static BOOL compose_client_surface_handoff(
         (unsigned int)slot->damage.bottom == slot->height &&
         slot->clip_count <= CLIENT_SURFACE_HANDOFF_MAX_CLIP_RECTS &&
         (!!(slot->flags & CLIENT_SURFACE_HANDOFF_CLIPPED) || !slot->clip_count) &&
-        ((!xfixes_clip && !slot->clip_region) ||
-         (xfixes_clip && (slot->flags & CLIENT_SURFACE_HANDOFF_CLIPPED) &&
+        ((!xfixes_clip && !pixmap_clip && !slot->clip_region) ||
+         (xfixes_clip != pixmap_clip && (slot->flags & CLIENT_SURFACE_HANDOFF_CLIPPED) &&
           !slot->clip_count && slot->clip_region &&
-          X11DRV_XFixes_ClientSurfaceAvailable())))
+          (pixmap_clip || X11DRV_XFixes_ClientSurfaceAvailable()))))
     {
         damage = slot->destination;
-        if ((slot->flags & CLIENT_SURFACE_HANDOFF_CLIPPED) && !xfixes_clip)
+        if ((slot->flags & CLIENT_SURFACE_HANDOFF_CLIPPED) && !xfixes_clip && !pixmap_clip)
         {
             SetRectEmpty( &damage );
             for (i = 0; i < slot->clip_count; ++i)

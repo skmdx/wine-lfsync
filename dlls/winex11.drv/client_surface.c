@@ -109,6 +109,7 @@ static void x11drv_client_surface_destroy( struct client_surface *client )
 
     x11drv_client_surface_completion_destroy( surface );
     X11DRV_XFixes_DestroyClientSurfaceRegion( gdi_display, surface->handoff_clip_region );
+    if (surface->handoff_clip_mask) XFreePixmap( gdi_display, surface->handoff_clip_mask );
     if (surface->composition_gc) XFreeGC( gdi_display, surface->composition_gc );
     if (surface->colormap != default_colormap) XFreeColormap( gdi_display, surface->colormap );
     if (surface->window) destroy_client_window( hwnd, surface->window );
@@ -180,6 +181,7 @@ static BOOL client_surface_update_offscreen( HWND hwnd, struct x11drv_client_sur
                                              struct client_surface_target *target )
 {
     BOOL offscreen, old_offscreen;
+    BOOL owner_compositor = surface->client.backend->caps & CLIENT_SURFACE_BACKEND_OWNER_COMPOSITOR;
     struct x11drv_win_data *data;
 
     /* Visibility and topology are server scene state.  In particular, the
@@ -207,7 +209,8 @@ static BOOL client_surface_update_offscreen( HWND hwnd, struct x11drv_client_sur
             attach_client_window( data, surface->window );
             release_win_data( data );
         }
-        return !offscreen || (surface->hdc_src && surface->hdc_dst && surface->hdc_backing);
+        return !offscreen || owner_compositor ||
+               (surface->hdc_src && surface->hdc_dst && surface->hdc_backing);
     }
     else
     {
@@ -239,29 +242,32 @@ static BOOL client_surface_update_offscreen( HWND hwnd, struct x11drv_client_sur
     }
     else
     {
-        static const WCHAR displayW[] = {'D','I','S','P','L','A','Y', 0};
-        UNICODE_STRING device_str = RTL_CONSTANT_STRING(displayW);
-        RECT rect = target->virtual_rect;
-        HDC hdc_dst, hdc_src, hdc_backing;
-
-        OffsetRect( &rect, -rect.left, -rect.top );
-        hdc_dst = NtGdiOpenDCW( &device_str, NULL, NULL, 0, TRUE, NULL, NULL, NULL );
-        hdc_src = NtGdiOpenDCW( &device_str, NULL, NULL, 0, TRUE, NULL, NULL, NULL );
-        hdc_backing = NtGdiOpenDCW( &device_str, NULL, NULL, 0, TRUE, NULL, NULL, NULL );
-
-        if (!hdc_dst || !hdc_src || !hdc_backing)
+        if (!owner_compositor)
         {
-            if (hdc_backing) NtGdiDeleteObjectApp( hdc_backing );
-            if (hdc_dst) NtGdiDeleteObjectApp( hdc_dst );
-            if (hdc_src) NtGdiDeleteObjectApp( hdc_src );
-            WARN( "failed to allocate offscreen composition DCs for %s\n",
-                  debugstr_client_surface( &surface->client ) );
-            return FALSE;
+            static const WCHAR displayW[] = {'D','I','S','P','L','A','Y', 0};
+            UNICODE_STRING device_str = RTL_CONSTANT_STRING(displayW);
+            RECT rect = target->virtual_rect;
+            HDC hdc_dst, hdc_src, hdc_backing;
+
+            OffsetRect( &rect, -rect.left, -rect.top );
+            hdc_dst = NtGdiOpenDCW( &device_str, NULL, NULL, 0, TRUE, NULL, NULL, NULL );
+            hdc_src = NtGdiOpenDCW( &device_str, NULL, NULL, 0, TRUE, NULL, NULL, NULL );
+            hdc_backing = NtGdiOpenDCW( &device_str, NULL, NULL, 0, TRUE, NULL, NULL, NULL );
+
+            if (!hdc_dst || !hdc_src || !hdc_backing)
+            {
+                if (hdc_backing) NtGdiDeleteObjectApp( hdc_backing );
+                if (hdc_dst) NtGdiDeleteObjectApp( hdc_dst );
+                if (hdc_src) NtGdiDeleteObjectApp( hdc_src );
+                WARN( "failed to allocate offscreen composition DCs for %s\n",
+                      debugstr_client_surface( &surface->client ) );
+                return FALSE;
+            }
+            surface->hdc_dst = hdc_dst;
+            surface->hdc_src = hdc_src;
+            surface->hdc_backing = hdc_backing;
+            set_dc_drawable( surface->hdc_src, surface->window, &rect, IncludeInferiors );
         }
-        surface->hdc_dst = hdc_dst;
-        surface->hdc_src = hdc_src;
-        surface->hdc_backing = hdc_backing;
-        set_dc_drawable( surface->hdc_src, surface->window, &rect, IncludeInferiors );
 
 #ifdef SONAME_LIBXCOMPOSITE
         if (usexcomposite)
@@ -280,9 +286,9 @@ static BOOL client_surface_update_offscreen( HWND hwnd, struct x11drv_client_sur
             else
             {
                 WARN( "failed to redirect client window %lx, X error %d\n", surface->window, error );
-                NtGdiDeleteObjectApp( surface->hdc_backing );
-                NtGdiDeleteObjectApp( surface->hdc_dst );
-                NtGdiDeleteObjectApp( surface->hdc_src );
+                if (surface->hdc_backing) NtGdiDeleteObjectApp( surface->hdc_backing );
+                if (surface->hdc_dst) NtGdiDeleteObjectApp( surface->hdc_dst );
+                if (surface->hdc_src) NtGdiDeleteObjectApp( surface->hdc_src );
                 surface->hdc_backing = surface->hdc_dst = surface->hdc_src = NULL;
                 return FALSE;
             }
@@ -486,6 +492,48 @@ static BOOL X11DRV_client_surface_present( struct client_surface *client,
     return ret;
 }
 
+static int client_surface_clip_error( Display *display, XErrorEvent *event, void *arg )
+{
+    *(int *)arg = event->error_code;
+    return TRUE;
+}
+
+static BOOL client_surface_create_clip_mask( struct x11drv_client_surface *surface,
+                                             const XRectangle *rects, unsigned int count,
+                                             unsigned int width, unsigned int height )
+{
+    Pixmap mask;
+    XGCValues values = {.foreground = 0, .graphics_exposures = False};
+    GC gc;
+    int error = 0;
+
+    /* The producer owns this mask until the same slot is released. Allocate a
+     * new mask for a new scene; never mutate a mask held by an owner GC. */
+    X11DRV_expect_error( gdi_display, client_surface_clip_error, &error );
+    mask = XCreatePixmap( gdi_display, root_window, width, height, 1 );
+    gc = XCreateGC( gdi_display, mask, GCForeground | GCGraphicsExposures, &values );
+    if (gc)
+    {
+        XFillRectangle( gdi_display, mask, gc, 0, 0, width, height );
+        XSetForeground( gdi_display, gc, 1 );
+        XFillRectangles( gdi_display, mask, gc, (XRectangle *)rects, count );
+        XFreeGC( gdi_display, gc );
+    }
+    XSync( gdi_display, False );
+    X11DRV_check_error();
+    if (error || !gc || !mask)
+    {
+        X11DRV_expect_error( gdi_display, client_surface_clip_error, &error );
+        if (mask) XFreePixmap( gdi_display, mask );
+        XSync( gdi_display, False );
+        X11DRV_check_error();
+        return FALSE;
+    }
+    if (surface->handoff_clip_mask) XFreePixmap( gdi_display, surface->handoff_clip_mask );
+    surface->handoff_clip_mask = mask;
+    return TRUE;
+}
+
 static BOOL x11drv_client_surface_prepare_handoff_clip(
     struct x11drv_client_surface *surface,
     struct client_surface_handoff_slot *slot, HRGN surface_region )
@@ -495,7 +543,7 @@ static BOOL x11drv_client_surface_prepare_handoff_clip(
     RGNDATA *clip = NULL;
     HRGN region = 0;
     HDC hdc = 0;
-    BOOL supported = FALSE, required = FALSE, xfixes = FALSE;
+    BOOL supported = FALSE, required = FALSE, xfixes = FALSE, pixmap = FALSE;
     unsigned int count = 0, i;
 
     if (surface->handoff_clip_valid &&
@@ -552,12 +600,16 @@ static BOOL x11drv_client_surface_prepare_handoff_clip(
     }
     if (count > CLIENT_SURFACE_HANDOFF_MAX_CLIP_RECTS)
     {
-        if (!X11DRV_XFixes_UpdateClientSurfaceRegion(
+        xfixes = X11DRV_XFixes_UpdateClientSurfaceRegion(
                 gdi_display, &surface->handoff_clip_region,
-                (const XRectangle *)clip->Buffer, count ))
+                (const XRectangle *)clip->Buffer, count );
+        if (!xfixes && !client_surface_create_clip_mask(
+                surface, (const XRectangle *)clip->Buffer, count,
+                slot->destination.right - slot->destination.left,
+                slot->destination.bottom - slot->destination.top ))
             goto done;
         count = 0;
-        xfixes = TRUE;
+        pixmap = !xfixes;
         required = TRUE;
         supported = TRUE;
         goto done;
@@ -586,6 +638,7 @@ done:
     surface->handoff_clip_supported = supported;
     surface->handoff_clip_required = required;
     surface->handoff_clip_xfixes = xfixes;
+    surface->handoff_clip_pixmap = pixmap;
     surface->handoff_clip_valid = TRUE;
     TRACE( "handoff clip hwnd %p source %ux%u visual %#lx destination %s region %p "
            "supported %u required %u xfixes %u count %u\n", client->hwnd, slot->width, slot->height,
@@ -604,6 +657,11 @@ publish:
             slot->flags |= CLIENT_SURFACE_HANDOFF_XFIXES_CLIP;
             slot->clip_region = surface->handoff_clip_region;
         }
+        else if (surface->handoff_clip_pixmap)
+        {
+            slot->flags |= CLIENT_SURFACE_HANDOFF_PIXMAP_CLIP;
+            slot->clip_region = surface->handoff_clip_mask;
+        }
         else
             memcpy( slot->clips, surface->handoff_clip_rects,
                     surface->handoff_clip_count * sizeof(*slot->clips) );
@@ -618,20 +676,13 @@ static BOOL x11drv_client_surface_handoff_prepare(
     struct x11drv_client_surface *surface = impl_from_client_surface( client );
     RECT source = client->raw ? client->target.monitor_rect : client->target.virtual_rect;
     RECT destination = client->target.monitor_rect;
-    unsigned int width, height, destination_width, destination_height;
+    unsigned int width, height;
 
     if (source.right <= source.left || source.bottom <= source.top ||
         destination.right <= destination.left || destination.bottom <= destination.top)
         return FALSE;
     width = source.right - source.left;
     height = source.bottom - source.top;
-    destination_width = destination.right - destination.left;
-    destination_height = destination.bottom - destination.top;
-    if ((width != destination_width || height != destination_height ||
-         surface->source_visual != default_visual.visualid) &&
-        !X11DRV_XRender_ClientSurfaceAvailable(
-            width != destination_width || height != destination_height ))
-        return FALSE;
     slot->source = surface->window;
     slot->source_visual = surface->source_visual;
     slot->flags = CLIENT_SURFACE_HANDOFF_NATIVE_X11 | CLIENT_SURFACE_HANDOFF_FULL_DAMAGE;
@@ -672,7 +723,6 @@ static const struct client_surface_backend x11drv_client_surface_owner_backend =
     .detach = x11drv_client_surface_detach,
     .direct_ready = x11drv_client_surface_direct_ready,
     .update = x11drv_client_surface_update,
-    .present = X11DRV_client_surface_present,
     .handoff_prepare = x11drv_client_surface_handoff_prepare,
     .completion = &x11drv_client_surface_completion_ops,
 };
@@ -699,14 +749,9 @@ struct client_surface *X11DRV_CreateClientSurface( HWND hwnd, int format, BOOL r
 
     if (format && !visual_from_pixel_format( format, &visual )) return NULL;
 
-    /* XComposite is the ownership primitive: it lets the owner connection
-     * retain the producer source.  XRender is required only for conversion
-     * or scaling, and core X11 handles ordinary same-visual copies.  XFixes
-     * remains a backend-lifetime requirement because a later topology can
-     * produce a clip too large for the fixed shared handoff slot; falling back
-     * to producer writes would target a different backing than the owner's
-     * frame pool. */
-    if (usexcomposite && X11DRV_XFixes_ClientSurfaceAvailable())
+    /* All conversion and clipping, including extension fallbacks, is done on
+     * the owner connection. The producer never writes the owner's backing. */
+    if (usexcomposite)
         backend = &x11drv_client_surface_owner_backend;
 
     if (visual.visualid == default_visual.visualid) colormap = default_colormap;
