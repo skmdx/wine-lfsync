@@ -33,11 +33,8 @@ struct x11drv_client_surface
     XWindowChanges changes;
     Colormap colormap;
     Window window;
-    Pixmap composition_backing;
-    Window composition_window;
-    UINT64 composition_scene_epoch;
-    HWND composition_toplevel;
-    GC composition_gc;
+    Pixmap snapshot;
+    SIZE snapshot_size;
     VisualID source_visual;
     UINT64 handoff_clip_scene_epoch;
     UINT64 handoff_clip_target_seq;
@@ -46,8 +43,6 @@ struct x11drv_client_surface
     struct client_surface_handoff_clip_rect
         handoff_clip_rects[CLIENT_SURFACE_HANDOFF_MAX_CLIP_RECTS];
     unsigned int handoff_clip_count;
-    BOOL composition_visual_checked;
-    BOOL composition_same_visual;
     BOOL handoff_clip_valid;
     BOOL handoff_clip_supported;
     BOOL handoff_clip_required;
@@ -56,14 +51,13 @@ struct x11drv_client_surface
     struct x11drv_client_surface_completion completion;
     BOOL manual_redirect;   /* client drawable is manually XComposite redirected */
 
-    HDC hdc_src;
-    HDC hdc_dst;
-    HDC hdc_backing;
 };
 
 extern struct x11drv_client_surface *impl_from_client_surface( struct client_surface *client );
 extern const struct client_surface_completion_ops x11drv_client_surface_completion_ops;
 extern BOOL x11drv_client_surface_completion_init( struct x11drv_client_surface *surface );
 extern void x11drv_client_surface_completion_destroy( struct x11drv_client_surface *surface );
+extern BOOL x11drv_client_surface_snapshot( struct client_surface *client, const BYTE *pixels,
+                                            unsigned int width, unsigned int height );
 
 #endif /* __WINE_X11DRV_CLIENT_SURFACE_H */

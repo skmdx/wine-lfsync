@@ -508,13 +508,8 @@ static BOOL x11drv_egl_describe_pixel_format( int format, struct wgl_pixel_forma
     XVisualInfo visual;
 
     if (!p_egl_describe_pixel_format( format, pf )) return FALSE;
-    if (!visual_from_pixel_format( format, &visual ) ||
-        (visual.depth != default_visual.depth && !usexcomposite &&
-         !X11DRV_XRender_ClientSurfaceAvailable( FALSE )))
-    {
-        /* Only the legacy path lacks owner-side software conversion. */
+    if (!visual_from_pixel_format( format, &visual ))
         pf->pfd.dwFlags &= ~PFD_DRAW_TO_WINDOW;
-    }
 
     return TRUE;
 }
@@ -810,15 +805,6 @@ static UINT x11drv_init_pixel_formats( UINT *onscreen_count )
              * The second run we only set offscreen formats. */
             if(!run && visinfo)
             {
-                /* Only the legacy path requires XCopyArea-compatible depths
-                 * when XRender is unavailable. */
-                if (visinfo->depth != default_visual.depth && !usexcomposite &&
-                    !X11DRV_XRender_ClientSurfaceAvailable( FALSE ))
-                {
-                    XFree(visinfo);
-                    continue;
-                }
-
                 TRACE("Found onscreen format FBCONFIG_ID 0x%x corresponding to iPixelFormat %d at GLX index %d\n", fmt_id, size+1, i);
                 list[size].fbconfig = cfgs[i];
                 list[size].visual = visinfo;
@@ -1183,10 +1169,14 @@ static BOOL x11drv_make_current( struct opengl_drawable *draw_base, struct openg
     return ret;
 }
 
+static BOOL snapshot_client_surface( struct opengl_drawable *base, struct client_surface_frame *present,
+                                     GLenum source_buffer );
+
 static void x11drv_surface_flush( struct opengl_drawable *base, UINT flags )
 {
     struct gl_drawable *gl = impl_from_opengl_drawable( base );
     struct client_surface_frame present;
+    BOOL ready = TRUE;
 
     TRACE( "%s flags %#x\n", debugstr_opengl_drawable( base ), flags );
 
@@ -1197,11 +1187,12 @@ static void x11drv_surface_flush( struct opengl_drawable *base, UINT flags )
     client_surface_begin_present( base->client );
     if (present.target == CLIENT_SURFACE_FRAME_TARGET_OFFSCREEN)
     {
-        if (!(flags & GL_FLUSH_FINISHED)) funcs->p_glFinish();
+        if (!usexcomposite) ready = snapshot_client_surface( base, &present, GL_FRONT );
+        else if (!(flags & GL_FLUSH_FINISHED)) funcs->p_glFinish();
         XFlush( gdi_display );
     }
     client_surface_submit_present( base->client, &present );
-    client_surface_complete_present( base->client, &present, TRUE, TRUE, NULL, 0 );
+    client_surface_complete_present( base->client, &present, ready, ready, NULL, 0 );
 }
 
 /***********************************************************************
@@ -1502,6 +1493,51 @@ static void release_glx_present_completion( void *context )
     free( completion );
 }
 
+static BOOL snapshot_client_surface( struct opengl_drawable *base, struct client_surface_frame *present,
+                                     GLenum source_buffer )
+{
+    static const GLenum pack_params[] = {GL_PACK_ALIGNMENT, GL_PACK_ROW_LENGTH,
+                                        GL_PACK_SKIP_ROWS, GL_PACK_SKIP_PIXELS};
+    GLint pack_values[ARRAY_SIZE(pack_params)], framebuffer, buffer, read_buffer;
+    struct x11drv_client_surface *surface = impl_from_client_surface( base->client );
+    SIZE size = base->virtual_size;
+    BYTE *pixels;
+    unsigned int i;
+    BOOL ret;
+
+    if (usexcomposite || present->target != CLIENT_SURFACE_FRAME_TARGET_OFFSCREEN) return TRUE;
+    if (size.cx <= 0 || size.cy <= 0 || (SIZE_T)size.cx > ~(SIZE_T)0 / 4 / size.cy ||
+        !(pixels = malloc( (SIZE_T)size.cx * size.cy * 4 )))
+        return FALSE;
+
+    /* Capture the completed GL buffer, not the clipped native window. This
+     * exceptional path needs neither XDamage nor native swap completion. The
+     * snapshot belongs to the producer and is reused only after owner release. */
+    funcs->p_glGetIntegerv( GL_READ_FRAMEBUFFER_BINDING, &framebuffer );
+    funcs->p_glBindFramebuffer( GL_READ_FRAMEBUFFER, 0 );
+    funcs->p_glGetIntegerv( GL_READ_BUFFER, &read_buffer );
+    funcs->p_glReadBuffer( source_buffer );
+    funcs->p_glGetIntegerv( GL_PIXEL_PACK_BUFFER_BINDING, &buffer );
+    funcs->p_glBindBuffer( GL_PIXEL_PACK_BUFFER, 0 );
+    for (i = 0; i < ARRAY_SIZE(pack_params); ++i)
+    {
+        funcs->p_glGetIntegerv( pack_params[i], &pack_values[i] );
+        funcs->p_glPixelStorei( pack_params[i], i ? 0 : 1 );
+    }
+    funcs->p_glReadPixels( 0, 0, size.cx, size.cy, GL_RGBA, GL_UNSIGNED_BYTE, pixels );
+    for (i = 0; i < ARRAY_SIZE(pack_params); ++i)
+        funcs->p_glPixelStorei( pack_params[i], pack_values[i] );
+    funcs->p_glBindBuffer( GL_PIXEL_PACK_BUFFER, buffer );
+    funcs->p_glReadBuffer( read_buffer );
+    funcs->p_glBindFramebuffer( GL_READ_FRAMEBUFFER, framebuffer );
+
+    ret = x11drv_client_surface_snapshot( base->client, pixels, size.cx, size.cy );
+    free( pixels );
+    if (ret && present->handoff_control)
+        base->client->handoff_slot->source = surface->snapshot;
+    return ret;
+}
+
 static BOOL x11drv_surface_swap( struct opengl_drawable *base )
 {
     GLXContext ctx = NtCurrentTeb()->glReserved2;
@@ -1513,9 +1549,16 @@ static BOOL x11drv_surface_swap( struct opengl_drawable *base )
     TRACE( "drawable %s\n", debugstr_opengl_drawable( base ) );
 
     use_oml = ctx && pglXGetSyncValuesOML && pglXSwapBuffersMscOML;
-    client_surface_prepare_present( base->client, &present, use_oml );
+    client_surface_prepare_present( base->client, &present, use_oml || !usexcomposite );
     client_surface_begin_present( base->client );
-    if (present.completion.kind == CLIENT_SURFACE_COMPLETION_EXACT)
+    if (!usexcomposite && present.target == CLIENT_SURFACE_FRAME_TARGET_OFFSCREEN)
+    {
+        submitted = completed = snapshot_client_surface( base, &present,
+                                                          base->doublebuffer ? GL_BACK : GL_FRONT );
+        pglXSwapBuffers( gdi_display, gl->drawable );
+        client_surface_submit_present( base->client, &present );
+    }
+    else if (present.completion.kind == CLIENT_SURFACE_COMPLETION_EXACT)
     {
         /* The swap buffer count identifies this exact GLX presentation, unlike
          * unrelated XDamage on the drawable. The polling deadline bounds retries,
@@ -1569,6 +1612,7 @@ static void x11drv_egl_surface_destroy( struct opengl_drawable *base )
 static void x11drv_egl_surface_flush( struct opengl_drawable *base, UINT flags )
 {
     struct client_surface_frame present;
+    BOOL ready = TRUE;
 
     TRACE( "%s flags %#x\n", debugstr_opengl_drawable( base ), flags );
 
@@ -1594,12 +1638,13 @@ static void x11drv_egl_surface_flush( struct opengl_drawable *base, UINT flags )
     client_surface_begin_present( base->client );
     if (present.target == CLIENT_SURFACE_FRAME_TARGET_OFFSCREEN)
     {
-        if (!(flags & GL_FLUSH_FINISHED)) funcs->p_glFinish();
+        if (!usexcomposite) ready = snapshot_client_surface( base, &present, GL_BACK );
+        else if (!(flags & GL_FLUSH_FINISHED)) funcs->p_glFinish();
         XFlush( gdi_display );
     }
 
     client_surface_submit_present( base->client, &present );
-    client_surface_complete_present( base->client, &present, TRUE, TRUE, NULL, 0 );
+    client_surface_complete_present( base->client, &present, ready, ready, NULL, 0 );
 }
 
 struct egl_present_completion
@@ -1656,8 +1701,8 @@ static BOOL x11drv_egl_surface_swap( struct opengl_drawable *base )
     timestamp_completion = egl->has_EGL_ANDROID_get_frame_timestamps &&
         funcs->p_eglGetFrameTimestampSupportedANDROID( egl->display, gl->base.surface,
                                                        EGL_DISPLAY_PRESENT_TIME_ANDROID );
-    client_surface_prepare_present( base->client, &present, timestamp_completion );
-    if (present.completion.kind == CLIENT_SURFACE_COMPLETION_EXACT &&
+    client_surface_prepare_present( base->client, &present, timestamp_completion || !usexcomposite );
+    if (usexcomposite && present.completion.kind == CLIENT_SURFACE_COMPLETION_EXACT &&
         !funcs->p_eglGetNextFrameIdANDROID( egl->display, gl->base.surface, &frame_id ))
     {
         WARN( "Failed to allocate EGL presentation frame ID for %s\n",
@@ -1665,6 +1710,16 @@ static BOOL x11drv_egl_surface_swap( struct opengl_drawable *base )
         frame_id = 0;
     }
     client_surface_begin_present( base->client );
+    if (!usexcomposite && present.target == CLIENT_SURFACE_FRAME_TARGET_OFFSCREEN)
+    {
+        BOOL copied = snapshot_client_surface( base, &present, GL_BACK );
+
+        ret = funcs->p_eglSwapBuffers( egl->display, gl->base.surface );
+        client_surface_submit_present( base->client, &present );
+        if (!client_surface_complete_present( base->client, &present, ret && copied, copied, NULL, 0 ))
+            WARN( "client-surface snapshot did not complete for %s\n", debugstr_opengl_drawable( base ) );
+        return ret;
+    }
     ret = funcs->p_eglSwapBuffers( egl->display, gl->base.surface );
     client_surface_submit_present( base->client, &present );
     if (!ret)

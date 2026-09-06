@@ -1186,6 +1186,16 @@ static BOOL get_client_surface_compositor_source(
         return TRUE;
     }
 
+    /* A snapshot remains producer-owned until our copy completes. Never cache
+     * its XID: producer death before the copy executes is LOST, while a
+     * completed copy leaves independently owned pixels in the owner frame. */
+    if ((slot->flags & CLIENT_SURFACE_HANDOFF_COPY_SOURCE) || !usexcomposite)
+    {
+        *source = slot->source;
+        TRACE( "copying transferred source %#lx without XComposite\n", *source );
+        return validate_client_surface_pixmap( *source, slot->width, slot->height, source_depth );
+    }
+
     if (!import_client_surface_pixmap( slot->source, &imported ) ||
         !validate_client_surface_pixmap( imported, slot->width, slot->height, source_depth ))
     {
