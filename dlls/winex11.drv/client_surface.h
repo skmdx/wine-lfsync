@@ -15,6 +15,7 @@
 #include "x11drv.h"
 
 struct x11drv_client_surface;
+struct x11drv_client_surface_retirement;
 
 struct x11drv_client_surface_completion
 {
@@ -60,6 +61,8 @@ struct x11drv_client_surface
     Pixmap gpu_snapshot;
     SIZE gpu_snapshot_size;
     struct x11drv_client_source_frame sources[CLIENT_SURFACE_SOURCE_FRAME_COUNT];
+    struct x11drv_client_surface_retirement *handoff_retirement;
+    struct x11drv_client_surface_retirement *snapshot_retirement;
     struct x11drv_client_surface_completion completion;
     BOOL manual_redirect;   /* client drawable is manually XComposite redirected */
 
@@ -72,6 +75,10 @@ extern void x11drv_client_surface_completion_destroy( struct x11drv_client_surfa
 extern BOOL x11drv_client_surface_snapshot( struct client_surface *client, const BYTE *pixels,
                                             unsigned int width, unsigned int height,
                                             BOOL top_down, BOOL bgra );
+extern void x11drv_client_surface_set_gpu_snapshot( struct x11drv_client_surface *surface, Pixmap pixmap );
+extern BOOL x11drv_client_surface_prepare_retirement( struct x11drv_client_surface *surface );
+extern void x11drv_client_surface_retire_handoff( struct client_surface *client );
+extern void x11drv_client_surface_destroy_retirement( struct x11drv_client_surface *surface );
 extern struct x11drv_client_source_frame *x11drv_client_surface_get_source(
     struct client_surface *client, unsigned int index, unsigned int width,
     unsigned int height, unsigned int depth );

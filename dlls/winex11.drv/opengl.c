@@ -1749,7 +1749,7 @@ static int snapshot_client_surface_gpu( struct opengl_drawable *base,
     pthread_mutex_lock( &base->client->present_lock );
     frame = x11drv_client_surface_get_source( base->client, present->handoff_index,
                                               slot->width, slot->height, default_visual.depth );
-    if (frame && surface->gpu_snapshot == frame->pixmap) surface->gpu_snapshot = 0;
+    if (frame && surface->gpu_snapshot == frame->pixmap) x11drv_client_surface_set_gpu_snapshot( surface, 0 );
     pthread_mutex_unlock( &base->client->present_lock );
     if (!frame) return -1;
     if (!(image = frame->image))

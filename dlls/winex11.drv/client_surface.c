@@ -109,6 +109,7 @@ static void x11drv_client_surface_destroy( struct client_surface *client )
     TRACE( "%s\n", debugstr_client_surface( client ) );
 
     x11drv_client_surface_completion_destroy( surface );
+    x11drv_client_surface_destroy_retirement( surface );
     free( surface->snapshot_pixels );
     client_surface_release_memory( CLIENT_SURFACE_MEMORY_STAGING, surface->snapshot_pixels_size );
     if (surface->snapshot_import) XFreePixmap( gdi_display, surface->snapshot_import );
@@ -307,7 +308,7 @@ struct x11drv_client_source_frame *x11drv_client_surface_get_source(
     }
     if (frame->pixmap == surface->gpu_snapshot)
     {
-        surface->gpu_snapshot = preserve ? next.pixmap : 0;
+        x11drv_client_surface_set_gpu_snapshot( surface, preserve ? next.pixmap : 0 );
         surface->gpu_snapshot_size = (SIZE){width, height};
     }
     if (frame->image) frame->release_image( frame->image );
@@ -433,7 +434,7 @@ BOOL x11drv_client_surface_snapshot( struct client_surface *client, const BYTE *
     }
     TRACE( "uploaded producer snapshot %#lx from visual %#lx to %#lx\n",
            surface->snapshot, surface->source_visual, default_visual.visualid );
-    surface->gpu_snapshot = 0;
+    x11drv_client_surface_set_gpu_snapshot( surface, 0 );
     return TRUE;
 }
 
@@ -446,6 +447,7 @@ static BOOL x11drv_client_surface_handoff_prepare(
     RECT destination = client->target.monitor_rect;
     unsigned int width, height;
 
+    if (!x11drv_client_surface_prepare_retirement( surface )) return FALSE;
     if (source.right <= source.left || source.bottom <= source.top ||
         destination.right <= destination.left || destination.bottom <= destination.top)
         return FALSE;
@@ -491,7 +493,8 @@ static BOOL x11drv_client_surface_handoff_complete( struct client_surface *clien
     assert( index < ARRAY_SIZE(surface->sources) );
     if (frame->gpu_control && frame->gpu_control == __atomic_load_n( &slot->control, __ATOMIC_ACQUIRE ))
     {
-        surface->gpu_snapshot = slot->source = frame->pixmap;
+        slot->source = frame->pixmap;
+        x11drv_client_surface_set_gpu_snapshot( surface, frame->pixmap );
         surface->gpu_snapshot_size = (SIZE){slot->width, slot->height};
         slot->source_visual = default_visual.visualid;
         slot->flags |= CLIENT_SURFACE_HANDOFF_COPY_SOURCE;
@@ -535,7 +538,7 @@ static BOOL x11drv_client_surface_handoff_complete( struct client_surface *clien
     X11DRV_check_error();
     if (error || !source || !frame->gc)
     {
-        if (frame->pixmap == surface->gpu_snapshot) surface->gpu_snapshot = 0;
+        if (frame->pixmap == surface->gpu_snapshot) x11drv_client_surface_set_gpu_snapshot( surface, 0 );
         if (frame->image) frame->release_image( frame->image );
         frame->image = NULL;
         discard_client_surface_source( &frame->pixmap, &frame->gc, &frame->bytes );
@@ -543,7 +546,7 @@ static BOOL x11drv_client_surface_handoff_complete( struct client_surface *clien
     }
     if (source == surface->gpu_snapshot)
     {
-        surface->gpu_snapshot = frame->pixmap;
+        x11drv_client_surface_set_gpu_snapshot( surface, frame->pixmap );
         surface->gpu_snapshot_size = (SIZE){slot->width, slot->height};
     }
     slot->source = frame->pixmap;
@@ -566,6 +569,7 @@ static const struct client_surface_backend x11drv_client_surface_backend =
     .handoff_prepare = x11drv_client_surface_handoff_prepare,
     .handoff_complete = x11drv_client_surface_handoff_complete,
     .handoff_serialize = x11drv_client_surface_handoff_serialize,
+    .handoff_retire = x11drv_client_surface_retire_handoff,
     .completion = &x11drv_client_surface_completion_ops,
 };
 

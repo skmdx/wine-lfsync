@@ -132,6 +132,11 @@ void client_surface_release_handoff( struct client_surface *surface )
         surface->handoff_release_pending = TRUE;
         return;
     }
+    if (surface->backend->handoff_retire)
+    {
+        surface->backend->handoff_retire( surface );
+        goto detached;
+    }
     for (i = 0; i < CLIENT_SURFACE_SOURCE_FRAME_COUNT; ++i)
     {
         slot = surface->handoff_slot + i;
@@ -186,6 +191,7 @@ void client_surface_release_handoff( struct client_surface *surface )
     SERVER_END_REQ;
     NtUnmapViewOfSection( NtCurrentProcess(), surface->handoff_view );
     if (surface->handoff_ready_fd >= 0) close( surface->handoff_ready_fd );
+detached:
     surface->handoff_ready_fd = -1;
     surface->handoff_view = NULL;
     surface->handoff_view_size = 0;

@@ -219,7 +219,7 @@ struct gdi_dc_funcs
 };
 
 /* increment this when changing driver tables or shared driver-facing structures */
-#define WINE_GDI_DRIVER_VERSION 119
+#define WINE_GDI_DRIVER_VERSION 120
 
 #define GDI_PRIORITY_NULL_DRV        0  /* null driver */
 #define GDI_PRIORITY_FONT_DRV      100  /* any font driver */
@@ -312,6 +312,9 @@ struct client_surface_backend
     BOOL (*handoff_complete)( struct client_surface *surface,
                               struct client_surface_handoff_slot *slot );
     BOOL (*handoff_serialize)( struct client_surface *surface );
+    /* Take ownership of the mapped handoff, its notification fd and source
+     * storage. Retire them after readers finish, without retaining surface. */
+    void (*handoff_retire)( struct client_surface *surface );
     const struct client_surface_completion_ops *completion;
 };
 
