@@ -1283,6 +1283,15 @@ BOOL client_surface_complete_present_locked( struct client_surface *surface,
             completed = FALSE;
         if (!completed) present->result = CLIENT_SURFACE_FRAME_COMPLETION_FAILED;
     }
+    /* A preparing scene prevents publication, not the acquisition of an
+     * independent image from an unchanged native target. The resolve below
+     * still validates the target sequence before touching its source. */
+    if (submitted && present->target == CLIENT_SURFACE_FRAME_TARGET_INVALID &&
+        present->completion.resolve && present->completion.kind == CLIENT_SURFACE_COMPLETION_EXACT)
+    {
+        completed = external_completed;
+        if (!completed) present->result = CLIENT_SURFACE_FRAME_COMPLETION_FAILED;
+    }
     if (completed && present->completion.resolve)
     {
         /* Completion waits run without submission serialization. A newer

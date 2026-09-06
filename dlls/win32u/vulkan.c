@@ -2305,7 +2305,9 @@ static VkResult snapshot_vulkan_present( struct vulkan_queue *queue, VkPresentIn
         VkBufferImageCopy copy = {.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
                                   .imageExtent = {swapchain->host_extents.width, swapchain->host_extents.height, 1}};
 
-        if (!swapchain->needs_snapshot || presents[i].target != CLIENT_SURFACE_FRAME_TARGET_OFFSCREEN) continue;
+        /* An exact completion is armed for a valid offscreen native target,
+         * including while its owner scene is still preparing. */
+        if (!swapchain->needs_snapshot || presents[i].completion.kind != CLIENT_SURFACE_COMPLETION_EXACT) continue;
         assert( snapshot && snapshot->busy );
         if ((res = prepare_swapchain_snapshot( queue, swapchain, snapshot ))) goto done;
         if (!(completion = malloc( sizeof(*completion) )))
@@ -2859,8 +2861,8 @@ reserve_snapshots:
         client_surface_prepare_present_locked( swapchain->surface->client, &presents[i],
                                                use_internal_present_wait || swapchain->needs_snapshot );
         have_snapshots |= swapchain->needs_snapshot &&
-                          presents[i].target == CLIENT_SURFACE_FRAME_TARGET_OFFSCREEN;
-        if (swapchain->needs_snapshot && presents[i].target == CLIENT_SURFACE_FRAME_TARGET_OFFSCREEN &&
+                          presents[i].completion.kind == CLIENT_SURFACE_COMPLETION_EXACT;
+        if (swapchain->needs_snapshot && presents[i].completion.kind == CLIENT_SURFACE_COMPLETION_EXACT &&
             !reservations[i].snapshot)
             reserve_more = reservations[i].required = TRUE;
     }
