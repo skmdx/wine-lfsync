@@ -729,7 +729,6 @@ struct x11drv_win_data
     unsigned int   client_surface_backing_height;
     unsigned int   client_surface_backing_valid_width;
     unsigned int   client_surface_backing_valid_height;
-    struct x11drv_retired_pixmap *client_surface_retired;
     unsigned long configure_serial;    /* serial of last pending configure request */
     unsigned long net_wm_icon_serial;  /* serial of last pending _NET_WM_ICON request */
     unsigned long state_locks;         /* X11 state requests lock while updating win32 state */
@@ -739,8 +738,6 @@ extern struct x11drv_win_data *get_win_data( HWND hwnd );
 extern void release_win_data( struct x11drv_win_data *data );
 extern void set_window_parent( struct x11drv_win_data *data, Window parent );
 extern Window X11DRV_get_whole_window( HWND hwnd );
-extern Pixmap X11DRV_get_client_surface_backing( HWND hwnd );
-extern Pixmap X11DRV_get_client_surface_backing_property( HWND hwnd );
 extern void X11DRV_client_surface_backing_destroy( struct x11drv_win_data *data );
 extern BOOL X11DRV_client_surface_backing_ensure( struct x11drv_win_data *data );
 extern BOOL X11DRV_client_surface_backing_snapshot( struct x11drv_win_data *data, BOOL invalidate );

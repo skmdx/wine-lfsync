@@ -2604,7 +2604,7 @@ static BOOL begin_client_surface_native_barrier( struct x11drv_win_data *data )
 
 static void destroy_client_surface_backing( struct x11drv_win_data *data )
 {
-    if (!data->client_surface_backing && !data->client_surface_retired) return;
+    if (!data->client_surface_backing && !data->client_surface_backing_spare) return;
 
     /* Seal this exact HWND even if it has been reparented to another root. */
     if (!begin_client_surface_native_barrier( data )) return;
@@ -2625,7 +2625,7 @@ static void destroy_whole_window( struct x11drv_win_data *data, BOOL already_des
 
     TRACE( "win %p xwin %lx/%lx\n", data->hwnd, data->whole_window, data->client_window );
 
-    if (data->client_surface_backing || data->client_surface_retired)
+    if (data->client_surface_backing || data->client_surface_backing_spare)
         barrier = begin_client_surface_native_barrier( data );
     X11DRV_client_surface_backing_destroy( data );
     if (!data->whole_window)
