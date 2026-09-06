@@ -117,6 +117,7 @@ struct client_surface_ref
     unsigned int    direct_presentation : 1; /* renderer can attach its native source directly */
     unsigned int    handoff_producer_mapped : 1;
     unsigned int    handoff_consumer_mapped : 1;
+    unsigned int    handoff_retired : 1; /* owner root changed; wait for checked reads before invalidation */
     unsigned int    notification_pending : 1; /* an update for this identity is queued */
     unsigned int    destroy_state : 2; /* renderer destroy delivery state */
 };
@@ -301,6 +302,7 @@ static void free_client_surface_handoff( struct client_surface_ref *surface )
     surface->handoff_top = NULL;
     surface->handoff_index = 0;
     surface->handoff_cookie = 0;
+    surface->handoff_retired = 0;
 }
 
 static void retire_client_surface_handoff( struct client_surface_ref *surface )
@@ -309,6 +311,15 @@ static void retire_client_surface_handoff( struct client_surface_ref *surface )
     mark_client_surface_handoff_lost( surface );
     if (!surface->handoff_producer_mapped && !surface->handoff_consumer_mapped)
         free_client_surface_handoff( surface );
+}
+
+static void retarget_client_surface_handoff( struct client_surface_ref *surface )
+{
+    if (!surface->handoff_pool) return;
+    surface->handoff_retired = 1;
+    /* The old owner may still be reading this storage. Keep its tokens until
+     * its endpoint release proves the checked copies have finished. */
+    if (!surface->handoff_consumer_mapped) retire_client_surface_handoff( surface );
 }
 
 static struct client_surface_handoff_pool *create_client_surface_handoff_pool(
@@ -923,6 +934,21 @@ static void attach_parent_thread( struct window *win, bool attach )
     else detach_thread_input( thread->queue, parent->queue, win->desktop );
 }
 
+static void retarget_client_surface_subtree_handoffs( struct window *win, struct window *top )
+{
+    struct client_surface_owner *owner;
+    struct client_surface_ref *surface;
+    struct window *child;
+
+    if (!win->client_surface_subtree_count) return;
+    LIST_FOR_EACH_ENTRY( owner, &win->client_surface_owners, struct client_surface_owner, entry )
+        LIST_FOR_EACH_ENTRY( surface, &owner->surfaces, struct client_surface_ref, entry )
+            if (surface->handoff_pool && surface->handoff_top != top)
+                retarget_client_surface_handoff( surface );
+    LIST_FOR_EACH_ENTRY( child, &win->children, struct window, entry )
+        retarget_client_surface_subtree_handoffs( child, top );
+}
+
 /* change the parent of a window (or unlink the window if the new parent is NULL) */
 static int set_parent_window( struct window *win, struct window *parent )
 {
@@ -982,6 +1008,7 @@ static int set_parent_window( struct window *win, struct window *parent )
             new_top = get_toplevel_window( win );
             if (old_top != new_top)
             {
+                retarget_client_surface_subtree_handoffs( win, new_top );
                 old_pending = old_top->client_surface_dirty;
                 /* The prepared set belongs to the old hierarchy.  Cancel it
                  * even when other surfaces remain there; otherwise commits
@@ -1573,6 +1600,7 @@ static struct client_surface_ref *get_client_surface_ref( struct client_surface_
     surface->handoff_cookie = 0;
     surface->handoff_producer_mapped = 0;
     surface->handoff_consumer_mapped = 0;
+    surface->handoff_retired = 0;
     surface->generation = 0;
     surface->sequence = 0;
     surface->active = 0;
@@ -2202,12 +2230,14 @@ DECL_HANDLER(get_client_surface_handoff)
     if (!(surface = get_client_surface_handoff_ref( win, req->producer, req->surface,
                                                     req->owner ))) return;
     if (surface->handoff_pool &&
-        (surface->handoff_top != top || is_client_surface_handoff_lost( surface )))
+        (surface->handoff_top != top || surface->handoff_retired || is_client_surface_handoff_lost( surface )))
     {
         /* Do not reacquire an endpoint of a failed binding while its peer
          * is retiring it. Otherwise both sides can repeatedly remap the
          * same LOST cookie and prevent its final release forever. */
-        retire_client_surface_handoff( surface );
+        if (surface->handoff_top != top || surface->handoff_retired)
+            retarget_client_surface_handoff( surface );
+        else retire_client_surface_handoff( surface );
         if (surface->handoff_producer_mapped || surface->handoff_consumer_mapped)
         {
             set_error( STATUS_DEVICE_BUSY );
@@ -2295,11 +2325,11 @@ DECL_HANDLER(release_client_surface_handoff)
     slot = &surface->handoff_pool->shared->slots[surface->handoff_index];
     if (producer_view) surface->handoff_producer_mapped = 0;
     else surface->handoff_consumer_mapped = 0;
-    /* Once the consumer retires a failed binding, it will never return the
-     * other image's READY token. Invalidate that token and wake the producer
-     * now, rather than making its endpoint release wait for a dead consumer.
+    /* A retired owner root cannot return any remaining READY token. A normal
+     * hide/show can reacquire the same binding and must keep its only image.
+     * Invalidate and wake for reparent or failure, before clearing the endpoint.
      * The consumer keeps its endpoint until all checked reads have finished. */
-    if (!producer_view && is_client_surface_handoff_lost( surface ))
+    if (!producer_view && (surface->handoff_retired || is_client_surface_handoff_lost( surface )))
         mark_client_surface_handoff_lost( surface );
     for (i = 0; i < CLIENT_SURFACE_SOURCE_FRAME_COUNT; ++i)
         __atomic_fetch_and( &slot[i].endpoints,
