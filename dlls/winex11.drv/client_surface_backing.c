@@ -222,6 +222,7 @@ enum client_surface_compositor_op
     CLIENT_SURFACE_COMPOSITOR_FREE_POOL,
     CLIENT_SURFACE_COMPOSITOR_PRESENT,
     CLIENT_SURFACE_COMPOSITOR_REGISTER_HANDOFF,
+    CLIENT_SURFACE_COMPOSITOR_REUSE_HANDOFF,
     CLIENT_SURFACE_COMPOSITOR_SWEEP_HANDOFFS,
     CLIENT_SURFACE_COMPOSITOR_UPDATE_TARGET,
     CLIENT_SURFACE_COMPOSITOR_REMOVE_TARGET,
@@ -1050,6 +1051,31 @@ static struct client_surface_compositor_pool *acquire_client_surface_compositor_
 failed:
     if (!pool) NtUnmapViewOfSection( NtCurrentProcess(), view );
     return NULL;
+}
+
+static BOOL reuse_client_surface_compositor_handoff( const struct client_surface_compositor_job *job )
+{
+    struct client_surface_compositor_binding *binding;
+    unsigned int i;
+
+    for (binding = client_surface_compositor_bindings; binding; binding = binding->next)
+    {
+        if (binding->toplevel != job->handoff_toplevel || binding->window != job->handoff_window ||
+            binding->process != job->process || binding->identity != job->identity ||
+            binding->cookie != job->cookie) continue;
+        for (i = 0; i < CLIENT_SURFACE_SOURCE_FRAME_COUNT; ++i)
+        {
+            const struct client_surface_handoff_slot *slot = &binding->slot[i];
+            UINT64 control = __atomic_load_n( &slot->control, __ATOMIC_ACQUIRE );
+
+            if (client_surface_handoff_state( control ) == CLIENT_SURFACE_HANDOFF_LOST ||
+                !(__atomic_load_n( &slot->endpoints, __ATOMIC_ACQUIRE ) &
+                  CLIENT_SURFACE_HANDOFF_ENDPOINT_CONSUMER)) return FALSE;
+        }
+        binding->mark = job->mark;
+        return TRUE;
+    }
+    return FALSE;
 }
 
 static BOOL register_client_surface_compositor_handoff(
@@ -2609,6 +2635,8 @@ static BOOL execute_client_surface_compositor_job( struct client_surface_composi
     }
     if (job->op == CLIENT_SURFACE_COMPOSITOR_REGISTER_HANDOFF)
         return register_client_surface_compositor_handoff( job );
+    if (job->op == CLIENT_SURFACE_COMPOSITOR_REUSE_HANDOFF)
+        return reuse_client_surface_compositor_handoff( job );
     if (job->op == CLIENT_SURFACE_COMPOSITOR_SWEEP_HANDOFFS)
         return sweep_client_surface_compositor_handoffs( job->handoff_toplevel, job->mark,
                                                           job );
@@ -3030,9 +3058,10 @@ static BOOL register_client_surface_handoff( HWND toplevel,
 {
     struct client_surface_compositor_job job =
     {
-        .op = CLIENT_SURFACE_COMPOSITOR_REGISTER_HANDOFF,
+        .op = CLIENT_SURFACE_COMPOSITOR_REUSE_HANDOFF,
         .process = desc->process,
         .identity = desc->surface,
+        .cookie = desc->cookie,
         .mark = mark,
         .handoff_window = wine_server_ptr_handle( desc->handle ),
         .handoff_toplevel = toplevel,
@@ -3042,6 +3071,11 @@ static BOOL register_client_surface_handoff( HWND toplevel,
     BOOL ret = FALSE;
     NTSTATUS status;
 
+    /* The server roster authorizes this cookie, including retirement state
+     * which is not reflected in the shared slots while an old owner reads.
+     * The caller still revalidates the scene epoch before installing its plan. */
+    if (job.cookie && submit_client_surface_compositor_job( &job )) return TRUE;
+    job.op = CLIENT_SURFACE_COMPOSITOR_REGISTER_HANDOFF;
     SERVER_START_REQ( get_client_surface_handoff )
     {
         req->handle = desc->handle;

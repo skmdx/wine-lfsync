@@ -783,6 +783,25 @@ static unsigned int release_surface_handoff( HWND hwnd, DWORD producer, UINT_PTR
     return p_wine_server_call( &info );
 }
 
+static void check_surface_handoff_cookie( HWND hwnd, UINT_PTR surface, UINT64 cookie )
+{
+    struct __server_request_info info = {0};
+    struct client_surface_handoff_desc desc = {0};
+    unsigned int status;
+
+    info.u.req.get_client_surface_handoffs_request.__header.req = REQ_get_client_surface_handoffs;
+    info.u.req.get_client_surface_handoffs_request.handle = wine_server_user_handle( hwnd );
+    wine_server_set_reply( &info, &desc, sizeof(desc) );
+    status = p_wine_server_call( &info );
+    ok( !status, "handoff roster status %#x\n", status );
+    ok( info.u.reply.get_client_surface_handoffs_reply.count == 1 &&
+        wine_server_reply_size( &info.u.reply ) == sizeof(desc), "unexpected handoff roster size\n" );
+    ok( desc.handle == wine_server_user_handle( hwnd ) && desc.process == GetCurrentProcessId() &&
+        desc.surface == surface, "unexpected handoff roster member\n" );
+    ok( desc.cookie == cookie, "handoff roster cookie %s, expected %s\n",
+        wine_dbgstr_longlong( desc.cookie ), wine_dbgstr_longlong( cookie ) );
+}
+
 static unsigned int complete_surface_handoffs( HWND hwnd, UINT64 generation, UINT64 epoch,
                                                const struct client_surface_handoff_receipt *receipts,
                                                unsigned int count,
@@ -1101,7 +1120,7 @@ static void test_handoff_consumer_retirement( BOOL failed )
     LONG release_sequence;
     BOOL producer_bound = FALSE, owner_bound = FALSE, replacement_bound = FALSE;
     unsigned int status, i;
-    HWND hwnd = create_test_window( FALSE );
+    HWND hwnd = create_test_window( TRUE );
     HWND other = NULL;
 
     ok( !!hwnd, "failed to create handoff recovery window\n" );
@@ -1110,6 +1129,7 @@ static void test_handoff_consumer_retirement( BOOL failed )
     ok( !status, "handoff recovery registration status %#x\n", status );
     status = claim_surface_state( hwnd, identity, NULL );
     ok( !status, "handoff recovery claim status %#x\n", status );
+    check_surface_handoff_cookie( hwnd, identity, 0 );
     status = get_surface_handoff( hwnd, 0, identity, FALSE, &producer );
     ok( !status, "handoff recovery producer bind status %#x\n", status );
     if (status) goto done;
@@ -1120,6 +1140,7 @@ static void test_handoff_consumer_retirement( BOOL failed )
     producer.mapping = NULL;
     ok( !!producer_view, "handoff recovery producer map error %lu\n", GetLastError() );
     if (!producer_view) goto done;
+    check_surface_handoff_cookie( hwnd, identity, 0 );
 
     status = get_surface_handoff( hwnd, GetCurrentProcessId(), identity, TRUE, &owner );
     ok( !status, "handoff recovery consumer bind status %#x\n", status );
@@ -1130,6 +1151,7 @@ static void test_handoff_consumer_retirement( BOOL failed )
     owner.mapping = NULL;
     ok( !!owner_view, "handoff recovery consumer map error %lu\n", GetLastError() );
     if (!owner_view) goto done;
+    check_surface_handoff_cookie( hwnd, identity, owner.cookie );
 
     slot = (void *)((char *)producer_view + producer.offset);
     /* A normal roster change can retire a consumer with unread images just
@@ -1147,6 +1169,7 @@ static void test_handoff_consumer_retirement( BOOL failed )
         status = release_surface_handoff( hwnd, GetCurrentProcessId(), identity, owner.cookie, TRUE );
         ok( !status, "temporary consumer release status %#x\n", status );
         owner_bound = FALSE;
+        check_surface_handoff_cookie( hwnd, identity, 0 );
         for (i = 0; i < CLIENT_SURFACE_SOURCE_FRAME_COUNT; ++i)
             ok( client_surface_handoff_state( __atomic_load_n( &slot[i].control, __ATOMIC_ACQUIRE ) ) ==
                 CLIENT_SURFACE_HANDOFF_READY, "temporary consumer release discarded image %u\n", i );
@@ -1157,8 +1180,9 @@ static void test_handoff_consumer_retirement( BOOL failed )
         ok( owner.cookie == producer.cookie, "temporary consumer rebind replaced the cookie\n" );
         CloseHandle( owner.mapping );
         owner.mapping = NULL;
+        check_surface_handoff_cookie( hwnd, identity, owner.cookie );
 
-        other = create_test_window( FALSE );
+        other = create_test_window( TRUE );
         ok( !!other, "failed to create replacement owner\n" );
         if (!other) goto done;
         control = __atomic_load_n( &slot[0].control, __ATOMIC_ACQUIRE );
@@ -1174,6 +1198,7 @@ static void test_handoff_consumer_retirement( BOOL failed )
             info.u.req.set_parent_request.parent = wine_server_user_handle( i ? GetDesktopWindow() : other );
             status = p_wine_server_call( &info );
             ok( !status, "reparent %u status %#x\n", i, status );
+            check_surface_handoff_cookie( hwnd, identity, 0 );
             status = get_surface_handoff( hwnd, 0, identity, FALSE, &pending );
             ok( status == STATUS_DEVICE_BUSY, "reparent %u reacquired retired binding, status %#x\n", i, status );
             if (!status) CloseHandle( pending.mapping );
@@ -1188,6 +1213,7 @@ static void test_handoff_consumer_retirement( BOOL failed )
         __atomic_store_n( &slot[CLIENT_SURFACE_SOURCE_FRAME_COUNT - 1].control,
                           client_surface_handoff_control( generation, CLIENT_SURFACE_HANDOFF_LOST ),
                           __ATOMIC_RELEASE );
+    check_surface_handoff_cookie( hwnd, identity, 0 );
     shared = producer_view;
     __atomic_store_n( &shared->release_parked, 1, __ATOMIC_RELEASE );
     release_sequence = __atomic_load_n( &shared->release_sequence, __ATOMIC_ACQUIRE );
@@ -1223,6 +1249,7 @@ static void test_handoff_consumer_retirement( BOOL failed )
     ok( !status, "handoff recovery replacement bind status %#x\n", status );
     if (status) goto done;
     replacement_bound = TRUE;
+    check_surface_handoff_cookie( hwnd, identity, 0 );
     replacement_view = MapViewOfFile( replacement.mapping, FILE_MAP_READ | FILE_MAP_WRITE,
                                       0, 0, replacement.size );
     CloseHandle( replacement.mapping );

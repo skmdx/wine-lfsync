@@ -282,6 +282,7 @@ struct client_surface_handoff_desc
     user_handle_t   handle;
     process_id_t    process;
     client_ptr_t    surface;
+    unsigned __int64 cookie;
 };
 
 
@@ -7459,6 +7460,6 @@ union generic_reply
     struct get_client_surface_handoffs_reply get_client_surface_handoffs_reply;
 };
 
-#define SERVER_PROTOCOL_VERSION 1002
+#define SERVER_PROTOCOL_VERSION 1003
 
 #endif /* __WINE_WINE_SERVER_PROTOCOL_H */

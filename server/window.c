@@ -2489,7 +2489,7 @@ DECL_HANDLER(publish_client_surface_handoff)
         restart_client_surface_generation( top );
 }
 
-static void collect_client_surface_handoffs( struct window *win,
+static void collect_client_surface_handoffs( struct window *win, struct window *top,
                                              struct client_surface_handoff_desc *data,
                                              unsigned int max_count, unsigned int *count )
 {
@@ -2505,11 +2505,16 @@ static void collect_client_surface_handoffs( struct window *win,
             data[*count].handle = win->handle;
             data[*count].process = owner->process->id;
             data[*count].surface = surface->id;
+            /* Shared endpoints alone cannot authorize reuse: A -> B -> A
+             * leaves the old owner mapped until its checked reads finish. */
+            data[*count].cookie = surface->handoff_pool && surface->handoff_top == top &&
+                                 surface->handoff_consumer_mapped && !surface->handoff_retired &&
+                                 !is_client_surface_handoff_lost( surface ) ? surface->handoff_cookie : 0;
         }
         (*count)++;
     }
     LIST_FOR_EACH_ENTRY( child, &win->children, struct window, entry )
-        collect_client_surface_handoffs( child, data, max_count, count );
+        collect_client_surface_handoffs( child, top, data, max_count, count );
 }
 
 DECL_HANDLER(get_client_surface_handoffs)
@@ -2530,7 +2535,7 @@ DECL_HANDLER(get_client_surface_handoffs)
     }
     reply->scene_generation = top->client_surface_scene_generation;
     if (max_count && !(data = mem_alloc( max_count * sizeof(*data) ))) return;
-    collect_client_surface_handoffs( top, data, max_count, &count );
+    collect_client_surface_handoffs( top, top, data, max_count, &count );
     reply->count = count;
     if (data) set_reply_data_ptr( data, min( count, max_count ) * sizeof(*data) );
 }
