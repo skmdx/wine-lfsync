@@ -337,6 +337,43 @@ static void client_surface_unlock_target( struct client_surface *surface )
     client_surface_unlock_present( surface );
 }
 
+void client_surface_prepare_scene( struct client_surface *surface )
+{
+    struct client_surface_scene scene;
+    HWND toplevel = 0;
+    UINT64 generation;
+    BOOL wake = FALSE;
+
+    if (client_surface_get_scene( surface, &scene ) && scene.authoritative) return;
+
+    /* A first submission can select a new producer and require an owner
+     * snapshot. Do that before acquiring a multi-surface submission's locks:
+     * preparing the owner may update every surface belonging to it. */
+    client_surface_lock_target( surface );
+    pthread_mutex_lock( &surface->present_lock );
+    client_surface_get_scene( surface, &scene );
+    if (surface->hwnd && InterlockedCompareExchange( &surface->active, 0, 0 ))
+    {
+        if (!scene.authoritative)
+            toplevel = client_surface_set_server_state( surface->hwnd, surface,
+                CLIENT_SURFACE_STATE_CLAIM, 0, 0, &wake );
+        else if (!scene.valid)
+            toplevel = scene.toplevel;
+    }
+    pthread_mutex_unlock( &surface->present_lock );
+    client_surface_unlock_target( surface );
+
+    if (toplevel && is_current_thread_window( toplevel ))
+    {
+        if (client_surface_begin_prepare( toplevel, &generation ) &&
+            prepare_window_client_surfaces( toplevel ))
+            client_surface_end_prepare( toplevel, generation );
+        update_window_state( toplevel );
+    }
+    else if (wake && toplevel)
+        NtUserPostMessage( toplevel, WM_WINE_UPDATEWINDOWSTATE, 0, 0 );
+}
+
 /* Owner-side geometry changes must not wait for a native present whose host
  * completion can depend on that owner reaching the window system.  Publish a
  * coalesced request first, then take the target only when it is immediately

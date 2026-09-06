@@ -337,9 +337,8 @@ BOOL client_surface_prepare_handoff_locked( struct client_surface *surface,
     slot->scene_epoch = present->scene.epoch;
     slot->scene_generation = present->scene.generation;
     slot->target_seq = present->target_seq;
-    slot->producer_process = HandleToULong( NtCurrentTeb()->ClientId.UniqueProcess );
-    slot->window = HandleToULong( surface->hwnd );
-    slot->toplevel = HandleToULong( present->scene.toplevel );
+    /* Process and window identities belong to the server-allocated binding,
+     * not the submitting thread (cached replay may run on a Unix worker). */
     if (!surface->backend->handoff_prepare( surface, slot, surface_region ))
     {
         UINT64 expected = token;
@@ -380,7 +379,7 @@ BOOL client_surface_publish_handoff_locked( struct client_surface *surface,
 
     if (!expected || !slot) return FALSE;
     pthread_mutex_lock( &surface->present_lock );
-    valid = surface->hwnd && surface->target.valid &&
+    valid = slot->source && surface->hwnd && surface->target.valid &&
             present->target_seq == surface->target.seq && present->scene.valid &&
             slot->scene_epoch == present->scene.epoch &&
             slot->scene_generation == present->scene.generation &&
@@ -426,12 +425,13 @@ BOOL client_surface_publish_handoff_locked( struct client_surface *surface,
                    wine_dbgstr_longlong( present->handoff_control ),
                    wine_dbgstr_longlong( expected ) );
         else
-            TRACE( "rejected handoff identity %s token %s control %s hwnd %p target %u/%u "
+            TRACE( "rejected handoff identity %s token %s control %s hwnd %p target %s/%s "
                    "scene %u/%s/%s/%u current %u/%s/%s/%u\n",
                    wine_dbgstr_longlong( surface->identity ),
                    wine_dbgstr_longlong( present->handoff_control ),
                    wine_dbgstr_longlong( __atomic_load_n( &slot->control, __ATOMIC_ACQUIRE ) ),
-                   surface->hwnd, present->target_seq, surface->target.seq,
+                   surface->hwnd, wine_dbgstr_longlong( present->target_seq ),
+                   wine_dbgstr_longlong( surface->target.seq ),
                    present->scene.valid, wine_dbgstr_longlong( present->scene.generation ),
                    wine_dbgstr_longlong( present->scene.epoch ), present->scene.mode,
                    current.valid, wine_dbgstr_longlong( current.generation ),
@@ -939,6 +939,7 @@ void client_surface_prepare_present( struct client_surface *surface,
                                      struct client_surface_frame *present,
                                      BOOL external_completion )
 {
+    client_surface_prepare_scene( surface );
     client_surface_lock_present( surface );
     client_surface_wait_present_locked( surface, external_completion );
     client_surface_prepare_present_locked( surface, present, external_completion );
