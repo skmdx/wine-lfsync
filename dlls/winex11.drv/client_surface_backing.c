@@ -248,7 +248,7 @@ struct client_surface_compositor_job
     unsigned int valid_height;
     unsigned int depth;
     Pixmap pixmaps[2];
-    void *view;
+    HANDLE mapping;
     SIZE_T view_size;
     SIZE_T offset;
     UINT64 mapping_id;
@@ -1002,21 +1002,67 @@ static void remove_client_surface_compositor_binding(
     free( binding );
 }
 
-static BOOL register_client_surface_compositor_handoff(
+static struct client_surface_compositor_pool *acquire_client_surface_compositor_pool(
     struct client_surface_compositor_job *job )
 {
-    struct client_surface_handoff_shared *shared = job->view;
-    struct client_surface_compositor_binding **cursor, *binding;
+    struct client_surface_handoff_shared *shared;
     struct client_surface_compositor_pool *pool;
-    unsigned int i;
+    SIZE_T size = job->view_size;
+    void *view = NULL;
 
-    if (job->view_size < sizeof(*shared) ||
-        job->offset > job->view_size - CLIENT_SURFACE_SOURCE_FRAME_COUNT * sizeof(struct client_surface_handoff_slot) ||
+    if ((pool = find_client_surface_compositor_pool( job->mapping_id )))
+    {
+        size = pool->size;
+        view = pool->shared;
+    }
+    else
+    {
+        /* The job's caller keeps its section handle until this synchronous job
+         * returns. Only the first binding maps a pool; later registrations use
+         * this connection's retained view, including across scene changes. */
+        if (NtMapViewOfSection( job->mapping, NtCurrentProcess(), &view, 0, 0, NULL,
+                               &size, ViewShare, 0, PAGE_READWRITE )) return NULL;
+    }
+    shared = view;
+
+    if (size < sizeof(*shared) ||
         __atomic_load_n( &shared->magic, __ATOMIC_ACQUIRE ) != CLIENT_SURFACE_HANDOFF_MAGIC ||
         shared->version != CLIENT_SURFACE_HANDOFF_VERSION ||
         shared->slot_count != CLIENT_SURFACE_HANDOFF_SLOTS ||
         shared->mapping_id != job->mapping_id)
         goto failed;
+    if (pool)
+    {
+        ++pool->refs;
+        return pool;
+    }
+    if (!(pool = calloc( 1, sizeof(*pool) ))) goto failed;
+    pool->next = client_surface_compositor_pools;
+    pool->shared = shared;
+    pool->id = job->mapping_id;
+    pool->size = size;
+    pool->refs = 1;
+    pool->ready_fd = job->ready_fd;
+    job->ready_fd = -1;
+    client_surface_compositor_pools = pool;
+    return pool;
+
+failed:
+    if (!pool) NtUnmapViewOfSection( NtCurrentProcess(), view );
+    return NULL;
+}
+
+static BOOL register_client_surface_compositor_handoff(
+    struct client_surface_compositor_job *job )
+{
+    struct client_surface_compositor_binding **cursor, *binding;
+    struct client_surface_compositor_pool *pool;
+    unsigned int i;
+    BOOL ret = FALSE;
+
+    if (!(pool = acquire_client_surface_compositor_pool( job ))) goto done;
+    if (job->offset > pool->size - CLIENT_SURFACE_SOURCE_FRAME_COUNT * sizeof(struct client_surface_handoff_slot))
+        goto done;
 
     for (cursor = &client_surface_compositor_bindings; *cursor; cursor = &(*cursor)->next)
     {
@@ -1027,52 +1073,20 @@ static BOOL register_client_surface_compositor_handoff(
         if (binding->cookie == job->cookie)
         {
             binding->mark = job->mark;
-            NtUnmapViewOfSection( NtCurrentProcess(), job->view );
-            close( job->ready_fd );
-            job->ready_fd = -1;
-            return TRUE;
+            ret = TRUE;
+            goto done;
         }
+        /* Keep the acquired pool alive if this was its last old binding. */
         remove_client_surface_compositor_binding( cursor );
         break;
     }
 
-    if (!(pool = find_client_surface_compositor_pool( job->mapping_id )))
-    {
-        if (!(pool = calloc( 1, sizeof(*pool) ))) goto failed;
-        pool->next = client_surface_compositor_pools;
-        pool->shared = shared;
-        pool->id = job->mapping_id;
-        pool->size = job->view_size;
-        pool->refs = 0;
-        pool->ready_fd = job->ready_fd;
-        job->ready_fd = -1;
-        client_surface_compositor_pools = pool;
-    }
-    else
-    {
-        NtUnmapViewOfSection( NtCurrentProcess(), job->view );
-        close( job->ready_fd );
-        job->ready_fd = -1;
-        if (job->offset > pool->size - CLIENT_SURFACE_SOURCE_FRAME_COUNT * sizeof(struct client_surface_handoff_slot))
-            return FALSE;
-        shared = pool->shared;
-    }
-    if (!(binding = calloc( 1, sizeof(*binding) )))
-    {
-        if (!pool->refs)
-        {
-            client_surface_compositor_pools = pool->next;
-            NtUnmapViewOfSection( NtCurrentProcess(), pool->shared );
-            close( pool->ready_fd );
-            free( pool );
-        }
-        return FALSE;
-    }
+    if (!(binding = calloc( 1, sizeof(*binding) ))) goto done;
     binding->next = client_surface_compositor_bindings;
     binding->pool = pool;
-    binding->slot = (struct client_surface_handoff_slot *)((char *)shared + job->offset);
+    binding->slot = (struct client_surface_handoff_slot *)((char *)pool->shared + job->offset);
     for (i = 0; i < CLIENT_SURFACE_SOURCE_FRAME_COUNT; ++i)
-        pool->bindings[binding->slot + i - shared->slots] = binding;
+        pool->bindings[binding->slot + i - pool->shared->slots] = binding;
     binding->toplevel = job->handoff_toplevel;
     binding->window = job->handoff_window;
     binding->process = job->process;
@@ -1084,13 +1098,13 @@ static BOOL register_client_surface_compositor_handoff(
     TRACE( "registered handoff hwnd %p identity %s producer %04x pool %s cookie %s\n",
            binding->window, wine_dbgstr_longlong( binding->identity ), binding->process,
            wine_dbgstr_longlong( pool->id ), wine_dbgstr_longlong( binding->cookie ) );
-    return TRUE;
+    ret = TRUE;
 
-failed:
-    NtUnmapViewOfSection( NtCurrentProcess(), job->view );
+done:
+    if (pool) release_client_surface_compositor_pool( pool );
     if (job->ready_fd >= 0) close( job->ready_fd );
     job->ready_fd = -1;
-    return FALSE;
+    return ret;
 }
 
 static void update_client_surface_compositor_scene(
@@ -3024,8 +3038,8 @@ static BOOL register_client_surface_handoff( HWND toplevel,
         .handoff_toplevel = toplevel,
         .ready_fd = -1,
     };
-    HANDLE mapping = NULL, event = NULL;
-    SIZE_T size;
+    HANDLE event = NULL;
+    BOOL ret = FALSE;
     NTSTATUS status;
 
     SERVER_START_REQ( get_client_surface_handoff )
@@ -3037,7 +3051,7 @@ static BOOL register_client_surface_handoff( HWND toplevel,
         status = wine_server_call( req );
         if (!status)
         {
-            mapping = wine_server_ptr_handle( reply->mapping );
+            job.mapping = wine_server_ptr_handle( reply->mapping );
             job.view_size = reply->size;
             job.offset = reply->offset;
             job.mapping_id = reply->mapping_id;
@@ -3046,12 +3060,6 @@ static BOOL register_client_surface_handoff( HWND toplevel,
     }
     SERVER_END_REQ;
     if (status) return FALSE;
-    size = job.view_size;
-    status = NtMapViewOfSection( mapping, NtCurrentProcess(), &job.view, 0, 0, NULL,
-                                 &size, ViewShare, 0, PAGE_READWRITE );
-    NtClose( mapping );
-    if (status) goto release;
-    job.view_size = size;
     SERVER_START_REQ( get_client_surface_handoff_event )
     {
         req->handle = desc->handle;
@@ -3068,19 +3076,13 @@ static BOOL register_client_surface_handoff( HWND toplevel,
         status = wine_server_handle_to_fd( event, FILE_READ_DATA, &job.ready_fd, NULL );
         NtClose( event );
     }
-    if (status)
-    {
-        NtUnmapViewOfSection( NtCurrentProcess(), job.view );
-        goto release;
-    }
-    if (submit_client_surface_compositor_job( &job )) return TRUE;
-    if (!job.complete)
-    {
-        NtUnmapViewOfSection( NtCurrentProcess(), job.view );
-        close( job.ready_fd );
-    }
+    if (status) goto release;
+    ret = submit_client_surface_compositor_job( &job );
+    if (!job.complete && job.ready_fd >= 0) close( job.ready_fd );
 
 release:
+    NtClose( job.mapping );
+    if (ret) return TRUE;
     SERVER_START_REQ( release_client_surface_handoff )
     {
         req->handle = wine_server_user_handle( toplevel );
