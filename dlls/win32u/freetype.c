@@ -852,7 +852,8 @@ static WCHAR *decode_opentype_name( struct opentype_name *name )
     if (!name->codepage)
     {
         len = min( ARRAY_SIZE(buffer), name->length / sizeof(WCHAR) );
-        while (len--) buffer[len] = GET_BE_WORD( ((WORD *)name->bytes)[len] );
+        if (len) memcpy( buffer, name->bytes, len * sizeof(*buffer) );
+        while (len--) buffer[len] = GET_BE_WORD( buffer[len] );
         len = min( ARRAY_SIZE(buffer), name->length / sizeof(WCHAR) );
     }
     else
