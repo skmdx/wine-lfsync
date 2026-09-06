@@ -1428,6 +1428,15 @@ then
         WINE_NOTICE_WITH(xpresent,[test "x$ac_cv_lib_soname_Xpresent" = "x"],
                          [libXpresent ${notice_platform}development files not found, X Present won't be supported.])
 
+        dnl *** Optional checked, asynchronous owner compositor requests
+        AC_CHECK_HEADER([X11/Xlib-xcb.h],
+                        [WINE_CHECK_SONAME(X11-xcb,XGetXCBConnection,,,[$X_LIBS])],,
+                        [$xlib_includes])
+        AC_CHECK_HEADER([xcb/xcbext.h],
+                        [WINE_CHECK_SONAME(xcb,xcb_poll_for_reply)])
+        AC_CHECK_HEADER([xcb/present.h],
+                        [WINE_CHECK_SONAME(xcb-present,xcb_present_pixmap_checked)])
+
         dnl *** Check for XICCallback struct
         AC_CHECK_MEMBERS([XICCallback.callback, XEvent.xcookie],,,[$xlib_includes])
 

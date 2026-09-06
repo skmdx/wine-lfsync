@@ -16802,6 +16802,212 @@ esac
 
 fi
 
+                ac_fn_c_check_header_compile "$LINENO" "X11/Xlib-xcb.h" "ac_cv_header_X11_Xlib_xcb_h" "$xlib_includes
+"
+if test "x$ac_cv_header_X11_Xlib_xcb_h" = xyes
+then :
+  { printf '%s\n' "$as_me:${as_lineno-$LINENO}: checking for -lX11-xcb" >&5
+printf %s "checking for -lX11-xcb... " >&6; }
+if test ${ac_cv_lib_soname_X11_xcb+y}
+then :
+  printf %s "(cached) " >&6
+else case e in #(
+  e) ac_check_soname_save_LIBS=$LIBS
+LIBS="-lX11-xcb $X_LIBS $LIBS"
+  cat confdefs.h - <<_ACEOF >conftest.$ac_ext
+/* end confdefs.h.  */
+
+/* Override any GCC internal prototype to avoid an error.
+   Use char because int might match the return type of a GCC
+   builtin and then its argument prototype would still apply.
+   The 'extern "C"' is for builds by C++ compilers;
+   although this is not generally supported in C code supporting it here
+   has little cost and some practical benefit (sr 110532).  */
+#ifdef __cplusplus
+extern "C"
+#endif
+char XGetXCBConnection (void);
+int
+main (void)
+{
+return XGetXCBConnection ();
+  ;
+  return 0;
+}
+_ACEOF
+if ac_fn_c_try_link "$LINENO"
+then :
+  case "$LIBEXT" in
+    dll) ac_cv_lib_soname_X11_xcb=`$ac_cv_path_LDD conftest.exe | grep "X11-xcb" | sed -e "s/dll.*/dll/"';2,$d'` ;;
+    dylib) ac_cv_lib_soname_X11_xcb=`$OTOOL -L conftest$ac_exeext | grep "libX11-xcb\\.[0-9A-Za-z.]*dylib" | sed -e "s/^.*\/\(libX11-xcb\.[0-9A-Za-z.]*dylib\).*$/\1/"';2,$d'` ;;
+    *) ac_cv_lib_soname_X11_xcb=`$READELF -d conftest$ac_exeext | grep "NEEDED.*libX11-xcb\\.$LIBEXT" | sed -e "s/^.*\\[\\(libX11-xcb\\.$LIBEXT[^	 ]*\\)\\].*$/\1/"';2,$d'`
+       if ${ac_cv_lib_soname_X11_xcb:+false} :
+then :
+  ac_cv_lib_soname_X11_xcb=`$LDD conftest$ac_exeext | grep "libX11-xcb\\.$LIBEXT" | sed -e "s/^.*\(libX11-xcb\.$LIBEXT[^	 ]*\).*$/\1/"';2,$d'`
+fi ;;
+  esac
+else case e in #(
+  e) ac_cv_lib_soname_X11_xcb= ;;
+esac
+fi
+rm -f core conftest.err conftest.$ac_objext conftest.beam \
+    conftest$ac_exeext conftest.$ac_ext
+  LIBS=$ac_check_soname_save_LIBS ;;
+esac
+fi
+if ${ac_cv_lib_soname_X11_xcb:+false} :
+then :
+  { printf '%s\n' "$as_me:${as_lineno-$LINENO}: result: not found" >&5
+printf '%s\n' "not found" >&6; }
+
+else case e in #(
+  e) { printf '%s\n' "$as_me:${as_lineno-$LINENO}: result: $ac_cv_lib_soname_X11_xcb" >&5
+printf '%s\n' "$ac_cv_lib_soname_X11_xcb" >&6; }
+
+printf '%s\n' "#define SONAME_LIBX11_XCB \"$ac_cv_lib_soname_X11_xcb\"" >>confdefs.h
+
+        ;;
+esac
+fi
+fi
+
+        ac_fn_c_check_header_compile "$LINENO" "xcb/xcbext.h" "ac_cv_header_xcb_xcbext_h" "$ac_includes_default"
+if test "x$ac_cv_header_xcb_xcbext_h" = xyes
+then :
+  { printf '%s\n' "$as_me:${as_lineno-$LINENO}: checking for -lxcb" >&5
+printf %s "checking for -lxcb... " >&6; }
+if test ${ac_cv_lib_soname_xcb+y}
+then :
+  printf %s "(cached) " >&6
+else case e in #(
+  e) ac_check_soname_save_LIBS=$LIBS
+LIBS="-lxcb  $LIBS"
+  cat confdefs.h - <<_ACEOF >conftest.$ac_ext
+/* end confdefs.h.  */
+
+/* Override any GCC internal prototype to avoid an error.
+   Use char because int might match the return type of a GCC
+   builtin and then its argument prototype would still apply.
+   The 'extern "C"' is for builds by C++ compilers;
+   although this is not generally supported in C code supporting it here
+   has little cost and some practical benefit (sr 110532).  */
+#ifdef __cplusplus
+extern "C"
+#endif
+char xcb_poll_for_reply (void);
+int
+main (void)
+{
+return xcb_poll_for_reply ();
+  ;
+  return 0;
+}
+_ACEOF
+if ac_fn_c_try_link "$LINENO"
+then :
+  case "$LIBEXT" in
+    dll) ac_cv_lib_soname_xcb=`$ac_cv_path_LDD conftest.exe | grep "xcb" | sed -e "s/dll.*/dll/"';2,$d'` ;;
+    dylib) ac_cv_lib_soname_xcb=`$OTOOL -L conftest$ac_exeext | grep "libxcb\\.[0-9A-Za-z.]*dylib" | sed -e "s/^.*\/\(libxcb\.[0-9A-Za-z.]*dylib\).*$/\1/"';2,$d'` ;;
+    *) ac_cv_lib_soname_xcb=`$READELF -d conftest$ac_exeext | grep "NEEDED.*libxcb\\.$LIBEXT" | sed -e "s/^.*\\[\\(libxcb\\.$LIBEXT[^	 ]*\\)\\].*$/\1/"';2,$d'`
+       if ${ac_cv_lib_soname_xcb:+false} :
+then :
+  ac_cv_lib_soname_xcb=`$LDD conftest$ac_exeext | grep "libxcb\\.$LIBEXT" | sed -e "s/^.*\(libxcb\.$LIBEXT[^	 ]*\).*$/\1/"';2,$d'`
+fi ;;
+  esac
+else case e in #(
+  e) ac_cv_lib_soname_xcb= ;;
+esac
+fi
+rm -f core conftest.err conftest.$ac_objext conftest.beam \
+    conftest$ac_exeext conftest.$ac_ext
+  LIBS=$ac_check_soname_save_LIBS ;;
+esac
+fi
+if ${ac_cv_lib_soname_xcb:+false} :
+then :
+  { printf '%s\n' "$as_me:${as_lineno-$LINENO}: result: not found" >&5
+printf '%s\n' "not found" >&6; }
+
+else case e in #(
+  e) { printf '%s\n' "$as_me:${as_lineno-$LINENO}: result: $ac_cv_lib_soname_xcb" >&5
+printf '%s\n' "$ac_cv_lib_soname_xcb" >&6; }
+
+printf '%s\n' "#define SONAME_LIBXCB \"$ac_cv_lib_soname_xcb\"" >>confdefs.h
+
+        ;;
+esac
+fi
+fi
+
+        ac_fn_c_check_header_compile "$LINENO" "xcb/present.h" "ac_cv_header_xcb_present_h" "$ac_includes_default"
+if test "x$ac_cv_header_xcb_present_h" = xyes
+then :
+  { printf '%s\n' "$as_me:${as_lineno-$LINENO}: checking for -lxcb-present" >&5
+printf %s "checking for -lxcb-present... " >&6; }
+if test ${ac_cv_lib_soname_xcb_present+y}
+then :
+  printf %s "(cached) " >&6
+else case e in #(
+  e) ac_check_soname_save_LIBS=$LIBS
+LIBS="-lxcb-present  $LIBS"
+  cat confdefs.h - <<_ACEOF >conftest.$ac_ext
+/* end confdefs.h.  */
+
+/* Override any GCC internal prototype to avoid an error.
+   Use char because int might match the return type of a GCC
+   builtin and then its argument prototype would still apply.
+   The 'extern "C"' is for builds by C++ compilers;
+   although this is not generally supported in C code supporting it here
+   has little cost and some practical benefit (sr 110532).  */
+#ifdef __cplusplus
+extern "C"
+#endif
+char xcb_present_pixmap_checked (void);
+int
+main (void)
+{
+return xcb_present_pixmap_checked ();
+  ;
+  return 0;
+}
+_ACEOF
+if ac_fn_c_try_link "$LINENO"
+then :
+  case "$LIBEXT" in
+    dll) ac_cv_lib_soname_xcb_present=`$ac_cv_path_LDD conftest.exe | grep "xcb-present" | sed -e "s/dll.*/dll/"';2,$d'` ;;
+    dylib) ac_cv_lib_soname_xcb_present=`$OTOOL -L conftest$ac_exeext | grep "libxcb-present\\.[0-9A-Za-z.]*dylib" | sed -e "s/^.*\/\(libxcb-present\.[0-9A-Za-z.]*dylib\).*$/\1/"';2,$d'` ;;
+    *) ac_cv_lib_soname_xcb_present=`$READELF -d conftest$ac_exeext | grep "NEEDED.*libxcb-present\\.$LIBEXT" | sed -e "s/^.*\\[\\(libxcb-present\\.$LIBEXT[^	 ]*\\)\\].*$/\1/"';2,$d'`
+       if ${ac_cv_lib_soname_xcb_present:+false} :
+then :
+  ac_cv_lib_soname_xcb_present=`$LDD conftest$ac_exeext | grep "libxcb-present\\.$LIBEXT" | sed -e "s/^.*\(libxcb-present\.$LIBEXT[^	 ]*\).*$/\1/"';2,$d'`
+fi ;;
+  esac
+else case e in #(
+  e) ac_cv_lib_soname_xcb_present= ;;
+esac
+fi
+rm -f core conftest.err conftest.$ac_objext conftest.beam \
+    conftest$ac_exeext conftest.$ac_ext
+  LIBS=$ac_check_soname_save_LIBS ;;
+esac
+fi
+if ${ac_cv_lib_soname_xcb_present:+false} :
+then :
+  { printf '%s\n' "$as_me:${as_lineno-$LINENO}: result: not found" >&5
+printf '%s\n' "not found" >&6; }
+
+else case e in #(
+  e) { printf '%s\n' "$as_me:${as_lineno-$LINENO}: result: $ac_cv_lib_soname_xcb_present" >&5
+printf '%s\n' "$ac_cv_lib_soname_xcb_present" >&6; }
+
+printf '%s\n' "#define SONAME_LIBXCB_PRESENT \"$ac_cv_lib_soname_xcb_present\"" >>confdefs.h
+
+        ;;
+esac
+fi
+fi
+
+
                 ac_fn_c_check_member "$LINENO" "XICCallback" "callback" "ac_cv_member_XICCallback_callback" "$xlib_includes
 "
 if test "x$ac_cv_member_XICCallback_callback" = xyes

@@ -810,6 +810,15 @@
 /* Define to the soname of the libX11 library. */
 #undef SONAME_LIBX11
 
+/* Define to the soname of the libX11-xcb library. */
+#undef SONAME_LIBX11_XCB
+
+/* Define to the soname of the libxcb library. */
+#undef SONAME_LIBXCB
+
+/* Define to the soname of the libxcb-present library. */
+#undef SONAME_LIBXCB_PRESENT
+
 /* Define to the soname of the libXcomposite library. */
 #undef SONAME_LIBXCOMPOSITE
 
