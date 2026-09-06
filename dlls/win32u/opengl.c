@@ -176,7 +176,7 @@ void opengl_drawable_release( struct opengl_drawable *drawable )
         if (drawable->surface) funcs->p_eglDestroySurface( egl->display, drawable->surface );
         if (drawable->client)
         {
-            use_window_client_surface( drawable->client, FALSE );
+            if (drawable->client_registered) use_window_client_surface( drawable->client, FALSE );
             client_surface_release( drawable->client );
         }
         free( drawable );
@@ -419,7 +419,8 @@ static void make_client_context_current(void)
 {
     struct opengl_context *context;
     if (!(context = NtCurrentTeb()->glContext) || get_opengl_thread_data()->client_current) return;
-    driver_funcs->p_make_current( get_target( context->draw ), get_target( context->read ), context->driver_private );
+    get_opengl_thread_data()->client_current = driver_funcs->p_make_current(
+        get_target( context->draw ), get_target( context->read ), context->driver_private );
 }
 
 static GLenum color_format_from_pfd( const struct wgl_pixel_format *desc, BOOL srgb )
@@ -663,16 +664,21 @@ static void blit_framebuffer_surface( struct opengl_drawable *drawable )
 {
     static pthread_once_t once = PTHREAD_ONCE_INIT;
 
+    struct opengl_drawable *target = framebuffer_from_opengl_drawable( drawable )->target;
     const struct opengl_funcs *funcs = &display_funcs;
     SIZE src = drawable->virtual_size, dst = drawable->monitor_size;
     float ramp_data[GAMMA_RAMP_SIZE * 4];
+
+    /* A source-copy target retains application pixels at virtual size; the
+     * owner compositor, not this scratch window, applies DPI conversion. */
+    if (target->needs_framebuffer) dst = target->virtual_size;
 
     TRACE( "%s src %s dst %s fbo %u\n", debugstr_opengl_drawable( drawable ), wine_dbgstr_point( (POINT *)&src ),
            wine_dbgstr_point( (POINT *)&dst ), drawable->read_fbo );
 
     funcs->p_glBindFramebuffer( GL_READ_FRAMEBUFFER, drawable->read_fbo );
     funcs->p_glBindFramebuffer( GL_DRAW_FRAMEBUFFER, 0 );
-    funcs->p_glDrawBuffer( GL_BACK );
+    funcs->p_glDrawBuffer( target->buffer_map[(target->doublebuffer ? GL_BACK : GL_FRONT) - GL_FRONT_LEFT] );
     if (drawable->srgb) funcs->p_glEnable( GL_FRAMEBUFFER_SRGB );
 
     if (drawable->read_fbo == drawable->draw_fbo && use_default_gamma_ramp())
@@ -752,6 +758,7 @@ static BOOL framebuffer_surface_swap( struct opengl_drawable *drawable )
 {
     struct framebuffer_surface *surface = framebuffer_from_opengl_drawable( drawable );
     const struct opengl_funcs *funcs = &display_funcs;
+    BOOL ret = TRUE;
 
     TRACE( "%s\n", debugstr_opengl_drawable( drawable ) );
 
@@ -796,12 +803,12 @@ static BOOL framebuffer_surface_swap( struct opengl_drawable *drawable )
     if (surface->target)
     {
         blit_framebuffer_surface( drawable );
-        opengl_drawable_swap( surface->target );
+        ret = opengl_drawable_swap( surface->target );
     }
 
     make_client_context_current();
 
-    return TRUE;
+    return ret;
 }
 
 static const struct opengl_drawable_funcs framebuffer_surface_funcs =
@@ -1826,15 +1833,22 @@ static struct opengl_drawable *get_window_unused_drawable( HWND hwnd, int format
         {
             if (!(driver_funcs->p_surface_create( client, format, &drawable )))
                 WARN( "Failed to create a drawable for window %p, format %d\n", hwnd, format );
-            else if (emulate_modeset && drawable->funcs != &framebuffer_surface_funcs)
+            else if ((emulate_modeset || drawable->needs_framebuffer) &&
+                     drawable->funcs != &framebuffer_surface_funcs)
             {
                 struct opengl_drawable *framebuffer = framebuffer_surface_create( format, client, drawable );
                 opengl_drawable_release( drawable );
                 drawable = framebuffer;
-                ERR( "Using experimental framebuffer OpenGL surface\n" );
+                TRACE( "Using explicit framebuffer OpenGL surface\n" );
             }
 
-            use_window_client_surface( client, !!drawable );
+            if (drawable)
+            {
+                /* An FBO wrapper and its native target share the same client
+                 * surface. Only the externally used drawable registers it. */
+                use_window_client_surface( client, TRUE );
+                drawable->client_registered = TRUE;
+            }
             client_surface_release( client );
         }
     }
@@ -2228,7 +2242,7 @@ static BOOL context_sync_drawables( struct opengl_context *context, HDC draw_hdc
 {
     struct opengl_drawable *new_draw, *new_read, *old_draw = NULL, *old_read = NULL;
     struct opengl_context *previous = NtCurrentTeb()->glContext;
-    BOOL ret = FALSE;
+    BOOL ret = FALSE, rebound = FALSE;
 
     if (!(new_draw = get_updated_drawable( draw_hdc, context->format, context->draw ))) return FALSE;
     if (!draw_hdc && context->draw == context->read) opengl_drawable_add_ref( (new_read = new_draw) );
@@ -2240,34 +2254,45 @@ static BOOL context_sync_drawables( struct opengl_context *context, HDC draw_hdc
     if (!new_draw || !new_read)
     {
         WARN( "One of the drawable has been lost, ignoring\n" );
+        if (new_draw) opengl_drawable_release( new_draw );
+        if (new_read) opengl_drawable_release( new_read );
         return FALSE;
     }
 
-    if (previous == context && new_draw == context->draw && new_read == context->read) ret = TRUE;
+    if (previous == context && new_draw == context->draw && new_read == context->read &&
+        get_opengl_thread_data()->client_current) ret = TRUE;
     else if (previous) context_exchange_drawables( previous, &old_draw, &old_read ); /* take ownership of the previous context drawables */
 
     if (!ret && (ret = driver_funcs->p_make_current( get_target( new_draw ), get_target( new_read ), context->driver_private )))
     {
         NtCurrentTeb()->glContext = context;
+        rebound = TRUE;
+    }
 
-        if (old_draw && old_draw != new_draw && old_draw != new_read && old_draw->client)
+    if (ret)
+    {
+        /* FBO destruction and resize temporarily bind the internal context.
+         * Install the new drawables before either operation can restore the
+         * application context, otherwise it restores its old (or empty) pair. */
+        context_exchange_drawables( context, &new_draw, &new_read );
+        get_opengl_thread_data()->client_current = TRUE;
+
+        if (old_draw && old_draw != context->draw && old_draw != context->read && old_draw->client)
             set_window_opengl_drawable( old_draw->client->hwnd, old_draw, FALSE );
-        if (old_read && old_read != new_draw && old_read != new_read && old_read->client)
+        if (old_read && old_read != context->draw && old_read != context->read && old_read->client)
             set_window_opengl_drawable( old_read->client->hwnd, old_read, FALSE );
 
         /* all good, release previous context drawables if any */
         if (old_draw) opengl_drawable_release( old_draw );
         if (old_read) opengl_drawable_release( old_read );
 
-        opengl_drawable_flush( new_read, new_read->interval, 0 );
-        opengl_drawable_flush( new_draw, new_draw->interval, 0 );
-    }
-
-    if (ret)
-    {
+        if (rebound)
+        {
+            opengl_drawable_flush( context->read, context->read->interval, 0 );
+            opengl_drawable_flush( context->draw, context->draw->interval, 0 );
+        }
         /* update the current window drawable to the last used draw surface */
-        if (new_draw->client) set_window_opengl_drawable( new_draw->client->hwnd, new_draw, TRUE );
-        context_exchange_drawables( context, &new_draw, &new_read );
+        if (context->draw->client) set_window_opengl_drawable( context->draw->client->hwnd, context->draw, TRUE );
     }
     else if (previous)
     {

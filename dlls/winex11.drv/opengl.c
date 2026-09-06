@@ -520,6 +520,7 @@ static BOOL x11drv_egl_surface_create( struct client_surface *client, int format
     struct gl_drawable *gl;
 
     if (!(gl = opengl_drawable_create( sizeof(*gl), &x11drv_egl_surface_funcs, format, client ))) return FALSE;
+    gl->base.needs_framebuffer = !usexcomposite;
 
     opengl_drawable_map_buffer( &gl->base, GL_FRONT_LEFT, GL_BACK_LEFT );
     opengl_drawable_map_buffer( &gl->base, GL_FRONT, GL_BACK );
@@ -939,6 +940,7 @@ static BOOL x11drv_surface_create( struct client_surface *client, int format, st
     struct gl_drawable *gl;
 
     if (!(gl = opengl_drawable_create( sizeof(*gl), &x11drv_surface_funcs, format, client ))) return FALSE;
+    gl->base.needs_framebuffer = !usexcomposite;
     if (!(gl->drawable = pglXCreateWindow( gdi_display, fmt->fbconfig, surface->window, NULL )))
     {
         opengl_drawable_release( &gl->base );
@@ -1501,11 +1503,23 @@ static BOOL snapshot_client_surface( struct opengl_drawable *base, struct client
     GLint pack_values[ARRAY_SIZE(pack_params)], framebuffer, buffer, read_buffer;
     struct x11drv_client_surface *surface = impl_from_client_surface( base->client );
     SIZE size = base->virtual_size;
+    RECT source;
     BYTE *pixels;
     unsigned int i;
     BOOL ret;
 
     if (usexcomposite || present->target != CLIENT_SURFACE_FRAME_TARGET_OFFSCREEN) return TRUE;
+    source = base->client->target.virtual_rect;
+    if (size.cx != source.right - source.left || size.cy != source.bottom - source.top)
+    {
+        /* Preparing the scene can observe a resize after the FBO was drawn.
+         * Discard that old-size frame instead of advertising a larger source
+         * than the snapshot actually contains and losing the owner binding. */
+        TRACE( "Discarding resized snapshot %ldx%ld for %s\n", size.cx, size.cy,
+               wine_dbgstr_rect( &source ) );
+        present->target = CLIENT_SURFACE_FRAME_TARGET_INVALID;
+        return TRUE;
+    }
     if (size.cx <= 0 || size.cy <= 0 || (SIZE_T)size.cx > ~(SIZE_T)0 / 4 / size.cy ||
         !(pixels = malloc( (SIZE_T)size.cx * size.cy * 4 )))
         return FALSE;
@@ -1555,7 +1569,9 @@ static BOOL x11drv_surface_swap( struct opengl_drawable *base )
     {
         submitted = completed = snapshot_client_surface( base, &present,
                                                           base->doublebuffer ? GL_BACK : GL_FRONT );
-        pglXSwapBuffers( gdi_display, gl->drawable );
+        /* The FBO owns front/back storage and the owner publishes the copied
+         * source. A native swap on this hidden scratch window adds no pixels
+         * and can leave glFinish waiting for an unviewable DRI3 presentation. */
         client_surface_submit_present( base->client, &present );
     }
     else if (present.completion.kind == CLIENT_SURFACE_COMPLETION_EXACT)
@@ -1714,7 +1730,7 @@ static BOOL x11drv_egl_surface_swap( struct opengl_drawable *base )
     {
         BOOL copied = snapshot_client_surface( base, &present, GL_BACK );
 
-        ret = funcs->p_eglSwapBuffers( egl->display, gl->base.surface );
+        ret = copied;
         client_surface_submit_present( base->client, &present );
         if (!client_surface_complete_present( base->client, &present, ret && copied, copied, NULL, 0 ))
             WARN( "client-surface snapshot did not complete for %s\n", debugstr_opengl_drawable( base ) );

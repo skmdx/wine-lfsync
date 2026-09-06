@@ -119,7 +119,7 @@ struct __GLsync
 #include "wine/gdi_driver.h"
 
 /* Wine internal opengl driver version, needs to be bumped upon opengl_funcs changes. */
-#define WINE_OPENGL_DRIVER_VERSION 39
+#define WINE_OPENGL_DRIVER_VERSION 40
 
 struct opengl_drawable;
 
@@ -249,6 +249,8 @@ struct opengl_drawable
     BOOL                                doublebuffer;   /* pixel format is double buffered */
     BOOL                                stereo;         /* pixel format is stereo buffered */
     BOOL                                srgb;           /* default framebuffer is SRGB */
+    BOOL                                needs_framebuffer; /* native window cannot retain offscreen front buffers */
+    BOOL                                client_registered; /* owns the underlying client surface's registration */
     EGLSurface                          surface;        /* surface for EGL based drivers */
     GLuint                              read_fbo;       /* default read FBO name when emulating framebuffer */
     GLuint                              draw_fbo;       /* default draw FBO name when emulating framebuffer */
