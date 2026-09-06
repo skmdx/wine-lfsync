@@ -2295,6 +2295,12 @@ DECL_HANDLER(release_client_surface_handoff)
     slot = &surface->handoff_pool->shared->slots[surface->handoff_index];
     if (producer_view) surface->handoff_producer_mapped = 0;
     else surface->handoff_consumer_mapped = 0;
+    /* Once the consumer retires a failed binding, it will never return the
+     * other image's READY token. Invalidate that token and wake the producer
+     * now, rather than making its endpoint release wait for a dead consumer.
+     * The consumer keeps its endpoint until all checked reads have finished. */
+    if (!producer_view && is_client_surface_handoff_lost( surface ))
+        mark_client_surface_handoff_lost( surface );
     for (i = 0; i < CLIENT_SURFACE_SOURCE_FRAME_COUNT; ++i)
         __atomic_fetch_and( &slot[i].endpoints,
                             ~(LONG)(producer_view ? CLIENT_SURFACE_HANDOFF_ENDPOINT_PRODUCER :

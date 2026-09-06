@@ -1129,6 +1129,11 @@ static void test_handoff_lost_recovery(void)
     if (!owner_view) goto done;
 
     slot = (void *)((char *)producer_view + producer.offset);
+    /* The other image may become ready while the first copy reports an
+     * error. Retiring the consumer must return both tokens to the producer. */
+    control = __atomic_load_n( &slot[0].control, __ATOMIC_ACQUIRE );
+    __atomic_store_n( &slot[0].control, client_surface_handoff_control(
+        client_surface_handoff_generation( control ), CLIENT_SURFACE_HANDOFF_READY ), __ATOMIC_RELEASE );
     /* A failure in either independent storage slot retires the binding. */
     control = __atomic_load_n( &slot[CLIENT_SURFACE_SOURCE_FRAME_COUNT - 1].control, __ATOMIC_ACQUIRE );
     generation = client_surface_handoff_generation( control );
@@ -1140,6 +1145,9 @@ static void test_handoff_lost_recovery(void)
                                       owner.cookie, TRUE );
     ok( !status, "handoff recovery consumer release status %#x\n", status );
     owner_bound = FALSE;
+    control = __atomic_load_n( &slot[0].control, __ATOMIC_ACQUIRE );
+    ok( client_surface_handoff_state( control ) == CLIENT_SURFACE_HANDOFF_LOST,
+        "retired consumer left the other image in state %u\n", client_surface_handoff_state( control ) );
     status = get_surface_handoff( hwnd, GetCurrentProcessId(), identity, TRUE, &pending );
     ok( status == STATUS_DEVICE_BUSY, "reacquired lost binding while producer still mapped, status %#x\n", status );
     if (!status)
