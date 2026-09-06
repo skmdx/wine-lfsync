@@ -60,8 +60,6 @@ static unsigned int client_surface_backend_state_flags( struct client_surface *s
 
     if (client_surface_backend_has_cap( surface, CLIENT_SURFACE_BACKEND_SCENE_PUBLICATION ))
         flags |= CLIENT_SURFACE_STATE_SCENE_PUBLICATION;
-    if (client_surface_backend_has_cap( surface, CLIENT_SURFACE_BACKEND_NATIVE_WRITE_LEASE ))
-        flags |= CLIENT_SURFACE_STATE_NATIVE_WRITE_LEASE;
     if (client_surface_backend_has_cap( surface, CLIENT_SURFACE_BACKEND_DIRECT_PRESENTATION ) &&
         InterlockedCompareExchange( &surface->direct_ready, 0, 0 ))
         flags |= CLIENT_SURFACE_STATE_DIRECT_PRESENTATION;

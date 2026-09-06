@@ -451,7 +451,7 @@ BOOL client_surface_publish_handoff_locked( struct client_surface *surface,
 
 static BOOL begin_client_surface_composition( HWND hwnd, const struct client_surface *surface,
                                               const struct client_surface_frame *present,
-                                              BOOL lease, BOOL *valid )
+                                              BOOL *valid )
 {
     BOOL compose = FALSE;
 
@@ -460,8 +460,7 @@ static BOOL begin_client_surface_composition( HWND hwnd, const struct client_sur
     {
         req->handle = wine_server_user_handle( hwnd );
         req->surface = surface->identity;
-        req->flags = CLIENT_SURFACE_STATE_PRESENT_BEGIN |
-                     (lease ? CLIENT_SURFACE_STATE_PRESENT_WRITE_LEASE : 0);
+        req->flags = CLIENT_SURFACE_STATE_PRESENT_BEGIN;
         req->generation = present->scene.generation;
         req->scene_generation = present->scene.epoch;
         if (!wine_server_call( req ))
@@ -659,9 +658,8 @@ BOOL client_surface_end_present_internal( struct client_surface *surface,
     BOOL commit = FALSE, compose = FALSE, composed = FALSE, copied = FALSE, offscreen = FALSE;
     BOOL region_valid = TRUE, sync = !!present->scene.generation, wake = FALSE;
     BOOL authorized = present->scene.authoritative;
-    BOOL begin_valid = TRUE, composition_retry = FALSE, guarded = FALSE, leased = FALSE;
+    BOOL begin_valid = TRUE, composition_retry = FALSE;
     BOOL scene_retry = FALSE, source_valid = FALSE;
-    UINT server_flags = 0;
     HDC hdc = 0;
 
     assert( present );
@@ -715,23 +713,9 @@ BOOL client_surface_end_present_internal( struct client_surface *surface,
             scene_retry = TRUE;
         compose = FALSE;
     }
-    guarded = compose && offscreen &&
-              client_surface_backend_has_cap( surface, CLIENT_SURFACE_BACKEND_NATIVE_WRITE_LEASE );
-    if (guarded && !NtUserIsWindowVisible( hwnd ))
+    if (compose && sync)
     {
-        /* The server cannot admit a writer for a hidden HWND.  Preserve this
-         * completed source for show-time replay without a predictably denied
-         * lease RPC on every hidden frame.  Visibility can race a scene
-         * change, so validate the shared scene just as for a server denial. */
-        composed = client_surface_scene_current( &present->scene );
-        scene_retry = !composed;
-        compose = FALSE;
-    }
-    if (compose && (sync || guarded))
-    {
-        authorized = begin_client_surface_composition( hwnd, surface, present,
-                                                       guarded, &begin_valid );
-        leased = guarded && authorized;
+        authorized = begin_client_surface_composition( hwnd, surface, present, &begin_valid );
         if (!authorized)
         {
             /* Only the authoritative producer for an HWND may touch its
@@ -770,10 +754,7 @@ BOOL client_surface_end_present_internal( struct client_surface *surface,
              * foreign HWNDs are refreshed unconditionally by NtUserGetDCEx.
              * Forcing another server fetch here made every local frame pay an
              * avoidable round trip despite a matching scene token. */
-            /* Keep this DCE distinct from ordinary application DCs, including
-             * subsequent dirty-region refreshes.  A leased composition must
-             * not acquire a native owner lock held by a teardown waiting for
-             * that very lease. */
+            /* Keep composition DCEs distinct from ordinary application DCs. */
             DWORD flags = DCX_CACHE | DCX_USESTYLE | WINE_DCX_CLIENT_SURFACE;
 
             /* A region-only backend leaves the borrowed DC unchanged. Avoid
@@ -804,12 +785,8 @@ BOOL client_surface_end_present_internal( struct client_surface *surface,
      * surface while it runs, allowing independent surfaces to keep moving. */
     if (compose)
     {
-        /* A native-target writer lease protects execution on the host server,
-         * not merely submission from this process.  Complete the backend
-         * copy before returning the lease so the owner cannot publish or
-         * replace the shared target ahead of work queued on this connection. */
         copied = client_surface_backend_present( surface, &present->scene, hdc, surface_region,
-                                                 sync || leased, sync );
+                                                 sync, sync );
         composed = copied;
     }
     if (copied && offscreen && !client_surface_scene_current( &present->scene ))
@@ -834,17 +811,12 @@ BOOL client_surface_end_present_internal( struct client_surface *surface,
 
     /* wineserver can block behind unrelated requests.  Do not serialize all
      * process-local surfaces while acknowledging one composition epoch. */
-    if (leased) server_flags |= CLIENT_SURFACE_STATE_PRESENT_END;
-    if (commit) server_flags |= CLIENT_SURFACE_STATE_PRESENT_COMMIT;
-    if (server_flags)
-        toplevel = client_surface_set_server_state( hwnd, surface, server_flags,
+    if (commit)
+        toplevel = client_surface_set_server_state( hwnd, surface, CLIENT_SURFACE_STATE_PRESENT_COMMIT,
                                                     present->scene.generation,
                                                     present->scene.epoch, &wake );
     if (wake && toplevel) NtUserPostMessage( toplevel, WM_WINE_UPDATEWINDOWSTATE, 0, 0 );
 
-    /* Release a native-target writer before requesting repair.  The server
-     * can then linearize the fresh owner snapshot immediately after the last
-     * stale writer instead of creating a second deferred restart. */
     if ((scene_retry || composition_retry) && present->scene.toplevel &&
         claim_client_surface_retry( surface, present->scene.generation ))
         client_surface_geometry_ready( present->scene.toplevel );
