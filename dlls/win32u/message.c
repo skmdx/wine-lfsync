@@ -342,7 +342,7 @@ static const INPUT_MESSAGE_SOURCE msg_source_unavailable = { IMDT_UNAVAILABLE, I
 /* flag for messages that contain pointers */
 /* 32 messages per entry, messages 0..31 map to bits 0..31 */
 
-#define SET(msg) (1 << ((msg) & 31))
+#define SET(msg) (1u << ((msg) & 31))
 
 static const unsigned int message_pointer_flags[] =
 {
