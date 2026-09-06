@@ -108,8 +108,7 @@ static unsigned int commit_surface_state( HWND hwnd, UINT_PTR surface,
                                           const struct surface_state *generation,
                                           struct surface_state *state )
 {
-    return set_surface_state_scene( hwnd, surface, CLIENT_SURFACE_STATE_PRESENT_COMMIT |
-                                    CLIENT_SURFACE_STATE_PRESENT_END,
+    return set_surface_state_scene( hwnd, surface, CLIENT_SURFACE_STATE_PRESENT_COMMIT,
                                     generation->generation, generation->scene_generation, state );
 }
 
@@ -124,15 +123,6 @@ static unsigned int begin_surface_state( HWND hwnd, UINT_PTR surface,
                                          struct surface_state *state )
 {
     return set_surface_state_scene( hwnd, surface, CLIENT_SURFACE_STATE_PRESENT_BEGIN,
-                                    generation->generation, generation->scene_generation, state );
-}
-
-static unsigned int begin_surface_write_state( HWND hwnd, UINT_PTR surface,
-                                               const struct surface_state *generation,
-                                               struct surface_state *state )
-{
-    return set_surface_state_scene( hwnd, surface, CLIENT_SURFACE_STATE_PRESENT_BEGIN |
-                                    CLIENT_SURFACE_STATE_PRESENT_WRITE_LEASE,
                                     generation->generation, generation->scene_generation, state );
 }
 
@@ -1640,120 +1630,10 @@ static void test_unbacked_live_generation(void)
     DestroyWindow( hwnd );
 }
 
-static void test_scene_writer_barrier(void)
-{
-    const UINT_PTR surface = 0x123c0000;
-    struct surface_state state, composing, ready, steady, blocked, repaired;
-    HWND hwnd;
-    unsigned int status;
-
-    hwnd = create_test_window( TRUE );
-    ok( !!hwnd, "failed to create writer barrier window, error %lu\n", GetLastError() );
-    if (!hwnd) return;
-
-    status = set_surface_state( hwnd, surface, CLIENT_SURFACE_STATE_REGISTER |
-                                CLIENT_SURFACE_STATE_SCENE_PUBLICATION |
-                                CLIENT_SURFACE_STATE_NATIVE_WRITE_LEASE, 0, NULL );
-    ok( !status, "writer barrier register failed, status %#x\n", status );
-    status = claim_surface_state( hwnd, surface, &state );
-    ok( !status && !state.generation, "writer barrier claim started before prepare, status %#x\n", status );
-    status = prepare_surface_state( hwnd, &composing );
-    ok( !status && composing.generation && composing.pending == 1,
-        "writer barrier initial prepare failed: status %#x generation %s pending %u\n",
-        status, wine_dbgstr_longlong( composing.generation ), composing.pending );
-    status = commit_surface_state( hwnd, surface, &composing, &ready );
-    ok( !status && ready.ready && !ready.pending,
-        "writer barrier initial composition failed: status %#x ready %u pending %u\n",
-        status, ready.ready, ready.pending );
-    status = publish_surface_state( hwnd, &state );
-    ok( !status && !state.generation && !state.ready,
-        "writer barrier initial publication failed: status %#x generation %s ready %u\n",
-        status, wine_dbgstr_longlong( state.generation ), state.ready );
-
-    status = begin_surface_write_state( hwnd, surface, &state, &steady );
-    ok( !status && steady.compose,
-        "steady backing writer was not admitted: status %#x compose %u\n", status, steady.compose );
-    SetWindowPos( hwnd, NULL, 17, 10, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE );
-    status = set_surface_state( hwnd, 0, CLIENT_SURFACE_STATE_PREPARE_BEGIN, 0, &blocked );
-    ok( !status && !blocked.publish && !blocked.generation,
-        "scene prepare crossed an active backing writer: status %#x prepare %u generation %s\n",
-        status, blocked.publish, wine_dbgstr_longlong( blocked.generation ) );
-
-    status = commit_surface_state( hwnd, surface, &state, &blocked );
-    ok( !status && !blocked.generation,
-        "stale writer completion entered the new scene: status %#x generation %s\n",
-        status, wine_dbgstr_longlong( blocked.generation ) );
-    status = prepare_surface_state( hwnd, &composing );
-    ok( !status && composing.generation && composing.pending == 1,
-        "writer release did not start scene repair: status %#x generation %s pending %u\n",
-        status, wine_dbgstr_longlong( composing.generation ), composing.pending );
-    status = commit_surface_state( hwnd, surface, &composing, &repaired );
-    ok( !status && repaired.ready && !repaired.pending,
-        "writer barrier repair did not become ready: status %#x ready %u pending %u\n",
-        status, repaired.ready, repaired.pending );
-    status = publish_surface_state( hwnd, &repaired );
-    ok( !status && !repaired.generation && !repaired.pending,
-        "writer barrier repair did not publish: status %#x generation %s pending %u\n",
-        status, wine_dbgstr_longlong( repaired.generation ), repaired.pending );
-
-    set_surface_state( hwnd, surface, CLIENT_SURFACE_STATE_UNREGISTER, 0, NULL );
-    DestroyWindow( hwnd );
-}
-
-static void test_backend_capability_isolation(void)
-{
-    const UINT_PTR surface = 0x123b8000, barrier = 0x45668000;
-    struct surface_state state, composing, ready, steady, denied, sealed;
-    HWND hwnd;
-    unsigned int status;
-
-    hwnd = create_test_window( TRUE );
-    ok( !!hwnd, "failed to create capability isolation window, error %lu\n", GetLastError() );
-    if (!hwnd) return;
-
-    status = set_surface_state( hwnd, surface, CLIENT_SURFACE_STATE_REGISTER |
-                                CLIENT_SURFACE_STATE_SCENE_PUBLICATION, 0, NULL );
-    ok( !status, "capability isolation register failed, status %#x\n", status );
-    claim_surface_state( hwnd, surface, &state );
-    status = prepare_surface_state( hwnd, &composing );
-    ok( !status && composing.generation && composing.pending == 1,
-        "capability isolation prepare failed: status %#x generation %s pending %u\n",
-        status, wine_dbgstr_longlong( composing.generation ), composing.pending );
-    status = commit_surface_state( hwnd, surface, &composing, &ready );
-    ok( !status && ready.ready, "capability isolation composition failed, status %#x ready %u\n",
-        status, ready.ready );
-    status = publish_surface_state( hwnd, &state );
-    ok( !status && !state.generation,
-        "capability isolation publication failed, status %#x generation %s\n",
-        status, wine_dbgstr_longlong( state.generation ) );
-
-    status = begin_surface_state( hwnd, surface, &state, &steady );
-    ok( !status && steady.compose,
-        "scene publication backend was not admitted, status %#x compose %u\n",
-        status, steady.compose );
-    status = begin_surface_write_state( hwnd, surface, &state, &denied );
-    ok( !status && !denied.compose,
-        "publication-only backend was granted a write lease, status %#x compose %u\n",
-        status, denied.compose );
-    status = set_surface_state( hwnd, barrier, CLIENT_SURFACE_STATE_NATIVE_BARRIER_BEGIN,
-                                0, &sealed );
-    ok( !status && !sealed.pending && (sealed.scene_generation & 1),
-        "publication-only backend acquired a write lease: status %#x pending %u scene %s\n",
-        status, sealed.pending, wine_dbgstr_longlong( sealed.scene_generation ) );
-    status = set_surface_state( hwnd, barrier, CLIENT_SURFACE_STATE_NATIVE_BARRIER_END,
-                                0, &sealed );
-    ok( !status && !(sealed.scene_generation & 1),
-        "capability isolation barrier did not reopen: status %#x scene %s\n",
-        status, wine_dbgstr_longlong( sealed.scene_generation ) );
-    set_surface_state( hwnd, surface, CLIENT_SURFACE_STATE_PRESENT_END, 0, NULL );
-    set_surface_state( hwnd, surface, CLIENT_SURFACE_STATE_UNREGISTER, 0, NULL );
-    DestroyWindow( hwnd );
-}
-
 static void test_native_backing_barrier(void)
 {
     const UINT_PTR surface = 0x123d0000, barrier = 0x45670000;
-    struct surface_state state, composing, ready, steady, sealed, blocked;
+    struct surface_state state, composing, ready, sealed, blocked;
     HWND hwnd;
     unsigned int status;
 
@@ -1762,8 +1642,7 @@ static void test_native_backing_barrier(void)
     if (!hwnd) return;
 
     status = set_surface_state( hwnd, surface, CLIENT_SURFACE_STATE_REGISTER |
-                                CLIENT_SURFACE_STATE_SCENE_PUBLICATION |
-                                CLIENT_SURFACE_STATE_NATIVE_WRITE_LEASE, 0, NULL );
+                                CLIENT_SURFACE_STATE_SCENE_PUBLICATION, 0, NULL );
     ok( !status, "native barrier register failed, status %#x\n", status );
     claim_surface_state( hwnd, surface, &state );
     status = prepare_surface_state( hwnd, &composing );
@@ -1776,28 +1655,26 @@ static void test_native_backing_barrier(void)
     status = publish_surface_state( hwnd, &state );
     ok( !status && !state.generation, "native barrier publication failed, status %#x\n", status );
 
-    status = begin_surface_write_state( hwnd, surface, &state, &steady );
-    ok( !status && steady.compose, "native barrier writer was not admitted, status %#x\n", status );
     status = set_surface_state( hwnd, barrier, CLIENT_SURFACE_STATE_NATIVE_BARRIER_BEGIN,
                                 0, &sealed );
-    ok( !status && sealed.pending == 1 && (sealed.scene_generation & 1),
-        "native barrier did not seal one writer: status %#x pending %u scene %s\n",
+    ok( !status && !sealed.pending && (sealed.scene_generation & 1),
+        "native barrier did not seal the scene: status %#x pending %u scene %s\n",
         status, sealed.pending, wine_dbgstr_longlong( sealed.scene_generation ) );
     status = set_surface_state( hwnd, barrier + 1, CLIENT_SURFACE_STATE_NATIVE_BARRIER_BEGIN,
                                 0, NULL );
     ok( status == STATUS_DEVICE_BUSY, "competing native barrier returned %#x\n", status );
-    status = set_surface_state( hwnd, barrier, CLIENT_SURFACE_STATE_NATIVE_BARRIER_END, 0, NULL );
-    ok( status == STATUS_DEVICE_BUSY, "active native barrier ended with status %#x\n", status );
+    status = set_surface_state( hwnd, barrier + 1, CLIENT_SURFACE_STATE_NATIVE_BARRIER_END, 0, NULL );
+    ok( status == STATUS_INVALID_PARAMETER, "wrong barrier token ended the scene, status %#x\n", status );
 
-    status = begin_surface_write_state( hwnd, surface, &state, &blocked );
+    status = begin_surface_state( hwnd, surface, &state, &blocked );
     ok( !status && !blocked.compose,
-        "new writer crossed native barrier: status %#x compose %u\n", status, blocked.compose );
+        "old composition crossed native barrier: status %#x compose %u\n", status, blocked.compose );
     status = commit_surface_state( hwnd, surface, &state, &sealed );
-    ok( !status, "native barrier writer release failed, status %#x\n", status );
+    ok( !status, "stale composition commit failed, status %#x\n", status );
     status = set_surface_state( hwnd, barrier, CLIENT_SURFACE_STATE_NATIVE_BARRIER_BEGIN,
                                 0, &sealed );
     ok( !status && !sealed.pending && (sealed.scene_generation & 1),
-        "native barrier did not drain: status %#x pending %u scene %s\n",
+        "native barrier lost its scene seal: status %#x pending %u scene %s\n",
         status, sealed.pending, wine_dbgstr_longlong( sealed.scene_generation ) );
     status = set_surface_state( hwnd, barrier, CLIENT_SURFACE_STATE_NATIVE_BARRIER_END,
                                 0, &sealed );
@@ -1809,68 +1686,10 @@ static void test_native_backing_barrier(void)
     DestroyWindow( hwnd );
 }
 
-static void test_reparent_writer_leases(void)
-{
-    const UINT_PTR first_surface = 0x123d4000, second_surface = 0x123d4001;
-    const UINT_PTR first_barrier = 0x45674000, second_barrier = 0x45674001;
-    struct surface_state state, sealed;
-    HWND first, second, child = NULL;
-    unsigned int status;
-
-    first = create_test_window( TRUE );
-    second = create_test_window( TRUE );
-    ok( !!first && !!second, "failed to create reparent lease parents, error %lu\n", GetLastError() );
-    if (!first || !second) goto done;
-    child = create_test_child( first, 10 );
-    ok( !!child, "failed to create reparent lease child, error %lu\n", GetLastError() );
-    if (!child) goto done;
-
-    status = set_surface_state( child, first_surface, CLIENT_SURFACE_STATE_REGISTER |
-                                CLIENT_SURFACE_STATE_NATIVE_WRITE_LEASE, 0, NULL );
-    ok( !status, "first lease registration failed, status %#x\n", status );
-    claim_surface_state( child, first_surface, &state );
-    status = begin_surface_write_state( child, first_surface, &state, &state );
-    ok( !status && state.compose, "first writer was not admitted, status %#x compose %u\n",
-        status, state.compose );
-
-    ok( SetParent( child, second ) == first, "failed to reparent lease child, error %lu\n", GetLastError() );
-    status = set_surface_state( child, second_surface, CLIENT_SURFACE_STATE_REGISTER |
-                                CLIENT_SURFACE_STATE_NATIVE_WRITE_LEASE, 0, NULL );
-    ok( !status, "second lease registration failed, status %#x\n", status );
-    claim_surface_state( child, second_surface, &state );
-    status = begin_surface_write_state( child, second_surface, &state, &state );
-    ok( !status && state.compose, "second writer was not admitted, status %#x compose %u\n",
-        status, state.compose );
-
-    status = set_surface_state( first, first_barrier, CLIENT_SURFACE_STATE_NATIVE_BARRIER_BEGIN, 0, &sealed );
-    ok( !status && sealed.pending == 1, "old parent lost its writer: status %#x pending %u\n",
-        status, sealed.pending );
-    status = set_surface_state( second, second_barrier, CLIENT_SURFACE_STATE_NATIVE_BARRIER_BEGIN, 0, &sealed );
-    ok( !status && sealed.pending == 1, "new parent lost its writer: status %#x pending %u\n",
-        status, sealed.pending );
-
-    ok( DestroyWindow( child ), "failed to destroy lease child, error %lu\n", GetLastError() );
-    child = NULL;
-    status = set_surface_state( first, first_barrier, CLIENT_SURFACE_STATE_NATIVE_BARRIER_BEGIN, 0, &sealed );
-    ok( !status && !sealed.pending, "old parent retained a destroyed writer: status %#x pending %u\n",
-        status, sealed.pending );
-    status = set_surface_state( first, first_barrier, CLIENT_SURFACE_STATE_NATIVE_BARRIER_END, 0, &sealed );
-    ok( !status && !(sealed.scene_generation & 1), "old parent barrier did not end, status %#x\n", status );
-    status = set_surface_state( second, second_barrier, CLIENT_SURFACE_STATE_NATIVE_BARRIER_BEGIN, 0, &sealed );
-    ok( !status && !sealed.pending, "new parent retained a destroyed writer: status %#x pending %u\n",
-        status, sealed.pending );
-    status = set_surface_state( second, second_barrier, CLIENT_SURFACE_STATE_NATIVE_BARRIER_END, 0, &sealed );
-    ok( !status && !(sealed.scene_generation & 1), "new parent barrier did not end, status %#x\n", status );
-done:
-    if (child) DestroyWindow( child );
-    if (second) DestroyWindow( second );
-    if (first) DestroyWindow( first );
-}
-
 static void test_demoted_native_barrier(void)
 {
     const UINT_PTR surface = 0x123d6000, barrier = 0x45676000;
-    struct surface_state state, sealed;
+    struct surface_state sealed;
     HWND first, second;
     unsigned int status;
 
@@ -1878,27 +1697,17 @@ static void test_demoted_native_barrier(void)
     second = create_test_window( TRUE );
     ok( !!first && !!second, "failed to create demotion parents, error %lu\n", GetLastError() );
     if (!first || !second) goto done;
-    set_surface_state( first, surface, CLIENT_SURFACE_STATE_REGISTER |
-                       CLIENT_SURFACE_STATE_NATIVE_WRITE_LEASE, 0, NULL );
-    claim_surface_state( first, surface, &state );
-    status = begin_surface_write_state( first, surface, &state, &state );
-    ok( !status && state.compose, "demotion writer not admitted: status %#x compose %u\n",
-        status, state.compose );
+    set_surface_state( first, surface, CLIENT_SURFACE_STATE_REGISTER, 0, NULL );
+    claim_surface_state( first, surface, NULL );
 
-    /* SetParent updates the server hierarchy before destroying the former
-     * top-level's native window.  Stop at this server boundary so the test
-     * can finish the writer while the native teardown barrier is sealed. */
+    /* Native resource replacement must still seal the old owner after the
+     * server hierarchy has changed, not the newly selected top-level. */
     status = set_server_parent( first, second );
     ok( !status, "server demotion failed, status %#x\n", status );
     status = set_surface_state( first, barrier, CLIENT_SURFACE_STATE_NATIVE_BARRIER_BEGIN, 0, &sealed );
-    ok( !status && sealed.toplevel == first && sealed.pending == 1,
+    ok( !status && sealed.toplevel == first && !sealed.pending,
         "native barrier followed new hierarchy: status %#x target %p pending %u\n",
         status, sealed.toplevel, sealed.pending );
-    status = set_surface_state( first, barrier, CLIENT_SURFACE_STATE_NATIVE_BARRIER_END, 0, NULL );
-    ok( status == STATUS_DEVICE_BUSY, "demoted barrier ignored old writer, status %#x\n", status );
-    set_surface_state( first, surface, CLIENT_SURFACE_STATE_PRESENT_END, 0, NULL );
-    /* Reopen even after a failed expectation so the baseline can clean up. */
-    set_surface_state( first, barrier, CLIENT_SURFACE_STATE_NATIVE_BARRIER_BEGIN, 0, NULL );
     status = set_surface_state( first, barrier, CLIENT_SURFACE_STATE_NATIVE_BARRIER_END, 0, &sealed );
     ok( !status && !(sealed.scene_generation & 1) && !sealed.generation,
         "demoted target retained its own transaction: status %#x scene %s generation %s\n",
@@ -1951,105 +1760,6 @@ static void test_notification_identity_aba(void)
         status );
     set_surface_state( second, surface, CLIENT_SURFACE_STATE_UNREGISTER, 0, NULL );
     DestroyWindow( second );
-}
-
-struct writer_exit_context
-{
-    HWND hwnd;
-    UINT_PTR surface;
-    struct surface_state scene;
-    HANDLE ready;
-    HANDLE release;
-    unsigned int status;
-    BOOL compose;
-};
-
-static DWORD WINAPI writer_exit_thread( void *arg )
-{
-    struct writer_exit_context *context = arg;
-    struct surface_state state = {0};
-
-    context->status = begin_surface_write_state( context->hwnd, context->surface,
-                                                 &context->scene, &state );
-    context->compose = state.compose;
-    SetEvent( context->ready );
-    WaitForSingleObject( context->release, 10000 );
-    return 0; /* deliberately omit PRESENT_END */
-}
-
-static void test_writer_thread_exit(void)
-{
-    const UINT_PTR surface = 0x123e0000, barrier = 0x45678000;
-    struct writer_exit_context context = {0};
-    struct surface_state state = {0}, composing = {0}, ready = {0}, sealed = {0};
-    HANDLE thread = NULL;
-    HWND hwnd;
-    unsigned int status;
-
-    hwnd = create_test_window( TRUE );
-    ok( !!hwnd, "failed to create writer-exit window, error %lu\n", GetLastError() );
-    if (!hwnd) return;
-
-    status = set_surface_state( hwnd, surface, CLIENT_SURFACE_STATE_REGISTER |
-                                CLIENT_SURFACE_STATE_SCENE_PUBLICATION |
-                                CLIENT_SURFACE_STATE_NATIVE_WRITE_LEASE, 0, NULL );
-    ok( !status, "writer-exit register failed, status %#x\n", status );
-    claim_surface_state( hwnd, surface, &state );
-    status = prepare_surface_state( hwnd, &composing );
-    ok( !status && composing.generation && composing.pending == 1,
-        "writer-exit prepare failed: status %#x generation %s pending %u\n",
-        status, wine_dbgstr_longlong( composing.generation ), composing.pending );
-    status = commit_surface_state( hwnd, surface, &composing, &ready );
-    ok( !status && ready.ready, "writer-exit composition failed, status %#x ready %u\n",
-        status, ready.ready );
-    status = publish_surface_state( hwnd, &state );
-    ok( !status && !state.generation, "writer-exit publication failed, status %#x\n", status );
-
-    context.hwnd = hwnd;
-    context.surface = surface;
-    context.scene = state;
-    context.ready = CreateEventA( NULL, TRUE, FALSE, NULL );
-    context.release = CreateEventA( NULL, TRUE, FALSE, NULL );
-    if (context.ready && context.release)
-        thread = CreateThread( NULL, 0, writer_exit_thread, &context, 0, NULL );
-    ok( !!context.ready && !!context.release && !!thread,
-        "failed to create writer-exit synchronization, error %lu\n", GetLastError() );
-    if (thread && WaitForSingleObject( context.ready, 10000 ) == WAIT_OBJECT_0)
-    {
-        ok( !context.status && context.compose,
-            "writer-exit lease failed: status %#x compose %u\n",
-            context.status, context.compose );
-        status = set_surface_state( hwnd, barrier, CLIENT_SURFACE_STATE_NATIVE_BARRIER_BEGIN,
-                                    0, &sealed );
-        ok( !status && sealed.pending == 1 && (sealed.scene_generation & 1),
-            "writer-exit barrier missed lease: status %#x pending %u scene %s\n",
-            status, sealed.pending, wine_dbgstr_longlong( sealed.scene_generation ) );
-        SetEvent( context.release );
-        ok( WaitForSingleObject( thread, 10000 ) == WAIT_OBJECT_0,
-            "writer-exit thread did not terminate\n" );
-        status = set_surface_state( hwnd, barrier, CLIENT_SURFACE_STATE_NATIVE_BARRIER_BEGIN,
-                                    0, &sealed );
-        ok( !status && !sealed.pending && (sealed.scene_generation & 1),
-            "dead writer retained lease: status %#x pending %u scene %s\n",
-            status, sealed.pending, wine_dbgstr_longlong( sealed.scene_generation ) );
-        status = set_surface_state( hwnd, barrier, CLIENT_SURFACE_STATE_NATIVE_BARRIER_END,
-                                    0, &sealed );
-        ok( !status && !(sealed.scene_generation & 1),
-            "writer-exit barrier did not reopen scene: status %#x scene %s\n",
-            status, wine_dbgstr_longlong( sealed.scene_generation ) );
-    }
-    else
-    {
-        ok( 0, "writer-exit thread did not acquire lease\n" );
-        if (context.release) SetEvent( context.release );
-        if (thread) WaitForSingleObject( thread, 10000 );
-    }
-    if (thread) CloseHandle( thread );
-    if (context.release) CloseHandle( context.release );
-    if (context.ready) CloseHandle( context.ready );
-
-    set_surface_state( hwnd, surface, CLIENT_SURFACE_STATE_UNREGISTER, 0, NULL );
-    DestroyWindow( hwnd );
 }
 
 static void test_late_present_cutover(void)
@@ -2839,18 +2549,12 @@ static BOOL run_focused_test_case( const char *name, char **argv )
          test_live_prepare_transaction},
         {"unbacked-live", "unbacked live client surface publication",
          test_unbacked_live_generation},
-        {"scene-writer-barrier", "client surface scene writer barrier",
-         test_scene_writer_barrier},
-        {"backend-capability", "client surface backend capability isolation",
-         test_backend_capability_isolation},
         {"native-backing-barrier", "native backing destruction barrier",
          test_native_backing_barrier},
-        {"reparent-writer-leases", "writer lease cleanup across reparenting", test_reparent_writer_leases},
         {"demoted-native-barrier", "native backing barrier after demotion", test_demoted_native_barrier},
         {"handoff-storage", "client surface generation handoff storage", test_handoff_storage},
         {"notification-filter", "client surface notification filter bypass",
          test_notification_identity_aba},
-        {"writer-thread-exit", "writer thread exit lease cleanup", test_writer_thread_exit},
         {"late-present-cutover", "late client surface publication cut-over",
          test_late_present_cutover},
         {"concurrent-state", "concurrent client surface state changes",
@@ -3028,20 +2732,12 @@ START_TEST(client_surface)
     test_live_prepare_transaction();
     trace( "testing unbacked live client surface publication\n" );
     test_unbacked_live_generation();
-    trace( "testing client surface backend capability isolation\n" );
-    test_backend_capability_isolation();
-    trace( "testing client surface scene writer barrier\n" );
-    test_scene_writer_barrier();
     trace( "testing native backing destruction barrier\n" );
     test_native_backing_barrier();
-    trace( "testing writer lease cleanup across reparenting\n" );
-    test_reparent_writer_leases();
     trace( "testing native backing barrier after demotion\n" );
     test_demoted_native_barrier();
     trace( "testing client surface notification identity ABA\n" );
     test_notification_identity_aba();
-    trace( "testing writer thread exit lease cleanup\n" );
-    test_writer_thread_exit();
     trace( "testing late client surface publication cut-over\n" );
     test_late_present_cutover();
     trace( "testing client surface generation membership\n" );

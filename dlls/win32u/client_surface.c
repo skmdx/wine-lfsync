@@ -1269,11 +1269,10 @@ void client_surface_bypass_staging( HWND hwnd )
     client_surface_set_server_state( hwnd, NULL, CLIENT_SURFACE_STATE_BYPASS, 0, 0, NULL );
 }
 
-BOOL client_surface_begin_native_barrier( HWND hwnd, UINT_PTR token, UINT *writers )
+BOOL client_surface_begin_native_barrier( HWND hwnd, UINT_PTR token )
 {
     BOOL ret = FALSE;
 
-    *writers = 0;
     SERVER_START_REQ( set_client_surface_state )
     {
         req->handle = wine_server_user_handle( hwnd );
@@ -1281,11 +1280,7 @@ BOOL client_surface_begin_native_barrier( HWND hwnd, UINT_PTR token, UINT *write
         req->flags = CLIENT_SURFACE_STATE_NATIVE_BARRIER_BEGIN;
         req->generation = 0;
         req->scene_generation = 0;
-        if (!wine_server_call( req ))
-        {
-            *writers = reply->pending;
-            ret = TRUE;
-        }
+        ret = !wine_server_call( req );
     }
     SERVER_END_REQ;
     return ret;

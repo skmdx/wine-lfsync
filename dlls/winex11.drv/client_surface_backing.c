@@ -762,10 +762,9 @@ static BOOL client_surface_present_on_compositor( Window window, Pixmap pixmap,
         return FALSE;
     frame->width = width;
     frame->height = height;
-    /* This entry is published by the owner after legacy writers have
-     * completed.  Treat it as a complete checkpoint so a later partial
-     * handoff can bring another pool entry current without losing pixels
-     * written outside the compositor connection. */
+    /* This owner scene snapshot includes GDI pixels written outside the
+     * compositor connection.  Record a complete checkpoint for later partial
+     * handoffs into other pool entries. */
     note_client_surface_compositor_snapshot( target, pixmap );
     if (!submit_client_surface_present( target, frame, 0, 0, &serial ))
         return FALSE;

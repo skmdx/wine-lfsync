@@ -2591,27 +2591,13 @@ done:
 }
 
 
-static BOOL wait_client_surface_native_barrier( struct x11drv_win_data *data )
+static BOOL begin_client_surface_native_barrier( struct x11drv_win_data *data )
 {
-    LARGE_INTEGER delay = {.QuadPart = -10000};
-    UINT writers = 0;
     BOOL barrier;
 
-    /* Foreign renderer connections may still be copying into an owner-owned
-     * backing Pixmap.  Seal the server scene first, then wait until every
-     * admitted writer has synchronized its X connection and returned its
-     * lease.  This makes freeing the Pixmap an XID lifetime boundary instead
-     * of an ABA race with a queued cross-client XCopyArea. */
-    barrier = client_surface_begin_native_barrier( data->hwnd, (UINT_PTR)data, &writers );
-    while (barrier && writers)
-    {
-        NtDelayExecution( FALSE, &delay );
-        if (!client_surface_begin_native_barrier( data->hwnd, (UINT_PTR)data, &writers ))
-        {
-            ERR( "failed to query client-surface backing barrier for window %p\n", data->hwnd );
-            return FALSE;
-        }
-    }
+    /* Seal the scene before replacing native resources.  The owner compositor
+     * drains its own X connection when it destroys the backing. */
+    barrier = client_surface_begin_native_barrier( data->hwnd, (UINT_PTR)data );
     if (!barrier) ERR( "failed to seal client-surface backing for window %p\n", data->hwnd );
     return barrier;
 }
@@ -2620,10 +2606,8 @@ static void destroy_client_surface_backing( struct x11drv_win_data *data )
 {
     if (!data->client_surface_backing && !data->client_surface_retired) return;
 
-    /* Removing the last member (e.g. reparenting it) can leave a writer
-     * admitted against the old root.  Disable is the same XID lifetime
-     * boundary as native-window destruction. */
-    if (!wait_client_surface_native_barrier( data )) return;
+    /* Seal this exact HWND even if it has been reparented to another root. */
+    if (!begin_client_surface_native_barrier( data )) return;
     X11DRV_client_surface_backing_destroy( data );
     XSync( data->display, False );
     if (!client_surface_end_native_barrier( data->hwnd, (UINT_PTR)data ))
@@ -2642,7 +2626,7 @@ static void destroy_whole_window( struct x11drv_win_data *data, BOOL already_des
     TRACE( "win %p xwin %lx/%lx\n", data->hwnd, data->whole_window, data->client_window );
 
     if (data->client_surface_backing || data->client_surface_retired)
-        barrier = wait_client_surface_native_barrier( data );
+        barrier = begin_client_surface_native_barrier( data );
     X11DRV_client_surface_backing_destroy( data );
     if (!data->whole_window)
     {
@@ -3182,16 +3166,6 @@ Window X11DRV_get_whole_window( HWND hwnd )
     return ret;
 }
 
-/* Renderer-side composition can run while the owner holds win_data across a
- * native backing barrier.  Read the owner-published capability directly so a
- * granted writer never needs the lock which teardown is holding while it
- * waits for that writer. */
-Window X11DRV_get_whole_window_property( HWND hwnd )
-{
-    if (hwnd == NtUserGetDesktopWindow()) return root_window;
-    return (Window)NtUserGetProp( hwnd, whole_window_prop );
-}
-
 /***********************************************************************
  *		X11DRV_GetDC   (X11DRV.@)
  */
@@ -3201,11 +3175,8 @@ void X11DRV_GetDC( HDC hdc, HWND hwnd, HWND top, const RECT *win_rect,
     struct x11drv_escape_set_drawable escape;
     struct x11drv_win_data *data;
 
-    /* Composition uses this DC only for SYSRGN; the actual copies use its
-     * private source/destination DCs.  Let win32u refresh the visible region
-     * without binding an owner drawable.  The owner may be holding win_data
-     * while waiting for our writer lease, and the hierarchy queried by the
-     * DCE may already differ from the root protected by that lease. */
+    /* The owner compositor performs the copies.  This DC supplies only the
+     * visible region, without binding an owner drawable in the producer. */
     if (flags & WINE_DCX_CLIENT_SURFACE) return;
 
     escape.code = X11DRV_SET_DRAWABLE;
