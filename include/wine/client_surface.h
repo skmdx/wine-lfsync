@@ -44,7 +44,7 @@ enum client_surface_handoff_state
  * host's wait primitive. Each binding reserves one group of source slots. */
 #define CLIENT_SURFACE_HANDOFF_MAX_POOLS_PER_CONSUMER 512
 #define CLIENT_SURFACE_HANDOFF_MAGIC ((UINT64)0x57435348414e444full)
-#define CLIENT_SURFACE_HANDOFF_VERSION 9
+#define CLIENT_SURFACE_HANDOFF_VERSION 10
 #define CLIENT_SURFACE_HANDOFF_MAX_CLIP_RECTS 16
 
 #define CLIENT_SURFACE_HANDOFF_NATIVE_X11 0x0001
@@ -94,7 +94,9 @@ struct client_surface_handoff_clip_rect
 C_ASSERT( sizeof(struct client_surface_handoff_clip_rect) == 8 );
 
 /* The producer owns the payload from SUBMITTED until READY. The owner acquires
- * it with READY -> READING and returns source storage with RELEASED. */
+ * it with READY -> READING and returns source storage with RELEASED. An owner
+ * may reclaim the exact RELEASED generation for a new scene before a producer
+ * reserves it again. Retirement must revoke returned tokens before freeing. */
 struct DECLSPEC_ALIGN(64) client_surface_handoff_slot
 {
     LONG64 control;

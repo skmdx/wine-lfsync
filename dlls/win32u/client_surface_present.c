@@ -141,9 +141,27 @@ void client_surface_release_handoff( struct client_surface *surface )
             enum client_surface_handoff_state state = client_surface_handoff_state( control );
             LONG sequence;
 
-            if (state == CLIENT_SURFACE_HANDOFF_FREE || state == CLIENT_SURFACE_HANDOFF_RELEASED ||
-                state == CLIENT_SURFACE_HANDOFF_LOST)
-                break;
+            if (state == CLIENT_SURFACE_HANDOFF_LOST) break;
+            if (state == CLIENT_SURFACE_HANDOFF_FREE || state == CLIENT_SURFACE_HANDOFF_RELEASED)
+            {
+                UINT64 lost = client_surface_handoff_control(
+                    client_surface_handoff_generation( control ), CLIENT_SURFACE_HANDOFF_LOST );
+
+                /* A scene replay may reclaim returned storage. Revoke our
+                 * token atomically before dropping the producer endpoint;
+                 * if the reader won, wait for its checked copy as usual. */
+                if (__atomic_compare_exchange_n( &slot->control, &control, lost, 0,
+                                                  __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE ))
+                {
+                    unsigned int index = slot - surface->handoff_shared->slots;
+
+                    __atomic_fetch_or( &surface->handoff_shared->ready_bitmap[index / 64],
+                                       (UINT64)1 << (index % 64), __ATOMIC_RELEASE );
+                    client_surface_handoff_wake_ready( surface );
+                    break;
+                }
+                continue;
+            }
             if (NtGetTickCount() - start >= CLIENT_SURFACE_PRESENT_TIMEOUT) break;
             __atomic_store_n( &surface->handoff_shared->release_parked, 1, __ATOMIC_RELEASE );
             sequence = __atomic_load_n( &surface->handoff_shared->release_sequence, __ATOMIC_ACQUIRE );

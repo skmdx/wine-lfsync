@@ -81,6 +81,9 @@ struct client_surface_compositor_binding
     unsigned int scene_index;
     UINT64 source_sequence;
     UINT64 source_epoch;
+    UINT64 replay_control;
+    UINT64 replay_epoch;
+    unsigned int replay_index;
 };
 
 static void trace_client_surface_source( const char *event,
@@ -186,6 +189,7 @@ struct client_surface_compositor_target
     struct client_surface_scene_plan scene;
     struct client_surface_handoff_receipt *receipts;
     unsigned int received;
+    unsigned int replay_member;
     BOOL mailbox_pending;
     BOOL assembly_pending;
     BOOL quiescing;
@@ -1194,6 +1198,7 @@ static BOOL install_client_surface_scene_plan( struct client_surface_compositor_
     target->scene.valid = TRUE;
     target->quiescing = !!target->native_updates;
     target->receipts = receipts;
+    target->replay_member = 0;
     for (i = 0; i < count; ++i)
     {
         members[i]->scene_index = i;
@@ -1882,7 +1887,9 @@ static void complete_client_surface_copy_batch( struct client_surface_copy_batch
             client_surface_handoff_generation( copy->control ),
             success ? CLIENT_SURFACE_HANDOFF_RELEASED : CLIENT_SURFACE_HANDOFF_LOST );
 
-        trace_client_surface_source( batch->asynchronous ? "copy_async" : "copy_sync",
+        trace_client_surface_source( client_surface_handoff_state( copy->control ) == CLIENT_SURFACE_HANDOFF_RELEASED ?
+                                     (batch->asynchronous ? "replay_copy_async" : "replay_copy_sync") :
+                                     (batch->asynchronous ? "copy_async" : "copy_sync"),
                                      binding, copy->control, slot->source_sequence,
                                      target->window, frame->pixmap, success && assembly_valid );
         if (success && assembly_valid)
@@ -1900,7 +1907,10 @@ static void complete_client_surface_copy_batch( struct client_surface_copy_batch
             };
         }
         else if (!success)
+        {
             binding->source_epoch = binding->source_sequence = 0;
+            binding->replay_control = 0;
+        }
         __atomic_compare_exchange_n( &slot->control, &expected, final, 0,
                                      __ATOMIC_RELEASE, __ATOMIC_RELAXED );
         if (!success)
@@ -2015,13 +2025,15 @@ static BOOL process_client_surface_copy_replies(void)
         frame->copy_binding = NULL;
         TRACE( "validated owner copy request %u pixmap %#lx success %u\n",
                frame->copy_request.cookies[0], frame->pixmap, success );
-        trace_client_surface_source( "copy_async", binding, control, slot->source_sequence,
+        trace_client_surface_source( client_surface_handoff_state( control ) == CLIENT_SURFACE_HANDOFF_RELEASED ?
+                                     "replay_copy_async" : "copy_async", binding, control, slot->source_sequence,
                                      target->window, frame->pixmap, success );
         if (!success)
         {
             unsigned int index = slot - binding->pool->shared->slots;
 
             binding->source_epoch = binding->source_sequence = 0;
+            binding->replay_control = 0;
             frame->revision = 0;
             discard_client_surface_compositor_gc( frame );
             __atomic_fetch_or( &binding->pool->shared->ready_bitmap[index / 64],
@@ -2048,7 +2060,8 @@ static BOOL process_client_surface_copy_replies(void)
 }
 
 static BOOL compose_client_surface_handoff(
-    struct client_surface_compositor_binding *binding, unsigned int buffer_index, UINT64 control )
+    struct client_surface_compositor_binding *binding, unsigned int buffer_index, UINT64 control,
+    BOOL replay )
 {
     struct client_surface_handoff_slot *slot = binding->slot + buffer_index;
     struct client_surface_handoff_slot source_frame;
@@ -2062,15 +2075,15 @@ static BOOL compose_client_surface_handoff(
     RECT damage;
     unsigned int destination_width, destination_height, source_depth = 0;
     unsigned int slot_index = slot - binding->pool->shared->slots;
-    BOOL composed = FALSE, copied = FALSE, dropped = FALSE, batch, pending = FALSE, asynchronous;
+    BOOL composed = FALSE, copied = FALSE, dropped = replay, batch, pending = FALSE, asynchronous;
 
     /* A producer can observe the new even scene before the GUI thread's
      * topology job reaches this connection. Keep that frame READY until its
      * owner target is installed; it is not an obsolete frame to release. */
     target = find_client_surface_compositor_target( binding->toplevel );
     if (!target || target->copy_frame || target->quiescing || !target->scene.valid ||
-        target->scene.epoch < slot->scene_epoch) return FALSE;
-    if ((slot->flags & CLIENT_SURFACE_HANDOFF_INDEPENDENT) &&
+        (!replay && target->scene.epoch < slot->scene_epoch)) return FALSE;
+    if ((replay || (slot->flags & CLIENT_SURFACE_HANDOFF_INDEPENDENT)) &&
         (!client_surface_get_toplevel_scene( binding->toplevel, &current ) ||
          current.epoch != target->scene.epoch ||
          current.mode == CLIENT_SURFACE_PRESENTATION_DIRECT)) return FALSE;
@@ -2080,7 +2093,10 @@ static BOOL compose_client_surface_handoff(
                                           client_surface_handoff_generation( control ),
                                           CLIENT_SURFACE_HANDOFF_READING ),
                                       0, __ATOMIC_ACQUIRE, __ATOMIC_ACQUIRE ))
+    {
+        if (replay) binding->replay_control = 0; /* Producer reused or retired this exact image. */
         return FALSE;
+    }
     /* Clear this generation's ready bit while READING still prevents the
      * producer from reusing the slot.  Clearing after RELEASED could erase a
      * newer READY generation published by a racing producer. */
@@ -2093,7 +2109,8 @@ static BOOL compose_client_surface_handoff(
            wine_dbgstr_longlong( client_surface_handoff_generation( control ) ) );
     source_frame = *slot;
     slot = &source_frame;
-    trace_client_surface_source( "claim", binding, control, slot->source_sequence,
+    if (replay) slot->flags |= CLIENT_SURFACE_HANDOFF_INDEPENDENT;
+    trace_client_surface_source( replay ? "replay_claim" : "claim", binding, control, slot->source_sequence,
                                  target->window, 0, TRUE );
     if (slot->flags & CLIENT_SURFACE_HANDOFF_INDEPENDENT)
     {
@@ -2175,6 +2192,7 @@ static BOOL compose_client_surface_handoff(
         (unsigned int)slot->damage.right <= slot->width &&
         (unsigned int)slot->damage.bottom <= slot->height)
     {
+        dropped = FALSE;
         /* Placement and clip come from the owner's scene. Children may
          * extend outside the top-level; the scene clip and destination
          * drawable bound the copy, without changing its source mapping. */
@@ -2227,7 +2245,7 @@ retry:
             expected = client_surface_handoff_control( client_surface_handoff_generation( control ),
                                                         CLIENT_SURFACE_HANDOFF_READING );
             if (__atomic_compare_exchange_n( &binding->slot[buffer_index].control, &expected, control, 0,
-                                              __ATOMIC_RELEASE, __ATOMIC_RELAXED ))
+                                              __ATOMIC_RELEASE, __ATOMIC_RELAXED ) && !replay)
                 __atomic_fetch_or( &binding->pool->shared->ready_bitmap[slot_index / 64],
                                    (UINT64)1 << (slot_index % 64),
                                    __ATOMIC_RELEASE );
@@ -2283,6 +2301,10 @@ retry:
         {
             binding->source_epoch = epoch;
             binding->source_sequence = slot->source_sequence;
+            binding->replay_epoch = epoch;
+            binding->replay_index = buffer_index;
+            binding->replay_control = client_surface_handoff_control(
+                client_surface_handoff_generation( control ), CLIENT_SURFACE_HANDOFF_RELEASED );
             frame->width = target->window_width;
             frame->height = target->window_height;
         }
@@ -2304,13 +2326,17 @@ retry:
         }
         else if (copied)
         {
-            trace_client_surface_source( "copy_sync", binding, control, slot->source_sequence,
+            trace_client_surface_source( replay ? "replay_copy_sync" : "copy_sync", binding, control, slot->source_sequence,
                                          target->window, frame->pixmap, TRUE );
             note_client_surface_compositor_damage( target, frame, &damage );
             composed = publish_client_surface_handoff_frame( target, frame, previous_publish );
         }
     }
 release:
+    /* A resized or otherwise incompatible image is still valid storage.
+     * Metadata rejection leaves it returned; a real copy/import error
+     * still retires the binding through the normal failure path. */
+    if (replay) binding->replay_epoch = target->scene.epoch;
     if (!copied)
         trace_client_surface_source( "discard", binding, control, slot->source_sequence,
                                      target->window, frame ? frame->pixmap : 0, dropped );
@@ -2328,6 +2354,12 @@ release:
     final = client_surface_handoff_control( client_surface_handoff_generation( control ), state );
     __atomic_compare_exchange_n( &binding->slot[buffer_index].control, &expected, final, 0,
                                  __ATOMIC_RELEASE, __ATOMIC_RELAXED );
+    if (state == CLIENT_SURFACE_HANDOFF_LOST)
+    {
+        binding->replay_control = 0;
+        __atomic_fetch_or( &binding->pool->shared->ready_bitmap[slot_index / 64],
+                           (UINT64)1 << (slot_index % 64), __ATOMIC_RELEASE );
+    }
     client_surface_handoff_wake_release( binding->pool->shared );
     TRACE( "%s handoff hwnd %p identity %s generation %s scene %s composed %u\n",
            state == CLIENT_SURFACE_HANDOFF_RELEASED ? "released" : "lost", binding->window,
@@ -2372,7 +2404,7 @@ static BOOL process_client_surface_handoffs(void)
                 control = __atomic_load_n( &pool->shared->slots[index].control, __ATOMIC_ACQUIRE );
                 if (client_surface_handoff_state( control ) == CLIENT_SURFACE_HANDOFF_READY)
                 {
-                    compose_client_surface_handoff( binding, pool->shared->slots + index - binding->slot, control );
+                    compose_client_surface_handoff( binding, pool->shared->slots + index - binding->slot, control, FALSE );
                     control = __atomic_load_n( &pool->shared->slots[index].control, __ATOMIC_ACQUIRE );
                     if (client_surface_handoff_state( control ) != CLIENT_SURFACE_HANDOFF_READY) --budget;
                 }
@@ -2401,6 +2433,46 @@ static BOOL process_client_surface_handoffs(void)
         if (budget <= 0) return TRUE;
     }
     return FALSE;
+}
+
+static BOOL replay_client_surface_scene_sources(void)
+{
+    static HWND next_toplevel;
+    struct client_surface_compositor_target *target, *next, *first = client_surface_compositor_targets;
+    unsigned int targets = 0, budget = CLIENT_SURFACE_COPY_BATCH_SIZE;
+    BOOL progressed = FALSE;
+
+    /* Only visit the roster when installing a scene. A returned source can
+     * be read again by claiming its exact token, without asking an idle
+     * producer to pump messages or keeping its storage pinned between copies. */
+    for (target = client_surface_compositor_targets; target; target = target->next)
+    {
+        if (target->toplevel == next_toplevel) first = target;
+        ++targets;
+    }
+    for (target = first; targets-- && budget; target = next)
+    {
+        next = target->next ? target->next : client_surface_compositor_targets;
+        next_toplevel = next->toplevel;
+        if (!target->scene.valid || target->quiescing || target->copy_frame) continue;
+        while (target->replay_member < target->scene.count && budget)
+        {
+            struct client_surface_compositor_binding *binding = target->scene.members[target->replay_member];
+
+            if (binding->replay_control && binding->source_epoch != target->scene.epoch &&
+                binding->replay_epoch != target->scene.epoch)
+            {
+                compose_client_surface_handoff( binding, binding->replay_index, binding->replay_control, TRUE );
+                if (binding->replay_control && binding->replay_epoch != target->scene.epoch) break;
+            }
+            ++target->replay_member;
+            --budget;
+            progressed = TRUE;
+            if (target->copy_frame) break;
+        }
+        flush_client_surface_copy_batch();
+    }
+    return progressed;
 }
 
 static void drain_client_surface_notification( int fd )
@@ -2710,6 +2782,7 @@ static void client_surface_compositor_thread( void *context )
         progressed |= process_client_surface_copy_replies();
         progressed |= process_client_surface_compositor_jobs();
         progressed |= process_client_surface_handoffs();
+        progressed |= replay_client_surface_scene_sources();
         process_client_surface_compositor_mailboxes();
         if (!progressed) wait_client_surface_compositor_work();
     }
