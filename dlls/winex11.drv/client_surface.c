@@ -441,13 +441,31 @@ BOOL x11drv_client_surface_snapshot( struct client_surface *client, const BYTE *
         XDestroyImage( image );
         return FALSE;
     }
-    for (y = 0; y < height; ++y)
-        for (x = 0; x < width; ++x, pixels += 4)
-            XPutPixel( image, x, height - y - 1,
-                       snapshot_component( pixels[0], default_visual.red_mask ) |
-                       snapshot_component( pixels[1], default_visual.green_mask ) |
-                       snapshot_component( pixels[2], default_visual.blue_mask ) |
-                       snapshot_component( pixels[3], alpha ) );
+    if (image->bits_per_pixel == 32 && image->byte_order == LSBFirst &&
+        default_visual.red_mask == 0xff0000 && default_visual.green_mask == 0xff00 &&
+        default_visual.blue_mask == 0xff)
+    {
+        for (y = 0; y < height; ++y)
+        {
+            BYTE *row = (BYTE *)image->data + (SIZE_T)(height - y - 1) * image->bytes_per_line;
+
+            for (x = 0; x < width; ++x, pixels += 4, row += 4)
+            {
+                row[0] = pixels[2];
+                row[1] = pixels[1];
+                row[2] = pixels[0];
+                row[3] = pixels[3];
+            }
+        }
+    }
+    else
+        for (y = 0; y < height; ++y)
+            for (x = 0; x < width; ++x, pixels += 4)
+                XPutPixel( image, x, height - y - 1,
+                           snapshot_component( pixels[0], default_visual.red_mask ) |
+                           snapshot_component( pixels[1], default_visual.green_mask ) |
+                           snapshot_component( pixels[2], default_visual.blue_mask ) |
+                           snapshot_component( pixels[3], alpha ) );
 
     X11DRV_expect_error( gdi_display, client_surface_clip_error, &error );
     if (!surface->snapshot || surface->snapshot_size.cx != width || surface->snapshot_size.cy != height)
