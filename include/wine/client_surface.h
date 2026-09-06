@@ -35,14 +35,16 @@ enum client_surface_handoff_state
 #define CLIENT_SURFACE_HANDOFF_STATE_BITS 3
 #define CLIENT_SURFACE_HANDOFF_STATE_MASK ((UINT64)((1u << CLIENT_SURFACE_HANDOFF_STATE_BITS) - 1))
 #define CLIENT_SURFACE_HANDOFF_GENERATION_SHIFT CLIENT_SURFACE_HANDOFF_STATE_BITS
-#define CLIENT_SURFACE_HANDOFF_SLOTS 1024
-#define CLIENT_SURFACE_SOURCE_FRAME_COUNT 2
+/* One READY image may wait for output capacity while the other two source
+ * images continue the producer pipeline. Allocation uses the image budget. */
+#define CLIENT_SURFACE_SOURCE_FRAME_COUNT 3
+#define CLIENT_SURFACE_HANDOFF_SLOTS (512 * CLIENT_SURFACE_SOURCE_FRAME_COUNT)
 #define CLIENT_SURFACE_HANDOFF_BITMAP_WORDS (CLIENT_SURFACE_HANDOFF_SLOTS / 64)
 /* Bound mapped metadata and notification descriptors independently of the
- * host's wait primitive. Each binding reserves two of the 1024 slots. */
+ * host's wait primitive. Each binding reserves one group of source slots. */
 #define CLIENT_SURFACE_HANDOFF_MAX_POOLS_PER_CONSUMER 512
 #define CLIENT_SURFACE_HANDOFF_MAGIC ((UINT64)0x57435348414e444full)
-#define CLIENT_SURFACE_HANDOFF_VERSION 8
+#define CLIENT_SURFACE_HANDOFF_VERSION 9
 #define CLIENT_SURFACE_HANDOFF_MAX_CLIP_RECTS 16
 
 #define CLIENT_SURFACE_HANDOFF_NATIVE_X11 0x0001

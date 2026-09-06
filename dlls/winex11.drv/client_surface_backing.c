@@ -526,7 +526,9 @@ static void finish_client_surface_compositor_frame(
            frame->serial, frame->pixmap );
     frame->serial = 0;
     frame->complete = frame->idle = FALSE;
-    flush_client_surface_compositor_mailbox( target );
+    /* Give READY sources a chance to replace a steady mailbox before it is
+     * submitted. A reserved topology publication keeps its original order. */
+    if (target->mailbox_publish_generation) flush_client_surface_compositor_mailbox( target );
 }
 
 static void complete_client_surface_compositor_frame(
@@ -751,7 +753,7 @@ static void flush_client_surface_compositor_mailbox(
     struct client_surface_compositor_frame *frame;
     BOOL copied;
 
-    if (target->quiescing || !target->mailbox_pending ||
+    if (target->quiescing || target->copy_frame || !target->mailbox_pending ||
         count_client_surface_compositor_frames( target ) >= CLIENT_SURFACE_COMPOSITOR_MAX_INFLIGHT)
         return;
     frame = &target->frames[target->mailbox_frame];
@@ -2117,6 +2119,40 @@ static BOOL compose_client_surface_handoff(
         dropped = TRUE;
         goto release;
     }
+#ifdef SONAME_LIBXPRESENT
+    if (usexpresent && !generation && target->mailbox_pending &&
+        !target->mailbox_publish_generation && !target->assembly_pending)
+    {
+        unsigned int i;
+
+        /* Keep the newest complete image in source storage while Present is
+         * full. Release only an older image which an immutable READY sibling
+         * supersedes; never discard the final update of an idle producer.
+         * Skipping a sequence also forces the subsequent copy to use full
+         * damage, since source_sequence still names the last checked copy. */
+        for (i = 0; i < CLIENT_SURFACE_SOURCE_FRAME_COUNT; ++i)
+        {
+            const struct client_surface_handoff_slot *newer = binding->slot + i;
+            UINT64 newer_control = __atomic_load_n( &newer->control, __ATOMIC_ACQUIRE );
+
+            if (i == buffer_index ||
+                client_surface_handoff_state( newer_control ) != CLIENT_SURFACE_HANDOFF_READY ||
+                newer->scene_generation || newer->scene_epoch != epoch ||
+                newer->source_sequence <= slot->source_sequence ||
+                newer->cookie != slot->cookie || newer->identity != slot->identity ||
+                newer->producer_process != slot->producer_process ||
+                newer->window != slot->window || newer->toplevel != slot->toplevel ||
+                newer->target_seq != slot->target_seq || newer->flags != slot->flags ||
+                newer->width != slot->width || newer->height != slot->height ||
+                newer->source_visual != slot->source_visual)
+                continue;
+            dropped = TRUE;
+            goto release;
+        }
+        if (count_client_surface_compositor_frames( target ) >= CLIENT_SURFACE_COMPOSITOR_MAX_INFLIGHT)
+            goto retry;
+    }
+#endif
     layout = &target->scene.layouts[binding->scene_index];
     slot->destination = layout->geometry.monitor_rect;
     destination_width = slot->destination.right > slot->destination.left ?
@@ -2195,6 +2231,8 @@ retry:
                 __atomic_fetch_or( &binding->pool->shared->ready_bitmap[slot_index / 64],
                                    (UINT64)1 << (slot_index % 64),
                                    __ATOMIC_RELEASE );
+            trace_client_surface_source( "retry", binding, control, slot->source_sequence,
+                                         target->window, 0, FALSE );
             return FALSE;
         }
         if (!get_client_surface_compositor_source( binding, buffer_index, slot, &source, &source_depth ))
@@ -2373,6 +2411,16 @@ static void drain_client_surface_notification( int fd )
     do ret = read( fd, &value, sizeof(value) ); while (ret > 0 || (ret < 0 && errno == EINTR));
 }
 
+static void process_client_surface_compositor_mailboxes(void)
+{
+#ifdef SONAME_LIBXPRESENT
+    struct client_surface_compositor_target *target;
+
+    for (target = client_surface_compositor_targets; target; target = target->next)
+        flush_client_surface_compositor_mailbox( target );
+#endif
+}
+
 static void wait_client_surface_compositor_work(void)
 {
     struct pollfd waiters[CLIENT_SURFACE_HANDOFF_MAX_POOLS_PER_CONSUMER + 2];
@@ -2392,12 +2440,18 @@ static void wait_client_surface_compositor_work(void)
     /* Drain before parking, then recheck authoritative work. A publisher
      * racing this scan leaves an unread notification; an earlier publisher
      * is found by the ready bitmap. Do not drain again before poll(). */
-    if (process_client_surface_handoffs()) return;
     process_client_surface_present_events();
     if (process_client_surface_compositor_jobs()) return;
     if (client_surface_compositor_display && XPending( client_surface_compositor_display )) return;
     /* Xlib may have read a reply into XCB while looking for events. Poll the
      * library buffer after that read, before waiting on the kernel fd. */
+    if (process_client_surface_present_replies()) return;
+    if (process_client_surface_copy_replies()) return;
+    if (process_client_surface_handoffs()) return;
+    process_client_surface_compositor_mailboxes();
+    /* A synchronous copy may have buffered events and replies while handling
+     * the sources above. Recheck after those requests as well, before poll. */
+    if (client_surface_compositor_display && XPending( client_surface_compositor_display )) return;
     if (process_client_surface_present_replies()) return;
     if (process_client_surface_copy_replies()) return;
     pthread_mutex_lock( &client_surface_compositor_mutex );
@@ -2656,6 +2710,7 @@ static void client_surface_compositor_thread( void *context )
         progressed |= process_client_surface_copy_replies();
         progressed |= process_client_surface_compositor_jobs();
         progressed |= process_client_surface_handoffs();
+        process_client_surface_compositor_mailboxes();
         if (!progressed) wait_client_surface_compositor_work();
     }
 }

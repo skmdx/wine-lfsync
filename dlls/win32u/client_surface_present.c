@@ -279,7 +279,7 @@ static BOOL acquire_client_surface_handoff( struct client_surface *surface, UINT
         LONG sequence;
         BOOL available = FALSE;
 
-        /* Prefer returned storage. Only when both images are occupied may an
+        /* Prefer returned storage. Only when all images are occupied may an
          * unsubmitted private generation be superseded; READY and READING
          * images are immutable until the owner returns that particular slot. */
         for (pass = 0; pass < 2; ++pass)
