@@ -2199,7 +2199,8 @@ static void win32u_init_extensions( BOOLEAN extensions[GL_EXTENSION_COUNT] )
 static void win32u_get_pixel_formats( struct wgl_pixel_format *formats, UINT max_formats,
                                       UINT *num_formats, UINT *num_onscreen_formats )
 {
-    memcpy( formats, pixel_formats, min( max_formats, formats_count ) * sizeof(*pixel_formats) );
+    max_formats = min( max_formats, formats_count );
+    if (max_formats) memcpy( formats, pixel_formats, max_formats * sizeof(*pixel_formats) );
     *num_formats = formats_count;
     *num_onscreen_formats = onscreen_count;
 }

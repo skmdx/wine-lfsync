@@ -1737,7 +1737,7 @@ static inline void set_dash_pattern( dash_pattern *pattern, DWORD count, DWORD *
 
     pattern->count = count;
     pattern->total_len = 0;
-    memcpy( pattern->dashes, dashes, count * sizeof(DWORD) );
+    if (count) memcpy( pattern->dashes, dashes, count * sizeof(DWORD) );
     for (i = 0; i < count; i++) pattern->total_len += dashes[i];
     if (pattern->count % 2) pattern->total_len *= 2;
 }

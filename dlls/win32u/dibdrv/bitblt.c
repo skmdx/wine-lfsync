@@ -910,7 +910,8 @@ static BOOL matching_color_info( const dib_info *dib, const BITMAPINFO *info, BO
     {
     case 1:
         if (dib->color_table_size != info->bmiHeader.biClrUsed) return FALSE;
-        return !memcmp( color_table, dib->color_table, dib->color_table_size * sizeof(RGBQUAD) );
+        return !dib->color_table_size ||
+               !memcmp( color_table, dib->color_table, dib->color_table_size * sizeof(RGBQUAD) );
 
     case 4:
     case 8:
