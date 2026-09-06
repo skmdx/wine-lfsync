@@ -3430,8 +3430,8 @@ void X11DRV_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_hint, UIN
 
     if ((is_managed = is_window_managed( hwnd, swp_flags, fullscreen ))) make_owner_managed( hwnd );
 
+    owner_update = X11DRV_client_surface_backing_begin_update( hwnd );
     if (!(data = get_win_data( hwnd ))) return;
-    owner_update = X11DRV_client_surface_backing_begin_update( data );
     if (is_managed) window_set_managed( data, TRUE );
 
     old_rects = data->rects;
@@ -3671,11 +3671,10 @@ void X11DRV_SetWindowIcons( HWND hwnd, HICON icon, const ICONINFO *ii, HICON ico
 void X11DRV_SetWindowRgn( HWND hwnd, HRGN hrgn, BOOL redraw )
 {
     struct x11drv_win_data *data;
+    BOOL owner_update = X11DRV_client_surface_backing_begin_update( hwnd );
 
     if ((data = get_win_data( hwnd )))
     {
-        BOOL owner_update = X11DRV_client_surface_backing_begin_update( data );
-
         sync_window_region( data, hrgn );
         if (owner_update) X11DRV_client_surface_backing_end_update( data );
         release_win_data( data );

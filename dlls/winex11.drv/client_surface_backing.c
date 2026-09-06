@@ -2894,15 +2894,25 @@ static void remove_client_surface_backing_target( HWND toplevel )
     submit_client_surface_compositor_job( &job );
 }
 
-BOOL X11DRV_client_surface_backing_begin_update( struct x11drv_win_data *data )
+BOOL X11DRV_client_surface_backing_begin_update( HWND hwnd )
 {
+    struct x11drv_win_data *data;
+    BOOL backing;
     struct client_surface_compositor_job job =
     {
         .op = CLIENT_SURFACE_COMPOSITOR_BEGIN_UPDATE,
-        .handoff_toplevel = data->hwnd,
+        .handoff_toplevel = hwnd,
     };
 
-    if (!data->client_surface_backing) return FALSE;
+    if (!(data = get_win_data( hwnd ))) return FALSE;
+    backing = !!data->client_surface_backing;
+    release_win_data( data );
+    if (!backing) return FALSE;
+
+    /* A missing Present event can leave this target quiescing indefinitely.
+     * Do not hold the process-wide window-data lock while it drains. Keep
+     * only the handle across the wait; the caller must look up its data again.
+     * Destroying the window also removes its compositor target. */
     return submit_client_surface_compositor_job( &job );
 }
 
