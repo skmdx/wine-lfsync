@@ -192,11 +192,19 @@ struct glx_pixel_format
     DWORD       dwFlags; /* We store some PFD_* flags in here for emulated bitmap formats */
 };
 
+struct glx_completion_context
+{
+    pthread_mutex_t lock;
+    GLXContext context;
+    GLXPbuffer pbuffer;
+};
+
 struct gl_drawable
 {
     struct opengl_drawable         base;
     GLXDrawable                    drawable;     /* drawable for rendering with GL */
     BOOL                           gpu_snapshot_failed;
+    struct glx_completion_context *completion;
 };
 
 static struct gl_drawable *impl_from_opengl_drawable( struct opengl_drawable *base )
@@ -273,6 +281,9 @@ static GLXDrawable (*pglXGetCurrentDrawable)( void );
 static const char *(*pglXQueryExtensionsString)( Display *dpy, int screen );
 static const char *(*pglXQueryServerString)( Display *dpy, int screen, int name );
 static const char *(*pglXGetClientString)( Display *dpy, int name );
+
+/* GLX 1.2 */
+static Display *(*pglXGetCurrentDisplay)( void );
 
 /* GLX 1.3 */
 static int (*pglXGetFBConfigAttrib)( Display *dpy, GLXFBConfig config, int attribute, int *value );
@@ -651,6 +662,9 @@ UINT X11DRV_OpenGLInit( UINT version, const struct opengl_funcs *opengl_funcs, c
     LOAD_FUNCPTR(glXQueryExtensionsString);
     LOAD_FUNCPTR(glXQueryServerString);
 
+    /* GLX 1.2 */
+    LOAD_FUNCPTR(glXGetCurrentDisplay);
+
     /* GLX 1.3 */
     LOAD_FUNCPTR(glXCreatePbuffer);
     LOAD_FUNCPTR(glXCreateNewContext);
@@ -897,12 +911,41 @@ static UINT x11drv_init_pixel_formats( UINT *onscreen_count )
     return size;
 }
 
+static int glx_completion_error_handler( Display *display, XErrorEvent *event, void *arg )
+{
+    /* This scope owns the display lock and requests from a private resource
+     * operation only. Direct-rendering drivers can also issue core X or DRI3
+     * allocation requests, which the GLX-opcode-only handler would reject. */
+    return 1;
+}
+
+static void destroy_glx_completion_objects( struct glx_completion_context *completion )
+{
+    /* The caller owns the query domain, or the drawable's final reference.
+     * A failed creation can leave a client handle with no server resource.
+     * Release it under a fresh error scope, including asynchronous errors. */
+    if (!completion->context && !completion->pbuffer) return;
+    X11DRV_expect_error( gdi_display, glx_completion_error_handler, NULL );
+    if (completion->context) pglXDestroyContext( gdi_display, completion->context );
+    if (completion->pbuffer) pglXDestroyPbuffer( gdi_display, completion->pbuffer );
+    XSync( gdi_display, False );
+    if (X11DRV_check_error()) TRACE( "Failed to destroy GLX completion objects\n" );
+    completion->context = NULL;
+    completion->pbuffer = None;
+}
+
 static void x11drv_surface_destroy( struct opengl_drawable *base )
 {
     struct gl_drawable *gl = impl_from_opengl_drawable( base );
 
     TRACE( "drawable %s\n", debugstr_opengl_drawable( base ) );
 
+    if (gl->completion)
+    {
+        destroy_glx_completion_objects( gl->completion );
+        pthread_mutex_destroy( &gl->completion->lock );
+        free( gl->completion );
+    }
     if (gl->drawable)
     {
         /* The last reference can belong to a completion worker. DRI3 teardown
@@ -973,6 +1016,19 @@ static BOOL x11drv_surface_create( struct client_surface *client, int format, st
     struct gl_drawable *gl;
 
     if (!(gl = opengl_drawable_create( sizeof(*gl), &x11drv_surface_funcs, format, client ))) return FALSE;
+    if (pglXGetSyncValuesOML && pglXSwapBuffersMscOML)
+    {
+        struct glx_completion_context *completion = calloc( 1, sizeof(*completion) );
+
+        if (completion && pthread_mutex_init( &completion->lock, NULL ))
+        {
+            free( completion );
+            completion = NULL;
+        }
+        /* No private query domain means using the shared completion monitor,
+         * armed before the native swap, rather than inventing OML evidence. */
+        gl->completion = completion;
+    }
     gl->base.needs_framebuffer = !usexcomposite;
     if (!(gl->drawable = pglXCreateWindow( gdi_display, fmt->fbconfig, surface->window, NULL )))
     {
@@ -1481,7 +1537,52 @@ static void x11drv_init_extensions( struct opengl_funcs *funcs, BOOLEAN extensio
     }
 }
 
-static BOOL wait_glx_swap_serial( struct gl_drawable *gl, INT64 target_sbc, DWORD timeout )
+static BOOL prepare_glx_completion_context( struct glx_completion_context *completion )
+{
+    static const int attribs[] = {GLX_PBUFFER_WIDTH, 1, GLX_PBUFFER_HEIGHT, 1, None};
+    GLXFBConfig *configs, config = NULL;
+    int count, i, drawable_type, render_type, error;
+
+    if (completion->context) return TRUE;
+    /* Queries address an explicit drawable. Their current context need not
+     * use its format, so choose a pbuffer-capable RGBA config independently
+     * of application window formats which may not support pbuffers. */
+    XLockDisplay( gdi_display );
+    configs = pglXGetFBConfigs( gdi_display, DefaultScreen( gdi_display ), &count );
+    for (i = 0; configs && i < count; ++i)
+    {
+        if (pglXGetFBConfigAttrib( gdi_display, configs[i], GLX_DRAWABLE_TYPE, &drawable_type ) ||
+            pglXGetFBConfigAttrib( gdi_display, configs[i], GLX_RENDER_TYPE, &render_type )) continue;
+        if (!(drawable_type & GLX_PBUFFER_BIT) || !(render_type & GLX_RGBA_BIT)) continue;
+        config = configs[i];
+        break;
+    }
+    if (configs) XFree( configs );
+    XUnlockDisplay( gdi_display );
+    if (!config) return FALSE;
+
+    X11DRV_expect_error( gdi_display, glx_completion_error_handler, NULL );
+    completion->context = pglXCreateNewContext( gdi_display, config, GLX_RGBA_TYPE, NULL, True );
+    XSync( gdi_display, False );
+    error = X11DRV_check_error();
+    if (error || !completion->context) goto failed;
+
+    X11DRV_expect_error( gdi_display, glx_completion_error_handler, NULL );
+    completion->pbuffer = pglXCreatePbuffer( gdi_display, config, attribs );
+    XSync( gdi_display, False );
+    error = X11DRV_check_error();
+    /* A failed server allocation can still return a client-side handle.
+     * Cleanup must release that handle while accepting the missing XID. */
+    if (error || !completion->pbuffer) goto failed;
+    TRACE( "created GLX completion context %p pbuffer %lx\n", completion->context, completion->pbuffer );
+    return TRUE;
+
+failed:
+    destroy_glx_completion_objects( completion );
+    return FALSE;
+}
+
+static BOOL query_glx_swap_serial( struct gl_drawable *gl, INT64 target_sbc, DWORD timeout )
 {
     LARGE_INTEGER delay;
     DWORD delay_ms = 1;
@@ -1504,6 +1605,83 @@ static BOOL wait_glx_swap_serial( struct gl_drawable *gl, INT64 target_sbc, DWOR
         NtDelayExecution( FALSE, &delay );
         delay_ms = min( delay_ms * 2, (DWORD)4 );
     }
+}
+
+static BOOL make_glx_completion_current( GLXDrawable drawable, GLXContext context, BOOL legacy )
+{
+    BOOL ret;
+    int error;
+
+    /* GLX may report a binding failure through an X error, including after
+     * returning a client-side result. Do not extend this global error scope
+     * across the completion query or its polling delay. */
+    X11DRV_expect_error( gdi_display, glx_completion_error_handler, NULL );
+    if (legacy) ret = pglXMakeCurrent( gdi_display, drawable, context );
+    else ret = pglXMakeContextCurrent( gdi_display, drawable, drawable, context );
+    XSync( gdi_display, False );
+    error = X11DRV_check_error();
+    return ret && !error && pglXGetCurrentContext() == context;
+}
+
+static BOOL wait_glx_swap_serial( struct gl_drawable *gl, INT64 target_sbc, DWORD timeout )
+{
+    struct glx_completion_context *completion = gl->completion;
+    GLXContext current = pglXGetCurrentContext();
+    DWORD start = NtGetTickCount(), elapsed;
+    BOOL completed = FALSE, bound, unbound;
+
+    /* OML queries require a current GLX context. An inline caller already
+     * owns its context on this thread; leave its binding and GL state alone.
+     * A context from another display must not select a different GLX driver. */
+    if (current)
+    {
+        /* Only x11drv_make_current() records application contexts in the TEB.
+         * If both private unbind operations failed, deletion does not clear
+         * the native current binding. Never mistake it for an inline caller. */
+        if (current != NtCurrentTeb()->glReserved2)
+        {
+            WARN( "Refusing a non-Wine current GLX context %p during completion\n", current );
+            return FALSE;
+        }
+        return pglXGetCurrentDisplay() == gdi_display && query_glx_swap_serial( gl, target_sbc, timeout );
+    }
+    if (!completion) return FALSE;
+
+    /* The token retains gl through query and release. This domain belongs to
+     * that native drawable, not a thread or the process; another worker may
+     * use it after we unbind. Never make the producer's window current here. */
+    pthread_mutex_lock( &completion->lock );
+    if (!prepare_glx_completion_context( completion )) goto done;
+    bound = make_glx_completion_current( completion->pbuffer, completion->context, FALSE );
+    if (bound)
+    {
+        elapsed = NtGetTickCount() - start;
+        completed = query_glx_swap_serial( gl, target_sbc, elapsed < timeout ? timeout - elapsed : 0 );
+    }
+    /* Even a failed bind can have changed the client-side current context
+     * before an asynchronous server error was delivered. Unwind that binding. */
+    unbound = TRUE;
+    if (pglXGetCurrentContext() == completion->context)
+    {
+        unbound = make_glx_completion_current( None, NULL, FALSE );
+        if (!unbound)
+        {
+            WARN( "Failed to unbind GLX completion context %p\n", completion->context );
+            if (pglXGetCurrentContext() == completion->context &&
+                !make_glx_completion_current( None, NULL, TRUE ))
+                ERR( "Failed to release the current GLX completion context\n" );
+        }
+    }
+    if (!bound || !unbound)
+    {
+        /* GLX defers deletion of a current context until its thread releases
+         * it. Do not let another worker attempt to bind that context again. */
+        destroy_glx_completion_objects( completion );
+        completed = FALSE;
+    }
+done:
+    pthread_mutex_unlock( &completion->lock );
+    return completed;
 }
 
 struct glx_present_completion
@@ -1615,7 +1793,7 @@ static BOOL x11drv_surface_swap( struct opengl_drawable *base )
 
     TRACE( "drawable %s\n", debugstr_opengl_drawable( base ) );
 
-    use_oml = ctx && pglXGetSyncValuesOML && pglXSwapBuffersMscOML;
+    use_oml = ctx && gl->completion;
     client_surface_prepare_present( base->client, &present, use_oml || !usexcomposite );
     client_surface_begin_present( base->client );
     /* A native offscreen target has an exact token even while the owner scene
