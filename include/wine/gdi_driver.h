@@ -219,7 +219,7 @@ struct gdi_dc_funcs
 };
 
 /* increment this when changing driver tables or shared driver-facing structures */
-#define WINE_GDI_DRIVER_VERSION 125
+#define WINE_GDI_DRIVER_VERSION 126
 
 #define GDI_PRIORITY_NULL_DRV        0  /* null driver */
 #define GDI_PRIORITY_FONT_DRV      100  /* any font driver */
@@ -254,6 +254,9 @@ struct client_surface_scene;
  * it before completion; only the core's completed frame enters the channel. */
 struct client_surface_source
 {
+    LONG64 reservation; /* producer-private token, zero once completed/abandoned */
+    UINT64 publication; /* consumer sequence which releases this image */
+    BOOL published;
     UINT64 source;
     UINT64 source_visual;
     UINT64 target_seq;
@@ -430,9 +433,10 @@ struct client_surface
     void                              *handoff_view;
     SIZE_T                             handoff_view_size;
     struct client_surface_handoff_shared *handoff_shared;
-    struct client_surface_handoff_slot *handoff_slot;
+    struct client_surface_handoff_channel *handoff_channel;
     struct client_surface_source        handoff_source[CLIENT_SURFACE_SOURCE_FRAME_COUNT];
     unsigned int next_handoff;
+    UINT64                             handoff_serial;
     UINT64                             handoff_mapping_id;
     UINT64                             handoff_cookie;
     BOOL                               handoff_release_pending;

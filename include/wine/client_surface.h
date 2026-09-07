@@ -22,37 +22,22 @@ enum client_surface_presentation_mode
     CLIENT_SURFACE_PRESENTATION_COMPOSITED,
 };
 
-enum client_surface_handoff_state
-{
-    CLIENT_SURFACE_HANDOFF_FREE,
-    CLIENT_SURFACE_HANDOFF_SUBMITTED,
-    CLIENT_SURFACE_HANDOFF_READY,
-    CLIENT_SURFACE_HANDOFF_READING,
-    CLIENT_SURFACE_HANDOFF_RELEASED,
-    CLIENT_SURFACE_HANDOFF_LOST,
-};
-
-#define CLIENT_SURFACE_HANDOFF_STATE_BITS 3
-#define CLIENT_SURFACE_HANDOFF_STATE_MASK ((UINT64)((1u << CLIENT_SURFACE_HANDOFF_STATE_BITS) - 1))
-#define CLIENT_SURFACE_HANDOFF_GENERATION_SHIFT CLIENT_SURFACE_HANDOFF_STATE_BITS
-/* One READY image may wait for output capacity while the other two source
- * images continue the producer pipeline. Allocation uses the image budget. */
+/* Private native storage and the completed-frame ring have separate capacities.
+ * A power-of-two descriptor ring keeps indexing valid across UINT64 wrap. */
 #define CLIENT_SURFACE_SOURCE_FRAME_COUNT 3
-#define CLIENT_SURFACE_HANDOFF_SLOTS (512 * CLIENT_SURFACE_SOURCE_FRAME_COUNT)
-#define CLIENT_SURFACE_HANDOFF_BITMAP_WORDS (CLIENT_SURFACE_HANDOFF_SLOTS / 64)
-/* Bound mapped metadata and notification descriptors independently of the
- * host's wait primitive. Each binding reserves one group of source slots. */
+#define CLIENT_SURFACE_HANDOFF_RING_SIZE 4
+#define CLIENT_SURFACE_HANDOFF_CHANNELS 512
+#define CLIENT_SURFACE_HANDOFF_BITMAP_WORDS (CLIENT_SURFACE_HANDOFF_CHANNELS / 64)
 #define CLIENT_SURFACE_HANDOFF_MAX_POOLS_PER_CONSUMER 512
 #define CLIENT_SURFACE_HANDOFF_MAGIC ((UINT64)0x57435348414e444full)
-#define CLIENT_SURFACE_HANDOFF_VERSION 10
-#define CLIENT_SURFACE_HANDOFF_MAX_CLIP_RECTS 16
+#define CLIENT_SURFACE_HANDOFF_VERSION 11
 
 #define CLIENT_SURFACE_HANDOFF_NATIVE_X11 0x0001
 #define CLIENT_SURFACE_HANDOFF_FULL_DAMAGE 0x0002
 #define CLIENT_SURFACE_HANDOFF_CLIPPED 0x0004
 #define CLIENT_SURFACE_HANDOFF_XFIXES_CLIP 0x0008
 #define CLIENT_SURFACE_HANDOFF_PIXMAP_CLIP 0x0010
-/* Producer-owned snapshot: copy while READING, without retaining its XID. */
+/* Producer-owned snapshot: copy before acknowledging, without retaining its XID. */
 #define CLIENT_SURFACE_HANDOFF_COPY_SOURCE 0x0020
 /* Completed independent image. Placement is selected from the owner's current
  * scene after validating this binding and the image's actual dimensions. */
@@ -60,45 +45,11 @@ enum client_surface_handoff_state
 #define CLIENT_SURFACE_HANDOFF_ENDPOINT_PRODUCER 0x0001
 #define CLIENT_SURFACE_HANDOFF_ENDPOINT_CONSUMER 0x0002
 
-static inline UINT64 client_surface_handoff_control( UINT64 generation,
-                                                     enum client_surface_handoff_state state )
-{
-    return generation << CLIENT_SURFACE_HANDOFF_GENERATION_SHIFT | state;
-}
-
-static inline UINT64 client_surface_handoff_generation( UINT64 control )
-{
-    return control >> CLIENT_SURFACE_HANDOFF_GENERATION_SHIFT;
-}
-
-static inline UINT64 client_surface_handoff_next_generation( UINT64 generation )
-{
-    generation = (generation + 1) & (~(UINT64)0 >> CLIENT_SURFACE_HANDOFF_GENERATION_SHIFT);
-    if (!generation) generation = 1;
-    return generation;
-}
-
-static inline enum client_surface_handoff_state client_surface_handoff_state( UINT64 control )
-{
-    return control & CLIENT_SURFACE_HANDOFF_STATE_MASK;
-}
-
-struct client_surface_handoff_clip_rect
-{
-    SHORT x;
-    SHORT y;
-    USHORT width;
-    USHORT height;
-};
-
-C_ASSERT( sizeof(struct client_surface_handoff_clip_rect) == 8 );
-
-/* The producer owns the payload from SUBMITTED until READY. The owner acquires
- * it with READY -> READING, copies the image into its local cache, and returns
- * source storage with RELEASED. Replay uses that cache, never returned slots. */
+/* Only completed immutable image metadata enters the ring. The producer owns
+ * a slot until producer_sequence publishes it; consumer_sequence returns it
+ * after the owner's checked cache copy. There is no shared per-slot state. */
 struct DECLSPEC_ALIGN(64) client_surface_handoff_slot
 {
-    LONG64 control;
     UINT64 cookie;
     UINT64 identity;
     UINT64 scene_epoch;
@@ -114,36 +65,61 @@ struct DECLSPEC_ALIGN(64) client_surface_handoff_slot
     UINT width;
     UINT height;
     RECT damage;
-    LONG endpoints;
-    UINT clip_count;
-    UINT64 clip_region;
-    struct client_surface_handoff_clip_rect clips[CLIENT_SURFACE_HANDOFF_MAX_CLIP_RECTS];
     UINT64 source_sequence;
     UINT64 damage_base_sequence;
-    UINT64 reserved[5];
 };
 
-C_ASSERT( sizeof(struct client_surface_handoff_slot) == 320 );
+C_ASSERT( sizeof(struct client_surface_handoff_slot) == 128 );
 
-/* One mapping is shared by one producer/owner process pair. There is a single
- * owner-side consumer, so the lfsync-style parked claim cannot strand another
- * compositor waiter. */
+/* A channel has one serialized completion publisher and one compositor
+ * consumer. Server/endpoint retirement closes the channel without changing
+ * either sequence or acknowledging unfinished native reads. */
+struct DECLSPEC_ALIGN(64) client_surface_handoff_channel
+{
+    LONG64 producer_sequence;
+    UINT64 producer_padding[7];
+    LONG64 consumer_sequence;
+    UINT64 consumer_padding[7];
+    UINT64 cookie;
+    UINT64 identity;
+    UINT producer_process;
+    UINT window;
+    UINT toplevel;
+    LONG endpoints;
+    LONG closed;
+    UINT reserved[7];
+    struct client_surface_handoff_slot slots[CLIENT_SURFACE_HANDOFF_RING_SIZE];
+};
+
+C_ASSERT( offsetof(struct client_surface_handoff_channel, slots) == 192 );
+
+/* A process pair can share many surface channels. The bitmap and parked
+ * notification are hints; each channel's sequence is the authoritative queue. */
 struct DECLSPEC_ALIGN(64) client_surface_handoff_shared
 {
     UINT64 magic;
     UINT64 mapping_id;
     UINT version;
-    UINT slot_count;
+    UINT channel_count;
     LONG ready_sequence;
     LONG ready_parked;
     LONG release_sequence;
     LONG release_parked;
     UINT reserved[6];
     LONG64 ready_bitmap[CLIENT_SURFACE_HANDOFF_BITMAP_WORDS];
-    struct client_surface_handoff_slot slots[CLIENT_SURFACE_HANDOFF_SLOTS];
+    struct client_surface_handoff_channel channels[CLIENT_SURFACE_HANDOFF_CHANNELS];
 };
 
-C_ASSERT( offsetof(struct client_surface_handoff_shared, slots) % 64 == 0 );
+C_ASSERT( offsetof(struct client_surface_handoff_shared, channels) % 64 == 0 );
+
+static inline BOOL client_surface_handoff_consumed( const struct client_surface_handoff_channel *channel,
+                                                     UINT64 publication )
+{
+    UINT64 consumed = __atomic_load_n( &channel->consumer_sequence, __ATOMIC_ACQUIRE );
+
+    /* Outstanding publications are bounded by RING_SIZE, including at wrap. */
+    return consumed - publication < ((UINT64)1 << 63);
+}
 
 enum client_surface_completion_kind
 {

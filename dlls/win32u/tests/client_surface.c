@@ -1079,7 +1079,7 @@ static void test_handoff_receipts(void)
     const UINT_PTR identity = 0x79580000;
     struct handoff_binding producer = {0}, owner = {0};
     struct client_surface_handoff_receipt receipt;
-    struct client_surface_handoff_slot *slots;
+    struct client_surface_handoff_channel *channel;
     struct surface_state state, before;
     struct __server_request_info info = {0};
     HWND hwnd = create_test_window( FALSE );
@@ -1100,11 +1100,10 @@ static void test_handoff_receipts(void)
     view = MapViewOfFile( producer.mapping, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, producer.size );
     ok( !!view, "receipt source mapping failed %lu\n", GetLastError() );
     if (!view) goto done;
-    slots = (void *)((char *)view + producer.offset);
-    ok( producer.offset + CLIENT_SURFACE_SOURCE_FRAME_COUNT * sizeof(*slots) <= producer.size,
-        "independent source images exceed their mapping\n" );
-    ok( slots[1].cookie == producer.cookie && slots[1].identity == identity,
-        "second source image has an unrelated identity\n" );
+    channel = (void *)((char *)view + producer.offset);
+    ok( producer.offset + sizeof(*channel) <= producer.size, "channel exceeds its mapping\n" );
+    ok( channel->cookie == producer.cookie && channel->identity == identity,
+        "source channel has an unrelated identity\n" );
     status = get_surface_handoff( hwnd, GetCurrentProcessId(), identity, TRUE, &owner );
     ok( !status, "receipt owner bind status %#x\n", status );
     if (status) goto done;
@@ -1119,17 +1118,16 @@ static void test_handoff_receipts(void)
         .handle = wine_server_user_handle( hwnd ), .process = GetCurrentProcessId(),
         .surface = identity, .cookie = producer.cookie, .source_generation = 7, .buffer_index = 1,
     };
-    __atomic_store_n( &slots[1].control,
-        client_surface_handoff_control( 8, CLIENT_SURFACE_HANDOFF_SUBMITTED ), __ATOMIC_RELEASE );
-    ok( client_surface_handoff_state( __atomic_load_n( &slots[0].control, __ATOMIC_ACQUIRE ) ) ==
-        CLIENT_SURFACE_HANDOFF_FREE, "reserving image 1 changed image 0\n" );
+    channel->slots[1].source_sequence = 8;
+    __atomic_store_n( &channel->producer_sequence, 2, __ATOMIC_RELEASE );
+    __atomic_store_n( &channel->consumer_sequence, 2, __ATOMIC_RELEASE );
     status = complete_surface_handoffs( hwnd, state.generation, state.scene_generation, NULL, 0, &accepted );
     ok( !status && !accepted, "missing receipt accepted, status %#x\n", status );
     ++receipt.cookie;
     status = complete_surface_handoffs( hwnd, state.generation, state.scene_generation, &receipt, 1, &accepted );
     ok( !status && !accepted, "stale binding receipt accepted, status %#x\n", status );
     --receipt.cookie;
-    receipt.buffer_index = CLIENT_SURFACE_SOURCE_FRAME_COUNT;
+    receipt.buffer_index = CLIENT_SURFACE_HANDOFF_RING_SIZE;
     status = complete_surface_handoffs( hwnd, state.generation, state.scene_generation, &receipt, 1, &accepted );
     ok( !status && !accepted, "out-of-range source receipt accepted, status %#x\n", status );
     receipt.buffer_index = 1;
@@ -1179,11 +1177,12 @@ static void test_handoff_storage(void)
 {
     const UINT_PTR identity = 0x79400000;
     const UINT flags = CLIENT_SURFACE_STATE_REGISTER | CLIENT_SURFACE_STATE_SCENE_PUBLICATION;
-    struct handoff_binding producer = {0}, owner = {0}, replacement = {0}, denied;
+    struct handoff_binding producer = {0}, owner = {0}, replacement = {0}, adjacent = {0}, denied;
     struct client_surface_handoff_shared *producer_shared = NULL, *owner_shared = NULL;
-    struct client_surface_handoff_slot *producer_slot = NULL, *owner_slot = NULL;
+    struct client_surface_handoff_channel *producer_slot = NULL, *owner_slot = NULL, *other_channel = NULL;
     HWND hwnd = create_test_window( FALSE ), other = create_test_window( FALSE );
-    UINT64 expected, control, generation, old_cookie = 0;
+    UINT64 produced, consumed, old_cookie = 0;
+    unsigned int round, i;
     BOOL producer_bound = FALSE, owner_bound = FALSE;
     BOOL accepted = TRUE;
     unsigned int status, index;
@@ -1226,17 +1225,17 @@ static void test_handoff_storage(void)
         producer.offset == owner.offset && producer.mapping_id == owner.mapping_id &&
         producer.cookie == owner.cookie && producer.cookie && producer.mapping_id,
         "producer/owner handoff bindings differ\n" );
-    ok( producer.offset >= offsetof(struct client_surface_handoff_shared, slots) &&
+    ok( producer.offset >= offsetof(struct client_surface_handoff_shared, channels) &&
         producer.offset + sizeof(*producer_slot) <= producer.size && !(producer.offset % 64),
         "invalid handoff slot layout size %u offset %u\n", producer.size, producer.offset );
     producer_shared = producer_view;
     owner_shared = owner_view;
     producer_slot = (void *)((char *)producer_view + producer.offset);
     owner_slot = (void *)((char *)owner_view + owner.offset);
-    index = producer_slot - producer_shared->slots;
+    index = producer_slot - producer_shared->channels;
     ok( producer_shared->magic == CLIENT_SURFACE_HANDOFF_MAGIC &&
         producer_shared->version == CLIENT_SURFACE_HANDOFF_VERSION &&
-        producer_shared->slot_count == CLIENT_SURFACE_HANDOFF_SLOTS &&
+        producer_shared->channel_count == CLIENT_SURFACE_HANDOFF_CHANNELS &&
         producer_shared->mapping_id == producer.mapping_id,
         "invalid producer handoff header\n" );
     ok( owner_shared->magic == CLIENT_SURFACE_HANDOFF_MAGIC &&
@@ -1249,69 +1248,77 @@ static void test_handoff_storage(void)
     ok( producer_slot->endpoints == (CLIENT_SURFACE_HANDOFF_ENDPOINT_PRODUCER |
                                      CLIENT_SURFACE_HANDOFF_ENDPOINT_CONSUMER),
         "handoff endpoints %#lx\n", producer_slot->endpoints );
-    control = __atomic_load_n( &producer_slot->control, __ATOMIC_ACQUIRE );
-    generation = client_surface_handoff_generation( control );
-    ok( generation && client_surface_handoff_state( control ) == CLIENT_SURFACE_HANDOFF_FREE,
-        "new handoff control %s\n", wine_dbgstr_longlong( control ) );
-    ok( client_surface_handoff_next_generation( ~(UINT64)0 >>
-                                                CLIENT_SURFACE_HANDOFF_GENERATION_SHIFT ) == 1,
-        "handoff generation wrap did not skip zero\n" );
+    ok( !producer_slot->producer_sequence && !producer_slot->consumer_sequence && !producer_slot->closed,
+        "new channel is not empty and open\n" );
+    status = set_surface_state( other, identity + 1, flags, 0, NULL );
+    ok( !status, "adjacent surface registration status %#x\n", status );
+    status = get_surface_handoff( other, 0, identity + 1, FALSE, &adjacent );
+    ok( !status, "adjacent channel bind status %#x\n", status );
+    if (!status)
+    {
+        ok( adjacent.mapping_id == producer.mapping_id && adjacent.offset != producer.offset,
+            "surfaces did not receive separate channels in the process-pair mapping\n" );
+        if (adjacent.mapping_id == producer.mapping_id && adjacent.offset != producer.offset)
+        {
+            other_channel = (void *)((char *)producer_view + adjacent.offset);
+            __atomic_store_n( &other_channel->producer_sequence, 1, __ATOMIC_RELEASE );
+        }
+        CloseHandle( adjacent.mapping );
+        adjacent.mapping = NULL;
+    }
+    /* Use both mappings, fill the whole ring before returning any descriptor,
+     * and cross UINT64 wrap. Adjacent surfaces keep independent sequences. */
+    for (round = 0; round < 3; ++round)
+    {
+        UINT64 start = round == 2 ? ~(UINT64)0 - 1 : round * CLIENT_SURFACE_HANDOFF_RING_SIZE;
 
-    expected = control;
-    control = client_surface_handoff_control( generation, CLIENT_SURFACE_HANDOFF_SUBMITTED );
-    ok( __atomic_compare_exchange_n( &producer_slot->control, &expected, control, FALSE,
-                                     __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE ),
-        "FREE -> SUBMITTED transition failed\n" );
-    expected = client_surface_handoff_control( generation, CLIENT_SURFACE_HANDOFF_FREE );
-    ok( !__atomic_compare_exchange_n( &producer_slot->control, &expected,
-                                      client_surface_handoff_control( generation,
-                                                                      CLIENT_SURFACE_HANDOFF_READING ),
-                                      FALSE, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE ),
-        "stale FREE token bypassed SUBMITTED\n" );
-    producer_slot->source = 0x12345678;
-    producer_slot->scene_generation = 0;
-    producer_slot->scene_epoch = 0;
-    expected = control;
-    control = client_surface_handoff_control( generation, CLIENT_SURFACE_HANDOFF_READY );
-    ok( __atomic_compare_exchange_n( &producer_slot->control, &expected, control, FALSE,
-                                     __ATOMIC_RELEASE, __ATOMIC_ACQUIRE ),
-        "SUBMITTED -> READY transition failed\n" );
-    __atomic_fetch_or( &producer_shared->ready_bitmap[index / 64],
-                       (UINT64)1 << (index % 64), __ATOMIC_RELEASE );
-    ok( owner_slot->source == 0x12345678 &&
-        (__atomic_load_n( &owner_shared->ready_bitmap[index / 64], __ATOMIC_ACQUIRE ) &
-         ((UINT64)1 << (index % 64))), "owner did not observe READY payload\n" );
-    expected = control;
-    control = client_surface_handoff_control( generation, CLIENT_SURFACE_HANDOFF_READING );
-    ok( __atomic_compare_exchange_n( &owner_slot->control, &expected, control, FALSE,
-                                     __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE ),
-        "READY -> READING transition failed\n" );
-    __atomic_fetch_and( &owner_shared->ready_bitmap[index / 64],
-                        ~((UINT64)1 << (index % 64)), __ATOMIC_RELEASE );
+        __atomic_store_n( &producer_slot->producer_sequence, start, __ATOMIC_RELEASE );
+        __atomic_store_n( &owner_slot->consumer_sequence, start, __ATOMIC_RELEASE );
+        for (i = 0; i < CLIENT_SURFACE_HANDOFF_RING_SIZE; ++i)
+        {
+            struct client_surface_handoff_slot *frame =
+                &producer_slot->slots[(start + i) & (CLIENT_SURFACE_HANDOFF_RING_SIZE - 1)];
 
+            frame->source = 0x12345678 + i;
+            frame->source_sequence = i + 1;
+            __atomic_store_n( &producer_slot->producer_sequence, start + i + 1, __ATOMIC_RELEASE );
+            ok( !client_surface_handoff_consumed( producer_slot, start + i + 1 ),
+                "unread descriptor %u was returned at round %u\n", i, round );
+        }
+        __atomic_fetch_or( &producer_shared->ready_bitmap[index / 64],
+                           (UINT64)1 << (index % 64), __ATOMIC_RELEASE );
+        __atomic_fetch_and( &owner_shared->ready_bitmap[index / 64],
+                            ~((UINT64)1 << (index % 64)), __ATOMIC_ACQ_REL );
+        produced = __atomic_load_n( &owner_slot->producer_sequence, __ATOMIC_ACQUIRE );
+        consumed = __atomic_load_n( &owner_slot->consumer_sequence, __ATOMIC_RELAXED );
+        ok( produced - consumed == CLIENT_SURFACE_HANDOFF_RING_SIZE, "ring was not full\n" );
+        for (i = 0; i < CLIENT_SURFACE_HANDOFF_RING_SIZE; ++i)
+        {
+            const struct client_surface_handoff_slot *frame =
+                &owner_slot->slots[consumed & (CLIENT_SURFACE_HANDOFF_RING_SIZE - 1)];
+
+            ok( frame->source == 0x12345678 + i && frame->source_sequence == i + 1,
+                "descriptor %u at round %u was overwritten\n", i, round );
+            __atomic_store_n( &owner_slot->consumer_sequence, ++consumed, __ATOMIC_RELEASE );
+            ok( client_surface_handoff_consumed( producer_slot, consumed ),
+                "producer did not observe returned descriptor %u at round %u\n", i, round );
+        }
+        ok( produced == consumed, "ring did not drain\n" );
+        if (other_channel)
+            ok( other_channel->producer_sequence == 1 && !other_channel->consumer_sequence &&
+                !other_channel->closed, "ring operation changed an adjacent channel\n" );
+    }
     status = complete_surface_handoffs( hwnd, 0, 0, NULL, 0, &accepted );
-    ok( !status && !accepted, "idle handoff completion status %#x accepted %u\n",
-        status, accepted );
-    expected = control;
-    control = client_surface_handoff_control( generation, CLIENT_SURFACE_HANDOFF_RELEASED );
-    ok( __atomic_compare_exchange_n( &owner_slot->control, &expected, control, FALSE,
-                                     __ATOMIC_RELEASE, __ATOMIC_ACQUIRE ),
-        "READING -> RELEASED transition failed\n" );
-    expected = control;
-    control = client_surface_handoff_control( client_surface_handoff_next_generation( generation ),
-                                              CLIENT_SURFACE_HANDOFF_FREE );
-    ok( __atomic_compare_exchange_n( &producer_slot->control, &expected, control, FALSE,
-                                     __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE ),
-        "RELEASED -> FREE transition failed\n" );
+    ok( !status && !accepted, "idle handoff completion status %#x accepted %u\n", status, accepted );
 
     old_cookie = producer.cookie;
     status = release_surface_handoff( hwnd, 0, identity, old_cookie + 1, FALSE );
     ok( status == STATUS_INVALID_PARAMETER, "wrong producer release status %#x\n", status );
     status = set_surface_state( hwnd, identity, CLIENT_SURFACE_STATE_UNREGISTER, 0, NULL );
     ok( !status, "handoff unregister status %#x\n", status );
-    ok( client_surface_handoff_state( __atomic_load_n( &producer_slot->control,
-                                                       __ATOMIC_ACQUIRE ) ) ==
-        CLIENT_SURFACE_HANDOFF_LOST, "unregister did not mark the handoff LOST\n" );
+    ok( __atomic_load_n( &producer_slot->closed, __ATOMIC_ACQUIRE ), "unregister did not close channel\n" );
+    ok( producer_slot->producer_sequence == produced && producer_slot->consumer_sequence == consumed,
+        "unregister changed channel sequences\n" );
     status = release_surface_handoff( hwnd, 0, identity, old_cookie, FALSE );
     ok( !status, "producer handoff release status %#x\n", status );
     producer_bound = FALSE;
@@ -1324,6 +1331,12 @@ static void test_handoff_storage(void)
     ok( !(__atomic_load_n( &owner_shared->ready_bitmap[index / 64], __ATOMIC_ACQUIRE ) &
           ((UINT64)1 << (index % 64))), "retired handoff left a ready bit set\n" );
 
+    set_surface_state( other, identity + 1, CLIENT_SURFACE_STATE_UNREGISTER, 0, NULL );
+    if (adjacent.cookie)
+    {
+        release_surface_handoff( other, 0, identity + 1, adjacent.cookie, FALSE );
+        adjacent.cookie = 0;
+    }
     status = set_surface_state( other, identity, flags, 0, NULL );
     ok( !status, "handoff identity reuse registration status %#x\n", status );
     status = get_surface_handoff( other, 0, identity, FALSE, &replacement );
@@ -1345,6 +1358,11 @@ static void test_handoff_storage(void)
 unregister:
     set_surface_state( hwnd, identity, CLIENT_SURFACE_STATE_UNREGISTER, 0, NULL );
 done:
+    if (other)
+    {
+        set_surface_state( other, identity + 1, CLIENT_SURFACE_STATE_UNREGISTER, 0, NULL );
+        if (adjacent.cookie) release_surface_handoff( other, 0, identity + 1, adjacent.cookie, FALSE );
+    }
     if (producer.mapping) CloseHandle( producer.mapping );
     if (owner.mapping) CloseHandle( owner.mapping );
     if (replacement.mapping) CloseHandle( replacement.mapping );
@@ -1364,10 +1382,10 @@ static void test_handoff_consumer_retirement( BOOL failed )
     const UINT flags = CLIENT_SURFACE_STATE_REGISTER | CLIENT_SURFACE_STATE_SCENE_PUBLICATION;
     struct handoff_binding producer = {0}, owner = {0}, replacement = {0}, pending = {0};
     struct client_surface_handoff_shared *shared;
-    struct client_surface_handoff_slot *slot;
+    struct client_surface_handoff_channel *slot;
     struct __server_request_info info;
     void *producer_view = NULL, *owner_view = NULL, *replacement_view = NULL;
-    UINT64 control, generation, old_cookie = 0;
+    UINT64 old_cookie = 0;
     LONG release_sequence;
     BOOL producer_bound = FALSE, owner_bound = FALSE, replacement_bound = FALSE;
     unsigned int status, i;
@@ -1413,14 +1431,9 @@ static void test_handoff_consumer_retirement( BOOL failed )
     check_surface_handoff_cookie( hwnd, identity, owner.cookie );
 
     slot = (void *)((char *)producer_view + producer.offset);
-    /* A normal roster change can retire a consumer with unread images just
-     * as a failed copy can. Both must release every storage token. */
-    for (i = 0; i < CLIENT_SURFACE_SOURCE_FRAME_COUNT; ++i)
-    {
-        control = __atomic_load_n( &slot[i].control, __ATOMIC_ACQUIRE );
-        __atomic_store_n( &slot[i].control, client_surface_handoff_control(
-            client_surface_handoff_generation( control ), CLIENT_SURFACE_HANDOFF_READY ), __ATOMIC_RELEASE );
-    }
+    /* Leave the ring full while changing its consumer lifetime. Retirement
+     * must close the channel without acknowledging these unread descriptors. */
+    __atomic_store_n( &slot->producer_sequence, CLIENT_SURFACE_HANDOFF_RING_SIZE, __ATOMIC_RELEASE );
     if (!failed)
     {
         /* A hidden owner can release and reacquire its unchanged binding.
@@ -1429,9 +1442,9 @@ static void test_handoff_consumer_retirement( BOOL failed )
         ok( !status, "temporary consumer release status %#x\n", status );
         owner_bound = FALSE;
         check_surface_handoff_cookie( hwnd, identity, 0 );
-        for (i = 0; i < CLIENT_SURFACE_SOURCE_FRAME_COUNT; ++i)
-            ok( client_surface_handoff_state( __atomic_load_n( &slot[i].control, __ATOMIC_ACQUIRE ) ) ==
-                CLIENT_SURFACE_HANDOFF_READY, "temporary consumer release discarded image %u\n", i );
+        ok( !slot->closed && !slot->consumer_sequence &&
+            slot->producer_sequence == CLIENT_SURFACE_HANDOFF_RING_SIZE,
+            "temporary consumer release discarded unread descriptors\n" );
         status = get_surface_handoff( hwnd, GetCurrentProcessId(), identity, TRUE, &owner );
         ok( !status, "temporary consumer rebind status %#x\n", status );
         if (status) goto done;
@@ -1444,9 +1457,6 @@ static void test_handoff_consumer_retirement( BOOL failed )
         other = create_test_window( TRUE );
         ok( !!other, "failed to create replacement owner\n" );
         if (!other) goto done;
-        control = __atomic_load_n( &slot[0].control, __ATOMIC_ACQUIRE );
-        __atomic_store_n( &slot[0].control, client_surface_handoff_control(
-            client_surface_handoff_generation( control ), CLIENT_SURFACE_HANDOFF_READING ), __ATOMIC_RELEASE );
         /* Reparent at the server boundary while the old owner is reading.
          * Returning to the original root must not revive this old binding. */
         for (i = 0; i < 2; ++i)
@@ -1461,17 +1471,11 @@ static void test_handoff_consumer_retirement( BOOL failed )
             status = get_surface_handoff( hwnd, 0, identity, FALSE, &pending );
             ok( status == STATUS_DEVICE_BUSY, "reparent %u reacquired retired binding, status %#x\n", i, status );
             if (!status) CloseHandle( pending.mapping );
-            ok( client_surface_handoff_state( __atomic_load_n( &slot[0].control, __ATOMIC_ACQUIRE ) ) ==
-                CLIENT_SURFACE_HANDOFF_READING, "reparent %u released an unfinished owner read\n", i );
+            ok( !__atomic_load_n( &slot->consumer_sequence, __ATOMIC_ACQUIRE ),
+                "reparent %u acknowledged an unfinished owner read\n", i );
         }
     }
-    /* A failure in any independent storage slot retires the binding. */
-    control = __atomic_load_n( &slot[CLIENT_SURFACE_SOURCE_FRAME_COUNT - 1].control, __ATOMIC_ACQUIRE );
-    generation = client_surface_handoff_generation( control );
-    if (failed)
-        __atomic_store_n( &slot[CLIENT_SURFACE_SOURCE_FRAME_COUNT - 1].control,
-                          client_surface_handoff_control( generation, CLIENT_SURFACE_HANDOFF_LOST ),
-                          __ATOMIC_RELEASE );
+    if (failed) __atomic_store_n( &slot->closed, 1, __ATOMIC_RELEASE );
     check_surface_handoff_cookie( hwnd, identity, 0 );
     shared = producer_view;
     __atomic_store_n( &shared->release_parked, 1, __ATOMIC_RELEASE );
@@ -1483,12 +1487,9 @@ static void test_handoff_consumer_retirement( BOOL failed )
     owner_bound = FALSE;
     ok( __atomic_load_n( &shared->release_sequence, __ATOMIC_ACQUIRE ) != release_sequence,
         "retired consumer did not wake source waiters\n" );
-    for (i = 0; i < CLIENT_SURFACE_SOURCE_FRAME_COUNT; ++i)
-    {
-        control = __atomic_load_n( &slot[i].control, __ATOMIC_ACQUIRE );
-        ok( client_surface_handoff_state( control ) == CLIENT_SURFACE_HANDOFF_LOST,
-            "retired consumer left image %u in state %u\n", i, client_surface_handoff_state( control ) );
-    }
+    ok( __atomic_load_n( &slot->closed, __ATOMIC_ACQUIRE ), "retired consumer left channel open\n" );
+    ok( !slot->consumer_sequence && slot->producer_sequence == CLIENT_SURFACE_HANDOFF_RING_SIZE,
+        "retirement changed channel sequences\n" );
     status = get_surface_handoff( hwnd, GetCurrentProcessId(), identity, TRUE, &pending );
     ok( status == STATUS_DEVICE_BUSY, "reacquired lost binding while producer still mapped, status %#x\n", status );
     if (!status)
@@ -1518,17 +1519,15 @@ static void test_handoff_consumer_retirement( BOOL failed )
     {
         shared = replacement_view;
         slot = (void *)((char *)replacement_view + replacement.offset);
-        control = __atomic_load_n( &slot->control, __ATOMIC_ACQUIRE );
         ok( replacement.cookie != old_cookie && slot->cookie == replacement.cookie,
             "handoff recovery reused stale cookie %s\n", wine_dbgstr_longlong( old_cookie ) );
-        ok( client_surface_handoff_state( control ) == CLIENT_SURFACE_HANDOFF_FREE &&
-            client_surface_handoff_generation( control ),
-            "handoff recovery replacement control %s\n", wine_dbgstr_longlong( control ) );
+        ok( !slot->producer_sequence && !slot->consumer_sequence && !slot->closed,
+            "replacement channel was not reset\n" );
         ok( slot->endpoints == CLIENT_SURFACE_HANDOFF_ENDPOINT_PRODUCER,
             "handoff recovery replacement endpoints %#lx\n", slot->endpoints );
         ok( !(__atomic_load_n( &shared->ready_bitmap[
-                                  (slot - shared->slots) / 64], __ATOMIC_ACQUIRE ) &
-              ((UINT64)1 << ((slot - shared->slots) % 64))),
+                                  (slot - shared->channels) / 64], __ATOMIC_ACQUIRE ) &
+              ((UINT64)1 << ((slot - shared->channels) % 64))),
             "handoff recovery replacement retained a ready bit\n" );
     }
 done:
@@ -1567,8 +1566,7 @@ static void handoff_storage_exit_child( HWND hwnd, HANDLE ready, HANDLE release,
 {
     struct handoff_binding binding;
     struct client_surface_handoff_shared *shared;
-    struct client_surface_handoff_slot *slot;
-    UINT64 expected, generation, control;
+    struct client_surface_handoff_channel *slot;
     unsigned int status, index;
     void *view = NULL;
 
@@ -1587,21 +1585,13 @@ static void handoff_storage_exit_child( HWND hwnd, HANDLE ready, HANDLE release,
     if (!view) goto done;
     shared = view;
     slot = (void *)((char *)view + binding.offset);
-    index = slot - shared->slots;
-    expected = __atomic_load_n( &slot->control, __ATOMIC_ACQUIRE );
-    generation = client_surface_handoff_generation( expected );
-    control = client_surface_handoff_control( generation, CLIENT_SURFACE_HANDOFF_SUBMITTED );
-    ok( client_surface_handoff_state( expected ) == CLIENT_SURFACE_HANDOFF_FREE &&
-        __atomic_compare_exchange_n( &slot->control, &expected, control, FALSE,
-                                     __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE ),
-        "exit child FREE -> SUBMITTED transition failed\n" );
+    index = slot - shared->channels;
+    ok( !slot->producer_sequence && !slot->consumer_sequence && !slot->closed,
+        "exit test channel was not empty\n" );
     if (completed)
     {
-        expected = control;
-        control = client_surface_handoff_control( generation, CLIENT_SURFACE_HANDOFF_READY );
-        ok( __atomic_compare_exchange_n( &slot->control, &expected, control, FALSE,
-                                         __ATOMIC_RELEASE, __ATOMIC_ACQUIRE ),
-            "exit child SUBMITTED -> READY transition failed\n" );
+        slot->slots[0].source_sequence = 1;
+        __atomic_store_n( &slot->producer_sequence, 1, __ATOMIC_RELEASE );
         __atomic_fetch_or( &shared->ready_bitmap[index / 64],
                            (UINT64)1 << (index % 64), __ATOMIC_RELEASE );
     }
@@ -1619,11 +1609,10 @@ static void test_handoff_storage_process_exit( char **argv, BOOL completed )
     PROCESS_INFORMATION process = {0};
     struct handoff_binding owner = {0};
     struct client_surface_handoff_shared *shared;
-    struct client_surface_handoff_slot *slot = NULL;
+    struct client_surface_handoff_channel *slot = NULL;
     struct surface_state state;
     HWND hwnd = create_test_window( FALSE );
     HANDLE ready = NULL, release = NULL;
-    UINT64 control;
     unsigned int status, index = 0;
     char command[MAX_PATH * 2];
     void *view = NULL;
@@ -1656,11 +1645,9 @@ static void test_handoff_storage_process_exit( char **argv, BOOL completed )
     {
         shared = view;
         slot = (void *)((char *)view + owner.offset);
-        index = slot - shared->slots;
-        control = __atomic_load_n( &slot->control, __ATOMIC_ACQUIRE );
-        ok( client_surface_handoff_state( control ) ==
-            (completed ? CLIENT_SURFACE_HANDOFF_READY : CLIENT_SURFACE_HANDOFF_SUBMITTED),
-            "exit child pre-exit state %u\n", client_surface_handoff_state( control ) );
+        index = slot - shared->channels;
+        ok( __atomic_load_n( &slot->producer_sequence, __ATOMIC_ACQUIRE ) == !!completed &&
+            !slot->consumer_sequence && !slot->closed, "unexpected pre-exit channel state\n" );
         ok( slot->endpoints == (CLIENT_SURFACE_HANDOFF_ENDPOINT_PRODUCER |
                                 CLIENT_SURFACE_HANDOFF_ENDPOINT_CONSUMER),
             "exit child endpoints before exit %#lx\n", slot->endpoints );
@@ -1672,9 +1659,9 @@ static void test_handoff_storage_process_exit( char **argv, BOOL completed )
     process.hProcess = NULL;
     if (slot)
     {
-        control = __atomic_load_n( &slot->control, __ATOMIC_ACQUIRE );
-        ok( client_surface_handoff_state( control ) == CLIENT_SURFACE_HANDOFF_LOST,
-            "producer exit left handoff state %u\n", client_surface_handoff_state( control ) );
+        ok( __atomic_load_n( &slot->closed, __ATOMIC_ACQUIRE ), "process exit left channel open\n" );
+        ok( slot->producer_sequence == !!completed && !slot->consumer_sequence,
+            "process exit forged a descriptor acknowledgement\n" );
         ok( !slot->endpoints, "producer exit left endpoints %#lx\n", slot->endpoints );
         ok( !(__atomic_load_n( &shared->ready_bitmap[index / 64], __ATOMIC_ACQUIRE ) &
               ((UINT64)1 << (index % 64))), "producer exit left a ready bit set\n" );
@@ -1753,10 +1740,9 @@ static void test_handoff_storage_owner_exit( char **argv, BOOL completed )
     struct handoff_owner_exit_shared *state = NULL;
     struct handoff_binding producer = {0};
     struct client_surface_handoff_shared *shared;
-    struct client_surface_handoff_slot *slot = NULL;
+    struct client_surface_handoff_channel *slot = NULL;
     HANDLE mapping = NULL, window_ready = NULL, binding_ready = NULL;
     HANDLE owner_ready = NULL, release = NULL;
-    UINT64 expected, generation, control;
     UINT_PTR identity = HANDOFF_OWNER_EXIT_ID + completed;
     unsigned int status, index = 0;
     char command[MAX_PATH * 2];
@@ -1811,28 +1797,19 @@ static void test_handoff_storage_owner_exit( char **argv, BOOL completed )
         "handoff owner-exit consumer did not become ready\n" );
     shared = view;
     slot = (void *)((char *)view + producer.offset);
-    index = slot - shared->slots;
+    index = slot - shared->channels;
     ok( slot->endpoints == (CLIENT_SURFACE_HANDOFF_ENDPOINT_PRODUCER |
                             CLIENT_SURFACE_HANDOFF_ENDPOINT_CONSUMER),
         "owner-exit endpoints before exit %#lx\n", slot->endpoints );
-    expected = __atomic_load_n( &slot->control, __ATOMIC_ACQUIRE );
-    generation = client_surface_handoff_generation( expected );
-    control = client_surface_handoff_control( generation, CLIENT_SURFACE_HANDOFF_SUBMITTED );
-    ok( client_surface_handoff_state( expected ) == CLIENT_SURFACE_HANDOFF_FREE &&
-        __atomic_compare_exchange_n( &slot->control, &expected, control, FALSE,
-                                     __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE ),
-        "owner-exit FREE -> SUBMITTED transition failed\n" );
+    ok( !slot->producer_sequence && !slot->consumer_sequence && !slot->closed,
+        "exit test channel was not empty\n" );
     if (completed)
     {
-        expected = control;
-        control = client_surface_handoff_control( generation, CLIENT_SURFACE_HANDOFF_READY );
-        ok( __atomic_compare_exchange_n( &slot->control, &expected, control, FALSE,
-                                         __ATOMIC_RELEASE, __ATOMIC_ACQUIRE ),
-            "owner-exit SUBMITTED -> READY transition failed\n" );
+        slot->slots[0].source_sequence = 1;
+        __atomic_store_n( &slot->producer_sequence, 1, __ATOMIC_RELEASE );
         __atomic_fetch_or( &shared->ready_bitmap[index / 64],
                            (UINT64)1 << (index % 64), __ATOMIC_RELEASE );
     }
-
 release_child:
     SetEvent( binding_ready );
     SetEvent( release );
@@ -1842,9 +1819,9 @@ release_child:
     process.hProcess = NULL;
     if (slot)
     {
-        control = __atomic_load_n( &slot->control, __ATOMIC_ACQUIRE );
-        ok( client_surface_handoff_state( control ) == CLIENT_SURFACE_HANDOFF_LOST,
-            "owner exit left handoff state %u\n", client_surface_handoff_state( control ) );
+        ok( __atomic_load_n( &slot->closed, __ATOMIC_ACQUIRE ), "process exit left channel open\n" );
+        ok( slot->producer_sequence == !!completed && !slot->consumer_sequence,
+            "process exit forged a descriptor acknowledgement\n" );
         ok( !slot->endpoints, "owner exit left endpoints %#lx\n", slot->endpoints );
         ok( !(__atomic_load_n( &shared->ready_bitmap[index / 64], __ATOMIC_ACQUIRE ) &
               ((UINT64)1 << (index % 64))), "owner exit left a ready bit set\n" );

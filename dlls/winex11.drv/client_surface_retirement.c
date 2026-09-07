@@ -31,10 +31,9 @@ struct x11drv_client_surface_retirement
     struct list entry;
     LONG refs;
     void *view;
-    struct client_surface_handoff_slot *slots;
+    struct client_surface_handoff_channel *channel;
     UINT64 identity, cookie;
     int ready_fd;
-    unsigned int released;
     struct x11drv_client_source_frame sources[CLIENT_SURFACE_SOURCE_FRAME_COUNT];
 };
 
@@ -101,37 +100,26 @@ static void wake_retiring_source_owner( struct x11drv_client_surface_retirement 
 static BOOL retire_source_mapping( struct x11drv_client_surface_retirement *retirement )
 {
     struct client_surface_handoff_shared *shared = retirement->view;
-    BOOL ready = TRUE;
-    unsigned int i;
+    struct client_surface_handoff_channel *channel = retirement->channel;
+    unsigned int i, index = channel - shared->channels;
+    BOOL ready;
 
+    /* Closing prevents new reads without pretending that a checked X11 copy
+     * has finished. Only the consumer advances its sequence or releases its
+     * endpoint after all native reads have completed. */
+    if (!__atomic_exchange_n( &channel->closed, 1, __ATOMIC_ACQ_REL ))
+    {
+        __atomic_fetch_or( &shared->ready_bitmap[index / 64], (UINT64)1 << (index % 64), __ATOMIC_RELEASE );
+        wake_retiring_source_owner( retirement );
+    }
+    ready = !(__atomic_load_n( &channel->endpoints, __ATOMIC_ACQUIRE ) &
+              CLIENT_SURFACE_HANDOFF_ENDPOINT_CONSUMER) ||
+            __atomic_load_n( &channel->consumer_sequence, __ATOMIC_ACQUIRE ) ==
+            __atomic_load_n( &channel->producer_sequence, __ATOMIC_ACQUIRE );
     for (i = 0; i < ARRAY_SIZE(retirement->sources); ++i)
     {
-        struct client_surface_handoff_slot *slot = retirement->slots + i;
         struct x11drv_client_source_frame *frame = retirement->sources + i;
 
-        while (!(retirement->released & (1u << i)))
-        {
-            UINT64 control = __atomic_load_n( &slot->control, __ATOMIC_ACQUIRE );
-            enum client_surface_handoff_state state = client_surface_handoff_state( control );
-            UINT64 lost = client_surface_handoff_control(
-                client_surface_handoff_generation( control ), CLIENT_SURFACE_HANDOFF_LOST );
-            unsigned int index = slot - shared->slots;
-
-            /* Server invalidation can replace READING with LOST. Only the
-             * checked read's RELEASED token or consumer endpoint release
-             * proves that such storage is no longer being read. A slot with
-             * no allocated source has never published an image to a reader. */
-            if (frame->pixmap &&
-                (state == CLIENT_SURFACE_HANDOFF_READING || state == CLIENT_SURFACE_HANDOFF_LOST) &&
-                (__atomic_load_n( &slot->endpoints, __ATOMIC_ACQUIRE ) & CLIENT_SURFACE_HANDOFF_ENDPOINT_CONSUMER))
-                break;
-            if (!__atomic_compare_exchange_n( &slot->control, &control, lost, 0,
-                                              __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE )) continue;
-            retirement->released |= 1u << i;
-            __atomic_fetch_or( &shared->ready_bitmap[index / 64], (UINT64)1 << (index % 64), __ATOMIC_RELEASE );
-            wake_retiring_source_owner( retirement );
-        }
-        if (!(retirement->released & (1u << i))) ready = FALSE;
         if (frame->image && frame->image_ready && !frame->image_ready( frame->image )) ready = FALSE;
     }
     if (!ready) return FALSE;
@@ -234,8 +222,8 @@ void x11drv_client_surface_retire_handoff( struct client_surface *client )
         /* Preparation failed before any source could be submitted. */
         struct x11drv_client_surface_retirement empty =
         {
-            .view = client->handoff_view, .slots = client->handoff_slot,
-            .identity = client->handoff_slot[0].identity, .cookie = client->handoff_cookie,
+            .view = client->handoff_view, .channel = client->handoff_channel,
+            .identity = client->handoff_channel->identity, .cookie = client->handoff_cookie,
             .ready_fd = client->handoff_ready_fd,
         };
         BOOL ready = retire_source_mapping( &empty );
@@ -243,8 +231,8 @@ void x11drv_client_surface_retire_handoff( struct client_surface *client )
         return;
     }
     retirement->view = client->handoff_view;
-    retirement->slots = client->handoff_slot;
-    retirement->identity = client->handoff_slot[0].identity;
+    retirement->channel = client->handoff_channel;
+    retirement->identity = client->handoff_channel->identity;
     retirement->cookie = client->handoff_cookie;
     retirement->ready_fd = client->handoff_ready_fd;
     memcpy( retirement->sources, surface->sources, sizeof(surface->sources) );

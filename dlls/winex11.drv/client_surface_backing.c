@@ -55,7 +55,7 @@ struct client_surface_compositor_pool
     unsigned int refs;
     unsigned int next_word;
     int ready_fd;
-    struct client_surface_compositor_binding *bindings[CLIENT_SURFACE_HANDOFF_SLOTS];
+    struct client_surface_compositor_binding *bindings[CLIENT_SURFACE_HANDOFF_CHANNELS];
 };
 
 struct client_surface_source_cache
@@ -78,8 +78,8 @@ struct client_surface_compositor_binding
 {
     struct client_surface_compositor_binding *next;
     struct client_surface_compositor_pool *pool;
-    struct client_surface_handoff_slot *slot;
-    struct client_surface_source_cache sources[CLIENT_SURFACE_SOURCE_FRAME_COUNT];
+    struct client_surface_handoff_channel *channel;
+    struct client_surface_source_cache sources[CLIENT_SURFACE_HANDOFF_RING_SIZE];
     HWND toplevel;
     HWND window;
     process_id_t process;
@@ -103,7 +103,7 @@ static void trace_client_surface_source( const char *event,
     TRACE_(csperf)( "ticks=%llu event=%s identity=%s cookie=%s token=%s sequence=%s "
                    "window=%lx pixmap=%lx success=%u\n", client_surface_perf_time(), event,
                    wine_dbgstr_longlong( binding->identity ), wine_dbgstr_longlong( binding->cookie ),
-                   wine_dbgstr_longlong( client_surface_handoff_generation( control ) ),
+                   wine_dbgstr_longlong( control ),
                    wine_dbgstr_longlong( sequence ), window, pixmap, success );
 }
 
@@ -560,7 +560,7 @@ static void finish_client_surface_compositor_frame(
            frame->serial, frame->pixmap );
     frame->serial = 0;
     frame->complete = frame->idle = FALSE;
-    /* Give READY sources a chance to replace a steady mailbox before it is
+    /* Give completed sources a chance to replace a steady mailbox before it is
      * submitted. A reserved topology publication keeps its original order. */
     if (target->mailbox_publish_generation) flush_client_surface_compositor_mailbox( target );
 }
@@ -1031,16 +1031,11 @@ static void remove_client_surface_compositor_binding(
 {
     struct client_surface_compositor_binding *binding = *cursor;
     struct client_surface_compositor_target *target = find_client_surface_compositor_target( binding->toplevel );
-    unsigned int i;
+    unsigned int index = binding->channel - binding->pool->shared->channels;
 
     assert( !target || !target->copy_frame );
     *cursor = binding->next;
-    for (i = 0; i < CLIENT_SURFACE_SOURCE_FRAME_COUNT; ++i)
-    {
-        unsigned int index = binding->slot + i - binding->pool->shared->slots;
-
-        if (binding->pool->bindings[index] == binding) binding->pool->bindings[index] = NULL;
-    }
+    if (binding->pool->bindings[index] == binding) binding->pool->bindings[index] = NULL;
     if (target)
     {
         finish_client_surface_compositor_assembly( target, TRUE );
@@ -1079,7 +1074,7 @@ static struct client_surface_compositor_pool *acquire_client_surface_compositor_
     if (size < sizeof(*shared) ||
         __atomic_load_n( &shared->magic, __ATOMIC_ACQUIRE ) != CLIENT_SURFACE_HANDOFF_MAGIC ||
         shared->version != CLIENT_SURFACE_HANDOFF_VERSION ||
-        shared->slot_count != CLIENT_SURFACE_HANDOFF_SLOTS ||
+        shared->channel_count != CLIENT_SURFACE_HANDOFF_CHANNELS ||
         shared->mapping_id != job->mapping_id)
         goto failed;
     if (pool)
@@ -1105,18 +1100,9 @@ failed:
 
 static BOOL client_surface_compositor_binding_is_live( const struct client_surface_compositor_binding *binding )
 {
-    unsigned int i;
-
-    for (i = 0; i < CLIENT_SURFACE_SOURCE_FRAME_COUNT; ++i)
-    {
-        const struct client_surface_handoff_slot *slot = &binding->slot[i];
-        UINT64 control = __atomic_load_n( &slot->control, __ATOMIC_ACQUIRE );
-
-        if (client_surface_handoff_state( control ) == CLIENT_SURFACE_HANDOFF_LOST ||
-            !(__atomic_load_n( &slot->endpoints, __ATOMIC_ACQUIRE ) &
-              CLIENT_SURFACE_HANDOFF_ENDPOINT_CONSUMER)) return FALSE;
-    }
-    return TRUE;
+    return !__atomic_load_n( &binding->channel->closed, __ATOMIC_ACQUIRE ) &&
+           (__atomic_load_n( &binding->channel->endpoints, __ATOMIC_ACQUIRE ) &
+            CLIENT_SURFACE_HANDOFF_ENDPOINT_CONSUMER);
 }
 
 static BOOL register_client_surface_compositor_handoff(
@@ -1124,12 +1110,19 @@ static BOOL register_client_surface_compositor_handoff(
 {
     struct client_surface_compositor_binding **cursor, *binding;
     struct client_surface_compositor_pool *pool;
-    unsigned int i;
+    struct client_surface_handoff_channel *channel;
     BOOL ret = FALSE;
 
     if (!(pool = acquire_client_surface_compositor_pool( job ))) goto done;
-    if (job->offset > pool->size - CLIENT_SURFACE_SOURCE_FRAME_COUNT * sizeof(struct client_surface_handoff_slot))
-        goto done;
+    if (job->offset < offsetof(struct client_surface_handoff_shared, channels) ||
+        job->offset > sizeof(*pool->shared) - sizeof(*channel) ||
+        (job->offset - offsetof(struct client_surface_handoff_shared, channels)) % sizeof(*channel)) goto done;
+    channel = (struct client_surface_handoff_channel *)((char *)pool->shared + job->offset);
+    if (channel->cookie != job->cookie || channel->identity != job->identity ||
+        channel->producer_process != job->process ||
+        channel->window != wine_server_user_handle( job->handoff_window ) ||
+        channel->toplevel != wine_server_user_handle( job->handoff_toplevel ) ||
+        __atomic_load_n( &channel->closed, __ATOMIC_ACQUIRE )) goto done;
 
     for (cursor = &client_surface_compositor_bindings; *cursor; cursor = &(*cursor)->next)
     {
@@ -1151,9 +1144,8 @@ static BOOL register_client_surface_compositor_handoff(
     if (!(binding = calloc( 1, sizeof(*binding) ))) goto done;
     binding->next = client_surface_compositor_bindings;
     binding->pool = pool;
-    binding->slot = (struct client_surface_handoff_slot *)((char *)pool->shared + job->offset);
-    for (i = 0; i < CLIENT_SURFACE_SOURCE_FRAME_COUNT; ++i)
-        pool->bindings[binding->slot + i - pool->shared->slots] = binding;
+    binding->channel = channel;
+    pool->bindings[channel - pool->shared->channels] = binding;
     binding->toplevel = job->handoff_toplevel;
     binding->window = job->handoff_window;
     binding->process = job->process;
@@ -1722,25 +1714,18 @@ static BOOL get_client_surface_compositor_source(
 static BOOL cache_client_surface_handoff( struct client_surface_compositor_binding *binding,
                                           unsigned int index, UINT64 control )
 {
-    struct client_surface_handoff_slot *shared = binding->slot + index, frame;
+    struct client_surface_handoff_channel *channel = binding->channel;
+    struct client_surface_handoff_slot frame = channel->slots[index];
     struct client_surface_cached_image *image = &binding->spare_image, previous;
     Display *display = client_surface_compositor_display;
-    UINT64 expected = control, final;
-    unsigned int bit = shared - binding->pool->shared->slots, depth;
+    unsigned int depth;
     Pixmap source;
     BOOL success = FALSE;
     int error = 0;
 
-    if (!__atomic_compare_exchange_n( &shared->control, &expected,
-            client_surface_handoff_control( client_surface_handoff_generation( control ),
-                                             CLIENT_SURFACE_HANDOFF_READING ),
-            0, __ATOMIC_ACQUIRE, __ATOMIC_ACQUIRE )) return FALSE;
-    __atomic_fetch_and( &binding->pool->shared->ready_bitmap[bit / 64],
-                        ~((UINT64)1 << (bit % 64)), __ATOMIC_ACQ_REL );
-    frame = *shared;
-    TRACE( "reading handoff hwnd %p identity %s generation %s into owner cache\n", binding->window,
+    TRACE( "reading handoff hwnd %p identity %s sequence %s into owner cache\n", binding->window,
            wine_dbgstr_longlong( binding->identity ),
-           wine_dbgstr_longlong( client_surface_handoff_generation( control ) ) );
+           wine_dbgstr_longlong( control ) );
     trace_client_surface_source( "claim", binding, control, frame.source_sequence, 0, frame.source, TRUE );
     if (frame.cookie != binding->cookie || frame.identity != binding->identity ||
         frame.producer_process != binding->process ||
@@ -1792,23 +1777,18 @@ static BOOL cache_client_surface_handoff( struct client_surface_compositor_bindi
 done:
     trace_client_surface_source( "cache_copy", binding, control, frame.source_sequence,
                                  0, binding->latest_image.pixmap, success );
-    expected = client_surface_handoff_control( client_surface_handoff_generation( control ),
-                                               CLIENT_SURFACE_HANDOFF_READING );
-    final = client_surface_handoff_control( client_surface_handoff_generation( control ),
-        success || binding->latest_image.pixmap ? CLIENT_SURFACE_HANDOFF_RELEASED : CLIENT_SURFACE_HANDOFF_LOST );
-    __atomic_compare_exchange_n( &shared->control, &expected, final, 0,
-                                 __ATOMIC_RELEASE, __ATOMIC_RELAXED );
-    /* A failed replacement does not invalidate the last complete owner image
-     * or its channel. Return this source so a later frame can recover. */
+    /* The acquire load of producer_sequence made this descriptor immutable.
+     * Return it only after every source read and its X error check completed.
+     * A failed replacement preserves the previous owner-local image. */
+    __atomic_store_n( &channel->consumer_sequence, control, __ATOMIC_RELEASE );
     if (!success && !binding->latest_image.pixmap)
-        __atomic_fetch_or( &binding->pool->shared->ready_bitmap[bit / 64],
-                           (UINT64)1 << (bit % 64), __ATOMIC_RELEASE );
+        __atomic_store_n( &channel->closed, 1, __ATOMIC_RELEASE );
     trace_client_surface_source( "cache_release", binding, control, frame.source_sequence,
                                  0, binding->latest_image.pixmap, success );
-    TRACE( "%s handoff hwnd %p identity %s generation %s after owner cache copy\n",
+    TRACE( "%s handoff hwnd %p identity %s sequence %s after owner cache copy\n",
            success || binding->latest_image.pixmap ? "released" : "lost", binding->window,
            wine_dbgstr_longlong( binding->identity ),
-           wine_dbgstr_longlong( client_surface_handoff_generation( control ) ) );
+           wine_dbgstr_longlong( control ) );
     client_surface_handoff_wake_release( binding->pool->shared );
     return success;
 }
@@ -1889,7 +1869,7 @@ static BOOL copy_client_surface_image( Display *display, Pixmap source, Pixmap d
     BOOL ret = FALSE;
 
     /* Keep the exceptional conversion path on the owner connection too.
-     * The caller holds READING until its final XSync, covering both readback
+     * The caller retains the source until its final XSync, covering both readback
      * and upload. The destination GC carries the exact scene clip. */
     if (!(source_visual = XGetVisualInfo( display, VisualIDMask, &source_template, &count )) ||
         !count || (source_visual->class != TrueColor && source_visual->class != DirectColor))
@@ -2228,7 +2208,7 @@ static void complete_client_surface_copy_batch( struct client_surface_copy_batch
                 .process = binding->process,
                 .surface = binding->identity,
                 .cookie = binding->cookie,
-                .source_generation = client_surface_handoff_generation( copy->control ),
+                .source_generation = copy->sequence,
                 .buffer_index = copy->buffer_index,
             };
         }
@@ -2592,6 +2572,7 @@ static BOOL process_client_surface_handoffs(void)
     static UINT64 next_pool_id;
     struct client_surface_compositor_pool *pool, *next, *first = client_surface_compositor_pools;
     unsigned int pools = 0;
+    BOOL progressed = FALSE;
     int budget = CLIENT_SURFACE_COPY_BATCH_SIZE;
 
     for (pool = client_surface_compositor_pools; pool; pool = pool->next)
@@ -2615,29 +2596,44 @@ static BOOL process_client_surface_handoffs(void)
             {
                 unsigned int bit = __builtin_ctzll( bits ), index = word * 64 + bit;
                 struct client_surface_compositor_binding *binding = pool->bindings[index], **cursor;
-                UINT64 control;
+                struct client_surface_handoff_channel *channel = &pool->shared->channels[index];
+                UINT64 consumed, produced;
+                unsigned int frames = 0;
 
                 bits &= bits - 1;
                 if (!binding) continue;
-                control = __atomic_load_n( &pool->shared->slots[index].control, __ATOMIC_ACQUIRE );
-                if (client_surface_handoff_state( control ) == CLIENT_SURFACE_HANDOFF_READY)
+                /* Clear the hint before acquiring the sequence. A concurrent
+                 * publisher either appears in that load or leaves its bit set. */
+                __atomic_fetch_and( &pool->shared->ready_bitmap[word], ~((UINT64)1 << bit), __ATOMIC_ACQ_REL );
+                while (!__atomic_load_n( &channel->closed, __ATOMIC_ACQUIRE ))
                 {
-                    struct client_surface_compositor_target *target =
-                        find_client_surface_compositor_target( binding->toplevel );
+                    struct client_surface_compositor_target *target;
 
-                    /* Receiving a frame does not need an output frame or an
-                     * installed scene. Finish any Xlib batch before opening
-                     * the cache copy's independent error scope. */
+                    consumed = __atomic_load_n( &channel->consumer_sequence, __ATOMIC_RELAXED );
+                    produced = __atomic_load_n( &channel->producer_sequence, __ATOMIC_ACQUIRE );
+                    if (produced == consumed) break;
+                    if (produced - consumed > CLIENT_SURFACE_HANDOFF_RING_SIZE)
+                    {
+                        __atomic_store_n( &channel->closed, 1, __ATOMIC_RELEASE );
+                        break;
+                    }
+                    if (frames++ == CLIENT_SURFACE_HANDOFF_RING_SIZE)
+                    {
+                        __atomic_fetch_or( &pool->shared->ready_bitmap[word], (UINT64)1 << bit, __ATOMIC_RELEASE );
+                        break;
+                    }
+                    target = find_client_surface_compositor_target( binding->toplevel );
                     flush_client_surface_copy_batch();
-                    if (cache_client_surface_handoff( binding, pool->shared->slots + index - binding->slot, control ))
+                    if (cache_client_surface_handoff( binding, consumed & (CLIENT_SURFACE_HANDOFF_RING_SIZE - 1),
+                                                      consumed + 1 ))
                     {
                         binding->replay_epoch = 0;
                         if (target) target->replay_member = min( target->replay_member, binding->scene_index );
                     }
-                    control = __atomic_load_n( &pool->shared->slots[index].control, __ATOMIC_ACQUIRE );
-                    if (client_surface_handoff_state( control ) != CLIENT_SURFACE_HANDOFF_READY) --budget;
+                    --budget;
+                    progressed = TRUE;
                 }
-                if (client_surface_handoff_state( control ) != CLIENT_SURFACE_HANDOFF_LOST) continue;
+                if (!__atomic_load_n( &channel->closed, __ATOMIC_ACQUIRE )) continue;
                 flush_client_surface_copy_batch();
                 /* A checked copy retains the binding and owner cache until
                  * its reply arrives, including after producer death. */
@@ -2645,7 +2641,11 @@ static BOOL process_client_surface_handoffs(void)
                     struct client_surface_compositor_target *target =
                         find_client_surface_compositor_target( binding->toplevel );
 
-                    if (target && target->copy_frame) continue;
+                    if (target && target->copy_frame)
+                    {
+                        __atomic_fetch_or( &pool->shared->ready_bitmap[word], (UINT64)1 << bit, __ATOMIC_RELEASE );
+                        continue;
+                    }
                 }
                 __atomic_fetch_and( &pool->shared->ready_bitmap[word], ~((UINT64)1 << bit), __ATOMIC_ACQ_REL );
                 for (cursor = &client_surface_compositor_bindings; *cursor != binding; cursor = &(*cursor)->next)
@@ -2661,7 +2661,7 @@ static BOOL process_client_surface_handoffs(void)
         release_client_surface_compositor_pool( pool );
         if (budget <= 0) return TRUE;
     }
-    return FALSE;
+    return progressed;
 }
 
 static BOOL replay_client_surface_scene_sources(void)

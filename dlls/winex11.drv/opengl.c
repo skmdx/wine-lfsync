@@ -1682,7 +1682,8 @@ struct egl_snapshot_completion
     /* Only the queued completion owns the drawable and mapping references.
      * Image retirement must test the fence without dereferencing these. */
     struct opengl_drawable *drawable;
-    const struct client_surface_handoff_slot *slot;
+    const struct client_surface_source *source;
+    const struct client_surface_handoff_channel *channel;
     UINT64 control;
 };
 
@@ -1710,7 +1711,8 @@ static BOOL wait_snapshot_completion( void *context, DWORD timeout )
         /* The completion token keeps this mapping alive. A revoked handoff
          * cannot publish the write, even if its GPU fence eventually signals.
          * Retire its callback promptly while the image retains the real fence. */
-        if (__atomic_load_n( &completion->slot->control, __ATOMIC_ACQUIRE ) != completion->control)
+        if (__atomic_load_n( &completion->source->reservation, __ATOMIC_ACQUIRE ) != completion->control ||
+            __atomic_load_n( &completion->channel->closed, __ATOMIC_ACQUIRE ))
         {
             TRACE( "cancelled EGL source completion for control %s\n",
                    wine_dbgstr_longlong( completion->control ) );
@@ -1834,7 +1836,8 @@ static int snapshot_client_surface_gpu( struct opengl_drawable *base,
             funcs->p_glFlush();
             completion->refs = 2;
             completion->drawable = base;
-            completion->slot = base->client->handoff_slot + present->handoff_index;
+            completion->source = base->client->handoff_source + present->handoff_index;
+            completion->channel = base->client->handoff_channel;
             completion->control = present->handoff_control;
             opengl_drawable_add_ref( base );
             release_snapshot_sync( image->pending );

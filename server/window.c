@@ -84,7 +84,7 @@ struct client_surface_handoff_pool
     struct file *ready_read;
     struct file *ready_write;
     int ready_fd;
-    unsigned char used[CLIENT_SURFACE_HANDOFF_SLOTS];
+    unsigned char used[CLIENT_SURFACE_HANDOFF_CHANNELS];
 };
 
 static struct list client_surface_handoff_pools = LIST_INIT( client_surface_handoff_pools );
@@ -245,58 +245,31 @@ static void signal_client_surface_handoff_ready( struct client_surface_handoff_p
 
 static int is_client_surface_handoff_lost( const struct client_surface_ref *surface )
 {
-    unsigned int i;
-
-    if (!surface->handoff_pool) return 0;
-    for (i = 0; i < CLIENT_SURFACE_SOURCE_FRAME_COUNT; ++i)
-        if (client_surface_handoff_state( __atomic_load_n(
-                &surface->handoff_pool->shared->slots[surface->handoff_index + i].control,
-                __ATOMIC_ACQUIRE ) ) == CLIENT_SURFACE_HANDOFF_LOST) return 1;
-    return 0;
+    return surface->handoff_pool && __atomic_load_n(
+        &surface->handoff_pool->shared->channels[surface->handoff_index].closed, __ATOMIC_ACQUIRE );
 }
 
 static void mark_client_surface_handoff_lost( struct client_surface_ref *surface )
 {
-    struct client_surface_handoff_slot *slot;
-    UINT64 control;
-    unsigned int i;
-
     if (!surface->handoff_pool) return;
-    for (i = 0; i < CLIENT_SURFACE_SOURCE_FRAME_COUNT; ++i)
-    {
-        slot = &surface->handoff_pool->shared->slots[surface->handoff_index + i];
-        control = __atomic_load_n( &slot->control, __ATOMIC_ACQUIRE );
-        for (;;)
-        {
-            UINT64 lost = client_surface_handoff_control(
-                client_surface_handoff_generation( control ), CLIENT_SURFACE_HANDOFF_LOST );
-
-            if (client_surface_handoff_state( control ) == CLIENT_SURFACE_HANDOFF_LOST) break;
-            if (__atomic_compare_exchange_n( &slot->control, &control, lost, 0,
-                                             __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE )) break;
-        }
-        signal_client_surface_handoff_ready( surface->handoff_pool, surface->handoff_index + i );
-    }
+    __atomic_store_n( &surface->handoff_pool->shared->channels[surface->handoff_index].closed,
+                      1, __ATOMIC_RELEASE );
+    signal_client_surface_handoff_ready( surface->handoff_pool, surface->handoff_index );
     wake_client_surface_handoff( surface->handoff_pool, 0 );
 }
 
 static void free_client_surface_handoff( struct client_surface_ref *surface )
 {
     struct client_surface_handoff_pool *pool = surface->handoff_pool;
-    unsigned int i;
+    unsigned int index = surface->handoff_index;
 
     if (!pool) return;
     assert( !surface->handoff_producer_mapped && !surface->handoff_consumer_mapped );
     mark_client_surface_handoff_lost( surface );
-    for (i = 0; i < CLIENT_SURFACE_SOURCE_FRAME_COUNT; ++i)
-    {
-        unsigned int index = surface->handoff_index + i;
-
-        __atomic_fetch_and( &pool->shared->ready_bitmap[index / 64],
-                            ~((UINT64)1 << (index % 64)), __ATOMIC_ACQ_REL );
-        __atomic_store_n( &pool->shared->slots[index].endpoints, 0, __ATOMIC_RELEASE );
-        pool->used[index] = 0;
-    }
+    __atomic_fetch_and( &pool->shared->ready_bitmap[index / 64],
+                        ~((UINT64)1 << (index % 64)), __ATOMIC_ACQ_REL );
+    __atomic_store_n( &pool->shared->channels[index].endpoints, 0, __ATOMIC_RELEASE );
+    pool->used[index] = 0;
     if (surface->handoff_top) release_object( surface->handoff_top );
     surface->handoff_pool = NULL;
     surface->handoff_top = NULL;
@@ -401,7 +374,7 @@ static struct client_surface_handoff_pool *create_client_surface_handoff_pool(
     memset( pool->shared, 0, sizeof(*pool->shared) );
     pool->shared->mapping_id = pool->id;
     pool->shared->version = CLIENT_SURFACE_HANDOFF_VERSION;
-    pool->shared->slot_count = CLIENT_SURFACE_HANDOFF_SLOTS;
+    pool->shared->channel_count = CLIENT_SURFACE_HANDOFF_CHANNELS;
     __atomic_store_n( &pool->shared->magic, CLIENT_SURFACE_HANDOFF_MAGIC, __ATOMIC_RELEASE );
     list_add_tail( &client_surface_handoff_pools, &pool->entry );
     return pool;
@@ -488,9 +461,9 @@ static int alloc_client_surface_handoff( struct client_surface_ref *surface,
                                          struct window *win, struct window *top )
 {
     struct client_surface_handoff_pool *pool;
-    struct client_surface_handoff_slot *slot;
+    struct client_surface_handoff_channel *channel;
     struct process *consumer;
-    unsigned int i, j;
+    unsigned int i;
 
     if (!top->thread || !(consumer = top->thread->process))
     {
@@ -506,7 +479,7 @@ static int alloc_client_surface_handoff( struct client_surface_ref *surface,
                          struct client_surface_handoff_pool, entry )
     {
         if (pool->producer != surface->process || pool->consumer != consumer) continue;
-        for (i = 0; i < CLIENT_SURFACE_HANDOFF_SLOTS; i += CLIENT_SURFACE_SOURCE_FRAME_COUNT)
+        for (i = 0; i < CLIENT_SURFACE_HANDOFF_CHANNELS; ++i)
             if (!pool->used[i]) goto found;
     }
     if (!(pool = create_client_surface_handoff_pool( surface->process, consumer ))) return 0;
@@ -518,22 +491,16 @@ found:
     surface->handoff_cookie = ++client_surface_handoff_serial;
     surface->handoff_producer_mapped = 0;
     surface->handoff_consumer_mapped = 0;
-    for (j = 0; j < CLIENT_SURFACE_SOURCE_FRAME_COUNT; ++j)
-    {
-        pool->used[i + j] = 1;
-        __atomic_fetch_and( &pool->shared->ready_bitmap[(i + j) / 64],
-                            ~((UINT64)1 << ((i + j) % 64)), __ATOMIC_ACQ_REL );
-        slot = &pool->shared->slots[i + j];
-        memset( slot, 0, sizeof(*slot) );
-        slot->cookie = surface->handoff_cookie;
-        slot->identity = surface->id;
-        slot->producer_process = surface->process->id;
-        slot->window = win->handle;
-        slot->toplevel = top->handle;
-        __atomic_store_n( &slot->control,
-                          client_surface_handoff_control( 1, CLIENT_SURFACE_HANDOFF_FREE ),
-                          __ATOMIC_RELEASE );
-    }
+    pool->used[i] = 1;
+    __atomic_fetch_and( &pool->shared->ready_bitmap[i / 64],
+                        ~((UINT64)1 << (i % 64)), __ATOMIC_ACQ_REL );
+    channel = &pool->shared->channels[i];
+    memset( channel, 0, sizeof(*channel) );
+    channel->cookie = surface->handoff_cookie;
+    channel->identity = surface->id;
+    channel->producer_process = surface->process->id;
+    channel->window = win->handle;
+    channel->toplevel = top->handle;
     return 1;
 }
 
@@ -2123,7 +2090,7 @@ void cleanup_process_client_surfaces( struct process *process )
             post_message( top->handle, WM_WINE_UPDATEWINDOWSTATE, 0, 0 );
     }
 
-    /* Either endpoint disappearing makes every unfinished generation LOST.
+    /* Either endpoint disappearing closes its channels.
      * Surviving mapped handles retain the section long enough to observe that
      * state; the server binding itself must not retain raw process pointers. */
     for (bucket = 0; bucket < CLIENT_SURFACE_REF_BUCKETS; bucket++)
@@ -2221,10 +2188,9 @@ static struct client_surface_ref *get_client_surface_handoff_ref( struct window 
 DECL_HANDLER(get_client_surface_handoff)
 {
     struct client_surface_ref *surface;
-    struct client_surface_handoff_slot *slot;
+    struct client_surface_handoff_channel *channel;
     struct window *top, *win;
     int producer_view = !req->owner;
-    unsigned int i;
 
     reply->mapping = 0;
     reply->size = reply->offset = 0;
@@ -2238,7 +2204,7 @@ DECL_HANDLER(get_client_surface_handoff)
     {
         /* Do not reacquire an endpoint of a failed binding while its peer
          * is retiring it. Otherwise both sides can repeatedly remap the
-         * same LOST cookie and prevent its final release forever. */
+         * same closed channel cookie and prevent its final release forever. */
         if (surface->handoff_top != top || surface->handoff_retired)
             retarget_client_surface_handoff( surface );
         else retire_client_surface_handoff( surface );
@@ -2254,15 +2220,13 @@ DECL_HANDLER(get_client_surface_handoff)
                                          SECTION_MAP_READ | SECTION_MAP_WRITE, 0 ))) return;
     if (producer_view) surface->handoff_producer_mapped = 1;
     else surface->handoff_consumer_mapped = 1;
-    slot = &surface->handoff_pool->shared->slots[surface->handoff_index];
-    for (i = 0; i < CLIENT_SURFACE_SOURCE_FRAME_COUNT; ++i)
-        __atomic_fetch_or( &slot[i].endpoints,
-                           producer_view ? CLIENT_SURFACE_HANDOFF_ENDPOINT_PRODUCER :
-                                           CLIENT_SURFACE_HANDOFF_ENDPOINT_CONSUMER,
-                           __ATOMIC_RELEASE );
+    channel = &surface->handoff_pool->shared->channels[surface->handoff_index];
+    __atomic_fetch_or( &channel->endpoints,
+                       producer_view ? CLIENT_SURFACE_HANDOFF_ENDPOINT_PRODUCER :
+                                       CLIENT_SURFACE_HANDOFF_ENDPOINT_CONSUMER, __ATOMIC_RELEASE );
     reply->mapping_id = surface->handoff_pool->id;
     reply->size = sizeof(*surface->handoff_pool->shared);
-    reply->offset = (char *)slot - (char *)surface->handoff_pool->shared;
+    reply->offset = (char *)channel - (char *)surface->handoff_pool->shared;
     reply->cookie = surface->handoff_cookie;
 }
 
@@ -2288,9 +2252,8 @@ DECL_HANDLER(get_client_surface_handoff_event)
 DECL_HANDLER(release_client_surface_handoff)
 {
     struct client_surface_ref *surface;
-    struct client_surface_handoff_slot *slot;
+    struct client_surface_handoff_channel *channel;
     user_handle_t refresh = 0;
-    unsigned int i;
     int producer_view = !req->owner;
 
     if (producer_view && req->producer && req->producer != current->process->id)
@@ -2326,20 +2289,18 @@ DECL_HANDLER(release_client_surface_handoff)
         set_error( STATUS_INVALID_PARAMETER );
         return;
     }
-    slot = &surface->handoff_pool->shared->slots[surface->handoff_index];
+    channel = &surface->handoff_pool->shared->channels[surface->handoff_index];
     if (producer_view) surface->handoff_producer_mapped = 0;
     else surface->handoff_consumer_mapped = 0;
-    /* A retired owner root cannot return any remaining READY token. A normal
+    /* A retired owner root cannot consume any remaining frame. A normal
      * hide/show can reacquire the same binding and must keep its only image.
      * Invalidate and wake for reparent or failure, before clearing the endpoint.
      * The consumer keeps its endpoint until all checked reads have finished. */
     if (!producer_view && (surface->handoff_retired || is_client_surface_handoff_lost( surface )))
         mark_client_surface_handoff_lost( surface );
-    for (i = 0; i < CLIENT_SURFACE_SOURCE_FRAME_COUNT; ++i)
-        __atomic_fetch_and( &slot[i].endpoints,
-                            ~(LONG)(producer_view ? CLIENT_SURFACE_HANDOFF_ENDPOINT_PRODUCER :
-                                                    CLIENT_SURFACE_HANDOFF_ENDPOINT_CONSUMER),
-                            __ATOMIC_RELEASE );
+    __atomic_fetch_and( &channel->endpoints,
+                        ~(LONG)(producer_view ? CLIENT_SURFACE_HANDOFF_ENDPOINT_PRODUCER :
+                                                CLIENT_SURFACE_HANDOFF_ENDPOINT_CONSUMER), __ATOMIC_RELEASE );
     if (!surface->handoff_producer_mapped && !surface->handoff_consumer_mapped &&
         ((!surface->active && !surface->cached) ||
          is_client_surface_handoff_lost( surface )))
@@ -2385,7 +2346,7 @@ static int validate_client_surface_handoff_generation( struct window *win, struc
         receipt = &receipts[low];
         if (receipt->handle != win->handle || receipt->process != owner->process->id ||
             receipt->surface != surface->id || receipt->cookie != surface->handoff_cookie ||
-            !receipt->source_generation || receipt->buffer_index >= CLIENT_SURFACE_SOURCE_FRAME_COUNT)
+            !receipt->source_generation || receipt->buffer_index >= CLIENT_SURFACE_HANDOFF_RING_SIZE)
             return 0;
         (*count)++;
     }
