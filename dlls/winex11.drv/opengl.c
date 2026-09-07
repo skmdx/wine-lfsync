@@ -1675,7 +1675,11 @@ struct egl_snapshot_completion
 {
     LONG refs;
     EGLSyncKHR sync;
+    /* Only the queued completion owns the drawable and mapping references.
+     * Image retirement must test the fence without dereferencing these. */
     struct opengl_drawable *drawable;
+    const struct client_surface_handoff_slot *slot;
+    UINT64 control;
 };
 
 struct egl_snapshot_image
@@ -1694,9 +1698,26 @@ static void release_snapshot_sync( struct egl_snapshot_completion *completion )
 static BOOL wait_snapshot_completion( void *context, DWORD timeout )
 {
     struct egl_snapshot_completion *completion = context;
+    DWORD elapsed = 0, start = NtGetTickCount();
+    EGLint result;
 
-    return snapshot_wait_sync( egl->display, completion->sync, 0, (EGLTimeKHR)timeout * 1000000 ) ==
-           EGL_CONDITION_SATISFIED_KHR;
+    do
+    {
+        /* The completion token keeps this mapping alive. A revoked handoff
+         * cannot publish the write, even if its GPU fence eventually signals.
+         * Retire its callback promptly while the image retains the real fence. */
+        if (__atomic_load_n( &completion->slot->control, __ATOMIC_ACQUIRE ) != completion->control)
+        {
+            TRACE( "cancelled EGL source completion for control %s\n",
+                   wine_dbgstr_longlong( completion->control ) );
+            return FALSE;
+        }
+        result = snapshot_wait_sync( egl->display, completion->sync, 0,
+                                      (EGLTimeKHR)min( timeout - elapsed, 10 ) * 1000000 );
+        if (result != EGL_TIMEOUT_EXPIRED_KHR) return result == EGL_CONDITION_SATISFIED_KHR;
+        elapsed = NtGetTickCount() - start;
+    } while (elapsed < timeout);
+    return FALSE;
 }
 
 static void release_snapshot_completion( void *context )
@@ -1712,7 +1733,8 @@ static BOOL snapshot_image_ready( void *context )
 {
     struct egl_snapshot_image *image = context;
 
-    return !image->pending || wait_snapshot_completion( image->pending, 0 );
+    return !image->pending || snapshot_wait_sync( egl->display, image->pending->sync, 0, 0 ) ==
+                             EGL_CONDITION_SATISFIED_KHR;
 }
 
 static void release_snapshot_image( void *context )
@@ -1807,6 +1829,8 @@ static int snapshot_client_surface_gpu( struct opengl_drawable *base,
             funcs->p_glFlush();
             completion->refs = 2;
             completion->drawable = base;
+            completion->slot = slot;
+            completion->control = present->handoff_control;
             opengl_drawable_add_ref( base );
             release_snapshot_sync( image->pending );
             image->pending = completion;

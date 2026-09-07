@@ -136,8 +136,9 @@ static BOOL retire_source_mapping( struct x11drv_client_surface_retirement *reti
     }
     if (!ready) return FALSE;
 
-    TRACE( "releasing source mapping identity %s cookie %s after readers completed, view %p\n",
-           wine_dbgstr_longlong( retirement->identity ), wine_dbgstr_longlong( retirement->cookie ), retirement->view );
+    TRACE( "releasing source mapping identity %s cookie %s after readers completed, view %p fd %d\n",
+           wine_dbgstr_longlong( retirement->identity ), wine_dbgstr_longlong( retirement->cookie ),
+           retirement->view, retirement->ready_fd );
     SERVER_START_REQ( release_client_surface_handoff )
     {
         req->handle = 0;
@@ -257,8 +258,9 @@ void x11drv_client_surface_retire_handoff( struct client_surface *client )
             surface->snapshot_retirement = retirement;
             break;
         }
-    TRACE( "retiring source mapping identity %s cookie %s view %p\n",
-           wine_dbgstr_longlong( retirement->identity ), wine_dbgstr_longlong( retirement->cookie ), retirement->view );
+    TRACE( "retiring source mapping identity %s cookie %s view %p fd %d\n",
+           wine_dbgstr_longlong( retirement->identity ), wine_dbgstr_longlong( retirement->cookie ),
+           retirement->view, retirement->ready_fd );
     for (i = 0; i < ARRAY_SIZE(retirement->sources); ++i)
         if (retirement->sources[i].pixmap)
             TRACE( "retaining source pixmap %#lx identity %s cookie %s\n", retirement->sources[i].pixmap,
