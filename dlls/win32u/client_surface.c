@@ -546,7 +546,8 @@ static void client_surface_release_locked( struct client_surface *surface )
         release_client_surface_id( client_surface_get_identity( surface ) );
         if (surface->clip_region) NtGdiDeleteObjectApp( surface->clip_region );
         assert( list_empty( &surface->completion_queue ) );
-        assert( !surface->completion_worker_active );
+        assert( list_empty( &surface->completion_ready_entry ) );
+        assert( !surface->completion_in_progress );
         assert( !surface->external_completion_count );
         assert( !surface->handoff_waiters );
         assert( !surface->driver_completion_count );
@@ -554,8 +555,6 @@ static void client_surface_release_locked( struct client_surface *surface )
         assert( !surface->native_present_count );
         assert( !surface->target_update_waiters );
         client_surface_backend_destroy( surface );
-        pthread_mutex_destroy( &surface->completion_wait_lock );
-        pthread_cond_destroy( &surface->completion_queue_cond );
         pthread_cond_destroy( &surface->completion_cond );
         pthread_mutex_destroy( &surface->completion_lock );
         pthread_mutex_destroy( &surface->present_lock );
@@ -1244,8 +1243,6 @@ void *client_surface_create( UINT size, const struct client_surface_backend *bac
     if (pthread_mutex_init( &surface->present_lock, NULL )) goto failed_present_lock;
     if (pthread_mutex_init( &surface->completion_lock, NULL )) goto failed_completion_lock;
     if (pthread_cond_init( &surface->completion_cond, NULL )) goto failed_completion_cond;
-    if (pthread_cond_init( &surface->completion_queue_cond, NULL )) goto failed_queue_cond;
-    if (pthread_mutex_init( &surface->completion_wait_lock, NULL )) goto failed_wait_lock;
     if (!(surface->identity = allocate_client_surface_identity())) goto failed_identity;
     surface->backend = backend;
     surface->handoff_ready_fd = -1;
@@ -1259,6 +1256,7 @@ void *client_surface_create( UINT size, const struct client_surface_backend *bac
         surface->target.virtual_rect = surface->target.monitor_rect = (RECT){0};
     list_init( &surface->entry );
     list_init( &surface->completion_queue );
+    list_init( &surface->completion_ready_entry );
     InterlockedCompareExchange( &client_surface_process_id,
                                 HandleToULong( NtCurrentTeb()->ClientId.UniqueProcess ), 0 );
     insert_client_surface_index( surface );
@@ -1269,10 +1267,6 @@ void *client_surface_create( UINT size, const struct client_surface_backend *bac
     return surface;
 
 failed_identity:
-    pthread_mutex_destroy( &surface->completion_wait_lock );
-failed_wait_lock:
-    pthread_cond_destroy( &surface->completion_queue_cond );
-failed_queue_cond:
     pthread_cond_destroy( &surface->completion_cond );
 failed_completion_cond:
     pthread_mutex_destroy( &surface->completion_lock );

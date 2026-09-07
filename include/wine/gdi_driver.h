@@ -219,7 +219,7 @@ struct gdi_dc_funcs
 };
 
 /* increment this when changing driver tables or shared driver-facing structures */
-#define WINE_GDI_DRIVER_VERSION 132
+#define WINE_GDI_DRIVER_VERSION 133
 
 #define GDI_PRIORITY_NULL_DRV        0  /* null driver */
 #define GDI_PRIORITY_FONT_DRV      100  /* any font driver */
@@ -407,12 +407,13 @@ struct client_surface
     struct client_surface             *toplevel_next; /* driver-ready top-level hash chain */
     HWND                               indexed_toplevel;
     pthread_mutex_t                    present_lock;   /* serializes driver operations for this surface */
-    pthread_mutex_t                    completion_lock; /* protects host completion state and deferred FIFO */
+    pthread_mutex_t                    completion_lock; /* protects host completion state */
     pthread_cond_t                     completion_cond; /* completion-mode and target handoff */
-    pthread_cond_t                     completion_queue_cond; /* wakes only the surface's FIFO worker */
-    pthread_mutex_t                    completion_wait_lock; /* serializes backend waits, including inline fallback */
+    /* The process completion executor protects these, independently of the
+     * native presentation locks. Its FIFO head owns each poll and finish. */
     struct list                        completion_queue;
-    BOOL                               completion_worker_active;
+    struct list                        completion_ready_entry;
+    BOOL                               completion_in_progress;
     LONG                               ref;            /* reference count */
     HWND                               hwnd;           /* window the surface was created for */
     int                                format;         /* pixel format of the surface */
