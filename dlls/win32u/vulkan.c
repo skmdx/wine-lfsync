@@ -944,13 +944,15 @@ static VkResult enable_swapchain_maintenance1( struct vulkan_physical_device *ph
     }, *enable;
     VkPhysicalDeviceFeatures2 features = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
                                          .pNext = &maintenance};
-    const VkPhysicalDeviceSwapchainMaintenance1FeaturesKHR *application;
+    VkPhysicalDeviceSwapchainMaintenance1FeaturesKHR *application;
     BOOL khr, ext;
 
     if (!device->extensions.has_VK_KHR_swapchain) return VK_SUCCESS;
-    /* KHR and EXT use the same structure type. Preserve an explicit disabled
-     * feature and never put a duplicate structure in the application's chain. */
-    if ((application = find_next_struct( info->pNext, maintenance.sType )))
+    /* The thunk copied the application chain. A disabled feature must not
+     * disable Wine's private Present fences on a capable host. KHR and EXT
+     * share a structure type; enable that copy without adding a duplicate. */
+    application = (void *)find_next_struct( info->pNext, maintenance.sType );
+    if (application && application->swapchainMaintenance1)
     {
         impl->swapchain_maintenance1 = application->swapchainMaintenance1 &&
             (device->extensions.has_VK_KHR_swapchain_maintenance1 ||
@@ -969,12 +971,20 @@ static VkResult enable_swapchain_maintenance1( struct vulkan_physical_device *ph
         instance->p_vkGetPhysicalDeviceFeatures2KHR( physical_device->host.physical_device, &features );
     if (!maintenance.swapchainMaintenance1) return VK_SUCCESS;
 
-    if (!(enable = mem_alloc( pool, sizeof(*enable) ))) return VK_ERROR_OUT_OF_HOST_MEMORY;
-    *enable = maintenance;
-    enable->pNext = (void *)info->pNext;
-    info->pNext = enable;
-    if (khr) device->extensions.has_VK_KHR_swapchain_maintenance1 = 1;
-    else device->extensions.has_VK_EXT_swapchain_maintenance1 = 1;
+    if (application) application->swapchainMaintenance1 = VK_TRUE;
+    else
+    {
+        if (!(enable = mem_alloc( pool, sizeof(*enable) ))) return VK_ERROR_OUT_OF_HOST_MEMORY;
+        *enable = maintenance;
+        enable->pNext = (void *)info->pNext;
+        info->pNext = enable;
+    }
+    if (!device->extensions.has_VK_KHR_swapchain_maintenance1 &&
+        !device->extensions.has_VK_EXT_swapchain_maintenance1)
+    {
+        if (khr) device->extensions.has_VK_KHR_swapchain_maintenance1 = 1;
+        else device->extensions.has_VK_EXT_swapchain_maintenance1 = 1;
+    }
     impl->swapchain_maintenance1 = TRUE;
     return VK_SUCCESS;
 }
