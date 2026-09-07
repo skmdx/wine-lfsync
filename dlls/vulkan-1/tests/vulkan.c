@@ -126,7 +126,7 @@ static VkResult create_device(VkPhysicalDevice vk_physical_device,
 }
 
 static VkResult create_swapchain_usage(VkPhysicalDevice physical_device, VkSurfaceKHR surface,
-        VkDevice device, HWND hwnd, VkImageUsageFlags usage, VkSwapchainKHR *swapchain)
+        VkDevice device, HWND hwnd, VkImageUsageFlags usage, VkSwapchainKHR old_swapchain, VkSwapchainKHR *swapchain)
 {
     VkSwapchainCreateInfoKHR create_info = {.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR};
     VkSurfaceCapabilitiesKHR capabilities;
@@ -156,6 +156,7 @@ static VkResult create_swapchain_usage(VkPhysicalDevice physical_device, VkSurfa
     create_info.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
     create_info.presentMode = VK_PRESENT_MODE_IMMEDIATE_KHR;
     create_info.clipped = VK_TRUE;
+    create_info.oldSwapchain = old_swapchain;
 
     return vkCreateSwapchainKHR(device, &create_info, NULL, swapchain);
 }
@@ -164,7 +165,7 @@ static VkResult create_swapchain(VkPhysicalDevice physical_device, VkSurfaceKHR 
         VkDevice device, HWND hwnd, VkSwapchainKHR *swapchain)
 {
     return create_swapchain_usage(physical_device, surface, device, hwnd,
-            VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, swapchain);
+            VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT, VK_NULL_HANDLE, swapchain);
 }
 
 static void test_instance_version(void)
@@ -1080,7 +1081,7 @@ done:
 }
 
 static void test_win32_surface_pixels(VkInstance instance, VkPhysicalDevice physical_device,
-        VkDevice device, VkQueue queue, VkCommandBuffer command_buffer, BOOL incremental)
+        VkDevice device, VkQueue queue, VkCommandBuffer command_buffer, BOOL incremental, BOOL retirement)
 {
     VkWin32SurfaceCreateInfoKHR surface_info = {.sType = VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR};
     VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
@@ -1090,6 +1091,7 @@ static void test_win32_surface_pixels(VkInstance instance, VkPhysicalDevice phys
     VkSubmitInfo submit = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO};
     struct multi_swapchain data[2] = {{0}};
     VkSwapchainKHR swapchains[2];
+    VkSwapchainKHR replacement = VK_NULL_HANDLE;
     uint32_t indices[2];
     VkResult results[2], vr;
     VkFence fence = VK_NULL_HANDLE;
@@ -1172,7 +1174,8 @@ static void test_win32_surface_pixels(VkInstance instance, VkPhysicalDevice phys
         ok(vr == VK_SUCCESS, "Create child surface %u failed, vr %d.\n", i, vr);
         if (vr) goto done;
         vr = create_swapchain_usage(physical_device, data[i].surface, device, data[i].hwnd,
-                VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT, &data[i].swapchain);
+                VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                VK_NULL_HANDLE, &data[i].swapchain);
         ok(vr == VK_SUCCESS, "Create child swapchain %u failed, vr %d.\n", i, vr);
         if (vr) goto done;
         vr = vkGetSwapchainImagesKHR(device, data[i].swapchain, &data[i].image_count, NULL);
@@ -1204,11 +1207,13 @@ static void test_win32_surface_pixels(VkInstance instance, VkPhysicalDevice phys
         ok(!!dc[i], "Failed to get readback DC.\n");
         if (!dc[i]) goto done;
     }
-    for (round = 0; round < (incremental ? 8 : 4); ++round)
+    for (round = 0; round < (incremental ? 8 : retirement ? 6 : 4); ++round)
     {
         COLORREF colors[2] = {CLR_INVALID, CLR_INVALID};
         COLORREF expected[2] = {round & 1 ? RGB(0,0,255) : RGB(255,0,0),
                                 round & 1 ? RGB(255,0,255) : RGB(0,255,0)};
+        BOOL check_pixels[2] = {TRUE, TRUE};
+        unsigned int replace_index = round / 2;
         DWORD start;
         MSG message;
 
@@ -1285,6 +1290,21 @@ static void test_win32_surface_pixels(VkInstance instance, VkPhysicalDevice phys
         present.pSwapchains = swapchains;
         present.pImageIndices = indices;
         present.pResults = results;
+        if (retirement && round < 4 && !(round & 1))
+        {
+            /* Acquired images remain presentable after a same-size
+             * replacement retires their swapchain. No image has yet been
+             * acquired from the replacement. The other source stays live. */
+            vr = create_swapchain_usage(physical_device, data[replace_index].surface, device,
+                    data[replace_index].hwnd, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                    data[replace_index].swapchain, &replacement);
+            ok(vr == VK_SUCCESS, "Round %u pre-present replacement failed, vr %d.\n", round, vr);
+            if (vr)
+            {
+                replacement = VK_NULL_HANDLE;
+                goto done;
+            }
+        }
         /* Every source image contains a full white background and a colored
          * center. Only the center changes after the first frame, including
          * when acquire rotates among images and owner output buffers. */
@@ -1293,7 +1313,47 @@ static void test_win32_surface_pixels(VkInstance instance, VkPhysicalDevice phys
         ok(vr == VK_SUCCESS, "Round %u composition present failed, vr %d.\n", round, vr);
         for (i = 0; i < ARRAY_SIZE(data); ++i)
             ok(results[i] == VK_SUCCESS, "Child %u present failed, vr %d.\n", i, results[i]);
-        vkQueueWaitIdle(queue);
+        if (retirement && round < 4 && (round & 1))
+        {
+            /* Replace immediately after submission, without waiting for its
+             * presentation or CPU capture. Internal wait admission can be
+             * open or already occupied here. A superseded frame may be
+             * abandoned; the untouched source must still publish. */
+            vr = create_swapchain_usage(physical_device, data[replace_index].surface, device,
+                    data[replace_index].hwnd, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                    data[replace_index].swapchain, &replacement);
+            ok(vr == VK_SUCCESS, "Round %u post-present replacement failed, vr %d.\n", round, vr);
+            if (vr)
+            {
+                replacement = VK_NULL_HANDLE;
+                goto done;
+            }
+            check_pixels[replace_index] = FALSE;
+        }
+        vr = vkQueueWaitIdle(queue);
+        ok(vr == VK_SUCCESS, "Round %u queue wait failed, vr %d.\n", round, vr);
+        if (vr) goto done;
+        if (replacement)
+        {
+            struct multi_swapchain *child = &data[replace_index];
+
+            /* Application GPU work is complete. Native presentation waits
+             * and private captures can still retain the old Wine object. */
+            vkDestroySwapchainKHR(device, child->swapchain, NULL);
+            child->swapchain = swapchains[replace_index] = replacement;
+            replacement = VK_NULL_HANDLE;
+            free(child->images);
+            child->images = NULL;
+            vr = vkGetSwapchainImagesKHR(device, child->swapchain, &child->image_count, NULL);
+            ok(vr == VK_SUCCESS && child->image_count, "Get replacement image count failed, vr %d.\n", vr);
+            if (vr || !child->image_count) goto done;
+            child->images = malloc(child->image_count * sizeof(*child->images));
+            ok(!!child->images, "Failed to allocate replacement images.\n");
+            if (!child->images) goto done;
+            vr = vkGetSwapchainImagesKHR(device, child->swapchain, &child->image_count, child->images);
+            ok(vr == VK_SUCCESS, "Get replacement images failed, vr %d.\n", vr);
+            if (vr) goto done;
+        }
 
         start = GetTickCount();
         do
@@ -1304,11 +1364,13 @@ static void test_win32_surface_pixels(VkInstance instance, VkPhysicalDevice phys
                 DispatchMessageW(&message);
             }
             for (i = 0; i < ARRAY_SIZE(data); ++i) colors[i] = GetPixel(dc[i], 64, 64);
-            if (colors[0] == expected[0] && colors[1] == expected[1]) break;
+            if ((!check_pixels[0] || colors[0] == expected[0]) &&
+                (!check_pixels[1] || colors[1] == expected[1])) break;
             Sleep(1);
         } while (GetTickCount() - start < 5000);
         for (i = 0; i < ARRAY_SIZE(data); ++i)
         {
+            if (!check_pixels[i]) continue;
             ok(colors[i] == expected[i], "Round %u child %u pixel %#lx, expected %#lx.\n",
                     round, i, colors[i], expected[i]);
             if (incremental)
@@ -1319,7 +1381,8 @@ static void test_win32_surface_pixels(VkInstance instance, VkPhysicalDevice phys
                     "Round %u child %u background %#lx, expected white.\n", round, i, background);
             }
         }
-        trace("Composition round %u pixels %#lx/%#lx.\n", round, colors[0], colors[1]);
+        trace("Composition round %u pixels %#lx/%#lx, checked %u/%u, retirement %u.\n",
+                round, colors[0], colors[1], check_pixels[0], check_pixels[1], retirement);
     }
 done:
     vkQueueWaitIdle(queue);
@@ -1328,6 +1391,7 @@ done:
     if (upload_memory) vkFreeMemory(device, upload_memory, NULL);
     if (rendered) vkDestroySemaphore(device, rendered, NULL);
     if (fence) vkDestroyFence(device, fence, NULL);
+    if (replacement) vkDestroySwapchainKHR(device, replacement, NULL);
     for (i = 0; i < ARRAY_SIZE(data); ++i)
     {
         free(data[i].images);
@@ -1359,6 +1423,7 @@ static void test_win32_surface(VkInstance instance, VkPhysicalDevice physical_de
     char **argv;
     int argc = winetest_get_mainargs(&argv);
     BOOL pixels_only = argc > 2 && !strcmp(argv[2], "composition-pixels");
+    BOOL retirement_only = argc > 2 && !strcmp(argv[2], "retirement-pixels");
     BOOL incremental;
 
     vr = create_device(physical_device, ARRAY_SIZE(device_extensions), device_extensions, NULL, &device);
@@ -1383,7 +1448,7 @@ static void test_win32_surface(VkInstance instance, VkPhysicalDevice physical_de
     vr = vkAllocateCommandBuffers(device, &allocate_info, &command_buffer);
     ok(vr == VK_SUCCESS, "Got unexpected vr %d.\n", vr);
 
-    if (pixels_only) goto composition_pixels;
+    if (pixels_only || retirement_only) goto composition_pixels;
 
     /* test NULL window */
 
@@ -1635,21 +1700,27 @@ static void test_win32_surface(VkInstance instance, VkPhysicalDevice physical_de
     winetest_pop_context();
 
 composition_pixels:
+    if (retirement_only) goto retirement_pixels;
     winetest_push_context("composition-pixels");
-    test_win32_surface_pixels(instance, physical_device, device, queue, command_buffer, FALSE);
+    test_win32_surface_pixels(instance, physical_device, device, queue, command_buffer, FALSE, FALSE);
     winetest_pop_context();
     if (incremental)
     {
         winetest_push_context("incremental-composition-pixels");
-        test_win32_surface_pixels(instance, physical_device, device, queue, command_buffer, TRUE);
+        test_win32_surface_pixels(instance, physical_device, device, queue, command_buffer, TRUE, FALSE);
         winetest_pop_context();
     }
     else skip("VK_KHR_incremental_present is unavailable.\n");
 
+retirement_pixels:
+    winetest_push_context("retirement-pixels");
+    test_win32_surface_pixels(instance, physical_device, device, queue, command_buffer, FALSE, TRUE);
+    winetest_pop_context();
+
     vkDestroyCommandPool(device, command_pool, NULL);
     vkDestroyDevice(device, NULL);
 
-    if (!pixels_only) test_present_timing(instance, physical_device);
+    if (!pixels_only && !retirement_only) test_present_timing(instance, physical_device);
 }
 
 static uint32_t find_memory_type(VkPhysicalDevice vk_physical_device, VkMemoryPropertyFlagBits flags, uint32_t mask)
@@ -2308,7 +2379,7 @@ START_TEST(vulkan)
 
     argc = winetest_get_mainargs(&argv);
 
-    if (argc > 2 && !strcmp(argv[2], "composition-pixels"))
+    if (argc > 2 && (!strcmp(argv[2], "composition-pixels") || !strcmp(argv[2], "retirement-pixels")))
     {
         for_each_device_instance(ARRAY_SIZE(test_win32_surface_extensions), test_win32_surface_extensions,
                 test_win32_surface, NULL);
