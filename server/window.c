@@ -2311,7 +2311,7 @@ DECL_HANDLER(release_client_surface_handoff)
 {
     struct client_surface_ref *surface;
     struct client_surface_handoff_channel *channel;
-    user_handle_t refresh = 0;
+    user_handle_t refresh = 0, current_refresh = 0;
     int producer_view = !req->owner;
 
     if (producer_view && req->producer && req->producer != current->process->id)
@@ -2368,12 +2368,29 @@ DECL_HANDLER(release_client_surface_handoff)
          is_client_surface_handoff_lost( surface )))
     {
         if ((surface->active || surface->cached) && surface->handoff_top)
+        {
+            struct client_surface_owner *owner;
+            struct window *win;
+
             refresh = surface->handoff_top->handle;
+            /* A new owner may already have tried to bind while the old
+             * mapping was still pinned. Wake it when that last endpoint
+             * releases, as well as the old root which needs cleanup. The
+             * shared window handle is only a lookup hint: authenticate its
+             * current registration and selection before routing the wake. */
+            if ((win = get_user_object( channel->window, NTUSER_OBJ_WINDOW )) &&
+                get_client_surface_owner( win, surface->process, 0 ) == surface->owner &&
+                select_client_surface_producer( win, &owner ) == surface)
+                current_refresh = get_toplevel_window( win )->handle;
+        }
         free_client_surface_handoff( surface );
     }
     free_client_surface_ref_if_unused( surface );
     if (refresh)
         post_message_coalesced( refresh, WM_WINE_UPDATEWINDOWSTATE,
+                                WINE_UPDATE_CLIENT_SURFACE_HANDOFFS, 0 );
+    if (current_refresh && current_refresh != refresh)
+        post_message_coalesced( current_refresh, WM_WINE_UPDATEWINDOWSTATE,
                                 WINE_UPDATE_CLIENT_SURFACE_HANDOFFS, 0 );
 }
 

@@ -2985,6 +2985,219 @@ static void test_handoff_lost_recovery(void)
     }
 }
 
+static void check_handoff_recovery_notifications( HWND old_root, UINT old_expected,
+                                                  HWND current_root, UINT current_expected )
+{
+    UINT old_count = 0, current_count = 0, status, i;
+
+    /* Consume the actual server queue without running the native owner.
+     * Counting each destination also detects a duplicate same-root wake. */
+    for (i = 0; i < 128; ++i)
+    {
+        struct __server_request_info info = {0};
+        struct get_message_reply *reply = &info.u.reply.get_message_reply;
+        char data[4096];
+
+        info.u.req.get_message_request.__header.req = REQ_get_message;
+        info.u.req.get_message_request.flags = PM_REMOVE | (QS_POSTMESSAGE << 16);
+        info.u.req.get_message_request.get_last = ~0u;
+        wine_server_set_reply( &info, data, sizeof(data) );
+        status = p_wine_server_call( &info );
+        if (status == STATUS_PENDING) break;
+        ok( !status, "recovery notification retrieval status %#x\n", status );
+        if (status) break;
+        if (reply->msg == WM_WINE_UPDATEWINDOWSTATE && reply->wparam == WINE_UPDATE_CLIENT_SURFACE_HANDOFFS)
+        {
+            HWND hwnd = wine_server_ptr_handle( reply->win );
+
+            if (hwnd == old_root) ++old_count;
+            else if (hwnd == current_root) ++current_count;
+            else ok( 0, "recovery notified unrelated root %p\n", hwnd );
+        }
+        if (reply->type != MSG_POSTED && reply->type != MSG_NOTIFY)
+        {
+            memset( &info, 0, sizeof(info) );
+            info.u.req.reply_message_request.__header.req = REQ_reply_message;
+            info.u.req.reply_message_request.remove = 1;
+            p_wine_server_call( &info );
+        }
+    }
+    ok( i < 128, "recovery notification queue did not settle\n" );
+    ok( old_count == old_expected && current_count == current_expected,
+        "recovery wakes old %p %u/%u, current %p %u/%u\n", old_root, old_count, old_expected,
+        current_root, current_count, current_expected );
+}
+
+static void test_handoff_recovery_owner_wake(void)
+{
+    enum recovery_case
+    {
+        UNCHANGED, LOST, REPARENT, REPARENT_AGAIN, OLD_ROOT_DESTROYED,
+        CURRENT_ROOT_DESTROYED, SOURCE_DESTROYED, UNSELECTED, FOREIGN_WINDOW_HINT,
+    };
+    static const char *const names[] =
+    {
+        "unchanged", "lost", "reparent", "reparent again", "old root destroyed",
+        "current root destroyed", "source destroyed", "unselected", "foreign window hint",
+    };
+    unsigned int test, producer_last;
+
+    for (test = 0; test < ARRAY_SIZE(names); ++test)
+    for (producer_last = 0; producer_last < 2; ++producer_last)
+    {
+        struct handoff_binding producer = {0}, consumer = {0}, pending, replacement;
+        struct client_surface_handoff_channel *channel = NULL;
+        UINT64 identity = allocate_surface(), dormant = allocate_surface(), decoy = 0;
+        HWND roots[3] = {0}, source = NULL, current_root, old_root;
+        BOOL producer_bound = FALSE, consumer_bound = FALSE, registered = FALSE;
+        BOOL dormant_registered = FALSE, decoy_registered = FALSE;
+        UINT flags = CLIENT_SURFACE_STATE_REGISTER | CLIENT_SURFACE_STATE_SCENE_PUBLICATION;
+        UINT status, updates, prepares, i, old_expected, current_expected;
+        void *view = NULL;
+
+        winetest_push_context( "%s, producer last %u", names[test], producer_last );
+        for (i = 0; i < ARRAY_SIZE(roots); ++i)
+        {
+            roots[i] = create_test_window( TRUE );
+            ok( !!roots[i], "failed to create root %u\n", i );
+            if (!roots[i]) goto done;
+        }
+        old_root = current_root = roots[0];
+        source = create_test_child( old_root, 10 );
+        ok( !!source, "failed to create producer window\n" );
+        if (!source) goto done;
+        status = set_surface_state( source, identity, flags, 0, NULL );
+        ok( !status, "producer registration status %#x\n", status );
+        if (status) goto done;
+        registered = TRUE;
+        status = set_surface_state( source, dormant, flags, 0, NULL );
+        ok( !status, "second registration status %#x\n", status );
+        if (status) goto done;
+        dormant_registered = TRUE;
+        status = claim_surface_state( source, identity, NULL );
+        ok( !status, "producer claim status %#x\n", status );
+        status = get_surface_handoff( source, 0, identity, FALSE, &producer );
+        ok( !status, "producer bind status %#x\n", status );
+        if (status) goto done;
+        producer_bound = TRUE;
+        view = MapViewOfFile( producer.mapping, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, producer.size );
+        CloseHandle( producer.mapping );
+        producer.mapping = NULL;
+        ok( !!view, "producer mapping error %lu\n", GetLastError() );
+        if (!view) goto done;
+        channel = (void *)((char *)view + producer.offset);
+        status = get_surface_handoff( source, GetCurrentProcessId(), identity, TRUE, &consumer );
+        ok( !status && consumer.cookie == producer.cookie, "consumer bind status %#x\n", status );
+        if (status) goto done;
+        consumer_bound = TRUE;
+        CloseHandle( consumer.mapping );
+        consumer.mapping = NULL;
+        __atomic_store_n( &channel->producer_sequence, 1, __ATOMIC_RELEASE );
+
+        if (test >= REPARENT)
+        {
+            current_root = roots[1];
+            status = set_server_parent( source, current_root );
+            ok( !status, "reparent status %#x\n", status );
+        }
+        if (test == REPARENT_AGAIN)
+        {
+            current_root = roots[2];
+            status = set_server_parent( source, current_root );
+            ok( !status, "second reparent status %#x\n", status );
+        }
+        if (test == LOST)
+            __atomic_store_n( &channel->closed, 1, __ATOMIC_RELEASE );
+        if (test == UNSELECTED)
+        {
+            status = claim_surface_state( source, dormant, NULL );
+            ok( !status, "replacement producer claim status %#x\n", status );
+        }
+        if (test == FOREIGN_WINDOW_HINT)
+        {
+            decoy = allocate_surface();
+            status = set_surface_state( roots[2], decoy, flags, 0, NULL );
+            ok( !status, "decoy registration status %#x\n", status );
+            decoy_registered = !status;
+            status = claim_surface_state( roots[2], decoy, NULL );
+            ok( !status, "decoy claim status %#x\n", status );
+            /* The writable channel must not confer another HWND's authority. */
+            channel->window = wine_server_user_handle( roots[2] );
+        }
+        if (test == OLD_ROOT_DESTROYED)
+        {
+            ok( DestroyWindow( roots[0] ), "old root destruction failed\n" );
+            roots[0] = NULL;
+        }
+        if (test == CURRENT_ROOT_DESTROYED || test == SOURCE_DESTROYED)
+        {
+            ok( DestroyWindow( test == SOURCE_DESTROYED ? source : roots[1] ), "source destruction failed\n" );
+            if (test == CURRENT_ROOT_DESTROYED) roots[1] = NULL;
+            source = NULL;
+            registered = dormant_registered = FALSE;
+        }
+        drain_scene_notifications( &updates, &prepares );
+        status = release_surface_handoff( NULL, producer_last ? GetCurrentProcessId() : 0,
+                                          identity, producer.cookie, producer_last );
+        ok( !status, "first endpoint release status %#x\n", status );
+        if (producer_last) consumer_bound = FALSE;
+        else producer_bound = FALSE;
+        ok( channel->endpoints == (producer_last ? CLIENT_SURFACE_HANDOFF_ENDPOINT_PRODUCER :
+                                                  CLIENT_SURFACE_HANDOFF_ENDPOINT_CONSUMER),
+            "first release endpoints %#lx\n", channel->endpoints );
+        ok( channel->producer_sequence == 1 && !channel->consumer_sequence,
+            "first release acknowledged the retained image\n" );
+        check_handoff_recovery_notifications( old_root, 0, current_root, 0 );
+        if (source && test != UNCHANGED)
+        {
+            status = get_surface_handoff( source, 0, identity, FALSE, &pending );
+            ok( status == STATUS_DEVICE_BUSY, "pinned binding reacquisition status %#x\n", status );
+            if (!status) CloseHandle( pending.mapping );
+            check_handoff_recovery_notifications( old_root, 0, current_root, 0 );
+        }
+
+        status = release_surface_handoff( NULL, producer_last ? 0 : GetCurrentProcessId(),
+                                          identity, producer.cookie, !producer_last );
+        ok( !status, "final endpoint release status %#x\n", status );
+        producer_bound = consumer_bound = FALSE;
+        ok( !channel->endpoints && channel->producer_sequence == 1 && !channel->consumer_sequence,
+            "final release changed endpoint/sequence ownership\n" );
+        old_expected = source && roots[0] && test != UNCHANGED;
+        current_expected = source && current_root != old_root &&
+                           test != UNSELECTED && test != FOREIGN_WINDOW_HINT;
+        check_handoff_recovery_notifications( old_root, old_expected, current_root, current_expected );
+        status = release_surface_handoff( NULL, 0, identity, producer.cookie, FALSE );
+        ok( test == UNCHANGED ? !status : status == STATUS_INVALID_PARAMETER,
+            "duplicate endpoint release status %#x\n", status );
+        check_handoff_recovery_notifications( old_root, 0, current_root, 0 );
+        if (source && test != UNSELECTED)
+        {
+            status = get_surface_handoff( source, GetCurrentProcessId(), identity, TRUE, &replacement );
+            ok( !status, "replacement consumer bind status %#x\n", status );
+            if (!status)
+            {
+                ok( test == UNCHANGED ? replacement.cookie == producer.cookie : replacement.cookie != producer.cookie,
+                    "replacement cookie did not follow channel lifetime\n" );
+                CloseHandle( replacement.mapping );
+                status = release_surface_handoff( current_root, GetCurrentProcessId(), identity,
+                                                  replacement.cookie, TRUE );
+                ok( !status, "replacement consumer release status %#x\n", status );
+            }
+        }
+done:
+        if (producer_bound) release_surface_handoff( NULL, 0, identity, producer.cookie, FALSE );
+        if (consumer_bound) release_surface_handoff( NULL, GetCurrentProcessId(), identity, consumer.cookie, TRUE );
+        if (producer.mapping) CloseHandle( producer.mapping );
+        if (consumer.mapping) CloseHandle( consumer.mapping );
+        if (view) UnmapViewOfFile( view );
+        if (registered) set_surface_state( source, identity, CLIENT_SURFACE_STATE_UNREGISTER, 0, NULL );
+        if (dormant_registered) set_surface_state( source, dormant, CLIENT_SURFACE_STATE_UNREGISTER, 0, NULL );
+        if (decoy_registered) set_surface_state( roots[2], decoy, CLIENT_SURFACE_STATE_UNREGISTER, 0, NULL );
+        for (i = 0; i < ARRAY_SIZE(roots); ++i) if (roots[i]) DestroyWindow( roots[i] );
+        winetest_pop_context();
+    }
+}
+
 static void handoff_storage_exit_child( HWND hwnd, HANDLE ready, HANDLE release,
                                         BOOL completed )
 {
@@ -4915,6 +5128,11 @@ static BOOL run_focused_test_case( const char *name, char **argv )
         test_handoff_lost_recovery();
         return TRUE;
     }
+    if (!strcmp( name, "handoff-recovery-owner-wake" ))
+    {
+        test_handoff_recovery_owner_wake();
+        return TRUE;
+    }
     if (!strcmp( name, "handoff-ready-process-exit" ))
     {
         test_handoff_storage_process_exit( argv, TRUE );
@@ -5042,6 +5260,7 @@ START_TEST(client_surface)
     test_handoff_receipts();
     test_child_visibility_sources();
     test_handoff_lost_recovery();
+    test_handoff_recovery_owner_wake();
     test_handoff_storage_process_exit( argv, FALSE );
     test_handoff_storage_process_exit( argv, TRUE );
     test_handoff_storage_owner_exit( argv, FALSE );
