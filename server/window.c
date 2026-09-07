@@ -4066,10 +4066,11 @@ static void set_window_pos( struct window *win, struct window *previous,
     const struct rectangle old_visible_rect = win->visible_rect;
     const struct rectangle old_client_rect = win->client_rect;
     const struct rectangle old_surface_rect = win->surface_rect;
+    const unsigned int old_ex_style = win->ex_style;
     struct window *client_surface_top = NULL;
     struct window *scene_top = get_toplevel_window( win );
     struct rectangle rect;
-    int client_changed, frame_changed, scene_change;
+    int client_changed, frame_changed, scene_change, zorder_only;
     int visible = (win->style & WS_VISIBLE) || (swp_flags & SWP_SHOWWINDOW);
     int zorder_changed = 0;
 
@@ -4082,12 +4083,24 @@ static void set_window_pos( struct window *win, struct window *previous,
     scene_change = memcmp( window_rect, &old_window_rect, sizeof(*window_rect) ) ||
                    memcmp( visible_rect, &old_visible_rect, sizeof(*visible_rect) ) ||
                    memcmp( client_rect, &old_client_rect, sizeof(*client_rect) ) ||
-                   memcmp( surface_rect, &old_surface_rect, sizeof(*surface_rect) ) ||
+                   memcmp( surface_rect, &old_surface_rect, sizeof(*surface_rect) );
+    /* Reordering linked children changes only their scene clips. Ask the
+     * owner about its retained images before waking the selected producers;
+     * native geometry, visibility and frame updates keep source recovery. */
+    zorder_only = !scene_change && win->is_linked && win->parent &&
+                  !is_desktop_window( win->parent ) &&
+                  !(swp_flags & (SWP_NOZORDER | SWP_SHOWWINDOW | SWP_HIDEWINDOW |
+                                 SWP_FRAMECHANGED | SWP_STATECHANGED));
+    scene_change = scene_change ||
                    (swp_flags & (SWP_SHOWWINDOW | SWP_HIDEWINDOW)) ||
                    (!(swp_flags & SWP_NOZORDER) && win->parent);
     scene_change = scene_change &&
                    (scene_top->client_surface_subtree_count || win->client_surface_subtree_count);
-    if (scene_change) begin_client_surface_scene_change( scene_top );
+    if (scene_change)
+    {
+        if (zorder_only) begin_client_surface_cached_scene_change( scene_top );
+        else begin_client_surface_scene_change( scene_top );
+    }
 
     if (has_client_surface( win ))
         client_surface_top = get_toplevel_window( win );
@@ -4103,6 +4116,9 @@ static void set_window_pos( struct window *win, struct window *previous,
         zorder_changed |= link_window( win, previous );
         if (!was_linked && win->client_surface_subtree_count)
             adjust_client_surface_subtree_count( win->parent, win->client_surface_subtree_count );
+        /* link_window() can also change WS_EX_TOPMOST. Such a style change
+         * is outside the retained-source ordering decision. */
+        if (win->ex_style != old_ex_style) scene_top->client_surface_transaction.source_pending = 0;
     }
     if (swp_flags & SWP_SHOWWINDOW) win->style |= WS_VISIBLE;
     else if (swp_flags & SWP_HIDEWINDOW) win->style &= ~WS_VISIBLE;
