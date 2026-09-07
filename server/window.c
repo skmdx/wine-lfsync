@@ -432,6 +432,7 @@ struct window
     struct rectangle visible_rect;    /* visible part of window rect (relative to parent client area) */
     struct rectangle surface_rect;    /* window surface rectangle (relative to parent client area) */
     struct rectangle client_rect;     /* client rectangle (relative to parent client area) */
+    struct rectangle present_rect;    /* exclusive fullscreen placement at window DPI */
     struct region   *win_region;      /* region for shaped windows (relative to window rect) */
     struct region   *update_region;   /* update region (relative to window rect) */
     unsigned int     style;           /* window style */
@@ -1253,6 +1254,7 @@ static struct window *create_window( struct window *parent, struct window *owner
     win->client_surface_dirty  = 0;
     win->client_surface_transaction = (struct client_surface_transaction){0};
     win->client_surface_native_barrier = 0;
+    win->present_rect = empty_rect;
     win->client_surface_scene_generation = 0;
     win->client_surface_scene_change_depth = 0;
     win->prop_inuse     = 0;
@@ -2446,6 +2448,23 @@ DECL_HANDLER(publish_client_surface_handoff)
         restart_client_surface_generation( top );
 }
 
+static void get_client_surface_handoff_desc( struct window *win, struct window *top,
+                                              struct client_surface_owner *owner,
+                                              struct client_surface_ref *surface,
+                                              struct client_surface_handoff_desc *desc )
+{
+    desc->handle = win->handle;
+    desc->process = owner->process->id;
+    desc->surface = surface->id;
+    desc->visible = is_visible( win );
+    desc->reserved = 0;
+    /* Shared endpoints alone cannot authorize reuse: A -> B -> A
+     * leaves the old owner mapped until its checked reads finish. */
+    desc->cookie = surface->handoff_pool && surface->handoff_top == top &&
+                   surface->handoff_consumer_mapped && !surface->handoff_retired &&
+                   !is_client_surface_handoff_lost( surface ) ? surface->handoff_cookie : 0;
+}
+
 static void collect_client_surface_handoffs( struct window *win, struct window *top,
                                              struct client_surface_handoff_desc *data,
                                              unsigned int max_count, unsigned int *count )
@@ -2457,19 +2476,7 @@ static void collect_client_surface_handoffs( struct window *win, struct window *
     if (!win->client_surface_subtree_count) return;
     if ((surface = select_client_surface_producer( win, &owner )))
     {
-        if (*count < max_count)
-        {
-            data[*count].handle = win->handle;
-            data[*count].process = owner->process->id;
-            data[*count].surface = surface->id;
-            data[*count].visible = is_visible( win );
-            data[*count].reserved = 0;
-            /* Shared endpoints alone cannot authorize reuse: A -> B -> A
-             * leaves the old owner mapped until its checked reads finish. */
-            data[*count].cookie = surface->handoff_pool && surface->handoff_top == top &&
-                                 surface->handoff_consumer_mapped && !surface->handoff_retired &&
-                                 !is_client_surface_handoff_lost( surface ) ? surface->handoff_cookie : 0;
-        }
+        if (*count < max_count) get_client_surface_handoff_desc( win, top, owner, surface, &data[*count] );
         (*count)++;
     }
     LIST_FOR_EACH_ENTRY( child, &win->children, struct window, entry )
@@ -5020,6 +5027,180 @@ DECL_HANDLER(get_client_surface_scene_regions)
 
 failed:
     free( data );
+}
+
+
+/* Match DCX_USESTYLE without consulting any process-local DC or window data. */
+static unsigned int get_client_surface_scene_clip_flags( struct window *win )
+{
+    unsigned int flags = 0;
+
+    if (win->style & WS_CLIPSIBLINGS) flags |= DCX_CLIPSIBLINGS;
+    if (get_class_style( win->class ) & CS_PARENTDC) flags |= DCX_PARENTCLIP;
+    if ((win->style & WS_CLIPCHILDREN) && !(win->style & WS_MINIMIZE)) flags |= DCX_CLIPCHILDREN;
+    if (is_toplevel( win )) flags = (flags & ~DCX_PARENTCLIP) | DCX_CLIPSIBLINGS;
+    if (flags & (DCX_CLIPSIBLINGS | DCX_CLIPCHILDREN)) flags &= ~DCX_PARENTCLIP;
+    /* The old owner batch dropped CLIPSIBLINGS after get_dc_flags() for
+     * PARENTCLIP, including its visible parent's CLIPSIBLINGS contribution. */
+    return flags;
+}
+
+static void get_client_surface_scene_geometry( struct window *win, struct window *top,
+                                               struct client_surface_scene_layer *layer )
+{
+    struct rectangle client = top->client_rect;
+
+    layer->window_dpi = get_window_dpi( win );
+    layer->raw_dpi = win->shared->raw_dpi;
+    layer->top_window = top->window_rect;
+    layer->top_client = top->client_rect;
+    layer->top_visible = top->visible_rect;
+    map_dpi_rect( top, &layer->top_window, get_window_dpi( top ), layer->window_dpi );
+    map_dpi_rect( top, &layer->top_client, get_window_dpi( top ), layer->window_dpi );
+    map_dpi_rect( top, &layer->top_visible, get_window_dpi( top ), layer->window_dpi );
+    if (!is_rect_empty( &win->present_rect ))
+    {
+        layer->source = win->present_rect;
+        offset_rect( &layer->source, -layer->top_client.left, -layer->top_client.top );
+        if (win == top) layer->flags = CLIENT_SURFACE_SCENE_PRESENT_RECT;
+        return;
+    }
+    layer->source = win->client_rect;
+    client_to_screen_rect( win->parent, &layer->source );
+    client_to_screen_rect( top->parent, &client );
+    map_dpi_rect( top, &client, get_window_dpi( top ), layer->window_dpi );
+    offset_rect( &layer->source, -client.left, -client.top );
+    if (top->ex_style & WS_EX_LAYOUTRTL)
+    {
+        struct rectangle bounds = {0, 0, client.right - client.left, client.bottom - client.top};
+        mirror_rect( &bounds, &layer->source );
+    }
+}
+
+static int collect_client_surface_scene_snapshot( struct window *win, struct window *top,
+                                                  unsigned char *data, unsigned int max_size,
+                                                  unsigned int *total, unsigned int *count )
+{
+    struct client_surface_owner *owner;
+    struct client_surface_ref *surface;
+    struct window *child;
+
+    if (!win->client_surface_subtree_count) return 1;
+    if ((surface = select_client_surface_producer( win, &owner )))
+    {
+        struct client_surface_scene_layer layer = {0};
+        struct client_surface_clip_window *clips = NULL;
+        struct region *visible = NULL;
+        const struct rectangle *rects = NULL;
+        unsigned int clip_max = 0;
+        size_t clip_offset, block_size;
+
+        get_client_surface_handoff_desc( win, top, owner, surface, &layer.producer );
+        get_client_surface_scene_geometry( win, top, &layer );
+        if (layer.producer.visible && !(layer.flags & CLIENT_SURFACE_SCENE_PRESENT_RECT))
+        {
+            if (!(visible = get_visible_region( win, get_client_surface_scene_clip_flags( win ) ))) return 0;
+            offset_region( visible, win->window_rect.left - win->client_rect.left,
+                            win->window_rect.top - win->client_rect.top );
+            rects = get_region_rectangles( visible, &layer.visible_count );
+        }
+        if (layer.visible_count > (UINT_MAX - sizeof(layer)) / sizeof(*rects))
+        {
+            if (visible) free_region( visible );
+            set_error( STATUS_INTEGER_OVERFLOW );
+            return 0;
+        }
+        clip_offset = sizeof(layer) + (size_t)layer.visible_count * sizeof(*rects);
+        if (clip_offset <= max_size && *total <= max_size - clip_offset)
+        {
+            if (layer.visible_count) memcpy( data + *total + sizeof(layer), rects,
+                                               layer.visible_count * sizeof(*rects) );
+            clips = (struct client_surface_clip_window *)(data + *total + clip_offset);
+            clip_max = (max_size - *total - clip_offset) / sizeof(*clips);
+        }
+        if (visible) free_region( visible );
+        /* The native monitor transform belongs to the owner target. Keep the
+         * exact occluders here; the owner intersects them with the transformed
+         * source extent without querying mutable window geometry again. */
+        if (layer.producer.visible && !collect_client_surface_clips( win, top, layer.raw_dpi,
+                NULL, clips, clip_max, &layer.clip_count )) return 0;
+        if (layer.clip_count > (UINT_MAX - clip_offset) / sizeof(*clips))
+        {
+            set_error( STATUS_INTEGER_OVERFLOW );
+            return 0;
+        }
+        block_size = clip_offset + (size_t)layer.clip_count * sizeof(*clips);
+        if (block_size > UINT_MAX - *total || *count == UINT_MAX)
+        {
+            set_error( STATUS_INTEGER_OVERFLOW );
+            return 0;
+        }
+        if (block_size <= max_size && *total <= max_size - block_size)
+            memcpy( data + *total, &layer, sizeof(layer) );
+        *total += block_size;
+        ++*count;
+    }
+    LIST_FOR_EACH_ENTRY( child, &win->children, struct window, entry )
+        if (!collect_client_surface_scene_snapshot( child, top, data, max_size, total, count )) return 0;
+    return 1;
+}
+
+DECL_HANDLER(get_client_surface_scene_snapshot)
+{
+    struct window *top = get_window( req->handle );
+    unsigned int max_size = get_reply_max_size(), total = 0, count = 0;
+    unsigned char *data = NULL;
+
+    if (!top) return;
+    if (get_toplevel_window( top ) != top || !top->thread || top->thread->process != current->process)
+    {
+        set_error( STATUS_ACCESS_DENIED );
+        return;
+    }
+    reply->scene_id = top->client_surface_scene_generation;
+    if ((reply->scene_id & 1) || (req->scene_id && req->scene_id != reply->scene_id))
+    {
+        set_error( STATUS_RETRY );
+        return;
+    }
+    if (max_size && !(data = mem_alloc( max_size ))) return;
+    if (!collect_client_surface_scene_snapshot( top, top, data, max_size, &total, &count )) goto failed;
+    reply->total_size = total;
+    reply->count = count;
+    if (total > max_size)
+    {
+        set_error( STATUS_BUFFER_OVERFLOW );
+        goto failed;
+    }
+    if (data) set_reply_data_ptr( data, total );
+    return;
+failed:
+    free( data );
+}
+
+DECL_HANDLER(set_window_present_rect)
+{
+    struct window *win = get_window( req->handle ), *top;
+    struct rectangle rect = req->rect;
+
+    if (!win) return;
+    if (!win->thread || win->thread->process != current->process)
+    {
+        set_error( STATUS_ACCESS_DENIED );
+        return;
+    }
+    if (!req->dpi.num || !req->dpi.den)
+    {
+        set_error( STATUS_INVALID_PARAMETER );
+        return;
+    }
+    map_dpi_rect( win, &rect, req->dpi, get_window_dpi( win ) );
+    if (is_rect_empty( &rect )) rect = empty_rect;
+    if (!memcmp( &rect, &win->present_rect, sizeof(rect) )) return;
+    top = get_toplevel_window( win );
+    begin_client_surface_scene_change( top );
+    win->present_rect = rect;
+    end_client_surface_scene_change( top );
 }
 
 

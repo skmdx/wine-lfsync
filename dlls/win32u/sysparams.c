@@ -3174,13 +3174,12 @@ RECT map_rect_virt_to_raw( RECT rect, struct ratio dpi_from )
 }
 
 /* map (absolute) window rects from MDT_DEFAULT to MDT_RAW_DPI coordinates */
-struct window_rects map_window_rects_virt_to_raw( struct window_rects rects, struct ratio dpi_from )
+static struct window_rects map_window_rects_virt_to_raw_locked( struct window_rects rects, struct ratio dpi_from )
 {
     RECT rect, monitor_rect, virt_visible_rect = rects.visible;
     struct monitor *monitor;
     BOOL is_fullscreen;
 
-    if (!lock_display_devices( FALSE )) return rects;
     if ((monitor = get_monitor_from_rect( rects.window, MONITOR_DEFAULTTONEAREST, dpi_from, MDT_DEFAULT )))
     {
         rects.visible = map_monitor_rect( monitor, rects.visible, dpi_from, MDT_DEFAULT, no_dpi, MDT_RAW_DPI );
@@ -3200,10 +3199,29 @@ struct window_rects map_window_rects_virt_to_raw( struct window_rects rects, str
             union_rect( &rects.visible, &rects.visible, &rect );
         }
     }
-    unlock_display_devices();
 
     return rects;
 }
+struct window_rects map_window_rects_virt_to_raw( struct window_rects rects, struct ratio dpi_from )
+{
+    if (!lock_display_devices( FALSE )) return rects;
+    rects = map_window_rects_virt_to_raw_locked( rects, dpi_from );
+    unlock_display_devices();
+    return rects;
+}
+
+/* A server scene is immutable; convert all of its owner rectangles against
+ * the same display configuration before installing the native target plan. */
+BOOL map_window_rects_virt_to_raw_batch( UINT count, struct window_rects *rects, const struct ratio *dpis )
+{
+    UINT i;
+
+    if (!lock_display_devices( FALSE )) return FALSE;
+    for (i = 0; i < count; ++i) rects[i] = map_window_rects_virt_to_raw_locked( rects[i], dpis[i] );
+    unlock_display_devices();
+    return TRUE;
+}
+
 
 static struct ratio get_monitor_dpi( HMONITOR handle, UINT type, struct ratio *x, struct ratio *y )
 {

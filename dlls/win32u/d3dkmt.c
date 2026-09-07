@@ -457,17 +457,31 @@ NTSTATUS WINAPI NtGdiDdDDIEscape( const D3DKMT_ESCAPE *desc )
     {
         HWND hwnd = UlongToHandle( desc->hContext );
         RECT *rect = desc->pPrivateDriverData;
-        struct ratio dpi = get_dpi_for_window( hwnd );
+        struct ratio dpi = get_dpi_for_window( hwnd ), thread_dpi = get_thread_dpi();
+        RECT present_rect;
+        NTSTATUS status;
         WND *win;
 
         if (desc->PrivateDriverDataSize != sizeof(*rect)) return STATUS_INVALID_PARAMETER;
 
         TRACE( "hwnd %p, rect %s\n", hwnd, wine_dbgstr_rect( rect ) );
-        if (!(win = get_win_ptr( hwnd ))) return STATUS_INVALID_PARAMETER;
-        win->present_rect = map_dpi_rect( *rect, get_thread_dpi(), dpi );
+        if (!(win = get_win_ptr( hwnd )) || win == WND_OTHER_PROCESS || win == WND_DESKTOP)
+            return STATUS_INVALID_PARAMETER;
+        /* A per-monitor-aware caller uses no_dpi. Normalize once using the
+         * existing local semantics, then send explicit window coordinates. */
+        present_rect = map_dpi_rect( *rect, thread_dpi, dpi );
+        /* Publish geometry before changing the local compatibility view. On
+         * failure both views retain the previous exclusive fullscreen rect. */
+        SERVER_START_REQ( set_window_present_rect )
+        {
+            req->handle = wine_server_user_handle( hwnd );
+            req->rect = wine_server_rectangle( present_rect );
+            req->dpi = dpi;
+            if (!(status = wine_server_call( req ))) win->present_rect = present_rect;
+        }
+        SERVER_END_REQ;
         release_win_ptr( win );
-
-        return STATUS_SUCCESS;
+        return status;
     }
 
     default:

@@ -719,6 +719,15 @@ BOOL client_surface_get_toplevel_scene( HWND toplevel, struct client_surface_sce
     return read_client_surface_scene( toplevel, scene, NULL, NULL ) && scene->valid;
 }
 
+BOOL client_surface_scene_snapshot_current( HWND toplevel, UINT64 scene_id )
+{
+    struct client_surface_scene current;
+
+    /* Layout remains readable while native preparation blocks publication. */
+    return !(scene_id & 1) && read_client_surface_scene( toplevel, &current, NULL, NULL ) &&
+           current.epoch == scene_id;
+}
+
 BOOL client_surface_get_scene( struct client_surface *surface, struct client_surface_scene *scene )
 {
     struct object_lock producer_lock = OBJECT_LOCK_INIT;

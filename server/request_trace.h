@@ -3713,6 +3713,27 @@ static void dump_get_client_surface_scene_regions_reply( const struct get_client
     dump_varargs_bytes( ", regions=", cur_size );
 }
 
+static void dump_get_client_surface_scene_snapshot_request( const struct get_client_surface_scene_snapshot_request *req )
+{
+    fprintf( stderr, " handle=%08x", req->handle );
+    dump_uint64( ", scene_id=", &req->scene_id );
+}
+
+static void dump_get_client_surface_scene_snapshot_reply( const struct get_client_surface_scene_snapshot_reply *req )
+{
+    dump_uint64( " scene_id=", &req->scene_id );
+    fprintf( stderr, ", count=%08x", req->count );
+    fprintf( stderr, ", total_size=%08x", req->total_size );
+    dump_varargs_bytes( ", layers=", cur_size );
+}
+
+static void dump_set_window_present_rect_request( const struct set_window_present_rect_request *req )
+{
+    fprintf( stderr, " handle=%08x", req->handle );
+    dump_rectangle( ", rect=", &req->rect );
+    dump_ratio( ", dpi=", &req->dpi );
+}
+
 typedef void (*dump_func)( const void *req );
 
 static const dump_func req_dumpers[REQ_NB_REQUESTS] =
@@ -4039,6 +4060,8 @@ static const dump_func req_dumpers[REQ_NB_REQUESTS] =
     (dump_func)dump_publish_client_surface_handoff_request,
     (dump_func)dump_get_client_surface_handoffs_request,
     (dump_func)dump_get_client_surface_scene_regions_request,
+    (dump_func)dump_get_client_surface_scene_snapshot_request,
+    (dump_func)dump_set_window_present_rect_request,
 };
 
 static const dump_func reply_dumpers[REQ_NB_REQUESTS] =
@@ -4365,6 +4388,8 @@ static const dump_func reply_dumpers[REQ_NB_REQUESTS] =
     (dump_func)dump_publish_client_surface_handoff_reply,
     (dump_func)dump_get_client_surface_handoffs_reply,
     (dump_func)dump_get_client_surface_scene_regions_reply,
+    (dump_func)dump_get_client_surface_scene_snapshot_reply,
+    NULL,
 };
 
 static const char * const req_names[REQ_NB_REQUESTS] =
@@ -4691,6 +4716,8 @@ static const char * const req_names[REQ_NB_REQUESTS] =
     "publish_client_surface_handoff",
     "get_client_surface_handoffs",
     "get_client_surface_scene_regions",
+    "get_client_surface_scene_snapshot",
+    "set_window_present_rect",
 };
 
 static const struct

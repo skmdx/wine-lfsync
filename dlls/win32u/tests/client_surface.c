@@ -20,6 +20,7 @@
 #include "wine/test.h"
 #include "wine/wgl.h"
 #include "wine/client_surface.h"
+#include "ddk/d3dkmthk.h"
 
 #define RACE_THREADS 4
 #define RACE_ROUNDS 2000
@@ -1080,6 +1081,389 @@ static unsigned int release_surface_handoff( HWND hwnd, DWORD producer, UINT64 s
     info.u.req.release_client_surface_handoff_request.cookie = cookie;
     info.u.req.release_client_surface_handoff_request.owner = owner;
     return p_wine_server_call( &info );
+}
+
+struct scene_snapshot
+{
+    UINT64 id;
+    UINT count, size, returned;
+    unsigned char data[16384];
+};
+
+static UINT get_scene_snapshot( HWND top, UINT64 id, UINT size, struct scene_snapshot *snapshot )
+{
+    struct __server_request_info info = {0};
+    struct get_client_surface_scene_snapshot_reply *reply = &info.u.reply.get_client_surface_scene_snapshot_reply;
+    UINT status;
+
+    info.u.req.get_client_surface_scene_snapshot_request.__header.req = REQ_get_client_surface_scene_snapshot;
+    info.u.req.get_client_surface_scene_snapshot_request.handle = wine_server_user_handle( top );
+    info.u.req.get_client_surface_scene_snapshot_request.scene_id = id;
+    wine_server_set_reply( &info, snapshot->data, size );
+    status = p_wine_server_call( &info );
+    snapshot->id = reply->scene_id;
+    snapshot->count = reply->count;
+    snapshot->size = reply->total_size;
+    snapshot->returned = wine_server_reply_size( reply );
+    return status;
+}
+
+static const struct client_surface_scene_layer *find_scene_layer( const struct scene_snapshot *snapshot, HWND hwnd )
+{
+    const unsigned char *cursor = snapshot->data;
+    const struct client_surface_scene_layer *found = NULL;
+    UINT remaining = snapshot->returned, i, size;
+
+    for (i = 0; i < snapshot->count; ++i)
+    {
+        const struct client_surface_scene_layer *layer = (const void *)cursor;
+
+        ok( remaining >= sizeof(*layer), "truncated scene layer %u\n", i );
+        if (remaining < sizeof(*layer)) return NULL;
+        cursor += sizeof(*layer);
+        remaining -= sizeof(*layer);
+        ok( layer->visible_count <= remaining / sizeof(RECT), "truncated scene visible region\n" );
+        if (layer->visible_count > remaining / sizeof(RECT)) return NULL;
+        size = layer->visible_count * sizeof(RECT);
+        cursor += size;
+        remaining -= size;
+        ok( layer->clip_count <= remaining / sizeof(struct client_surface_clip_window), "truncated scene clips\n" );
+        if (layer->clip_count > remaining / sizeof(struct client_surface_clip_window)) return NULL;
+        size = layer->clip_count * sizeof(struct client_surface_clip_window);
+        cursor += size;
+        remaining -= size;
+        if (layer->producer.handle == wine_server_user_handle( hwnd )) found = layer;
+    }
+    ok( !remaining, "trailing snapshot bytes %u\n", remaining );
+    return found;
+}
+
+static void test_scene_snapshot(void)
+{
+    NTSTATUS (WINAPI *escape)( const D3DKMT_ESCAPE * ) =
+        (void *)GetProcAddress( GetModuleHandleA( "win32u.dll" ), "NtGdiDdDDIEscape" );
+    const UINT64 first_id = allocate_surface(), second_id = allocate_surface(), top_id = allocate_surface();
+    struct client_surface_scene_region_request region_request = {0};
+    const struct client_surface_scene_layer *layer;
+    struct handoff_binding binding = {0};
+    struct scene_snapshot snapshot;
+    struct surface_state state;
+    struct __server_request_info info = {0};
+    unsigned char regions[16384];
+    UINT status, size, returned;
+    UINT64 scene_id, cookie;
+    HWND top, first, second, other = NULL;
+    HRGN shape;
+    RECT rect = {30, 20, 150, 110};
+    D3DKMT_ESCAPE desc = {0};
+
+    top = create_test_window( TRUE );
+    first = create_test_child( top, 10 );
+    second = create_test_child( top, 25 );
+    other = create_test_window( TRUE );
+    ok( top && first && second && other, "could not create scene windows\n" );
+    if (!top || !first || !second || !other) goto done;
+    SetWindowPos( first, HWND_BOTTOM, 10, 10, 80, 60, SWP_NOACTIVATE );
+    shape = CreateRectRgn( 4, 2, 21, 23 );
+    SetWindowRgn( second, shape, FALSE );
+    set_surface_state( top, top_id, CLIENT_SURFACE_STATE_REGISTER, 0, NULL );
+    set_surface_state( first, first_id, CLIENT_SURFACE_STATE_REGISTER, 0, NULL );
+    set_surface_state( second, second_id, CLIENT_SURFACE_STATE_REGISTER, 0, NULL );
+    claim_surface_state( top, top_id, NULL );
+    claim_surface_state( first, first_id, NULL );
+    claim_surface_state( second, second_id, &state );
+    scene_id = state.scene_generation;
+
+    status = get_scene_snapshot( top, scene_id, 1, &snapshot );
+    ok( status == STATUS_BUFFER_OVERFLOW && !snapshot.returned && snapshot.count == 3 && snapshot.size > 1,
+        "short snapshot status %#x size %u/%u count %u\n", status, snapshot.returned, snapshot.size, snapshot.count );
+    if (!snapshot.size || snapshot.size > sizeof(snapshot.data)) goto done;
+    status = get_scene_snapshot( top, scene_id, snapshot.size, &snapshot );
+    ok( !status && snapshot.returned == snapshot.size && snapshot.id == scene_id,
+        "exact snapshot status %#x size %u/%u\n", status, snapshot.returned, snapshot.size );
+    if (status) goto done;
+    layer = find_scene_layer( &snapshot, first );
+    ok( !!layer, "first producer missing\n" );
+    if (!layer) goto done;
+    ok( layer->producer.surface == first_id && layer->producer.process == GetCurrentProcessId() &&
+        layer->producer.visible && !layer->producer.cookie, "incorrect selected producer\n" );
+    ok( layer->source.left == 10 && layer->source.top == 10 && layer->source.right == 90 &&
+        layer->source.bottom == 70, "source placement %s\n", wine_dbgstr_rect( (const RECT *)&layer->source ) );
+    region_request.handle = wine_server_user_handle( first );
+    region_request.dpi = layer->raw_dpi;
+    region_request.bounds = (struct rectangle){-10000, -10000, 10000, 10000};
+    status = get_scene_regions( top, scene_id, &region_request, sizeof(region_request), regions, sizeof(regions),
+                                 &size, &returned );
+    ok( !status && returned == size, "comparison regions status %#x\n", status );
+    if (!status)
+    {
+        const struct client_surface_scene_region *region = (const void *)regions;
+        size = layer->visible_count * sizeof(RECT) + layer->clip_count * sizeof(struct client_surface_clip_window);
+        ok( region->visible_count == layer->visible_count && region->clip_count == layer->clip_count &&
+            returned == sizeof(*region) + size && !memcmp( region + 1, layer + 1, size ),
+            "snapshot clipped regions differ from authoritative region request\n" );
+    }
+    status = get_scene_snapshot( first, scene_id, sizeof(snapshot.data), &snapshot );
+    ok( status == STATUS_ACCESS_DENIED && !snapshot.returned, "child owner request status %#x\n", status );
+    status = get_scene_snapshot( top, scene_id | 1, sizeof(snapshot.data), &snapshot );
+    ok( status == STATUS_RETRY && !snapshot.returned, "odd scene status %#x\n", status );
+
+    status = get_surface_handoff( first, GetCurrentProcessId(), first_id, TRUE, &binding );
+    ok( !status, "owner channel status %#x\n", status );
+    if (status) goto done;
+    cookie = binding.cookie;
+    CloseHandle( binding.mapping );
+    binding.mapping = NULL;
+    ShowWindow( first, SW_HIDE );
+    status = get_scene_snapshot( top, scene_id, sizeof(snapshot.data), &snapshot );
+    ok( status == STATUS_RETRY && !snapshot.returned, "stale scene status %#x\n", status );
+    status = get_scene_snapshot( top, 0, sizeof(snapshot.data), &snapshot );
+    ok( !status && snapshot.count == 3 && snapshot.id != scene_id, "hidden snapshot status %#x count %u\n", status, snapshot.count );
+    if (status) goto done;
+    scene_id = snapshot.id;
+    layer = find_scene_layer( &snapshot, first );
+    ok( layer && !layer->producer.visible && layer->producer.cookie == cookie &&
+        !layer->visible_count && !layer->clip_count, "hidden channel cache membership lost\n" );
+    ShowWindow( first, SW_SHOW );
+    status = get_scene_snapshot( top, 0, sizeof(snapshot.data), &snapshot );
+    ok( !status, "shown snapshot status %#x\n", status );
+    layer = status ? NULL : find_scene_layer( &snapshot, first );
+    ok( layer && layer->producer.visible && layer->producer.cookie == cookie, "show replaced channel lifetime\n" );
+    release_surface_handoff( first, GetCurrentProcessId(), first_id, cookie, TRUE );
+
+    if (escape)
+    {
+        DPI_AWARENESS_CONTEXT context;
+
+        /* Per-monitor callers carry no explicit thread DPI in win32u. The
+         * escape must normalize it before sending server window geometry. */
+        context = SetThreadDpiAwarenessContext( DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 );
+        ok( !!context, "could not select per-monitor present context\n" );
+        desc.Type = D3DKMT_ESCAPE_SET_PRESENT_RECT_WINE;
+        desc.hContext = HandleToUlong( top );
+        desc.PrivateDriverDataSize = sizeof(rect);
+        desc.pPrivateDriverData = &rect;
+        status = escape( &desc );
+        ok( !status, "set present rectangle status %#x\n", status );
+        status = get_scene_snapshot( top, 0, sizeof(snapshot.data), &snapshot );
+        ok( !status, "present snapshot status %#x\n", status );
+        scene_id = snapshot.id;
+        layer = status ? NULL : find_scene_layer( &snapshot, top );
+        ok( layer && (layer->flags & CLIENT_SURFACE_SCENE_PRESENT_RECT) && !layer->visible_count &&
+            layer->source.left == rect.left - layer->top_client.left &&
+            layer->source.right == rect.right - layer->top_client.left, "present rectangle missing from scene\n" );
+        status = escape( &desc );
+        ok( !status, "repeat present rectangle status %#x\n", status );
+        status = get_scene_snapshot( top, scene_id, sizeof(snapshot.data), &snapshot );
+        ok( !status, "unchanged present rectangle changed scene %#x\n", status );
+        desc.PrivateDriverDataSize--;
+        status = escape( &desc );
+        ok( status == STATUS_INVALID_PARAMETER, "malformed present rectangle status %#x\n", status );
+        status = get_scene_snapshot( top, scene_id, sizeof(snapshot.data), &snapshot );
+        ok( !status, "failed update changed scene %#x\n", status );
+        desc.PrivateDriverDataSize++;
+        SetRectEmpty( &rect );
+        status = escape( &desc );
+        ok( !status, "clear present rectangle status %#x\n", status );
+        status = get_scene_snapshot( top, scene_id, sizeof(snapshot.data), &snapshot );
+        ok( status == STATUS_RETRY && !snapshot.returned, "exclusive exit did not invalidate scene %#x\n", status );
+        status = get_scene_snapshot( top, 0, sizeof(snapshot.data), &snapshot );
+        ok( !status, "normal snapshot status %#x\n", status );
+        layer = status ? NULL : find_scene_layer( &snapshot, top );
+        ok( layer && !(layer->flags & CLIENT_SURFACE_SCENE_PRESENT_RECT), "present clip remained after exit\n" );
+        if (context) SetThreadDpiAwarenessContext( context );
+    }
+    else win_skip( "NtGdiDdDDIEscape unavailable\n" );
+
+    scene_id = snapshot.id;
+    info.u.req.set_window_present_rect_request.__header.req = REQ_set_window_present_rect;
+    info.u.req.set_window_present_rect_request.handle = wine_server_user_handle( top );
+    info.u.req.set_window_present_rect_request.rect = (struct rectangle){1, 2, 3, 4};
+    status = p_wine_server_call( &info );
+    ok( status == STATUS_INVALID_PARAMETER, "invalid present DPI status %#x\n", status );
+    status = get_scene_snapshot( top, scene_id, sizeof(snapshot.data), &snapshot );
+    ok( !status, "invalid present DPI changed scene %#x\n", status );
+    SetParent( first, other );
+    status = get_scene_snapshot( top, scene_id, sizeof(snapshot.data), &snapshot );
+    ok( status == STATUS_RETRY && !snapshot.returned, "reparent did not invalidate snapshot %#x\n", status );
+    status = get_scene_snapshot( top, 0, sizeof(snapshot.data), &snapshot );
+    ok( !status && snapshot.count == 2, "old owner retained reparented producer %#x count %u\n", status, snapshot.count );
+    status = get_scene_snapshot( other, 0, sizeof(snapshot.data), &snapshot );
+    ok( !status && snapshot.count == 1, "new owner missing producer %#x count %u\n", status, snapshot.count );
+    layer = status ? NULL : find_scene_layer( &snapshot, first );
+    ok( layer && layer->producer.surface == first_id && !layer->producer.cookie, "reparent retained stale channel authority\n" );
+done:
+    if (binding.mapping) CloseHandle( binding.mapping );
+    if (other) DestroyWindow( other );
+    if (top) DestroyWindow( top );
+}
+
+static void check_scene_layer_geometry( const struct scene_snapshot *snapshot, HWND top, HWND hwnd )
+{
+    const struct client_surface_scene_layer *layer = find_scene_layer( snapshot, hwnd );
+    DPI_AWARENESS_CONTEXT old_context;
+    RECT source, actual, expected_bounds;
+    HRGN expected, actual_region;
+    RGNDATA *data;
+    POINT origin;
+    HDC dc;
+    UINT size;
+    int ret;
+
+    ok( !!layer, "missing scene layer %p\n", hwnd );
+    if (!layer) return;
+    old_context = SetThreadDpiAwarenessContext( GetWindowDpiAwarenessContext( hwnd ) );
+    ok( !!old_context, "could not use window DPI context, error %lu\n", GetLastError() );
+    if (!old_context) return;
+    ok( GetClientRect( hwnd, &source ), "GetClientRect failed, error %lu\n", GetLastError() );
+    /* Use the public window mapping operation as the oracle, including its
+     * rectangle mirroring and ancestor coordinate/DPI conversion. */
+    SetLastError( 0 );
+    ret = MapWindowPoints( hwnd, top, (POINT *)&source, 2 );
+    ok( ret || !GetLastError(), "MapWindowPoints failed, error %lu\n", GetLastError() );
+    actual = wine_server_get_rect( layer->source );
+    ok( EqualRect( &source, &actual ), "source %s, expected Win32 placement %s (window DPI %u/%u)\n",
+        wine_dbgstr_rect( &actual ), wine_dbgstr_rect( &source ), layer->window_dpi.num, layer->window_dpi.den );
+
+    expected = CreateRectRgn( 0, 0, 0, 0 );
+    dc = GetDC( hwnd );
+    ok( !!dc && !!expected, "could not acquire real DC/region\n" );
+    if (dc && expected)
+    {
+        ret = GetRandomRgn( dc, expected, 4 /* SYSRGN */ );
+        ok( ret == 1, "GetRandomRgn returned %d\n", ret );
+        if (ret == 1)
+        {
+            ok( GetDCOrgEx( dc, &origin ), "GetDCOrgEx failed, error %lu\n", GetLastError() );
+            OffsetRgn( expected, -origin.x, -origin.y );
+            size = FIELD_OFFSET( RGNDATA, Buffer ) + layer->visible_count * sizeof(RECT);
+            data = calloc( 1, size );
+            ok( !!data, "could not allocate visible region data\n" );
+            if (data)
+            {
+                data->rdh.dwSize = sizeof(data->rdh);
+                data->rdh.iType = RDH_RECTANGLES;
+                data->rdh.nCount = layer->visible_count;
+                data->rdh.nRgnSize = layer->visible_count * sizeof(RECT);
+                memcpy( data->Buffer, layer + 1, data->rdh.nRgnSize );
+                actual_region = ExtCreateRegion( NULL, size, data );
+                ok( !!actual_region, "could not import snapshot visible region\n" );
+                if (actual_region)
+                {
+                    GetRgnBox( expected, &expected_bounds );
+                    GetRgnBox( actual_region, &actual );
+                    ok( EqualRgn( actual_region, expected ),
+                        "snapshot visible region %s differs from real DC region %s\n",
+                        wine_dbgstr_rect( &actual ), wine_dbgstr_rect( &expected_bounds ) );
+                    DeleteObject( actual_region );
+                }
+                free( data );
+            }
+        }
+    }
+    if (dc) ReleaseDC( hwnd, dc );
+    if (expected) DeleteObject( expected );
+    SetThreadDpiAwarenessContext( old_context );
+}
+
+static void test_scene_snapshot_geometry(void)
+{
+    /* Exercise these standard contexts in separate real system-DPI prefixes;
+     * an encoded system-aware context cannot override the process system DPI. */
+    static const struct
+    {
+        const char *name;
+        DPI_AWARENESS_CONTEXT context;
+        DWORD top_exstyle, child_exstyle;
+    }
+    cases[] =
+    {
+        {"nested unaware", DPI_AWARENESS_CONTEXT_UNAWARE, 0, 0},
+        {"RTL owner", DPI_AWARENESS_CONTEXT_UNAWARE, WS_EX_LAYOUTRTL, 0},
+        {"RTL child", DPI_AWARENESS_CONTEXT_UNAWARE, 0, WS_EX_LAYOUTRTL},
+        {"RTL owner and child", DPI_AWARENESS_CONTEXT_UNAWARE, WS_EX_LAYOUTRTL, WS_EX_LAYOUTRTL},
+        {"nested system aware", DPI_AWARENESS_CONTEXT_SYSTEM_AWARE, 0, 0},
+        {"nested per-monitor aware", DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, 0, 0},
+        {"RTL per-monitor aware", DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, WS_EX_LAYOUTRTL, 0},
+    };
+    DPI_AWARENESS_CONTEXT old_context, creation_context;
+    const char *expected_dpi = getenv( "WINETEST_EXPECT_SYSTEM_DPI" );
+    struct scene_snapshot snapshot;
+    struct surface_state state = {0};
+    HWND windows[4];
+    UINT64 identities[4];
+    UINT i, j, status;
+    HRGN shape, part;
+
+    for (i = 0; i < ARRAY_SIZE(cases); ++i)
+    {
+        winetest_push_context( "%s", cases[i].name );
+        old_context = SetThreadDpiAwarenessContext( cases[i].context );
+        if (!old_context)
+        {
+            win_skip( "DPI context %p unavailable, error %lu\n", cases[i].context, GetLastError() );
+            winetest_pop_context();
+            continue;
+        }
+        memset( windows, 0, sizeof(windows) );
+        memset( identities, 0, sizeof(identities) );
+        windows[0] = create_test_window( TRUE );
+        ok( !!windows[0], "could not create owner\n" );
+        if (!windows[0]) goto next;
+        SetWindowLongW( windows[0], GWL_EXSTYLE, cases[i].top_exstyle | WS_EX_NOINHERITLAYOUT );
+        SetWindowLongW( windows[0], GWL_STYLE, GetWindowLongW( windows[0], GWL_STYLE ) | WS_CLIPCHILDREN );
+        SetWindowPos( windows[0], NULL, 37, 29, 263, 197, SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED );
+
+        /* Create descendants from a different caller awareness context. Child
+         * DPI inheritance and nested physical placement are provided by Win32. */
+        creation_context = SetThreadDpiAwarenessContext( cases[i].context == DPI_AWARENESS_CONTEXT_UNAWARE ?
+            DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 : DPI_AWARENESS_CONTEXT_UNAWARE );
+        ok( !!creation_context, "could not switch child creation DPI context\n" );
+        windows[1] = CreateWindowExA( cases[i].child_exstyle | WS_EX_NOINHERITLAYOUT,
+            "client_surface_test", "scene geometry parent", WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN,
+            19, 13, 171, 127, windows[0], NULL, GetModuleHandleA( NULL ), NULL );
+        windows[2] = CreateWindowExA( WS_EX_NOINHERITLAYOUT, "client_surface_test", "nested scene geometry",
+            WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS, 23, 17, 83, 67,
+            windows[1], NULL, GetModuleHandleA( NULL ), NULL );
+        windows[3] = CreateWindowExA( cases[i].child_exstyle | WS_EX_NOINHERITLAYOUT,
+            "client_surface_test", "shaped scene geometry", WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS,
+            51, 31, 73, 59, windows[1], NULL, GetModuleHandleA( NULL ), NULL );
+        ok( windows[1] && windows[2] && windows[3], "could not create nested scene windows\n" );
+        if (!windows[1] || !windows[2] || !windows[3]) goto next;
+        shape = CreateRectRgn( 3, 2, 27, 19 );
+        part = CreateRectRgn( 8, 19, 39, 43 );
+        CombineRgn( shape, shape, part, RGN_OR );
+        DeleteObject( part );
+        ok( SetWindowRgn( windows[3], shape, FALSE ), "could not set asymmetric shape\n" );
+        for (j = 0; j < ARRAY_SIZE(windows); ++j)
+        {
+            identities[j] = allocate_surface();
+            status = set_surface_state( windows[j], identities[j], CLIENT_SURFACE_STATE_REGISTER, 0, NULL );
+            ok( !status, "register layer %u status %#x\n", j, status );
+            status = claim_surface_state( windows[j], identities[j], &state );
+            ok( !status, "claim layer %u status %#x\n", j, status );
+            trace( "layer %u window DPI %u, context %p\n", j, GetDpiForWindow( windows[j] ),
+                   GetWindowDpiAwarenessContext( windows[j] ) );
+            if (expected_dpi)
+                ok( GetDpiForWindow( windows[j] ) == (cases[i].context == DPI_AWARENESS_CONTEXT_UNAWARE ?
+                    96 : atoi( expected_dpi )), "layer %u DPI %u, expected prefix DPI %s\n",
+                    j, GetDpiForWindow( windows[j] ), expected_dpi );
+        }
+        status = get_scene_snapshot( windows[0], state.scene_generation, sizeof(snapshot.data), &snapshot );
+        ok( !status && snapshot.count == ARRAY_SIZE(windows), "geometry snapshot status %#x count %u\n",
+            status, snapshot.count );
+        if (!status)
+            for (j = 0; j < ARRAY_SIZE(windows); ++j)
+            {
+                winetest_push_context( "layer %u", j );
+                check_scene_layer_geometry( &snapshot, windows[0], windows[j] );
+                winetest_pop_context();
+            }
+next:
+        if (windows[0]) DestroyWindow( windows[0] );
+        SetThreadDpiAwarenessContext( old_context );
+        winetest_pop_context();
+    }
 }
 
 static void check_surface_handoff_cookie( HWND hwnd, UINT64 surface, UINT64 cookie )
@@ -3454,6 +3838,8 @@ static BOOL run_focused_test_case( const char *name, char **argv )
          test_clip_scene_snapshot},
         {"complex-clip-snapshot", "complex client surface clip snapshot", test_complex_clip_snapshot},
         {"scene-region-batch", "client surface region batches", test_scene_region_batch},
+        {"scene-snapshot", "authoritative client surface scene snapshot", test_scene_snapshot},
+        {"scene-snapshot-geometry", "client surface scene coordinate and clipping geometry", test_scene_snapshot_geometry},
         {"subtree-retirement", "client surface subtree retirement",
          test_subtree_generation_retirement},
         {"generation-aba", "client surface generation ABA exclusion", test_generation_aba},
@@ -3682,6 +4068,8 @@ START_TEST(client_surface)
     trace( "testing client surface clip scene snapshots\n" );
     test_clip_scene_snapshot();
     test_scene_region_batch();
+    test_scene_snapshot();
+    test_scene_snapshot_geometry();
     trace( "testing complex client surface clip snapshot\n" );
     test_complex_clip_snapshot();
     trace( "testing client surface subtree retirement\n" );

@@ -683,129 +683,153 @@ static HRGN create_client_surface_visible_region( const RECT *rects, UINT count,
     return mapped;
 }
 
-static BOOL get_client_surface_scene_region_batch( HWND toplevel, UINT64 epoch, UINT count,
-                                                   struct client_surface_scene_member *members )
+void client_surface_free_scene_snapshot( UINT count, struct client_surface_scene_member *members )
 {
-    struct client_surface_scene_region_request requests[CLIENT_SURFACE_SCENE_BATCH_MAX];
-    UINT size = count * (sizeof(struct client_surface_scene_region) + sizeof(RECT)), i;
-    unsigned char *data = NULL, *next, *cursor;
-    data_size_t reply_size, remaining;
-    NTSTATUS status;
-    BOOL ret = FALSE;
-    RECT rect;
+    UINT i;
 
     for (i = 0; i < count; ++i)
-    {
-        struct client_surface_target *target = &members[i].target;
-        if (!get_client_surface_rects( toplevel, members[i].hwnd, target )) goto done;
-        requests[i].handle = wine_server_user_handle( members[i].hwnd );
-        requests[i].dpi = (struct ratio){target->dpi_num, target->dpi_den};
-        requests[i].bounds = wine_server_rectangle( target->monitor_rect );
-        requests[i].flags = members[i].hwnd == toplevel && NtUserGetPresentRect( toplevel, &rect, -1 ) ?
-            CLIENT_SURFACE_SCENE_PRESENT_RECT : get_window_client_surface_flags( members[i].hwnd );
-    }
+        if (members[i].region) NtGdiDeleteObjectApp( members[i].region );
+    free( members );
+}
+
+BOOL client_surface_get_scene_snapshot( HWND toplevel, UINT64 *scene_id, UINT *count,
+                                        struct client_surface_scene_member **members )
+{
+    struct client_surface_scene_member *result = NULL;
+    struct client_surface_scene_layer *layers = NULL;
+    struct window_rects *monitor_rects = NULL;
+    struct ratio *dpis = NULL;
+    unsigned char *data = NULL, *next, *cursor;
+    UINT size = 4096, total = 0, i;
+    data_size_t reply_size = 0, remaining;
+    UINT64 id = *scene_id;
+    NTSTATUS status;
+    BOOL ret = FALSE;
+
+    *count = 0;
+    *members = NULL;
+    if (id & 1) return FALSE;
     for (;;)
     {
-        UINT required = 0;
-        UINT64 current = 0;
+        UINT required;
+        UINT64 current;
+
         if (!(next = realloc( data, size ))) goto done;
         data = next;
-        SERVER_START_REQ( get_client_surface_scene_regions )
+        SERVER_START_REQ( get_client_surface_scene_snapshot )
         {
             req->handle = wine_server_user_handle( toplevel );
-            req->scene_generation = epoch;
-            wine_server_add_data( req, requests, count * sizeof(*requests) );
+            req->scene_id = id;
             wine_server_set_reply( req, data, size );
             status = wine_server_call( req );
             required = reply->total_size;
-            current = reply->scene_generation;
+            current = reply->scene_id;
+            total = reply->count;
             reply_size = wine_server_reply_size( reply );
         }
         SERVER_END_REQ;
-        if (status == STATUS_BUFFER_OVERFLOW && required > size)
+        if (status == STATUS_BUFFER_OVERFLOW && required > size && !(current & 1))
         {
+            /* Do not silently join the sizing reply to a different scene. */
+            id = current;
             size = required;
             continue;
         }
-        if (status || current != epoch || required != reply_size) goto done;
+        if (status || (current & 1) || (id && id != current) || required != reply_size ||
+            total > reply_size / sizeof(*layers)) goto done;
+        id = current;
         break;
     }
+    if (total && (!(result = calloc( total, sizeof(*result) )) ||
+                  !(layers = calloc( total, sizeof(*layers) )) ||
+                  !(monitor_rects = calloc( total, sizeof(*monitor_rects) )) ||
+                  !(dpis = calloc( total, sizeof(*dpis) )))) goto done;
     cursor = data;
     remaining = reply_size;
-    for (i = 0; i < count; ++i)
+    for (i = 0; i < total; ++i)
     {
-        struct client_surface_scene_region header;
+        struct client_surface_scene_layer *layer = &layers[i];
+        struct client_surface_target *target = &result[i].target;
+        UINT bytes;
+
+        if (remaining < sizeof(*layer)) goto done;
+        memcpy( layer, cursor, sizeof(*layer) );
+        cursor += sizeof(*layer);
+        remaining -= sizeof(*layer);
+        if (!layer->producer.handle || !layer->producer.surface || !layer->producer.process ||
+            !layer->window_dpi.num || !layer->window_dpi.den || !layer->raw_dpi.num || !layer->raw_dpi.den ||
+            (layer->flags & ~CLIENT_SURFACE_SCENE_PRESENT_RECT) || layer->reserved ||
+            layer->visible_count > remaining / sizeof(RECT)) goto done;
+        bytes = layer->visible_count * sizeof(RECT);
+        cursor += bytes;
+        remaining -= bytes;
+        if (layer->clip_count > remaining / sizeof(struct client_surface_clip_window)) goto done;
+        bytes = layer->clip_count * sizeof(struct client_surface_clip_window);
+        cursor += bytes;
+        remaining -= bytes;
+        if (!layer->producer.visible && (layer->visible_count || layer->clip_count)) goto done;
+        result[i].hwnd = wine_server_ptr_handle( layer->producer.handle );
+        result[i].process = layer->producer.process;
+        result[i].identity = layer->producer.surface;
+        result[i].cookie = layer->producer.cookie;
+        result[i].visible = !!layer->producer.visible;
+        dpis[i] = layer->window_dpi;
+        monitor_rects[i].window = wine_server_get_rect( layer->top_window );
+        monitor_rects[i].client = wine_server_get_rect( layer->top_client );
+        monitor_rects[i].visible = wine_server_get_rect( layer->top_visible );
+        target->toplevel = toplevel;
+        target->virtual_rect = wine_server_get_rect( layer->source );
+        target->monitor_rect = map_dpi_rect( target->virtual_rect, layer->window_dpi, layer->raw_dpi );
+        OffsetRect( &target->virtual_rect, layer->top_client.left - layer->top_visible.left,
+                     layer->top_client.top - layer->top_visible.top );
+        target->dpi_num = layer->raw_dpi.num;
+        target->dpi_den = layer->raw_dpi.den;
+    }
+    if (remaining || (total && !map_window_rects_virt_to_raw_batch( total, monitor_rects, dpis ))) goto done;
+    cursor = data;
+    for (i = 0; i < total; ++i)
+    {
+        const struct client_surface_scene_layer *layer = &layers[i];
         struct client_surface_clip_snapshot snapshot = {0};
-        const struct client_surface_target *target = &members[i].target;
+        struct client_surface_target *target = &result[i].target;
         const RECT *visible_rects;
         HRGN visible;
-        UINT bytes;
         BOOL combined;
 
-        if (remaining < sizeof(header)) goto done;
-        memcpy( &header, cursor, sizeof(header) );
-        cursor += sizeof(header);
-        remaining -= sizeof(header);
-        if (header.handle != requests[i].handle || !header.window_dpi.num || !header.window_dpi.den ||
-            header.visible_count > remaining / sizeof(RECT)) goto done;
-        bytes = header.visible_count * sizeof(RECT);
+        OffsetRect( &target->monitor_rect, monitor_rects[i].client.left - monitor_rects[i].visible.left,
+                     monitor_rects[i].client.top - monitor_rects[i].visible.top );
+        cursor += sizeof(*layer);
         visible_rects = (const RECT *)cursor;
-        cursor += bytes;
-        remaining -= bytes;
-        if (header.clip_count > remaining / sizeof(*snapshot.windows)) goto done;
+        cursor += layer->visible_count * sizeof(RECT);
         snapshot.windows = (struct client_surface_clip_window *)cursor;
-        snapshot.count = header.clip_count;
-        bytes = header.clip_count * sizeof(*snapshot.windows);
-        cursor += bytes;
-        remaining -= bytes;
-        if (!get_client_surface_region( &target->monitor_rect, &snapshot, &members[i].region )) goto done;
-        /* NULL in the producer cache means no occlusion. Owner plans always
-         * carry an explicit region, including a successful empty clip. */
-        if (!members[i].region && !(members[i].region = NtGdiCreateRectRgn( 0, 0,
+        snapshot.count = layer->clip_count;
+        cursor += layer->clip_count * sizeof(*snapshot.windows);
+        if (!result[i].visible) continue;
+        if (!get_client_surface_region( &target->monitor_rect, &snapshot, &result[i].region )) goto done;
+        if (!result[i].region && !(result[i].region = NtGdiCreateRectRgn( 0, 0,
             target->monitor_rect.right - target->monitor_rect.left,
             target->monitor_rect.bottom - target->monitor_rect.top ))) goto done;
-        if (!(requests[i].flags & CLIENT_SURFACE_SCENE_PRESENT_RECT))
+        if (!(layer->flags & CLIENT_SURFACE_SCENE_PRESENT_RECT))
         {
-            visible = create_client_surface_visible_region( visible_rects, header.visible_count,
-                                                             header.window_dpi, requests[i].dpi );
+            visible = create_client_surface_visible_region( visible_rects, layer->visible_count,
+                                                             layer->window_dpi, layer->raw_dpi );
             if (!visible) goto done;
-            combined = NtGdiCombineRgn( members[i].region, members[i].region, visible, RGN_AND ) != ERROR;
+            combined = NtGdiCombineRgn( result[i].region, result[i].region, visible, RGN_AND ) != ERROR;
             NtGdiDeleteObjectApp( visible );
             if (!combined) goto done;
         }
     }
-    ret = !remaining;
+    *scene_id = id;
+    *members = result;
+    *count = total;
+    ret = TRUE;
 done:
+    if (!ret && result) client_surface_free_scene_snapshot( total, result );
+    free( monitor_rects );
+    free( dpis );
+    free( layers );
     free( data );
     return ret;
-}
-
-/* Collect bounded groups from one server scene. The owner validates the epoch
- * again before installing the complete roster; no partial group is installed. */
-BOOL client_surface_get_scene_members( HWND toplevel, UINT64 epoch, UINT count,
-                                       struct client_surface_scene_member *members )
-{
-    UINT i, batch;
-
-    for (i = 0; i < count; ++i)
-    {
-        members[i].region = 0;
-        memset( &members[i].target, 0, sizeof(members[i].target) );
-    }
-    if (epoch & 1) return FALSE;
-    for (i = 0; i < count; i += batch)
-    {
-        batch = min( count - i, CLIENT_SURFACE_SCENE_BATCH_MAX );
-        if (!get_client_surface_scene_region_batch( toplevel, epoch, batch, members + i )) goto failed;
-    }
-    return TRUE;
-failed:
-    for (i = 0; i < count; ++i)
-    {
-        if (members[i].region) NtGdiDeleteObjectApp( members[i].region );
-        members[i].region = 0;
-    }
-    return FALSE;
 }
 
 /* Cross-process clipping changes only with the server-owned scene sequence.

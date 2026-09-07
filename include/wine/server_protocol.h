@@ -308,6 +308,25 @@ struct client_surface_handoff_desc
     unsigned int   reserved;
 };
 
+/* One selected producer followed by visible_count client-relative rectangles
+ * at window_dpi and clip_count owner-relative clip rectangles at raw_dpi.
+ * Geometry is captured with the roster; native monitor conversion needs no
+ * further window queries. Hidden bindings have no region payload. */
+struct client_surface_scene_layer
+{
+    struct client_surface_handoff_desc producer;
+    struct rectangle source;
+    struct rectangle top_window;
+    struct rectangle top_client;
+    struct rectangle top_visible;
+    struct ratio window_dpi;
+    struct ratio raw_dpi;
+    unsigned int flags;
+    unsigned int visible_count;
+    unsigned int clip_count;
+    unsigned int reserved;
+};
+
 
 struct client_surface_handoff_receipt
 {
@@ -6568,6 +6587,38 @@ struct get_client_surface_scene_regions_reply
     /* VARARG(regions,bytes); */
 };
 
+/* Capture roster, geometry and clips in one serialized server scene. A zero
+ * scene_id requests the current stable scene; otherwise it must still match.
+ * An undersized reply reports total_size and returns no partial snapshot. */
+struct get_client_surface_scene_snapshot_request
+{
+    struct request_header __header;
+    user_handle_t handle;
+    unsigned __int64 scene_id;
+};
+struct get_client_surface_scene_snapshot_reply
+{
+    struct reply_header __header;
+    unsigned __int64 scene_id;
+    unsigned int count;
+    unsigned int total_size;
+    /* VARARG(layers,bytes); */
+};
+
+
+struct set_window_present_rect_request
+{
+    struct request_header __header;
+    user_handle_t handle;
+    struct rectangle rect;
+    struct ratio dpi;
+    char __pad_36[4];
+};
+struct set_window_present_rect_reply
+{
+    struct reply_header __header;
+};
+
 
 enum request
 {
@@ -6893,6 +6944,8 @@ enum request
     REQ_publish_client_surface_handoff,
     REQ_get_client_surface_handoffs,
     REQ_get_client_surface_scene_regions,
+    REQ_get_client_surface_scene_snapshot,
+    REQ_set_window_present_rect,
     REQ_NB_REQUESTS
 };
 
@@ -7222,6 +7275,8 @@ union generic_request
     struct publish_client_surface_handoff_request publish_client_surface_handoff_request;
     struct get_client_surface_handoffs_request get_client_surface_handoffs_request;
     struct get_client_surface_scene_regions_request get_client_surface_scene_regions_request;
+    struct get_client_surface_scene_snapshot_request get_client_surface_scene_snapshot_request;
+    struct set_window_present_rect_request set_window_present_rect_request;
 };
 union generic_reply
 {
@@ -7549,8 +7604,10 @@ union generic_reply
     struct publish_client_surface_handoff_reply publish_client_surface_handoff_reply;
     struct get_client_surface_handoffs_reply get_client_surface_handoffs_reply;
     struct get_client_surface_scene_regions_reply get_client_surface_scene_regions_reply;
+    struct get_client_surface_scene_snapshot_reply get_client_surface_scene_snapshot_reply;
+    struct set_window_present_rect_reply set_window_present_rect_reply;
 };
 
-#define SERVER_PROTOCOL_VERSION 1008
+#define SERVER_PROTOCOL_VERSION 1009
 
 #endif /* __WINE_WINE_SERVER_PROTOCOL_H */

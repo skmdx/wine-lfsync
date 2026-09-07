@@ -324,6 +324,25 @@ struct client_surface_handoff_desc
     unsigned int   reserved;
 };
 
+/* One selected producer followed by visible_count client-relative rectangles
+ * at window_dpi and clip_count owner-relative clip rectangles at raw_dpi.
+ * Geometry is captured with the roster; native monitor conversion needs no
+ * further window queries. Hidden bindings have no region payload. */
+struct client_surface_scene_layer
+{
+    struct client_surface_handoff_desc producer;
+    struct rectangle source;       /* source placement in top-level client coords */
+    struct rectangle top_window;   /* owner rectangles at window_dpi */
+    struct rectangle top_client;
+    struct rectangle top_visible;
+    struct ratio window_dpi;
+    struct ratio raw_dpi;
+    unsigned int flags;            /* CLIENT_SURFACE_SCENE_PRESENT_RECT */
+    unsigned int visible_count;
+    unsigned int clip_count;
+    unsigned int reserved;
+};
+
 /* Owner attestation for pixels already copied out of producer storage. */
 struct client_surface_handoff_receipt
 {
@@ -4571,4 +4590,24 @@ enum inproc_sync_type
     unsigned int total_size;
     unsigned __int64 scene_generation;
     VARARG(regions,bytes); /* complete client_surface_scene_region records */
+@END
+
+/* Capture roster, geometry and clips in one serialized server scene. A zero
+ * scene_id requests the current stable scene; otherwise it must still match.
+ * An undersized reply reports total_size and returns no partial snapshot. */
+@REQ(get_client_surface_scene_snapshot)
+    user_handle_t handle;
+    unsigned __int64 scene_id;
+@REPLY
+    unsigned __int64 scene_id;
+    unsigned int count;
+    unsigned int total_size;
+    VARARG(layers,bytes); /* complete client_surface_scene_layer records */
+@END
+
+/* Publish exclusive fullscreen placement with its scene version. */
+@REQ(set_window_present_rect)
+    user_handle_t handle;
+    struct rectangle rect;
+    struct ratio dpi;
 @END

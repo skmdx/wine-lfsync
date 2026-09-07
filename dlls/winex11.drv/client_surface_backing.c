@@ -3461,97 +3461,29 @@ release:
     return FALSE;
 }
 
-static BOOL get_client_surface_scene_layouts( HWND toplevel, UINT64 epoch, UINT count,
-                                               const struct client_surface_handoff_desc *descs,
-                                               struct client_surface_scene_layout *layouts )
-{
-    struct client_surface_scene_member *members;
-    BOOL ret = FALSE;
-    UINT i, visible = 0, index = 0;
-
-    for (i = 0; i < count; ++i) visible += !!descs[i].visible;
-    if (!visible) return TRUE;
-    if (!(members = calloc( visible, sizeof(*members) ))) return FALSE;
-    for (i = 0; i < count; ++i)
-        if (descs[i].visible) members[index++].hwnd = wine_server_ptr_handle( descs[i].handle );
-    if (!client_surface_get_scene_members( toplevel, epoch, visible, members )) goto done;
-    /* Keep the exact native rectangles, including an empty successful region,
-     * in the immutable owner plan. No producer-owned region XID survives here. */
-    for (i = 0, index = 0; i < count; ++i)
-    {
-        if (!descs[i].visible) continue;
-        layouts[index].window = members[index].hwnd;
-        layouts[index].process = descs[i].process;
-        layouts[index].identity = descs[i].surface;
-        layouts[index].geometry = members[index].target;
-        if (!(layouts[index].clip = X11DRV_GetRegionData( members[index].region, 0 ))) goto done;
-        ++index;
-    }
-    ret = TRUE;
-done:
-    for (i = 0; i < visible; ++i)
-        if (members[i].region) NtGdiDeleteObjectApp( members[i].region );
-    free( members );
-    return ret;
-}
-
-static BOOL validate_client_surface_handoff_scene( HWND toplevel, UINT64 epoch )
-{
-    UINT64 current = 0;
-    NTSTATUS status;
-
-    SERVER_START_REQ( get_client_surface_handoffs )
-    {
-        req->handle = wine_server_user_handle( toplevel );
-        status = wine_server_call( req );
-        if (!status) current = reply->scene_generation;
-    }
-    SERVER_END_REQ;
-    return !status && current == epoch;
-}
-
 static BOOL refresh_client_surface_handoffs( HWND toplevel )
 {
     struct client_surface_handoff_desc *descs = NULL;
+    struct client_surface_scene_member *members = NULL;
     struct client_surface_scene_layout *layouts = NULL;
     BOOL *reused = NULL;
-    UINT size = 8, count = 0, i;
+    UINT count = 0, i, index;
     unsigned int layout_count = 0;
     UINT64 scene_generation = 0;
     UINT64 mark = InterlockedIncrement64( (LONG64 *)&client_surface_compositor_mark );
-    NTSTATUS status;
 
     if (!mark) mark = InterlockedIncrement64( (LONG64 *)&client_surface_compositor_mark );
-    for (;;)
+    if (!client_surface_get_scene_snapshot( toplevel, &scene_generation, &count, &members )) goto failed;
+    if (count && !(descs = calloc( count, sizeof(*descs) ))) goto failed;
+    for (i = 0; i < count; ++i)
     {
-        struct client_surface_handoff_desc *next;
-        data_size_t reply_size = 0;
-
-        if (!(next = realloc( descs, size * sizeof(*descs) ))) goto failed;
-        descs = next;
-        SERVER_START_REQ( get_client_surface_handoffs )
-        {
-            req->handle = wine_server_user_handle( toplevel );
-            wine_server_set_reply( req, descs, size * sizeof(*descs) );
-            status = wine_server_call( req );
-            if (!status)
-            {
-                count = reply->count;
-                scene_generation = reply->scene_generation;
-                reply_size = wine_server_reply_size( reply );
-            }
-        }
-        SERVER_END_REQ;
-        if (status) goto failed;
-        if (count > size)
-        {
-            size = count;
-            continue;
-        }
-        if (reply_size != count * sizeof(*descs) || (scene_generation & 1)) goto failed;
-        break;
+        descs[i].handle = wine_server_user_handle( members[i].hwnd );
+        descs[i].process = members[i].process;
+        descs[i].surface = members[i].identity;
+        descs[i].cookie = members[i].cookie;
+        descs[i].visible = members[i].visible;
     }
-    qsort( descs, count, sizeof(*descs), compare_client_surface_handoff_descs );
+    if (count) qsort( descs, count, sizeof(*descs), compare_client_surface_handoff_descs );
     {
         struct client_surface_compositor_job job =
         {
@@ -3568,8 +3500,9 @@ static BOOL refresh_client_surface_handoffs( HWND toplevel )
          * native geometry and target changes keep their invalidation rules. */
         if (submit_client_surface_compositor_job( &job ))
         {
-            if (!validate_client_surface_handoff_scene( toplevel, scene_generation )) goto failed;
+            if (!client_surface_scene_snapshot_current( toplevel, scene_generation )) goto failed;
             free( descs );
+            client_surface_free_scene_snapshot( count, members );
             return TRUE;
         }
     }
@@ -3579,7 +3512,18 @@ static BOOL refresh_client_surface_handoffs( HWND toplevel )
         layout_count = 0;
         goto failed;
     }
-    if (!get_client_surface_scene_layouts( toplevel, scene_generation, count, descs, layouts )) goto failed;
+    /* Roster, selection, geometry and clips all come from the same reply.
+     * The binding cache remains independent and includes hidden producers. */
+    for (i = 0, index = 0; i < count; ++i)
+    {
+        if (!members[i].visible) continue;
+        layouts[index].window = members[i].hwnd;
+        layouts[index].process = members[i].process;
+        layouts[index].identity = members[i].identity;
+        layouts[index].geometry = members[i].target;
+        if (!(layouts[index].clip = X11DRV_GetRegionData( members[i].region, 0 ))) goto failed;
+        ++index;
+    }
     if (count)
     {
         struct client_surface_compositor_job job =
@@ -3601,7 +3545,7 @@ static BOOL refresh_client_surface_handoffs( HWND toplevel )
                 !register_client_surface_handoff( toplevel, &descs[i], mark )) goto failed;
     }
 
-    if (!validate_client_surface_handoff_scene( toplevel, scene_generation )) goto failed;
+    if (!client_surface_scene_snapshot_current( toplevel, scene_generation )) goto failed;
     {
         struct client_surface_compositor_job job =
         {
@@ -3622,12 +3566,14 @@ static BOOL refresh_client_surface_handoffs( HWND toplevel )
     free_client_surface_scene_layouts( layouts, layout_count );
     free( descs );
     free( reused );
+    client_surface_free_scene_snapshot( count, members );
     return TRUE;
 
 failed:
     free_client_surface_scene_layouts( layouts, layout_count );
     free( descs );
     free( reused );
+    client_surface_free_scene_snapshot( count, members );
     return FALSE;
 }
 

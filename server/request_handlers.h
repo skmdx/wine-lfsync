@@ -329,6 +329,8 @@ DECL_HANDLER(cancel_client_surface_handoffs);
 DECL_HANDLER(publish_client_surface_handoff);
 DECL_HANDLER(get_client_surface_handoffs);
 DECL_HANDLER(get_client_surface_scene_regions);
+DECL_HANDLER(get_client_surface_scene_snapshot);
+DECL_HANDLER(set_window_present_rect);
 
 typedef void (*req_handler)( const void *req, void *reply );
 static const req_handler req_handlers[REQ_NB_REQUESTS] =
@@ -655,6 +657,8 @@ static const req_handler req_handlers[REQ_NB_REQUESTS] =
     (req_handler)req_publish_client_surface_handoff,
     (req_handler)req_get_client_surface_handoffs,
     (req_handler)req_get_client_surface_scene_regions,
+    (req_handler)req_get_client_surface_scene_snapshot,
+    (req_handler)req_set_window_present_rect,
 };
 
 C_ASSERT( sizeof(abstime_t) == 8 );
@@ -2519,3 +2523,14 @@ C_ASSERT( sizeof(struct get_client_surface_scene_regions_request) == 24 );
 C_ASSERT( offsetof(struct get_client_surface_scene_regions_reply, total_size) == 8 );
 C_ASSERT( offsetof(struct get_client_surface_scene_regions_reply, scene_generation) == 16 );
 C_ASSERT( sizeof(struct get_client_surface_scene_regions_reply) == 24 );
+C_ASSERT( offsetof(struct get_client_surface_scene_snapshot_request, handle) == 12 );
+C_ASSERT( offsetof(struct get_client_surface_scene_snapshot_request, scene_id) == 16 );
+C_ASSERT( sizeof(struct get_client_surface_scene_snapshot_request) == 24 );
+C_ASSERT( offsetof(struct get_client_surface_scene_snapshot_reply, scene_id) == 8 );
+C_ASSERT( offsetof(struct get_client_surface_scene_snapshot_reply, count) == 16 );
+C_ASSERT( offsetof(struct get_client_surface_scene_snapshot_reply, total_size) == 20 );
+C_ASSERT( sizeof(struct get_client_surface_scene_snapshot_reply) == 24 );
+C_ASSERT( offsetof(struct set_window_present_rect_request, handle) == 12 );
+C_ASSERT( offsetof(struct set_window_present_rect_request, rect) == 16 );
+C_ASSERT( offsetof(struct set_window_present_rect_request, dpi) == 32 );
+C_ASSERT( sizeof(struct set_window_present_rect_request) == 40 );
