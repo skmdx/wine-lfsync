@@ -1391,6 +1391,26 @@ static BOOL client_surface_complete_direct_present_locked(
     return completed;
 }
 
+static BOOL client_surface_capture_present( struct client_surface *surface, struct client_surface_frame *present )
+{
+    BOOL captured = FALSE;
+
+    /* Completion waits run without submission serialization. A newer frame
+     * can replace their handoff while they sleep; it alone owns the mutable
+     * native source when the wait returns. Capture never consumes the fence. */
+    pthread_mutex_lock( &surface->present_lock );
+    if (!surface->target.valid || present->target_seq != surface->target.seq ||
+        present->serial <= surface->composed_serial ||
+        (present->handoff_control && (!surface->handoff_slot ||
+         __atomic_load_n( &surface->handoff_slot[present->handoff_index].control, __ATOMIC_ACQUIRE ) !=
+         present->handoff_control)))
+        present->result = CLIENT_SURFACE_FRAME_SUPERSEDED;
+    else if (!(captured = present->capture.capture( present->capture.context, surface, present )))
+        present->result = CLIENT_SURFACE_FRAME_COMPLETION_FAILED;
+    pthread_mutex_unlock( &surface->present_lock );
+    return captured;
+}
+
 BOOL client_surface_complete_present_locked( struct client_surface *surface,
                                              struct client_surface_frame *present,
                                              BOOL submitted, BOOL external_completed,
@@ -1429,38 +1449,21 @@ BOOL client_surface_complete_present_locked( struct client_surface *surface,
         if (!completed) present->result = CLIENT_SURFACE_FRAME_COMPLETION_FAILED;
     }
     /* A preparing scene prevents publication, not the acquisition of an
-     * independent image from an unchanged native target. The resolve below
+     * independent image from an unchanged native target. The capture below
      * still validates the target sequence before touching its source. */
     if (submitted && present->target == CLIENT_SURFACE_FRAME_TARGET_INVALID &&
-        present->completion.resolve && present->completion.kind == CLIENT_SURFACE_COMPLETION_EXACT)
+        present->capture.capture && present->completion.kind == CLIENT_SURFACE_COMPLETION_EXACT)
     {
         completed = external_completed;
         if (!completed) present->result = CLIENT_SURFACE_FRAME_COMPLETION_FAILED;
     }
-    if (completed && present->completion.resolve)
+    if (completed && present->capture.capture)
     {
-        /* Completion waits run without submission serialization. A newer
-         * frame can replace their handoff while they sleep; it alone owns
-         * the mutable native source when the wait returns. */
-        pthread_mutex_lock( &surface->present_lock );
-        if (!surface->target.valid || present->target_seq != surface->target.seq ||
-            present->serial <= surface->composed_serial ||
-            (present->handoff_control && (!surface->handoff_slot ||
-             __atomic_load_n( &surface->handoff_slot[present->handoff_index].control, __ATOMIC_ACQUIRE ) !=
-             present->handoff_control)))
-        {
-            present->result = CLIENT_SURFACE_FRAME_SUPERSEDED;
-        }
-        else if (!present->completion.resolve( present->completion.context, surface, present ))
-        {
+        if (!external_completed)
             present->result = CLIENT_SURFACE_FRAME_COMPLETION_FAILED;
-            completed = FALSE;
-        }
-        pthread_mutex_unlock( &surface->present_lock );
-        if (present->result == CLIENT_SURFACE_FRAME_SUPERSEDED)
-            client_surface_abandon_handoff_locked( surface, present );
+        completed = external_completed && client_surface_capture_present( surface, present );
     }
-    if (submitted && external_completed && !present->completion.resolve &&
+    if (submitted && external_completed && !present->capture.capture &&
         present->completion.kind == CLIENT_SURFACE_COMPLETION_EXACT &&
         present->target == CLIENT_SURFACE_FRAME_TARGET_INVALID && !present->source_size.cx &&
         client_surface_backend_has_cap( surface, CLIENT_SURFACE_BACKEND_OWNER_SCENE_PLAN ))
@@ -1481,7 +1484,8 @@ BOOL client_surface_complete_present_locked( struct client_surface *surface,
         }
         pthread_mutex_unlock( &surface->present_lock );
     }
-    if (submitted && external_completed && present->source_size.cx && present->source_size.cy)
+    if (submitted && external_completed && present->result == CLIENT_SURFACE_FRAME_PENDING &&
+        present->source_size.cx && present->source_size.cy)
     {
         /* An independently frozen source can outlive the scene sampled at
          * submission. Retain it before checking publication authorization;
@@ -1585,6 +1589,7 @@ BOOL client_surface_complete_present_locked( struct client_surface *surface,
             wake = TRUE;
         }
         memset( &present->completion, 0, sizeof(present->completion) );
+        memset( &present->capture, 0, sizeof(present->capture) );
         if (release_handoff) client_surface_release_handoff( surface );
         /* An abandoned image or the last completion can also satisfy the
          * source waiter, without an owner copy producing a release wake. */

@@ -235,7 +235,7 @@ struct vulkan_present_completion
     uint64_t present_id;
 };
 
-struct vulkan_snapshot_completion
+struct vulkan_snapshot_capture
 {
     struct vulkan_device *device;
     struct swapchain *swapchain;
@@ -2372,21 +2372,25 @@ static VkResult acquire_snapshot_reservation( struct vulkan_device *device, stru
 
 static BOOL wait_vulkan_snapshot( void *context, DWORD timeout )
 {
-    struct vulkan_snapshot_completion *completion = context;
-    struct vulkan_device *device = completion->device;
-    struct swapchain_snapshot *snapshot = completion->snapshot;
+    struct vulkan_snapshot_fence *pending = context;
+    struct vulkan_device *device = pending->device;
 
-    return device->p_vkWaitForFences( device->host.device, 1, &snapshot->pending->fence,
+    return device->p_vkWaitForFences( device->host.device, 1, &pending->fence,
                                      VK_TRUE, (uint64_t)timeout * 1000000 ) == VK_SUCCESS;
 }
 
-static BOOL resolve_vulkan_snapshot( void *context, struct client_surface *surface,
+static void release_vulkan_snapshot_completion( void *context )
+{
+    release_snapshot_fence( context );
+}
+
+static BOOL capture_vulkan_snapshot( void *context, struct client_surface *surface,
                                       struct client_surface_frame *present )
 {
-    struct vulkan_snapshot_completion *completion = context;
-    struct vulkan_device *device = completion->device;
-    struct swapchain *swapchain = completion->swapchain;
-    struct swapchain_snapshot *snapshot = completion->snapshot;
+    struct vulkan_snapshot_capture *capture = context;
+    struct vulkan_device *device = capture->device;
+    struct swapchain *swapchain = capture->swapchain;
+    struct swapchain_snapshot *snapshot = capture->snapshot;
     VkMappedMemoryRange range = {.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
                                  .memory = snapshot->memory, .size = VK_WHOLE_SIZE};
 
@@ -2395,12 +2399,12 @@ static BOOL resolve_vulkan_snapshot( void *context, struct client_surface *surfa
                swapchain->host_extents.width, swapchain->host_extents.height, swapchain->format );
 }
 
-static void release_vulkan_snapshot( void *context )
+static void release_vulkan_snapshot_capture( void *context )
 {
-    struct vulkan_snapshot_completion *completion = context;
+    struct vulkan_snapshot_capture *capture = context;
 
-    release_snapshot_reservation( completion->swapchain, completion->snapshot );
-    free( completion );
+    release_snapshot_reservation( capture->swapchain, capture->snapshot );
+    free( capture );
 }
 
 static void destroy_swapchain_snapshot( struct vulkan_device *device, struct swapchain_snapshot *snapshot )
@@ -2562,7 +2566,7 @@ static VkResult snapshot_vulkan_present( struct vulkan_queue *queue, VkPresentIn
     {
         struct swapchain *swapchain = swapchain_from_handle( client_swapchains[i] );
         struct swapchain_snapshot *snapshot = reservations[i].snapshot;
-        struct vulkan_snapshot_completion *completion;
+        struct vulkan_snapshot_capture *capture;
         VkCommandBufferBeginInfo begin = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
                                           .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};
         VkImageMemoryBarrier image = {.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
@@ -2587,17 +2591,16 @@ static VkResult snapshot_vulkan_present( struct vulkan_queue *queue, VkPresentIn
         if (!swapchain->needs_snapshot || presents[i].completion.kind != CLIENT_SURFACE_COMPLETION_EXACT) continue;
         assert( snapshot && snapshot->busy );
         if ((res = prepare_swapchain_snapshot( queue, swapchain, snapshot ))) goto done;
-        if (!(completion = malloc( sizeof(*completion) )))
+        if (!(capture = malloc( sizeof(*capture) )))
         {
             res = VK_ERROR_OUT_OF_HOST_MEMORY;
             goto done;
         }
-        completion->device = device;
-        completion->swapchain = swapchain;
-        completion->snapshot = snapshot;
-        client_surface_set_present_completion( &presents[i], wait_vulkan_snapshot,
-                                               release_vulkan_snapshot, completion );
-        presents[i].completion.resolve = resolve_vulkan_snapshot;
+        capture->device = device;
+        capture->swapchain = swapchain;
+        capture->snapshot = snapshot;
+        presents[i].capture = (struct client_surface_capture){capture_vulkan_snapshot,
+                                                            release_vulkan_snapshot_capture, capture};
         image.image = snapshot->images[present_info->pImageIndices[i]];
         buffer.buffer = snapshot->buffer;
         if ((res = device->p_vkBeginCommandBuffer( snapshot->command, &begin ))) goto done;
@@ -2636,23 +2639,27 @@ static VkResult snapshot_vulkan_present( struct vulkan_queue *queue, VkPresentIn
     {
         struct swapchain_snapshot *snapshot = reservations[i].snapshot;
 
-        if (!presents[i].completion.resolve) continue;
+        if (!presents[i].capture.capture) continue;
         assert( !snapshot->pending );
         snapshot->pending = pending;
         InterlockedIncrement( &pending->refs );
+        /* The completion owns only the submitted fence. Capture owns the
+         * buffer reservation separately, and the image retains another fence
+         * reference to prevent reuse after an abandoned or timed-out wait. */
+        InterlockedIncrement( &pending->refs );
+        client_surface_set_present_completion( &presents[i], wait_vulkan_snapshot,
+                                               release_vulkan_snapshot_completion, pending );
     }
 done:
     if (res)
         for (i = 0; i < present_info->swapchainCount; ++i)
         {
-            struct client_surface_completion *completion = &presents[i].completion;
+            struct client_surface_capture *capture = &presents[i].capture;
 
-            if (!completion->resolve) continue;
-            free( completion->context );
-            completion->wait = NULL;
-            completion->release = NULL;
-            completion->resolve = NULL;
-            completion->context = NULL;
+            /* No submitted fence was installed. The caller still owns and
+             * releases all reservations after dropping the submission locks. */
+            free( capture->context );
+            memset( capture, 0, sizeof(*capture) );
         }
     release_snapshot_fence( pending );
     if (stages != stages_buffer) free( stages );
@@ -3256,7 +3263,7 @@ reserve_snapshots:
             {
                 struct swapchain_snapshot *snapshot = reservations[i].snapshot;
 
-                if (!presents[i].completion.resolve) continue;
+                if (!presents[i].capture.capture) continue;
                 if (!present_fences[i])
                     present_fences[i] = snapshot->present_sync[present_info->pImageIndices[i]].fence;
             }
@@ -3276,7 +3283,7 @@ reserve_snapshots:
                 struct swapchain_snapshot *snapshot = reservations[i].snapshot;
                 struct swapchain_present_sync *sync;
 
-                if (!presents[i].completion.resolve) continue;
+                if (!presents[i].capture.capture) continue;
                 sync = &snapshot->present_sync[present_info->pImageIndices[i]];
                 /* OOM failed to enqueue and leaves the signaled semaphore
                  * unconsumed. OUT_OF_DATE and SURFACE_LOST still enqueue
@@ -3323,9 +3330,9 @@ reserve_snapshots:
     {
         struct swapchain *swapchain = swapchain_from_handle( client_swapchains[i] );
 
-        if (reservations[i].snapshot && !presents[i].completion.resolve)
+        if (reservations[i].snapshot && !presents[i].capture.capture)
             release_snapshot_reservation( swapchain, reservations[i].snapshot );
-        /* A successful snapshot is now owned by its completion context. */
+        /* A submitted snapshot is now owned by its capture context. */
         reservations[i].snapshot = NULL;
     }
 
@@ -3336,8 +3343,9 @@ reserve_snapshots:
         struct surface *surface = swapchain->surface;
         SIZE expected_size = {swapchain->extents.width, swapchain->extents.height};
         BOOL compose = swapchain_res >= VK_SUCCESS;
-        BOOL snapshot_completed = !!presents[i].completion.resolve;
+        BOOL snapshot_submitted = !!presents[i].capture.capture;
         struct client_surface_completion completion = presents[i].completion;
+        struct client_surface_capture capture = presents[i].capture;
         RECT client_rect;
 
         if (compose && !get_surface_rect( surface->hwnd, &client_rect,
@@ -3367,13 +3375,13 @@ reserve_snapshots:
              * extent. */
         }
 
-        if (compose && snapshot_completed)
+        if (compose && snapshot_submitted)
         {
             client_surface_defer_present( surface->client, &presents[i], &expected_size );
             continue;
         }
         if (compose && presents[i].completion.kind == CLIENT_SURFACE_COMPLETION_EXACT &&
-            use_internal_present_wait && !snapshot_completed)
+            use_internal_present_wait && !snapshot_submitted)
         {
             struct vulkan_present_completion *completion;
 
@@ -3398,7 +3406,7 @@ reserve_snapshots:
                               CLIENT_SURFACE_PRESENT_TIMEOUT - elapsed : 0;
 
             if (compose && presents[i].completion.kind == CLIENT_SURFACE_COMPLETION_EXACT &&
-                use_internal_present_wait && !snapshot_completed)
+                use_internal_present_wait && !snapshot_submitted)
             {
                 struct vulkan_present_completion fallback = {device, swapchain, present_ids[i]};
 
@@ -3425,7 +3433,11 @@ reserve_snapshots:
                 }
             }
         }
-        if (snapshot_completed) completion.release( completion.context );
+        if (snapshot_submitted)
+        {
+            completion.release( completion.context );
+            capture.release( capture.context );
+        }
     }
 
 done:

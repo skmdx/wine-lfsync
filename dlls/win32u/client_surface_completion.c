@@ -108,16 +108,35 @@ static BOOL wait_for_completion_job_locked( struct client_surface *surface )
     return !list_empty( &surface->completion_queue );
 }
 
+static void complete_deferred_present( struct client_surface *surface,
+                                      struct client_surface_frame *present, const SIZE *expected_size )
+{
+    struct client_surface_completion completion = present->completion;
+    struct client_surface_capture capture = present->capture;
+    DWORD elapsed = NtGetTickCount() - present->submission_time;
+    DWORD remaining = elapsed < CLIENT_SURFACE_PRESENT_TIMEOUT ? CLIENT_SURFACE_PRESENT_TIMEOUT - elapsed : 0;
+    BOOL completed;
+
+    /* A detached or retargeted surface cannot consume this completion. The
+     * capture still owns its storage, and the native image keeps its fence
+     * until GPU work retires even if we skip the wait or it fails. */
+    completed = client_surface_wait_present_completion( surface, present, remaining );
+    if (!client_surface_complete_present( surface, present, TRUE, completed, expected_size, 0 ) &&
+        present->result == CLIENT_SURFACE_FRAME_PENDING)
+        WARN( "deferred client-surface composition did not complete for %s\n",
+              debugstr_client_surface( surface ) );
+    /* Release outside the surface locks. Capture can hold the last reservation
+     * on the native image; return the fence reference before that reservation. */
+    completion.release( completion.context );
+    if (capture.release) capture.release( capture.context );
+}
+
 static void client_surface_completion_worker( struct client_surface *surface, BOOL linger )
 {
     struct client_surface_completion_job *job;
 
     for (;;)
     {
-        struct client_surface_completion completion;
-        DWORD elapsed, remaining;
-        BOOL completed;
-
         pthread_mutex_lock( &surface->completion_lock );
         /* Backend completion callbacks may depend on per-thread state.  Reuse
          * this worker only for its own surface and only across short frame
@@ -135,23 +154,7 @@ static void client_surface_completion_worker( struct client_surface *surface, BO
         list_remove( &job->entry );
         pthread_mutex_unlock( &surface->completion_lock );
 
-        completion = job->present.completion;
-        elapsed = NtGetTickCount() - job->present.submission_time;
-        remaining = elapsed < CLIENT_SURFACE_PRESENT_TIMEOUT ?
-                    CLIENT_SURFACE_PRESENT_TIMEOUT - elapsed : 0;
-        /* A detached or retargeted surface cannot consume this completion.
-         * Its job-owned references still protect the native source while the
-         * queued request retires, but waiting for an unmapped drawable may
-         * otherwise run to the full timeout for every queued frame. */
-        completed = client_surface_wait_present_completion( surface, &job->present, remaining );
-        if (!client_surface_complete_present( surface, &job->present, TRUE,
-                                              completed,
-                                              job->has_expected_size ? &job->expected_size : NULL,
-                                              0 ) &&
-            job->present.result == CLIENT_SURFACE_FRAME_PENDING)
-            WARN( "deferred client-surface composition did not complete for %s\n",
-                  debugstr_client_surface( surface ) );
-        completion.release( completion.context );
+        complete_deferred_present( surface, &job->present, job->has_expected_size ? &job->expected_size : NULL );
         InterlockedDecrement( &client_surface_deferred_present_count );
         free( job );
     }
@@ -171,8 +174,7 @@ void client_surface_defer_present( struct client_surface *surface,
 {
     struct client_surface_completion completion = present->completion;
     struct client_surface_completion_job *job;
-    BOOL completed, start_worker = FALSE;
-    DWORD elapsed, remaining;
+    BOOL start_worker = FALSE;
 
     assert( completion.kind != CLIENT_SURFACE_COMPLETION_NONE );
     assert( completion.external_result );
@@ -182,25 +184,13 @@ void client_surface_defer_present( struct client_surface *surface,
 
     if (!(job = malloc( sizeof(*job) )))
     {
-        elapsed = NtGetTickCount() - present->submission_time;
-        remaining = elapsed < CLIENT_SURFACE_PRESENT_TIMEOUT ?
-                    CLIENT_SURFACE_PRESENT_TIMEOUT - elapsed : 0;
-        completed = client_surface_wait_present_completion( surface, present, remaining );
-        client_surface_complete_present( surface, present, TRUE, completed,
-                                         expected_size, 0 );
-        completion.release( completion.context );
+        complete_deferred_present( surface, present, expected_size );
         return;
     }
     if (!client_surface_reserve_completion_slot())
     {
         free( job );
-        elapsed = NtGetTickCount() - present->submission_time;
-        remaining = elapsed < CLIENT_SURFACE_PRESENT_TIMEOUT ?
-                    CLIENT_SURFACE_PRESENT_TIMEOUT - elapsed : 0;
-        completed = client_surface_wait_present_completion( surface, present, remaining );
-        client_surface_complete_present( surface, present, TRUE, completed,
-                                         expected_size, 0 );
-        completion.release( completion.context );
+        complete_deferred_present( surface, present, expected_size );
         return;
     }
     job->has_expected_size = !!expected_size;
@@ -212,13 +202,7 @@ void client_surface_defer_present( struct client_surface *surface,
         CLIENT_SURFACE_MAX_DEFERRED_PRESENTS)
     {
         pthread_mutex_unlock( &surface->completion_lock );
-        elapsed = NtGetTickCount() - present->submission_time;
-        remaining = elapsed < CLIENT_SURFACE_PRESENT_TIMEOUT ?
-                    CLIENT_SURFACE_PRESENT_TIMEOUT - elapsed : 0;
-        completed = client_surface_wait_present_completion( surface, present, remaining );
-        client_surface_complete_present( surface, present, TRUE, completed,
-                                         expected_size, 0 );
-        completion.release( completion.context );
+        complete_deferred_present( surface, present, expected_size );
         InterlockedDecrement( &client_surface_deferred_present_count );
         free( job );
         return;

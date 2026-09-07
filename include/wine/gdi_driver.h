@@ -219,7 +219,7 @@ struct gdi_dc_funcs
 };
 
 /* increment this when changing driver tables or shared driver-facing structures */
-#define WINE_GDI_DRIVER_VERSION 122
+#define WINE_GDI_DRIVER_VERSION 123
 
 #define GDI_PRIORITY_NULL_DRV        0  /* null driver */
 #define GDI_PRIORITY_FONT_DRV      100  /* any font driver */
@@ -356,6 +356,7 @@ struct client_surface_frame
     UINT64 damage_base_sequence;
     SIZE source_size; /* independently frozen image, valid after external completion */
     struct client_surface_completion completion;
+    struct client_surface_capture capture;
     enum client_surface_frame_result result;
 };
 

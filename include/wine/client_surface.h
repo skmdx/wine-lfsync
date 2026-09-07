@@ -155,20 +155,27 @@ enum client_surface_completion_kind
 
 typedef BOOL (*client_surface_completion_wait_func)( void *context, DWORD timeout );
 typedef void (*client_surface_completion_release_func)( void *context );
-struct client_surface;
-struct client_surface_frame;
-typedef BOOL (*client_surface_completion_resolve_func)( void *context,
-    struct client_surface *surface, struct client_surface_frame *frame );
-
 struct client_surface_completion
 {
     enum client_surface_completion_kind kind;
     BOOL external_result; /* completion result is supplied by the caller or queued token */
     client_surface_completion_wait_func wait;
     client_surface_completion_release_func release;
+    void *context;
+};
+
+struct client_surface;
+struct client_surface_frame;
+
+struct client_surface_capture
+{
     /* Consume completed private storage under the surface submission lock.
-     * Unlike wait(), this may update the native source of the current frame. */
-    client_surface_completion_resolve_func resolve;
+     * This must not wait for GPU work. The core validates the frame's target
+     * and source ownership before allowing capture to modify the native image. */
+    BOOL (*capture)( void *context, struct client_surface *surface, struct client_surface_frame *frame );
+    /* Own the storage independently of the completion fence, including when
+     * a failed or stale completion prevents capture from being called. */
+    void (*release)( void *context );
     void *context;
 };
 
