@@ -529,6 +529,8 @@ static BOOL client_surface_free_on_compositor( const Pixmap pixmaps[2] )
         free( allocation );
         break;
     }
+    if (error) WARN( "failed to release client-surface frame pool %#lx/%#lx, error %d\n",
+                     pixmaps[0], pixmaps[1], error );
     return !error;
 }
 
@@ -3291,14 +3293,15 @@ static BOOL submit_client_surface_compositor_job( struct client_surface_composit
     return ret;
 }
 
-/* Release notifications carry only values; the caller does not consume their
- * result. Keep the synchronous path if ownership cannot pass to the actor. */
+/* Release jobs carry only values; the caller does not consume their result.
+ * Keep the synchronous path if ownership cannot pass to the actor. */
 static void post_client_surface_compositor_job( struct client_surface_compositor_job *job )
 {
     struct client_surface_compositor_job *pending;
 
     assert( job->op == CLIENT_SURFACE_COMPOSITOR_FINISH_UPDATE ||
-            job->op == CLIENT_SURFACE_COMPOSITOR_END_UPDATE );
+            job->op == CLIENT_SURFACE_COMPOSITOR_END_UPDATE ||
+            job->op == CLIENT_SURFACE_COMPOSITOR_FREE_POOL );
     if ((pending = malloc( sizeof(*pending) )))
     {
         BOOL queued;
@@ -3311,8 +3314,12 @@ static void post_client_surface_compositor_job( struct client_surface_compositor
         if (queued) return;
         free( pending );
     }
-    /* Dropping either notification would leave its target quiescent. */
-    submit_client_surface_compositor_job( job );
+    /* Dropping a release would leave a target quiescent or leak its retired
+     * pixmaps. Only a successful enqueue transfers the release obligation. */
+    if (!submit_client_surface_compositor_job( job ) && !job->complete &&
+        job->op == CLIENT_SURFACE_COMPOSITOR_FREE_POOL)
+        WARN( "failed to queue client-surface frame pool release %#lx/%#lx\n",
+              job->pixmaps[0], job->pixmaps[1] );
 }
 
 static BOOL client_surface_backing_copy_area( Drawable source, Drawable destination,
@@ -3363,8 +3370,10 @@ static void client_surface_backing_free( Pixmap first, Pixmap second )
         .pixmaps = {first, second},
     };
 
-    if (!submit_client_surface_compositor_job( &job ))
-        WARN( "failed to release client-surface frame pool %#lx/%#lx\n", first, second );
+    /* These are either unregistered allocations, or the prior synchronous
+     * target removal/replacement drained and detached them. The actor owns
+     * both XIDs and their accounting after enqueue; no GUI data is retained. */
+    post_client_surface_compositor_job( &job );
 }
 
 static BOOL client_surface_backing_copy( Drawable source, Drawable destination,
