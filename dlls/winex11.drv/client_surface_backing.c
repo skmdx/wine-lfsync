@@ -2001,8 +2001,9 @@ static BOOL copy_client_surface_handoff_to_frame(
             &client_surface_copy_batch.requests[client_surface_copy_batch.count - 1], FALSE );
         /* Subsequent members append to this private image in request order;
          * another checkpoint copy would overwrite their earlier neighbors.
+         * A full source replaces the checkpoint just as catchup does.
          * The revision is invalidated if any request in the batch fails. */
-        if (copied && needs_catchup) frame->revision = target->revision;
+        if (copied && (needs_catchup || incoming_full)) frame->revision = target->revision;
         return copied;
     }
 
@@ -2072,7 +2073,9 @@ static BOOL copy_client_surface_handoff_to_frame(
         if (!batch) discard_client_surface_compositor_gc( frame );
         return FALSE;
     }
-    if (needs_catchup) frame->revision = target->revision;
+    /* A successful full source also consumes the checkpoint. Later partial
+     * or empty members must preserve its pixels in this private assembly. */
+    if (needs_catchup || incoming_full) frame->revision = target->revision;
     return TRUE;
 }
 
