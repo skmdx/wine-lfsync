@@ -238,6 +238,7 @@ USER_DRIVER_FUNCS = {
     "vkQueueSubmit",
     "vkQueueSubmit2",
     "vkQueueSubmit2KHR",
+    "vkResetFences",
     "vkUnmapMemory",
     "vkUnmapMemory2KHR",
 }
