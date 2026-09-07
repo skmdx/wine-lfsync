@@ -1699,6 +1699,161 @@ static UINT drain_scene_notifications( UINT *owner_updates, UINT *prepares )
     return drain_scene_notifications_for_surface( owner_updates, prepares, 0 );
 }
 
+/* Create and destroy at the real server boundary. Public DestroyWindow hides
+ * and unlinks first; thread/process teardown can destroy a linked visible HWND. */
+static HWND create_scene_occluder( HWND parent, HWND class_window )
+{
+    struct __server_request_info info = {0};
+    struct create_window_request *req = &info.u.req.create_window_request;
+    struct rectangle rect = {10, 10, 50, 40}, extra[2] = {rect, rect};
+    UINT status;
+    HWND hwnd;
+
+    req->__header.req = REQ_create_window;
+    req->parent = wine_server_user_handle( parent );
+    req->atom = GetClassLongW( class_window, GCW_ATOM );
+    req->class_instance = req->instance = (ULONG_PTR)GetModuleHandleW( NULL );
+    req->style = WS_CHILD;
+    status = p_wine_server_call( &info );
+    ok( !status, "occluder creation status %#x\n", status );
+    if (status) return NULL;
+    hwnd = wine_server_ptr_handle( info.u.reply.create_window_reply.handle );
+    memset( &info, 0, sizeof(info) );
+    info.u.req.set_window_pos_request.__header.req = REQ_set_window_pos;
+    info.u.req.set_window_pos_request.handle = wine_server_user_handle( hwnd );
+    info.u.req.set_window_pos_request.swp_flags = SWP_SHOWWINDOW | SWP_NOACTIVATE | SWP_NOREDRAW;
+    info.u.req.set_window_pos_request.window = info.u.req.set_window_pos_request.client = rect;
+    wine_server_add_data( &info, extra, sizeof(extra) );
+    status = p_wine_server_call( &info );
+    ok( !status, "occluder placement status %#x\n", status );
+    return hwnd;
+}
+
+static UINT destroy_scene_window( HWND hwnd )
+{
+    struct __server_request_info info = {0};
+
+    info.u.req.destroy_window_request.__header.req = REQ_destroy_window;
+    info.u.req.destroy_window_request.handle = wine_server_user_handle( hwnd );
+    return p_wine_server_call( &info );
+}
+
+static void check_source_free_destruction( HWND hwnd, const struct client_surface_handoff_receipt *receipt )
+{
+    struct handoff_binding rebound;
+    struct surface_state state, before;
+    struct scene_snapshot snapshot;
+    struct client_surface_scene_layer initial = {0};
+    const struct client_surface_scene_layer *layer;
+    UINT status, i, notifications, updates, prepares;
+    UINT64 lifetime;
+    HWND child, nested;
+    BOOL accepted;
+
+    for (i = 0; i < 8; ++i)
+    {
+        winetest_push_context( "source-free destruction boundary %u", i );
+        lifetime = 0;
+        child = create_scene_occluder( hwnd, hwnd );
+        if (!child) { winetest_pop_context(); continue; }
+        nested = i == 5 || i == 7 ? create_scene_occluder( child, hwnd ) : NULL;
+        if (i == 6 || i == 7)
+        {
+            /* Even an unclaimed lifetime excludes the source-free shortcut. */
+            lifetime = allocate_surface();
+            status = set_surface_state( nested ? nested : child, lifetime,
+                CLIENT_SURFACE_STATE_REGISTER | CLIENT_SURFACE_STATE_SCENE_PUBLICATION, 0, NULL );
+            ok( !status, "dormant source registration status %#x\n", status );
+        }
+        prepare_surface_state( hwnd, &state );
+        complete_surface_handoffs( hwnd, state.generation, state.scene_generation, receipt, 1, &accepted );
+        ok( accepted, "destruction bootstrap receipt rejected\n" );
+        set_surface_state_scene( hwnd, 0, CLIENT_SURFACE_STATE_PUBLISH_COMMIT,
+                                 state.generation, state.scene_generation, &state );
+        status = get_scene_snapshot( hwnd, state.scene_generation, sizeof(snapshot.data), &snapshot );
+        ok( !status && snapshot.count == 1, "initial source snapshot status %#x count %u\n", status, snapshot.count );
+        layer = !status ? find_scene_layer( &snapshot, hwnd ) : NULL;
+        ok( !!layer, "initial source missing\n" );
+        if (layer) initial = *layer;
+        before = state;
+        drain_scene_notifications( &updates, &prepares );
+        if (i == 4)
+        {
+            set_surface_state( hwnd, 0, CLIENT_SURFACE_STATE_GEOMETRY_READY, 0, NULL );
+            prepare_surface_state( hwnd, &state );
+            notifications = drain_scene_notifications_for_surface( &updates, &prepares, receipt->surface );
+            ok( notifications == 1, "cold assembly did not request its source\n" );
+        }
+        status = destroy_scene_window( child );
+        ok( !status, "visible occluder teardown status %#x\n", status );
+        if (i == 2)
+        {
+            release_surface_handoff( hwnd, receipt->process, receipt->surface, receipt->cookie, TRUE );
+            status = get_surface_handoff( hwnd, receipt->process, receipt->surface, TRUE, &rebound );
+            ok( !status && rebound.cookie == receipt->cookie, "preparation endpoint replacement status %#x\n", status );
+            if (!status && rebound.mapping) CloseHandle( rebound.mapping );
+        }
+        prepare_surface_state( hwnd, &state );
+        ok( state.pending == 1 && state.generation && state.scene_generation > before.scene_generation &&
+            !(state.scene_generation & 1), "teardown did not open a new one-source scene\n" );
+        notifications = drain_scene_notifications_for_surface( &updates, &prepares, receipt->surface );
+        ok( notifications == (i == 2 || i >= 4), "teardown scheduled %u source notifications\n", notifications );
+        status = resolve_scene_sources( hwnd, state.scene_generation, receipt, i == 1 ? 0 : sizeof(*receipt), &accepted );
+        ok( !status && accepted == (i < 2 || i == 3), "teardown inventory accepted %u status %#x\n", accepted, status );
+        if (i == 3)
+        {
+            release_surface_handoff( hwnd, receipt->process, receipt->surface, receipt->cookie, TRUE );
+            status = get_surface_handoff( hwnd, receipt->process, receipt->surface, TRUE, &rebound );
+            ok( !status && rebound.cookie == receipt->cookie, "resolved endpoint replacement status %#x\n", status );
+            if (!status && rebound.mapping) CloseHandle( rebound.mapping );
+        }
+        notifications = drain_scene_notifications_for_surface( &updates, &prepares, receipt->surface );
+        ok( notifications == (i == 1 || i == 3), "missing source recovery scheduled %u notifications\n", notifications );
+        if (lifetime)
+        {
+            status = release_surface( lifetime );
+            ok( status == STATUS_INVALID_PARAMETER, "destroyed source lifetime retained after message removal, status %#x\n", status );
+        }
+        status = get_scene_snapshot( hwnd, state.scene_generation, sizeof(snapshot.data), &snapshot );
+        ok( !status && snapshot.count == 1, "remaining source snapshot status %#x count %u\n", status, snapshot.count );
+        if (!status && layer && (layer = find_scene_layer( &snapshot, hwnd )))
+            ok( !memcmp( &layer->producer, &initial.producer, sizeof(layer->producer) ) &&
+                !memcmp( &layer->source, &initial.source, sizeof(layer->source) ) &&
+                !memcmp( &layer->window_dpi, &initial.window_dpi, sizeof(layer->window_dpi) ) &&
+                !memcmp( &layer->raw_dpi, &initial.raw_dpi, sizeof(layer->raw_dpi) ),
+                "occluder teardown changed surviving source identity, endpoint, extent or DPI\n" );
+        status = complete_surface_handoffs( hwnd, state.generation, state.scene_generation, receipt, 1, &accepted );
+        ok( !status && accepted, "remaining source publication rejected, status %#x\n", status );
+        set_surface_state_scene( hwnd, 0, CLIENT_SURFACE_STATE_PUBLISH_COMMIT,
+                                 state.generation, state.scene_generation, &state );
+        ok( !state.pending && !state.generation && !state.staged, "teardown scene did not settle\n" );
+        winetest_pop_context();
+    }
+
+    child = create_test_window( TRUE );
+    if (!child) return;
+    lifetime = allocate_surface();
+    set_surface_state( child, lifetime, CLIENT_SURFACE_STATE_REGISTER, 0, NULL );
+    claim_surface_state( child, lifetime, &state );
+    nested = create_scene_occluder( child, child );
+    set_surface_state( child, 0, 0, 0, &state );
+    complete_single_surface_generation( child, lifetime, &state );
+    drain_scene_notifications( &updates, &prepares );
+    if (nested)
+    {
+        status = destroy_scene_window( nested );
+        ok( !status, "legacy occluder teardown status %#x\n", status );
+        set_surface_state( child, 0, 0, 0, &state );
+        notifications = drain_scene_notifications_for_surface( &updates, &prepares, lifetime );
+        ok( state.pending == 1 && notifications == 1, "legacy teardown omitted source recovery\n" );
+        resolve_scene_sources( child, state.scene_generation, NULL, 0, &accepted );
+        ok( !accepted, "legacy teardown accepted owner inventory\n" );
+        complete_single_surface_generation( child, lifetime, &state );
+    }
+    set_surface_state( child, lifetime, CLIENT_SURFACE_STATE_UNREGISTER, 0, NULL );
+    DestroyWindow( child );
+}
+
 static void check_owner_repair( HWND hwnd, const struct client_surface_handoff_receipt *receipt )
 {
     struct client_surface_handoff_receipt invalid[2] = {*receipt, *receipt};
@@ -2405,6 +2560,7 @@ static void test_handoff_receipts(void)
     check_scene_source_subset( hwnd, &receipt, NULL );
     check_zorder_scene_sources( hwnd, &receipt );
     check_child_placement_sources( hwnd, &receipt );
+    check_source_free_destruction( hwnd, &receipt );
     set_surface_state( hwnd, 0, 0, 0, &state );
     drain_scene_notifications( &owner_updates, &prepares );
     status = request_owner_repair( hwnd, state.scene_generation, &receipt, sizeof(receipt), &accepted );

@@ -4360,7 +4360,17 @@ void free_window_handle( struct window *win )
     client_surface_top = get_toplevel_window( win );
     scene_change = client_surface_top->client_surface_subtree_count &&
                    (win->client_surface_subtree_count || (win->is_linked && (win->style & WS_VISIBLE)));
-    if (scene_change) begin_client_surface_scene_change( client_surface_top );
+    if (scene_change)
+    {
+        /* Removing a source-free leaf only exposes the surviving images.
+         * The owner must still validate those images against the new scene.
+         * Keep subtree teardown and any existing cold assembly conservative. */
+        if (!win->client_surface_subtree_count && is_visible( win ) &&
+            list_empty( &win->children ) && list_empty( &win->unlinked ) &&
+            client_surface_child_placement_compatible( win, win->parent ))
+            begin_client_surface_cached_scene_change( client_surface_top );
+        else begin_client_surface_scene_change( client_surface_top );
+    }
     if (client_surface_top == win) finish_client_surface_generation( win );
 
     /* hide the window */
