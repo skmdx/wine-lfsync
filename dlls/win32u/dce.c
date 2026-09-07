@@ -806,23 +806,13 @@ static void dump_rdw_flags(UINT flags)
 #undef RDW_FLAGS
 }
 
-/***********************************************************************
- *           update_visible_region
- *
- * Set the visible region and X11 drawable for the DC associated to
- * a given window.
- */
-static void update_visible_region( struct dce *dce )
+/* Fetch clipping independently of a DC and its native drawable. */
+static HRGN get_window_visible_region( HWND hwnd, DWORD flags, HWND *top_win,
+                                       RECT *win_rect, RECT *top_rect, DWORD *paint_flags )
 {
-    struct window_surface *surface = NULL;
     NTSTATUS status;
     HRGN vis_rgn = 0;
-    HWND top_win = 0;
-    DWORD flags = dce->flags;
-    DWORD paint_flags = 0;
     size_t size = 256;
-    RECT win_rect, top_rect;
-    WND *win;
 
     /* don't clip siblings if using parent clip region */
     if (flags & DCX_PARENTCLIP) flags &= ~DCX_CLIPSIBLINGS;
@@ -831,11 +821,11 @@ static void update_visible_region( struct dce *dce )
     do
     {
         RGNDATA *data = malloc( sizeof(*data) + size - 1 );
-        if (!data) return;
+        if (!data) return 0;
 
         SERVER_START_REQ( get_visible_region )
         {
-            req->window  = wine_server_user_handle( dce->hwnd );
+            req->window  = wine_server_user_handle( hwnd );
             req->flags   = flags;
             wine_server_set_reply( req, data->Buffer, size );
             if (!(status = wine_server_call( req )))
@@ -846,10 +836,10 @@ static void update_visible_region( struct dce *dce )
                 data->rdh.nCount   = reply_size / sizeof(RECT);
                 data->rdh.nRgnSize = reply_size;
                 vis_rgn = NtGdiExtCreateRegion( NULL, data->rdh.dwSize + data->rdh.nRgnSize, data );
-                top_win     = wine_server_ptr_handle( reply->top_win );
-                win_rect    = wine_server_get_rect( reply->win_rect );
-                top_rect    = wine_server_get_rect( reply->top_rect );
-                paint_flags = reply->paint_flags;
+                *top_win     = wine_server_ptr_handle( reply->top_win );
+                *win_rect    = wine_server_get_rect( reply->win_rect );
+                *top_rect    = wine_server_get_rect( reply->top_rect );
+                *paint_flags = reply->paint_flags;
             }
             else size = reply->total_size;
         }
@@ -857,7 +847,27 @@ static void update_visible_region( struct dce *dce )
         free( data );
     } while (status == STATUS_BUFFER_OVERFLOW);
 
-    if (status || !vis_rgn) return;
+    return vis_rgn;
+}
+
+/***********************************************************************
+ *           update_visible_region
+ *
+ * Set the visible region and X11 drawable for the DC associated to
+ * a given window.
+ */
+static void update_visible_region( struct dce *dce )
+{
+    struct window_surface *surface = NULL;
+    DWORD flags = dce->flags, paint_flags;
+    RECT win_rect, top_rect;
+    HWND top_win;
+    HRGN vis_rgn;
+    WND *win;
+
+    if (flags & DCX_PARENTCLIP) flags &= ~DCX_CLIPSIBLINGS;
+    if (!(vis_rgn = get_window_visible_region( dce->hwnd, flags, &top_win,
+                                               &win_rect, &top_rect, &paint_flags ))) return;
 
     user_driver->pGetDC( dce->hdc, dce->hwnd, top_win, &win_rect, &top_rect, flags );
 
@@ -1253,30 +1263,9 @@ static INT release_dc( HWND hwnd, HDC hdc, BOOL end_paint )
     return ret;
 }
 
-/***********************************************************************
- *           NtUserGetDCEx (win32u.@)
- */
-HDC WINAPI NtUserGetDCEx( HWND hwnd, HRGN clip_rgn, DWORD flags )
+static DWORD get_dc_flags( HWND hwnd, DWORD flags, DWORD window_style )
 {
-    const DWORD clip_flags = DCX_PARENTCLIP | DCX_CLIPSIBLINGS | DCX_CLIPCHILDREN | DCX_WINDOW |
-                            WINE_DCX_CLIENT_SURFACE;
-    const DWORD user_flags = clip_flags | DCX_NORESETATTRS; /* flags that can be set by user */
-    BOOL force_update = flags & WINE_DCX_FORCEUPDATE;
-    BOOL update_vis_rgn = TRUE;
-    struct dce *dce;
     HWND parent;
-    DWORD window_style = get_window_long( hwnd, GWL_STYLE );
-
-    if (!hwnd) hwnd = get_desktop_window();
-    else hwnd = get_full_window_handle( hwnd );
-
-    TRACE( "hwnd %p, clip_rgn %p, flags %08x\n", hwnd, clip_rgn, flags );
-
-    flags &= ~WINE_DCX_FORCEUPDATE;
-
-    if (!is_window(hwnd)) return 0;
-
-    /* fixup flags */
 
     if (flags & (DCX_WINDOW | DCX_PARENTCLIP)) flags |= DCX_CACHE;
 
@@ -1313,6 +1302,57 @@ HDC WINAPI NtUserGetDCEx( HWND hwnd, HRGN clip_rgn, DWORD flags )
             if (parent_style & WS_CLIPSIBLINGS) flags |= DCX_CLIPSIBLINGS;
         }
     }
+
+    return flags;
+}
+
+/* Scene collection only needs SYSRGN in monitor pixels. Use the same server
+ * region and style rules as GetDCEx, without acquiring a cached DC or changing
+ * its drawable. SYSRGN is not mirrored for an RTL DC. */
+HRGN get_window_client_surface_region( HWND hwnd, struct ratio dpi )
+{
+    DWORD flags, paint_flags;
+    RECT win_rect, top_rect;
+    HWND top_win;
+    HRGN region, mapped;
+
+    hwnd = get_full_window_handle( hwnd );
+    if (!is_window( hwnd )) return 0;
+    flags = get_dc_flags( hwnd, DCX_CACHE | DCX_USESTYLE | WINE_DCX_CLIENT_SURFACE,
+                          get_window_long( hwnd, GWL_STYLE ) );
+    if (!(region = get_window_visible_region( hwnd, flags, &top_win,
+                                               &win_rect, &top_rect, &paint_flags ))) return 0;
+    /* set_visible_region() and SYSRGN | NTGDI_RGN_MONITOR_DPI remove this
+     * origin before mapping from window DPI to monitor DPI. */
+    NtGdiOffsetRgn( region, -win_rect.left, -win_rect.top );
+    mapped = map_dpi_region( region, get_dpi_for_window( hwnd ), dpi );
+    NtGdiDeleteObjectApp( region );
+    return mapped;
+}
+
+/***********************************************************************
+ *           NtUserGetDCEx (win32u.@)
+ */
+HDC WINAPI NtUserGetDCEx( HWND hwnd, HRGN clip_rgn, DWORD flags )
+{
+    const DWORD clip_flags = DCX_PARENTCLIP | DCX_CLIPSIBLINGS | DCX_CLIPCHILDREN | DCX_WINDOW |
+                            WINE_DCX_CLIENT_SURFACE;
+    const DWORD user_flags = clip_flags | DCX_NORESETATTRS; /* flags that can be set by user */
+    BOOL force_update = flags & WINE_DCX_FORCEUPDATE;
+    BOOL update_vis_rgn = TRUE;
+    struct dce *dce;
+    DWORD window_style = get_window_long( hwnd, GWL_STYLE );
+
+    if (!hwnd) hwnd = get_desktop_window();
+    else hwnd = get_full_window_handle( hwnd );
+
+    TRACE( "hwnd %p, clip_rgn %p, flags %08x\n", hwnd, clip_rgn, flags );
+
+    flags &= ~WINE_DCX_FORCEUPDATE;
+
+    if (!is_window(hwnd)) return 0;
+
+    flags = get_dc_flags( hwnd, flags, window_style );
 
     /* find a suitable DCE */
 

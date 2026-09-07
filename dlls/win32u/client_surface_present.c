@@ -709,7 +709,7 @@ static BOOL get_client_surface_region( const RECT *monitor_rect,
 }
 
 /* Construct an owner-side plan member from authoritative window geometry and
- * occlusion. The caller validates the epoch again after collecting the roster;
+ * clipping. The caller validates the epoch again after collecting the roster;
  * no producer slot contributes placement or clipping to this snapshot. */
 BOOL client_surface_get_scene_member( HWND toplevel, HWND hwnd, UINT64 epoch,
                                       struct client_surface_target *target, HRGN *region )
@@ -717,6 +717,8 @@ BOOL client_surface_get_scene_member( HWND toplevel, HWND hwnd, UINT64 epoch,
     struct client_surface_clip_snapshot snapshot = {0};
     struct client_surface_frame present = {0};
     struct ratio dpi;
+    HRGN visible;
+    RECT rect;
     BOOL ret;
 
     *region = 0;
@@ -729,6 +731,23 @@ BOOL client_surface_get_scene_member( HWND toplevel, HWND hwnd, UINT64 epoch,
     ret = get_client_surface_clip_snapshot( hwnd, &dpi, &target->monitor_rect, &present, &snapshot );
     if (ret) ret = get_client_surface_region( &target->monitor_rect, &snapshot, region );
     release_client_surface_clip_snapshot( &snapshot );
+    /* The producer cache uses NULL for no occlusion. An owner plan always
+     * carries an explicit region, including an empty successful clip. */
+    if (ret && !*region)
+        ret = !!(*region = NtGdiCreateRectRgn( 0, 0,
+            target->monitor_rect.right - target->monitor_rect.left,
+            target->monitor_rect.bottom - target->monitor_rect.top ));
+    if (ret && (hwnd != toplevel || !NtUserGetPresentRect( toplevel, &rect, -1 )))
+    {
+        visible = get_window_client_surface_region( hwnd, dpi );
+        ret = visible && NtGdiCombineRgn( *region, *region, visible, RGN_AND ) != ERROR;
+        if (visible) NtGdiDeleteObjectApp( visible );
+    }
+    if (!ret && *region)
+    {
+        NtGdiDeleteObjectApp( *region );
+        *region = 0;
+    }
     return ret;
 }
 

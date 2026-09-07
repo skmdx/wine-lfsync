@@ -3190,34 +3190,19 @@ static BOOL get_client_surface_scene_layout( HWND toplevel, UINT64 epoch,
                                               const struct client_surface_handoff_desc *desc,
                                               struct client_surface_scene_layout *layout )
 {
-    HRGN occlusion = 0, region = 0, bounds = 0;
-    HDC hdc;
-    RECT rect;
+    HRGN region = 0;
     BOOL ret = FALSE;
 
     layout->window = wine_server_ptr_handle( desc->handle );
     layout->process = desc->process;
     layout->identity = desc->surface;
     if (!client_surface_get_scene_member( toplevel, layout->window, epoch,
-                                          &layout->geometry, &occlusion )) goto done;
-    rect = layout->geometry.monitor_rect;
-    if (!(bounds = NtGdiCreateRectRgn( 0, 0, rect.right - rect.left, rect.bottom - rect.top ))) goto done;
-    if (layout->window != toplevel || !NtUserGetPresentRect( toplevel, &rect, -1 ))
-    {
-        if (!(hdc = NtUserGetDCEx( layout->window, 0, DCX_CACHE | DCX_USESTYLE |
-                                  DCX_NORESETATTRS | WINE_DCX_CLIENT_SURFACE ))) goto done;
-        region = get_dc_monitor_region( layout->window, hdc );
-        NtUserReleaseDC( layout->window, hdc );
-        if (!region || NtGdiCombineRgn( bounds, bounds, region, RGN_AND ) == ERROR) goto done;
-    }
-    if (occlusion && NtGdiCombineRgn( bounds, bounds, occlusion, RGN_AND ) == ERROR) goto done;
+                                          &layout->geometry, &region )) goto done;
     /* Keep the exact native rectangles, including an empty successful region,
      * in the immutable owner plan. No producer-owned region XID survives here. */
-    ret = !!(layout->clip = X11DRV_GetRegionData( bounds, 0 ));
+    ret = !!(layout->clip = X11DRV_GetRegionData( region, 0 ));
 done:
-    if (bounds) NtGdiDeleteObjectApp( bounds );
     if (region) NtGdiDeleteObjectApp( region );
-    if (occlusion) NtGdiDeleteObjectApp( occlusion );
     return ret;
 }
 
