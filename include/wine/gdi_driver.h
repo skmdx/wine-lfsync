@@ -219,7 +219,7 @@ struct gdi_dc_funcs
 };
 
 /* increment this when changing driver tables or shared driver-facing structures */
-#define WINE_GDI_DRIVER_VERSION 131
+#define WINE_GDI_DRIVER_VERSION 132
 
 #define GDI_PRIORITY_NULL_DRV        0  /* null driver */
 #define GDI_PRIORITY_FONT_DRV      100  /* any font driver */
@@ -301,9 +301,10 @@ enum client_surface_backend_caps
 
 struct client_surface_completion_ops
 {
-    /* arm and wait for a host presentation completion boundary */
+    /* Arm and poll a host presentation boundary. PENDING preserves the same
+     * monitor; only terminal failure or cancellation may abandon it. */
     BOOL (*prepare)( struct client_surface *surface );
-    BOOL (*wait)( struct client_surface *surface, DWORD timeout );
+    struct client_surface_completion_result (*wait)( struct client_surface *surface, DWORD timeout );
     /* retire an armed boundary when host submission may have partially failed */
     void (*abandon)( struct client_surface *surface );
 };
@@ -480,7 +481,7 @@ W32KAPI BOOL client_surface_complete_present( struct client_surface *surface,
                                               struct client_surface_frame *present,
                                               BOOL submitted, BOOL external_completed,
                                               const SIZE *expected_size, DWORD timeout );
-W32KAPI BOOL client_surface_wait_present_completion( struct client_surface *surface,
+W32KAPI struct client_surface_completion_result client_surface_wait_present_completion( struct client_surface *surface,
                                                       const struct client_surface_frame *present,
                                                       DWORD timeout );
 W32KAPI void client_surface_set_present_completion( struct client_surface_frame *present,

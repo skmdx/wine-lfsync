@@ -1582,29 +1582,21 @@ failed:
     return FALSE;
 }
 
-static BOOL query_glx_swap_serial( struct gl_drawable *gl, INT64 target_sbc, DWORD timeout )
+static struct client_surface_completion_result query_glx_swap_serial( struct gl_drawable *gl, INT64 target_sbc )
 {
-    LARGE_INTEGER delay;
-    DWORD delay_ms = 1;
-    DWORD start = NtGetTickCount();
     INT64 ust, msc, sbc;
     Bool ret;
 
-    for (;;)
-    {
-        /* A direct-rendering GLX driver may send XCB requests. Take the display
-         * lock first, matching X11DRV_expect_error(), or XCB's socket-return
-         * callback can wait for a display lock held by another XCB sender. */
-        XLockDisplay( gdi_display );
-        ret = pglXGetSyncValuesOML( gdi_display, gl->drawable, &ust, &msc, &sbc );
-        XUnlockDisplay( gdi_display );
-        if (!ret) return FALSE;
-        if (sbc >= target_sbc) return TRUE;
-        if (NtGetTickCount() - start >= timeout) return FALSE;
-        delay.QuadPart = -(LONGLONG)delay_ms * 10000;
-        NtDelayExecution( FALSE, &delay );
-        delay_ms = min( delay_ms * 2, (DWORD)4 );
-    }
+    /* A direct-rendering GLX driver may send XCB requests. Take the display
+     * lock first, matching X11DRV_expect_error(), or XCB's socket-return
+     * callback can wait for a display lock held by another XCB sender.
+     * This query has no native timeout; the core bounds only its retries. */
+    XLockDisplay( gdi_display );
+    ret = pglXGetSyncValuesOML( gdi_display, gl->drawable, &ust, &msc, &sbc );
+    XUnlockDisplay( gdi_display );
+    if (!ret) return client_surface_completion_result( CLIENT_SURFACE_COMPLETION_FAILED );
+    return client_surface_completion_result( sbc >= target_sbc ? CLIENT_SURFACE_COMPLETION_SIGNALED :
+                                                               CLIENT_SURFACE_COMPLETION_PENDING );
 }
 
 static BOOL make_glx_completion_current( GLXDrawable drawable, GLXContext context, BOOL legacy )
@@ -1623,12 +1615,12 @@ static BOOL make_glx_completion_current( GLXDrawable drawable, GLXContext contex
     return ret && !error && pglXGetCurrentContext() == context;
 }
 
-static BOOL wait_glx_swap_serial( struct gl_drawable *gl, INT64 target_sbc, DWORD timeout )
+static struct client_surface_completion_result wait_glx_swap_serial( struct gl_drawable *gl, INT64 target_sbc )
 {
+    struct client_surface_completion_result result = client_surface_completion_result( CLIENT_SURFACE_COMPLETION_FAILED );
     struct glx_completion_context *completion = gl->completion;
     GLXContext current = pglXGetCurrentContext();
-    DWORD start = NtGetTickCount(), elapsed;
-    BOOL completed = FALSE, bound, unbound;
+    BOOL bound, unbound;
 
     /* OML queries require a current GLX context. An inline caller already
      * owns its context on this thread; leave its binding and GL state alone.
@@ -1641,11 +1633,13 @@ static BOOL wait_glx_swap_serial( struct gl_drawable *gl, INT64 target_sbc, DWOR
         if (current != NtCurrentTeb()->glReserved2)
         {
             WARN( "Refusing a non-Wine current GLX context %p during completion\n", current );
-            return FALSE;
+            result.worker = CLIENT_SURFACE_COMPLETION_WORKER_RETIRE;
+            return result;
         }
-        return pglXGetCurrentDisplay() == gdi_display && query_glx_swap_serial( gl, target_sbc, timeout );
+        if (pglXGetCurrentDisplay() != gdi_display) return result;
+        return query_glx_swap_serial( gl, target_sbc );
     }
-    if (!completion) return FALSE;
+    if (!completion) return result;
 
     /* The token retains gl through query and release. This domain belongs to
      * that native drawable, not a thread or the process; another worker may
@@ -1653,11 +1647,7 @@ static BOOL wait_glx_swap_serial( struct gl_drawable *gl, INT64 target_sbc, DWOR
     pthread_mutex_lock( &completion->lock );
     if (!prepare_glx_completion_context( completion )) goto done;
     bound = make_glx_completion_current( completion->pbuffer, completion->context, FALSE );
-    if (bound)
-    {
-        elapsed = NtGetTickCount() - start;
-        completed = query_glx_swap_serial( gl, target_sbc, elapsed < timeout ? timeout - elapsed : 0 );
-    }
+    if (bound) result = query_glx_swap_serial( gl, target_sbc );
     /* Even a failed bind can have changed the client-side current context
      * before an asynchronous server error was delivered. Unwind that binding. */
     unbound = TRUE;
@@ -1677,11 +1667,20 @@ static BOOL wait_glx_swap_serial( struct gl_drawable *gl, INT64 target_sbc, DWOR
         /* GLX defers deletion of a current context until its thread releases
          * it. Do not let another worker attempt to bind that context again. */
         destroy_glx_completion_objects( completion );
-        completed = FALSE;
+        result.status = CLIENT_SURFACE_COMPLETION_FAILED;
     }
 done:
+    /* Destruction only marks a current context for deletion. The exact
+     * native binding, not the unbind function's return alone, decides whether
+     * this thread can execute another callback. Do not transfer that binding
+     * to a replacement worker or terminate an inline application thread. */
+    if (pglXGetCurrentContext())
+    {
+        result.status = CLIENT_SURFACE_COMPLETION_FAILED;
+        result.worker = CLIENT_SURFACE_COMPLETION_WORKER_RETIRE;
+    }
     pthread_mutex_unlock( &completion->lock );
-    return completed;
+    return result;
 }
 
 struct glx_present_completion
@@ -1690,12 +1689,12 @@ struct glx_present_completion
     INT64 target_sbc;
 };
 
-static BOOL wait_glx_present_completion( void *context, DWORD timeout )
+static struct client_surface_completion_result wait_glx_present_completion( void *context, DWORD timeout )
 {
     struct glx_present_completion *completion = context;
 
     return wait_glx_swap_serial( impl_from_opengl_drawable( completion->drawable ),
-                                 completion->target_sbc, timeout );
+                                 completion->target_sbc );
 }
 
 static void release_glx_present_completion( void *context )
@@ -1836,7 +1835,8 @@ static BOOL x11drv_surface_swap( struct opengl_drawable *base )
                 client_surface_set_present_completion( &present, wait_glx_present_completion,
                                                        NULL, &fallback );
                 completed = client_surface_wait_present_completion( base->client, &present,
-                                                                     CLIENT_SURFACE_PRESENT_TIMEOUT );
+                                                                     CLIENT_SURFACE_PRESENT_TIMEOUT ).status ==
+                            CLIENT_SURFACE_COMPLETION_SIGNALED;
             }
         }
     }
@@ -1878,30 +1878,27 @@ static void release_snapshot_sync( struct egl_snapshot_completion *completion )
     free( completion );
 }
 
-static BOOL wait_snapshot_completion( void *context, DWORD timeout )
+static struct client_surface_completion_result wait_snapshot_completion( void *context, DWORD timeout )
 {
     struct egl_snapshot_completion *completion = context;
-    DWORD elapsed = 0, start = NtGetTickCount();
     EGLint result;
 
-    do
+    /* The completion token keeps this mapping alive. A revoked handoff
+     * cannot publish the write, even if its GPU fence eventually signals.
+     * Retire its callback promptly while the image retains the real fence. */
+    if (__atomic_load_n( &completion->source->reservation, __ATOMIC_ACQUIRE ) != completion->control ||
+        __atomic_load_n( &completion->channel->closed, __ATOMIC_ACQUIRE ))
     {
-        /* The completion token keeps this mapping alive. A revoked handoff
-         * cannot publish the write, even if its GPU fence eventually signals.
-         * Retire its callback promptly while the image retains the real fence. */
-        if (__atomic_load_n( &completion->source->reservation, __ATOMIC_ACQUIRE ) != completion->control ||
-            __atomic_load_n( &completion->channel->closed, __ATOMIC_ACQUIRE ))
-        {
-            TRACE( "cancelled EGL source completion for control %s\n",
-                   wine_dbgstr_longlong( completion->control ) );
-            return FALSE;
-        }
-        result = snapshot_wait_sync( egl->display, completion->sync, 0,
-                                      (EGLTimeKHR)min( timeout - elapsed, 10 ) * 1000000 );
-        if (result != EGL_TIMEOUT_EXPIRED_KHR) return result == EGL_CONDITION_SATISFIED_KHR;
-        elapsed = NtGetTickCount() - start;
-    } while (elapsed < timeout);
-    return FALSE;
+        TRACE( "cancelled EGL source completion for control %s\n",
+               wine_dbgstr_longlong( completion->control ) );
+        return client_surface_completion_result( CLIENT_SURFACE_COMPLETION_FAILED );
+    }
+    result = snapshot_wait_sync( egl->display, completion->sync, 0, (EGLTimeKHR)timeout * 1000000 );
+    if (result == EGL_CONDITION_SATISFIED_KHR)
+        return client_surface_completion_result( CLIENT_SURFACE_COMPLETION_SIGNALED );
+    if (result == EGL_TIMEOUT_EXPIRED_KHR)
+        return client_surface_completion_result( CLIENT_SURFACE_COMPLETION_PENDING );
+    return client_surface_completion_result( CLIENT_SURFACE_COMPLETION_FAILED );
 }
 
 static void release_snapshot_completion( void *context )
@@ -2097,30 +2094,20 @@ struct egl_present_completion
     EGLuint64KHR frame_id;
 };
 
-static BOOL wait_egl_present_completion( void *context, DWORD timeout )
+static struct client_surface_completion_result wait_egl_present_completion( void *context, DWORD timeout )
 {
     struct egl_present_completion *completion = context;
     struct opengl_drawable *base = completion->drawable;
-    LARGE_INTEGER delay;
-    DWORD delay_ms = 1;
     EGLint timestamp_name = EGL_DISPLAY_PRESENT_TIME_ANDROID;
-    DWORD start = NtGetTickCount();
     EGLnsecsANDROID timestamp = EGL_TIMESTAMP_PENDING_ANDROID;
 
-    do
-    {
-        if (!funcs->p_eglGetFrameTimestampsANDROID( egl->display, base->surface,
-                                                    completion->frame_id, 1,
-                                                    &timestamp_name, &timestamp ))
-            break;
-        if (timestamp != EGL_TIMESTAMP_PENDING_ANDROID) break;
-        if (NtGetTickCount() - start >= timeout) break;
-        delay.QuadPart = -(LONGLONG)delay_ms * 10000;
-        NtDelayExecution( FALSE, &delay );
-        delay_ms = min( delay_ms * 2, (DWORD)4 );
-    } while (NtGetTickCount() - start < timeout);
-    return timestamp != EGL_TIMESTAMP_PENDING_ANDROID &&
-           timestamp != EGL_TIMESTAMP_INVALID_ANDROID;
+    if (!funcs->p_eglGetFrameTimestampsANDROID( egl->display, base->surface,
+                                               completion->frame_id, 1, &timestamp_name, &timestamp ))
+        return client_surface_completion_result( CLIENT_SURFACE_COMPLETION_FAILED );
+    if (timestamp == EGL_TIMESTAMP_PENDING_ANDROID)
+        return client_surface_completion_result( CLIENT_SURFACE_COMPLETION_PENDING );
+    return client_surface_completion_result( timestamp != EGL_TIMESTAMP_INVALID_ANDROID ?
+        CLIENT_SURFACE_COMPLETION_SIGNALED : CLIENT_SURFACE_COMPLETION_FAILED );
 }
 
 static void release_egl_present_completion( void *context )
@@ -2219,7 +2206,7 @@ static BOOL x11drv_egl_surface_swap_framebuffer( struct opengl_drawable *base, G
             client_surface_set_present_completion( &present, wait_egl_present_completion,
                                                    NULL, &fallback );
             timestamp_completion = client_surface_wait_present_completion(
-                base->client, &present, CLIENT_SURFACE_PRESENT_TIMEOUT );
+                base->client, &present, CLIENT_SURFACE_PRESENT_TIMEOUT ).status == CLIENT_SURFACE_COMPLETION_SIGNALED;
         }
     }
     else timestamp_completion = FALSE;

@@ -42,6 +42,10 @@ static int xdamage_event_base;
 static struct x11drv_client_surface *xdamage_surfaces[XDAMAGE_SURFACE_BUCKETS];
 static struct list xdamage_waiters = LIST_INIT( xdamage_waiters );
 static BOOL xdamage_dispatching;
+/* A failed dedicated connection is never rearmed or reconnected. XCloseDisplay
+ * can perform I/O too; retain its unusable client storage until process exit.
+ * Local monitor ownership is still removed without touching that connection. */
+static BOOL xdamage_failed;
 static void insert_xdamage_surface_locked( struct x11drv_client_surface *surface );
 
 static void init_xdamage(void)
@@ -115,6 +119,7 @@ static void dispatch_xdamage_events_locked(void)
 {
     XEvent event;
 
+    if (xdamage_failed) return;
     while (XPending( xdamage_display ))
     {
         struct x11drv_client_surface *surface;
@@ -169,6 +174,11 @@ static BOOL init_client_surface_damage( struct x11drv_client_surface *surface )
      * shared event connection creates a Damage object for that XID. */
     XSync( gdi_display, False );
     pthread_mutex_lock( &xdamage_lock );
+    if (xdamage_failed)
+    {
+        pthread_mutex_unlock( &xdamage_lock );
+        return FALSE;
+    }
     X11DRV_expect_error( xdamage_display, xdamage_resource_error, &error );
     surface->completion.damage = pXDamageCreate( xdamage_display, surface->window, XDamageReportNonEmpty );
     XSync( xdamage_display, False );
@@ -203,6 +213,13 @@ static BOOL x11drv_client_surface_prepare_completion( struct client_surface *cli
     do
     {
         pthread_mutex_lock( &xdamage_lock );
+        if (xdamage_failed)
+        {
+            surface->completion.broken = TRUE;
+            InterlockedExchange( &client->cacheable, FALSE );
+            pthread_mutex_unlock( &xdamage_lock );
+            return FALSE;
+        }
         while (take_client_surface_damage_locked( surface ));
         pXDamageSubtract( xdamage_display, surface->completion.damage, None, None );
         /* Empty the region before the WSI request is submitted on its own
@@ -210,6 +227,7 @@ static BOOL x11drv_client_surface_prepare_completion( struct client_surface *cli
         XSync( xdamage_display, False );
         if (!take_client_surface_damage_locked( surface ))
         {
+            TRACE( "event=xdamage_prepare surface=%p damage=%lx\n", client, surface->completion.damage );
             pthread_mutex_unlock( &xdamage_lock );
             break;
         }
@@ -238,6 +256,15 @@ static void x11drv_client_surface_abandon_completion( struct client_surface *cli
     pthread_mutex_lock( &xdamage_lock );
     assert( list_empty( &surface->completion.wait_entry ) );
     remove_xdamage_surface_locked( surface );
+    TRACE( "event=xdamage_abandon surface=%p damage=%lx failed=%u\n",
+           client, surface->completion.damage, xdamage_failed );
+    if (xdamage_failed)
+    {
+        surface->completion.ready = FALSE;
+        surface->completion.damage = 0;
+        pthread_mutex_unlock( &xdamage_lock );
+        return;
+    }
     /* Synchronize and drain before freeing the ID so a queued event cannot be
      * confused with a later Damage object if Xlib recycles the XID. */
     XSync( xdamage_display, False );
@@ -251,41 +278,46 @@ static void x11drv_client_surface_abandon_completion( struct client_surface *cli
 #endif
 }
 
-static BOOL x11drv_client_surface_wait_completion( struct client_surface *client, DWORD timeout )
+static struct client_surface_completion_result x11drv_client_surface_wait_completion(
+    struct client_surface *client, DWORD timeout )
 {
 #if defined(HAVE_X11_EXTENSIONS_XDAMAGE_H) && defined(SONAME_LIBXDAMAGE)
     struct x11drv_client_surface *surface = impl_from_client_surface( client );
     DWORD start = NtGetTickCount();
 
-    if (!surface->completion.damage) return FALSE;
+    if (!surface->completion.damage)
+        return client_surface_completion_result( CLIENT_SURFACE_COMPLETION_FAILED );
     for (;;)
     {
         DWORD elapsed, remaining;
         int ret = 0;
 
         pthread_mutex_lock( &xdamage_lock );
+        if (xdamage_failed)
+        {
+            pthread_mutex_unlock( &xdamage_lock );
+            return client_surface_completion_result( CLIENT_SURFACE_COMPLETION_FAILED );
+        }
         if (take_client_surface_damage_locked( surface ))
         {
             /* Leave the region nonempty until prepare resets and synchronizes
              * it before the next submission. Rearming here would add a redundant
              * request and allow unrelated updates to generate more notifications. */
             pthread_mutex_unlock( &xdamage_lock );
-            return TRUE;
+            return client_surface_completion_result( CLIENT_SURFACE_COMPLETION_SIGNALED );
         }
         elapsed = NtGetTickCount() - start;
         remaining = elapsed < timeout ? timeout - elapsed : 0;
         if (!remaining)
         {
             pthread_mutex_unlock( &xdamage_lock );
-            WARN( "timed out waiting for presentation completion for %s\n",
-                  debugstr_client_surface( client ) );
-            x11drv_client_surface_abandon_completion( client );
-            return FALSE;
+            return client_surface_completion_result( CLIENT_SURFACE_COMPLETION_PENDING );
         }
 
         if (!xdamage_dispatching)
         {
             struct pollfd pollfd = {ConnectionNumber( xdamage_display ), POLLIN, 0};
+            int error;
 
             /* Elect one waiter to service the dedicated Damage connection.
              * Other surfaces sleep on their own condition instead of every
@@ -293,41 +325,55 @@ static BOOL x11drv_client_surface_wait_completion( struct client_surface *client
             xdamage_dispatching = TRUE;
             pthread_mutex_unlock( &xdamage_lock );
             ret = poll( &pollfd, 1, (int)min( remaining, (DWORD)10 ) );
+            error = errno;
             pthread_mutex_lock( &xdamage_lock );
-            if (ret > 0 && pollfd.revents & POLLIN) dispatch_xdamage_events_locked();
+            if ((ret < 0 && error != EINTR) || (pollfd.revents & (POLLERR | POLLHUP | POLLNVAL)))
+                xdamage_failed = TRUE;
+            /* A terminal transport error may arrive together with readable
+             * data. Do not enter Xlib's connection reader on that failure. */
+            if (ret > 0 && (pollfd.revents & POLLIN) &&
+                !(pollfd.revents & (POLLERR | POLLHUP | POLLNVAL)))
+                dispatch_xdamage_events_locked();
             xdamage_dispatching = FALSE;
-            wake_xdamage_dispatcher_locked();
+            if (xdamage_failed)
+                while (!list_empty( &xdamage_waiters )) wake_xdamage_dispatcher_locked();
+            else wake_xdamage_dispatcher_locked();
             pthread_mutex_unlock( &xdamage_lock );
 
-            if (ret < 0 && errno != EINTR)
+            if ((ret < 0 && error != EINTR) || (pollfd.revents & (POLLERR | POLLHUP | POLLNVAL)))
             {
                 WARN( "failed waiting for presentation completion for %s, ret %d, revents %#x\n",
                       debugstr_client_surface( client ), ret, pollfd.revents );
-                x11drv_client_surface_abandon_completion( client );
-                return FALSE;
+                return client_surface_completion_result( CLIENT_SURFACE_COMPLETION_FAILED );
             }
         }
         else
         {
             struct timespec abstime;
 
-            clock_gettime( CLOCK_REALTIME, &abstime );
+            if (clock_gettime( CLOCK_REALTIME, &abstime ))
+            {
+                pthread_mutex_unlock( &xdamage_lock );
+                return client_surface_completion_result( CLIENT_SURFACE_COMPLETION_FAILED );
+            }
             abstime.tv_nsec += (long)(remaining % 1000) * 1000000;
             abstime.tv_sec += remaining / 1000 + abstime.tv_nsec / 1000000000;
             abstime.tv_nsec %= 1000000000;
             assert( list_empty( &surface->completion.wait_entry ) );
             list_add_tail( &xdamage_waiters, &surface->completion.wait_entry );
-            pthread_cond_timedwait( &surface->completion.cond, &xdamage_lock, &abstime );
+            ret = pthread_cond_timedwait( &surface->completion.cond, &xdamage_lock, &abstime );
             if (!list_empty( &surface->completion.wait_entry ))
             {
                 list_remove( &surface->completion.wait_entry );
                 list_init( &surface->completion.wait_entry );
             }
             pthread_mutex_unlock( &xdamage_lock );
+            if (ret && ret != ETIMEDOUT)
+                return client_surface_completion_result( CLIENT_SURFACE_COMPLETION_FAILED );
         }
     }
 #else
-    return FALSE;
+    return client_surface_completion_result( CLIENT_SURFACE_COMPLETION_FAILED );
 #endif
 }
 

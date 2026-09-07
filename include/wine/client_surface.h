@@ -123,7 +123,36 @@ enum client_surface_completion_kind
     CLIENT_SURFACE_COMPLETION_SHARED,
 };
 
-typedef BOOL (*client_surface_completion_wait_func)( void *context, DWORD timeout );
+enum client_surface_completion_status
+{
+    CLIENT_SURFACE_COMPLETION_PENDING,
+    CLIENT_SURFACE_COMPLETION_SIGNALED,
+    CLIENT_SURFACE_COMPLETION_FAILED,
+};
+
+enum client_surface_completion_worker_disposition
+{
+    CLIENT_SURFACE_COMPLETION_WORKER_REUSE,
+    CLIENT_SURFACE_COMPLETION_WORKER_RETIRE,
+};
+
+struct client_surface_completion_result
+{
+    enum client_surface_completion_status status;
+    enum client_surface_completion_worker_disposition worker;
+};
+
+static inline struct client_surface_completion_result client_surface_completion_result(
+    enum client_surface_completion_status status )
+{
+    return (struct client_surface_completion_result){status, CLIENT_SURFACE_COMPLETION_WORKER_REUSE};
+}
+
+/* A poll consumes neither the token nor its image on PENDING. A zero timeout
+ * tests the current boundary once. Native queries may still take longer than
+ * the supplied wait budget. RETIRE is terminal: the caller must not execute
+ * another completion callback on this worker. */
+typedef struct client_surface_completion_result (*client_surface_completion_wait_func)( void *context, DWORD timeout );
 typedef void (*client_surface_completion_release_func)( void *context );
 struct client_surface_completion
 {

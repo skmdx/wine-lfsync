@@ -61,12 +61,6 @@ static BOOL client_surface_backend_prepare_completion( struct client_surface *su
     return surface->backend->completion && surface->backend->completion->prepare( surface );
 }
 
-static BOOL client_surface_backend_wait_completion( struct client_surface *surface, DWORD timeout )
-{
-    assert( surface->backend->completion );
-    return surface->backend->completion->wait( surface, timeout );
-}
-
 static void client_surface_backend_abandon_completion( struct client_surface *surface )
 {
     if (surface->backend->completion && surface->backend->completion->abandon)
@@ -1392,13 +1386,6 @@ static BOOL client_surface_finish_host_completion( struct client_surface *surfac
 {
     BOOL completed = submitted;
 
-    if (!submitted && present->completion.kind == CLIENT_SURFACE_COMPLETION_SHARED)
-    {
-        /* A failed WSI call does not prove that no native request escaped.
-         * Retire the armed boundary so a delayed request cannot satisfy the
-         * next transaction's completion wait. */
-        client_surface_backend_abandon_completion( surface );
-    }
     if (completed && present->completion.kind != CLIENT_SURFACE_COMPLETION_NONE)
     {
         /* kind identifies the host completion source, while external_result
@@ -1408,12 +1395,21 @@ static BOOL client_surface_finish_host_completion( struct client_surface *surfac
         if (client_surface_completion_result_is_external( &present->completion ))
             completed = external_completed;
         else if (present->completion.kind == CLIENT_SURFACE_COMPLETION_SHARED)
-            completed = client_surface_backend_wait_completion( surface, timeout );
+            completed = client_surface_wait_present_completion( surface, present, timeout ).status ==
+                        CLIENT_SURFACE_COMPLETION_SIGNALED;
         else
             completed = FALSE;
     }
     else if (completed)
         completed = present->target == CLIENT_SURFACE_FRAME_TARGET_ONSCREEN;
+    if (!completed && present->completion.kind == CLIENT_SURFACE_COMPLETION_SHARED)
+    {
+        /* A failed submission, terminal poll failure or expired frame can
+         * still produce delayed native damage. Retire its one-shot monitor
+         * before releasing driver_completion_count. Short PENDING polls do
+         * not enter this path and must never rearm or abandon the monitor. */
+        client_surface_backend_abandon_completion( surface );
+    }
     if (!completed && present->completion.kind != CLIENT_SURFACE_COMPLETION_NONE)
         present->result = CLIENT_SURFACE_FRAME_COMPLETION_FAILED;
     return completed;
@@ -1521,11 +1517,11 @@ BOOL client_surface_complete_present_locked( struct client_surface *surface,
     return completed;
 }
 
-static BOOL wait_deferred_driver_completion( void *context, DWORD timeout )
+static struct client_surface_completion_result wait_deferred_driver_completion( void *context, DWORD timeout )
 {
     struct client_surface *surface = context;
 
-    return client_surface_backend_wait_completion( surface, timeout );
+    return surface->backend->completion->wait( surface, timeout );
 }
 
 static void release_deferred_driver_completion( void *context )

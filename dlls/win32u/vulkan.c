@@ -252,7 +252,7 @@ struct vulkan_snapshot_reservation
     BOOL required;
 };
 
-static BOOL wait_vulkan_present_completion( void *context, DWORD timeout )
+static struct client_surface_completion_result wait_vulkan_present_completion( void *context, DWORD timeout )
 {
     struct vulkan_present_completion *completion = context;
     struct swapchain *swapchain = completion->swapchain;
@@ -266,7 +266,7 @@ static BOOL wait_vulkan_present_completion( void *context, DWORD timeout )
         pthread_mutex_unlock( &swapchain->present_lock );
         TRACE( "Skipping present wait for retired swapchain %p, id %s\n",
                swapchain, wine_dbgstr_longlong( completion->present_id ) );
-        return FALSE;
+        return client_surface_completion_result( CLIENT_SURFACE_COMPLETION_FAILED );
     }
     /* Admission pins the host handle even for an inline completion. A
      * replacement cannot retire it between this check and the host call. */
@@ -277,7 +277,7 @@ static BOOL wait_vulkan_present_completion( void *context, DWORD timeout )
     res = completion->device->p_vkWaitForPresentKHR(
         completion->device->host.device, swapchain->obj.host.swapchain,
         completion->present_id, (uint64_t)timeout * 1000000 );
-    if (res != VK_SUCCESS)
+    if (res != VK_SUCCESS && res != VK_TIMEOUT)
         WARN( "Failed waiting for present %s, status %d\n",
               debugstr_client_surface( swapchain->surface->client ), res );
     pthread_mutex_lock( &swapchain->present_lock );
@@ -286,7 +286,9 @@ static BOOL wait_vulkan_present_completion( void *context, DWORD timeout )
            swapchain, wine_dbgstr_longlong( completion->present_id ), res );
     if (!--swapchain->present_waits) pthread_cond_broadcast( &swapchain->completion_cond );
     pthread_mutex_unlock( &swapchain->present_lock );
-    return res == VK_SUCCESS;
+    if (res == VK_SUCCESS) return client_surface_completion_result( CLIENT_SURFACE_COMPLETION_SIGNALED );
+    if (res == VK_TIMEOUT) return client_surface_completion_result( CLIENT_SURFACE_COMPLETION_PENDING );
+    return client_surface_completion_result( CLIENT_SURFACE_COMPLETION_FAILED );
 }
 
 static void release_swapchain_completion( struct swapchain *swapchain )
@@ -2415,13 +2417,17 @@ static VkResult acquire_snapshot_reservation( struct vulkan_device *device, stru
     return VK_SUCCESS;
 }
 
-static BOOL wait_vulkan_snapshot( void *context, DWORD timeout )
+static struct client_surface_completion_result wait_vulkan_snapshot( void *context, DWORD timeout )
 {
     struct vulkan_snapshot_fence *pending = context;
     struct vulkan_device *device = pending->device;
+    VkResult res;
 
-    return device->p_vkWaitForFences( device->host.device, 1, &pending->fence,
-                                     VK_TRUE, (uint64_t)timeout * 1000000 ) == VK_SUCCESS;
+    res = device->p_vkWaitForFences( device->host.device, 1, &pending->fence,
+                                   VK_TRUE, (uint64_t)timeout * 1000000 );
+    if (res == VK_SUCCESS) return client_surface_completion_result( CLIENT_SURFACE_COMPLETION_SIGNALED );
+    if (res == VK_TIMEOUT) return client_surface_completion_result( CLIENT_SURFACE_COMPLETION_PENDING );
+    return client_surface_completion_result( CLIENT_SURFACE_COMPLETION_FAILED );
 }
 
 static void release_vulkan_snapshot_completion( void *context )
@@ -3501,7 +3507,7 @@ reserve_snapshots:
                 client_surface_set_present_completion( &presents[i], wait_vulkan_present_completion,
                                                        NULL, &fallback );
                 external_completed = client_surface_wait_present_completion(
-                    surface->client, &presents[i], remaining );
+                    surface->client, &presents[i], remaining ).status == CLIENT_SURFACE_COMPLETION_SIGNALED;
                 wait_skipped = fallback.wait_skipped;
             }
 
