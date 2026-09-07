@@ -611,9 +611,11 @@ struct client_surface_clip_snapshot
 };
 
 static BOOL get_client_surface_clip_snapshot( HWND hwnd, const struct ratio *raw_dpi,
+                                              const RECT *monitor_rect,
                                               const struct client_surface_frame *present,
                                               struct client_surface_clip_snapshot *snapshot )
 {
+    struct rectangle bounds = wine_server_rectangle( *monitor_rect );
     NTSTATUS status;
 
     snapshot->size = 8;
@@ -633,6 +635,7 @@ static BOOL get_client_surface_clip_snapshot( HWND hwnd, const struct ratio *raw
         {
             req->handle = wine_server_user_handle( hwnd );
             req->dpi = *raw_dpi;
+            wine_server_add_data( req, &bounds, sizeof(bounds) );
             wine_server_set_reply( req, snapshot->windows,
                                    snapshot->size * sizeof(*snapshot->windows) );
             status = wine_server_call( req );
@@ -723,7 +726,7 @@ BOOL client_surface_get_scene_member( HWND toplevel, HWND hwnd, UINT64 epoch,
     present.scene.epoch = epoch;
     present.scene.valid = TRUE;
     dpi = (struct ratio){target->dpi_num, target->dpi_den};
-    ret = get_client_surface_clip_snapshot( hwnd, &dpi, &present, &snapshot );
+    ret = get_client_surface_clip_snapshot( hwnd, &dpi, &target->monitor_rect, &present, &snapshot );
     if (ret) ret = get_client_surface_region( &target->monitor_rect, &snapshot, region );
     release_client_surface_clip_snapshot( &snapshot );
     return ret;
@@ -752,7 +755,7 @@ static BOOL get_cached_client_surface_region( struct client_surface *surface, HW
         return TRUE;
     }
 
-    valid = get_client_surface_clip_snapshot( hwnd, &raw_dpi, present, &snapshot );
+    valid = get_client_surface_clip_snapshot( hwnd, &raw_dpi, monitor_rect, present, &snapshot );
     if (valid) valid = get_client_surface_region( monitor_rect, &snapshot, &new_region );
     release_client_surface_clip_snapshot( &snapshot );
     if (!valid)

@@ -6354,6 +6354,7 @@ struct get_client_surface_clip_windows_request
     struct request_header __header;
     user_handle_t  handle;
     struct ratio   dpi;
+    /* VARARG(bounds,rectangles); */
     char __pad_20[4];
 };
 struct get_client_surface_clip_windows_reply
@@ -7460,6 +7461,6 @@ union generic_reply
     struct get_client_surface_handoffs_reply get_client_surface_handoffs_reply;
 };
 
-#define SERVER_PROTOCOL_VERSION 1003
+#define SERVER_PROTOCOL_VERSION 1004
 
 #endif /* __WINE_WINE_SERVER_PROTOCOL_H */

@@ -4818,8 +4818,26 @@ DECL_HANDLER(set_window_pos)
 }
 
 
+static int client_surface_clip_intersects_bounds( struct window *win, struct ratio dpi,
+                                                  const struct rectangle *top_visible,
+                                                  const struct rectangle *bounds )
+{
+    struct rectangle rect;
+
+    if (!bounds) return 1;
+    /* The exact region is a subset of this client rectangle. Use the same
+     * screen/DPI mapping as the region before rejecting a disjoint source. */
+    if (!intersect_rect( &rect, &win->window_rect, &win->client_rect ) ||
+        !intersect_rect( &rect, &rect, &win->surface_rect )) return 0;
+    client_to_screen_rect( win->parent, &rect );
+    map_dpi_rect( win, &rect, get_window_dpi( win ), dpi );
+    offset_rect( &rect, -top_visible->left, -top_visible->top );
+    return intersect_rect( &rect, &rect, bounds );
+}
+
 static int collect_client_surface_clip_subtree( struct window *win, struct ratio dpi,
                                                 const struct rectangle *top_visible,
+                                                const struct rectangle *bounds,
                                                 struct client_surface_clip_window *data,
                                                 unsigned int max_count, unsigned int *count )
 {
@@ -4833,7 +4851,8 @@ static int collect_client_surface_clip_subtree( struct window *win, struct ratio
     /* A dormant registration does not own any pixels or advance the scene
      * epoch.  Derive occlusion from the same producer choice as composition,
      * otherwise identical scene tokens can describe different clip regions. */
-    if (select_client_surface_producer( win, &owner ))
+    if (select_client_surface_producer( win, &owner ) &&
+        client_surface_clip_intersects_bounds( win, dpi, top_visible, bounds ))
     {
         /* A rectangular HWND snapshot over-clips shaped windows and ignores
          * ancestor clipping.  Serialize the exact client-visible region into
@@ -4845,18 +4864,21 @@ static int collect_client_surface_clip_subtree( struct window *win, struct ratio
             map_dpi_region( win, region, get_window_dpi( win ), dpi );
             offset_region( region, -top_visible->left, -top_visible->top );
             rects = get_region_rectangles( region, &rect_count );
-            if (rect_count > UINT_MAX - *count)
-            {
-                free_region( region );
-                set_error( STATUS_INTEGER_OVERFLOW );
-                return 0;
-            }
             for (i = 0; i < rect_count; ++i)
             {
+                struct rectangle rect = rects[i];
+
+                if (bounds && !intersect_rect( &rect, &rect, bounds )) continue;
+                if (*count == UINT_MAX)
+                {
+                    free_region( region );
+                    set_error( STATUS_INTEGER_OVERFLOW );
+                    return 0;
+                }
                 if (*count < max_count)
                 {
                     data[*count].handle = win->handle;
-                    data[*count].rect = rects[i];
+                    data[*count].rect = rect;
                 }
                 (*count)++;
             }
@@ -4865,7 +4887,7 @@ static int collect_client_surface_clip_subtree( struct window *win, struct ratio
         else free_region( region );
     }
     LIST_FOR_EACH_ENTRY( child, &win->children, struct window, entry )
-        if (!collect_client_surface_clip_subtree( child, dpi, top_visible,
+        if (!collect_client_surface_clip_subtree( child, dpi, top_visible, bounds,
                                                   data, max_count, count )) return 0;
     return 1;
 }
@@ -4878,13 +4900,15 @@ DECL_HANDLER(get_client_surface_clip_windows)
     unsigned int count = 0, max_count = get_reply_max_size() / sizeof(struct client_surface_clip_window);
     struct window *child, *current, *parent, *top, *win = get_window( req->handle );
     struct client_surface_clip_window *data = NULL;
+    const struct rectangle *bounds = get_req_data_size() ? get_req_data() : NULL;
     struct rectangle top_visible;
 
     reply->toplevel = 0;
     reply->count = 0;
     reply->scene_generation = 0;
     if (!win) return;
-    if (!req->dpi.num || !req->dpi.den)
+    if (!req->dpi.num || !req->dpi.den ||
+        (get_req_data_size() && get_req_data_size() != sizeof(*bounds)))
     {
         set_error( STATUS_INVALID_PARAMETER );
         return;
@@ -4896,13 +4920,14 @@ DECL_HANDLER(get_client_surface_clip_windows)
     top_visible = top->visible_rect;
     client_to_screen_rect( top->parent, &top_visible );
     map_dpi_rect( top, &top_visible, get_window_dpi( top ), req->dpi );
+    if (bounds && is_rect_empty( bounds )) return;
     /* Entries are region rectangles, not HWNDs.  One shaped producer can
      * contribute more rectangles than the handle table has slots.  The
      * caller's reply buffer already bounds the allocation and its product. */
     if (max_count && !(data = mem_alloc( max_count * sizeof(*data) ))) return;
 
     LIST_FOR_EACH_ENTRY( child, &win->children, struct window, entry )
-        if (!collect_client_surface_clip_subtree( child, req->dpi, &top_visible,
+        if (!collect_client_surface_clip_subtree( child, req->dpi, &top_visible, bounds,
                                                   data, max_count, &count )) goto failed;
 
     for (current = win; current != top; current = parent)
@@ -4912,7 +4937,7 @@ DECL_HANDLER(get_client_surface_clip_windows)
         LIST_FOR_EACH_ENTRY( child, &parent->children, struct window, entry )
         {
             if (child == current) break;
-            if (!collect_client_surface_clip_subtree( child, req->dpi, &top_visible,
+            if (!collect_client_surface_clip_subtree( child, req->dpi, &top_visible, bounds,
                                                        data, max_count, &count )) goto failed;
         }
     }

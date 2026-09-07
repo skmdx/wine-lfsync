@@ -158,21 +158,28 @@ static unsigned int prepare_surface_state( HWND hwnd, struct surface_state *stat
                                     0, begin.scene_generation, state );
 }
 
-static unsigned int get_clip_state( HWND hwnd, struct clip_state *state )
+static unsigned int get_clip_state_in_bounds( HWND hwnd, UINT dpi, const RECT *bounds,
+                                               struct clip_state *state )
 {
     struct __server_request_info info;
     struct get_client_surface_clip_windows_request *req =
         &info.u.req.get_client_surface_clip_windows_request;
     const struct get_client_surface_clip_windows_reply *reply =
         &info.u.reply.get_client_surface_clip_windows_reply;
+    struct rectangle rect;
     unsigned int status;
 
     memset( &info, 0, sizeof(info) );
     memset( state, 0, sizeof(*state) );
     req->__header.req = REQ_get_client_surface_clip_windows;
     req->handle = wine_server_user_handle( hwnd );
-    req->dpi.num = 96;
+    req->dpi.num = dpi;
     req->dpi.den = 1;
+    if (bounds)
+    {
+        rect = wine_server_rectangle( *bounds );
+        wine_server_add_data( &info, &rect, sizeof(rect) );
+    }
     wine_server_set_reply( &info, state->windows, sizeof(state->windows) );
     status = p_wine_server_call( &info );
     if (!status)
@@ -182,6 +189,44 @@ static unsigned int get_clip_state( HWND hwnd, struct clip_state *state )
         state->count = reply->count;
     }
     return status;
+}
+
+static unsigned int get_clip_state( HWND hwnd, struct clip_state *state )
+{
+    return get_clip_state_in_bounds( hwnd, 96, NULL, state );
+}
+
+static void check_clip_bounds( HWND hwnd, UINT dpi, const RECT *bounds )
+{
+    struct clip_state full, clipped;
+    unsigned int status, count = 0, i;
+
+    status = get_clip_state_in_bounds( hwnd, dpi, NULL, &full );
+    ok( !status && full.count <= ARRAY_SIZE(full.windows),
+        "full clip status %#x count %u\n", status, full.count );
+    if (status || full.count > ARRAY_SIZE(full.windows)) return;
+    status = get_clip_state_in_bounds( hwnd, dpi, bounds, &clipped );
+    ok( !status, "bounded clip status %#x\n", status );
+    if (status) return;
+    ok( clipped.toplevel == full.toplevel && clipped.scene_generation == full.scene_generation,
+        "bounds changed the clip scene\n" );
+    for (i = 0; i < full.count; ++i)
+    {
+        RECT rect = wine_server_get_rect( full.windows[i].rect ), expected, actual;
+
+        if (!IntersectRect( &expected, &rect, bounds )) continue;
+        if (count < clipped.count && count < ARRAY_SIZE(clipped.windows))
+        {
+            actual = wine_server_get_rect( clipped.windows[count].rect );
+            ok( clipped.windows[count].handle == full.windows[i].handle && EqualRect( &actual, &expected ),
+                "bounded clip %u at DPI %u has window %#x rect %s, expected %#x %s\n",
+                count, dpi, clipped.windows[count].handle, wine_dbgstr_rect( &actual ),
+                full.windows[i].handle, wine_dbgstr_rect( &expected ) );
+        }
+        ++count;
+    }
+    ok( clipped.count == count, "bounded clip count %u, expected %u at DPI %u for %s\n",
+        clipped.count, count, dpi, wine_dbgstr_rect( bounds ) );
 }
 
 static BOOL clip_state_contains( const struct clip_state *state, HWND hwnd )
@@ -456,9 +501,14 @@ static void test_clip_scene_snapshot(void)
     const UINT_PTR first_surface = 0x12370000, second_surface = 0x12370001;
     const UINT_PTR descendant_surface = 0x12370002, duplicate_surface = 0x12370003;
     struct clip_state before, after;
+    static const RECT bounds[] =
+    {
+        {23, 13, 34, 21}, {42, 12, 49, 25}, {10, 10, 60, 50},
+        {65, 35, 70, 50}, {20, 20, 20, 30}, {200, 200, 210, 210}, {-5, -5, 20, 20},
+    };
     HRGN shape, shape_part;
     HWND parent, first, second, descendant;
-    unsigned int status;
+    unsigned int status, i;
 
     parent = create_test_window( TRUE );
     ok( !!parent, "failed to create clip parent, error %lu\n", GetLastError() );
@@ -533,6 +583,18 @@ static void test_clip_scene_snapshot(void)
         if (shape) DeleteObject( shape );
         if (shape_part) DeleteObject( shape_part );
     }
+
+    /* Compare exact tagged rectangles with the unrestricted snapshot, also
+     * beyond the target's HWND rectangle: present coverage can differ from
+     * Win32 client bounds. Keep shaped and ancestor clipping at each DPI. */
+    for (i = 0; i < ARRAY_SIZE(bounds); ++i)
+    {
+        check_clip_bounds( first, 96, &bounds[i] );
+        check_clip_bounds( first, 144, &bounds[i] );
+    }
+    SetWindowPos( first, NULL, -10, -10, 50, 40, SWP_NOACTIVATE | SWP_NOZORDER );
+    check_clip_bounds( first, 96, &bounds[ARRAY_SIZE(bounds) - 1] );
+    check_clip_bounds( first, 144, &bounds[ARRAY_SIZE(bounds) - 1] );
 
     SetWindowPos( first, HWND_TOP, 10, 10, 50, 40, SWP_NOACTIVATE );
     status = get_clip_state( first, &after );

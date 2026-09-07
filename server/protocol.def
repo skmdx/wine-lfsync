@@ -4437,6 +4437,7 @@ enum inproc_sync_type
 @REQ(get_client_surface_clip_windows)
     user_handle_t  handle;        /* target client-surface window */
     struct ratio   dpi;           /* common monitor coordinate DPI */
+    VARARG(bounds,rectangles);    /* optional owner-relative rectangle to intersect */
 @REPLY
     user_handle_t  toplevel;      /* target top-level ancestor */
     int            count;         /* total count of clip windows */

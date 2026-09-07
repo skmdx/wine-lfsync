@@ -3576,6 +3576,7 @@ static void dump_get_client_surface_clip_windows_request( const struct get_clien
 {
     fprintf( stderr, " handle=%08x", req->handle );
     dump_ratio( ", dpi=", &req->dpi );
+    dump_varargs_rectangles( ", bounds=", cur_size );
 }
 
 static void dump_get_client_surface_clip_windows_reply( const struct get_client_surface_clip_windows_reply *req )
