@@ -222,7 +222,7 @@ enum client_surface_compositor_op
     CLIENT_SURFACE_COMPOSITOR_FREE_POOL,
     CLIENT_SURFACE_COMPOSITOR_PRESENT,
     CLIENT_SURFACE_COMPOSITOR_REGISTER_HANDOFF,
-    CLIENT_SURFACE_COMPOSITOR_REUSE_HANDOFF,
+    CLIENT_SURFACE_COMPOSITOR_REUSE_HANDOFFS,
     CLIENT_SURFACE_COMPOSITOR_CHECK_SCENE,
     CLIENT_SURFACE_COMPOSITOR_SWEEP_HANDOFFS,
     CLIENT_SURFACE_COMPOSITOR_UPDATE_TARGET,
@@ -272,6 +272,7 @@ struct client_surface_compositor_job
     unsigned int layout_count;
     const struct client_surface_handoff_desc *handoffs;
     unsigned int handoff_count;
+    BOOL *handoff_reused;
     BOOL invalidate_scene;
     DWORD shrink_start;
 };
@@ -1073,22 +1074,6 @@ static BOOL client_surface_compositor_binding_is_live( const struct client_surfa
     return TRUE;
 }
 
-static BOOL reuse_client_surface_compositor_handoff( const struct client_surface_compositor_job *job )
-{
-    struct client_surface_compositor_binding *binding;
-
-    for (binding = client_surface_compositor_bindings; binding; binding = binding->next)
-    {
-        if (binding->toplevel != job->handoff_toplevel || binding->window != job->handoff_window ||
-            binding->process != job->process || binding->identity != job->identity ||
-            binding->cookie != job->cookie) continue;
-        if (!client_surface_compositor_binding_is_live( binding )) return FALSE;
-        binding->mark = job->mark;
-        return TRUE;
-    }
-    return FALSE;
-}
-
 static BOOL register_client_surface_compositor_handoff(
     struct client_surface_compositor_job *job )
 {
@@ -1191,6 +1176,52 @@ static int compare_client_surface_scene_layouts( const void *a, const void *b )
     user_handle_t l = wine_server_user_handle( left->window ), r = wine_server_user_handle( right->window );
 
     return (l > r) - (l < r);
+}
+
+/* Only the owner thread touches these binding references. Build an index for
+ * this job rather than borrowing pointers from an invalidated ScenePlan. */
+static BOOL reuse_client_surface_compositor_handoffs( const struct client_surface_compositor_job *job )
+{
+    struct client_surface_compositor_binding *binding, **members;
+    unsigned int count = 0, i = 0;
+
+    for (i = 0; i < job->handoff_count; ++i) job->handoff_reused[i] = FALSE;
+    for (binding = client_surface_compositor_bindings; binding; binding = binding->next)
+        if (binding->toplevel == job->handoff_toplevel) ++count;
+    if (!count) return TRUE;
+    if (!(members = calloc( count, sizeof(*members) ))) return FALSE;
+    i = 0;
+    for (binding = client_surface_compositor_bindings; binding; binding = binding->next)
+        if (binding->toplevel == job->handoff_toplevel) members[i++] = binding;
+    qsort( members, count, sizeof(*members), compare_client_surface_scene_members );
+
+    for (i = 0; i < job->handoff_count; ++i)
+    {
+        const struct client_surface_handoff_desc *desc = &job->handoffs[i];
+        unsigned int low = 0, high = count;
+
+        /* A nonzero roster cookie includes server-side retirement checks;
+         * shared slot endpoints alone cannot authorize A -> B -> A reuse. */
+        if (!desc->cookie) continue;
+        while (low < high)
+        {
+            unsigned int mid = low + (high - low) / 2;
+            if (wine_server_user_handle( members[mid]->window ) < desc->handle) low = mid + 1;
+            else high = mid;
+        }
+        for (; low < count; ++low)
+        {
+            binding = members[low];
+            if (wine_server_user_handle( binding->window ) != desc->handle) break;
+            if (binding->process != desc->process || binding->identity != desc->surface ||
+                binding->cookie != desc->cookie) continue;
+            if ((job->handoff_reused[i] = client_surface_compositor_binding_is_live( binding )))
+                binding->mark = job->mark;
+            break;
+        }
+    }
+    free( members );
+    return TRUE;
 }
 
 static void free_client_surface_scene_layouts( struct client_surface_scene_layout *layouts,
@@ -2679,8 +2710,8 @@ static BOOL execute_client_surface_compositor_job( struct client_surface_composi
     }
     if (job->op == CLIENT_SURFACE_COMPOSITOR_REGISTER_HANDOFF)
         return register_client_surface_compositor_handoff( job );
-    if (job->op == CLIENT_SURFACE_COMPOSITOR_REUSE_HANDOFF)
-        return reuse_client_surface_compositor_handoff( job );
+    if (job->op == CLIENT_SURFACE_COMPOSITOR_REUSE_HANDOFFS)
+        return reuse_client_surface_compositor_handoffs( job );
     if (job->op == CLIENT_SURFACE_COMPOSITOR_CHECK_SCENE)
         return check_client_surface_compositor_scene( job );
     if (job->op == CLIENT_SURFACE_COMPOSITOR_SWEEP_HANDOFFS)
@@ -3114,7 +3145,7 @@ static BOOL register_client_surface_handoff( HWND toplevel,
 {
     struct client_surface_compositor_job job =
     {
-        .op = CLIENT_SURFACE_COMPOSITOR_REUSE_HANDOFF,
+        .op = CLIENT_SURFACE_COMPOSITOR_REGISTER_HANDOFF,
         .process = desc->process,
         .identity = desc->surface,
         .cookie = desc->cookie,
@@ -3127,11 +3158,6 @@ static BOOL register_client_surface_handoff( HWND toplevel,
     BOOL ret = FALSE;
     NTSTATUS status;
 
-    /* The server roster authorizes this cookie, including retirement state
-     * which is not reflected in the shared slots while an old owner reads.
-     * The caller still revalidates the scene epoch before installing its plan. */
-    if (job.cookie && submit_client_surface_compositor_job( &job )) return TRUE;
-    job.op = CLIENT_SURFACE_COMPOSITOR_REGISTER_HANDOFF;
     SERVER_START_REQ( get_client_surface_handoff )
     {
         req->handle = desc->handle;
@@ -3235,6 +3261,7 @@ static BOOL refresh_client_surface_handoffs( HWND toplevel )
 {
     struct client_surface_handoff_desc *descs = NULL;
     struct client_surface_scene_layout *layouts = NULL;
+    BOOL *reused = NULL;
     UINT size = 8, count = 0, i;
     unsigned int layout_count = 0;
     UINT64 scene_generation = 0;
@@ -3295,8 +3322,23 @@ static BOOL refresh_client_surface_handoffs( HWND toplevel )
     if (count && !(layouts = calloc( count, sizeof(*layouts) ))) goto failed;
     layout_count = count;
     if (!get_client_surface_scene_layouts( toplevel, scene_generation, count, descs, layouts )) goto failed;
-    for (i = 0; i < count; ++i)
-        if (!register_client_surface_handoff( toplevel, &descs[i], mark )) goto failed;
+    if (count)
+    {
+        struct client_surface_compositor_job job =
+        {
+            .op = CLIENT_SURFACE_COMPOSITOR_REUSE_HANDOFFS,
+            .handoff_toplevel = toplevel,
+            .handoffs = descs,
+            .handoff_count = count,
+            .mark = mark,
+        };
+
+        if (!(reused = calloc( count, sizeof(*reused) ))) goto failed;
+        job.handoff_reused = reused;
+        if (!submit_client_surface_compositor_job( &job )) goto failed;
+        for (i = 0; i < count; ++i)
+            if (!reused[i] && !register_client_surface_handoff( toplevel, &descs[i], mark )) goto failed;
+    }
 
     if (!validate_client_surface_handoff_scene( toplevel, scene_generation )) goto failed;
     {
@@ -3318,11 +3360,13 @@ static BOOL refresh_client_surface_handoffs( HWND toplevel )
     }
     free_client_surface_scene_layouts( layouts, layout_count );
     free( descs );
+    free( reused );
     return TRUE;
 
 failed:
     free_client_surface_scene_layouts( layouts, layout_count );
     free( descs );
+    free( reused );
     return FALSE;
 }
 
