@@ -2289,6 +2289,8 @@ static LRESULT handle_internal_message( HWND hwnd, UINT msg, WPARAM wparam, LPAR
         }
         else if (wparam == WINE_UPDATE_CLIENT_SURFACE_HANDOFFS)
             update_window_state( hwnd );
+        else if (wparam == WINE_RESOLVE_CLIENT_SURFACE_SOURCES)
+            client_surface_resolve_sources( hwnd );
         else update_window_state( hwnd );
         return 0;
     case WM_WINE_SETPIXELFORMAT:

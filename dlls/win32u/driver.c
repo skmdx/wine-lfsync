@@ -883,7 +883,7 @@ static struct client_surface *nulldrv_CreateClientSurface( HWND hwnd, int pixel_
     return client_surface_create( sizeof(struct client_surface), NULL, hwnd, pixel_format, raw );
 }
 
-static BOOL nulldrv_RepairClientSurfaceOwner( HWND hwnd )
+static BOOL nulldrv_RepairClientSurfaceOwner( HWND hwnd, BOOL resolve )
 {
     return FALSE;
 }

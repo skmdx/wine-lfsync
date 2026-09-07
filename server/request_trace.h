@@ -3713,6 +3713,18 @@ static void dump_request_client_surface_owner_repair_reply( const struct request
     fprintf( stderr, " accepted=%d", req->accepted );
 }
 
+static void dump_resolve_client_surface_scene_sources_request( const struct resolve_client_surface_scene_sources_request *req )
+{
+    fprintf( stderr, " handle=%08x", req->handle );
+    dump_uint64( ", scene_id=", &req->scene_id );
+    dump_varargs_bytes( ", receipts=", cur_size );
+}
+
+static void dump_resolve_client_surface_scene_sources_reply( const struct resolve_client_surface_scene_sources_reply *req )
+{
+    fprintf( stderr, " accepted=%d", req->accepted );
+}
+
 static void dump_set_window_present_rect_request( const struct set_window_present_rect_request *req )
 {
     fprintf( stderr, " handle=%08x", req->handle );
@@ -4046,6 +4058,7 @@ static const dump_func req_dumpers[REQ_NB_REQUESTS] =
     (dump_func)dump_publish_client_surface_handoff_request,
     (dump_func)dump_get_client_surface_scene_snapshot_request,
     (dump_func)dump_request_client_surface_owner_repair_request,
+    (dump_func)dump_resolve_client_surface_scene_sources_request,
     (dump_func)dump_set_window_present_rect_request,
 };
 
@@ -4373,6 +4386,7 @@ static const dump_func reply_dumpers[REQ_NB_REQUESTS] =
     (dump_func)dump_publish_client_surface_handoff_reply,
     (dump_func)dump_get_client_surface_scene_snapshot_reply,
     (dump_func)dump_request_client_surface_owner_repair_reply,
+    (dump_func)dump_resolve_client_surface_scene_sources_reply,
     NULL,
 };
 
@@ -4700,6 +4714,7 @@ static const char * const req_names[REQ_NB_REQUESTS] =
     "publish_client_surface_handoff",
     "get_client_surface_scene_snapshot",
     "request_client_surface_owner_repair",
+    "resolve_client_surface_scene_sources",
     "set_window_present_rect",
 };
 

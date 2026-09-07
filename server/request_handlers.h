@@ -329,6 +329,7 @@ DECL_HANDLER(cancel_client_surface_handoffs);
 DECL_HANDLER(publish_client_surface_handoff);
 DECL_HANDLER(get_client_surface_scene_snapshot);
 DECL_HANDLER(request_client_surface_owner_repair);
+DECL_HANDLER(resolve_client_surface_scene_sources);
 DECL_HANDLER(set_window_present_rect);
 
 typedef void (*req_handler)( const void *req, void *reply );
@@ -656,6 +657,7 @@ static const req_handler req_handlers[REQ_NB_REQUESTS] =
     (req_handler)req_publish_client_surface_handoff,
     (req_handler)req_get_client_surface_scene_snapshot,
     (req_handler)req_request_client_surface_owner_repair,
+    (req_handler)req_resolve_client_surface_scene_sources,
     (req_handler)req_set_window_present_rect,
 };
 
@@ -2522,6 +2524,11 @@ C_ASSERT( offsetof(struct request_client_surface_owner_repair_request, scene_id)
 C_ASSERT( sizeof(struct request_client_surface_owner_repair_request) == 24 );
 C_ASSERT( offsetof(struct request_client_surface_owner_repair_reply, accepted) == 8 );
 C_ASSERT( sizeof(struct request_client_surface_owner_repair_reply) == 16 );
+C_ASSERT( offsetof(struct resolve_client_surface_scene_sources_request, handle) == 12 );
+C_ASSERT( offsetof(struct resolve_client_surface_scene_sources_request, scene_id) == 16 );
+C_ASSERT( sizeof(struct resolve_client_surface_scene_sources_request) == 24 );
+C_ASSERT( offsetof(struct resolve_client_surface_scene_sources_reply, accepted) == 8 );
+C_ASSERT( sizeof(struct resolve_client_surface_scene_sources_reply) == 16 );
 C_ASSERT( offsetof(struct set_window_present_rect_request, handle) == 12 );
 C_ASSERT( offsetof(struct set_window_present_rect_request, rect) == 16 );
 C_ASSERT( offsetof(struct set_window_present_rect_request, dpi) == 32 );

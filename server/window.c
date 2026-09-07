@@ -119,6 +119,10 @@ struct client_surface_ref
     unsigned int    handoff_consumer_mapped : 1;
     unsigned int    handoff_retired : 1; /* owner root changed; wait for checked reads before invalidation */
     unsigned int    notification_pending : 1; /* an update for this identity is queued */
+    /* pending counts all selected images, including warm ones. This separate
+     * obligation selects producer retries after the inventory was consumed
+     * and notification_pending was cleared by message/thread teardown. */
+    unsigned int    source_required : 1;
     unsigned int    destroy_state : 2; /* renderer destroy delivery state */
 };
 
@@ -412,6 +416,7 @@ struct client_surface_transaction
     unsigned int staged : 1;         /* host is mapped into unpublished backing */
     unsigned int prepared : 1;       /* owner snapshot permits a live replay */
     unsigned int owner_repair : 1;   /* warm replay; source recovery supersedes it */
+    unsigned int source_pending : 1; /* owner inventory decision, not image proof */
     unsigned int restarting : 1;     /* restart loop owns transaction changes */
     unsigned int restart_pending : 1;/* replay requested during a transition */
     struct timeout_user *timeout;    /* liveness deadline callback */
@@ -564,7 +569,8 @@ static void update_client_surface_publication( struct window *top )
             (client_surface_is_publishing( top ) ? WINDOW_SHM_CLIENT_SURFACE_PUBLISHING : 0) |
             (client_surface_is_preparing( top ) ? WINDOW_SHM_CLIENT_SURFACE_PREPARING : 0) |
             (direct ? WINDOW_SHM_CLIENT_SURFACE_DIRECT : 0) |
-            (backing_required ? WINDOW_SHM_CLIENT_SURFACE_BACKING : 0);
+            (backing_required ? WINDOW_SHM_CLIENT_SURFACE_BACKING : 0) |
+            (top->client_surface_transaction.source_pending ? WINDOW_SHM_CLIENT_SURFACE_SOURCE_PENDING : 0);
     }
     SHARED_WRITE_END;
     top->client_surface_backing_required = backing_required;
@@ -1505,10 +1511,26 @@ static void adjust_client_surface_subtree_count( struct window *win, int delta )
  * validate the same even sequence before and after native composition. */
 static void begin_client_surface_scene_change( struct window *top )
 {
+    top->client_surface_transaction.source_pending = 0;
     if (top->client_surface_scene_change_depth++) return;
     assert( !(top->client_surface_scene_generation & 1) );
     top->client_surface_scene_generation++;
     update_client_surface_publication( top );
+}
+
+/* Changes which preserve the selected source extents can ask the owner for
+ * its exact new scene's image inventory before scheduling source recovery.
+ * An outstanding cold assembly or nested mutation always takes precedence. */
+static void begin_client_surface_cached_scene_change( struct window *top )
+{
+    int probe = !top->client_surface_scene_change_depth &&
+                (top->client_surface_transaction.phase == CLIENT_SURFACE_PHASE_IDLE ||
+                 (client_surface_is_preparing( top ) &&
+                  (top->client_surface_transaction.owner_repair ||
+                   top->client_surface_transaction.source_pending)));
+
+    begin_client_surface_scene_change( top );
+    top->client_surface_transaction.source_pending = probe;
 }
 
 static void end_client_surface_scene_change( struct window *top )
@@ -1523,7 +1545,12 @@ static void end_client_surface_scene_change( struct window *top )
                                 WINE_UPDATE_CLIENT_SURFACE_HANDOFFS, 0 );
     if (!client_surface_is_publishing( top ) &&
         (top->client_surface_transaction.staged || (is_visible( top ) && has_client_surface( top ))))
-        restart_client_surface_generation( top );
+    {
+        if (top->client_surface_transaction.source_pending)
+            restart_client_surface_generation_internal( top );
+        else
+            restart_client_surface_generation( top );
+    }
 }
 
 /* A newer frame in the same geometric scene still invalidates a publication
@@ -1760,6 +1787,7 @@ static void finish_client_surface_generation( struct window *top )
     top->client_surface_transaction.pending = 0;
     top->client_surface_transaction.epoch = 0;
     top->client_surface_transaction.owner_repair = 0;
+    top->client_surface_transaction.source_pending = 0;
     update_client_surface_publication( top );
 }
 
@@ -1776,6 +1804,7 @@ static void finish_client_surface_publication( struct window *top )
 static int mark_client_surface_generation_ready( struct window *top )
 {
     if (!client_surface_is_composing( top ) || top->client_surface_transaction.pending ||
+        top->client_surface_transaction.source_pending ||
         top->client_surface_transaction.epoch != top->client_surface_scene_generation ||
         (top->client_surface_scene_generation & 1))
         return 0;
@@ -1846,6 +1875,7 @@ static void client_surface_publication_timeout( void *private )
         top->client_surface_transaction.phase = CLIENT_SURFACE_PHASE_IDLE;
         top->client_surface_transaction.prepared = 0;
         top->client_surface_transaction.owner_repair = 0;
+        top->client_surface_transaction.source_pending = 0;
         update_client_surface_publication( top );
         if (top->client_surface_transaction.staged)
         {
@@ -1892,6 +1922,7 @@ static int complete_client_surface_generation( struct window *top, struct client
                                                unsigned long long generation )
 {
     if (!client_surface_is_composing( top ) ||
+        top->client_surface_transaction.source_pending ||
         generation != client_surface_transaction_generation( top ) ||
         surface->generation != generation)
         return 0;
@@ -2324,7 +2355,7 @@ DECL_HANDLER(release_client_surface_handoff)
 
 static int validate_client_surface_handoff_generation( struct window *win, struct window *top,
                                                        unsigned long long generation,
-                                                       int owner_repair,
+                                                       int owner_repair, int partial,
                                                        const struct client_surface_handoff_receipt *receipts,
                                                        unsigned int receipt_count,
                                                        unsigned int *count )
@@ -2339,13 +2370,6 @@ static int validate_client_surface_handoff_generation( struct window *win, struc
         const struct client_surface_handoff_receipt *receipt;
         unsigned int low = 0, high = receipt_count;
 
-        if ((!owner_repair && surface->generation != generation) || !surface->handoff_pool ||
-            surface->handoff_top != top || surface->handoff_pool->consumer != current->process)
-            return 0;
-        /* A completed publication may outlive source endpoint retirement, but
-         * a new repair must not authorize a binding already being replaced. */
-        if (owner_repair && (!surface->handoff_consumer_mapped || surface->handoff_retired ||
-                            is_client_surface_handoff_lost( surface ))) return 0;
         while (low < high)
         {
             unsigned int mid = low + (high - low) / 2;
@@ -2353,7 +2377,20 @@ static int validate_client_surface_handoff_generation( struct window *win, struc
             if (receipts[mid].handle < win->handle) low = mid + 1;
             else high = mid;
         }
-        if (low == receipt_count) return 0;
+        if (low == receipt_count || receipts[low].handle != win->handle)
+        {
+            if (partial) goto children;
+            return 0;
+        }
+        if ((!owner_repair && surface->generation != generation) || !surface->handoff_pool ||
+            surface->handoff_top != top || surface->handoff_pool->consumer != current->process)
+            return 0;
+        /* A completed publication may outlive source endpoint retirement, but
+         * a new repair must not authorize a binding already being replaced.
+         * Once recovery was requested, a remapped endpoint is not fresh proof. */
+        if (owner_repair && (!surface->handoff_consumer_mapped || surface->handoff_retired ||
+                            is_client_surface_handoff_lost( surface ) ||
+                            (partial && surface->source_required))) return 0;
         receipt = &receipts[low];
         if (receipt->handle != win->handle || receipt->process != owner->process->id ||
             receipt->surface != surface->id || receipt->cookie != surface->handoff_cookie ||
@@ -2361,9 +2398,10 @@ static int validate_client_surface_handoff_generation( struct window *win, struc
             return 0;
         (*count)++;
     }
+children:
     LIST_FOR_EACH_ENTRY( child, &win->children, struct window, entry )
         if (!validate_client_surface_handoff_generation( child, top, generation,
-                                                         owner_repair, receipts, receipt_count, count ))
+                                                         owner_repair, partial, receipts, receipt_count, count ))
             return 0;
     return 1;
 }
@@ -2398,9 +2436,10 @@ DECL_HANDLER(complete_client_surface_handoffs)
         req->scene_generation != top->client_surface_scene_generation ||
         req->scene_generation != top->client_surface_transaction.epoch ||
         !top->client_surface_transaction.pending ||
+        top->client_surface_transaction.source_pending ||
         receipt_count != top->client_surface_transaction.pending ||
         !validate_client_surface_handoff_generation( top, top, req->generation,
-                                                     0, receipts, receipt_count, &count ) ||
+                                                     0, 0, receipts, receipt_count, &count ) ||
         count != top->client_surface_transaction.pending)
         return;
 
@@ -2442,7 +2481,7 @@ DECL_HANDLER(request_client_surface_owner_repair)
         }
     if ((req->scene_id & 1) || req->scene_id != top->client_surface_scene_generation ||
         !receipt_count || !is_visible( top ) ||
-        !validate_client_surface_handoff_generation( top, top, 0, 1, receipts, receipt_count, &count ) ||
+        !validate_client_surface_handoff_generation( top, top, 0, 1, 0, receipts, receipt_count, &count ) ||
         count != receipt_count)
         return;
 
@@ -2526,7 +2565,8 @@ static void get_client_surface_handoff_desc( struct window *win, struct window *
                    !is_client_surface_handoff_lost( surface ) ? surface->handoff_cookie : 0;
 }
 
-static unsigned int prepare_client_surface_generation( struct window *win, unsigned long long generation )
+static unsigned int prepare_client_surface_generation( struct window *win, unsigned long long generation,
+                                                       int source_required )
 {
     struct client_surface_owner *owner;
     struct client_surface_owner *selected_owner;
@@ -2539,15 +2579,19 @@ static unsigned int prepare_client_surface_generation( struct window *win, unsig
     LIST_FOR_EACH_ENTRY( owner, &win->client_surface_owners, struct client_surface_owner, entry )
     {
         LIST_FOR_EACH_ENTRY( surface, &owner->surfaces, struct client_surface_ref, entry )
+        {
             surface->generation = 0;
+            surface->source_required = 0;
+        }
     }
     if (selected && is_visible( win ))
     {
         selected->generation = generation;
+        selected->source_required = source_required;
         count = 1;
     }
     LIST_FOR_EACH_ENTRY( child, &win->children, struct window, entry )
-        count += prepare_client_surface_generation( child, generation );
+        count += prepare_client_surface_generation( child, generation, source_required );
     return count;
 }
 
@@ -2575,6 +2619,7 @@ static int notify_client_surface_geometry_ready_recursive( struct window *win, s
         LIST_FOR_EACH_ENTRY( surface, &owner->surfaces, struct client_surface_ref, entry )
         {
             if (surface->generation != client_surface_transaction_generation( top )) continue;
+            if (!surface->source_required) continue;
             if (surface->notification_pending) continue;
             if (post_client_surface_notification( surface, top->handle, WM_WINE_UPDATECLIENTSURFACE ))
             {
@@ -2600,9 +2645,80 @@ static int notify_client_surface_geometry_ready_recursive( struct window *win, s
     return removed_surface;
 }
 
+/* Recovery belongs to the selected identity in this generation. Keep that
+ * obligation across queue teardown and endpoint replacement; receipt reuse
+ * must not retract a notification which was already required. */
+static void mark_client_surface_source_recovery( struct window *win, struct window *top,
+                                                 const struct client_surface_handoff_receipt *receipts,
+                                                 unsigned int receipt_count )
+{
+    struct client_surface_owner *owner;
+    struct client_surface_ref *surface;
+    struct window *child;
+    unsigned int low = 0, high = receipt_count;
+
+    if (!win->client_surface_subtree_count || !is_visible( win )) return;
+    if ((surface = select_client_surface_producer( win, &owner )) &&
+        surface->generation == client_surface_transaction_generation( top ))
+    {
+        while (low < high)
+        {
+            unsigned int mid = low + (high - low) / 2;
+            if (receipts[mid].handle < win->handle) low = mid + 1;
+            else high = mid;
+        }
+        if (low == receipt_count || receipts[low].handle != win->handle) surface->source_required = 1;
+    }
+    LIST_FOR_EACH_ENTRY( child, &win->children, struct window, entry )
+        mark_client_surface_source_recovery( child, top, receipts, receipt_count );
+}
+
 static void notify_client_surface_geometry_ready( struct window *top )
 {
+    mark_client_surface_source_recovery( top, top, NULL, 0 );
     notify_client_surface_geometry_ready_recursive( top, top );
+}
+
+DECL_HANDLER(resolve_client_surface_scene_sources)
+{
+    const struct client_surface_handoff_receipt *receipts = get_req_data();
+    unsigned int count = 0, i, receipt_count = get_req_data_size() / sizeof(*receipts);
+    struct window *top = get_window( req->handle );
+
+    reply->accepted = 0;
+    if (!top) return;
+    if (get_toplevel_window( top ) != top || !top->thread || top->thread->process != current->process)
+    {
+        set_error( STATUS_ACCESS_DENIED );
+        return;
+    }
+    if (get_req_data_size() % sizeof(*receipts))
+    {
+        set_error( STATUS_INVALID_PARAMETER );
+        return;
+    }
+    for (i = 1; i < receipt_count; ++i)
+        if (receipts[i - 1].handle >= receipts[i].handle)
+        {
+            set_error( STATUS_INVALID_PARAMETER );
+            return;
+        }
+    if ((req->scene_id & 1) || req->scene_id != top->client_surface_scene_generation ||
+        req->scene_id != top->client_surface_transaction.epoch ||
+        top->client_surface_transaction.phase != CLIENT_SURFACE_PHASE_COMPOSING ||
+        !top->client_surface_transaction.source_pending ||
+        !validate_client_surface_handoff_generation( top, top, 0, 1, 1, receipts, receipt_count, &count ) ||
+        count != receipt_count)
+        return;
+
+    /* This consumes one decision, not an assembly completion. Actual checked
+     * copies and native publication still need the full scene's receipts. */
+    top->client_surface_transaction.source_pending = 0;
+    top->client_surface_transaction.owner_repair = 1;
+    mark_client_surface_source_recovery( top, top, receipts, receipt_count );
+    update_client_surface_publication( top );
+    notify_client_surface_geometry_ready_recursive( top, top );
+    reply->accepted = 1;
 }
 
 static void invalidate_client_surface_owner_repair( struct client_surface_ref *surface )
@@ -2610,10 +2726,13 @@ static void invalidate_client_surface_owner_repair( struct client_surface_ref *s
     struct window *top = surface->handoff_top;
     unsigned int error = get_error();
 
-    if (!top || !top->client_surface_transaction.owner_repair) return;
+    if (!top || (!top->client_surface_transaction.owner_repair &&
+                 !top->client_surface_transaction.source_pending)) return;
     if (client_surface_is_preparing( top ))
     {
         top->client_surface_transaction.owner_repair = 0;
+        top->client_surface_transaction.source_pending = 0;
+        update_client_surface_publication( top );
         return;
     }
     /* A cache discarded after preparation needs its exact source again.
@@ -2622,9 +2741,13 @@ static void invalidate_client_surface_owner_repair( struct client_surface_ref *s
      * from inside another endpoint/lifetime teardown. */
     if (top->client_surface_transaction.phase == CLIENT_SURFACE_PHASE_COMPOSING &&
         surface->generation == client_surface_transaction_generation( top ) &&
-        !top->client_surface_scene_change_depth && !surface->notification_pending &&
-        post_client_surface_notification( surface, top->handle, WM_WINE_UPDATECLIENTSURFACE ))
-        surface->notification_pending = 1;
+        !top->client_surface_scene_change_depth)
+    {
+        surface->source_required = 1;
+        if (!surface->notification_pending &&
+            post_client_surface_notification( surface, top->handle, WM_WINE_UPDATECLIENTSURFACE ))
+            surface->notification_pending = 1;
+    }
     set_error( error );
 }
 
@@ -2716,6 +2839,7 @@ void retry_process_client_surface_notifications( struct process *process, user_h
         {
             if (!surface->generation ||
                 surface->generation != client_surface_transaction_generation( top ) ||
+                !surface->source_required ||
                 surface->notification_pending)
                 continue;
             if (post_client_surface_notification( surface, top->handle, WM_WINE_UPDATECLIENTSURFACE ))
@@ -2735,6 +2859,7 @@ static void restart_client_surface_generation( struct window *top )
     /* A real scene mutation or source recovery supersedes a warm repair,
      * including one waiting for the owner to preserve its GDI backing. */
     top->client_surface_transaction.owner_repair = 0;
+    top->client_surface_transaction.source_pending = 0;
     restart_client_surface_generation_internal( top );
 }
 
@@ -2744,8 +2869,12 @@ static void restart_client_surface_generation_internal( struct window *top )
 
     /* The actor discards a cache only while retiring its endpoint. Also
      * observe a shared channel loss which has not yet reached that request. */
-    if (top->client_surface_transaction.owner_repair && !client_surface_owner_repair_channels_live( top, top ))
+    if ((top->client_surface_transaction.owner_repair || top->client_surface_transaction.source_pending) &&
+        !client_surface_owner_repair_channels_live( top, top ))
+    {
         top->client_surface_transaction.owner_repair = 0;
+        top->client_surface_transaction.source_pending = 0;
+    }
 
     /* Reparenting transfers composition to the new top-level.  Do not restart
      * an independent scene on a window which is now a child. */
@@ -2793,6 +2922,7 @@ static void restart_client_surface_generation_internal( struct window *top )
         return;
     }
     scene_published = client_surface_scene_published( top );
+    if (!scene_published) top->client_surface_transaction.source_pending = 0;
 
     /* Preserve the visible non-client and GDI pixels before the owner
      * compositor assembles the next scene. */
@@ -2830,19 +2960,28 @@ static void restart_client_surface_generation_internal( struct window *top )
         top->client_surface_transaction.epoch = top->client_surface_scene_generation;
         top->client_surface_transaction.pending =
             prepare_client_surface_generation( top,
-                                               client_surface_transaction_generation( top ) );
+                                               client_surface_transaction_generation( top ),
+                                               !top->client_surface_transaction.owner_repair &&
+                                               !top->client_surface_transaction.source_pending );
         update_client_surface_publication( top );
 
         if (top->client_surface_transaction.pending)
         {
-            if (!top->client_surface_transaction.owner_repair) notify_client_surface_geometry_ready( top );
+            if (top->client_surface_transaction.source_pending)
+                post_message_coalesced( top->handle, WM_WINE_UPDATEWINDOWSTATE,
+                                        WINE_RESOLVE_CLIENT_SURFACE_SOURCES, 0 );
+            else if (!top->client_surface_transaction.owner_repair) notify_client_surface_geometry_ready( top );
         }
         else
             mark_client_surface_generation_ready( top );
         /* A nested mutation can request another pass while this loop owns
          * the transition. Only the first pass has the caller's cache proof;
          * every subsequent restart must retain producer recovery. */
-        if (top->client_surface_transaction.restart_pending) top->client_surface_transaction.owner_repair = 0;
+        if (top->client_surface_transaction.restart_pending)
+        {
+            top->client_surface_transaction.owner_repair = 0;
+            top->client_surface_transaction.source_pending = 0;
+        }
         /* A nested scene change can retire the final producer and therefore
          * finish a live generation before requesting a restart.  The restart
          * request, not the old generation's composing bit, owns this loop. */
@@ -4141,7 +4280,7 @@ static void set_window_region( struct window *win, struct region *region, int re
 
     if (redraw) old_vis_rgn = get_visible_region( win, DCX_WINDOW );
 
-    if (scene_change) begin_client_surface_scene_change( scene_top );
+    if (scene_change) begin_client_surface_cached_scene_change( scene_top );
     if (win->win_region) free_region( win->win_region );
     win->win_region = region;
     if (scene_change) end_client_surface_scene_change( scene_top );
@@ -5415,10 +5554,14 @@ DECL_HANDLER(set_client_surface_state)
         /* Source recovery and backends without a complete owner cache still
          * require the producer to update its target and republish content. */
         top->client_surface_transaction.owner_repair = 0;
+        top->client_surface_transaction.source_pending = 0;
         if (!client_surface_is_composing( top ) && is_visible( top ) && has_client_surface( top ))
             restart_client_surface_generation( top );
         else if (client_surface_is_composing( top ) && top->client_surface_transaction.pending)
+        {
+            update_client_surface_publication( top );
             notify_client_surface_geometry_ready( top );
+        }
     }
     if ((req->flags & CLIENT_SURFACE_STATE_PRESENT_BEGIN) && surface &&
         !top->client_surface_transaction.restart_pending &&

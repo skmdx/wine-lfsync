@@ -1143,6 +1143,7 @@ typedef volatile struct
 #define WINDOW_SHM_CLIENT_SURFACE_PREPARING 0x08
 #define WINDOW_SHM_CLIENT_SURFACE_DIRECT 0x10
 #define WINDOW_SHM_CLIENT_SURFACE_BACKING 0x20
+#define WINDOW_SHM_CLIENT_SURFACE_SOURCE_PENDING 0x40
 
 typedef volatile union
 {
@@ -6570,6 +6571,22 @@ struct request_client_surface_owner_repair_reply
     char __pad_12[4];
 };
 
+/* Resolve the owner's retained image inventory for one pending scene. Missing
+ * selected producers require recovery; receipts only attest compatible images. */
+struct resolve_client_surface_scene_sources_request
+{
+    struct request_header __header;
+    user_handle_t handle;
+    unsigned __int64 scene_id;
+    /* VARARG(receipts,bytes); */
+};
+struct resolve_client_surface_scene_sources_reply
+{
+    struct reply_header __header;
+    int accepted;
+    char __pad_12[4];
+};
+
 
 struct set_window_present_rect_request
 {
@@ -6909,6 +6926,7 @@ enum request
     REQ_publish_client_surface_handoff,
     REQ_get_client_surface_scene_snapshot,
     REQ_request_client_surface_owner_repair,
+    REQ_resolve_client_surface_scene_sources,
     REQ_set_window_present_rect,
     REQ_NB_REQUESTS
 };
@@ -7239,6 +7257,7 @@ union generic_request
     struct publish_client_surface_handoff_request publish_client_surface_handoff_request;
     struct get_client_surface_scene_snapshot_request get_client_surface_scene_snapshot_request;
     struct request_client_surface_owner_repair_request request_client_surface_owner_repair_request;
+    struct resolve_client_surface_scene_sources_request resolve_client_surface_scene_sources_request;
     struct set_window_present_rect_request set_window_present_rect_request;
 };
 union generic_reply
@@ -7567,9 +7586,10 @@ union generic_reply
     struct publish_client_surface_handoff_reply publish_client_surface_handoff_reply;
     struct get_client_surface_scene_snapshot_reply get_client_surface_scene_snapshot_reply;
     struct request_client_surface_owner_repair_reply request_client_surface_owner_repair_reply;
+    struct resolve_client_surface_scene_sources_reply resolve_client_surface_scene_sources_reply;
     struct set_window_present_rect_reply set_window_present_rect_reply;
 };
 
-#define SERVER_PROTOCOL_VERSION 1011
+#define SERVER_PROTOCOL_VERSION 1012
 
 #endif /* __WINE_WINE_SERVER_PROTOCOL_H */

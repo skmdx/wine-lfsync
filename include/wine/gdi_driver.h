@@ -219,7 +219,7 @@ struct gdi_dc_funcs
 };
 
 /* increment this when changing driver tables or shared driver-facing structures */
-#define WINE_GDI_DRIVER_VERSION 130
+#define WINE_GDI_DRIVER_VERSION 131
 
 #define GDI_PRIORITY_NULL_DRV        0  /* null driver */
 #define GDI_PRIORITY_FONT_DRV      100  /* any font driver */
@@ -347,6 +347,7 @@ struct client_surface_scene
     enum client_surface_presentation_mode mode;
     BOOL valid;
     BOOL authoritative;
+    BOOL source_pending; /* current assembly awaits the owner's image inventory */
 };
 
 enum client_surface_frame_result
@@ -500,6 +501,7 @@ W32KAPI BOOL client_surface_complete_present_locked( struct client_surface *surf
                                                      const SIZE *expected_size, DWORD timeout );
 W32KAPI void client_surface_geometry_ready( HWND hwnd );
 W32KAPI void client_surface_repair_owner( HWND hwnd );
+W32KAPI void client_surface_resolve_sources( HWND hwnd );
 W32KAPI BOOL client_surface_get_toplevel_scene( HWND toplevel, struct client_surface_scene *scene );
 struct client_surface_scene_member
 {
@@ -677,7 +679,7 @@ struct user_driver_funcs
     BOOL    (*pGetWindowStateUpdates)(HWND,UINT*,UINT*,RECT*,HWND*);
     struct client_surface *(*pCreateClientSurface)(HWND,int,BOOL);
     /* TRUE if native owner images can service this repair without a producer. */
-    BOOL    (*pRepairClientSurfaceOwner)(HWND);
+    BOOL    (*pRepairClientSurfaceOwner)(HWND,BOOL);
     BOOL    (*pCreateWindowSurface)(HWND,BOOL,const RECT *,struct window_surface**);
     void    (*pMoveWindowBits)(HWND,const struct window_rects *,const struct window_rects *,const RECT *);
     BOOL    (*pWindowPosChanged)(HWND,HWND,HWND,UINT,const struct window_rects*,struct window_surface*);

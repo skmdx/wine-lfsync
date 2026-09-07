@@ -1159,6 +1159,7 @@ typedef volatile struct
 #define WINDOW_SHM_CLIENT_SURFACE_PREPARING 0x08
 #define WINDOW_SHM_CLIENT_SURFACE_DIRECT 0x10
 #define WINDOW_SHM_CLIENT_SURFACE_BACKING 0x20
+#define WINDOW_SHM_CLIENT_SURFACE_SOURCE_PENDING 0x40
 
 typedef volatile union
 {
@@ -4572,6 +4573,16 @@ enum inproc_sync_type
     user_handle_t handle;
     unsigned __int64 scene_id;
     VARARG(receipts,bytes); /* sorted client_surface_handoff_receipt entries */
+@REPLY
+    int accepted;
+@END
+
+/* Resolve the owner's retained image inventory for one pending scene. Missing
+ * selected producers require recovery; receipts only attest compatible images. */
+@REQ(resolve_client_surface_scene_sources)
+    user_handle_t handle;
+    unsigned __int64 scene_id;
+    VARARG(receipts,bytes); /* sorted client_surface_handoff_receipt subset */
 @REPLY
     int accepted;
 @END

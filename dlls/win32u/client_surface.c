@@ -712,6 +712,7 @@ static BOOL read_client_surface_scene( HWND toplevel, struct client_surface_scen
                       (window_shm->client_surface_flags & WINDOW_SHM_CLIENT_SURFACE_STAGED) ?
                       CLIENT_SURFACE_PRESENTATION_STAGED : CLIENT_SURFACE_PRESENTATION_COMPOSITED;
         preparing = !!(window_shm->client_surface_flags & WINDOW_SHM_CLIENT_SURFACE_PREPARING);
+        scene->source_pending = !!(window_shm->client_surface_flags & WINDOW_SHM_CLIENT_SURFACE_SOURCE_PENDING);
         if (producer_process) *producer_process = window_shm->client_surface_process;
         if (producer_id) *producer_id = window_shm->client_surface_id;
     }
@@ -1413,7 +1414,25 @@ void client_surface_repair_owner( HWND hwnd )
 {
     /* Only the native owner can know whether its immutable images cover the
      * current scene. Legacy and cold caches still need producer source recovery. */
-    if (!user_driver->pRepairClientSurfaceOwner( hwnd )) client_surface_geometry_ready( hwnd );
+    if (!user_driver->pRepairClientSurfaceOwner( hwnd, FALSE )) client_surface_geometry_ready( hwnd );
+}
+
+void client_surface_resolve_sources( HWND hwnd )
+{
+    struct client_surface_scene scene;
+
+    if (!client_surface_get_toplevel_scene( hwnd, &scene ) || !scene.source_pending) return;
+    if (user_driver->pRepairClientSurfaceOwner( hwnd, TRUE )) return;
+    /* Unsupported backends and failed cache inspections report an empty
+     * inventory for the captured scene. A late owner message cannot reopen a
+     * finished repair or supersede a newer source recovery request. */
+    SERVER_START_REQ( resolve_client_surface_scene_sources )
+    {
+        req->handle = wine_server_user_handle( hwnd );
+        req->scene_id = scene.epoch;
+        wine_server_call( req );
+    }
+    SERVER_END_REQ;
 }
 
 void client_surface_set_staged( HWND hwnd )

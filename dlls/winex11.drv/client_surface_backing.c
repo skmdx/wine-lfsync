@@ -241,6 +241,7 @@ enum client_surface_compositor_op
     CLIENT_SURFACE_COMPOSITOR_REUSE_HANDOFFS,
     CLIENT_SURFACE_COMPOSITOR_CHECK_SCENE,
     CLIENT_SURFACE_COMPOSITOR_REPAIR_OWNER,
+    CLIENT_SURFACE_COMPOSITOR_RESOLVE_SOURCES,
     CLIENT_SURFACE_COMPOSITOR_SWEEP_HANDOFFS,
     CLIENT_SURFACE_COMPOSITOR_UPDATE_TARGET,
     CLIENT_SURFACE_COMPOSITOR_REMOVE_TARGET,
@@ -2384,13 +2385,16 @@ static BOOL client_surface_cached_frame_matches_layout( const struct client_surf
            (unsigned int)slot->damage.right <= slot->width && (unsigned int)slot->damage.bottom <= slot->height;
 }
 
-static BOOL repair_client_surface_compositor_owner( HWND toplevel )
+static BOOL repair_client_surface_compositor_owner( HWND toplevel, BOOL resolve )
 {
     struct client_surface_compositor_target *target = find_client_surface_compositor_target( toplevel );
     struct client_surface_handoff_receipt *receipts;
-    unsigned int i;
+    struct client_surface_scene current;
+    unsigned int i, count = 0;
     BOOL accepted = FALSE;
 
+    if (resolve && (!client_surface_get_toplevel_scene( toplevel, &current ) || !current.source_pending))
+        return TRUE;
     if (!target || !target->scene.valid || !target->scene.count ||
         !client_surface_scene_snapshot_current( toplevel, target->scene.epoch )) return FALSE;
     if (!(receipts = calloc( target->scene.count, sizeof(*receipts) ))) return FALSE;
@@ -2399,23 +2403,43 @@ static BOOL repair_client_surface_compositor_owner( HWND toplevel )
         struct client_surface_compositor_binding *binding = target->scene.members[i];
 
         if (!client_surface_compositor_binding_is_live( binding ) ||
-            !client_surface_cached_frame_matches_layout( binding, &target->scene.layouts[i] )) goto done;
-        receipts[i] = (struct client_surface_handoff_receipt){
+            !client_surface_cached_frame_matches_layout( binding, &target->scene.layouts[i] ))
+        {
+            if (resolve) continue;
+            goto done;
+        }
+        receipts[count++] = (struct client_surface_handoff_receipt){
             .handle = wine_server_user_handle( binding->window ), .process = binding->process,
             .surface = binding->identity, .cookie = binding->cookie,
             .source_generation = binding->latest_frame.source_sequence, .buffer_index = binding->latest_index,
         };
     }
-    SERVER_START_REQ( request_client_surface_owner_repair )
+    if (resolve)
     {
-        req->handle = wine_server_user_handle( toplevel );
-        req->scene_id = target->scene.epoch;
-        wine_server_add_data( req, receipts, target->scene.count * sizeof(*receipts) );
-        if (!wine_server_call( req )) accepted = reply->accepted;
+        SERVER_START_REQ( resolve_client_surface_scene_sources )
+        {
+            req->handle = wine_server_user_handle( toplevel );
+            req->scene_id = target->scene.epoch;
+            wine_server_add_data( req, receipts, count * sizeof(*receipts) );
+            if (!wine_server_call( req )) accepted = reply->accepted;
+        }
+        SERVER_END_REQ;
+        TRACE( "owner scene sources hwnd %p scene %s images %u/%u accepted %u\n", toplevel,
+               wine_dbgstr_longlong( target->scene.epoch ), count, target->scene.count, accepted );
     }
-    SERVER_END_REQ;
-    TRACE( "owner cache repair hwnd %p scene %s images %u accepted %u\n", toplevel,
-           wine_dbgstr_longlong( target->scene.epoch ), target->scene.count, accepted );
+    else
+    {
+        SERVER_START_REQ( request_client_surface_owner_repair )
+        {
+            req->handle = wine_server_user_handle( toplevel );
+            req->scene_id = target->scene.epoch;
+            wine_server_add_data( req, receipts, count * sizeof(*receipts) );
+            if (!wine_server_call( req )) accepted = reply->accepted;
+        }
+        SERVER_END_REQ;
+        TRACE( "owner cache repair hwnd %p scene %s images %u accepted %u\n", toplevel,
+               wine_dbgstr_longlong( target->scene.epoch ), count, accepted );
+    }
     if (accepted)
     {
         /* A repair of an existing assembly can keep its scene ID. Backing
@@ -2458,6 +2482,13 @@ static BOOL compose_client_surface_cached_frame( struct client_surface_composito
     if (!client_surface_get_toplevel_scene( binding->toplevel, &current ) ||
         current.epoch != target->scene.epoch ||
         current.mode == CLIENT_SURFACE_PRESENTATION_DIRECT) return FALSE;
+    /* Inventory resolution precedes the first copy, so the full assembly
+     * cannot race its own pending decision or publish a stale cache proof. */
+    if (current.source_pending &&
+        (!repair_client_surface_compositor_owner( binding->toplevel, TRUE ) ||
+         !client_surface_get_toplevel_scene( binding->toplevel, &current ) || current.source_pending ||
+         current.epoch != target->scene.epoch || current.mode == CLIENT_SURFACE_PRESENTATION_DIRECT))
+        return FALSE;
     if (replay) trace_client_surface_source( "replay_cache", binding, control,
                                              slot->source_sequence, target->window, source, TRUE );
     /* Only the owner's current transaction can publish this image. A new
@@ -2960,7 +2991,9 @@ static BOOL execute_client_surface_compositor_job( struct client_surface_composi
     if (job->op == CLIENT_SURFACE_COMPOSITOR_CHECK_SCENE)
         return check_client_surface_compositor_scene( job );
     if (job->op == CLIENT_SURFACE_COMPOSITOR_REPAIR_OWNER)
-        return repair_client_surface_compositor_owner( job->handoff_toplevel );
+        return repair_client_surface_compositor_owner( job->handoff_toplevel, FALSE );
+    if (job->op == CLIENT_SURFACE_COMPOSITOR_RESOLVE_SOURCES)
+        return repair_client_surface_compositor_owner( job->handoff_toplevel, TRUE );
     if (job->op == CLIENT_SURFACE_COMPOSITOR_SWEEP_HANDOFFS)
         return sweep_client_surface_compositor_handoffs( job->handoff_toplevel, job->mark,
                                                           job );
@@ -3693,11 +3726,11 @@ static unsigned int client_surface_backing_extent( int size )
     return min( (requested + 63) & ~63u, 65535 );
 }
 
-BOOL X11DRV_RepairClientSurfaceOwner( HWND hwnd )
+BOOL X11DRV_RepairClientSurfaceOwner( HWND hwnd, BOOL resolve )
 {
     struct client_surface_compositor_job job =
     {
-        .op = CLIENT_SURFACE_COMPOSITOR_REPAIR_OWNER,
+        .op = resolve ? CLIENT_SURFACE_COMPOSITOR_RESOLVE_SOURCES : CLIENT_SURFACE_COMPOSITOR_REPAIR_OWNER,
         .handoff_toplevel = hwnd,
     };
 

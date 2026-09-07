@@ -1536,7 +1536,32 @@ static UINT request_owner_repair( HWND hwnd, UINT64 scene_id, const void *receip
     return status;
 }
 
-static UINT drain_scene_notifications( UINT *owner_updates, UINT *prepares )
+static UINT resolve_scene_sources( HWND hwnd, UINT64 scene_id, const void *receipts, UINT size, BOOL *accepted )
+{
+    struct __server_request_info info = {0};
+    UINT status;
+
+    info.u.req.resolve_client_surface_scene_sources_request.__header.req = REQ_resolve_client_surface_scene_sources;
+    info.u.req.resolve_client_surface_scene_sources_request.handle = wine_server_user_handle( hwnd );
+    info.u.req.resolve_client_surface_scene_sources_request.scene_id = scene_id;
+    wine_server_add_data( &info, receipts, size );
+    status = p_wine_server_call( &info );
+    *accepted = info.u.reply.resolve_client_surface_scene_sources_reply.accepted;
+    return status;
+}
+
+static UINT set_scene_shape( HWND hwnd, unsigned int inset )
+{
+    struct __server_request_info info = {0};
+    struct rectangle shape[2] = {{inset, 0, 157, 40}, {0, 60, 137, 117}};
+
+    info.u.req.set_window_region_request.__header.req = REQ_set_window_region;
+    info.u.req.set_window_region_request.window = wine_server_user_handle( hwnd );
+    wine_server_add_data( &info, shape, sizeof(shape) );
+    return p_wine_server_call( &info );
+}
+
+static UINT drain_scene_notifications_for_surface( UINT *owner_updates, UINT *prepares, UINT64 expected_surface )
 {
     UINT count = 0, i, status;
 
@@ -1558,7 +1583,13 @@ static UINT drain_scene_notifications( UINT *owner_updates, UINT *prepares )
         if (status == STATUS_PENDING) break;
         ok( !status, "notification retrieval status %#x\n", status );
         if (status) break;
-        if (reply->msg == WM_WINE_UPDATECLIENTSURFACE) ++count;
+        if (reply->msg == WM_WINE_UPDATECLIENTSURFACE)
+        {
+            UINT64 identity = ((UINT64)(UINT32)reply->wparam << 32) | (UINT32)reply->lparam;
+            ++count;
+            if (expected_surface) ok( identity == expected_surface, "notified unrelated producer %s\n",
+                                      wine_dbgstr_longlong( identity ) );
+        }
         if (reply->msg == WM_WINE_UPDATEWINDOWSTATE && reply->wparam == WINE_UPDATE_CLIENT_SURFACE_HANDOFFS)
             ++*owner_updates;
         if (reply->msg == WM_WINE_UPDATEWINDOWSTATE && reply->wparam == WINE_PREPARE_CLIENT_SURFACES)
@@ -1575,12 +1606,15 @@ static UINT drain_scene_notifications( UINT *owner_updates, UINT *prepares )
     return count;
 }
 
+static UINT drain_scene_notifications( UINT *owner_updates, UINT *prepares )
+{
+    return drain_scene_notifications_for_surface( owner_updates, prepares, 0 );
+}
+
 static void check_owner_repair( HWND hwnd, const struct client_surface_handoff_receipt *receipt )
 {
     struct client_surface_handoff_receipt invalid[2] = {*receipt, *receipt};
     struct surface_state state, before;
-    struct __server_request_info info = {0};
-    struct rectangle shape = {0, 0, 157, 117};
     struct native_barrier_state barrier;
     UINT status, producers, owner_updates, prepares, i;
     UINT64 child_surface;
@@ -1624,11 +1658,10 @@ static void check_owner_repair( HWND hwnd, const struct client_surface_handoff_r
             set_surface_state( hwnd, 0, CLIENT_SURFACE_STATE_GEOMETRY_READY, 0, NULL );
         else if (i == 2)
         {
-            info.u.req.set_window_region_request.__header.req = REQ_set_window_region;
-            info.u.req.set_window_region_request.window = wine_server_user_handle( hwnd );
-            wine_server_add_data( &info, &shape, sizeof(shape) );
-            status = p_wine_server_call( &info );
+            status = set_native_barrier( hwnd, 0x654321, TRUE, &barrier );
             ok( !status, "superseding scene mutation status %#x\n", status );
+            status = set_native_barrier( hwnd, 0x654321, FALSE, &barrier );
+            ok( !status, "superseding scene unseal status %#x\n", status );
         }
         status = prepare_surface_state( hwnd, &state );
         ok( !status && state.pending == 1 && state.generation, "repair prepare status %#x pending %u\n",
@@ -1679,6 +1712,220 @@ static void check_owner_repair( HWND hwnd, const struct client_surface_handoff_r
         ok( status == STATUS_ACCESS_DENIED && !accepted, "child accepted as repair owner, status %#x\n", status );
         DestroyWindow( child );
     }
+}
+
+static void check_scene_source_decisions( HWND hwnd, const struct client_surface_handoff_receipt *receipt )
+{
+    struct client_surface_handoff_receipt invalid[2] = {*receipt, *receipt};
+    struct handoff_binding rebound = {0};
+    struct surface_state state, before;
+    struct native_barrier_state barrier;
+    UINT status, i, producers, owner_updates, prepares;
+    BOOL accepted;
+
+    for (i = 0; i < 8; ++i)
+    {
+        winetest_push_context( "scene source decision %u", i );
+        set_surface_state( hwnd, 0, 0, 0, &before );
+        drain_scene_notifications( &owner_updates, &prepares );
+        if (i == 6)
+        {
+            set_surface_state( hwnd, 0, CLIENT_SURFACE_STATE_GEOMETRY_READY, 0, NULL );
+            prepare_surface_state( hwnd, &state );
+        }
+        status = set_scene_shape( hwnd, i );
+        ok( !status, "shape update status %#x\n", status );
+        set_surface_state( hwnd, 0, 0, 0, &state );
+        ok( state.scene_generation > before.scene_generation && !(state.scene_generation & 1),
+            "shape did not publish a new even scene\n" );
+        status = resolve_scene_sources( hwnd, state.scene_generation, receipt, sizeof(*receipt), &accepted );
+        ok( !status && !accepted, "inventory accepted before preparation, status %#x\n", status );
+        if (i == 2) set_surface_state( hwnd, 0, CLIENT_SURFACE_STATE_GEOMETRY_READY, 0, NULL );
+        if (i == 3)
+        {
+            status = release_surface_handoff( hwnd, receipt->process, receipt->surface, receipt->cookie, TRUE );
+            ok( !status, "preparation cache loss status %#x\n", status );
+            status = get_surface_handoff( hwnd, receipt->process, receipt->surface, TRUE, &rebound );
+            ok( !status && rebound.cookie == receipt->cookie, "preparation rebind status %#x\n", status );
+            if (rebound.mapping) CloseHandle( rebound.mapping );
+        }
+        prepare_surface_state( hwnd, &state );
+        ok( state.pending == 1 && state.generation, "no shape assembly, pending %u\n", state.pending );
+        producers = drain_scene_notifications( &owner_updates, &prepares );
+        ok( i == 2 || i == 3 || i == 6 ? !!producers : !producers,
+            "premature or missing recovery: %u producer notifications\n", producers );
+        before = state;
+
+        if (i == 2 || i == 3 || i == 6)
+        {
+            status = resolve_scene_sources( hwnd, state.scene_generation, receipt, sizeof(*receipt), &accepted );
+            ok( !status && !accepted, "inventory suppressed an existing source recovery, status %#x\n", status );
+        }
+        else
+        {
+            status = complete_surface_handoffs( hwnd, state.generation, state.scene_generation, receipt, 1, &accepted );
+            ok( !status && !accepted, "assembly bypassed pending inventory, status %#x\n", status );
+            status = resolve_scene_sources( hwnd, state.scene_generation - 2, receipt, sizeof(*receipt), &accepted );
+            ok( !status && !accepted, "wrong scene inventory accepted, status %#x\n", status );
+            status = resolve_scene_sources( hwnd, state.scene_generation | 1, receipt, sizeof(*receipt), &accepted );
+            ok( !status && !accepted, "odd scene inventory accepted, status %#x\n", status );
+            status = resolve_scene_sources( hwnd, state.scene_generation, receipt, sizeof(*receipt) - 1, &accepted );
+            ok( status == STATUS_INVALID_PARAMETER && !accepted, "partial inventory record status %#x\n", status );
+            status = resolve_scene_sources( hwnd, state.scene_generation, invalid, sizeof(invalid), &accepted );
+            ok( status == STATUS_INVALID_PARAMETER && !accepted, "duplicate inventory record status %#x\n", status );
+            ++invalid[0].cookie;
+            status = resolve_scene_sources( hwnd, state.scene_generation, invalid, sizeof(*invalid), &accepted );
+            ok( !status && !accepted, "wrong cookie inventory accepted, status %#x\n", status );
+            --invalid[0].cookie;
+            if (i == 4)
+            {
+                release_surface_handoff( hwnd, receipt->process, receipt->surface, receipt->cookie, TRUE );
+                status = get_surface_handoff( hwnd, receipt->process, receipt->surface, TRUE, &rebound );
+                ok( !status && rebound.cookie == receipt->cookie, "composition rebind status %#x\n", status );
+                if (rebound.mapping) CloseHandle( rebound.mapping );
+                status = resolve_scene_sources( hwnd, state.scene_generation, receipt, sizeof(*receipt), &accepted );
+                ok( !status && !accepted, "remapped endpoint erased cache-loss recovery, status %#x\n", status );
+            }
+            status = resolve_scene_sources( hwnd, state.scene_generation, receipt,
+                                            i == 1 || i == 4 ? 0 : sizeof(*receipt), &accepted );
+            ok( !status && accepted, "inventory decision rejected, status %#x\n", status );
+            if (i == 5)
+            {
+                release_surface_handoff( hwnd, receipt->process, receipt->surface, receipt->cookie, TRUE );
+                status = get_surface_handoff( hwnd, receipt->process, receipt->surface, TRUE, &rebound );
+                ok( !status && rebound.cookie == receipt->cookie, "resolved cache rebind status %#x\n", status );
+                if (rebound.mapping) CloseHandle( rebound.mapping );
+            }
+            status = resolve_scene_sources( hwnd, state.scene_generation, receipt, sizeof(*receipt), &accepted );
+            ok( !status && !accepted, "same assembly consumed another inventory, status %#x\n", status );
+            producers = drain_scene_notifications( &owner_updates, &prepares );
+            ok( producers == (i == 1 || i == 4 || i == 5), "inventory scheduled %u producers\n", producers );
+            SendMessageW( hwnd, WM_WINE_UPDATEWINDOWSTATE, WINE_RESOLVE_CLIENT_SURFACE_SOURCES, 0 );
+            producers = drain_scene_notifications( &owner_updates, &prepares );
+            ok( !producers && !prepares, "resolved owner message restarted recovery\n" );
+        }
+        if (i == 7)
+        {
+            status = set_native_barrier( hwnd, 0x654322, TRUE, &barrier );
+            ok( !status, "resolved scene mutation status %#x\n", status );
+            status = set_native_barrier( hwnd, 0x654322, FALSE, &barrier );
+            ok( !status, "resolved scene unseal status %#x\n", status );
+            prepare_surface_state( hwnd, &state );
+            ok( state.scene_generation > before.scene_generation, "mutation retained resolved scene\n" );
+            status = resolve_scene_sources( hwnd, before.scene_generation, receipt, sizeof(*receipt), &accepted );
+            ok( !status && !accepted, "delayed resolved inventory superseded mutation\n" );
+            producers = drain_scene_notifications( &owner_updates, &prepares );
+            ok( producers == 1, "mutation after warm inventory omitted recovery: %u\n", producers );
+            before = state;
+        }
+        set_surface_state( hwnd, 0, 0, 0, &state );
+        ok( state.generation == before.generation && state.scene_generation == before.scene_generation &&
+            state.pending == before.pending, "inventory changed the assembly token or completed sources\n" );
+        status = complete_surface_handoffs( hwnd, state.generation, state.scene_generation, receipt, 1, &accepted );
+        ok( !status && accepted, "shape assembly receipt rejected, status %#x\n", status );
+        status = set_surface_state_scene( hwnd, 0, CLIENT_SURFACE_STATE_PUBLISH_COMMIT,
+                                          state.generation, state.scene_generation, &state );
+        ok( !status && !state.generation && !state.pending && !state.staged, "shape did not settle\n" );
+        status = resolve_scene_sources( hwnd, state.scene_generation, receipt, sizeof(*receipt), &accepted );
+        ok( !status && !accepted, "late decision reopened a published scene, status %#x\n", status );
+        SendMessageW( hwnd, WM_WINE_UPDATEWINDOWSTATE, WINE_RESOLVE_CLIENT_SURFACE_SOURCES, 0 );
+        set_surface_state( hwnd, 0, 0, 0, &before );
+        ok( !before.generation && !before.pending && !before.staged &&
+            before.scene_generation == state.scene_generation, "late owner message reopened the scene\n" );
+        winetest_pop_context();
+    }
+}
+
+static void check_scene_source_subset( HWND hwnd, const struct client_surface_handoff_receipt *receipt )
+{
+    struct client_surface_handoff_receipt receipts[2] = {*receipt};
+    struct handoff_binding producer = {0}, owner = {0};
+    struct client_surface_handoff_channel *channel;
+    struct surface_state state;
+    const UINT64 identity = allocate_surface();
+    HWND child = create_test_child( hwnd, 10 );
+    UINT status, producers, updates, prepares;
+    void *view = NULL;
+    BOOL accepted;
+
+    ok( !!child, "failed to create partial inventory child\n" );
+    if (!child) return;
+    set_surface_state( child, identity, CLIENT_SURFACE_STATE_REGISTER | CLIENT_SURFACE_STATE_SCENE_PUBLICATION, 0, NULL );
+    claim_surface_state( child, identity, NULL );
+    status = get_surface_handoff( child, 0, identity, FALSE, &producer );
+    ok( !status, "partial inventory producer status %#x\n", status );
+    if (status) goto done;
+    status = get_surface_handoff( child, GetCurrentProcessId(), identity, TRUE, &owner );
+    ok( !status, "partial inventory consumer status %#x\n", status );
+    if (status) goto done;
+    receipts[1] = (struct client_surface_handoff_receipt){
+        .handle = wine_server_user_handle( child ), .process = GetCurrentProcessId(),
+        .surface = identity, .cookie = producer.cookie, .source_generation = 1, .buffer_index = 0,
+    };
+    if (receipts[0].handle > receipts[1].handle)
+    {
+        struct client_surface_handoff_receipt tmp = receipts[0];
+        receipts[0] = receipts[1];
+        receipts[1] = tmp;
+    }
+    prepare_surface_state( hwnd, &state );
+    status = complete_surface_handoffs( hwnd, state.generation, state.scene_generation, receipts, 2, &accepted );
+    ok( !status && accepted, "partial inventory bootstrap status %#x\n", status );
+    set_surface_state_scene( hwnd, 0, CLIENT_SURFACE_STATE_PUBLISH_COMMIT,
+                             state.generation, state.scene_generation, &state );
+    drain_scene_notifications( &updates, &prepares );
+    set_scene_shape( hwnd, 8 );
+    prepare_surface_state( hwnd, &state );
+    producers = drain_scene_notifications( &updates, &prepares );
+    ok( !producers && state.pending == 2, "inventory broadcast before decision: %u notifications\n", producers );
+    status = resolve_scene_sources( child, state.scene_generation, receipt, sizeof(*receipt), &accepted );
+    ok( status == STATUS_ACCESS_DENIED && !accepted, "child resolved owner inventory, status %#x\n", status );
+    status = resolve_scene_sources( hwnd, state.scene_generation, receipt, sizeof(*receipt), &accepted );
+    ok( !status && accepted, "partial owner inventory rejected, status %#x\n", status );
+    producers = drain_scene_notifications_for_surface( &updates, &prepares, identity );
+    ok( producers == 1, "partial inventory woke %u producers, expected only its cold child\n", producers );
+    status = complete_surface_handoffs( hwnd, state.generation, state.scene_generation, receipt, 1, &accepted );
+    ok( !status && !accepted, "partial inventory was mistaken for complete assembly, status %#x\n", status );
+    {
+        UINT64 previous_scene = state.scene_generation;
+
+        set_scene_shape( hwnd, 9 );
+        prepare_surface_state( hwnd, &state );
+        producers = drain_scene_notifications( &updates, &prepares );
+        ok( producers == 2, "new shape suppressed outstanding cold-source recovery: %u\n", producers );
+        status = resolve_scene_sources( hwnd, previous_scene, receipts, sizeof(receipts), &accepted );
+        ok( !status && !accepted, "old partial inventory erased the next assembly\n" );
+        status = resolve_scene_sources( hwnd, state.scene_generation, receipts, sizeof(receipts), &accepted );
+        ok( !status && !accepted, "new inventory erased outstanding cold-source recovery\n" );
+    }
+    status = complete_surface_handoffs( hwnd, state.generation, state.scene_generation, receipts, 2, &accepted );
+    ok( !status && accepted, "full assembly after partial inventory status %#x\n", status );
+    set_surface_state_scene( hwnd, 0, CLIENT_SURFACE_STATE_PUBLISH_COMMIT,
+                             state.generation, state.scene_generation, &state );
+    view = MapViewOfFile( producer.mapping, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, producer.size );
+    ok( !!view, "could not map partial inventory channel\n" );
+    if (!view) goto done;
+    channel = (void *)((char *)view + producer.offset);
+    drain_scene_notifications( &updates, &prepares );
+    set_scene_shape( hwnd, 10 );
+    __atomic_store_n( &channel->closed, 1, __ATOMIC_RELEASE );
+    prepare_surface_state( hwnd, &state );
+    producers = drain_scene_notifications( &updates, &prepares );
+    ok( producers == 2, "channel loss during inventory preparation omitted recovery: %u\n", producers );
+    status = resolve_scene_sources( hwnd, state.scene_generation, receipts, sizeof(receipts), &accepted );
+    ok( !status && !accepted, "closed channel inventory authorized reuse, status %#x\n", status );
+done:
+    set_surface_state( child, identity, CLIENT_SURFACE_STATE_UNREGISTER, 0, NULL );
+    if (producer.cookie) release_surface_handoff( child, 0, identity, producer.cookie, FALSE );
+    if (owner.cookie) release_surface_handoff( child, GetCurrentProcessId(), identity, owner.cookie, TRUE );
+    if (view) UnmapViewOfFile( view );
+    if (producer.mapping) CloseHandle( producer.mapping );
+    if (owner.mapping) CloseHandle( owner.mapping );
+    DestroyWindow( child );
+    prepare_surface_state( hwnd, &state );
+    complete_surface_handoffs( hwnd, state.generation, state.scene_generation, receipt, 1, &accepted );
+    set_surface_state_scene( hwnd, 0, CLIENT_SURFACE_STATE_PUBLISH_COMMIT,
+                             state.generation, state.scene_generation, &state );
 }
 
 static void test_handoff_receipts(void)
@@ -1775,6 +2022,9 @@ static void test_handoff_receipts(void)
     complete_surface_handoffs( hwnd, state.generation, state.scene_generation, &receipt, 1, &accepted );
     set_surface_state_scene( hwnd, 0, CLIENT_SURFACE_STATE_PUBLISH_COMMIT,
                              state.generation, state.scene_generation, &state );
+    check_scene_source_decisions( hwnd, &receipt );
+    check_scene_source_subset( hwnd, &receipt );
+    set_surface_state( hwnd, 0, 0, 0, &state );
     drain_scene_notifications( &owner_updates, &prepares );
     status = request_owner_repair( hwnd, state.scene_generation, &receipt, sizeof(receipt), &accepted );
     ok( !status && accepted, "warm repair before channel loss status %#x\n", status );
