@@ -240,6 +240,7 @@ enum client_surface_compositor_op
     CLIENT_SURFACE_COMPOSITOR_REGISTER_HANDOFF,
     CLIENT_SURFACE_COMPOSITOR_REUSE_HANDOFFS,
     CLIENT_SURFACE_COMPOSITOR_CHECK_SCENE,
+    CLIENT_SURFACE_COMPOSITOR_REPAIR_OWNER,
     CLIENT_SURFACE_COMPOSITOR_SWEEP_HANDOFFS,
     CLIENT_SURFACE_COMPOSITOR_UPDATE_TARGET,
     CLIENT_SURFACE_COMPOSITOR_REMOVE_TARGET,
@@ -2358,6 +2359,72 @@ static BOOL process_client_surface_copy_replies(void)
     return progressed;
 }
 
+/* Use the same immutable source predicate for composition and native owner
+ * repair. Backend capability and consumed channel sequences are not cache proof. */
+static BOOL client_surface_cached_frame_matches_layout( const struct client_surface_compositor_binding *binding,
+                                                         const struct client_surface_scene_layout *layout )
+{
+    const struct client_surface_handoff_slot *slot = &binding->latest_frame;
+    const RECT *destination = &layout->geometry.monitor_rect;
+    unsigned int width = destination->right > destination->left ? destination->right - destination->left : 0;
+    unsigned int height = destination->bottom > destination->top ? destination->bottom - destination->top : 0;
+
+    return binding->latest_image.pixmap && slot->cookie == binding->cookie && slot->identity == binding->identity &&
+           slot->producer_process == binding->process && slot->window == wine_server_user_handle( binding->window ) &&
+           slot->toplevel == wine_server_user_handle( binding->toplevel ) &&
+           (slot->flags & CLIENT_SURFACE_HANDOFF_NATIVE_X11) && width && height &&
+           slot->width && slot->height && slot->source_visual &&
+           ((slot->width == width && slot->height == height) ||
+            (slot->width == layout->geometry.virtual_rect.right - layout->geometry.virtual_rect.left &&
+             slot->height == layout->geometry.virtual_rect.bottom - layout->geometry.virtual_rect.top)) &&
+           slot->damage.left >= 0 && slot->damage.top >= 0 && !IsRectEmpty( &slot->damage ) &&
+           (unsigned int)slot->damage.right <= slot->width && (unsigned int)slot->damage.bottom <= slot->height;
+}
+
+static BOOL repair_client_surface_compositor_owner( HWND toplevel )
+{
+    struct client_surface_compositor_target *target = find_client_surface_compositor_target( toplevel );
+    struct client_surface_handoff_receipt *receipts;
+    unsigned int i;
+    BOOL accepted = FALSE;
+
+    if (!target || !target->scene.valid || !target->scene.count ||
+        !client_surface_scene_snapshot_current( toplevel, target->scene.epoch )) return FALSE;
+    if (!(receipts = calloc( target->scene.count, sizeof(*receipts) ))) return FALSE;
+    for (i = 0; i < target->scene.count; ++i)
+    {
+        struct client_surface_compositor_binding *binding = target->scene.members[i];
+
+        if (!client_surface_compositor_binding_is_live( binding ) ||
+            !client_surface_cached_frame_matches_layout( binding, &target->scene.layouts[i] )) goto done;
+        receipts[i] = (struct client_surface_handoff_receipt){
+            .handle = wine_server_user_handle( binding->window ), .process = binding->process,
+            .surface = binding->identity, .cookie = binding->cookie,
+            .source_generation = binding->latest_frame.source_sequence, .buffer_index = binding->latest_index,
+        };
+    }
+    SERVER_START_REQ( request_client_surface_owner_repair )
+    {
+        req->handle = wine_server_user_handle( toplevel );
+        req->scene_id = target->scene.epoch;
+        wine_server_add_data( req, receipts, target->scene.count * sizeof(*receipts) );
+        if (!wine_server_call( req )) accepted = reply->accepted;
+    }
+    SERVER_END_REQ;
+    TRACE( "owner cache repair hwnd %p scene %s images %u accepted %u\n", toplevel,
+           wine_dbgstr_longlong( target->scene.epoch ), target->scene.count, accepted );
+    if (accepted)
+    {
+        /* A repair of an existing assembly can keep its scene ID. Backing
+         * damage must nevertheless replay every retained image in that scene. */
+        target->replay_member = 0;
+        for (i = 0; i < target->scene.count; ++i) target->scene.members[i]->replay_epoch = 0;
+    }
+done:
+    free( receipts );
+    return accepted;
+}
+
 static BOOL compose_client_surface_cached_frame( struct client_surface_compositor_binding *binding )
 {
     const struct client_surface_handoff_slot *slot;
@@ -2420,21 +2487,8 @@ static BOOL compose_client_surface_cached_frame( struct client_surface_composito
                         plan.destination.right - plan.destination.left : 0;
     destination_height = plan.destination.bottom > plan.destination.top ?
                          plan.destination.bottom - plan.destination.top : 0;
-    if (slot->cookie == binding->cookie && slot->identity == binding->identity &&
-        slot->producer_process == binding->process &&
-        slot->window == wine_server_user_handle( binding->window ) &&
-        slot->toplevel == wine_server_user_handle( binding->toplevel ) &&
-        (slot->flags & CLIENT_SURFACE_HANDOFF_NATIVE_X11) &&
-        target->backing && target->frames[0].pixmap && target->frames[1].pixmap &&
-        target->window &&
-        destination_width && destination_height &&
-        slot->width && slot->height && slot->source_visual &&
-        ((slot->width == destination_width && slot->height == destination_height) ||
-         (slot->width == layout->geometry.virtual_rect.right - layout->geometry.virtual_rect.left &&
-          slot->height == layout->geometry.virtual_rect.bottom - layout->geometry.virtual_rect.top)) &&
-        plan.source_damage.left >= 0 && plan.source_damage.top >= 0 && !IsRectEmpty( &plan.source_damage ) &&
-        (unsigned int)plan.source_damage.right <= slot->width &&
-        (unsigned int)plan.source_damage.bottom <= slot->height)
+    if (target->backing && target->frames[0].pixmap && target->frames[1].pixmap && target->window &&
+        client_surface_cached_frame_matches_layout( binding, layout ))
     {
         dropped = FALSE;
         /* Placement and clip come from the owner's scene. Children may
@@ -2902,6 +2956,8 @@ static BOOL execute_client_surface_compositor_job( struct client_surface_composi
         return reuse_client_surface_compositor_handoffs( job );
     if (job->op == CLIENT_SURFACE_COMPOSITOR_CHECK_SCENE)
         return check_client_surface_compositor_scene( job );
+    if (job->op == CLIENT_SURFACE_COMPOSITOR_REPAIR_OWNER)
+        return repair_client_surface_compositor_owner( job->handoff_toplevel );
     if (job->op == CLIENT_SURFACE_COMPOSITOR_SWEEP_HANDOFFS)
         return sweep_client_surface_compositor_handoffs( job->handoff_toplevel, job->mark,
                                                           job );
@@ -3632,6 +3688,20 @@ static unsigned int client_surface_backing_extent( int size )
     unsigned int requested = min( max( size, 1 ), 65535 );
 
     return min( (requested + 63) & ~63u, 65535 );
+}
+
+BOOL X11DRV_RepairClientSurfaceOwner( HWND hwnd )
+{
+    struct client_surface_compositor_job job =
+    {
+        .op = CLIENT_SURFACE_COMPOSITOR_REPAIR_OWNER,
+        .handoff_toplevel = hwnd,
+    };
+
+    /* The authoritative snapshot selects the exact bindings and layouts to
+     * inspect. The actor owns their images and attestations; no channel state
+     * is interpreted by the application thread as proof of a completed copy. */
+    return refresh_client_surface_handoffs( hwnd ) && submit_client_surface_compositor_job( &job );
 }
 
 static BOOL get_client_surface_window_extent( struct x11drv_win_data *data,

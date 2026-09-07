@@ -4566,6 +4566,16 @@ enum inproc_sync_type
     VARARG(layers,bytes); /* complete client_surface_scene_layer records */
 @END
 
+/* Request an owner cache replay after native repair. Receipts attest a
+ * retained image for every visible selected producer in the exact scene. */
+@REQ(request_client_surface_owner_repair)
+    user_handle_t handle;
+    unsigned __int64 scene_id;
+    VARARG(receipts,bytes); /* sorted client_surface_handoff_receipt entries */
+@REPLY
+    int accepted;
+@END
+
 /* Publish exclusive fullscreen placement with its scene version. */
 @REQ(set_window_present_rect)
     user_handle_t handle;

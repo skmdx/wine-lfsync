@@ -16,6 +16,7 @@
 #define WIN32_NO_STATUS
 #include "windows.h"
 #include "winternl.h"
+#include "ntuser.h"
 #include "wine/server.h"
 #include "wine/test.h"
 #include "wine/wgl.h"
@@ -1521,6 +1522,165 @@ static unsigned int complete_surface_handoffs( HWND hwnd, UINT64 generation, UIN
     return status;
 }
 
+static UINT request_owner_repair( HWND hwnd, UINT64 scene_id, const void *receipts, UINT size, BOOL *accepted )
+{
+    struct __server_request_info info = {0};
+    UINT status;
+
+    info.u.req.request_client_surface_owner_repair_request.__header.req = REQ_request_client_surface_owner_repair;
+    info.u.req.request_client_surface_owner_repair_request.handle = wine_server_user_handle( hwnd );
+    info.u.req.request_client_surface_owner_repair_request.scene_id = scene_id;
+    if (size) wine_server_add_data( &info, receipts, size );
+    status = p_wine_server_call( &info );
+    *accepted = info.u.reply.request_client_surface_owner_repair_reply.accepted;
+    return status;
+}
+
+static UINT drain_scene_notifications( UINT *owner_updates, UINT *prepares )
+{
+    UINT count = 0, i, status;
+
+    *owner_updates = *prepares = 0;
+    /* Read the real queue at the protocol boundary so win32u does not dispatch
+     * these producer notifications before the test can count them. Owner
+     * preparation/publication is driven explicitly by the protocol test. */
+    for (i = 0; i < 128; ++i)
+    {
+        struct __server_request_info info = {0};
+        struct get_message_reply *reply = &info.u.reply.get_message_reply;
+        char data[4096];
+
+        info.u.req.get_message_request.__header.req = REQ_get_message;
+        info.u.req.get_message_request.flags = PM_REMOVE | (QS_POSTMESSAGE << 16);
+        info.u.req.get_message_request.get_last = ~0u;
+        wine_server_set_reply( &info, data, sizeof(data) );
+        status = p_wine_server_call( &info );
+        if (status == STATUS_PENDING) break;
+        ok( !status, "notification retrieval status %#x\n", status );
+        if (status) break;
+        if (reply->msg == WM_WINE_UPDATECLIENTSURFACE) ++count;
+        if (reply->msg == WM_WINE_UPDATEWINDOWSTATE && reply->wparam == WINE_UPDATE_CLIENT_SURFACE_HANDOFFS)
+            ++*owner_updates;
+        if (reply->msg == WM_WINE_UPDATEWINDOWSTATE && reply->wparam == WINE_PREPARE_CLIENT_SURFACES)
+            ++*prepares;
+        if (reply->type != MSG_POSTED && reply->type != MSG_NOTIFY)
+        {
+            memset( &info, 0, sizeof(info) );
+            info.u.req.reply_message_request.__header.req = REQ_reply_message;
+            info.u.req.reply_message_request.remove = 1;
+            p_wine_server_call( &info );
+        }
+    }
+    ok( i < 128, "scene notification queue did not settle\n" );
+    return count;
+}
+
+static void check_owner_repair( HWND hwnd, const struct client_surface_handoff_receipt *receipt )
+{
+    struct client_surface_handoff_receipt invalid[2] = {*receipt, *receipt};
+    struct surface_state state, before;
+    struct __server_request_info info = {0};
+    struct rectangle shape = {0, 0, 157, 117};
+    struct native_barrier_state barrier;
+    UINT status, producers, owner_updates, prepares, i;
+    UINT64 child_surface;
+    HWND child;
+    BOOL accepted;
+
+    set_surface_state( hwnd, 0, 0, 0, &state );
+    drain_scene_notifications( &owner_updates, &prepares );
+    status = request_owner_repair( hwnd, state.scene_generation, NULL, 0, &accepted );
+    ok( !status && !accepted, "missing owner cache accepted, status %#x\n", status );
+    status = request_owner_repair( hwnd, state.scene_generation, receipt, sizeof(*receipt) - 1, &accepted );
+    ok( status == STATUS_INVALID_PARAMETER && !accepted, "partial repair receipt status %#x\n", status );
+    status = request_owner_repair( hwnd, state.scene_generation, invalid, sizeof(invalid), &accepted );
+    ok( status == STATUS_INVALID_PARAMETER && !accepted, "duplicate repair receipt status %#x\n", status );
+    ++invalid[0].cookie;
+    status = request_owner_repair( hwnd, state.scene_generation, invalid, sizeof(*invalid), &accepted );
+    ok( !status && !accepted, "retired repair cookie accepted, status %#x\n", status );
+    status = request_owner_repair( hwnd, state.scene_generation | 1, receipt, sizeof(*receipt), &accepted );
+    ok( !status && !accepted, "odd repair scene accepted, status %#x\n", status );
+    status = set_native_barrier( hwnd, 0x654321, TRUE, &barrier );
+    ok( !status, "repair scene seal status %#x\n", status );
+    status = request_owner_repair( hwnd, state.scene_generation, receipt, sizeof(*receipt), &accepted );
+    ok( !status && !accepted, "stale repair scene accepted, status %#x\n", status );
+    status = set_native_barrier( hwnd, 0x654321, FALSE, &barrier );
+    ok( !status, "repair scene unseal status %#x\n", status );
+    prepare_surface_state( hwnd, &state );
+    complete_surface_handoffs( hwnd, state.generation, state.scene_generation, receipt, 1, &accepted );
+    set_surface_state_scene( hwnd, 0, CLIENT_SURFACE_STATE_PUBLISH_COMMIT,
+                             state.generation, state.scene_generation, &state );
+    drain_scene_notifications( &owner_updates, &prepares );
+
+    for (i = 0; i < 3; ++i)
+    {
+        winetest_push_context( "warm repair with superseding request %u", i );
+        status = request_owner_repair( hwnd, state.scene_generation, receipt, sizeof(*receipt), &accepted );
+        ok( !status && accepted, "warm repair rejected, status %#x\n", status );
+        producers = drain_scene_notifications( &owner_updates, &prepares );
+        ok( !producers && owner_updates && prepares, "warm prepare producer %u owner %u preparation %u\n",
+            producers, owner_updates, prepares );
+        if (i == 1)
+            set_surface_state( hwnd, 0, CLIENT_SURFACE_STATE_GEOMETRY_READY, 0, NULL );
+        else if (i == 2)
+        {
+            info.u.req.set_window_region_request.__header.req = REQ_set_window_region;
+            info.u.req.set_window_region_request.window = wine_server_user_handle( hwnd );
+            wine_server_add_data( &info, &shape, sizeof(shape) );
+            status = p_wine_server_call( &info );
+            ok( !status, "superseding scene mutation status %#x\n", status );
+        }
+        status = prepare_surface_state( hwnd, &state );
+        ok( !status && state.pending == 1 && state.generation, "repair prepare status %#x pending %u\n",
+            status, state.pending );
+        producers = drain_scene_notifications( &owner_updates, &prepares );
+        ok( producers == !!i && owner_updates, "repair composition producer %u owner %u\n",
+            producers, owner_updates );
+        before = state;
+        status = request_owner_repair( hwnd, state.scene_generation, receipt, sizeof(*receipt), &accepted );
+        ok( !status && accepted, "existing assembly repair rejected, status %#x\n", status );
+        set_surface_state( hwnd, 0, 0, 0, &state );
+        ok( state.generation == before.generation && state.scene_generation == before.scene_generation,
+            "existing assembly repair opened a new scene\n" );
+        producers = drain_scene_notifications( &owner_updates, &prepares );
+        ok( !producers && owner_updates && !prepares, "assembly repair producer %u owner %u preparation %u\n",
+            producers, owner_updates, prepares );
+        if (!i)
+        {
+            struct handoff_binding rebound = {0};
+
+            status = release_surface_handoff( hwnd, receipt->process, receipt->surface, receipt->cookie, TRUE );
+            ok( !status, "warm assembly consumer release status %#x\n", status );
+            producers = drain_scene_notifications( &owner_updates, &prepares );
+            ok( producers == 1, "warm assembly cache retirement omitted source recovery: %u notifications\n", producers );
+            status = get_surface_handoff( hwnd, receipt->process, receipt->surface, TRUE, &rebound );
+            ok( !status && rebound.cookie == receipt->cookie, "temporary consumer rebind status %#x\n", status );
+            if (rebound.mapping) CloseHandle( rebound.mapping );
+        }
+        status = complete_surface_handoffs( hwnd, state.generation, state.scene_generation, receipt, 1, &accepted );
+        ok( !status && accepted, "repaired assembly rejected retained receipt, status %#x\n", status );
+        status = set_surface_state_scene( hwnd, 0, CLIENT_SURFACE_STATE_PUBLISH_COMMIT,
+                                          state.generation, state.scene_generation, &state );
+        ok( !status && !state.generation && !state.staged, "repair publication status %#x\n", status );
+        drain_scene_notifications( &owner_updates, &prepares );
+        winetest_pop_context();
+    }
+    child = create_test_child( hwnd, 10 );
+    ok( !!child, "could not create cold scene layer\n" );
+    if (child)
+    {
+        child_surface = allocate_surface();
+        set_surface_state( child, child_surface,
+            CLIENT_SURFACE_STATE_REGISTER | CLIENT_SURFACE_STATE_SCENE_PUBLICATION, 0, NULL );
+        claim_surface_state( child, child_surface, &state );
+        status = request_owner_repair( hwnd, state.scene_generation, receipt, sizeof(*receipt), &accepted );
+        ok( !status && !accepted, "incomplete owner cache accepted a cold selected layer, status %#x\n", status );
+        status = request_owner_repair( child, state.scene_generation, receipt, sizeof(*receipt), &accepted );
+        ok( status == STATUS_ACCESS_DENIED && !accepted, "child accepted as repair owner, status %#x\n", status );
+        DestroyWindow( child );
+    }
+}
+
 static void test_handoff_receipts(void)
 {
     const UINT64 identity = allocate_surface();
@@ -1530,7 +1690,7 @@ static void test_handoff_receipts(void)
     struct surface_state state, before;
     struct __server_request_info info = {0};
     HWND hwnd = create_test_window( FALSE );
-    unsigned int status;
+    unsigned int status, producers, owner_updates, prepares;
     void *view = NULL;
     BOOL accepted;
 
@@ -1610,6 +1770,22 @@ static void test_handoff_receipts(void)
     status = set_surface_state_scene( hwnd, 0, CLIENT_SURFACE_STATE_PUBLISH_COMMIT,
         state.generation, state.scene_generation, &state );
     ok( !status && !state.staged, "receipt publication failed, status %#x staged %u\n", status, state.staged );
+    check_owner_repair( hwnd, &receipt );
+    prepare_surface_state( hwnd, &state );
+    complete_surface_handoffs( hwnd, state.generation, state.scene_generation, &receipt, 1, &accepted );
+    set_surface_state_scene( hwnd, 0, CLIENT_SURFACE_STATE_PUBLISH_COMMIT,
+                             state.generation, state.scene_generation, &state );
+    drain_scene_notifications( &owner_updates, &prepares );
+    status = request_owner_repair( hwnd, state.scene_generation, &receipt, sizeof(receipt), &accepted );
+    ok( !status && accepted, "warm repair before channel loss status %#x\n", status );
+    drain_scene_notifications( &owner_updates, &prepares );
+    __atomic_store_n( &channel->closed, 1, __ATOMIC_RELEASE );
+    status = prepare_surface_state( hwnd, &state );
+    ok( !status && state.pending == 1, "lost cache preparation status %#x pending %u\n", status, state.pending );
+    producers = drain_scene_notifications( &owner_updates, &prepares );
+    ok( producers == 1, "channel loss during preparation omitted source recovery: %u notifications\n", producers );
+    status = request_owner_repair( hwnd, state.scene_generation, &receipt, sizeof(receipt), &accepted );
+    ok( !status && !accepted, "lost channel authorized a new owner repair, status %#x\n", status );
 done:
     set_surface_state( hwnd, identity, CLIENT_SURFACE_STATE_UNREGISTER, 0, NULL );
     if (producer.cookie) release_surface_handoff( hwnd, 0, identity, producer.cookie, FALSE );
@@ -2042,6 +2218,12 @@ static void handoff_storage_exit_child( HWND hwnd, HANDLE ready, HANDLE release,
     status = get_scene_snapshot( hwnd, 0, sizeof(snapshot.data), &snapshot );
     ok( status == STATUS_ACCESS_DENIED && !snapshot.returned,
         "foreign producer read owner scene, status %#x size %u\n", status, snapshot.returned );
+    {
+        BOOL accepted;
+
+        status = request_owner_repair( hwnd, 0, NULL, 0, &accepted );
+        ok( status == STATUS_ACCESS_DENIED && !accepted, "foreign producer requested owner repair, status %#x\n", status );
+    }
     status = get_surface_handoff( hwnd, 0, identity, FALSE, &binding );
     ok( !status, "exit child producer bind status %#x\n", status );
     if (status) goto done;

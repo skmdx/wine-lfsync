@@ -870,7 +870,7 @@ static BOOL X11DRV_Expose( HWND hwnd, XEvent *xev )
 
     release_win_data( data );
 
-    if (repair) client_surface_geometry_ready( hwnd );
+    if (repair) client_surface_repair_owner( hwnd );
     if (!restored) NtUserExposeWindowSurface( hwnd, flags, &rect );
     return TRUE;
 }

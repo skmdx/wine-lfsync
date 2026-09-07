@@ -6554,6 +6554,22 @@ struct get_client_surface_scene_snapshot_reply
     /* VARARG(layers,bytes); */
 };
 
+/* Request an owner cache replay after native repair. Receipts attest a
+ * retained image for every visible selected producer in the exact scene. */
+struct request_client_surface_owner_repair_request
+{
+    struct request_header __header;
+    user_handle_t handle;
+    unsigned __int64 scene_id;
+    /* VARARG(receipts,bytes); */
+};
+struct request_client_surface_owner_repair_reply
+{
+    struct reply_header __header;
+    int accepted;
+    char __pad_12[4];
+};
+
 
 struct set_window_present_rect_request
 {
@@ -6892,6 +6908,7 @@ enum request
     REQ_cancel_client_surface_handoffs,
     REQ_publish_client_surface_handoff,
     REQ_get_client_surface_scene_snapshot,
+    REQ_request_client_surface_owner_repair,
     REQ_set_window_present_rect,
     REQ_NB_REQUESTS
 };
@@ -7221,6 +7238,7 @@ union generic_request
     struct cancel_client_surface_handoffs_request cancel_client_surface_handoffs_request;
     struct publish_client_surface_handoff_request publish_client_surface_handoff_request;
     struct get_client_surface_scene_snapshot_request get_client_surface_scene_snapshot_request;
+    struct request_client_surface_owner_repair_request request_client_surface_owner_repair_request;
     struct set_window_present_rect_request set_window_present_rect_request;
 };
 union generic_reply
@@ -7548,9 +7566,10 @@ union generic_reply
     struct cancel_client_surface_handoffs_reply cancel_client_surface_handoffs_reply;
     struct publish_client_surface_handoff_reply publish_client_surface_handoff_reply;
     struct get_client_surface_scene_snapshot_reply get_client_surface_scene_snapshot_reply;
+    struct request_client_surface_owner_repair_reply request_client_surface_owner_repair_reply;
     struct set_window_present_rect_reply set_window_present_rect_reply;
 };
 
-#define SERVER_PROTOCOL_VERSION 1010
+#define SERVER_PROTOCOL_VERSION 1011
 
 #endif /* __WINE_WINE_SERVER_PROTOCOL_H */

@@ -2281,13 +2281,10 @@ static BOOL apply_window_pos( HWND hwnd, HWND insert_after, UINT swp_flags, stru
              * handshake must not acknowledge a native change still pending. */
             return !(swp_flags & (WINE_SWP_CLIENT_SURFACE_PREPARE | WINE_SWP_CLIENT_SURFACE_PUBLISH));
         }
-        /* The server publishes Win32 geometry before the host driver applies
-         * it.  A client surface in another process can therefore compose into
-         * the old host extent and lose the newly allocated pixels.  Once the
-         * driver has completed its resize/barrier, ask each process owning an
-         * active surface to copy its cached drawable again.  This is an
-         * ordering notification, not a timer-based retry. */
-        if (toplevel_size_changed) client_surface_geometry_ready( toplevel );
+        /* Win32 geometry precedes the native resize. Repair the completed
+         * host extent from owner images when possible; cold or legacy sources
+         * retain their producer target update and recompose path. */
+        if (toplevel_size_changed) client_surface_repair_owner( toplevel );
         update_client_surfaces( toplevel );
     }
 

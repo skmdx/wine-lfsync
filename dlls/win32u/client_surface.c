@@ -1409,6 +1409,13 @@ void client_surface_geometry_ready( HWND hwnd )
     if (wake && toplevel) NtUserPostMessage( toplevel, WM_WINE_UPDATEWINDOWSTATE, 0, 0 );
 }
 
+void client_surface_repair_owner( HWND hwnd )
+{
+    /* Only the native owner can know whether its immutable images cover the
+     * current scene. Legacy and cold caches still need producer source recovery. */
+    if (!user_driver->pRepairClientSurfaceOwner( hwnd )) client_surface_geometry_ready( hwnd );
+}
+
 void client_surface_set_staged( HWND hwnd )
 {
     HWND toplevel;

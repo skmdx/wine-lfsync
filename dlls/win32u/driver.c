@@ -883,6 +883,11 @@ static struct client_surface *nulldrv_CreateClientSurface( HWND hwnd, int pixel_
     return client_surface_create( sizeof(struct client_surface), NULL, hwnd, pixel_format, raw );
 }
 
+static BOOL nulldrv_RepairClientSurfaceOwner( HWND hwnd )
+{
+    return FALSE;
+}
+
 static BOOL nulldrv_CreateWindowSurface( HWND hwnd, BOOL layered, const RECT *surface_rect, struct window_surface **surface )
 {
     return FALSE;
@@ -1308,6 +1313,7 @@ static const struct user_driver_funcs lazy_load_driver =
     nulldrv_GetWindowStyleMasks,
     nulldrv_GetWindowStateUpdates,
     nulldrv_CreateClientSurface,
+    nulldrv_RepairClientSurfaceOwner,
     nulldrv_CreateWindowSurface,
     nulldrv_MoveWindowBits,
     nulldrv_WindowPosChanged,
@@ -1408,6 +1414,7 @@ void __wine_set_user_driver( const struct user_driver_funcs *funcs, UINT version
     SET_USER_FUNC(GetWindowStyleMasks);
     SET_USER_FUNC(GetWindowStateUpdates);
     SET_USER_FUNC(CreateClientSurface);
+    SET_USER_FUNC(RepairClientSurfaceOwner);
     SET_USER_FUNC(CreateWindowSurface);
     SET_USER_FUNC(MoveWindowBits);
     SET_USER_FUNC(WindowPosChanged);
