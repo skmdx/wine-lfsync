@@ -194,6 +194,9 @@ struct client_surface_compositor_target
     BOOL assembly_pending;
     BOOL quiescing;
     unsigned int native_updates;
+    UINT64 deferred_update;
+    BOOL update_notified;
+    UINT deferred_update_types;
     UINT64 mailbox_bytes;
     DWORD shrink_start;
     XID present_event;
@@ -229,6 +232,9 @@ enum client_surface_compositor_op
     CLIENT_SURFACE_COMPOSITOR_REMOVE_TARGET,
     CLIENT_SURFACE_COMPOSITOR_RESTORE_TARGET,
     CLIENT_SURFACE_COMPOSITOR_BEGIN_UPDATE,
+    CLIENT_SURFACE_COMPOSITOR_TRY_BEGIN_UPDATE,
+    CLIENT_SURFACE_COMPOSITOR_CHECK_UPDATE,
+    CLIENT_SURFACE_COMPOSITOR_FINISH_UPDATE,
     CLIENT_SURFACE_COMPOSITOR_END_UPDATE,
 };
 
@@ -274,6 +280,8 @@ struct client_surface_compositor_job
     unsigned int handoff_count;
     BOOL *handoff_reused;
     BOOL invalidate_scene;
+    BOOL update_deferred;
+    UINT update_types;
     DWORD shrink_start;
 };
 
@@ -283,6 +291,7 @@ static struct client_surface_compositor_job **client_surface_compositor_tail =
 /* Only the compositor thread touches pending jobs. Their submitting threads
  * retain ownership until completion, including while another target runs. */
 static struct client_surface_compositor_job *client_surface_compositor_pending;
+static UINT64 client_surface_native_update_serial;
 
 #define CLIENT_SURFACE_COPY_BATCH_SIZE 64
 struct client_surface_owner_copy
@@ -1316,7 +1325,7 @@ static BOOL install_client_surface_scene_plan( struct client_surface_compositor_
     job->layout_count = 0;
     target->scene.count = count;
     target->scene.valid = TRUE;
-    target->quiescing = !!target->native_updates;
+    target->quiescing = target->native_updates || target->deferred_update;
     target->receipts = receipts;
     target->replay_member = 0;
     for (i = 0; i < count; ++i)
@@ -1467,7 +1476,7 @@ static BOOL update_client_surface_compositor_target( struct client_surface_compo
     target->window_height = job->window_height;
     target->depth = job->depth;
     target->visual = job->visual;
-    target->quiescing = !!target->native_updates;
+    target->quiescing = target->native_updates || target->deferred_update;
     TRACE( "updated compositor target hwnd %p window %#lx size %ux%u depth %u visual %#lx\n",
            target->toplevel, target->window, target->window_width, target->window_height,
            target->depth, target->visual );
@@ -2686,17 +2695,84 @@ static void wait_client_surface_compositor_work(void)
     if (ret < 0) WARN( "client-surface compositor poll failed, error %d\n", errno );
 }
 
+static void quiesce_client_surface_compositor_target( struct client_surface_compositor_target *target )
+{
+    target->quiescing = TRUE;
+    if (target->copy_frame) return;
+    finish_client_surface_compositor_assembly( target, TRUE );
+    if (target->mailbox_pending && target->mailbox_publish_generation)
+        publish_client_surface_handoff_generation( target->toplevel,
+            target->mailbox_publish_generation, target->mailbox_publish_epoch, FALSE );
+    target->mailbox_pending = FALSE;
+    target->mailbox_publish_generation = target->mailbox_publish_epoch = 0;
+}
+
+static struct client_surface_compositor_target *client_surface_compositor_job_target(
+    const struct client_surface_compositor_job *job );
+
+static BOOL client_surface_compositor_update_ready( struct client_surface_compositor_target *target,
+                                                    const struct client_surface_compositor_job *until )
+{
+    const struct client_surface_compositor_job *job;
+    unsigned int i;
+
+    if (target->copy_frame || target->native_updates) return FALSE;
+    for (i = 0; i < ARRAY_SIZE(target->frames); ++i)
+        if (target->frames[i].serial) return FALSE;
+    for (job = client_surface_compositor_pending; job && job != until; job = job->next)
+        if (client_surface_compositor_job_target( job ) == target) return FALSE;
+    return TRUE;
+}
+
 static BOOL execute_client_surface_compositor_job( struct client_surface_compositor_job *job )
 {
     if (job->op == CLIENT_SURFACE_COMPOSITOR_BEGIN_UPDATE ||
+        job->op == CLIENT_SURFACE_COMPOSITOR_TRY_BEGIN_UPDATE ||
+        job->op == CLIENT_SURFACE_COMPOSITOR_CHECK_UPDATE ||
+        job->op == CLIENT_SURFACE_COMPOSITOR_FINISH_UPDATE ||
         job->op == CLIENT_SURFACE_COMPOSITOR_END_UPDATE)
     {
         struct client_surface_compositor_target *target =
             find_client_surface_compositor_target( job->handoff_toplevel );
 
         if (!target) return FALSE;
-        if (job->op == CLIENT_SURFACE_COMPOSITOR_BEGIN_UPDATE)
+        if (job->op == CLIENT_SURFACE_COMPOSITOR_CHECK_UPDATE ||
+            job->op == CLIENT_SURFACE_COMPOSITOR_FINISH_UPDATE)
         {
+            if (target->deferred_update != job->mark || !target->update_notified) return FALSE;
+            if (job->op == CLIENT_SURFACE_COMPOSITOR_CHECK_UPDATE)
+            {
+                job->update_types = target->deferred_update_types | X11DRV_CLIENT_SURFACE_UPDATE_STATE;
+                target->deferred_update_types = 0;
+            }
+            else
+            {
+                if (!target->deferred_update_types) target->deferred_update = 0;
+                target->update_notified = FALSE;
+                target->quiescing = target->native_updates || target->deferred_update;
+            }
+            return TRUE;
+        }
+        if (job->op == CLIENT_SURFACE_COMPOSITOR_TRY_BEGIN_UPDATE)
+        {
+            quiesce_client_surface_compositor_target( target );
+            if (!client_surface_compositor_update_ready( target, job ))
+            {
+                if (!target->deferred_update)
+                {
+                    if (!(++client_surface_native_update_serial)) ++client_surface_native_update_serial;
+                    target->deferred_update = client_surface_native_update_serial;
+                }
+                target->deferred_update_types |= job->update_types;
+                job->update_deferred = TRUE;
+                TRACE( "deferring native state update %s for %p\n",
+                       wine_dbgstr_longlong( target->deferred_update ), target->toplevel );
+                return FALSE;
+            }
+        }
+        if (job->op != CLIENT_SURFACE_COMPOSITOR_END_UPDATE)
+        {
+            target->deferred_update_types &= ~job->update_types;
             ++target->native_updates;
             target->quiescing = TRUE;
             if (job->invalidate_scene) target->scene.valid = FALSE;
@@ -2704,7 +2780,7 @@ static BOOL execute_client_surface_compositor_job( struct client_surface_composi
         else
         {
             if (target->native_updates) --target->native_updates;
-            target->quiescing = !!target->native_updates;
+            target->quiescing = target->native_updates || target->deferred_update;
         }
         return TRUE;
     }
@@ -2773,6 +2849,11 @@ static BOOL client_surface_compositor_job_ready( struct client_surface_composito
     BOOL drain = FALSE;
 
     if (!target) return TRUE;
+    /* These probes never mutate native geometry or consume an output. They
+     * must answer while that target's older Present work is still pending. */
+    if (job->op == CLIENT_SURFACE_COMPOSITOR_TRY_BEGIN_UPDATE ||
+        job->op == CLIENT_SURFACE_COMPOSITOR_CHECK_UPDATE ||
+        job->op == CLIENT_SURFACE_COMPOSITOR_FINISH_UPDATE) return TRUE;
     /* Preserve the scene, binding and frame referenced by the request. Only
      * this target waits; jobs for independent targets remain eligible. */
     if (target->copy_frame) return FALSE;
@@ -2787,13 +2868,7 @@ static BOOL client_surface_compositor_job_ready( struct client_surface_composito
     {
         /* Stop producing work for this target while its previous native
          * scene drains. Other targets remain eligible in the same loop. */
-        target->quiescing = TRUE;
-        finish_client_surface_compositor_assembly( target, TRUE );
-        if (target->mailbox_pending && target->mailbox_publish_generation)
-            publish_client_surface_handoff_generation( target->toplevel,
-                target->mailbox_publish_generation, target->mailbox_publish_epoch, FALSE );
-        target->mailbox_pending = FALSE;
-        target->mailbox_publish_generation = target->mailbox_publish_epoch = 0;
+        quiesce_client_surface_compositor_target( target );
     }
     for (i = 0; i < ARRAY_SIZE(target->frames); ++i)
     {
@@ -2841,7 +2916,9 @@ static BOOL process_client_surface_compositor_jobs(void)
         for (earlier = client_surface_compositor_pending; earlier != job; earlier = earlier->next)
             if ((target && target == client_surface_compositor_job_target( earlier )) ||
                 (job->handoff_toplevel && job->handoff_toplevel == earlier->handoff_toplevel)) break;
-        if (earlier != job)
+        if (earlier != job && job->op != CLIENT_SURFACE_COMPOSITOR_TRY_BEGIN_UPDATE &&
+            job->op != CLIENT_SURFACE_COMPOSITOR_CHECK_UPDATE &&
+            job->op != CLIENT_SURFACE_COMPOSITOR_FINISH_UPDATE)
         {
             cursor = &job->next;
             continue;
@@ -2889,6 +2966,20 @@ static BOOL process_client_surface_compositor_jobs(void)
         job->complete = TRUE;
         pthread_cond_broadcast( &client_surface_compositor_cond );
         pthread_mutex_unlock( &client_surface_compositor_mutex );
+    }
+    for (target = client_surface_compositor_targets; target; target = target->next)
+    {
+        if (!target->deferred_update || target->update_notified) continue;
+        quiesce_client_surface_compositor_target( target );
+        if (!client_surface_compositor_update_ready( target, NULL )) continue;
+        /* Keep this target quiescent until the GUI applies the latest server
+         * state. A token prevents a delayed notification from resuming a new
+         * target or a state update already consumed by another native change. */
+        target->update_notified = NtUserPostMessage( target->toplevel, WM_X11DRV_CLIENT_SURFACE_UPDATE,
+                                                    (UINT)target->deferred_update,
+                                                    (UINT)(target->deferred_update >> 32) );
+        if (!target->update_notified)
+            WARN( "failed to notify deferred native update for %p\n", target->toplevel );
     }
     return progressed;
 }
@@ -2947,6 +3038,7 @@ static BOOL submit_client_surface_compositor_job( struct client_surface_composit
     job->next = NULL;
     job->complete = FALSE;
     job->present_started = job->present_done = FALSE;
+    job->update_deferred = FALSE;
     pthread_mutex_lock( &client_surface_compositor_mutex );
     if (!client_surface_compositor_started)
     {
@@ -3092,21 +3184,28 @@ static void remove_client_surface_backing_target( HWND toplevel )
 }
 
 BOOL X11DRV_client_surface_backing_begin_update( HWND hwnd, const struct window_rects *rects,
-                                                UINT swp_flags )
+                                                UINT swp_flags, BOOL *deferred )
 {
     const UINT no_geometry = SWP_NOSIZE | SWP_NOMOVE | SWP_NOCLIENTSIZE | SWP_NOCLIENTMOVE | SWP_NOZORDER;
     struct x11drv_win_data *data;
-    BOOL backing;
+    BOOL backing, activation;
     struct client_surface_compositor_job job =
     {
         .op = CLIENT_SURFACE_COMPOSITOR_BEGIN_UPDATE,
         .handoff_toplevel = hwnd,
+        .update_types = X11DRV_CLIENT_SURFACE_UPDATE_STATE |
+            ((swp_flags & (WINE_SWP_CLIENT_SURFACE_BACKING_ENABLE | WINE_SWP_CLIENT_SURFACE_BACKING_DISABLE))
+             ? X11DRV_CLIENT_SURFACE_UPDATE_BACKING : 0) |
+            ((swp_flags & WINE_SWP_CLIENT_SURFACE_PREPARE) ? X11DRV_CLIENT_SURFACE_UPDATE_PREPARE : 0),
     };
 
+    if (deferred) *deferred = FALSE;
     if (!(data = get_win_data( hwnd ))) return FALSE;
     backing = !!data->client_surface_backing;
-    /* A state-only refresh still drains native work, but does not change
-     * the plan's placement or clip. The server roster/epoch check continues
+    activation = (swp_flags & WINE_SWP_CLIENT_SURFACE_BACKING_ENABLE) &&
+                 !data->client_surface_backing_enabled;
+    /* A state-only refresh does not change the plan's placement or clip.
+     * The server roster/epoch check continues
      * to invalidate topology and producer changes. Be conservative for
      * fullscreen mappings, shape, frame and actual native geometry changes. */
     job.invalidate_scene = !rects || (swp_flags & no_geometry) != no_geometry ||
@@ -3116,11 +3215,56 @@ BOOL X11DRV_client_surface_backing_begin_update( HWND hwnd, const struct window_
     release_win_data( data );
     if (!backing) return FALSE;
 
+    /* Plain state notifications can be coalesced and reapplied from current
+     * server state, including backing and preparation. A deferred prepare
+     * returns FALSE to win32u, which must not acknowledge it before replay.
+     * A new backing activation retains its synchronous native publication
+     * boundary. Repeated enables can coalesce with a pending disable while
+     * the native backing is still enabled. */
+    if (deferred && !job.invalidate_scene && !activation &&
+        !(swp_flags & WINE_SWP_CLIENT_SURFACE_PUBLISH))
+    {
+        BOOL ret;
+
+        job.op = CLIENT_SURFACE_COMPOSITOR_TRY_BEGIN_UPDATE;
+        ret = submit_client_surface_compositor_job( &job );
+        *deferred = job.update_deferred;
+        return ret;
+    }
+
     /* A missing Present event can leave this target quiescing indefinitely.
      * Do not hold the process-wide window-data lock while it drains. Keep
      * only the handle across the wait; the caller must look up its data again.
      * Destroying the window also removes its compositor target. */
     return submit_client_surface_compositor_job( &job );
+}
+
+UINT X11DRV_client_surface_backing_resume_update( HWND hwnd, UINT64 serial )
+{
+    struct client_surface_compositor_job job =
+    {
+        .op = CLIENT_SURFACE_COMPOSITOR_CHECK_UPDATE,
+        .handoff_toplevel = hwnd,
+        .mark = serial,
+    };
+
+    if (!submit_client_surface_compositor_job( &job )) return 0;
+    return job.update_types;
+}
+
+void X11DRV_client_surface_backing_finish_deferred_update( HWND hwnd, UINT64 serial )
+{
+    struct client_surface_compositor_job job =
+    {
+        .op = CLIENT_SURFACE_COMPOSITOR_FINISH_UPDATE,
+        .handoff_toplevel = hwnd,
+        .mark = serial,
+    };
+
+    /* Even if the server no longer needs a prepare or backing transition,
+     * release this notification's hold after every state handler returned.
+     * A handler which deferred again leaves its reasons for the next wake. */
+    submit_client_surface_compositor_job( &job );
 }
 
 void X11DRV_client_surface_backing_end_update( struct x11drv_win_data *data )

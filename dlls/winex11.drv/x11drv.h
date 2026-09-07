@@ -255,7 +255,7 @@ extern struct client_surface *X11DRV_CreateClientSurface( HWND hwnd, int format,
 extern BOOL X11DRV_CreateWindowSurface( HWND hwnd, BOOL layered, const RECT *surface_rect, struct window_surface **surface );
 extern void X11DRV_MoveWindowBits( HWND hwnd, const struct window_rects *old_rects,
                                    const struct window_rects *new_rects, const RECT *valid_rects );
-extern void X11DRV_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_hint, UINT swp_flags,
+extern BOOL X11DRV_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_hint, UINT swp_flags,
                                      const struct window_rects *new_rects, struct window_surface *surface );
 extern BOOL X11DRV_SystemParametersInfo( UINT action, UINT int_param, void *ptr_param,
                                          UINT flags );
@@ -641,7 +641,8 @@ enum x11drv_window_messages
     WM_X11DRV_SET_WIN_REGION,
     WM_X11DRV_DELETE_TAB,
     WM_X11DRV_ADD_TAB,
-    WM_X11DRV_SET_LAYERED_ATTRIBUTES
+    WM_X11DRV_SET_LAYERED_ATTRIBUTES,
+    WM_X11DRV_CLIENT_SURFACE_UPDATE
 };
 
 /* _NET_WM_STATE properties that we keep track of */
@@ -743,7 +744,12 @@ extern Window X11DRV_get_whole_window( HWND hwnd );
 extern void X11DRV_client_surface_backing_destroy( struct x11drv_win_data *data );
 extern BOOL X11DRV_client_surface_backing_ensure( struct x11drv_win_data *data );
 extern BOOL X11DRV_client_surface_backing_begin_update( HWND hwnd, const struct window_rects *rects,
-                                                       UINT swp_flags );
+                                                        UINT swp_flags, BOOL *deferred );
+extern UINT X11DRV_client_surface_backing_resume_update( HWND hwnd, UINT64 serial );
+extern void X11DRV_client_surface_backing_finish_deferred_update( HWND hwnd, UINT64 serial );
+#define X11DRV_CLIENT_SURFACE_UPDATE_STATE   1
+#define X11DRV_CLIENT_SURFACE_UPDATE_BACKING 2
+#define X11DRV_CLIENT_SURFACE_UPDATE_PREPARE 4
 extern void X11DRV_client_surface_backing_end_update( struct x11drv_win_data *data );
 extern BOOL X11DRV_client_surface_backing_snapshot( struct x11drv_win_data *data, BOOL invalidate );
 extern BOOL X11DRV_client_surface_backing_publish( struct x11drv_win_data *data );

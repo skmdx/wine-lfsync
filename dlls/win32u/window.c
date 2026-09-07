@@ -2273,8 +2273,14 @@ static BOOL apply_window_pos( HWND hwnd, HWND insert_after, UINT swp_flags, stru
         if (!owner_hint) owner_hint = NtUserWindowFromPoint(new_rects->window.left - 1, new_rects->window.top - 1);
         if (owner_hint) owner_hint = NtUserGetAncestor(owner_hint, GA_ROOT);
 
-        user_driver->pWindowPosChanged( hwnd, insert_after, owner_hint, swp_flags, &monitor_rects,
-                                        get_driver_window_surface( new_surface, raw_dpi ) );
+        if (!user_driver->pWindowPosChanged( hwnd, insert_after, owner_hint, swp_flags, &monitor_rects,
+                                             get_driver_window_surface( new_surface, raw_dpi ) ))
+        {
+            /* State notifications may wait for native work asynchronously.
+             * Win32 state is already committed, but a prepare/publication
+             * handshake must not acknowledge a native change still pending. */
+            return !(swp_flags & (WINE_SWP_CLIENT_SURFACE_PREPARE | WINE_SWP_CLIENT_SURFACE_PUBLISH));
+        }
         /* The server publishes Win32 geometry before the host driver applies
          * it.  A client surface in another process can therefore compose into
          * the old host extent and lose the newly allocated pixels.  Once the

@@ -1036,14 +1036,14 @@ BOOL ANDROID_CreateWindowSurface( HWND hwnd, BOOL layered, const RECT *surface_r
 /***********************************************************************
  *           ANDROID_WindowPosChanged
  */
-void ANDROID_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_hint, UINT swp_flags,
+BOOL ANDROID_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_hint, UINT swp_flags,
                                const struct window_rects *new_rects, struct window_surface *surface )
 {
     struct android_win_data *data;
     UINT new_style = NtUserGetWindowLongW( hwnd, GWL_STYLE );
     HWND owner = 0;
 
-    if (!(data = get_win_data( hwnd ))) return;
+    if (!(data = get_win_data( hwnd ))) return TRUE;
     data->rects = *new_rects;
 
     if (!data->parent) owner = NtUserGetWindowRelative( hwnd, GW_OWNER );
@@ -1055,6 +1055,7 @@ void ANDROID_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_hint, UI
            debugstr_window_rects(new_rects), new_style, owner, insert_after, swp_flags );
 
     ioctl_window_pos_changed( hwnd, new_rects, new_style, swp_flags, insert_after, owner );
+    return TRUE;
 }
 
 

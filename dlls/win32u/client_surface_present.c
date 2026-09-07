@@ -306,7 +306,8 @@ release:
     return FALSE;
 }
 
-static BOOL acquire_client_surface_handoff( struct client_surface *surface, UINT64 *token,
+static BOOL acquire_client_surface_handoff( struct client_surface *surface,
+                                            const struct client_surface_scene *scene, UINT64 *token,
                                             unsigned int *index_ret )
 {
     DWORD start = NtGetTickCount();
@@ -342,6 +343,21 @@ static BOOL acquire_client_surface_handoff( struct client_surface *surface, UINT
                 *token = submitted;
                 return TRUE;
             }
+        /* A target writer may need this mutex to move the producer to the
+         * owner which can consume its images. Do not keep waiting on the old
+         * binding after that writer or a new scene has invalidated this wait.
+         * Retirement retains immutable images until their actual readers
+         * finish; cancellation does not make READY or READING storage free.
+         * Independent snapshots need no published scene, but must yield to
+         * a pending target change for the same reason. */
+        if (InterlockedCompareExchange( &surface->target_update_waiters, 0, 0 ) ||
+            InterlockedCompareExchange( &surface->target_update_pending, 0, 0 ) ||
+            (scene && !client_surface_scene_current( scene )))
+        {
+            TRACE( "cancelling stale source wait identity %s cookie %s\n",
+                   wine_dbgstr_longlong( surface->identity ), wine_dbgstr_longlong( surface->handoff_cookie ) );
+            return FALSE;
+        }
         if (NtGetTickCount() - start >= CLIENT_SURFACE_PRESENT_TIMEOUT) return FALSE;
         __atomic_store_n( &surface->handoff_shared->release_parked, 1, __ATOMIC_RELEASE );
         sequence = __atomic_load_n( &surface->handoff_shared->release_sequence, __ATOMIC_ACQUIRE );
@@ -391,7 +407,8 @@ static BOOL prepare_client_surface_handoff_locked( struct client_surface *surfac
                wine_dbgstr_longlong( surface->identity ) );
         return FALSE;
     }
-    if (!acquire_client_surface_handoff( surface, &token, &present->handoff_index ))
+    if (!acquire_client_surface_handoff( surface, independent ? NULL : &present->scene,
+                                        &token, &present->handoff_index ))
     {
         client_surface_release_handoff( surface );
         return FALSE;

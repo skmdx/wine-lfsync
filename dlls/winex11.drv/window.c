@@ -3413,7 +3413,7 @@ static BOOL get_desired_wm_state( DWORD style, const struct window_rects *rects 
 /***********************************************************************
  *		WindowPosChanged   (X11DRV.@)
  */
-void X11DRV_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_hint, UINT swp_flags,
+BOOL X11DRV_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_hint, UINT swp_flags,
                               const struct window_rects *new_rects, struct window_surface *surface )
 {
     struct x11drv_win_data *data;
@@ -3426,12 +3426,13 @@ void X11DRV_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_hint, UIN
     BOOL prepare_client_surface = !!(swp_flags & WINE_SWP_CLIENT_SURFACE_PREPARE);
     BOOL enable_client_surface_backing = !!(swp_flags & WINE_SWP_CLIENT_SURFACE_BACKING_ENABLE);
     BOOL disable_client_surface_backing = !!(swp_flags & WINE_SWP_CLIENT_SURFACE_BACKING_DISABLE);
-    BOOL owner_update;
+    BOOL owner_update, deferred;
 
     if ((is_managed = is_window_managed( hwnd, swp_flags, fullscreen ))) make_owner_managed( hwnd );
 
-    owner_update = X11DRV_client_surface_backing_begin_update( hwnd, new_rects, swp_flags );
-    if (!(data = get_win_data( hwnd ))) return;
+    owner_update = X11DRV_client_surface_backing_begin_update( hwnd, new_rects, swp_flags, &deferred );
+    if (deferred) return FALSE;
+    if (!(data = get_win_data( hwnd ))) return TRUE;
     if (is_managed) window_set_managed( data, TRUE );
 
     old_rects = data->rects;
@@ -3484,7 +3485,7 @@ void X11DRV_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_hint, UIN
             client_surface_bypass_staging( hwnd );
         if (owner_update) X11DRV_client_surface_backing_end_update( data );
         release_win_data( data );
-        return;
+        return TRUE;
     }
 
     /* don't change position if we are about to minimize or maximize a managed window */
@@ -3580,6 +3581,7 @@ void X11DRV_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_hint, UIN
     release_win_data( data );
 
     if (was_fullscreen) NtUserClipCursor( NULL );
+    return TRUE;
 }
 
 /* check if the window icon should be hidden (i.e. moved off-screen) */
@@ -3671,7 +3673,7 @@ void X11DRV_SetWindowIcons( HWND hwnd, HICON icon, const ICONINFO *ii, HICON ico
 void X11DRV_SetWindowRgn( HWND hwnd, HRGN hrgn, BOOL redraw )
 {
     struct x11drv_win_data *data;
-    BOOL owner_update = X11DRV_client_surface_backing_begin_update( hwnd, NULL, 0 );
+    BOOL owner_update = X11DRV_client_surface_backing_begin_update( hwnd, NULL, 0, NULL );
 
     if ((data = get_win_data( hwnd )))
     {
@@ -3786,6 +3788,22 @@ LRESULT X11DRV_WindowMessage( HWND hwnd, UINT msg, WPARAM wp, LPARAM lp )
 
     switch(msg)
     {
+    case WM_X11DRV_CLIENT_SURFACE_UPDATE:
+    {
+        UINT64 serial = (UINT64)(UINT)wp | ((UINT64)(UINT)lp << 32);
+        UINT types = X11DRV_client_surface_backing_resume_update( hwnd, serial );
+
+        if (types)
+        {
+            if (types & X11DRV_CLIENT_SURFACE_UPDATE_BACKING)
+                send_message( hwnd, WM_WINE_UPDATEWINDOWSTATE, WINE_UPDATE_CLIENT_SURFACE_BACKING, 0 );
+            if (types & X11DRV_CLIENT_SURFACE_UPDATE_PREPARE)
+                send_message( hwnd, WM_WINE_UPDATEWINDOWSTATE, WINE_PREPARE_CLIENT_SURFACES, 0 );
+            send_message( hwnd, WM_WINE_UPDATEWINDOWSTATE, WINE_UPDATE_CLIENT_SURFACE_HANDOFFS, 0 );
+            X11DRV_client_surface_backing_finish_deferred_update( hwnd, serial );
+        }
+        return 0;
+    }
     case WM_X11DRV_UPDATE_CLIPBOARD:
         return update_clipboard( hwnd );
     case WM_X11DRV_SET_WIN_REGION:
