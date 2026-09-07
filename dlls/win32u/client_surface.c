@@ -341,7 +341,15 @@ void client_surface_invalidate_source_locked( struct client_surface *surface,
         surface->composed_serial = present->serial;
         InterlockedExchange( &surface->content_valid, FALSE );
         if (!InterlockedCompareExchange( &surface->active, 0, 0 ))
+        {
             client_surface_uncache_present_locked( surface );
+            /* No renderer or cached image can use this handoff again. Retire
+             * it independently of the native drawable's final release, which
+             * may still wait for the failed frame's GPU work. Completion
+             * ownership protects the remaining submitted handoff tokens. */
+            if (!InterlockedCompareExchange( &surface->server_cached, 0, 0 ))
+                client_surface_release_handoff( surface );
+        }
     }
     pthread_mutex_unlock( &surface->present_lock );
 }
@@ -1570,7 +1578,13 @@ void use_window_client_surface( struct client_surface *surface, BOOL use )
     /* Keep the old token when the server request failed.  Re-registering the
      * same identity can then repair client/server membership instead of
      * leaking an unreachable active ref until process teardown. */
-    if (renew_identity && toplevel) renew_client_surface_identity( surface );
+    if (renew_identity && toplevel)
+    {
+        /* An invalidated frame may have completed before the drawable became
+         * unused. End its old handoff here as well as in the completion path. */
+        client_surface_release_handoff( surface );
+        renew_client_surface_identity( surface );
+    }
     pthread_mutex_unlock( &surface->present_lock );
 
     if (invalid) detach_client_surfaces( hwnd );
