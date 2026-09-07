@@ -2450,6 +2450,10 @@ void attach_client_window( struct x11drv_win_data *data, Window client_window )
         client_window_events_enable( data, client_window );
         XReparentWindow( gdi_display, client_window, data->whole_window, data->rects.client.left - data->rects.visible.left,
                          data->rects.client.top - data->rects.visible.top );
+        /* Native WSI may present through another X connection. Complete the
+         * reparent before it can present, otherwise the later unmap/remap can
+         * discard that first image. Unchanged attachments return above. */
+        XSync( gdi_display, False );
     }
 
     data->client_window = client_window;
