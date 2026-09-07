@@ -183,6 +183,14 @@ static const char *glxExtensions;
 static int glxVersion[2];
 static int glx_opcode;
 
+/* Serialize runtime context operations before taking an X error scope. GLX
+ * context creation can hold the display lock while updating libGLX's context
+ * table, whereas binding and destruction can hold native context locks while
+ * sending X requests. Do not hold the display lock around ordinary binding:
+ * releasing the old context can wait for presentation while the GUI needs it.
+ * The initialization probe runs before the driver is published. */
+static pthread_mutex_t glx_context_mutex = PTHREAD_MUTEX_INITIALIZER;
+
 struct glx_pixel_format
 {
     GLXFBConfig fbconfig;
@@ -925,6 +933,7 @@ static void destroy_glx_completion_objects( struct glx_completion_context *compl
      * A failed creation can leave a client handle with no server resource.
      * Release it under a fresh error scope, including asynchronous errors. */
     if (!completion->context && !completion->pbuffer) return;
+    pthread_mutex_lock( &glx_context_mutex );
     X11DRV_expect_error( gdi_display, glx_completion_error_handler, NULL );
     if (completion->context) pglXDestroyContext( gdi_display, completion->context );
     if (completion->pbuffer) pglXDestroyPbuffer( gdi_display, completion->pbuffer );
@@ -932,6 +941,7 @@ static void destroy_glx_completion_objects( struct glx_completion_context *compl
     if (X11DRV_check_error()) TRACE( "Failed to destroy GLX completion objects\n" );
     completion->context = NULL;
     completion->pbuffer = None;
+    pthread_mutex_unlock( &glx_context_mutex );
 }
 
 static void x11drv_surface_destroy( struct opengl_drawable *base )
@@ -1236,7 +1246,9 @@ static BOOL x11drv_describe_pixel_format( int format, struct wgl_pixel_format *p
 static BOOL x11drv_context_destroy( void *context )
 {
     TRACE("(%p)\n", context);
+    pthread_mutex_lock( &glx_context_mutex );
     pglXDestroyContext( gdi_display, context );
+    pthread_mutex_unlock( &glx_context_mutex );
     return TRUE;
 }
 
@@ -1254,8 +1266,10 @@ static BOOL x11drv_make_current( struct opengl_drawable *draw_base, struct openg
 
     TRACE( "draw %s, read %s, context %p\n", debugstr_opengl_drawable( draw_base ), debugstr_opengl_drawable( read_base ), context );
 
+    pthread_mutex_lock( &glx_context_mutex );
     if (!pglXMakeContextCurrent || !context) ret = pglXMakeCurrent( gdi_display, context ? draw->drawable : None, context );
     else ret = pglXMakeContextCurrent( gdi_display, draw->drawable, read->drawable, context );
+    pthread_mutex_unlock( &glx_context_mutex );
     if (ret) NtCurrentTeb()->glReserved2 = context;
     return ret;
 }
@@ -1338,10 +1352,13 @@ static BOOL x11drv_context_create( int format, void *share, const int *attribLis
         }
     }
 
+    pthread_mutex_lock( &glx_context_mutex );
     X11DRV_expect_error(gdi_display, GLXErrorHandler, NULL);
     *context = create_glxcontext( format, share, attribList ? glx_attribs : NULL );
     XSync(gdi_display, False);
-    if ((err = X11DRV_check_error()) || !*context)
+    err = X11DRV_check_error();
+    pthread_mutex_unlock( &glx_context_mutex );
+    if (err || !*context)
     {
         /* In the future we should convert the GLX error to a win32 one here if needed */
         WARN("Context creation failed (error %#x).\n", err);
@@ -1561,6 +1578,7 @@ static BOOL prepare_glx_completion_context( struct glx_completion_context *compl
     XUnlockDisplay( gdi_display );
     if (!config) return FALSE;
 
+    pthread_mutex_lock( &glx_context_mutex );
     X11DRV_expect_error( gdi_display, glx_completion_error_handler, NULL );
     completion->context = pglXCreateNewContext( gdi_display, config, GLX_RGBA_TYPE, NULL, True );
     XSync( gdi_display, False );
@@ -1574,10 +1592,12 @@ static BOOL prepare_glx_completion_context( struct glx_completion_context *compl
     /* A failed server allocation can still return a client-side handle.
      * Cleanup must release that handle while accepting the missing XID. */
     if (error || !completion->pbuffer) goto failed;
+    pthread_mutex_unlock( &glx_context_mutex );
     TRACE( "created GLX completion context %p pbuffer %lx\n", completion->context, completion->pbuffer );
     return TRUE;
 
 failed:
+    pthread_mutex_unlock( &glx_context_mutex );
     destroy_glx_completion_objects( completion );
     return FALSE;
 }
@@ -1606,12 +1626,16 @@ static BOOL make_glx_completion_current( GLXDrawable drawable, GLXContext contex
 
     /* GLX may report a binding failure through an X error, including after
      * returning a client-side result. Do not extend this global error scope
-     * across the completion query or its polling delay. */
+     * across the completion query or its polling delay. Only an unbound
+     * thread or our private, never-rendered pbuffer context enters here, so
+     * this cannot flush an application's old window while holding Display. */
+    pthread_mutex_lock( &glx_context_mutex );
     X11DRV_expect_error( gdi_display, glx_completion_error_handler, NULL );
     if (legacy) ret = pglXMakeCurrent( gdi_display, drawable, context );
     else ret = pglXMakeContextCurrent( gdi_display, drawable, drawable, context );
     XSync( gdi_display, False );
     error = X11DRV_check_error();
+    pthread_mutex_unlock( &glx_context_mutex );
     return ret && !error && pglXGetCurrentContext() == context;
 }
 
