@@ -131,8 +131,8 @@ extern void post_message_coalesced( user_handle_t win, unsigned int message,
                                     lparam_t wparam, lparam_t lparam );
 extern int post_process_message( struct process *process, user_handle_t win,
                                  unsigned int message, lparam_t wparam, lparam_t lparam );
-extern void client_surface_notification_removed( struct process *process, client_ptr_t surface,
-                                                 lparam_t type, int delivered );
+extern void client_surface_notification_removed( struct process *process, UINT64 surface,
+                                                 unsigned int message, int delivered );
 extern void retry_process_client_surface_notifications( struct process *process,
                                                         user_handle_t exclude );
 extern void retry_process_client_surface_destroys( struct process *process );

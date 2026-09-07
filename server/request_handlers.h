@@ -316,6 +316,8 @@ DECL_HANDLER(d3dkmt_object_open_name);
 DECL_HANDLER(d3dkmt_mutex_acquire);
 DECL_HANDLER(d3dkmt_mutex_release);
 DECL_HANDLER(alpc_create_port);
+DECL_HANDLER(allocate_client_surface);
+DECL_HANDLER(release_client_surface);
 DECL_HANDLER(set_client_surface_state);
 DECL_HANDLER(get_client_surface_clip_windows);
 DECL_HANDLER(get_client_surface_handoff);
@@ -639,6 +641,8 @@ static const req_handler req_handlers[REQ_NB_REQUESTS] =
     (req_handler)req_d3dkmt_mutex_acquire,
     (req_handler)req_d3dkmt_mutex_release,
     (req_handler)req_alpc_create_port,
+    (req_handler)req_allocate_client_surface,
+    (req_handler)req_release_client_surface,
     (req_handler)req_set_client_surface_state,
     (req_handler)req_get_client_surface_clip_windows,
     (req_handler)req_get_client_surface_handoff,
@@ -2422,6 +2426,11 @@ C_ASSERT( offsetof(struct alpc_create_port_request, max_msg_len) == 16 );
 C_ASSERT( sizeof(struct alpc_create_port_request) == 24 );
 C_ASSERT( offsetof(struct alpc_create_port_reply, handle) == 8 );
 C_ASSERT( sizeof(struct alpc_create_port_reply) == 16 );
+C_ASSERT( sizeof(struct allocate_client_surface_request) == 16 );
+C_ASSERT( offsetof(struct allocate_client_surface_reply, surface) == 8 );
+C_ASSERT( sizeof(struct allocate_client_surface_reply) == 16 );
+C_ASSERT( offsetof(struct release_client_surface_request, surface) == 16 );
+C_ASSERT( sizeof(struct release_client_surface_request) == 24 );
 C_ASSERT( offsetof(struct set_client_surface_state_request, handle) == 12 );
 C_ASSERT( offsetof(struct set_client_surface_state_request, surface) == 16 );
 C_ASSERT( offsetof(struct set_client_surface_state_request, flags) == 24 );

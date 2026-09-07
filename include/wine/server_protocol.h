@@ -302,7 +302,7 @@ struct client_surface_handoff_desc
 {
     user_handle_t   handle;
     process_id_t    process;
-    client_ptr_t    surface;
+    unsigned __int64 surface;
     unsigned __int64 cookie;
     unsigned int   visible;
     unsigned int   reserved;
@@ -313,7 +313,7 @@ struct client_surface_handoff_receipt
 {
     user_handle_t handle;
     process_id_t process;
-    client_ptr_t surface;
+    unsigned __int64 surface;
     unsigned __int64 cookie;
     unsigned __int64 source_generation;
     unsigned int buffer_index;
@@ -1133,7 +1133,7 @@ typedef volatile struct
     unsigned __int64     client_surface_scene_generation;
     unsigned int         client_surface_flags;
     process_id_t         client_surface_process;
-    client_ptr_t         client_surface_id;
+    unsigned __int64     client_surface_id;
     char                 extra[];
 } window_shm_t;
 
@@ -6323,11 +6323,35 @@ struct alpc_create_port_reply
 
 
 
+struct allocate_client_surface_request
+{
+    struct request_header __header;
+    char __pad_12[4];
+};
+struct allocate_client_surface_reply
+{
+    struct reply_header __header;
+    unsigned __int64 surface;
+};
+
+
+struct release_client_surface_request
+{
+    struct request_header __header;
+    char __pad_12[4];
+    unsigned __int64 surface;
+};
+struct release_client_surface_reply
+{
+    struct reply_header __header;
+};
+
+
 struct set_client_surface_state_request
 {
     struct request_header __header;
     user_handle_t  handle;
-    client_ptr_t   surface;
+    unsigned __int64 surface;
     unsigned int   flags;
     char __pad_28[4];
     unsigned __int64 generation;
@@ -6398,7 +6422,7 @@ struct get_client_surface_handoff_request
     user_handle_t  handle;
     process_id_t   producer;
     char __pad_20[4];
-    client_ptr_t   surface;
+    unsigned __int64 surface;
     unsigned int   owner;
     char __pad_36[4];
 };
@@ -6420,7 +6444,7 @@ struct get_client_surface_handoff_event_request
     user_handle_t  handle;
     process_id_t   producer;
     char __pad_20[4];
-    client_ptr_t   surface;
+    unsigned __int64 surface;
     unsigned __int64 cookie;
     unsigned int   owner;
     char __pad_44[4];
@@ -6440,7 +6464,7 @@ struct release_client_surface_handoff_request
     user_handle_t  handle;
     process_id_t   producer;
     char __pad_20[4];
-    client_ptr_t   surface;
+    unsigned __int64 surface;
     unsigned __int64 cookie;
     unsigned int   owner;
     char __pad_44[4];
@@ -6842,6 +6866,8 @@ enum request
     REQ_d3dkmt_mutex_acquire,
     REQ_d3dkmt_mutex_release,
     REQ_alpc_create_port,
+    REQ_allocate_client_surface,
+    REQ_release_client_surface,
     REQ_set_client_surface_state,
     REQ_get_client_surface_clip_windows,
     REQ_get_client_surface_handoff,
@@ -7168,6 +7194,8 @@ union generic_request
     struct d3dkmt_mutex_acquire_request d3dkmt_mutex_acquire_request;
     struct d3dkmt_mutex_release_request d3dkmt_mutex_release_request;
     struct alpc_create_port_request alpc_create_port_request;
+    struct allocate_client_surface_request allocate_client_surface_request;
+    struct release_client_surface_request release_client_surface_request;
     struct set_client_surface_state_request set_client_surface_state_request;
     struct get_client_surface_clip_windows_request get_client_surface_clip_windows_request;
     struct get_client_surface_handoff_request get_client_surface_handoff_request;
@@ -7492,6 +7520,8 @@ union generic_reply
     struct d3dkmt_mutex_acquire_reply d3dkmt_mutex_acquire_reply;
     struct d3dkmt_mutex_release_reply d3dkmt_mutex_release_reply;
     struct alpc_create_port_reply alpc_create_port_reply;
+    struct allocate_client_surface_reply allocate_client_surface_reply;
+    struct release_client_surface_reply release_client_surface_reply;
     struct set_client_surface_state_reply set_client_surface_state_reply;
     struct get_client_surface_clip_windows_reply get_client_surface_clip_windows_reply;
     struct get_client_surface_handoff_reply get_client_surface_handoff_reply;
@@ -7504,6 +7534,6 @@ union generic_reply
     struct get_client_surface_scene_regions_reply get_client_surface_scene_regions_reply;
 };
 
-#define SERVER_PROTOCOL_VERSION 1006
+#define SERVER_PROTOCOL_VERSION 1007
 
 #endif /* __WINE_WINE_SERVER_PROTOCOL_H */

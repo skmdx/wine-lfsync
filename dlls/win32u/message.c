@@ -2262,12 +2262,14 @@ static LRESULT handle_internal_message( HWND hwnd, UINT msg, WPARAM wparam, LPAR
         user_driver->pGetWindowStateUpdates( hwnd, NULL, NULL, NULL, NULL ); /* unlock the host state */
         return 0;
     }
+    case WM_WINE_UPDATECLIENTSURFACE:
+        recompose_client_surface( hwnd, ((UINT64)(UINT32)wparam << 32) | (UINT32)lparam );
+        return 0;
+    case WM_WINE_DESTROYCLIENTSURFACE:
+        detach_client_surface_identity( ((UINT64)(UINT32)wparam << 32) | (UINT32)lparam );
+        return 0;
     case WM_WINE_UPDATEWINDOWSTATE:
-        if (wparam == WINE_UPDATE_CLIENT_SURFACES)
-            recompose_client_surface( hwnd, lparam );
-        else if (wparam == WINE_DESTROY_CLIENT_SURFACES)
-            detach_client_surface_identity( lparam );
-        else if (wparam == WINE_UPDATE_CLIENT_SURFACE_BACKING)
+        if (wparam == WINE_UPDATE_CLIENT_SURFACE_BACKING)
             update_window_client_surface_backing( hwnd );
         else if (wparam == WINE_PUBLISH_CLIENT_SURFACES)
         {

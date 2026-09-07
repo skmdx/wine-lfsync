@@ -73,7 +73,6 @@ void client_surface_release_memory( enum client_surface_memory_class type, UINT6
 #define CLIENT_SURFACE_INDEX_BUCKETS 256
 static struct client_surface *client_surface_identity_index[CLIENT_SURFACE_INDEX_BUCKETS];
 static struct client_surface *client_surface_toplevel_index[CLIENT_SURFACE_INDEX_BUCKETS];
-static UINT_PTR client_surface_identity;
 static LONG client_surface_process_id;
 
 static void client_surface_backend_destroy( struct client_surface *surface )
@@ -107,40 +106,64 @@ static unsigned int client_surface_backend_state_flags( struct client_surface *s
 static void remove_client_surface_chain( struct client_surface **head,
                                          struct client_surface *surface, BOOL identity );
 
-static unsigned int client_surface_index_hash( UINT_PTR value )
+static unsigned int client_surface_index_hash( UINT64 value )
 {
+    value ^= value >> 32;
     value ^= value >> 17;
     value ^= value >> 9;
     return value & (CLIENT_SURFACE_INDEX_BUCKETS - 1);
 }
 
-static void assign_client_surface_identity_locked( struct client_surface *surface )
+static UINT64 allocate_client_surface_identity(void)
 {
-    struct client_surface *cursor;
-    unsigned int identity_bucket;
+    UINT64 identity = 0;
 
-    /* The server returns this token through a queued message.  A pointer
-     * identity lets a delayed message address an unrelated allocation after
-     * malloc reuses the old surface, so allocate an opaque live-unique token
-     * instead.  The index lookup below also makes wraparound safe while any
-     * colliding token is still live. */
-    do
+    SERVER_START_REQ( allocate_client_surface )
     {
-        if (!(++client_surface_identity)) ++client_surface_identity;
-        identity_bucket = client_surface_index_hash( client_surface_identity );
-        for (cursor = client_surface_identity_index[identity_bucket]; cursor;
-             cursor = cursor->identity_next)
-            if (cursor->identity == client_surface_identity) break;
-    } while (cursor);
-    surface->identity = client_surface_identity;
-    surface->identity_next = client_surface_identity_index[identity_bucket];
-    client_surface_identity_index[identity_bucket] = surface;
+        if (!wine_server_call( req )) identity = reply->surface;
+    }
+    SERVER_END_REQ;
+    return identity;
+}
+
+static void release_client_surface_id( UINT64 identity )
+{
+    if (!identity) return;
+    SERVER_START_REQ( release_client_surface )
+    {
+        req->surface = identity;
+        wine_server_call( req );
+    }
+    SERVER_END_REQ;
+}
+
+static void insert_client_surface_identity_locked( struct client_surface *surface )
+{
+    unsigned int bucket = client_surface_index_hash( client_surface_get_identity( surface ) );
+
+    assert( client_surface_get_identity( surface ) );
+    surface->identity_next = client_surface_identity_index[bucket];
+    client_surface_identity_index[bucket] = surface;
+}
+
+/* Reserve before registration can make the server send any notification. */
+static BOOL ensure_client_surface_identity( struct client_surface *surface )
+{
+    UINT64 identity;
+
+    if (client_surface_get_identity( surface )) return TRUE;
+    if (!(identity = allocate_client_surface_identity())) return FALSE;
+    pthread_mutex_lock( &surface_index_lock );
+    __atomic_store_n( &surface->identity, identity, __ATOMIC_RELEASE );
+    insert_client_surface_identity_locked( surface );
+    pthread_mutex_unlock( &surface_index_lock );
+    return TRUE;
 }
 
 static void insert_client_surface_index( struct client_surface *surface )
 {
     pthread_mutex_lock( &surface_index_lock );
-    assign_client_surface_identity_locked( surface );
+    insert_client_surface_identity_locked( surface );
     surface->indexed_toplevel = surface->target.toplevel;
     if (surface->target.toplevel)
     {
@@ -151,20 +174,21 @@ static void insert_client_surface_index( struct client_surface *surface )
     pthread_mutex_unlock( &surface_index_lock );
 }
 
-/* A non-cached unregister ends the server lifetime of the token even when the
- * client object itself is reused.  Move it to a fresh identity before another
- * registration so a delayed queue entry can only miss, never target the new
- * lifecycle.  present_lock excludes registration while the index changes. */
-static void renew_client_surface_identity( struct client_surface *surface )
+/* End notification lookup before the object can be reused. A later activation
+ * reserves a new server lifetime. present_lock excludes registration here. */
+static void reset_client_surface_identity( struct client_surface *surface )
 {
     unsigned int bucket;
+    UINT64 identity = client_surface_get_identity( surface );
 
+    if (!identity) return;
     pthread_mutex_lock( &surface_index_lock );
-    bucket = client_surface_index_hash( surface->identity );
+    bucket = client_surface_index_hash( identity );
     remove_client_surface_chain( &client_surface_identity_index[bucket], surface, TRUE );
     surface->identity_next = NULL;
-    assign_client_surface_identity_locked( surface );
+    __atomic_store_n( &surface->identity, 0, __ATOMIC_RELEASE );
     pthread_mutex_unlock( &surface_index_lock );
+    release_client_surface_id( identity );
 }
 
 static void remove_client_surface_chain( struct client_surface **head,
@@ -185,9 +209,10 @@ static void remove_client_surface_chain( struct client_surface **head,
 
 static void remove_client_surface_index_locked( struct client_surface *surface )
 {
-    unsigned int identity_bucket = client_surface_index_hash( surface->identity );
+    unsigned int identity_bucket = client_surface_index_hash( client_surface_get_identity( surface ) );
 
-    remove_client_surface_chain( &client_surface_identity_index[identity_bucket], surface, TRUE );
+    if (client_surface_get_identity( surface ))
+        remove_client_surface_chain( &client_surface_identity_index[identity_bucket], surface, TRUE );
     if (surface->indexed_toplevel)
     {
         unsigned int bucket = client_surface_index_hash( (UINT_PTR)surface->indexed_toplevel );
@@ -278,7 +303,7 @@ HWND client_surface_set_server_state( HWND hwnd, const struct client_surface *su
     SERVER_START_REQ( set_client_surface_state )
     {
         req->handle = wine_server_user_handle( hwnd );
-        req->surface = surface ? surface->identity : 0;
+        req->surface = surface ? client_surface_get_identity( surface ) : 0;
         req->flags = flags;
         req->generation = generation;
         req->scene_generation = scene_generation;
@@ -506,6 +531,7 @@ static void client_surface_release_locked( struct client_surface *surface )
     if (!ref)
     {
         client_surface_detach_locked( surface );
+        release_client_surface_id( client_surface_get_identity( surface ) );
         if (surface->clip_region) NtGdiDeleteObjectApp( surface->clip_region );
         assert( list_empty( &surface->completion_queue ) );
         assert( !surface->completion_worker_active );
@@ -566,7 +592,7 @@ void detach_client_surfaces( HWND hwnd )
     pthread_mutex_unlock( &surfaces_lock );
 }
 
-void detach_client_surface_identity( UINT_PTR identity )
+void detach_client_surface_identity( UINT64 identity )
 {
     struct client_surface *surface, *next;
 
@@ -574,13 +600,13 @@ void detach_client_surface_identity( UINT_PTR identity )
 
     LIST_FOR_EACH_ENTRY_SAFE( surface, next, &client_surfaces, struct client_surface, entry )
     {
-        if (surface->identity != identity) continue;
+        if (client_surface_get_identity( surface ) != identity) continue;
         client_surface_detach_locked( surface );
         goto done;
     }
     LIST_FOR_EACH_ENTRY_SAFE( surface, next, &unused_surfaces, struct client_surface, entry )
     {
-        if (surface->identity != identity) continue;
+        if (client_surface_get_identity( surface ) != identity) continue;
         remove_unused_client_surface_locked( surface );
         client_surface_detach_locked( surface );
         client_surface_release_locked( surface ); /* unused-list ownership */
@@ -655,7 +681,7 @@ void client_surface_get_geometry( const struct client_surface *surface,
 }
 
 static BOOL read_client_surface_scene( HWND toplevel, struct client_surface_scene *scene,
-                                       process_id_t *producer_process, client_ptr_t *producer_id )
+                                       process_id_t *producer_process, UINT64 *producer_id )
 {
     struct object_lock lock = OBJECT_LOCK_INIT;
     const window_shm_t *window_shm = NULL;
@@ -699,7 +725,7 @@ BOOL client_surface_get_scene( struct client_surface *surface, struct client_sur
     const window_shm_t *producer_shm = NULL;
     struct client_surface_target target;
     process_id_t producer_process = 0;
-    client_ptr_t producer_id = 0;
+    UINT64 producer_id = 0;
     HWND hwnd, toplevel;
     NTSTATUS status = STATUS_SUCCESS;
 
@@ -732,7 +758,7 @@ BOOL client_surface_get_scene( struct client_surface *surface, struct client_sur
     if (hwnd != toplevel && scene->valid && !client_surface_scene_current( scene ))
         scene->valid = FALSE;
     scene->authoritative = producer_process == (process_id_t)client_surface_process_id &&
-                           producer_id == surface->identity;
+                           producer_id == client_surface_get_identity( surface );
     return scene->valid;
 }
 
@@ -1026,7 +1052,7 @@ static BOOL collect_indexed_client_surfaces( HWND toplevel, struct client_surfac
     return ret;
 }
 
-static struct client_surface *find_client_surface_identity( UINT_PTR identity )
+static struct client_surface *find_client_surface_identity( UINT64 identity )
 {
     unsigned int bucket = client_surface_index_hash( identity );
     struct client_surface *surface;
@@ -1034,7 +1060,7 @@ static struct client_surface *find_client_surface_identity( UINT_PTR identity )
     pthread_mutex_lock( &surface_index_lock );
     for (surface = client_surface_identity_index[bucket]; surface; surface = surface->identity_next)
     {
-        if (surface->identity != identity) continue;
+        if (client_surface_get_identity( surface ) != identity) continue;
         if (!InterlockedCompareExchange( &surface->active, 0, 0 ) &&
             !InterlockedCompareExchange( &surface->server_cached, 0, 0 ))
             surface = NULL;
@@ -1152,41 +1178,12 @@ void *client_surface_create( UINT size, const struct client_surface_backend *bac
     if (backend->completion &&
         (!backend->completion->prepare || !backend->completion->wait)) return NULL;
     if (!(surface = calloc( 1, size ))) return NULL;
-    if (pthread_mutex_init( &surface->present_lock, NULL ))
-    {
-        free( surface );
-        return NULL;
-    }
-    if (pthread_mutex_init( &surface->completion_lock, NULL ))
-    {
-        pthread_mutex_destroy( &surface->present_lock );
-        free( surface );
-        return NULL;
-    }
-    if (pthread_cond_init( &surface->completion_cond, NULL ))
-    {
-        pthread_mutex_destroy( &surface->completion_lock );
-        pthread_mutex_destroy( &surface->present_lock );
-        free( surface );
-        return NULL;
-    }
-    if (pthread_cond_init( &surface->completion_queue_cond, NULL ))
-    {
-        pthread_cond_destroy( &surface->completion_cond );
-        pthread_mutex_destroy( &surface->completion_lock );
-        pthread_mutex_destroy( &surface->present_lock );
-        free( surface );
-        return NULL;
-    }
-    if (pthread_mutex_init( &surface->completion_wait_lock, NULL ))
-    {
-        pthread_cond_destroy( &surface->completion_queue_cond );
-        pthread_cond_destroy( &surface->completion_cond );
-        pthread_mutex_destroy( &surface->completion_lock );
-        pthread_mutex_destroy( &surface->present_lock );
-        free( surface );
-        return NULL;
-    }
+    if (pthread_mutex_init( &surface->present_lock, NULL )) goto failed_present_lock;
+    if (pthread_mutex_init( &surface->completion_lock, NULL )) goto failed_completion_lock;
+    if (pthread_cond_init( &surface->completion_cond, NULL )) goto failed_completion_cond;
+    if (pthread_cond_init( &surface->completion_queue_cond, NULL )) goto failed_queue_cond;
+    if (pthread_mutex_init( &surface->completion_wait_lock, NULL )) goto failed_wait_lock;
+    if (!(surface->identity = allocate_client_surface_identity())) goto failed_identity;
     surface->backend = backend;
     surface->handoff_ready_fd = -1;
     surface->ref = 1;
@@ -1207,6 +1204,20 @@ void *client_surface_create( UINT size, const struct client_surface_backend *bac
            format, raw, toplevel, wine_dbgstr_rect( &surface->target.virtual_rect ),
            wine_dbgstr_rect( &surface->target.monitor_rect ) );
     return surface;
+
+failed_identity:
+    pthread_mutex_destroy( &surface->completion_wait_lock );
+failed_wait_lock:
+    pthread_cond_destroy( &surface->completion_queue_cond );
+failed_queue_cond:
+    pthread_cond_destroy( &surface->completion_cond );
+failed_completion_cond:
+    pthread_mutex_destroy( &surface->completion_lock );
+failed_completion_lock:
+    pthread_mutex_destroy( &surface->present_lock );
+failed_present_lock:
+    free( surface );
+    return NULL;
 }
 
 void client_surface_add_ref( struct client_surface *surface )
@@ -1315,7 +1326,7 @@ void client_surface_resume_recompose( struct client_surface *surface )
     drain_client_surface_recompose( surface );
 }
 
-void recompose_client_surface( HWND hwnd, UINT_PTR identity )
+void recompose_client_surface( HWND hwnd, UINT64 identity )
 {
     struct client_surface *selected;
     struct client_surface_geometry geometry;
@@ -1538,6 +1549,13 @@ void use_window_client_surface( struct client_surface *surface, BOOL use )
         WARN( "surface %s has been detached already, ignoring.\n", debugstr_client_surface( surface ) );
     else if (use)
     {
+        if (!ensure_client_surface_identity( surface ))
+        {
+            WARN( "failed to reserve a server lifetime for %s\n", debugstr_client_surface( surface ) );
+            pthread_mutex_unlock( &surface->present_lock );
+            pthread_mutex_unlock( &surfaces_lock );
+            return;
+        }
         /* surface wasn't used, it shouldn't be in any list */
         list_add_tail( &client_surfaces, &surface->entry );
         InterlockedExchange( &surface->active, TRUE );
@@ -1605,7 +1623,7 @@ void use_window_client_surface( struct client_surface *surface, BOOL use )
         /* An invalidated frame may have completed before the drawable became
          * unused. End its old handoff here as well as in the completion path. */
         client_surface_release_handoff( surface );
-        renew_client_surface_identity( surface );
+        reset_client_surface_identity( surface );
     }
     pthread_mutex_unlock( &surface->present_lock );
 
@@ -1653,7 +1671,14 @@ struct client_surface *get_unused_client_surface( HWND hwnd, int format, BOOL ra
         if (!InterlockedCompareExchange( &surface->server_cached, 0, 0 ))
         {
             client_surface_release_handoff( surface );
-            renew_client_surface_identity( surface );
+            reset_client_surface_identity( surface );
+        }
+        if (!ensure_client_surface_identity( surface ))
+        {
+            pthread_mutex_unlock( &surface->present_lock );
+            client_surface_unlock_present( surface );
+            client_surface_release( surface );
+            return NULL;
         }
         if (InterlockedCompareExchangePointer( (void **)&surface->hwnd, NULL, NULL ))
             client_surface_update_present_locked( surface ); /* refresh before creating GL/VK drawable */

@@ -127,7 +127,7 @@ void client_surface_release_handoff( struct client_surface *surface )
     {
         if (surface->handoff_waiters)
             TRACE( "retaining handoff mapping identity %s cookie %s for %u source waiters\n",
-                   wine_dbgstr_longlong( surface->identity ), wine_dbgstr_longlong( surface->handoff_cookie ),
+                   wine_dbgstr_longlong( client_surface_get_identity( surface ) ), wine_dbgstr_longlong( surface->handoff_cookie ),
                    surface->handoff_waiters );
         surface->handoff_release_pending = TRUE;
         return;
@@ -163,7 +163,7 @@ void client_surface_release_handoff( struct client_surface *surface )
     {
         req->handle = 0;
         req->producer = 0;
-        req->surface = surface->identity;
+        req->surface = client_surface_get_identity( surface );
         req->cookie = surface->handoff_cookie;
         req->owner = 0;
         wine_server_call( req );
@@ -206,7 +206,7 @@ static BOOL map_client_surface_handoff( struct client_surface *surface )
     {
         req->handle = wine_server_user_handle( surface->hwnd );
         req->producer = 0;
-        req->surface = surface->identity;
+        req->surface = client_surface_get_identity( surface );
         req->owner = 0;
         status = wine_server_call( req );
         if (!status)
@@ -222,7 +222,7 @@ static BOOL map_client_surface_handoff( struct client_surface *surface )
     if (status)
     {
         TRACE( "failed to map handoff identity %s, status %#lx\n",
-               wine_dbgstr_longlong( surface->identity ), (unsigned long)status );
+               wine_dbgstr_longlong( client_surface_get_identity( surface ) ), (unsigned long)status );
         return FALSE;
     }
     status = NtMapViewOfSection( mapping, NtCurrentProcess(), &view, 0, 0, NULL,
@@ -238,13 +238,13 @@ static BOOL map_client_surface_handoff( struct client_surface *surface )
         shared->channel_count != CLIENT_SURFACE_HANDOFF_CHANNELS || shared->mapping_id != mapping_id)
         goto failed;
     channel = (struct client_surface_handoff_channel *)((char *)view + offset);
-    if (channel->cookie != cookie || channel->identity != surface->identity ||
+    if (channel->cookie != cookie || channel->identity != client_surface_get_identity( surface ) ||
         __atomic_load_n( &channel->closed, __ATOMIC_ACQUIRE )) goto failed;
     SERVER_START_REQ( get_client_surface_handoff_event )
     {
         req->handle = wine_server_user_handle( surface->hwnd );
         req->producer = 0;
-        req->surface = surface->identity;
+        req->surface = client_surface_get_identity( surface );
         req->cookie = cookie;
         req->owner = 0;
         status = wine_server_call( req );
@@ -264,7 +264,7 @@ static BOOL map_client_surface_handoff( struct client_surface *surface )
     surface->handoff_mapping_id = mapping_id;
     surface->handoff_cookie = cookie;
     TRACE( "mapped handoff hwnd %p identity %s pool %s cookie %s\n", surface->hwnd,
-           wine_dbgstr_longlong( surface->identity ), wine_dbgstr_longlong( mapping_id ),
+           wine_dbgstr_longlong( client_surface_get_identity( surface ) ), wine_dbgstr_longlong( mapping_id ),
            wine_dbgstr_longlong( cookie ) );
     return TRUE;
 
@@ -275,7 +275,7 @@ release:
     {
         req->handle = 0;
         req->producer = 0;
-        req->surface = surface->identity;
+        req->surface = client_surface_get_identity( surface );
         req->cookie = cookie;
         req->owner = 0;
         wine_server_call( req );
@@ -330,7 +330,7 @@ static BOOL acquire_client_surface_handoff( struct client_surface *surface,
             (scene && !client_surface_scene_current( scene )))
         {
             TRACE( "cancelling stale source wait identity %s cookie %s\n",
-                   wine_dbgstr_longlong( surface->identity ), wine_dbgstr_longlong( surface->handoff_cookie ) );
+                   wine_dbgstr_longlong( client_surface_get_identity( surface ) ), wine_dbgstr_longlong( surface->handoff_cookie ) );
             return FALSE;
         }
         if (NtGetTickCount() - start >= CLIENT_SURFACE_PRESENT_TIMEOUT) return FALSE;
@@ -362,7 +362,7 @@ static BOOL prepare_client_surface_handoff_locked( struct client_surface *surfac
         !surface->backend->handoff_prepare)
     {
         TRACE( "handoff unavailable identity %s target %u mode %u generation %s valid %u cap %u prepare %p\n",
-               wine_dbgstr_longlong( surface->identity ), present->target, present->mode,
+               wine_dbgstr_longlong( client_surface_get_identity( surface ) ), present->target, present->mode,
                wine_dbgstr_longlong( present->scene.generation ), present->scene.valid,
                client_surface_backend_has_cap( surface, CLIENT_SURFACE_BACKEND_GENERATION_HANDOFF ),
                surface->backend->handoff_prepare );
@@ -373,7 +373,7 @@ static BOOL prepare_client_surface_handoff_locked( struct client_surface *surfac
          CLIENT_SURFACE_HANDOFF_ENDPOINT_CONSUMER) == 0)
     {
         TRACE( "handoff identity %s has no compositor endpoint\n",
-               wine_dbgstr_longlong( surface->identity ) );
+               wine_dbgstr_longlong( client_surface_get_identity( surface ) ) );
         return FALSE;
     }
     if (!acquire_client_surface_handoff( surface, independent ? NULL : &present->scene,
@@ -441,7 +441,7 @@ BOOL client_surface_freeze_frame_locked( struct client_surface *surface,
     {
         if (client_surface_backend_has_cap( surface, CLIENT_SURFACE_BACKEND_OWNER_SCENE_PLAN ))
             source->flags |= CLIENT_SURFACE_HANDOFF_INDEPENDENT;
-        frame->surface_id = surface->identity;
+        frame->surface_id = client_surface_get_identity( surface );
         frame->frame_id = present->serial;
         frame->target_epoch = present->target_seq;
         frame->image = source->source;
@@ -481,7 +481,7 @@ BOOL client_surface_publish_handoff_locked( struct client_surface *surface,
     consumed = __atomic_load_n( &channel->consumer_sequence, __ATOMIC_ACQUIRE );
     valid = !__atomic_load_n( &channel->closed, __ATOMIC_ACQUIRE ) &&
             produced - consumed < CLIENT_SURFACE_HANDOFF_RING_SIZE &&
-            frame->surface_id == surface->identity && frame->frame_id == present->serial &&
+            frame->surface_id == client_surface_get_identity( surface ) && frame->frame_id == present->serial &&
             frame->target_epoch == present->target_seq && frame->image == source->source &&
             frame->visual == source->source_visual && frame->size.cx == source->width &&
             frame->size.cy == source->height && frame->flags == source->flags &&
@@ -512,7 +512,7 @@ BOOL client_surface_publish_handoff_locked( struct client_surface *surface,
         ready_time = TRACE_ON(csperf) ? client_surface_perf_time() : 0;
         __atomic_store_n( &channel->producer_sequence, produced + 1, __ATOMIC_RELEASE );
         TRACE_(csperf)( "ticks=%llu event=ready identity=%s cookie=%s token=%s sequence=%s\n",
-                       ready_time, wine_dbgstr_longlong( surface->identity ),
+                       ready_time, wine_dbgstr_longlong( client_surface_get_identity( surface ) ),
                        wine_dbgstr_longlong( surface->handoff_cookie ),
                        wine_dbgstr_longlong( produced + 1 ), wine_dbgstr_longlong( frame->frame_id ) );
         surface->composed_serial = present->serial;
@@ -525,7 +525,7 @@ BOOL client_surface_publish_handoff_locked( struct client_surface *surface,
                        (UINT64)1 << (index % 64), __ATOMIC_RELEASE );
     client_surface_handoff_wake_ready( surface );
     TRACE( "published handoff identity %s sequence %s channel %td\n",
-           wine_dbgstr_longlong( surface->identity ), wine_dbgstr_longlong( produced + 1 ), index );
+           wine_dbgstr_longlong( client_surface_get_identity( surface ) ), wine_dbgstr_longlong( produced + 1 ), index );
     present->handoff_control = 0;
     return TRUE;
 }
@@ -540,7 +540,7 @@ static BOOL begin_client_surface_composition( HWND hwnd, const struct client_sur
     SERVER_START_REQ( set_client_surface_state )
     {
         req->handle = wine_server_user_handle( hwnd );
-        req->surface = surface->identity;
+        req->surface = client_surface_get_identity( surface );
         req->flags = CLIENT_SURFACE_STATE_PRESENT_BEGIN;
         req->generation = present->scene.generation;
         req->scene_generation = present->scene.epoch;
@@ -1245,7 +1245,7 @@ void client_surface_prepare_present( struct client_surface *surface,
     client_surface_prepare_present_locked( surface, present, external_completion );
     TRACE_(csperf)( "ticks=%llu event=prepare identity=%s begin=%llu scene=%llu locked=%llu ready=%llu "
                    "pending_before=%d pending_after=%d\n", client_surface_perf_time(),
-                   wine_dbgstr_longlong( surface->identity ), start, scene, locked, ready,
+                   wine_dbgstr_longlong( client_surface_get_identity( surface ) ), start, scene, locked, ready,
                    pending_before, pending_after );
 }
 

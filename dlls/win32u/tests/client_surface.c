@@ -53,7 +53,30 @@ struct clip_state
 static unsigned int (CDECL *p_wine_server_call)(void *);
 static void pump_messages( DWORD timeout );
 
-static unsigned int set_surface_state_scene( HWND hwnd, UINT_PTR surface, UINT flags,
+static UINT64 allocate_surface(void)
+{
+    struct __server_request_info info = {0};
+    unsigned int status;
+
+    info.u.req.allocate_client_surface_request.__header.req = REQ_allocate_client_surface;
+    status = p_wine_server_call( &info );
+    ok( !status, "surface allocation status %#x\n", status );
+    ok( status || info.u.reply.allocate_client_surface_reply.surface > ~(UINT32)0,
+        "surface lifetime was not a 64-bit ID: %s\n",
+        wine_dbgstr_longlong( info.u.reply.allocate_client_surface_reply.surface ) );
+    return status ? 0 : info.u.reply.allocate_client_surface_reply.surface;
+}
+
+static unsigned int release_surface( UINT64 surface )
+{
+    struct __server_request_info info = {0};
+
+    info.u.req.release_client_surface_request.__header.req = REQ_release_client_surface;
+    info.u.req.release_client_surface_request.surface = surface;
+    return p_wine_server_call( &info );
+}
+
+static unsigned int set_surface_state_scene( HWND hwnd, UINT64 surface, UINT flags,
                                              UINT64 generation, UINT64 scene_generation,
                                              struct surface_state *state )
 {
@@ -88,7 +111,7 @@ static unsigned int set_surface_state_scene( HWND hwnd, UINT_PTR surface, UINT f
     return status;
 }
 
-static unsigned int set_surface_state( HWND hwnd, UINT_PTR surface, UINT flags,
+static unsigned int set_surface_state( HWND hwnd, UINT64 surface, UINT flags,
                                        UINT64 generation, struct surface_state *state )
 {
     return set_surface_state_scene( hwnd, surface, flags, generation, 0, state );
@@ -104,7 +127,7 @@ static unsigned int set_server_parent( HWND hwnd, HWND parent )
     return p_wine_server_call( &info );
 }
 
-static unsigned int commit_surface_state( HWND hwnd, UINT_PTR surface,
+static unsigned int commit_surface_state( HWND hwnd, UINT64 surface,
                                           const struct surface_state *generation,
                                           struct surface_state *state )
 {
@@ -112,13 +135,13 @@ static unsigned int commit_surface_state( HWND hwnd, UINT_PTR surface,
                                     generation->generation, generation->scene_generation, state );
 }
 
-static unsigned int claim_surface_state( HWND hwnd, UINT_PTR surface,
+static unsigned int claim_surface_state( HWND hwnd, UINT64 surface,
                                          struct surface_state *state )
 {
     return set_surface_state( hwnd, surface, CLIENT_SURFACE_STATE_CLAIM, 0, state );
 }
 
-static unsigned int begin_surface_state( HWND hwnd, UINT_PTR surface,
+static unsigned int begin_surface_state( HWND hwnd, UINT64 surface,
                                          const struct surface_state *generation,
                                          struct surface_state *state )
 {
@@ -291,7 +314,7 @@ static HWND create_test_child( HWND parent, int x )
                             GetModuleHandleA( NULL ), NULL );
 }
 
-static void complete_single_surface_generation( HWND hwnd, UINT_PTR surface,
+static void complete_single_surface_generation( HWND hwnd, UINT64 surface,
                                                 struct surface_state *state )
 {
     struct surface_state generation;
@@ -319,7 +342,7 @@ static void complete_single_surface_generation( HWND hwnd, UINT_PTR surface,
 
 static void test_presentation_modes(void)
 {
-    const UINT_PTR surface = 0x1234d000, child_surface = 0x1234d001;
+    const UINT64 surface = allocate_surface(), child_surface = allocate_surface();
     const UINT direct_flags = CLIENT_SURFACE_STATE_REGISTER |
                               CLIENT_SURFACE_STATE_SCENE_PUBLICATION |
                               CLIENT_SURFACE_STATE_DIRECT_PRESENTATION;
@@ -390,7 +413,7 @@ static void test_presentation_modes(void)
 
 static void test_generation_membership(void)
 {
-    const UINT_PTR first_surface = 0x12350000, second_surface = 0x12350001;
+    const UINT64 first_surface = allocate_surface(), second_surface = allocate_surface();
     struct surface_state state, staged, committed;
     HWND hwnd;
     unsigned int status;
@@ -475,7 +498,9 @@ static void test_generation_membership(void)
     status = set_surface_state( hwnd, first_surface,
                                 CLIENT_SURFACE_STATE_UNREGISTER | CLIENT_SURFACE_STATE_UNCACHE,
                                 0, &state );
-    ok( !status, "duplicate removal failed, status %#x\n", status );
+    ok( status == STATUS_INVALID_PARAMETER, "retired removal status %#x\n", status );
+    status = set_surface_state( hwnd, 0, 0, 0, &state );
+    ok( !status, "retired removal state query status %#x\n", status );
     ok( state.active == 1 && !state.cached && state.pending == 1 && state.staged,
         "duplicate removal underflowed state: active %u cached %u pending %u staged %u\n",
         state.active, state.cached, state.pending, state.staged );
@@ -498,8 +523,8 @@ static void test_generation_membership(void)
 
 static void test_clip_scene_snapshot(void)
 {
-    const UINT_PTR first_surface = 0x12370000, second_surface = 0x12370001;
-    const UINT_PTR descendant_surface = 0x12370002, duplicate_surface = 0x12370003;
+    const UINT64 first_surface = allocate_surface(), second_surface = allocate_surface();
+    const UINT64 descendant_surface = allocate_surface(), duplicate_surface = allocate_surface();
     struct clip_state before, after;
     static const RECT bounds[] =
     {
@@ -728,7 +753,7 @@ static void test_scene_region_batch(void)
     static const UINT flags[] = {0, DCX_CLIPCHILDREN, DCX_CLIPSIBLINGS,
                                  DCX_PARENTCLIP, DCX_PARENTCLIP | DCX_CLIPSIBLINGS};
     const RECT bounds[] = {{0, 0, 160, 120}, {28, 11, 37, 28}, {0, 0, 0, 0}, {-5, -5, 15, 15}};
-    const UINT_PTR identity = 0x12470000;
+    const UINT64 identity = allocate_surface();
     unsigned char data[16384];
     struct clip_state state;
     HWND top, first, second, other;
@@ -808,7 +833,7 @@ done:
 
 static void test_complex_clip_snapshot(void)
 {
-    const UINT_PTR surface = 0x1235a000;
+    const UINT64 surface = allocate_surface();
     const UINT side = 256, count = side * side;
     struct __server_request_info info;
     struct client_surface_clip_window *clips = NULL;
@@ -868,7 +893,7 @@ done:
 
 static void test_subtree_generation_retirement(void)
 {
-    const UINT_PTR first_surface = 0x12360000, second_surface = 0x12360001;
+    const UINT64 first_surface = allocate_surface(), second_surface = allocate_surface();
     struct surface_state staged, partial, state;
     HWND parent, first, second;
     unsigned int status;
@@ -991,7 +1016,7 @@ struct handoff_binding
     UINT64 mapping_id, cookie;
 };
 
-static unsigned int get_surface_handoff( HWND hwnd, DWORD producer, UINT_PTR surface,
+static unsigned int get_surface_handoff( HWND hwnd, DWORD producer, UINT64 surface,
                                          BOOL owner, struct handoff_binding *binding )
 {
     struct __server_request_info info = {0};
@@ -1017,7 +1042,7 @@ static unsigned int get_surface_handoff( HWND hwnd, DWORD producer, UINT_PTR sur
     return status;
 }
 
-static unsigned int release_surface_handoff( HWND hwnd, DWORD producer, UINT_PTR surface,
+static unsigned int release_surface_handoff( HWND hwnd, DWORD producer, UINT64 surface,
                                               UINT64 cookie, BOOL owner )
 {
     struct __server_request_info info = {0};
@@ -1032,7 +1057,7 @@ static unsigned int release_surface_handoff( HWND hwnd, DWORD producer, UINT_PTR
     return p_wine_server_call( &info );
 }
 
-static void check_surface_handoff_cookie( HWND hwnd, UINT_PTR surface, UINT64 cookie )
+static void check_surface_handoff_cookie( HWND hwnd, UINT64 surface, UINT64 cookie )
 {
     struct __server_request_info info = {0};
     struct client_surface_handoff_desc desc = {0};
@@ -1076,7 +1101,7 @@ static unsigned int complete_surface_handoffs( HWND hwnd, UINT64 generation, UIN
 
 static void test_handoff_receipts(void)
 {
-    const UINT_PTR identity = 0x79580000;
+    const UINT64 identity = allocate_surface();
     struct handoff_binding producer = {0}, owner = {0};
     struct client_surface_handoff_receipt receipt;
     struct client_surface_handoff_channel *channel;
@@ -1175,7 +1200,8 @@ done:
 
 static void test_handoff_storage(void)
 {
-    const UINT_PTR identity = 0x79400000;
+    const UINT64 identity = allocate_surface(), adjacent_id = allocate_surface();
+    UINT64 replacement_id = 0;
     const UINT flags = CLIENT_SURFACE_STATE_REGISTER | CLIENT_SURFACE_STATE_SCENE_PUBLICATION;
     struct handoff_binding producer = {0}, owner = {0}, replacement = {0}, adjacent = {0}, denied;
     struct client_surface_handoff_shared *producer_shared = NULL, *owner_shared = NULL;
@@ -1250,9 +1276,9 @@ static void test_handoff_storage(void)
         "handoff endpoints %#lx\n", producer_slot->endpoints );
     ok( !producer_slot->producer_sequence && !producer_slot->consumer_sequence && !producer_slot->closed,
         "new channel is not empty and open\n" );
-    status = set_surface_state( other, identity + 1, flags, 0, NULL );
+    status = set_surface_state( other, adjacent_id, flags, 0, NULL );
     ok( !status, "adjacent surface registration status %#x\n", status );
-    status = get_surface_handoff( other, 0, identity + 1, FALSE, &adjacent );
+    status = get_surface_handoff( other, 0, adjacent_id, FALSE, &adjacent );
     ok( !status, "adjacent channel bind status %#x\n", status );
     if (!status)
     {
@@ -1331,15 +1357,20 @@ static void test_handoff_storage(void)
     ok( !(__atomic_load_n( &owner_shared->ready_bitmap[index / 64], __ATOMIC_ACQUIRE ) &
           ((UINT64)1 << (index % 64))), "retired handoff left a ready bit set\n" );
 
-    set_surface_state( other, identity + 1, CLIENT_SURFACE_STATE_UNREGISTER, 0, NULL );
+    set_surface_state( other, adjacent_id, CLIENT_SURFACE_STATE_UNREGISTER, 0, NULL );
     if (adjacent.cookie)
     {
-        release_surface_handoff( other, 0, identity + 1, adjacent.cookie, FALSE );
+        release_surface_handoff( other, 0, adjacent_id, adjacent.cookie, FALSE );
         adjacent.cookie = 0;
     }
     status = set_surface_state( other, identity, flags, 0, NULL );
-    ok( !status, "handoff identity reuse registration status %#x\n", status );
-    status = get_surface_handoff( other, 0, identity, FALSE, &replacement );
+    ok( status == STATUS_INVALID_PARAMETER, "retired handoff identity registration status %#x\n", status );
+    replacement_id = allocate_surface();
+    ok( replacement_id != identity && replacement_id != adjacent_id,
+        "replacement reused a retired surface ID\n" );
+    status = set_surface_state( other, replacement_id, flags, 0, NULL );
+    ok( !status, "replacement handoff registration status %#x\n", status );
+    status = get_surface_handoff( other, 0, replacement_id, FALSE, &replacement );
     ok( !status, "replacement handoff bind status %#x\n", status );
     if (!status)
     {
@@ -1347,12 +1378,12 @@ static void test_handoff_storage(void)
         replacement.mapping = NULL;
         ok( replacement.cookie != old_cookie,
             "replacement handoff reused cookie %s\n", wine_dbgstr_longlong( old_cookie ) );
-        status = release_surface_handoff( other, 0, identity, old_cookie, FALSE );
+        status = release_surface_handoff( other, 0, replacement_id, old_cookie, FALSE );
         ok( status == STATUS_INVALID_PARAMETER, "stale cookie released replacement, status %#x\n", status );
-        status = release_surface_handoff( other, 0, identity, replacement.cookie, FALSE );
+        status = release_surface_handoff( other, 0, replacement_id, replacement.cookie, FALSE );
         ok( !status, "replacement handoff release status %#x\n", status );
     }
-    set_surface_state( other, identity, CLIENT_SURFACE_STATE_UNREGISTER, 0, NULL );
+    set_surface_state( other, replacement_id, CLIENT_SURFACE_STATE_UNREGISTER, 0, NULL );
     goto done;
 
 unregister:
@@ -1360,8 +1391,8 @@ unregister:
 done:
     if (other)
     {
-        set_surface_state( other, identity + 1, CLIENT_SURFACE_STATE_UNREGISTER, 0, NULL );
-        if (adjacent.cookie) release_surface_handoff( other, 0, identity + 1, adjacent.cookie, FALSE );
+        set_surface_state( other, adjacent_id, CLIENT_SURFACE_STATE_UNREGISTER, 0, NULL );
+        if (adjacent.cookie) release_surface_handoff( other, 0, adjacent_id, adjacent.cookie, FALSE );
     }
     if (producer.mapping) CloseHandle( producer.mapping );
     if (owner.mapping) CloseHandle( owner.mapping );
@@ -1378,7 +1409,7 @@ done:
 
 static void test_handoff_consumer_retirement( BOOL failed )
 {
-    const UINT_PTR identity = 0x79480000;
+    const UINT64 identity = allocate_surface();
     const UINT flags = CLIENT_SURFACE_STATE_REGISTER | CLIENT_SURFACE_STATE_SCENE_PUBLICATION;
     struct handoff_binding producer = {0}, owner = {0}, replacement = {0}, pending = {0};
     struct client_surface_handoff_shared *shared;
@@ -1559,8 +1590,6 @@ static void test_handoff_lost_recovery(void)
     }
 }
 
-#define HANDOFF_EXIT_ID 0x79500000
-
 static void handoff_storage_exit_child( HWND hwnd, HANDLE ready, HANDLE release,
                                         BOOL completed )
 {
@@ -1569,14 +1598,15 @@ static void handoff_storage_exit_child( HWND hwnd, HANDLE ready, HANDLE release,
     struct client_surface_handoff_channel *slot;
     unsigned int status, index;
     void *view = NULL;
+    const UINT64 identity = allocate_surface();
 
-    status = set_surface_state( hwnd, HANDOFF_EXIT_ID,
+    status = set_surface_state( hwnd, identity,
                                 CLIENT_SURFACE_STATE_REGISTER |
                                 CLIENT_SURFACE_STATE_SCENE_PUBLICATION, 0, NULL );
     ok( !status, "exit child handoff registration status %#x\n", status );
-    status = claim_surface_state( hwnd, HANDOFF_EXIT_ID, NULL );
+    status = claim_surface_state( hwnd, identity, NULL );
     ok( !status, "exit child handoff claim status %#x\n", status );
-    status = get_surface_handoff( hwnd, 0, HANDOFF_EXIT_ID, FALSE, &binding );
+    status = get_surface_handoff( hwnd, 0, identity, FALSE, &binding );
     ok( !status, "exit child producer bind status %#x\n", status );
     if (status) goto done;
     view = MapViewOfFile( binding.mapping, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, binding.size );
@@ -1632,7 +1662,22 @@ static void test_handoff_storage_process_exit( char **argv, BOOL completed )
     }
     ok( WaitForSingleObject( ready, 10000 ) == WAIT_OBJECT_0,
         "handoff exit child did not become ready\n" );
-    status = get_surface_handoff( hwnd, process.dwProcessId, HANDOFF_EXIT_ID, TRUE, &owner );
+    {
+        struct __server_request_info info = {0};
+        struct client_surface_handoff_desc desc = {0};
+
+        info.u.req.get_client_surface_handoffs_request.__header.req = REQ_get_client_surface_handoffs;
+        info.u.req.get_client_surface_handoffs_request.handle = wine_server_user_handle( hwnd );
+        wine_server_set_reply( &info, &desc, sizeof(desc) );
+        status = p_wine_server_call( &info );
+        ok( !status && info.u.reply.get_client_surface_handoffs_reply.count == 1 &&
+            wine_server_reply_size( &info.u.reply.get_client_surface_handoffs_reply ) == sizeof(desc),
+            "exit child roster status %#x count %u\n",
+            status, info.u.reply.get_client_surface_handoffs_reply.count );
+        ok( desc.handle == wine_server_user_handle( hwnd ) && desc.process == process.dwProcessId &&
+            desc.surface > ~(UINT32)0, "exit child roster returned a different lifetime\n" );
+        status = get_surface_handoff( hwnd, process.dwProcessId, desc.surface, TRUE, &owner );
+    }
     ok( !status, "exit child owner bind status %#x\n", status );
     if (!status)
     {
@@ -1685,8 +1730,6 @@ done:
     DestroyWindow( hwnd );
 }
 
-#define HANDOFF_OWNER_EXIT_ID 0x79600000
-
 struct handoff_owner_exit_shared
 {
     HWND hwnd;
@@ -1694,7 +1737,7 @@ struct handoff_owner_exit_shared
 
 static void handoff_storage_owner_exit_child( HANDLE mapping, HANDLE window_ready,
                                                HANDLE binding_ready, HANDLE owner_ready,
-                                               HANDLE release, DWORD producer, UINT_PTR identity )
+                                               HANDLE release, DWORD producer, UINT64 identity )
 {
     struct handoff_owner_exit_shared *state;
     struct handoff_binding binding = {0};
@@ -1743,7 +1786,7 @@ static void test_handoff_storage_owner_exit( char **argv, BOOL completed )
     struct client_surface_handoff_channel *slot = NULL;
     HANDLE mapping = NULL, window_ready = NULL, binding_ready = NULL;
     HANDLE owner_ready = NULL, release = NULL;
-    UINT_PTR identity = HANDOFF_OWNER_EXIT_ID + completed;
+    UINT64 identity = allocate_surface();
     unsigned int status, index = 0;
     char command[MAX_PATH * 2];
     void *view = NULL;
@@ -1762,7 +1805,7 @@ static void test_handoff_storage_owner_exit( char **argv, BOOL completed )
     ok( !!state, "owner-exit parent shared map error %lu\n", GetLastError() );
     if (!state) goto done;
 
-    sprintf( command, "\"%s\" %s handoff_storage_owner_exit_child %p %p %p %p %p %lu %Ix",
+    sprintf( command, "\"%s\" %s handoff_storage_owner_exit_child %p %p %p %p %p %lu %I64x",
              argv[0], argv[1], mapping, window_ready, binding_ready, owner_ready, release,
              GetCurrentProcessId(), identity );
     if (!CreateProcessA( NULL, command, NULL, NULL, TRUE, 0, NULL, NULL, &startup, &process ))
@@ -1848,7 +1891,7 @@ done:
 
 static void test_generation_aba(void)
 {
-    const UINT_PTR surface = 0x12340000;
+    const UINT64 surface = allocate_surface();
     struct surface_state first, second, stale, current, empty;
     HWND hwnd;
     unsigned int status;
@@ -1932,7 +1975,7 @@ static void test_generation_aba(void)
 
 static void test_publish_transaction(void)
 {
-    const UINT_PTR surface = 0x12380000;
+    const UINT64 surface = allocate_surface();
     struct surface_state staged, ready, publishing, changed, committed, repaired;
     HWND hwnd;
     unsigned int status;
@@ -1997,7 +2040,7 @@ static void test_publish_transaction(void)
 
 static void test_live_prepare_transaction(void)
 {
-    const UINT_PTR surface = 0x123a0000;
+    const UINT64 surface = allocate_surface();
     struct surface_state preparing, stale, current, ready;
     HWND hwnd;
     unsigned int status;
@@ -2053,7 +2096,7 @@ static void test_live_prepare_transaction(void)
 
 static void test_unbacked_live_generation(void)
 {
-    const UINT_PTR surface = 0x123b0000;
+    const UINT64 surface = allocate_surface();
     struct surface_state composing, completed, prepare;
     HWND hwnd;
     unsigned int status;
@@ -2084,7 +2127,7 @@ static void test_unbacked_live_generation(void)
 
 static void test_native_backing_barrier(void)
 {
-    const UINT_PTR surface = 0x123d0000, barrier = 0x45670000;
+    const UINT64 surface = allocate_surface(), barrier = 0x45670000;
     struct surface_state state, composing, ready, sealed, blocked;
     HWND hwnd;
     unsigned int status;
@@ -2140,7 +2183,7 @@ static void test_native_backing_barrier(void)
 
 static void test_demoted_native_barrier(void)
 {
-    const UINT_PTR surface = 0x123d6000, barrier = 0x45676000;
+    const UINT64 surface = allocate_surface(), barrier = 0x45676000;
     struct surface_state sealed;
     HWND first, second;
     unsigned int status;
@@ -2172,9 +2215,177 @@ done:
     if (second) DestroyWindow( second );
 }
 
+struct lifetime_test_shared
+{
+    HWND hwnd;
+    UINT64 parent_id;
+    UINT64 child_id;
+};
+
+static void surface_lifetime_child( HANDLE mapping, HANDLE ready, HANDLE release )
+{
+    struct lifetime_test_shared *shared;
+    unsigned int status;
+
+    shared = MapViewOfFile( mapping, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, sizeof(*shared) );
+    ok( !!shared, "lifetime child mapping failed, error %lu\n", GetLastError() );
+    if (!shared)
+    {
+        SetEvent( ready );
+        return;
+    }
+    status = release_surface( shared->parent_id );
+    ok( status == STATUS_INVALID_PARAMETER, "foreign reservation release status %#x\n", status );
+    status = set_surface_state( shared->hwnd, shared->parent_id, CLIENT_SURFACE_STATE_REGISTER, 0, NULL );
+    ok( status == STATUS_INVALID_PARAMETER, "foreign reservation register status %#x\n", status );
+    status = set_surface_state( shared->hwnd, shared->parent_id, CLIENT_SURFACE_STATE_CACHE, 0, NULL );
+    ok( status == STATUS_INVALID_PARAMETER, "foreign reservation cache status %#x\n", status );
+
+    shared->child_id = allocate_surface();
+    ok( shared->child_id != shared->parent_id, "processes received the same lifetime ID\n" );
+    status = set_surface_state( shared->hwnd, shared->child_id, CLIENT_SURFACE_STATE_REGISTER, 0, NULL );
+    ok( !status, "child lifetime register status %#x\n", status );
+    SetEvent( ready );
+    ok( WaitForSingleObject( release, 10000 ) == WAIT_OBJECT_0, "lifetime child release timed out\n" );
+    /* Process exit must retire this registered ID without touching the
+     * parent's independent lifetime on the same window. */
+    UnmapViewOfFile( shared );
+}
+
+static void test_surface_lifetimes( char **argv )
+{
+    SECURITY_ATTRIBUTES attr = {sizeof(attr), NULL, TRUE};
+    STARTUPINFOA startup = {.cb = sizeof(startup)};
+    PROCESS_INFORMATION process = {0};
+    struct lifetime_test_shared *shared = NULL;
+    struct surface_state state;
+    HWND first = create_test_window( FALSE ), second = create_test_window( FALSE ), invalid;
+    HANDLE mapping = NULL, ready = NULL, release = NULL;
+    UINT64 unused, surface, replacement;
+    char command[MAX_PATH * 2];
+    unsigned int status;
+
+    ok( first && second, "failed to create lifetime test windows\n" );
+    if (!first || !second) goto done;
+    unused = allocate_surface();
+    surface = allocate_surface();
+    ok( unused != surface, "concurrent reservations reused an ID\n" );
+    status = release_surface( unused );
+    ok( !status, "unused reservation release status %#x\n", status );
+    status = release_surface( unused );
+    ok( status == STATUS_INVALID_PARAMETER, "released reservation remained indexed, status %#x\n", status );
+    status = set_surface_state( first, unused, CLIENT_SURFACE_STATE_REGISTER, 0, NULL );
+    ok( status == STATUS_INVALID_PARAMETER, "released reservation register status %#x\n", status );
+    status = set_surface_state( first, ~(UINT64)0, CLIENT_SURFACE_STATE_REGISTER, 0, NULL );
+    ok( status == STATUS_INVALID_PARAMETER, "unissued lifetime register status %#x\n", status );
+    status = set_surface_state( first, (UINT32)surface, CLIENT_SURFACE_STATE_CACHE, 0, NULL );
+    ok( status == STATUS_INVALID_PARAMETER, "truncated lifetime cache status %#x\n", status );
+
+    invalid = create_test_window( FALSE );
+    ok( !!invalid, "failed to create registration failure window\n" );
+    if (invalid)
+    {
+        DestroyWindow( invalid );
+        status = set_surface_state( invalid, surface, CLIENT_SURFACE_STATE_REGISTER, 0, NULL );
+        ok( status == STATUS_WINE_INVALID_WINDOW_HANDLE,
+            "destroyed window registration status %#x\n", status );
+    }
+    status = set_surface_state( first, surface, CLIENT_SURFACE_STATE_REGISTER, 0, &state );
+    ok( !status && state.active == 1 && !state.cached,
+        "failed registration consumed reservation: status %#x active %u cached %u\n",
+        status, state.active, state.cached );
+    status = set_surface_state( first, surface, CLIENT_SURFACE_STATE_REGISTER, 0, &state );
+    ok( !status && state.active == 1, "duplicate registration status %#x active %u\n", status, state.active );
+    status = set_surface_state( second, surface, CLIENT_SURFACE_STATE_REGISTER, 0, NULL );
+    ok( status == STATUS_INVALID_PARAMETER, "live lifetime rebound to another window, status %#x\n", status );
+    status = release_surface( surface );
+    ok( status == STATUS_DEVICE_BUSY, "registered lifetime release status %#x\n", status );
+    status = set_surface_state( first, surface, CLIENT_SURFACE_STATE_UNREGISTER | CLIENT_SURFACE_STATE_CACHE,
+                                0, &state );
+    ok( !status && !state.active && state.cached == 1,
+        "cached lifetime transition status %#x active %u cached %u\n", status, state.active, state.cached );
+    status = release_surface( surface );
+    ok( status == STATUS_DEVICE_BUSY, "cached lifetime release status %#x\n", status );
+    status = set_surface_state( first, surface, CLIENT_SURFACE_STATE_REGISTER | CLIENT_SURFACE_STATE_UNCACHE,
+                                0, &state );
+    ok( !status && state.active == 1 && !state.cached,
+        "live cache reactivation status %#x active %u cached %u\n", status, state.active, state.cached );
+    status = set_surface_state( first, surface, CLIENT_SURFACE_STATE_UNREGISTER, 0, NULL );
+    ok( !status, "lifetime retirement status %#x\n", status );
+    status = set_surface_state( first, surface, CLIENT_SURFACE_STATE_REGISTER, 0, NULL );
+    ok( status == STATUS_INVALID_PARAMETER, "retired lifetime register status %#x\n", status );
+    status = set_surface_state( first, surface, CLIENT_SURFACE_STATE_CACHE, 0, NULL );
+    ok( status == STATUS_INVALID_PARAMETER, "retired lifetime cache status %#x\n", status );
+    status = claim_surface_state( first, surface, NULL );
+    ok( status == STATUS_INVALID_PARAMETER, "retired lifetime claim status %#x\n", status );
+    status = set_surface_state( first, 0, 0, 0, &state );
+    ok( !status && !state.active && !state.cached,
+        "rejected IDs changed state: status %#x active %u cached %u\n", status, state.active, state.cached );
+
+    replacement = allocate_surface();
+    ok( replacement != surface && replacement != unused, "new reservation reused a retired ID\n" );
+    mapping = CreateFileMappingA( INVALID_HANDLE_VALUE, &attr, PAGE_READWRITE, 0, sizeof(*shared), NULL );
+    ready = CreateEventA( &attr, TRUE, FALSE, NULL );
+    release = CreateEventA( &attr, TRUE, FALSE, NULL );
+    ok( mapping && ready && release, "failed to create lifetime test synchronization\n" );
+    if (!mapping || !ready || !release) goto release_reservation;
+    shared = MapViewOfFile( mapping, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, sizeof(*shared) );
+    ok( !!shared, "lifetime parent mapping failed, error %lu\n", GetLastError() );
+    if (!shared) goto release_reservation;
+    shared->hwnd = first;
+    shared->parent_id = replacement;
+    sprintf( command, "\"%s\" %s surface_lifetime_child %p %p %p", argv[0], argv[1], mapping, ready, release );
+    if (!CreateProcessA( NULL, command, NULL, NULL, TRUE, 0, NULL, NULL, &startup, &process ))
+    {
+        ok( 0, "lifetime child CreateProcess error %lu\n", GetLastError() );
+        goto release_reservation;
+    }
+    ok( WaitForSingleObject( ready, 10000 ) == WAIT_OBJECT_0, "lifetime child did not become ready\n" );
+    ok( shared->child_id > ~(UINT32)0 && shared->child_id != replacement && shared->child_id != surface,
+        "child did not receive an independent 64-bit lifetime\n" );
+    status = release_surface( shared->child_id );
+    ok( status == STATUS_INVALID_PARAMETER, "foreign registered release status %#x\n", status );
+    status = set_surface_state( first, shared->child_id, CLIENT_SURFACE_STATE_REGISTER, 0, NULL );
+    ok( status == STATUS_INVALID_PARAMETER, "foreign registered ID adopted, status %#x\n", status );
+    status = claim_surface_state( first, shared->child_id, NULL );
+    ok( status == STATUS_INVALID_PARAMETER, "foreign registered ID claimed, status %#x\n", status );
+    status = set_surface_state( first, replacement, CLIENT_SURFACE_STATE_REGISTER, 0, &state );
+    ok( !status && state.active == 2 && !state.cached,
+        "independent process registrations status %#x active %u cached %u\n", status, state.active, state.cached );
+    SetEvent( release );
+    wait_child_process( &process );
+    CloseHandle( process.hThread );
+    CloseHandle( process.hProcess );
+    process.hProcess = NULL;
+    status = set_surface_state( first, 0, 0, 0, &state );
+    ok( !status && state.active == 1 && !state.cached,
+        "child exit affected parent lifetime: status %#x active %u cached %u\n", status, state.active, state.cached );
+    status = set_surface_state( first, replacement, CLIENT_SURFACE_STATE_UNREGISTER, 0, NULL );
+    ok( !status, "parent replacement retirement status %#x\n", status );
+    goto done;
+
+release_reservation:
+    release_surface( replacement );
+done:
+    if (process.hProcess)
+    {
+        SetEvent( release );
+        wait_child_process( &process );
+        CloseHandle( process.hThread );
+        CloseHandle( process.hProcess );
+    }
+    if (shared) UnmapViewOfFile( shared );
+    if (mapping) CloseHandle( mapping );
+    if (ready) CloseHandle( ready );
+    if (release) CloseHandle( release );
+    if (first) DestroyWindow( first );
+    if (second) DestroyWindow( second );
+}
+
 static void test_notification_identity_aba(void)
 {
-    const UINT_PTR surface = 0x123d8000;
+    const UINT64 surface = allocate_surface(), replacement = allocate_surface();
+    struct surface_state state;
     MSG message;
     HWND first, second;
     unsigned int status;
@@ -2187,36 +2398,51 @@ static void test_notification_identity_aba(void)
     {
         if (first) DestroyWindow( first );
         if (second) DestroyWindow( second );
+        release_surface( surface );
+        release_surface( replacement );
         return;
     }
 
-    /* Ensure that window destruction can queue the process-local identity
-     * notification, but leave it undispatched across the first registration
-     * attempt.  The retired index entry is the ABA exclusion boundary. */
+    /* Leave the full 64-bit lifetime's destroy notification queued while
+     * registering another lifetime. No client address or drained queue may
+     * make the old ID reusable. */
     PeekMessageA( &message, NULL, 0, 0, PM_NOREMOVE );
     status = set_surface_state( first, surface, CLIENT_SURFACE_STATE_REGISTER, 0, NULL );
     ok( !status, "notification ABA register failed, status %#x\n", status );
     ok( DestroyWindow( first ), "failed to destroy notification ABA window, error %lu\n",
         GetLastError() );
+    status = release_surface( surface );
+    ok( !status, "queued notification did not retain its lifetime, status %#x\n", status );
 
     status = set_surface_state( second, surface, CLIENT_SURFACE_STATE_REGISTER, 0, NULL );
     ok( status == STATUS_INVALID_PARAMETER,
         "retired identity was reused before notification removal, status %#x\n", status );
+    ok( replacement != surface, "new lifetime reused retired ID\n" );
+    status = set_surface_state( second, replacement, CLIENT_SURFACE_STATE_REGISTER, 0, &state );
+    ok( !status && state.active == 1, "fresh lifetime registration status %#x active %u\n",
+        status, state.active );
 
-    /* Process-internal notifications are sent-message work and must bypass
-     * application window and message-range filters.  A posted notification
-     * would remain stranded behind this valid restrictive PeekMessage call. */
+    /* Sent-message work bypasses the application's window and range filters.
+     * Removing this notification must reconstruct both ID halves: truncating
+     * the ID would leave its server record retained after this filtered pump. */
     PeekMessageA( &message, second, WM_USER, WM_USER, PM_NOREMOVE );
+    status = release_surface( surface );
+    ok( status == STATUS_INVALID_PARAMETER,
+        "filtered pump retained the 64-bit notification lifetime, status %#x\n", status );
     status = set_surface_state( second, surface, CLIENT_SURFACE_STATE_REGISTER, 0, NULL );
-    ok( !status, "filtered message pump retained notification identity tombstone, status %#x\n",
-        status );
-    set_surface_state( second, surface, CLIENT_SURFACE_STATE_UNREGISTER, 0, NULL );
+    ok( status == STATUS_INVALID_PARAMETER,
+        "notification removal made a retired identity reusable, status %#x\n", status );
+    status = set_surface_state( second, replacement, 0, 0, &state );
+    ok( !status && state.active == 1 && !state.cached,
+        "stale notification affected new lifetime: status %#x active %u cached %u\n",
+        status, state.active, state.cached );
+    set_surface_state( second, replacement, CLIENT_SURFACE_STATE_UNREGISTER, 0, NULL );
     DestroyWindow( second );
 }
 
 static void test_late_present_cutover(void)
 {
-    const UINT_PTR surface = 0x12390000;
+    const UINT64 surface = allocate_surface();
     struct surface_state staged, ready, reopened, publishing, late, published, repaired;
     HWND hwnd;
     unsigned int status;
@@ -2282,7 +2508,6 @@ static void test_late_present_cutover(void)
 struct race_context
 {
     HWND hwnd;
-    UINT_PTR base;
     LONG failures;
     LONG first_status;
 };
@@ -2294,10 +2519,15 @@ static DWORD WINAPI surface_race_thread( void *arg )
 
     for (i = 0; i < RACE_ROUNDS; ++i)
     {
-        UINT_PTR id = context->base + i;
+        UINT64 id = allocate_surface();
 
         status = set_surface_state( context->hwnd, id, CLIENT_SURFACE_STATE_REGISTER, 0, NULL );
-        if (status == STATUS_INVALID_HANDLE || status == STATUS_WINE_INVALID_WINDOW_HANDLE) break;
+        if (status == STATUS_INVALID_HANDLE || status == STATUS_WINE_INVALID_WINDOW_HANDLE)
+        {
+            status = release_surface( id );
+            ok( !status, "failed registration reservation release status %#x\n", status );
+            break;
+        }
         if (status)
         {
             InterlockedCompareExchange( &context->first_status, status, 0 );
@@ -2347,7 +2577,6 @@ static void test_concurrent_state_changes(void)
     for (i = 0; i < RACE_THREADS; ++i)
     {
         contexts[i].hwnd = hwnd;
-        contexts[i].base = 0x20000000 + i * 0x10000;
         contexts[i].failures = 0;
         contexts[i].first_status = 0;
         threads[i] = CreateThread( NULL, 0, surface_race_thread, &contexts[i], 0, NULL );
@@ -2393,7 +2622,7 @@ static void owner_exit_child( HWND hwnd, HANDLE ready, HANDLE release, BOOL crea
 
     for (i = 0; i < OWNER_SURFACES; ++i)
     {
-        status = set_surface_state( hwnd, 0x30000000 + i,
+        status = set_surface_state( hwnd, allocate_surface(),
                                     CLIENT_SURFACE_STATE_REGISTER | CLIENT_SURFACE_STATE_CACHE |
                                     (scene_publication ? CLIENT_SURFACE_STATE_SCENE_PUBLICATION : 0),
                                     0, NULL );
@@ -2407,7 +2636,7 @@ static void owner_exit_child( HWND hwnd, HANDLE ready, HANDLE release, BOOL crea
 
 static void destroy_race_child( HWND hwnd )
 {
-    struct race_context context = {hwnd, 0x40000000};
+    struct race_context context = {.hwnd = hwnd};
 
     surface_race_thread( &context );
     ok( !context.failures, "destroy race had %ld request failures, first status %#lx\n",
@@ -3189,6 +3418,12 @@ static BOOL run_focused_test_case( const char *name, char **argv )
     };
     unsigned int i;
 
+    if (!strcmp( name, "surface-lifetimes" ))
+    {
+        trace( "testing server-issued surface lifetimes\n" );
+        test_surface_lifetimes( argv );
+        return TRUE;
+    }
     if (!strcmp( name, "presentation-modes-destroy-race" ))
     {
         trace( "testing presentation mode teardown before present destruction race\n" );
@@ -3266,6 +3501,16 @@ START_TEST(client_surface)
         return;
     }
 
+    if (argc > 5 && !strcmp( argv[2], "surface_lifetime_child" ))
+    {
+        HANDLE mapping, ready, release;
+
+        sscanf( argv[3], "%p", &mapping );
+        sscanf( argv[4], "%p", &ready );
+        sscanf( argv[5], "%p", &release );
+        surface_lifetime_child( mapping, ready, release );
+        return;
+    }
     if (argc > 6 && !strcmp( argv[2], "handoff_storage_exit_child" ))
     {
         HANDLE ready, release;
@@ -3334,6 +3579,8 @@ START_TEST(client_surface)
     }
 
     GetDesktopWindow();
+    trace( "testing server-issued surface lifetimes\n" );
+    test_surface_lifetimes( argv );
     trace( "testing client surface completion result provenance\n" );
     test_completion_result_provenance();
     trace( "testing client surface generation handoff storage\n" );

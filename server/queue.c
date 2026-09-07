@@ -1011,17 +1011,17 @@ static void free_message( struct message *msg )
 static int is_client_surface_notification( const struct message *msg )
 {
     return (msg->type == MSG_POSTED || msg->type == MSG_NOTIFY) &&
-           msg->msg == WM_WINE_UPDATEWINDOWSTATE &&
-           (msg->wparam == WINE_UPDATE_CLIENT_SURFACES ||
-            msg->wparam == WINE_DESTROY_CLIENT_SURFACES);
+           (msg->msg == WM_WINE_UPDATECLIENTSURFACE ||
+            msg->msg == WM_WINE_DESTROYCLIENTSURFACE);
 }
 
 static void release_client_surface_notification( struct msg_queue *queue,
                                                  const struct message *msg, int delivered )
 {
     if (is_client_surface_notification( msg ))
-        client_surface_notification_removed( queue->process, msg->lparam,
-                                             msg->wparam, delivered );
+        client_surface_notification_removed( queue->process,
+                                             ((UINT64)(UINT32)msg->wparam << 32) | (UINT32)msg->lparam,
+                                             msg->msg, delivered );
 }
 
 static void remove_queue_message( struct msg_queue *queue, struct message *msg,

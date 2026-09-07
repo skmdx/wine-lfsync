@@ -219,7 +219,7 @@ struct gdi_dc_funcs
 };
 
 /* increment this when changing driver tables or shared driver-facing structures */
-#define WINE_GDI_DRIVER_VERSION 126
+#define WINE_GDI_DRIVER_VERSION 127
 
 #define GDI_PRIORITY_NULL_DRV        0  /* null driver */
 #define GDI_PRIORITY_FONT_DRV      100  /* any font driver */
@@ -390,7 +390,7 @@ struct client_surface
 {
     const struct client_surface_backend *backend;
     struct list                        entry;          /* entry in win32u managed list */
-    UINT_PTR                           identity;       /* opaque server notification token */
+    DECLSPEC_ALIGN(8) UINT64            identity;       /* server-issued surface lifetime, atomic */
     struct client_surface             *identity_next; /* process-local identity hash chain */
     struct client_surface             *toplevel_next; /* driver-ready top-level hash chain */
     HWND                               indexed_toplevel;

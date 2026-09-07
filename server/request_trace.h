@@ -3547,6 +3547,20 @@ static void dump_alpc_create_port_reply( const struct alpc_create_port_reply *re
     fprintf( stderr, " handle=%04x", req->handle );
 }
 
+static void dump_allocate_client_surface_request( const struct allocate_client_surface_request *req )
+{
+}
+
+static void dump_allocate_client_surface_reply( const struct allocate_client_surface_reply *req )
+{
+    dump_uint64( " surface=", &req->surface );
+}
+
+static void dump_release_client_surface_request( const struct release_client_surface_request *req )
+{
+    dump_uint64( " surface=", &req->surface );
+}
+
 static void dump_set_client_surface_state_request( const struct set_client_surface_state_request *req )
 {
     fprintf( stderr, " handle=%08x", req->handle );
@@ -3999,6 +4013,8 @@ static const dump_func req_dumpers[REQ_NB_REQUESTS] =
     (dump_func)dump_d3dkmt_mutex_acquire_request,
     (dump_func)dump_d3dkmt_mutex_release_request,
     (dump_func)dump_alpc_create_port_request,
+    (dump_func)dump_allocate_client_surface_request,
+    (dump_func)dump_release_client_surface_request,
     (dump_func)dump_set_client_surface_state_request,
     (dump_func)dump_get_client_surface_clip_windows_request,
     (dump_func)dump_get_client_surface_handoff_request,
@@ -4322,6 +4338,8 @@ static const dump_func reply_dumpers[REQ_NB_REQUESTS] =
     (dump_func)dump_d3dkmt_mutex_acquire_reply,
     NULL,
     (dump_func)dump_alpc_create_port_reply,
+    (dump_func)dump_allocate_client_surface_reply,
+    NULL,
     (dump_func)dump_set_client_surface_state_reply,
     (dump_func)dump_get_client_surface_clip_windows_reply,
     (dump_func)dump_get_client_surface_handoff_reply,
@@ -4645,6 +4663,8 @@ static const char * const req_names[REQ_NB_REQUESTS] =
     "d3dkmt_mutex_acquire",
     "d3dkmt_mutex_release",
     "alpc_create_port",
+    "allocate_client_surface",
+    "release_client_surface",
     "set_client_surface_state",
     "get_client_surface_clip_windows",
     "get_client_surface_handoff",
@@ -4801,6 +4821,7 @@ static const struct
     { "THREAD_IS_TERMINATING",       STATUS_THREAD_IS_TERMINATING },
     { "THREAD_WAS_SUSPENDED",        STATUS_THREAD_WAS_SUSPENDED },
     { "TIMEOUT",                     STATUS_TIMEOUT },
+    { "TOO_MANY_CONTEXT_IDS",        STATUS_TOO_MANY_CONTEXT_IDS },
     { "TOO_MANY_OPENED_FILES",       STATUS_TOO_MANY_OPENED_FILES },
     { "UNSUCCESSFUL",                STATUS_UNSUCCESSFUL },
     { "USER_APC",                    STATUS_USER_APC },

@@ -331,8 +331,14 @@ extern BOOL publish_window_state( HWND hwnd );
 extern BOOL prepare_window_client_surfaces( HWND hwnd );
 extern void client_surface_prepare_scene( struct client_surface *surface );
 extern void update_window_client_surface_backing( HWND hwnd );
-extern void detach_client_surface_identity( UINT_PTR identity );
-extern void recompose_client_surface( HWND hwnd, UINT_PTR identity );
+extern void detach_client_surface_identity( UINT64 identity );
+extern void recompose_client_surface( HWND hwnd, UINT64 identity );
+
+static inline UINT64 client_surface_get_identity( const struct client_surface *surface )
+{
+    return __atomic_load_n( &surface->identity, __ATOMIC_ACQUIRE );
+}
+
 extern HWND window_from_point( HWND hwnd, POINT pt, INT *hittest, BOOL send_nchittest );
 extern HWND get_shell_window(void);
 extern HWND get_progman_window(void);
