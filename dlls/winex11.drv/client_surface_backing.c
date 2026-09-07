@@ -284,6 +284,7 @@ struct client_surface_compositor_job
     VisualID visual;
     BOOL result;
     BOOL complete;
+    BOOL async;
     BOOL present_started;
     BOOL present_done;
     DWORD present_start;
@@ -3075,6 +3076,11 @@ static BOOL process_client_surface_compositor_jobs(void)
         *cursor = job->next;
         --budget;
         progressed = TRUE;
+        if (job->async)
+        {
+            free( job );
+            continue;
+        }
         pthread_mutex_lock( &client_surface_compositor_mutex );
         job->complete = TRUE;
         pthread_cond_broadcast( &client_surface_compositor_cond );
@@ -3144,7 +3150,9 @@ static BOOL init_client_surface_compositor_notification(void)
     return TRUE;
 }
 
-static BOOL submit_client_surface_compositor_job( struct client_surface_compositor_job *job )
+/* The caller holds client_surface_compositor_mutex. Ownership of asynchronous
+ * jobs passes to the actor only when they have been queued successfully. */
+static BOOL queue_client_surface_compositor_job( struct client_surface_compositor_job *job )
 {
     HANDLE thread;
     NTSTATUS status;
@@ -3153,19 +3161,13 @@ static BOOL submit_client_surface_compositor_job( struct client_surface_composit
     job->complete = FALSE;
     job->present_started = job->present_done = FALSE;
     job->update_deferred = FALSE;
-    pthread_mutex_lock( &client_surface_compositor_mutex );
     if (!client_surface_compositor_started)
     {
-        if (!init_client_surface_compositor_notification())
-        {
-            pthread_mutex_unlock( &client_surface_compositor_mutex );
-            return FALSE;
-        }
+        if (!init_client_surface_compositor_notification()) return FALSE;
         status = PsCreateSystemThread( &thread, THREAD_ALL_ACCESS, NULL, 0, NULL,
                                        client_surface_compositor_thread, NULL );
         if (status)
         {
-            pthread_mutex_unlock( &client_surface_compositor_mutex );
             WARN( "failed to create client-surface compositor, status %#lx\n",
                   (unsigned long)status );
             return FALSE;
@@ -3177,11 +3179,24 @@ static BOOL submit_client_surface_compositor_job( struct client_surface_composit
     client_surface_compositor_tail = &job->next;
     wake_client_surface_compositor();
     pthread_cond_broadcast( &client_surface_compositor_cond );
-    while (!job->complete)
-        pthread_cond_wait( &client_surface_compositor_cond,
-                           &client_surface_compositor_mutex );
+    return TRUE;
+}
+
+static BOOL submit_client_surface_compositor_job( struct client_surface_compositor_job *job )
+{
+    BOOL ret = FALSE;
+
+    job->async = FALSE;
+    pthread_mutex_lock( &client_surface_compositor_mutex );
+    if (queue_client_surface_compositor_job( job ))
+    {
+        while (!job->complete)
+            pthread_cond_wait( &client_surface_compositor_cond,
+                               &client_surface_compositor_mutex );
+        ret = job->result;
+    }
     pthread_mutex_unlock( &client_surface_compositor_mutex );
-    return job->result;
+    return ret;
 }
 
 static BOOL client_surface_backing_copy_area( Drawable source, Drawable destination,
@@ -3368,6 +3383,7 @@ UINT X11DRV_client_surface_backing_resume_update( HWND hwnd, UINT64 serial )
 
 void X11DRV_client_surface_backing_finish_deferred_update( HWND hwnd, UINT64 serial )
 {
+    struct client_surface_compositor_job *pending;
     struct client_surface_compositor_job job =
     {
         .op = CLIENT_SURFACE_COMPOSITOR_FINISH_UPDATE,
@@ -3378,6 +3394,20 @@ void X11DRV_client_surface_backing_finish_deferred_update( HWND hwnd, UINT64 ser
     /* Even if the server no longer needs a prepare or backing transition,
      * release this notification's hold after every state handler returned.
      * A handler which deferred again leaves its reasons for the next wake. */
+    if ((pending = malloc( sizeof(*pending) )))
+    {
+        BOOL queued;
+
+        *pending = job;
+        pending->async = TRUE;
+        pthread_mutex_lock( &client_surface_compositor_mutex );
+        queued = queue_client_surface_compositor_job( pending );
+        pthread_mutex_unlock( &client_surface_compositor_mutex );
+        if (queued) return;
+        free( pending );
+    }
+    /* The hold must still be released if allocating or queuing the owned job
+     * fails. Only this failure path needs the actor's synchronous reply. */
     submit_client_surface_compositor_job( &job );
 }
 
