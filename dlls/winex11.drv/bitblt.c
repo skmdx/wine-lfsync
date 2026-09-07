@@ -1776,8 +1776,11 @@ static void x11drv_surface_set_clip( struct window_surface *window_surface, cons
 
     TRACE( "surface %p, rects %p, count %u\n", surface, rects, count );
 
-    if (!count)
+    /* An empty region excludes all pixels; NULL removes the clip. */
+    if (!rects)
         XSetClipMask( gdi_display, surface->gc, None );
+    else if (!count)
+        XSetClipRectangles( gdi_display, surface->gc, 0, 0, NULL, 0, YXBanded );
     else if ((xrects = xrectangles_from_rects( rects, count )))
     {
         XSetClipRectangles( gdi_display, surface->gc, 0, 0, xrects, count, YXBanded );
