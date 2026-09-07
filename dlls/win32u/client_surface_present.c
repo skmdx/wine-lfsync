@@ -152,9 +152,8 @@ void client_surface_release_handoff( struct client_surface *surface )
                 UINT64 lost = client_surface_handoff_control(
                     client_surface_handoff_generation( control ), CLIENT_SURFACE_HANDOFF_LOST );
 
-                /* A scene replay may reclaim returned storage. Revoke our
-                 * token atomically before dropping the producer endpoint;
-                 * if the reader won, wait for its checked copy as usual. */
+                /* Revoke returned storage before dropping the endpoint.
+                 * Scene replay uses the owner's independent cache. */
                 if (__atomic_compare_exchange_n( &slot->control, &control, lost, 0,
                                                   __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE ))
                 {
@@ -282,6 +281,7 @@ static BOOL map_client_surface_handoff( struct client_surface *surface )
     surface->handoff_view_size = size;
     surface->handoff_shared = shared;
     surface->handoff_slot = slot;
+    memset( surface->handoff_source, 0, sizeof(surface->handoff_source) );
     surface->next_handoff = 0;
     surface->handoff_mapping_id = mapping_id;
     surface->handoff_cookie = cookie;
@@ -376,8 +376,7 @@ static BOOL acquire_client_surface_handoff( struct client_surface *surface,
 static BOOL prepare_client_surface_handoff_locked( struct client_surface *surface,
                                                    struct client_surface_frame *present, BOOL independent )
 {
-    struct client_surface_handoff_slot *slot;
-    HRGN surface_region = 0;
+    struct client_surface_source *source;
     UINT64 token;
 
     if ((!independent && (present->target != CLIENT_SURFACE_FRAME_TARGET_OFFSCREEN ||
@@ -394,11 +393,6 @@ static BOOL prepare_client_surface_handoff_locked( struct client_surface *surfac
                surface->backend->handoff_prepare );
         return FALSE;
     }
-    if (!client_surface_backend_has_cap( surface, CLIENT_SURFACE_BACKEND_OWNER_SCENE_PLAN ) &&
-        !get_cached_client_surface_region( surface, surface->hwnd,
-                                           &surface->target.monitor_rect,
-                                           present, &surface_region ))
-        return FALSE;
     if (!map_client_surface_handoff( surface )) return FALSE;
     if (!independent && (__atomic_load_n( &surface->handoff_slot->endpoints, __ATOMIC_ACQUIRE ) &
          CLIENT_SURFACE_HANDOFF_ENDPOINT_CONSUMER) == 0)
@@ -413,23 +407,19 @@ static BOOL prepare_client_surface_handoff_locked( struct client_surface *surfac
         client_surface_release_handoff( surface );
         return FALSE;
     }
-    slot = surface->handoff_slot + present->handoff_index;
-    slot->scene_epoch = present->scene.epoch;
-    slot->scene_generation = present->scene.generation;
-    slot->target_seq = present->target_seq;
-    /* Process and window identities belong to the server-allocated binding,
-     * not the submitting thread (cached replay may run on a Unix worker). */
-    if (!surface->backend->handoff_prepare( surface, slot, surface_region ))
+    source = surface->handoff_source + present->handoff_index;
+    *source = (struct client_surface_source){.target_seq = present->target_seq};
+    if (!surface->backend->handoff_prepare( surface, source ))
     {
         UINT64 expected = token;
         UINT64 free = client_surface_handoff_control(
             client_surface_handoff_generation( token ), CLIENT_SURFACE_HANDOFF_FREE );
 
-        __atomic_compare_exchange_n( &slot->control, &expected, free, 0,
+        __atomic_compare_exchange_n( &surface->handoff_slot[present->handoff_index].control, &expected, free, 0,
                                      __ATOMIC_RELEASE, __ATOMIC_RELAXED );
         return FALSE;
     }
-    if (independent) slot->flags |= CLIENT_SURFACE_HANDOFF_INDEPENDENT;
+    if (independent) source->flags |= CLIENT_SURFACE_HANDOFF_INDEPENDENT;
     present->handoff_control = token;
     return TRUE;
 }
@@ -459,6 +449,7 @@ BOOL client_surface_freeze_frame_locked( struct client_surface *surface,
                                          struct client_surface_completed_frame *frame )
 {
     struct client_surface_handoff_slot *slot;
+    struct client_surface_source *source = surface->handoff_source + present->handoff_index;
     BOOL valid;
 
     memset( frame, 0, sizeof(*frame) );
@@ -471,25 +462,26 @@ BOOL client_surface_freeze_frame_locked( struct client_surface *surface,
             (present->serial > surface->composed_serial ||
              (present->serial == surface->composed_serial && surface->content_valid));
     if (valid && present->capture.size.cx)
-        valid = slot->width == present->capture.size.cx && slot->height == present->capture.size.cy;
+        valid = source->width == present->capture.size.cx && source->height == present->capture.size.cy;
     if (valid && surface->backend->handoff_complete)
-        valid = surface->backend->handoff_complete( surface, slot );
+        valid = surface->backend->handoff_complete( surface, source );
     if (valid)
-        valid = slot->source && slot->width && slot->height && (slot->flags & CLIENT_SURFACE_HANDOFF_COPY_SOURCE);
+        valid = source->source && source->width && source->height && (source->flags & CLIENT_SURFACE_HANDOFF_COPY_SOURCE);
     if (valid)
     {
         if (client_surface_backend_has_cap( surface, CLIENT_SURFACE_BACKEND_OWNER_SCENE_PLAN ))
-            slot->flags |= CLIENT_SURFACE_HANDOFF_INDEPENDENT;
+            source->flags |= CLIENT_SURFACE_HANDOFF_INDEPENDENT;
         frame->surface_id = surface->identity;
         frame->frame_id = present->serial;
         frame->target_epoch = present->target_seq;
-        frame->image = slot->source;
-        frame->visual = slot->source_visual;
-        frame->size = (SIZE){slot->width, slot->height};
-        SetRect( &frame->damage, 0, 0, slot->width, slot->height );
+        frame->image = source->source;
+        frame->visual = source->source_visual;
+        frame->flags = source->flags;
+        frame->size = (SIZE){source->width, source->height};
+        SetRect( &frame->damage, 0, 0, source->width, source->height );
         if (present->damage_base_sequence && !IsRectEmpty( &present->damage ) &&
             present->damage.left >= 0 && present->damage.top >= 0 &&
-            present->damage.right <= slot->width && present->damage.bottom <= slot->height)
+            present->damage.right <= source->width && present->damage.bottom <= source->height)
         {
             frame->damage = present->damage;
             frame->damage_base_frame = present->damage_base_sequence;
@@ -507,6 +499,7 @@ BOOL client_surface_publish_handoff_locked( struct client_surface *surface,
 {
     struct client_surface_handoff_slot *slot = surface->handoff_slot ?
         surface->handoff_slot + present->handoff_index : NULL;
+    const struct client_surface_source *source = surface->handoff_source + present->handoff_index;
     UINT64 expected = present->handoff_control;
     UINT64 ready;
     unsigned long long ready_time;
@@ -516,18 +509,25 @@ BOOL client_surface_publish_handoff_locked( struct client_surface *surface,
     if (!expected || !slot || !frame->image) return FALSE;
     pthread_mutex_lock( &surface->present_lock );
     valid = frame->surface_id == surface->identity && frame->frame_id == present->serial &&
-            frame->target_epoch == present->target_seq && frame->image == slot->source &&
-            frame->visual == slot->source_visual && frame->size.cx == slot->width && frame->size.cy == slot->height &&
-            (slot->flags & CLIENT_SURFACE_HANDOFF_COPY_SOURCE) && surface->hwnd && surface->target.valid &&
+            frame->target_epoch == present->target_seq && frame->image == source->source &&
+            frame->visual == source->source_visual && frame->size.cx == source->width &&
+            frame->size.cy == source->height && frame->flags == source->flags &&
+            (frame->flags & CLIENT_SURFACE_HANDOFF_COPY_SOURCE) && surface->hwnd && surface->target.valid &&
             __atomic_load_n( &slot->control, __ATOMIC_ACQUIRE ) == expected &&
             present->serial >= surface->composed_serial &&
             present->target_seq == surface->target.seq;
-    valid = valid && (slot->flags & CLIENT_SURFACE_HANDOFF_INDEPENDENT) &&
+    valid = valid && (frame->flags & CLIENT_SURFACE_HANDOFF_INDEPENDENT) &&
             client_surface_backend_has_cap( surface, CLIENT_SURFACE_BACKEND_OWNER_SCENE_PLAN );
     if (valid)
     {
         /* Completion establishes an image, not a scene. The owner selects
          * placement and checks the authoritative producer in its own snapshot. */
+        slot->source = frame->image;
+        slot->source_visual = frame->visual;
+        slot->target_seq = frame->target_epoch;
+        slot->width = frame->size.cx;
+        slot->height = frame->size.cy;
+        slot->flags = frame->flags;
         slot->source_sequence = frame->frame_id;
         slot->damage = frame->damage;
         slot->damage_base_sequence = frame->damage_base_frame;

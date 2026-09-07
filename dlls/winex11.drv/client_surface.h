@@ -37,7 +37,7 @@ struct x11drv_client_source_frame
     void *image;
     void (*release_image)( void *image );
     BOOL (*image_ready)( void *image );
-    UINT64 gpu_control;
+    BOOL gpu_copy; /* this reservation uses the image's independently owned GPU fence */
 };
 
 struct x11drv_client_surface

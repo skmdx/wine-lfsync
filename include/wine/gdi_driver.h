@@ -219,7 +219,7 @@ struct gdi_dc_funcs
 };
 
 /* increment this when changing driver tables or shared driver-facing structures */
-#define WINE_GDI_DRIVER_VERSION 124
+#define WINE_GDI_DRIVER_VERSION 125
 
 #define GDI_PRIORITY_NULL_DRV        0  /* null driver */
 #define GDI_PRIORITY_FONT_DRV      100  /* any font driver */
@@ -250,6 +250,16 @@ static inline void push_dc_driver( PHYSDEV *dev, PHYSDEV physdev, const struct g
 struct client_surface;
 struct client_surface_scene;
 
+/* Producer-private native storage metadata. Preparation and capture may change
+ * it before completion; only the core's completed frame enters the channel. */
+struct client_surface_source
+{
+    UINT64 source;
+    UINT64 source_visual;
+    UINT64 target_seq;
+    UINT width, height;
+    UINT flags;
+};
 /* Driver-ready native target.  seq is a seqlock and the sole invalidation
  * token for geometry, presentation mode, resize, detach and native replacement. */
 struct client_surface_target
@@ -303,14 +313,12 @@ struct client_surface_backend
      * flush requires host completion before returning, defer_visible keeps a scene generation staged */
     BOOL (*present)( struct client_surface *surface, const struct client_surface_scene *scene,
                      HDC hdc, HRGN surface_region, BOOL flush, BOOL defer_visible );
-    /* Publish immutable native source metadata into an owner-consumed slot. */
+    /* Prepare producer-private storage. This does not publish a frame. */
     BOOL (*handoff_prepare)( struct client_surface *surface,
-                             struct client_surface_handoff_slot *slot,
-                             HRGN surface_region );
-    /* Freeze a completed mutable native drawable into this slot's independent
-     * storage before READY. The slot is still producer-private here. */
+                             struct client_surface_source *source );
+    /* Freeze a completed native drawable into independent producer storage. */
     BOOL (*handoff_complete)( struct client_surface *surface,
-                              struct client_surface_handoff_slot *slot );
+                              struct client_surface_source *source );
     BOOL (*handoff_serialize)( struct client_surface *surface );
     /* Take ownership of the mapped handoff, its notification fd and source
      * storage. Retire them after readers finish, without retaining surface. */
@@ -423,6 +431,7 @@ struct client_surface
     SIZE_T                             handoff_view_size;
     struct client_surface_handoff_shared *handoff_shared;
     struct client_surface_handoff_slot *handoff_slot;
+    struct client_surface_source        handoff_source[CLIENT_SURFACE_SOURCE_FRAME_COUNT];
     unsigned int next_handoff;
     UINT64                             handoff_mapping_id;
     UINT64                             handoff_cookie;

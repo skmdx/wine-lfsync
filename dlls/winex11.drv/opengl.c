@@ -1599,7 +1599,7 @@ static BOOL snapshot_client_surface( struct opengl_drawable *base, struct client
     pthread_mutex_lock( &base->client->present_lock );
     ret = x11drv_client_surface_snapshot( base->client, pixels, size.cx, size.cy, FALSE, FALSE );
     if (ret && present->handoff_control)
-        base->client->handoff_slot[present->handoff_index].source = surface->snapshot;
+        base->client->handoff_source[present->handoff_index].source = surface->snapshot;
     if (ret) present->capture.size = size;
     pthread_mutex_unlock( &base->client->present_lock );
     return ret;
@@ -1760,14 +1760,14 @@ static int snapshot_client_surface_gpu( struct opengl_drawable *base,
     struct egl_snapshot_completion *completion;
     struct egl_snapshot_image *image;
     struct x11drv_client_surface *surface = impl_from_client_surface( base->client );
-    struct client_surface_handoff_slot *slot = base->client->handoff_slot + present->handoff_index;
+    struct client_surface_source *source = base->client->handoff_source + present->handoff_index;
     GLint read_fbo, draw_fbo, read_buffer, renderbuffer;
     GLuint fbo = 0, buffer = 0;
     GLboolean scissor, srgb;
     GLenum status, error;
     int ret = 0;
 
-    if (slot->width != base->virtual_size.cx || slot->height != base->virtual_size.cy)
+    if (source->width != base->virtual_size.cx || source->height != base->virtual_size.cy)
     {
         present->target = CLIENT_SURFACE_FRAME_TARGET_INVALID;
         present->result = CLIENT_SURFACE_FRAME_SUPERSEDED;
@@ -1775,7 +1775,7 @@ static int snapshot_client_surface_gpu( struct opengl_drawable *base,
     }
     pthread_mutex_lock( &base->client->present_lock );
     frame = x11drv_client_surface_get_source( base->client, present->handoff_index,
-                                              slot->width, slot->height, default_visual.depth );
+                                              source->width, source->height, default_visual.depth );
     if (frame && surface->gpu_snapshot == frame->pixmap) x11drv_client_surface_set_gpu_snapshot( surface, 0 );
     pthread_mutex_unlock( &base->client->present_lock );
     if (!frame) return -1;
@@ -1819,7 +1819,7 @@ static int snapshot_client_surface_gpu( struct opengl_drawable *base,
     funcs->p_glDisable( GL_SCISSOR_TEST );
     funcs->p_glDisable( GL_FRAMEBUFFER_SRGB );
     /* Native X pixmap coordinates have their origin at the top left. */
-    funcs->p_glBlitFramebuffer( 0, 0, slot->width, slot->height, 0, slot->height, slot->width, 0,
+    funcs->p_glBlitFramebuffer( 0, 0, source->width, source->height, 0, source->height, source->width, 0,
                                 GL_COLOR_BUFFER_BIT, GL_NEAREST );
     ret = funcs->p_glGetError() == GL_NO_ERROR ? 1 : -1;
     /* Keep the source's fence reference even if the common completion times
@@ -1834,7 +1834,7 @@ static int snapshot_client_surface_gpu( struct opengl_drawable *base,
             funcs->p_glFlush();
             completion->refs = 2;
             completion->drawable = base;
-            completion->slot = slot;
+            completion->slot = base->client->handoff_slot + present->handoff_index;
             completion->control = present->handoff_control;
             opengl_drawable_add_ref( base );
             release_snapshot_sync( image->pending );
@@ -1851,9 +1851,9 @@ static int snapshot_client_surface_gpu( struct opengl_drawable *base,
     }
     if (ret > 0)
     {
-        frame->gpu_control = present->handoff_control;
-        slot->source = frame->pixmap;
-        present->capture.size = (SIZE){slot->width, slot->height};
+        frame->gpu_copy = TRUE;
+        source->source = frame->pixmap;
+        present->capture.size = (SIZE){source->width, source->height};
     }
 done:
     if (scissor) funcs->p_glEnable( GL_SCISSOR_TEST );

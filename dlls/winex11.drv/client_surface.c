@@ -439,32 +439,24 @@ BOOL x11drv_client_surface_snapshot( struct client_surface *client, const BYTE *
 }
 
 static BOOL x11drv_client_surface_handoff_prepare(
-    struct client_surface *client, struct client_surface_handoff_slot *slot,
-    HRGN surface_region )
+    struct client_surface *client, struct client_surface_source *image )
 {
     struct x11drv_client_surface *surface = impl_from_client_surface( client );
     RECT source = client->raw ? client->target.monitor_rect : client->target.virtual_rect;
-    RECT destination = client->target.monitor_rect;
     unsigned int width, height;
 
     if (!x11drv_client_surface_prepare_retirement( surface )) return FALSE;
-    if (source.right <= source.left || source.bottom <= source.top ||
-        destination.right <= destination.left || destination.bottom <= destination.top)
-        return FALSE;
+    if (source.right <= source.left || source.bottom <= source.top) return FALSE;
     width = source.right - source.left;
     height = source.bottom - source.top;
-    slot->source = usexcomposite && !surface->direct_snapshot ? surface->window : surface->snapshot;
-    if (surface->gpu_snapshot) slot->source = surface->gpu_snapshot;
-    slot->source_visual = usexcomposite && !surface->direct_snapshot ? surface->source_visual : default_visual.visualid;
-    slot->flags = CLIENT_SURFACE_HANDOFF_NATIVE_X11 | CLIENT_SURFACE_HANDOFF_FULL_DAMAGE;
-    slot->destination = destination;
-    slot->width = width;
-    slot->height = height;
-    SetRect( &slot->damage, 0, 0, width, height );
-    if (!usexcomposite || surface->direct_snapshot) slot->flags |= CLIENT_SURFACE_HANDOFF_COPY_SOURCE;
-    surface->sources[slot - client->handoff_slot].gpu_control = 0;
-    slot->clip_count = 0;
-    slot->clip_region = 0;
+    image->source = usexcomposite && !surface->direct_snapshot ? surface->window : surface->snapshot;
+    if (surface->gpu_snapshot) image->source = surface->gpu_snapshot;
+    image->source_visual = usexcomposite && !surface->direct_snapshot ? surface->source_visual : default_visual.visualid;
+    image->flags = CLIENT_SURFACE_HANDOFF_NATIVE_X11 | CLIENT_SURFACE_HANDOFF_FULL_DAMAGE;
+    image->width = width;
+    image->height = height;
+    if (!usexcomposite || surface->direct_snapshot) image->flags |= CLIENT_SURFACE_HANDOFF_COPY_SOURCE;
+    surface->sources[image - client->handoff_source].gpu_copy = FALSE;
     return TRUE;
 }
 
@@ -480,10 +472,10 @@ static BOOL x11drv_client_surface_handoff_serialize( struct client_surface *clie
 }
 
 static BOOL x11drv_client_surface_handoff_complete( struct client_surface *client,
-                                                   struct client_surface_handoff_slot *slot )
+                                                   struct client_surface_source *image )
 {
     struct x11drv_client_surface *surface = impl_from_client_surface( client );
-    unsigned int index = slot - client->handoff_slot;
+    unsigned int index = image - client->handoff_source;
     struct x11drv_client_source_frame *frame = &surface->sources[index];
     BOOL native = usexcomposite && !surface->direct_snapshot;
     unsigned int depth = native ? surface->source_depth : default_visual.depth;
@@ -491,29 +483,31 @@ static BOOL x11drv_client_surface_handoff_complete( struct client_surface *clien
     int error = 0;
 
     assert( index < ARRAY_SIZE(surface->sources) );
-    if (frame->gpu_control && frame->gpu_control == __atomic_load_n( &slot->control, __ATOMIC_ACQUIRE ))
+    /* The core validated this reservation and consumed its native completion.
+     * gpu_copy selects storage; it is not itself proof of GPU completion. */
+    if (frame->gpu_copy)
     {
-        slot->source = frame->pixmap;
+        image->source = frame->pixmap;
         x11drv_client_surface_set_gpu_snapshot( surface, frame->pixmap );
-        surface->gpu_snapshot_size = (SIZE){slot->width, slot->height};
-        slot->source_visual = default_visual.visualid;
-        slot->flags |= CLIENT_SURFACE_HANDOFF_COPY_SOURCE;
+        surface->gpu_snapshot_size = (SIZE){image->width, image->height};
+        image->source_visual = default_visual.visualid;
+        image->flags |= CLIENT_SURFACE_HANDOFF_COPY_SOURCE;
         return TRUE;
     }
-    if (!(frame = x11drv_client_surface_get_source( client, index, slot->width, slot->height, depth )))
+    if (!(frame = x11drv_client_surface_get_source( client, index, image->width, image->height, depth )))
         return FALSE;
-    if (surface->gpu_snapshot && surface->gpu_snapshot_size.cx >= slot->width &&
-        surface->gpu_snapshot_size.cy >= slot->height)
+    if (surface->gpu_snapshot && surface->gpu_snapshot_size.cx >= image->width &&
+        surface->gpu_snapshot_size.cy >= image->height)
         source = surface->gpu_snapshot;
     X11DRV_expect_error( gdi_display, client_surface_clip_error, &error );
 #ifdef SONAME_LIBXCOMPOSITE
     if (native)
     {
-        if (!surface->snapshot_import || surface->snapshot_import_seq != slot->target_seq)
+        if (!surface->snapshot_import || surface->snapshot_import_seq != image->target_seq)
         {
             if (surface->snapshot_import) XFreePixmap( gdi_display, surface->snapshot_import );
             surface->snapshot_import = pXCompositeNameWindowPixmap( gdi_display, surface->window );
-            surface->snapshot_import_seq = slot->target_seq;
+            surface->snapshot_import_seq = image->target_seq;
             XSync( gdi_display, False );
             X11DRV_check_error();
             if (error)
@@ -530,7 +524,7 @@ static BOOL x11drv_client_surface_handoff_complete( struct client_surface *clien
 #endif
     if (!frame->gc) frame->gc = XCreateGC( gdi_display, frame->pixmap, 0, NULL );
     if (source && frame->gc)
-        XCopyArea( gdi_display, source, frame->pixmap, frame->gc, 0, 0, slot->width, slot->height, 0, 0 );
+        XCopyArea( gdi_display, source, frame->pixmap, frame->gc, 0, 0, image->width, image->height, 0, 0 );
     /* This boundary proves the source image is immutable before READY, not
      * merely that its copy request was queued. The other slot remains usable
      * while the owner reads this independent pixmap. */
@@ -547,10 +541,10 @@ static BOOL x11drv_client_surface_handoff_complete( struct client_surface *clien
     if (source == surface->gpu_snapshot)
     {
         x11drv_client_surface_set_gpu_snapshot( surface, frame->pixmap );
-        surface->gpu_snapshot_size = (SIZE){slot->width, slot->height};
+        surface->gpu_snapshot_size = (SIZE){image->width, image->height};
     }
-    slot->source = frame->pixmap;
-    slot->flags |= CLIENT_SURFACE_HANDOFF_COPY_SOURCE;
+    image->source = frame->pixmap;
+    image->flags |= CLIENT_SURFACE_HANDOFF_COPY_SOURCE;
     return TRUE;
 }
 

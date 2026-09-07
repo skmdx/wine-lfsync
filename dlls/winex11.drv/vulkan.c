@@ -87,7 +87,7 @@ static BOOL X11DRV_vulkan_surface_snapshot( struct client_surface *client,
     BOOL bgra = format == VK_FORMAT_B8G8R8A8_UNORM || format == VK_FORMAT_B8G8R8A8_SRGB;
 
     if (!x11drv_client_surface_snapshot( client, pixels, width, height, TRUE, bgra )) return FALSE;
-    if (present->handoff_control) client->handoff_slot[present->handoff_index].source = surface->snapshot;
+    if (present->handoff_control) client->handoff_source[present->handoff_index].source = surface->snapshot;
     /* Retain the completed image even while the owner prepares a new scene.
      * The common completion path freezes it before publishing its source. */
     present->capture.size = (SIZE){width, height};
