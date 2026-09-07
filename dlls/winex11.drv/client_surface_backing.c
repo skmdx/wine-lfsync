@@ -179,6 +179,7 @@ struct client_surface_compositor_target
     struct client_surface_compositor_damage damages[CLIENT_SURFACE_COMPOSITOR_DAMAGE_HISTORY];
     unsigned int published_width;
     unsigned int published_height;
+    RECT restore_rect;
     unsigned int next_frame;
     unsigned int mailbox_frame;
     unsigned int assembly_frame;
@@ -1411,7 +1412,10 @@ static BOOL update_client_surface_compositor_target( struct client_surface_compo
     checkpoint = !same_pool || target->backing != job->pixmaps[0];
     if (target->window != job->destination || target->window_width != job->window_width ||
         target->window_height != job->window_height || target->depth != job->depth || target->visual != job->visual)
+    {
         target->scene.valid = FALSE;
+        SetRectEmpty( &target->restore_rect );
+    }
     if (target->assembly_pending &&
         (target->window != job->destination || target->backing != job->pixmaps[0] ||
          target->window_width != job->window_width || target->window_height != job->window_height ||
@@ -1536,25 +1540,75 @@ static BOOL remove_client_surface_compositor_target( HWND toplevel )
     return TRUE;
 }
 
+static BOOL client_surface_compositor_restore_ready( const struct client_surface_compositor_target *target )
+{
+    unsigned int i;
+
+    if (target->copy_frame) return FALSE;
+    for (i = 0; i < ARRAY_SIZE(target->frames); ++i)
+        if (target->frames[i].serial &&
+            (target->frames[i].request_pending || !target->frames[i].complete)) return FALSE;
+    return TRUE;
+}
+
+static BOOL restore_client_surface_compositor_pixels( struct client_surface_compositor_target *target )
+{
+    RECT rect = target->restore_rect;
+
+    SetRectEmpty( &target->restore_rect );
+    if (!target->published || target->published_width < target->window_width ||
+        target->published_height < target->window_height) return FALSE;
+    TRACE( "restoring target %p window %#lx from published pixmap %#lx rect %s\n",
+           target->toplevel, target->window, target->published, wine_dbgstr_rect( &rect ) );
+    return client_surface_copy_on_compositor( target->published, target->window,
+                                              rect.left, rect.top, rect.left, rect.top,
+                                              rect.right - rect.left, rect.bottom - rect.top );
+}
+
+static BOOL process_client_surface_compositor_restores(void)
+{
+    struct client_surface_compositor_target *target;
+    BOOL progressed = FALSE;
+
+    for (target = client_surface_compositor_targets; target; target = target->next)
+    {
+        if (IsRectEmpty( &target->restore_rect ) || !client_surface_compositor_restore_ready( target )) continue;
+        progressed = TRUE;
+        if (!restore_client_surface_compositor_pixels( target ))
+            NtUserPostMessage( target->toplevel, WM_WINE_UPDATEWINDOWSTATE,
+                               WINE_UPDATE_CLIENT_SURFACE_HANDOFFS, 0 );
+    }
+    return progressed;
+}
+
 static BOOL restore_client_surface_compositor_target(
     struct client_surface_compositor_job *job )
 {
     struct client_surface_compositor_target *target =
         find_client_surface_compositor_target( job->handoff_toplevel );
+    RECT rect = {job->destination_x, job->destination_y,
+                 job->destination_x + job->width, job->destination_y + job->height};
 
     process_client_surface_present_events();
-    if (!target || !target->published || !target->window ||
+    if (!target || !target->window ||
+        target->window != job->destination ||
         target->window_width != job->window_width ||
-        target->window_height != job->window_height ||
-        target->published_width < job->window_width ||
-        target->published_height < job->window_height)
+        target->window_height != job->window_height)
         return FALSE;
     job->valid_width = target->published_width;
     job->valid_height = target->published_height;
-    return client_surface_copy_on_compositor( target->published, target->window,
-                                              job->source_x, job->source_y,
-                                              job->destination_x, job->destination_y,
-                                              job->width, job->height );
+    if (IsRectEmpty( &target->restore_rect )) target->restore_rect = rect;
+    else add_bounds_rect( &target->restore_rect, &rect );
+    /* A newer Present may have reached the window before its Complete event
+     * reaches us. Do not overwrite it with the previously published image,
+     * or make the GUI caller wait for that Present. */
+    if (!client_surface_compositor_restore_ready( target ))
+    {
+        TRACE( "deferring restore for target %p rect %s\n",
+               target->toplevel, wine_dbgstr_rect( &target->restore_rect ) );
+        return TRUE;
+    }
+    return restore_client_surface_compositor_pixels( target );
 }
 
 static BOOL validate_client_surface_pixmap( Pixmap pixmap, unsigned int min_width,
@@ -2854,6 +2908,8 @@ static BOOL client_surface_compositor_job_ready( struct client_surface_composito
     if (job->op == CLIENT_SURFACE_COMPOSITOR_TRY_BEGIN_UPDATE ||
         job->op == CLIENT_SURFACE_COMPOSITOR_CHECK_UPDATE ||
         job->op == CLIENT_SURFACE_COMPOSITOR_FINISH_UPDATE) return TRUE;
+    /* Expose restoration records its own deferred work if necessary. */
+    if (job->op == CLIENT_SURFACE_COMPOSITOR_RESTORE_TARGET) return TRUE;
     /* Preserve the scene, binding and frame referenced by the request. Only
      * this target waits; jobs for independent targets remain eligible. */
     if (target->copy_frame) return FALSE;
@@ -2995,6 +3051,7 @@ static void client_surface_compositor_thread( void *context )
         process_client_surface_present_events();
         progressed = process_client_surface_present_replies();
         progressed |= process_client_surface_copy_replies();
+        progressed |= process_client_surface_compositor_restores();
         progressed |= process_client_surface_compositor_jobs();
         progressed |= process_client_surface_handoffs();
         progressed |= replay_client_surface_scene_sources();
@@ -3748,6 +3805,7 @@ BOOL X11DRV_client_surface_backing_restore( struct x11drv_win_data *data,
     job = (struct client_surface_compositor_job)
     {
         .op = CLIENT_SURFACE_COMPOSITOR_RESTORE_TARGET,
+        .destination = window,
         .source_x = rect->left,
         .source_y = rect->top,
         .destination_x = rect->left,
