@@ -4739,8 +4739,9 @@ static BOOL update_window_state_flags( HWND hwnd, UINT driver_flags )
     UINT context;
     RECT valid_rects[2], surface_rect;
     struct window_surface *surface;
+    struct client_surface_scene scene;
     struct window_rects new_rects;
-    BOOL ret;
+    BOOL ret, preserve_bits = TRUE;
 
     if (!is_current_thread_window( hwnd ))
     {
@@ -4753,7 +4754,12 @@ static BOOL update_window_state_flags( HWND hwnd, UINT driver_flags )
     valid_rects[0] = valid_rects[1] = new_rects.client;
 
     surface = get_window_surface( hwnd, swp_flags, FALSE, &new_rects, &surface_rect );
-    ret = apply_window_pos( hwnd, 0, swp_flags, surface, &new_rects, valid_rects );
+    /* A deferred DIRECT transition may run after the client's first Present.
+     * Its image has replaced the old GDI client pixels; copying those pixels
+     * into the newly attached native client window would erase that frame. */
+    if (!surface && client_surface_get_toplevel_scene( hwnd, &scene ) &&
+        scene.mode == CLIENT_SURFACE_PRESENTATION_DIRECT) preserve_bits = FALSE;
+    ret = apply_window_pos( hwnd, 0, swp_flags, surface, &new_rects, preserve_bits ? valid_rects : NULL );
     if (surface) window_surface_release( surface );
 
     set_thread_dpi_awareness_context( context );
