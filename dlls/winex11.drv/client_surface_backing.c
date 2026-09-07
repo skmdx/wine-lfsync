@@ -3186,23 +3186,33 @@ release:
     return FALSE;
 }
 
-static BOOL get_client_surface_scene_layout( HWND toplevel, UINT64 epoch,
-                                              const struct client_surface_handoff_desc *desc,
-                                              struct client_surface_scene_layout *layout )
+static BOOL get_client_surface_scene_layouts( HWND toplevel, UINT64 epoch, UINT count,
+                                               const struct client_surface_handoff_desc *descs,
+                                               struct client_surface_scene_layout *layouts )
 {
-    HRGN region = 0;
+    struct client_surface_scene_member *members;
     BOOL ret = FALSE;
+    UINT i;
 
-    layout->window = wine_server_ptr_handle( desc->handle );
-    layout->process = desc->process;
-    layout->identity = desc->surface;
-    if (!client_surface_get_scene_member( toplevel, layout->window, epoch,
-                                          &layout->geometry, &region )) goto done;
+    if (!count) return TRUE;
+    if (!(members = calloc( count, sizeof(*members) ))) return FALSE;
+    for (i = 0; i < count; ++i) members[i].hwnd = wine_server_ptr_handle( descs[i].handle );
+    if (!client_surface_get_scene_members( toplevel, epoch, count, members )) goto done;
     /* Keep the exact native rectangles, including an empty successful region,
      * in the immutable owner plan. No producer-owned region XID survives here. */
-    ret = !!(layout->clip = X11DRV_GetRegionData( region, 0 ));
+    for (i = 0; i < count; ++i)
+    {
+        layouts[i].window = members[i].hwnd;
+        layouts[i].process = descs[i].process;
+        layouts[i].identity = descs[i].surface;
+        layouts[i].geometry = members[i].target;
+        if (!(layouts[i].clip = X11DRV_GetRegionData( members[i].region, 0 ))) goto done;
+    }
+    ret = TRUE;
 done:
-    if (region) NtGdiDeleteObjectApp( region );
+    for (i = 0; i < count; ++i)
+        if (members[i].region) NtGdiDeleteObjectApp( members[i].region );
+    free( members );
     return ret;
 }
 
@@ -3284,9 +3294,9 @@ static BOOL refresh_client_surface_handoffs( HWND toplevel )
     }
     if (count && !(layouts = calloc( count, sizeof(*layouts) ))) goto failed;
     layout_count = count;
+    if (!get_client_surface_scene_layouts( toplevel, scene_generation, count, descs, layouts )) goto failed;
     for (i = 0; i < count; ++i)
-        if (!get_client_surface_scene_layout( toplevel, scene_generation, &descs[i], &layouts[i] ) ||
-            !register_client_surface_handoff( toplevel, &descs[i], mark )) goto failed;
+        if (!register_client_surface_handoff( toplevel, &descs[i], mark )) goto failed;
 
     if (!validate_client_surface_handoff_scene( toplevel, scene_generation )) goto failed;
     {

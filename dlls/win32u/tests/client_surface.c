@@ -633,6 +633,179 @@ done:
     DestroyWindow( parent );
 }
 
+static unsigned int get_scene_regions( HWND top, UINT64 epoch, const void *members, UINT member_bytes,
+                                        void *data, UINT size, UINT *required, UINT *returned )
+{
+    struct __server_request_info info = {0};
+    struct get_client_surface_scene_regions_request *req = &info.u.req.get_client_surface_scene_regions_request;
+    unsigned int status;
+
+    req->__header.req = REQ_get_client_surface_scene_regions;
+    req->handle = wine_server_user_handle( top );
+    req->scene_generation = epoch;
+    if (member_bytes) wine_server_add_data( &info, members, member_bytes );
+    wine_server_set_reply( &info, data, size );
+    status = p_wine_server_call( &info );
+    *required = info.u.reply.get_client_surface_scene_regions_reply.total_size;
+    *returned = wine_server_reply_size( &info.u.reply.get_client_surface_scene_regions_reply );
+    return status;
+}
+
+static void check_scene_region_batch( HWND top, UINT64 epoch,
+                                      const struct client_surface_scene_region_request *members, UINT count )
+{
+    unsigned char data[16384], *cursor = data;
+    UINT status, required, returned, remaining, i, j;
+
+    status = get_scene_regions( top, epoch, members, count * sizeof(*members), data, sizeof(data),
+                                 &required, &returned );
+    ok( !status && returned == required, "batch status %#x, size %u/%u\n", status, returned, required );
+    if (status) return;
+    remaining = returned;
+    for (i = 0; i < count; ++i)
+    {
+        struct client_surface_scene_region header;
+        struct __server_request_info info = {0};
+        struct rectangle visible[64];
+        struct get_visible_region_reply *reply = &info.u.reply.get_visible_region_reply;
+        struct clip_state clips;
+        RECT bounds = wine_server_get_rect( members[i].bounds );
+        HWND hwnd = wine_server_ptr_handle( members[i].handle );
+        UINT bytes;
+
+        ok( remaining >= sizeof(header), "truncated header %u\n", i );
+        if (remaining < sizeof(header)) return;
+        memcpy( &header, cursor, sizeof(header) );
+        cursor += sizeof(header);
+        remaining -= sizeof(header);
+        ok( header.handle == members[i].handle && header.window_dpi.num && header.window_dpi.den,
+            "member %u handle %#x/%#x dpi %u/%u\n", i, header.handle, members[i].handle,
+            header.window_dpi.num, header.window_dpi.den );
+        ok( header.visible_count <= remaining / sizeof(RECT), "truncated visible region\n" );
+        if (header.visible_count > remaining / sizeof(RECT)) return;
+        bytes = header.visible_count * sizeof(RECT);
+        if (!(members[i].flags & CLIENT_SURFACE_SCENE_PRESENT_RECT))
+        {
+            info.u.req.get_visible_region_request.__header.req = REQ_get_visible_region;
+            info.u.req.get_visible_region_request.window = members[i].handle;
+            info.u.req.get_visible_region_request.flags = members[i].flags;
+            if (members[i].flags & DCX_PARENTCLIP)
+                info.u.req.get_visible_region_request.flags &= ~DCX_CLIPSIBLINGS;
+            wine_server_set_reply( &info, visible, sizeof(visible) );
+            status = p_wine_server_call( &info );
+            ok( !status && wine_server_reply_size( reply ) == bytes,
+                "visible %u status %#x size %u/%u\n", i, status, wine_server_reply_size( reply ), bytes );
+            if (status || wine_server_reply_size( reply ) != bytes) return;
+            for (j = 0; j < header.visible_count; ++j)
+            {
+                visible[j].left -= reply->win_rect.left;
+                visible[j].right -= reply->win_rect.left;
+                visible[j].top -= reply->win_rect.top;
+                visible[j].bottom -= reply->win_rect.top;
+            }
+            ok( !memcmp( visible, cursor, bytes ), "visible region differs for member %u\n", i );
+        }
+        else ok( !header.visible_count, "present rectangle has DC clip\n" );
+        cursor += bytes;
+        remaining -= bytes;
+        status = get_clip_state_in_bounds( hwnd, members[i].dpi.num, &bounds, &clips );
+        ok( !status && clips.scene_generation == epoch && clips.count == header.clip_count,
+            "occlusion %u status %#x, count %u/%u\n", i, status, clips.count, header.clip_count );
+        if (status || clips.count != header.clip_count || clips.count > ARRAY_SIZE(clips.windows)) return;
+        bytes = header.clip_count * sizeof(*clips.windows);
+        ok( remaining >= bytes, "truncated occlusion\n" );
+        if (remaining < bytes) return;
+        ok( !memcmp( cursor, clips.windows, bytes ), "occlusion differs for member %u\n", i );
+        cursor += bytes;
+        remaining -= bytes;
+    }
+    ok( !remaining, "unexpected trailing bytes %u\n", remaining );
+}
+
+static void test_scene_region_batch(void)
+{
+    struct client_surface_scene_region_request members[CLIENT_SURFACE_SCENE_BATCH_MAX + 1];
+    static const UINT flags[] = {0, DCX_CLIPCHILDREN, DCX_CLIPSIBLINGS,
+                                 DCX_PARENTCLIP, DCX_PARENTCLIP | DCX_CLIPSIBLINGS};
+    const RECT bounds[] = {{0, 0, 160, 120}, {28, 11, 37, 28}, {0, 0, 0, 0}, {-5, -5, 15, 15}};
+    const UINT_PTR identity = 0x12470000;
+    unsigned char data[16384];
+    struct clip_state state;
+    HWND top, first, second, other;
+    UINT status, required, returned, i, j;
+    UINT64 epoch;
+    HRGN shape;
+
+    top = create_test_window( TRUE );
+    first = create_test_child( top, 10 );
+    second = create_test_child( top, 20 );
+    other = create_test_window( TRUE );
+    ok( top && first && second && other, "could not create batch clip windows\n" );
+    if (!top || !first || !second || !other) goto done;
+    SetWindowPos( first, HWND_BOTTOM, 10, 10, 80, 60, SWP_NOACTIVATE );
+    SetWindowPos( second, HWND_TOP, 25, 5, 50, 40, SWP_NOACTIVATE );
+    shape = CreateRectRgn( 4, 2, 21, 23 );
+    SetWindowRgn( second, shape, FALSE );
+    set_surface_state( second, identity, CLIENT_SURFACE_STATE_REGISTER, 0, NULL );
+    claim_surface_state( second, identity, NULL );
+    get_clip_state( first, &state );
+    epoch = state.scene_generation;
+    memset( members, 0, sizeof(members) );
+    for (i = 0; i < ARRAY_SIZE(members); ++i)
+    {
+        members[i].handle = wine_server_user_handle( first );
+        members[i].dpi = (struct ratio){96, 1};
+        members[i].bounds = wine_server_rectangle( bounds[0] );
+    }
+    for (i = 0; i < ARRAY_SIZE(flags); ++i)
+        for (j = 0; j < ARRAY_SIZE(bounds); ++j)
+        {
+            members[0].flags = flags[i];
+            members[0].dpi.num = j & 1 ? 144 : 96;
+            members[0].bounds = wine_server_rectangle( bounds[j] );
+            check_scene_region_batch( top, epoch, members, 2 );
+        }
+    members[0] = members[1];
+    check_scene_region_batch( top, epoch, members, CLIENT_SURFACE_SCENE_BATCH_MAX );
+    status = get_scene_regions( top, epoch, members, sizeof(members), data, sizeof(data), &required, &returned );
+    ok( status == STATUS_INVALID_PARAMETER && !returned, "oversized batch status %#x size %u\n", status, returned );
+    status = get_scene_regions( top, epoch, members, sizeof(*members) - 1, data, sizeof(data), &required, &returned );
+    ok( status == STATUS_INVALID_PARAMETER && !returned, "partial member status %#x size %u\n", status, returned );
+    status = get_scene_regions( top, epoch, NULL, 0, data, sizeof(data), &required, &returned );
+    ok( !status && !returned && !required, "empty batch status %#x size %u/%u\n", status, returned, required );
+    status = get_scene_regions( top, epoch, members, 2 * sizeof(*members), data, 1, &required, &returned );
+    ok( status == STATUS_BUFFER_OVERFLOW && required > 1 && !returned,
+        "short reply status %#x size %u/%u\n", status, returned, required );
+    ok( required && required <= sizeof(data), "unexpected required size %u\n", required );
+    if (!required || required > sizeof(data)) goto done;
+    status = get_scene_regions( top, epoch, members, 2 * sizeof(*members), data, required, &required, &returned );
+    ok( !status && returned == required, "exact reply status %#x size %u/%u\n", status, returned, required );
+    members[1].handle = wine_server_user_handle( other );
+    status = get_scene_regions( top, epoch, members, 2 * sizeof(*members), data, sizeof(data), &required, &returned );
+    ok( status == STATUS_INVALID_PARAMETER && !returned, "foreign scene status %#x size %u\n", status, returned );
+    members[1] = members[0];
+    members[1].dpi.den = 0;
+    status = get_scene_regions( top, epoch, members, 2 * sizeof(*members), data, sizeof(data), &required, &returned );
+    ok( status == STATUS_INVALID_PARAMETER && !returned, "invalid dpi status %#x size %u\n", status, returned );
+    members[1] = members[0];
+    members[1].flags = CLIENT_SURFACE_SCENE_PRESENT_RECT;
+    status = get_scene_regions( top, epoch, members, 2 * sizeof(*members), data, sizeof(data), &required, &returned );
+    ok( status == STATUS_INVALID_PARAMETER && !returned, "child present rect status %#x size %u\n", status, returned );
+    members[1].handle = wine_server_user_handle( top );
+    check_scene_region_batch( top, epoch, members, 2 );
+    status = get_scene_regions( top, epoch | 1, members, sizeof(*members), data, sizeof(data), &required, &returned );
+    ok( status == STATUS_RETRY && !returned, "odd epoch status %#x size %u\n", status, returned );
+    ShowWindow( second, SW_HIDE );
+    status = get_scene_regions( top, epoch, members, sizeof(*members), data, sizeof(data), &required, &returned );
+    ok( status == STATUS_RETRY && !returned, "stale epoch status %#x size %u\n", status, returned );
+    get_clip_state( first, &state );
+    check_scene_region_batch( top, state.scene_generation, members, 2 );
+    set_surface_state( second, identity, CLIENT_SURFACE_STATE_UNREGISTER, 0, NULL );
+done:
+    if (other) DestroyWindow( other );
+    if (top) DestroyWindow( top );
+}
+
 static void test_complex_clip_snapshot(void)
 {
     const UINT_PTR surface = 0x1235a000;
@@ -2996,6 +3169,7 @@ static BOOL run_focused_test_case( const char *name, char **argv )
         {"clip-scene-snapshot", "client surface clip scene snapshots",
          test_clip_scene_snapshot},
         {"complex-clip-snapshot", "complex client surface clip snapshot", test_complex_clip_snapshot},
+        {"scene-region-batch", "client surface region batches", test_scene_region_batch},
         {"subtree-retirement", "client surface subtree retirement",
          test_subtree_generation_retirement},
         {"generation-aba", "client surface generation ABA exclusion", test_generation_aba},
@@ -3205,6 +3379,7 @@ START_TEST(client_surface)
     test_generation_membership();
     trace( "testing client surface clip scene snapshots\n" );
     test_clip_scene_snapshot();
+    test_scene_region_batch();
     trace( "testing complex client surface clip snapshot\n" );
     test_complex_clip_snapshot();
     trace( "testing client surface subtree retirement\n" );

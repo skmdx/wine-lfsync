@@ -1306,28 +1306,11 @@ static DWORD get_dc_flags( HWND hwnd, DWORD flags, DWORD window_style )
     return flags;
 }
 
-/* Scene collection only needs SYSRGN in monitor pixels. Use the same server
- * region and style rules as GetDCEx, without acquiring a cached DC or changing
- * its drawable. SYSRGN is not mirrored for an RTL DC. */
-HRGN get_window_client_surface_region( HWND hwnd, struct ratio dpi )
+/* Scene collection uses the same clipping rules without acquiring a DC. */
+DWORD get_window_client_surface_flags( HWND hwnd )
 {
-    DWORD flags, paint_flags;
-    RECT win_rect, top_rect;
-    HWND top_win;
-    HRGN region, mapped;
-
-    hwnd = get_full_window_handle( hwnd );
-    if (!is_window( hwnd )) return 0;
-    flags = get_dc_flags( hwnd, DCX_CACHE | DCX_USESTYLE | WINE_DCX_CLIENT_SURFACE,
-                          get_window_long( hwnd, GWL_STYLE ) );
-    if (!(region = get_window_visible_region( hwnd, flags, &top_win,
-                                               &win_rect, &top_rect, &paint_flags ))) return 0;
-    /* set_visible_region() and SYSRGN | NTGDI_RGN_MONITOR_DPI remove this
-     * origin before mapping from window DPI to monitor DPI. */
-    NtGdiOffsetRgn( region, -win_rect.left, -win_rect.top );
-    mapped = map_dpi_region( region, get_dpi_for_window( hwnd ), dpi );
-    NtGdiDeleteObjectApp( region );
-    return mapped;
+    return get_dc_flags( hwnd, DCX_USESTYLE, get_window_long( hwnd, GWL_STYLE ) ) &
+           (DCX_PARENTCLIP | DCX_CLIPSIBLINGS | DCX_CLIPCHILDREN);
 }
 
 /***********************************************************************

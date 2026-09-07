@@ -4897,16 +4897,44 @@ static int collect_client_surface_clip_subtree( struct window *win, struct ratio
     return 1;
 }
 
+static int collect_client_surface_clips( struct window *win, struct window *top, struct ratio dpi,
+                                         const struct rectangle *bounds,
+                                         struct client_surface_clip_window *data,
+                                         unsigned int max_count, unsigned int *count )
+{
+    struct window *child, *current, *parent;
+    struct rectangle top_visible = top->visible_rect;
+
+    client_to_screen_rect( top->parent, &top_visible );
+    map_dpi_rect( top, &top_visible, get_window_dpi( top ), dpi );
+    if (bounds && is_rect_empty( bounds )) return 1;
+    LIST_FOR_EACH_ENTRY( child, &win->children, struct window, entry )
+        if (!collect_client_surface_clip_subtree( child, dpi, &top_visible, bounds,
+                                                  data, max_count, count )) return 0;
+
+    for (current = win; current != top; current = parent)
+    {
+        if (!current->is_linked) break;
+        parent = current->parent;
+        LIST_FOR_EACH_ENTRY( child, &parent->children, struct window, entry )
+        {
+            if (child == current) break;
+            if (!collect_client_surface_clip_subtree( child, dpi, &top_visible, bounds,
+                                                       data, max_count, count )) return 0;
+        }
+    }
+    return 1;
+}
+
 /* Return the exact set which the client compositor must subtract.  Walking
  * upward from the target visits only preceding sibling subtrees, while all
  * target descendants are above their ancestor in the Win32 child scene. */
 DECL_HANDLER(get_client_surface_clip_windows)
 {
     unsigned int count = 0, max_count = get_reply_max_size() / sizeof(struct client_surface_clip_window);
-    struct window *child, *current, *parent, *top, *win = get_window( req->handle );
+    struct window *top, *win = get_window( req->handle );
     struct client_surface_clip_window *data = NULL;
     const struct rectangle *bounds = get_req_data_size() ? get_req_data() : NULL;
-    struct rectangle top_visible;
 
     reply->toplevel = 0;
     reply->count = 0;
@@ -4922,33 +4950,122 @@ DECL_HANDLER(get_client_surface_clip_windows)
     top = get_toplevel_window( win );
     reply->toplevel = top->handle;
     reply->scene_generation = top->client_surface_scene_generation;
-    top_visible = top->visible_rect;
-    client_to_screen_rect( top->parent, &top_visible );
-    map_dpi_rect( top, &top_visible, get_window_dpi( top ), req->dpi );
     if (bounds && is_rect_empty( bounds )) return;
     /* Entries are region rectangles, not HWNDs.  One shaped producer can
      * contribute more rectangles than the handle table has slots.  The
      * caller's reply buffer already bounds the allocation and its product. */
     if (max_count && !(data = mem_alloc( max_count * sizeof(*data) ))) return;
 
-    LIST_FOR_EACH_ENTRY( child, &win->children, struct window, entry )
-        if (!collect_client_surface_clip_subtree( child, req->dpi, &top_visible, bounds,
-                                                  data, max_count, &count )) goto failed;
-
-    for (current = win; current != top; current = parent)
-    {
-        if (!current->is_linked) break;
-        parent = current->parent;
-        LIST_FOR_EACH_ENTRY( child, &parent->children, struct window, entry )
-        {
-            if (child == current) break;
-            if (!collect_client_surface_clip_subtree( child, req->dpi, &top_visible, bounds,
-                                                       data, max_count, &count )) goto failed;
-        }
-    }
+    if (!collect_client_surface_clips( win, top, req->dpi, bounds, data, max_count, &count )) goto failed;
 
     reply->count = count;
     if (data) set_reply_data_ptr( data, min( count, max_count ) * sizeof(*data) );
+    return;
+
+failed:
+    free( data );
+}
+
+/* A bounded group shares one epoch check and one request/reply round trip.
+ * Never expose partial records: an undersized reply only reports total_size. */
+DECL_HANDLER(get_client_surface_scene_regions)
+{
+    const struct client_surface_scene_region_request *members = get_req_data();
+    unsigned int count = get_req_data_size() / sizeof(*members), i;
+    unsigned int max_size = get_reply_max_size(), total = 0;
+    struct window *top = get_window( req->handle ), *win;
+    unsigned char *data = NULL;
+
+    if (!top) return;
+    if (get_toplevel_window( top ) != top || !top->thread || top->thread->process != current->process)
+    {
+        set_error( STATUS_ACCESS_DENIED );
+        return;
+    }
+    if (get_req_data_size() % sizeof(*members) || count > CLIENT_SURFACE_SCENE_BATCH_MAX)
+    {
+        set_error( STATUS_INVALID_PARAMETER );
+        return;
+    }
+    reply->scene_generation = top->client_surface_scene_generation;
+    if ((req->scene_generation & 1) || req->scene_generation != reply->scene_generation)
+    {
+        set_error( STATUS_RETRY );
+        return;
+    }
+    if (!count) return;
+    if (max_size && !(data = mem_alloc( max_size ))) return;
+    for (i = 0; i < count; ++i)
+    {
+        struct client_surface_scene_region header = {0};
+        const struct rectangle *rects = NULL;
+        struct client_surface_clip_window *clips = NULL;
+        struct region *visible = NULL;
+        unsigned int flags = members[i].flags, clip_max = 0, clip_count = 0;
+        size_t clip_offset, block_size;
+
+        if (!(win = get_window( members[i].handle ))) goto failed;
+        if (get_toplevel_window( win ) != top || !members[i].dpi.num || !members[i].dpi.den ||
+            (flags & ~(DCX_PARENTCLIP | DCX_CLIPSIBLINGS | DCX_CLIPCHILDREN |
+                       CLIENT_SURFACE_SCENE_PRESENT_RECT)) ||
+            ((flags & CLIENT_SURFACE_SCENE_PRESENT_RECT) && win != top))
+        {
+            set_error( STATUS_INVALID_PARAMETER );
+            goto failed;
+        }
+        header.handle = win->handle;
+        header.window_dpi = get_window_dpi( win );
+        if (!(flags & CLIENT_SURFACE_SCENE_PRESENT_RECT))
+        {
+            if (flags & DCX_PARENTCLIP) flags &= ~DCX_CLIPSIBLINGS;
+            if (!(visible = get_visible_region( win, flags ))) goto failed;
+            /* get_visible_region() is window-relative; SYSRGN at monitor DPI
+             * removes the client origin before scaling. Leave scaling to
+             * win32u's existing map_dpi_region(), including fractional DPI. */
+            offset_region( visible, win->window_rect.left - win->client_rect.left,
+                            win->window_rect.top - win->client_rect.top );
+            rects = get_region_rectangles( visible, &header.visible_count );
+        }
+        if (header.visible_count > (UINT_MAX - sizeof(header)) / sizeof(*rects))
+        {
+            if (visible) free_region( visible );
+            set_error( STATUS_INTEGER_OVERFLOW );
+            goto failed;
+        }
+        clip_offset = sizeof(header) + (size_t)header.visible_count * sizeof(*rects);
+        if (clip_offset <= max_size && total <= max_size - clip_offset)
+        {
+            if (header.visible_count) memcpy( data + total + sizeof(header), rects,
+                                               header.visible_count * sizeof(*rects) );
+            clips = (struct client_surface_clip_window *)(data + total + clip_offset);
+            clip_max = (max_size - total - clip_offset) / sizeof(*clips);
+        }
+        if (visible) free_region( visible );
+        if (!collect_client_surface_clips( win, top, members[i].dpi, &members[i].bounds,
+                                           clips, clip_max, &clip_count )) goto failed;
+        header.clip_count = clip_count;
+        if (clip_count > (UINT_MAX - clip_offset) / sizeof(*clips))
+        {
+            set_error( STATUS_INTEGER_OVERFLOW );
+            goto failed;
+        }
+        block_size = clip_offset + (size_t)clip_count * sizeof(*clips);
+        if (block_size > UINT_MAX - total)
+        {
+            set_error( STATUS_INTEGER_OVERFLOW );
+            goto failed;
+        }
+        if (block_size <= max_size && total <= max_size - block_size)
+            memcpy( data + total, &header, sizeof(header) );
+        total += block_size;
+    }
+    reply->total_size = total;
+    if (total > max_size)
+    {
+        set_error( STATUS_BUFFER_OVERFLOW );
+        goto failed;
+    }
+    if (data) set_reply_data_ptr( data, total );
     return;
 
 failed:

@@ -3672,6 +3672,20 @@ static void dump_get_client_surface_handoffs_reply( const struct get_client_surf
     dump_varargs_bytes( ", handoffs=", cur_size );
 }
 
+static void dump_get_client_surface_scene_regions_request( const struct get_client_surface_scene_regions_request *req )
+{
+    fprintf( stderr, " handle=%08x", req->handle );
+    dump_uint64( ", scene_generation=", &req->scene_generation );
+    dump_varargs_bytes( ", members=", cur_size );
+}
+
+static void dump_get_client_surface_scene_regions_reply( const struct get_client_surface_scene_regions_reply *req )
+{
+    fprintf( stderr, " total_size=%08x", req->total_size );
+    dump_uint64( ", scene_generation=", &req->scene_generation );
+    dump_varargs_bytes( ", regions=", cur_size );
+}
+
 typedef void (*dump_func)( const void *req );
 
 static const dump_func req_dumpers[REQ_NB_REQUESTS] =
@@ -3994,6 +4008,7 @@ static const dump_func req_dumpers[REQ_NB_REQUESTS] =
     (dump_func)dump_cancel_client_surface_handoffs_request,
     (dump_func)dump_publish_client_surface_handoff_request,
     (dump_func)dump_get_client_surface_handoffs_request,
+    (dump_func)dump_get_client_surface_scene_regions_request,
 };
 
 static const dump_func reply_dumpers[REQ_NB_REQUESTS] =
@@ -4316,6 +4331,7 @@ static const dump_func reply_dumpers[REQ_NB_REQUESTS] =
     NULL,
     (dump_func)dump_publish_client_surface_handoff_reply,
     (dump_func)dump_get_client_surface_handoffs_reply,
+    (dump_func)dump_get_client_surface_scene_regions_reply,
 };
 
 static const char * const req_names[REQ_NB_REQUESTS] =
@@ -4638,6 +4654,7 @@ static const char * const req_names[REQ_NB_REQUESTS] =
     "cancel_client_surface_handoffs",
     "publish_client_surface_handoff",
     "get_client_surface_handoffs",
+    "get_client_surface_scene_regions",
 };
 
 static const struct
@@ -4775,6 +4792,7 @@ static const struct
     { "PROCESS_NOT_IN_JOB",          STATUS_PROCESS_NOT_IN_JOB },
     { "RANGE_NOT_LOCKED",            STATUS_RANGE_NOT_LOCKED },
     { "REPARSE_POINT_NOT_RESOLVED",  STATUS_REPARSE_POINT_NOT_RESOLVED },
+    { "RETRY",                       STATUS_RETRY },
     { "SECTION_TOO_BIG",             STATUS_SECTION_TOO_BIG },
     { "SEMAPHORE_LIMIT_EXCEEDED",    STATUS_SEMAPHORE_LIMIT_EXCEEDED },
     { "SHARING_VIOLATION",           STATUS_SHARING_VIOLATION },

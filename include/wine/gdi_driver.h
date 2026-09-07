@@ -219,7 +219,7 @@ struct gdi_dc_funcs
 };
 
 /* increment this when changing driver tables or shared driver-facing structures */
-#define WINE_GDI_DRIVER_VERSION 120
+#define WINE_GDI_DRIVER_VERSION 121
 
 #define GDI_PRIORITY_NULL_DRV        0  /* null driver */
 #define GDI_PRIORITY_FONT_DRV      100  /* any font driver */
@@ -477,8 +477,14 @@ W32KAPI BOOL client_surface_complete_present_locked( struct client_surface *surf
                                                      const SIZE *expected_size, DWORD timeout );
 W32KAPI void client_surface_geometry_ready( HWND hwnd );
 W32KAPI BOOL client_surface_get_toplevel_scene( HWND toplevel, struct client_surface_scene *scene );
-W32KAPI BOOL client_surface_get_scene_member( HWND toplevel, HWND hwnd, UINT64 epoch,
-                                              struct client_surface_target *target, HRGN *region );
+struct client_surface_scene_member
+{
+    HWND hwnd;
+    struct client_surface_target target;
+    HRGN region;
+};
+W32KAPI BOOL client_surface_get_scene_members( HWND toplevel, UINT64 epoch, UINT count,
+                                               struct client_surface_scene_member *members );
 W32KAPI void client_surface_set_staged( HWND hwnd );
 W32KAPI void client_surface_bypass_staging( HWND hwnd );
 W32KAPI BOOL client_surface_begin_native_barrier( HWND hwnd, UINT_PTR token );

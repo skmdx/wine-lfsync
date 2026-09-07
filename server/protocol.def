@@ -293,6 +293,27 @@ struct client_surface_clip_window
     struct rectangle rect;
 };
 
+struct client_surface_scene_region_request
+{
+    user_handle_t handle;
+    unsigned int flags; /* effective DC clip flags, or PRESENT_RECT for the owner */
+    struct ratio dpi;
+    struct rectangle bounds; /* source extent relative to the owner, at dpi */
+};
+
+/* Followed by visible_count client-relative rectangles at window_dpi and
+ * clip_count client_surface_clip_window entries at the requested monitor dpi. */
+struct client_surface_scene_region
+{
+    user_handle_t handle;
+    unsigned int visible_count;
+    unsigned int clip_count;
+    struct ratio window_dpi;
+};
+
+#define CLIENT_SURFACE_SCENE_BATCH_MAX 64
+#define CLIENT_SURFACE_SCENE_PRESENT_RECT 0x80000000
+
 struct client_surface_handoff_desc
 {
     user_handle_t   handle;
@@ -4518,4 +4539,15 @@ enum inproc_sync_type
     int            count;
     unsigned __int64 scene_generation;
     VARARG(handoffs,bytes); /* client_surface_handoff_desc entries */
+@END
+
+/* Read a bounded group of owner plan clips in one authoritative scene. */
+@REQ(get_client_surface_scene_regions)
+    user_handle_t handle;
+    unsigned __int64 scene_generation;
+    VARARG(members,bytes); /* client_surface_scene_region_request entries */
+@REPLY
+    unsigned int total_size;
+    unsigned __int64 scene_generation;
+    VARARG(regions,bytes); /* complete client_surface_scene_region records */
 @END

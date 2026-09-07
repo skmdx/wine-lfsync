@@ -325,6 +325,7 @@ DECL_HANDLER(complete_client_surface_handoffs);
 DECL_HANDLER(cancel_client_surface_handoffs);
 DECL_HANDLER(publish_client_surface_handoff);
 DECL_HANDLER(get_client_surface_handoffs);
+DECL_HANDLER(get_client_surface_scene_regions);
 
 typedef void (*req_handler)( const void *req, void *reply );
 static const req_handler req_handlers[REQ_NB_REQUESTS] =
@@ -647,6 +648,7 @@ static const req_handler req_handlers[REQ_NB_REQUESTS] =
     (req_handler)req_cancel_client_surface_handoffs,
     (req_handler)req_publish_client_surface_handoff,
     (req_handler)req_get_client_surface_handoffs,
+    (req_handler)req_get_client_surface_scene_regions,
 };
 
 C_ASSERT( sizeof(abstime_t) == 8 );
@@ -2493,3 +2495,9 @@ C_ASSERT( sizeof(struct get_client_surface_handoffs_request) == 16 );
 C_ASSERT( offsetof(struct get_client_surface_handoffs_reply, count) == 8 );
 C_ASSERT( offsetof(struct get_client_surface_handoffs_reply, scene_generation) == 16 );
 C_ASSERT( sizeof(struct get_client_surface_handoffs_reply) == 24 );
+C_ASSERT( offsetof(struct get_client_surface_scene_regions_request, handle) == 12 );
+C_ASSERT( offsetof(struct get_client_surface_scene_regions_request, scene_generation) == 16 );
+C_ASSERT( sizeof(struct get_client_surface_scene_regions_request) == 24 );
+C_ASSERT( offsetof(struct get_client_surface_scene_regions_reply, total_size) == 8 );
+C_ASSERT( offsetof(struct get_client_surface_scene_regions_reply, scene_generation) == 16 );
+C_ASSERT( sizeof(struct get_client_surface_scene_regions_reply) == 24 );
