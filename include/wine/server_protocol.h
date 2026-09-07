@@ -277,25 +277,6 @@ struct client_surface_clip_window
     struct rectangle rect;
 };
 
-struct client_surface_scene_region_request
-{
-    user_handle_t handle;
-    unsigned int flags;
-    struct ratio dpi;
-    struct rectangle bounds;
-};
-
-/* Followed by visible_count client-relative rectangles at window_dpi and
- * clip_count client_surface_clip_window entries at the requested monitor dpi. */
-struct client_surface_scene_region
-{
-    user_handle_t handle;
-    unsigned int visible_count;
-    unsigned int clip_count;
-    struct ratio window_dpi;
-};
-
-#define CLIENT_SURFACE_SCENE_BATCH_MAX 64
 #define CLIENT_SURFACE_SCENE_PRESENT_RECT 0x80000000
 
 struct client_surface_handoff_desc
@@ -6555,38 +6536,6 @@ struct publish_client_surface_handoff_reply
     char __pad_12[4];
 };
 
-
-struct get_client_surface_handoffs_request
-{
-    struct request_header __header;
-    user_handle_t  handle;
-};
-struct get_client_surface_handoffs_reply
-{
-    struct reply_header __header;
-    int            count;
-    char __pad_12[4];
-    unsigned __int64 scene_generation;
-    /* VARARG(handoffs,bytes); */
-};
-
-
-struct get_client_surface_scene_regions_request
-{
-    struct request_header __header;
-    user_handle_t handle;
-    unsigned __int64 scene_generation;
-    /* VARARG(members,bytes); */
-};
-struct get_client_surface_scene_regions_reply
-{
-    struct reply_header __header;
-    unsigned int total_size;
-    char __pad_12[4];
-    unsigned __int64 scene_generation;
-    /* VARARG(regions,bytes); */
-};
-
 /* Capture roster, geometry and clips in one serialized server scene. A zero
  * scene_id requests the current stable scene; otherwise it must still match.
  * An undersized reply reports total_size and returns no partial snapshot. */
@@ -6942,8 +6891,6 @@ enum request
     REQ_complete_client_surface_handoffs,
     REQ_cancel_client_surface_handoffs,
     REQ_publish_client_surface_handoff,
-    REQ_get_client_surface_handoffs,
-    REQ_get_client_surface_scene_regions,
     REQ_get_client_surface_scene_snapshot,
     REQ_set_window_present_rect,
     REQ_NB_REQUESTS
@@ -7273,8 +7220,6 @@ union generic_request
     struct complete_client_surface_handoffs_request complete_client_surface_handoffs_request;
     struct cancel_client_surface_handoffs_request cancel_client_surface_handoffs_request;
     struct publish_client_surface_handoff_request publish_client_surface_handoff_request;
-    struct get_client_surface_handoffs_request get_client_surface_handoffs_request;
-    struct get_client_surface_scene_regions_request get_client_surface_scene_regions_request;
     struct get_client_surface_scene_snapshot_request get_client_surface_scene_snapshot_request;
     struct set_window_present_rect_request set_window_present_rect_request;
 };
@@ -7602,12 +7547,10 @@ union generic_reply
     struct complete_client_surface_handoffs_reply complete_client_surface_handoffs_reply;
     struct cancel_client_surface_handoffs_reply cancel_client_surface_handoffs_reply;
     struct publish_client_surface_handoff_reply publish_client_surface_handoff_reply;
-    struct get_client_surface_handoffs_reply get_client_surface_handoffs_reply;
-    struct get_client_surface_scene_regions_reply get_client_surface_scene_regions_reply;
     struct get_client_surface_scene_snapshot_reply get_client_surface_scene_snapshot_reply;
     struct set_window_present_rect_reply set_window_present_rect_reply;
 };
 
-#define SERVER_PROTOCOL_VERSION 1009
+#define SERVER_PROTOCOL_VERSION 1010
 
 #endif /* __WINE_WINE_SERVER_PROTOCOL_H */

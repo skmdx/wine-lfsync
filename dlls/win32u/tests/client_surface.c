@@ -684,189 +684,154 @@ done:
     DestroyWindow( parent );
 }
 
-static unsigned int get_scene_regions( HWND top, UINT64 epoch, const void *members, UINT member_bytes,
-                                        void *data, UINT size, UINT *required, UINT *returned )
+struct scene_snapshot
+{
+    UINT64 id;
+    UINT count, size, returned;
+    unsigned char data[16384];
+};
+
+static UINT get_scene_snapshot_data( HWND top, UINT64 id, void *data, UINT size, struct scene_snapshot *snapshot )
 {
     struct __server_request_info info = {0};
-    struct get_client_surface_scene_regions_request *req = &info.u.req.get_client_surface_scene_regions_request;
-    unsigned int status;
+    struct get_client_surface_scene_snapshot_reply *reply = &info.u.reply.get_client_surface_scene_snapshot_reply;
+    UINT status;
 
-    req->__header.req = REQ_get_client_surface_scene_regions;
-    req->handle = wine_server_user_handle( top );
-    req->scene_generation = epoch;
-    if (member_bytes) wine_server_add_data( &info, members, member_bytes );
+    info.u.req.get_client_surface_scene_snapshot_request.__header.req = REQ_get_client_surface_scene_snapshot;
+    info.u.req.get_client_surface_scene_snapshot_request.handle = wine_server_user_handle( top );
+    info.u.req.get_client_surface_scene_snapshot_request.scene_id = id;
     wine_server_set_reply( &info, data, size );
     status = p_wine_server_call( &info );
-    *required = info.u.reply.get_client_surface_scene_regions_reply.total_size;
-    *returned = wine_server_reply_size( &info.u.reply.get_client_surface_scene_regions_reply );
+    snapshot->id = reply->scene_id;
+    snapshot->count = reply->count;
+    snapshot->size = reply->total_size;
+    snapshot->returned = wine_server_reply_size( reply );
     return status;
 }
 
-static void check_scene_region_batch( HWND top, UINT64 epoch,
-                                      const struct client_surface_scene_region_request *members, UINT count )
+static UINT get_scene_snapshot( HWND top, UINT64 id, UINT size, struct scene_snapshot *snapshot )
 {
-    unsigned char data[16384], *cursor = data;
-    UINT status, required, returned, remaining, i, j;
-
-    status = get_scene_regions( top, epoch, members, count * sizeof(*members), data, sizeof(data),
-                                 &required, &returned );
-    ok( !status && returned == required, "batch status %#x, size %u/%u\n", status, returned, required );
-    if (status) return;
-    remaining = returned;
-    for (i = 0; i < count; ++i)
-    {
-        struct client_surface_scene_region header;
-        struct __server_request_info info = {0};
-        struct rectangle visible[64];
-        struct get_visible_region_reply *reply = &info.u.reply.get_visible_region_reply;
-        struct clip_state clips;
-        RECT bounds = wine_server_get_rect( members[i].bounds );
-        HWND hwnd = wine_server_ptr_handle( members[i].handle );
-        UINT bytes;
-
-        ok( remaining >= sizeof(header), "truncated header %u\n", i );
-        if (remaining < sizeof(header)) return;
-        memcpy( &header, cursor, sizeof(header) );
-        cursor += sizeof(header);
-        remaining -= sizeof(header);
-        ok( header.handle == members[i].handle && header.window_dpi.num && header.window_dpi.den,
-            "member %u handle %#x/%#x dpi %u/%u\n", i, header.handle, members[i].handle,
-            header.window_dpi.num, header.window_dpi.den );
-        ok( header.visible_count <= remaining / sizeof(RECT), "truncated visible region\n" );
-        if (header.visible_count > remaining / sizeof(RECT)) return;
-        bytes = header.visible_count * sizeof(RECT);
-        if (!(members[i].flags & CLIENT_SURFACE_SCENE_PRESENT_RECT))
-        {
-            info.u.req.get_visible_region_request.__header.req = REQ_get_visible_region;
-            info.u.req.get_visible_region_request.window = members[i].handle;
-            info.u.req.get_visible_region_request.flags = members[i].flags;
-            if (members[i].flags & DCX_PARENTCLIP)
-                info.u.req.get_visible_region_request.flags &= ~DCX_CLIPSIBLINGS;
-            wine_server_set_reply( &info, visible, sizeof(visible) );
-            status = p_wine_server_call( &info );
-            ok( !status && wine_server_reply_size( reply ) == bytes,
-                "visible %u status %#x size %u/%u\n", i, status, wine_server_reply_size( reply ), bytes );
-            if (status || wine_server_reply_size( reply ) != bytes) return;
-            for (j = 0; j < header.visible_count; ++j)
-            {
-                visible[j].left -= reply->win_rect.left;
-                visible[j].right -= reply->win_rect.left;
-                visible[j].top -= reply->win_rect.top;
-                visible[j].bottom -= reply->win_rect.top;
-            }
-            ok( !memcmp( visible, cursor, bytes ), "visible region differs for member %u\n", i );
-        }
-        else ok( !header.visible_count, "present rectangle has DC clip\n" );
-        cursor += bytes;
-        remaining -= bytes;
-        status = get_clip_state_in_bounds( hwnd, members[i].dpi.num, &bounds, &clips );
-        ok( !status && clips.scene_generation == epoch && clips.count == header.clip_count,
-            "occlusion %u status %#x, count %u/%u\n", i, status, clips.count, header.clip_count );
-        if (status || clips.count != header.clip_count || clips.count > ARRAY_SIZE(clips.windows)) return;
-        bytes = header.clip_count * sizeof(*clips.windows);
-        ok( remaining >= bytes, "truncated occlusion\n" );
-        if (remaining < bytes) return;
-        ok( !memcmp( cursor, clips.windows, bytes ), "occlusion differs for member %u\n", i );
-        cursor += bytes;
-        remaining -= bytes;
-    }
-    ok( !remaining, "unexpected trailing bytes %u\n", remaining );
+    return get_scene_snapshot_data( top, id, snapshot->data, size, snapshot );
 }
 
-static void test_scene_region_batch(void)
+static const struct client_surface_scene_layer *find_scene_layer_data( const struct scene_snapshot *snapshot,
+                                                                      const void *data, HWND hwnd )
 {
-    struct client_surface_scene_region_request members[CLIENT_SURFACE_SCENE_BATCH_MAX + 1];
-    static const UINT flags[] = {0, DCX_CLIPCHILDREN, DCX_CLIPSIBLINGS,
-                                 DCX_PARENTCLIP, DCX_PARENTCLIP | DCX_CLIPSIBLINGS};
-    const RECT bounds[] = {{0, 0, 160, 120}, {28, 11, 37, 28}, {0, 0, 0, 0}, {-5, -5, 15, 15}};
-    const UINT64 identity = allocate_surface();
-    unsigned char data[16384];
-    struct clip_state state;
-    HWND top, first, second, other;
-    UINT status, required, returned, i, j;
-    UINT64 epoch;
-    HRGN shape;
+    const unsigned char *cursor = data;
+    const struct client_surface_scene_layer *found = NULL;
+    UINT remaining = snapshot->returned, i, size;
 
-    top = create_test_window( TRUE );
-    first = create_test_child( top, 10 );
-    second = create_test_child( top, 20 );
-    other = create_test_window( TRUE );
-    ok( top && first && second && other, "could not create batch clip windows\n" );
-    if (!top || !first || !second || !other) goto done;
-    SetWindowPos( first, HWND_BOTTOM, 10, 10, 80, 60, SWP_NOACTIVATE );
-    SetWindowPos( second, HWND_TOP, 25, 5, 50, 40, SWP_NOACTIVATE );
-    shape = CreateRectRgn( 4, 2, 21, 23 );
-    SetWindowRgn( second, shape, FALSE );
-    set_surface_state( second, identity, CLIENT_SURFACE_STATE_REGISTER, 0, NULL );
-    claim_surface_state( second, identity, NULL );
-    get_clip_state( first, &state );
-    epoch = state.scene_generation;
-    memset( members, 0, sizeof(members) );
-    for (i = 0; i < ARRAY_SIZE(members); ++i)
+    for (i = 0; i < snapshot->count; ++i)
     {
-        members[i].handle = wine_server_user_handle( first );
-        members[i].dpi = (struct ratio){96, 1};
-        members[i].bounds = wine_server_rectangle( bounds[0] );
+        const struct client_surface_scene_layer *layer = (const void *)cursor;
+
+        ok( remaining >= sizeof(*layer), "truncated scene layer %u\n", i );
+        if (remaining < sizeof(*layer)) return NULL;
+        cursor += sizeof(*layer);
+        remaining -= sizeof(*layer);
+        ok( layer->visible_count <= remaining / sizeof(RECT), "truncated scene visible region\n" );
+        if (layer->visible_count > remaining / sizeof(RECT)) return NULL;
+        size = layer->visible_count * sizeof(RECT);
+        cursor += size;
+        remaining -= size;
+        ok( layer->clip_count <= remaining / sizeof(struct client_surface_clip_window), "truncated scene clips\n" );
+        if (layer->clip_count > remaining / sizeof(struct client_surface_clip_window)) return NULL;
+        size = layer->clip_count * sizeof(struct client_surface_clip_window);
+        cursor += size;
+        remaining -= size;
+        if (layer->producer.handle == wine_server_user_handle( hwnd )) found = layer;
     }
-    for (i = 0; i < ARRAY_SIZE(flags); ++i)
-        for (j = 0; j < ARRAY_SIZE(bounds); ++j)
-        {
-            members[0].flags = flags[i];
-            members[0].dpi.num = j & 1 ? 144 : 96;
-            members[0].bounds = wine_server_rectangle( bounds[j] );
-            check_scene_region_batch( top, epoch, members, 2 );
-        }
-    members[0] = members[1];
-    check_scene_region_batch( top, epoch, members, CLIENT_SURFACE_SCENE_BATCH_MAX );
-    status = get_scene_regions( top, epoch, members, sizeof(members), data, sizeof(data), &required, &returned );
-    ok( status == STATUS_INVALID_PARAMETER && !returned, "oversized batch status %#x size %u\n", status, returned );
-    status = get_scene_regions( top, epoch, members, sizeof(*members) - 1, data, sizeof(data), &required, &returned );
-    ok( status == STATUS_INVALID_PARAMETER && !returned, "partial member status %#x size %u\n", status, returned );
-    status = get_scene_regions( top, epoch, NULL, 0, data, sizeof(data), &required, &returned );
-    ok( !status && !returned && !required, "empty batch status %#x size %u/%u\n", status, returned, required );
-    status = get_scene_regions( top, epoch, members, 2 * sizeof(*members), data, 1, &required, &returned );
-    ok( status == STATUS_BUFFER_OVERFLOW && required > 1 && !returned,
-        "short reply status %#x size %u/%u\n", status, returned, required );
-    ok( required && required <= sizeof(data), "unexpected required size %u\n", required );
-    if (!required || required > sizeof(data)) goto done;
-    status = get_scene_regions( top, epoch, members, 2 * sizeof(*members), data, required, &required, &returned );
-    ok( !status && returned == required, "exact reply status %#x size %u/%u\n", status, returned, required );
-    members[1].handle = wine_server_user_handle( other );
-    status = get_scene_regions( top, epoch, members, 2 * sizeof(*members), data, sizeof(data), &required, &returned );
-    ok( status == STATUS_INVALID_PARAMETER && !returned, "foreign scene status %#x size %u\n", status, returned );
-    members[1] = members[0];
-    members[1].dpi.den = 0;
-    status = get_scene_regions( top, epoch, members, 2 * sizeof(*members), data, sizeof(data), &required, &returned );
-    ok( status == STATUS_INVALID_PARAMETER && !returned, "invalid dpi status %#x size %u\n", status, returned );
-    members[1] = members[0];
-    members[1].flags = CLIENT_SURFACE_SCENE_PRESENT_RECT;
-    status = get_scene_regions( top, epoch, members, 2 * sizeof(*members), data, sizeof(data), &required, &returned );
-    ok( status == STATUS_INVALID_PARAMETER && !returned, "child present rect status %#x size %u\n", status, returned );
-    members[1].handle = wine_server_user_handle( top );
-    check_scene_region_batch( top, epoch, members, 2 );
-    status = get_scene_regions( top, epoch | 1, members, sizeof(*members), data, sizeof(data), &required, &returned );
-    ok( status == STATUS_RETRY && !returned, "odd epoch status %#x size %u\n", status, returned );
-    ShowWindow( second, SW_HIDE );
-    status = get_scene_regions( top, epoch, members, sizeof(*members), data, sizeof(data), &required, &returned );
-    ok( status == STATUS_RETRY && !returned, "stale epoch status %#x size %u\n", status, returned );
-    get_clip_state( first, &state );
-    check_scene_region_batch( top, state.scene_generation, members, 2 );
-    set_surface_state( second, identity, CLIENT_SURFACE_STATE_UNREGISTER, 0, NULL );
+    ok( !remaining, "trailing snapshot bytes %u\n", remaining );
+    return found;
+}
+
+static const struct client_surface_scene_layer *find_scene_layer( const struct scene_snapshot *snapshot, HWND hwnd )
+{
+    return find_scene_layer_data( snapshot, snapshot->data, hwnd );
+}
+
+static void test_scene_snapshot_limits(void)
+{
+    HWND top = create_test_window( FALSE ), children[80] = {0};
+    UINT64 identities[ARRAY_SIZE(children)], scene_id;
+    BOOL found[ARRAY_SIZE(children)] = {0};
+    const struct client_surface_scene_layer *layer;
+    struct scene_snapshot snapshot;
+    UINT status, size, i, j;
+
+    ok( !!top, "could not create snapshot limits owner\n" );
+    if (!top) return;
+    status = get_scene_snapshot( top, 0, 0, &snapshot );
+    ok( !status && !snapshot.count && !snapshot.size && !snapshot.returned && !(snapshot.id & 1),
+        "empty snapshot status %#x count %u size %u/%u\n", status, snapshot.count,
+        snapshot.returned, snapshot.size );
+    /* These are distinct selected producers, not a caller-supplied batch of
+     * duplicate windows. The complete scene has no 64-member batch limit. */
+    for (i = 0; i < ARRAY_SIZE(children); ++i)
+    {
+        children[i] = create_test_child( top, 0 );
+        ok( !!children[i], "could not create layer %u\n", i );
+        if (!children[i]) goto done;
+        identities[i] = allocate_surface();
+        status = set_surface_state( children[i], identities[i], CLIENT_SURFACE_STATE_REGISTER, 0, NULL );
+        ok( !status, "register layer %u status %#x\n", i, status );
+        status = claim_surface_state( children[i], identities[i], NULL );
+        ok( !status, "claim layer %u status %#x\n", i, status );
+    }
+    status = get_scene_snapshot( top, 0, 0, &snapshot );
+    size = ARRAY_SIZE(children) * sizeof(*layer);
+    ok( status == STATUS_BUFFER_OVERFLOW && snapshot.count == ARRAY_SIZE(children) &&
+        snapshot.size == size && !snapshot.returned, "large roster status %#x count %u size %u/%u\n",
+        status, snapshot.count, snapshot.returned, snapshot.size );
+    if (status != STATUS_BUFFER_OVERFLOW || snapshot.size != size || size > sizeof(snapshot.data)) goto done;
+    scene_id = snapshot.id;
+    /* Reject a reply which ends inside a header or after a complete prefix. */
+    for (i = 0; i < 2; ++i)
+    {
+        memset( snapshot.data, 0xcd, sizeof(snapshot.data) );
+        status = get_scene_snapshot( top, scene_id, size - (i ? sizeof(*layer) : 1), &snapshot );
+        ok( status == STATUS_BUFFER_OVERFLOW && !snapshot.returned && snapshot.size == size &&
+            snapshot.count == ARRAY_SIZE(children), "partial roster status %#x size %u/%u count %u\n",
+            status, snapshot.returned, snapshot.size, snapshot.count );
+        for (j = 0; j < sizeof(snapshot.data) && snapshot.data[j] == 0xcd; ++j) ;
+        ok( j == sizeof(snapshot.data), "partial roster modified reply byte %u\n", j );
+    }
+    status = get_scene_snapshot( top, scene_id, size, &snapshot );
+    ok( !status && snapshot.returned == size && snapshot.size == size && snapshot.id == scene_id,
+        "exact large roster status %#x size %u/%u\n", status, snapshot.returned, snapshot.size );
+    if (status || snapshot.returned != size) goto done;
+    layer = (const void *)snapshot.data;
+    for (i = 0; i < ARRAY_SIZE(children); ++i)
+    {
+        for (j = 0; j < ARRAY_SIZE(children); ++j)
+            if (layer[i].producer.handle == wine_server_user_handle( children[j] )) break;
+        ok( j < ARRAY_SIZE(children), "unknown large roster member %#x\n", layer[i].producer.handle );
+        if (j == ARRAY_SIZE(children)) continue;
+        ok( !found[j], "duplicate large roster member %u\n", j );
+        found[j] = TRUE;
+        ok( layer[i].producer.process == GetCurrentProcessId() && layer[i].producer.surface == identities[j],
+            "large roster member %u has a different lifetime\n", j );
+        ok( !layer[i].producer.visible && !layer[i].producer.cookie &&
+            !layer[i].visible_count && !layer[i].clip_count, "hidden member %u has visible payload\n", j );
+    }
 done:
-    if (other) DestroyWindow( other );
-    if (top) DestroyWindow( top );
+    DestroyWindow( top );
 }
 
 static void test_complex_clip_snapshot(void)
 {
-    const UINT64 surface = allocate_surface();
+    const UINT64 surface = allocate_surface(), parent_surface = allocate_surface();
     const UINT side = 256, count = side * side;
     struct __server_request_info info;
     struct client_surface_clip_window *clips = NULL;
+    const struct client_surface_scene_layer *layer;
+    struct scene_snapshot snapshot;
     struct rectangle *rects = NULL;
+    unsigned char *data = NULL;
     HWND parent, child = NULL;
     unsigned int status;
-    UINT x, y, i;
+    UINT x, y, i, size;
+    UINT64 scene_id;
 
     parent = create_test_window( TRUE );
     ok( !!parent, "failed to create complex clip parent\n" );
@@ -909,8 +874,56 @@ static void test_complex_clip_snapshot(void)
     ok( wine_server_reply_size( &info.u.reply ) == count * sizeof(*clips),
         "rectangle reply truncated at handle count: %u bytes, expected %u\n",
         wine_server_reply_size( &info.u.reply ), count * (UINT)sizeof(*clips) );
+
+    set_surface_state( parent, parent_surface, CLIENT_SURFACE_STATE_REGISTER, 0, NULL );
+    claim_surface_state( parent, parent_surface, NULL );
+    status = get_scene_snapshot( parent, 0, 0, &snapshot );
+    ok( status == STATUS_BUFFER_OVERFLOW && !snapshot.returned && snapshot.count == 2 &&
+        snapshot.size > count * sizeof(*clips), "complex scene sizing status %#x size %u count %u\n",
+        status, snapshot.size, snapshot.count );
+    if (status != STATUS_BUFFER_OVERFLOW || !snapshot.size) goto done;
+    scene_id = snapshot.id;
+    size = snapshot.size;
+    data = malloc( size + 1 );
+    ok( !!data, "failed to allocate complex scene data\n" );
+    if (!data) goto done;
+    memset( data, 0xcd, size + 1 );
+    status = get_scene_snapshot_data( parent, scene_id, data, size - 1, &snapshot );
+    ok( status == STATUS_BUFFER_OVERFLOW && !snapshot.returned && snapshot.size == size && snapshot.count == 2,
+        "complex short scene status %#x size %u/%u count %u\n", status,
+        snapshot.returned, snapshot.size, snapshot.count );
+    for (i = 0; i <= size && data[i] == 0xcd; ++i) ;
+    ok( i == size + 1, "short scene exposed a partial record at byte %u\n", i );
+    status = get_scene_snapshot_data( parent, scene_id, data, size, &snapshot );
+    ok( !status && snapshot.returned == size && snapshot.size == size && snapshot.id == scene_id,
+        "complex exact scene status %#x size %u/%u\n", status, snapshot.returned, snapshot.size );
+    ok( data[size] == 0xcd, "complex scene overran reply buffer\n" );
+    if (status) goto done;
+    layer = find_scene_layer_data( &snapshot, data, child );
+    ok( !!layer && layer->visible_count == count, "complex visible region missing or truncated\n" );
+    if (layer && layer->visible_count == count)
+        ok( !memcmp( layer + 1, rects, count * sizeof(*rects) ), "complex visible shape differs\n" );
+    layer = find_scene_layer_data( &snapshot, data, parent );
+    ok( !!layer && layer->clip_count == count, "complex occlusion missing or truncated\n" );
+    if (layer && layer->clip_count == count)
+    {
+        memset( &info, 0, sizeof(info) );
+        info.u.req.get_client_surface_clip_windows_request.__header.req = REQ_get_client_surface_clip_windows;
+        info.u.req.get_client_surface_clip_windows_request.handle = wine_server_user_handle( parent );
+        info.u.req.get_client_surface_clip_windows_request.dpi = layer->raw_dpi;
+        wine_server_set_reply( &info, clips, count * sizeof(*clips) );
+        status = p_wine_server_call( &info );
+        ok( !status && info.u.reply.get_client_surface_clip_windows_reply.scene_generation == scene_id &&
+            wine_server_reply_size( &info.u.reply ) == count * sizeof(*clips),
+            "complex producer clips status %#x size %u\n", status, wine_server_reply_size( &info.u.reply ) );
+        if (!status && wine_server_reply_size( &info.u.reply ) == count * sizeof(*clips))
+            ok( !memcmp( (const char *)(layer + 1) + layer->visible_count * sizeof(RECT),
+                         clips, count * sizeof(*clips) ), "complex scene occlusion differs from producer clips\n" );
+    }
+    set_surface_state( parent, parent_surface, CLIENT_SURFACE_STATE_UNREGISTER, 0, NULL );
     set_surface_state( child, surface, CLIENT_SURFACE_STATE_UNREGISTER, 0, NULL );
 done:
+    free( data );
     free( clips );
     free( rects );
     if (child) SetWindowRgn( child, NULL, FALSE );
@@ -1083,74 +1096,19 @@ static unsigned int release_surface_handoff( HWND hwnd, DWORD producer, UINT64 s
     return p_wine_server_call( &info );
 }
 
-struct scene_snapshot
-{
-    UINT64 id;
-    UINT count, size, returned;
-    unsigned char data[16384];
-};
-
-static UINT get_scene_snapshot( HWND top, UINT64 id, UINT size, struct scene_snapshot *snapshot )
-{
-    struct __server_request_info info = {0};
-    struct get_client_surface_scene_snapshot_reply *reply = &info.u.reply.get_client_surface_scene_snapshot_reply;
-    UINT status;
-
-    info.u.req.get_client_surface_scene_snapshot_request.__header.req = REQ_get_client_surface_scene_snapshot;
-    info.u.req.get_client_surface_scene_snapshot_request.handle = wine_server_user_handle( top );
-    info.u.req.get_client_surface_scene_snapshot_request.scene_id = id;
-    wine_server_set_reply( &info, snapshot->data, size );
-    status = p_wine_server_call( &info );
-    snapshot->id = reply->scene_id;
-    snapshot->count = reply->count;
-    snapshot->size = reply->total_size;
-    snapshot->returned = wine_server_reply_size( reply );
-    return status;
-}
-
-static const struct client_surface_scene_layer *find_scene_layer( const struct scene_snapshot *snapshot, HWND hwnd )
-{
-    const unsigned char *cursor = snapshot->data;
-    const struct client_surface_scene_layer *found = NULL;
-    UINT remaining = snapshot->returned, i, size;
-
-    for (i = 0; i < snapshot->count; ++i)
-    {
-        const struct client_surface_scene_layer *layer = (const void *)cursor;
-
-        ok( remaining >= sizeof(*layer), "truncated scene layer %u\n", i );
-        if (remaining < sizeof(*layer)) return NULL;
-        cursor += sizeof(*layer);
-        remaining -= sizeof(*layer);
-        ok( layer->visible_count <= remaining / sizeof(RECT), "truncated scene visible region\n" );
-        if (layer->visible_count > remaining / sizeof(RECT)) return NULL;
-        size = layer->visible_count * sizeof(RECT);
-        cursor += size;
-        remaining -= size;
-        ok( layer->clip_count <= remaining / sizeof(struct client_surface_clip_window), "truncated scene clips\n" );
-        if (layer->clip_count > remaining / sizeof(struct client_surface_clip_window)) return NULL;
-        size = layer->clip_count * sizeof(struct client_surface_clip_window);
-        cursor += size;
-        remaining -= size;
-        if (layer->producer.handle == wine_server_user_handle( hwnd )) found = layer;
-    }
-    ok( !remaining, "trailing snapshot bytes %u\n", remaining );
-    return found;
-}
-
 static void test_scene_snapshot(void)
 {
     NTSTATUS (WINAPI *escape)( const D3DKMT_ESCAPE * ) =
         (void *)GetProcAddress( GetModuleHandleA( "win32u.dll" ), "NtGdiDdDDIEscape" );
     const UINT64 first_id = allocate_surface(), second_id = allocate_surface(), top_id = allocate_surface();
-    struct client_surface_scene_region_request region_request = {0};
     const struct client_surface_scene_layer *layer;
     struct handoff_binding binding = {0};
     struct scene_snapshot snapshot;
     struct surface_state state;
     struct __server_request_info info = {0};
-    unsigned char regions[16384];
-    UINT status, size, returned;
+    struct clip_state clips;
+    const RECT bounds = {-10000, -10000, 10000, 10000};
+    UINT status;
     UINT64 scene_id, cookie;
     HWND top, first, second, other = NULL;
     HRGN shape;
@@ -1189,20 +1147,12 @@ static void test_scene_snapshot(void)
         layer->producer.visible && !layer->producer.cookie, "incorrect selected producer\n" );
     ok( layer->source.left == 10 && layer->source.top == 10 && layer->source.right == 90 &&
         layer->source.bottom == 70, "source placement %s\n", wine_dbgstr_rect( (const RECT *)&layer->source ) );
-    region_request.handle = wine_server_user_handle( first );
-    region_request.dpi = layer->raw_dpi;
-    region_request.bounds = (struct rectangle){-10000, -10000, 10000, 10000};
-    status = get_scene_regions( top, scene_id, &region_request, sizeof(region_request), regions, sizeof(regions),
-                                 &size, &returned );
-    ok( !status && returned == size, "comparison regions status %#x\n", status );
-    if (!status)
-    {
-        const struct client_surface_scene_region *region = (const void *)regions;
-        size = layer->visible_count * sizeof(RECT) + layer->clip_count * sizeof(struct client_surface_clip_window);
-        ok( region->visible_count == layer->visible_count && region->clip_count == layer->clip_count &&
-            returned == sizeof(*region) + size && !memcmp( region + 1, layer + 1, size ),
-            "snapshot clipped regions differ from authoritative region request\n" );
-    }
+    status = get_clip_state_in_bounds( first, layer->raw_dpi.num, &bounds, &clips );
+    ok( !status && clips.scene_generation == scene_id && clips.count == layer->clip_count,
+        "producer clip status %#x count %u/%u\n", status, clips.count, layer->clip_count );
+    if (!status && clips.count == layer->clip_count && clips.count <= ARRAY_SIZE(clips.windows))
+        ok( !memcmp( (const char *)(layer + 1) + layer->visible_count * sizeof(RECT),
+                     clips.windows, clips.count * sizeof(*clips.windows) ), "producer clips differ\n" );
     status = get_scene_snapshot( first, scene_id, sizeof(snapshot.data), &snapshot );
     ok( status == STATUS_ACCESS_DENIED && !snapshot.returned, "child owner request status %#x\n", status );
     status = get_scene_snapshot( top, scene_id | 1, sizeof(snapshot.data), &snapshot );
@@ -1466,25 +1416,88 @@ next:
     }
 }
 
-static void check_surface_handoff_cookie( HWND hwnd, UINT64 surface, UINT64 cookie )
+static void test_scene_snapshot_parent_clip(void)
 {
-    struct __server_request_info info = {0};
-    struct client_surface_handoff_desc desc = {0};
-    unsigned int status;
+    static const struct
+    {
+        DWORD parent_style, child_style;
+    }
+    cases[] =
+    {
+        {0, 0},
+        {WS_CLIPSIBLINGS, 0},
+        {WS_CLIPCHILDREN, 0},
+        {WS_CLIPSIBLINGS, WS_CLIPSIBLINGS},
+        {WS_CLIPSIBLINGS, WS_CLIPCHILDREN},
+    };
+    WNDCLASSA class = {0};
+    struct scene_snapshot snapshot;
+    HWND windows[4];
+    UINT64 identity;
+    UINT i, j, status;
+    HRGN shape;
 
-    info.u.req.get_client_surface_handoffs_request.__header.req = REQ_get_client_surface_handoffs;
-    info.u.req.get_client_surface_handoffs_request.handle = wine_server_user_handle( hwnd );
-    wine_server_set_reply( &info, &desc, sizeof(desc) );
-    status = p_wine_server_call( &info );
-    ok( !status, "handoff roster status %#x\n", status );
-    ok( info.u.reply.get_client_surface_handoffs_reply.count == 1 &&
-        wine_server_reply_size( &info.u.reply ) == sizeof(desc), "unexpected handoff roster size\n" );
-    ok( desc.handle == wine_server_user_handle( hwnd ) && desc.process == GetCurrentProcessId() &&
-        desc.surface == surface, "unexpected handoff roster member\n" );
-    ok( desc.cookie == cookie, "handoff roster cookie %s, expected %s\n",
-        wine_dbgstr_longlong( desc.cookie ), wine_dbgstr_longlong( cookie ) );
-    ok( desc.visible == !!IsWindowVisible( hwnd ), "handoff roster visibility %u, expected %u\n",
-        desc.visible, !!IsWindowVisible( hwnd ) );
+    class.style = CS_PARENTDC;
+    class.lpfnWndProc = client_surface_proc;
+    class.hInstance = GetModuleHandleA( NULL );
+    class.lpszClassName = "client_surface_parent_dc";
+    ok( RegisterClassA( &class ), "could not register parent DC class, error %lu\n", GetLastError() );
+    for (i = 0; i < ARRAY_SIZE(cases); ++i)
+    {
+        winetest_push_context( "parent style %#lx, child style %#lx", cases[i].parent_style, cases[i].child_style );
+        memset( windows, 0, sizeof(windows) );
+        windows[0] = create_test_window( TRUE );
+        ok( !!windows[0], "could not create parent DC owner\n" );
+        if (!windows[0]) goto next;
+        SetWindowLongW( windows[0], GWL_STYLE, WS_POPUP | WS_VISIBLE | cases[i].parent_style );
+        windows[1] = CreateWindowExA( 0, class.lpszClassName, "parent DC scene layer",
+            WS_CHILD | WS_VISIBLE | cases[i].child_style, 17, 13, 103, 79,
+            windows[0], NULL, class.hInstance, NULL );
+        if (windows[1]) windows[2] = create_test_child( windows[1], 11 );
+        windows[3] = create_test_child( windows[0], 49 );
+        ok( windows[1] && windows[2] && windows[3], "could not create parent DC scene layers\n" );
+        if (!windows[1] || !windows[2] || !windows[3]) goto next;
+        shape = CreateRectRgn( 3, 7, 29, 31 );
+        ok( SetWindowRgn( windows[3], shape, FALSE ), "could not shape parent DC sibling\n" );
+        for (j = 0; j < ARRAY_SIZE(windows); ++j)
+        {
+            identity = allocate_surface();
+            status = set_surface_state( windows[j], identity, CLIENT_SURFACE_STATE_REGISTER, 0, NULL );
+            ok( !status, "register parent DC layer %u status %#x\n", j, status );
+            status = claim_surface_state( windows[j], identity, NULL );
+            ok( !status, "claim parent DC layer %u status %#x\n", j, status );
+        }
+        status = get_scene_snapshot( windows[0], 0, sizeof(snapshot.data), &snapshot );
+        ok( !status && snapshot.count == ARRAY_SIZE(windows), "parent DC snapshot status %#x count %u\n",
+            status, snapshot.count );
+        if (!status)
+            for (j = 0; j < ARRAY_SIZE(windows); ++j)
+                check_scene_layer_geometry( &snapshot, windows[0], windows[j] );
+next:
+        if (windows[0]) DestroyWindow( windows[0] );
+        winetest_pop_context();
+    }
+    UnregisterClassA( class.lpszClassName, class.hInstance );
+}
+
+static void check_surface_handoff_cookie( HWND top, HWND hwnd, UINT64 surface, UINT64 cookie )
+{
+    const struct client_surface_scene_layer *layer;
+    struct scene_snapshot snapshot;
+    UINT status;
+
+    status = get_scene_snapshot( top, 0, sizeof(snapshot.data), &snapshot );
+    ok( !status && snapshot.count == 1, "handoff scene status %#x count %u\n", status, snapshot.count );
+    if (status) return;
+    layer = find_scene_layer( &snapshot, hwnd );
+    ok( !!layer, "handoff scene member missing\n" );
+    if (!layer) return;
+    ok( layer->producer.process == GetCurrentProcessId() && layer->producer.surface == surface,
+        "unexpected handoff scene producer\n" );
+    ok( layer->producer.cookie == cookie, "handoff scene cookie %s, expected %s\n",
+        wine_dbgstr_longlong( layer->producer.cookie ), wine_dbgstr_longlong( cookie ) );
+    ok( layer->producer.visible == !!IsWindowVisible( hwnd ), "handoff scene visibility %u, expected %u\n",
+        layer->producer.visible, !!IsWindowVisible( hwnd ) );
 }
 
 static unsigned int complete_surface_handoffs( HWND hwnd, UINT64 generation, UINT64 epoch,
@@ -1848,7 +1861,7 @@ static void test_handoff_consumer_retirement( BOOL failed )
     ok( !status, "handoff recovery registration status %#x\n", status );
     status = claim_surface_state( hwnd, identity, NULL );
     ok( !status, "handoff recovery claim status %#x\n", status );
-    check_surface_handoff_cookie( hwnd, identity, 0 );
+    check_surface_handoff_cookie( hwnd, hwnd, identity, 0 );
     status = get_surface_handoff( hwnd, 0, identity, FALSE, &producer );
     ok( !status, "handoff recovery producer bind status %#x\n", status );
     if (status) goto done;
@@ -1859,7 +1872,7 @@ static void test_handoff_consumer_retirement( BOOL failed )
     producer.mapping = NULL;
     ok( !!producer_view, "handoff recovery producer map error %lu\n", GetLastError() );
     if (!producer_view) goto done;
-    check_surface_handoff_cookie( hwnd, identity, 0 );
+    check_surface_handoff_cookie( hwnd, hwnd, identity, 0 );
 
     status = get_surface_handoff( hwnd, GetCurrentProcessId(), identity, TRUE, &owner );
     ok( !status, "handoff recovery consumer bind status %#x\n", status );
@@ -1870,15 +1883,15 @@ static void test_handoff_consumer_retirement( BOOL failed )
     owner.mapping = NULL;
     ok( !!owner_view, "handoff recovery consumer map error %lu\n", GetLastError() );
     if (!owner_view) goto done;
-    check_surface_handoff_cookie( hwnd, identity, owner.cookie );
+    check_surface_handoff_cookie( hwnd, hwnd, identity, owner.cookie );
 
     /* Hiding removes a layer from composition, not its authenticated channel
      * or cached frame. The hidden roster must keep the selected producer and
      * reusable owner binding. */
     ShowWindow( hwnd, SW_HIDE );
-    check_surface_handoff_cookie( hwnd, identity, owner.cookie );
+    check_surface_handoff_cookie( hwnd, hwnd, identity, owner.cookie );
     ShowWindow( hwnd, SW_SHOW );
-    check_surface_handoff_cookie( hwnd, identity, owner.cookie );
+    check_surface_handoff_cookie( hwnd, hwnd, identity, owner.cookie );
 
     slot = (void *)((char *)producer_view + producer.offset);
     /* Leave the ring full while changing its consumer lifetime. Retirement
@@ -1891,7 +1904,7 @@ static void test_handoff_consumer_retirement( BOOL failed )
         status = release_surface_handoff( hwnd, GetCurrentProcessId(), identity, owner.cookie, TRUE );
         ok( !status, "temporary consumer release status %#x\n", status );
         owner_bound = FALSE;
-        check_surface_handoff_cookie( hwnd, identity, 0 );
+        check_surface_handoff_cookie( hwnd, hwnd, identity, 0 );
         ok( !slot->closed && !slot->consumer_sequence &&
             slot->producer_sequence == CLIENT_SURFACE_HANDOFF_RING_SIZE,
             "temporary consumer release discarded unread descriptors\n" );
@@ -1902,7 +1915,7 @@ static void test_handoff_consumer_retirement( BOOL failed )
         ok( owner.cookie == producer.cookie, "temporary consumer rebind replaced the cookie\n" );
         CloseHandle( owner.mapping );
         owner.mapping = NULL;
-        check_surface_handoff_cookie( hwnd, identity, owner.cookie );
+        check_surface_handoff_cookie( hwnd, hwnd, identity, owner.cookie );
 
         other = create_test_window( TRUE );
         ok( !!other, "failed to create replacement owner\n" );
@@ -1917,7 +1930,7 @@ static void test_handoff_consumer_retirement( BOOL failed )
             info.u.req.set_parent_request.parent = wine_server_user_handle( i ? GetDesktopWindow() : other );
             status = p_wine_server_call( &info );
             ok( !status, "reparent %u status %#x\n", i, status );
-            check_surface_handoff_cookie( hwnd, identity, 0 );
+            check_surface_handoff_cookie( i ? hwnd : other, hwnd, identity, 0 );
             status = get_surface_handoff( hwnd, 0, identity, FALSE, &pending );
             ok( status == STATUS_DEVICE_BUSY, "reparent %u reacquired retired binding, status %#x\n", i, status );
             if (!status) CloseHandle( pending.mapping );
@@ -1926,7 +1939,7 @@ static void test_handoff_consumer_retirement( BOOL failed )
         }
     }
     if (failed) __atomic_store_n( &slot->closed, 1, __ATOMIC_RELEASE );
-    check_surface_handoff_cookie( hwnd, identity, 0 );
+    check_surface_handoff_cookie( hwnd, hwnd, identity, 0 );
     shared = producer_view;
     __atomic_store_n( &shared->release_parked, 1, __ATOMIC_RELEASE );
     release_sequence = __atomic_load_n( &shared->release_sequence, __ATOMIC_ACQUIRE );
@@ -1959,7 +1972,7 @@ static void test_handoff_consumer_retirement( BOOL failed )
     ok( !status, "handoff recovery replacement bind status %#x\n", status );
     if (status) goto done;
     replacement_bound = TRUE;
-    check_surface_handoff_cookie( hwnd, identity, 0 );
+    check_surface_handoff_cookie( hwnd, hwnd, identity, 0 );
     replacement_view = MapViewOfFile( replacement.mapping, FILE_MAP_READ | FILE_MAP_WRITE,
                                       0, 0, replacement.size );
     CloseHandle( replacement.mapping );
@@ -2013,6 +2026,7 @@ static void handoff_storage_exit_child( HWND hwnd, HANDLE ready, HANDLE release,
                                         BOOL completed )
 {
     struct handoff_binding binding;
+    struct scene_snapshot snapshot;
     struct client_surface_handoff_shared *shared;
     struct client_surface_handoff_channel *slot;
     unsigned int status, index;
@@ -2025,6 +2039,9 @@ static void handoff_storage_exit_child( HWND hwnd, HANDLE ready, HANDLE release,
     ok( !status, "exit child handoff registration status %#x\n", status );
     status = claim_surface_state( hwnd, identity, NULL );
     ok( !status, "exit child handoff claim status %#x\n", status );
+    status = get_scene_snapshot( hwnd, 0, sizeof(snapshot.data), &snapshot );
+    ok( status == STATUS_ACCESS_DENIED && !snapshot.returned,
+        "foreign producer read owner scene, status %#x size %u\n", status, snapshot.returned );
     status = get_surface_handoff( hwnd, 0, identity, FALSE, &binding );
     ok( !status, "exit child producer bind status %#x\n", status );
     if (status) goto done;
@@ -2060,6 +2077,7 @@ static void test_handoff_storage_process_exit( char **argv, BOOL completed )
     struct client_surface_handoff_shared *shared;
     struct client_surface_handoff_channel *slot = NULL;
     struct surface_state state;
+    struct scene_snapshot snapshot;
     HWND hwnd = create_test_window( FALSE );
     HANDLE ready = NULL, release = NULL;
     unsigned int status, index = 0;
@@ -2082,20 +2100,17 @@ static void test_handoff_storage_process_exit( char **argv, BOOL completed )
     ok( WaitForSingleObject( ready, 10000 ) == WAIT_OBJECT_0,
         "handoff exit child did not become ready\n" );
     {
-        struct __server_request_info info = {0};
-        struct client_surface_handoff_desc desc = {0};
+        const struct client_surface_scene_layer *layer;
 
-        info.u.req.get_client_surface_handoffs_request.__header.req = REQ_get_client_surface_handoffs;
-        info.u.req.get_client_surface_handoffs_request.handle = wine_server_user_handle( hwnd );
-        wine_server_set_reply( &info, &desc, sizeof(desc) );
-        status = p_wine_server_call( &info );
-        ok( !status && info.u.reply.get_client_surface_handoffs_reply.count == 1 &&
-            wine_server_reply_size( &info.u.reply.get_client_surface_handoffs_reply ) == sizeof(desc),
-            "exit child roster status %#x count %u\n",
-            status, info.u.reply.get_client_surface_handoffs_reply.count );
-        ok( desc.handle == wine_server_user_handle( hwnd ) && desc.process == process.dwProcessId &&
-            desc.surface > ~(UINT32)0, "exit child roster returned a different lifetime\n" );
-        status = get_surface_handoff( hwnd, process.dwProcessId, desc.surface, TRUE, &owner );
+        status = get_scene_snapshot( hwnd, 0, sizeof(snapshot.data), &snapshot );
+        ok( !status && snapshot.count == 1, "exit child scene status %#x count %u\n", status, snapshot.count );
+        if (status) goto done;
+        layer = find_scene_layer( &snapshot, hwnd );
+        ok( !!layer, "exit child scene member missing\n" );
+        if (!layer) goto done;
+        ok( layer->producer.process == process.dwProcessId && layer->producer.surface > ~(UINT32)0,
+            "exit child scene returned a different lifetime\n" );
+        status = get_surface_handoff( hwnd, process.dwProcessId, layer->producer.surface, TRUE, &owner );
     }
     ok( !status, "exit child owner bind status %#x\n", status );
     if (!status)
@@ -2134,6 +2149,10 @@ static void test_handoff_storage_process_exit( char **argv, BOOL completed )
     ok( !status && !state.active && !state.cached,
         "producer exit left memberships: status %#x active %u cached %u\n",
         status, state.active, state.cached );
+    status = get_scene_snapshot( hwnd, 0, sizeof(snapshot.data), &snapshot );
+    ok( !status && !snapshot.count && !snapshot.size && !snapshot.returned,
+        "producer exit left scene layers: status %#x count %u size %u/%u\n",
+        status, snapshot.count, snapshot.returned, snapshot.size );
 done:
     if (process.hProcess)
     {
@@ -3847,8 +3866,9 @@ static BOOL run_focused_test_case( const char *name, char **argv )
         {"clip-scene-snapshot", "client surface clip scene snapshots",
          test_clip_scene_snapshot},
         {"complex-clip-snapshot", "complex client surface clip snapshot", test_complex_clip_snapshot},
-        {"scene-region-batch", "client surface region batches", test_scene_region_batch},
         {"scene-snapshot", "authoritative client surface scene snapshot", test_scene_snapshot},
+        {"scene-snapshot-limits", "complete client surface scene reply limits", test_scene_snapshot_limits},
+        {"scene-snapshot-parent-clip", "client surface scene parent DC clipping", test_scene_snapshot_parent_clip},
         {"scene-snapshot-geometry", "client surface scene coordinate and clipping geometry", test_scene_snapshot_geometry},
         {"subtree-retirement", "client surface subtree retirement",
          test_subtree_generation_retirement},
@@ -4077,8 +4097,9 @@ START_TEST(client_surface)
     test_generation_membership();
     trace( "testing client surface clip scene snapshots\n" );
     test_clip_scene_snapshot();
-    test_scene_region_batch();
     test_scene_snapshot();
+    test_scene_snapshot_limits();
+    test_scene_snapshot_parent_clip();
     test_scene_snapshot_geometry();
     trace( "testing complex client surface clip snapshot\n" );
     test_complex_clip_snapshot();

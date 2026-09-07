@@ -3687,32 +3687,6 @@ static void dump_publish_client_surface_handoff_reply( const struct publish_clie
     fprintf( stderr, " accepted=%d", req->accepted );
 }
 
-static void dump_get_client_surface_handoffs_request( const struct get_client_surface_handoffs_request *req )
-{
-    fprintf( stderr, " handle=%08x", req->handle );
-}
-
-static void dump_get_client_surface_handoffs_reply( const struct get_client_surface_handoffs_reply *req )
-{
-    fprintf( stderr, " count=%d", req->count );
-    dump_uint64( ", scene_generation=", &req->scene_generation );
-    dump_varargs_bytes( ", handoffs=", cur_size );
-}
-
-static void dump_get_client_surface_scene_regions_request( const struct get_client_surface_scene_regions_request *req )
-{
-    fprintf( stderr, " handle=%08x", req->handle );
-    dump_uint64( ", scene_generation=", &req->scene_generation );
-    dump_varargs_bytes( ", members=", cur_size );
-}
-
-static void dump_get_client_surface_scene_regions_reply( const struct get_client_surface_scene_regions_reply *req )
-{
-    fprintf( stderr, " total_size=%08x", req->total_size );
-    dump_uint64( ", scene_generation=", &req->scene_generation );
-    dump_varargs_bytes( ", regions=", cur_size );
-}
-
 static void dump_get_client_surface_scene_snapshot_request( const struct get_client_surface_scene_snapshot_request *req )
 {
     fprintf( stderr, " handle=%08x", req->handle );
@@ -4058,8 +4032,6 @@ static const dump_func req_dumpers[REQ_NB_REQUESTS] =
     (dump_func)dump_complete_client_surface_handoffs_request,
     (dump_func)dump_cancel_client_surface_handoffs_request,
     (dump_func)dump_publish_client_surface_handoff_request,
-    (dump_func)dump_get_client_surface_handoffs_request,
-    (dump_func)dump_get_client_surface_scene_regions_request,
     (dump_func)dump_get_client_surface_scene_snapshot_request,
     (dump_func)dump_set_window_present_rect_request,
 };
@@ -4386,8 +4358,6 @@ static const dump_func reply_dumpers[REQ_NB_REQUESTS] =
     (dump_func)dump_complete_client_surface_handoffs_reply,
     NULL,
     (dump_func)dump_publish_client_surface_handoff_reply,
-    (dump_func)dump_get_client_surface_handoffs_reply,
-    (dump_func)dump_get_client_surface_scene_regions_reply,
     (dump_func)dump_get_client_surface_scene_snapshot_reply,
     NULL,
 };
@@ -4714,8 +4684,6 @@ static const char * const req_names[REQ_NB_REQUESTS] =
     "complete_client_surface_handoffs",
     "cancel_client_surface_handoffs",
     "publish_client_surface_handoff",
-    "get_client_surface_handoffs",
-    "get_client_surface_scene_regions",
     "get_client_surface_scene_snapshot",
     "set_window_present_rect",
 };

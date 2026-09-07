@@ -2465,47 +2465,6 @@ static void get_client_surface_handoff_desc( struct window *win, struct window *
                    !is_client_surface_handoff_lost( surface ) ? surface->handoff_cookie : 0;
 }
 
-static void collect_client_surface_handoffs( struct window *win, struct window *top,
-                                             struct client_surface_handoff_desc *data,
-                                             unsigned int max_count, unsigned int *count )
-{
-    struct client_surface_owner *owner;
-    struct client_surface_ref *surface;
-    struct window *child;
-
-    if (!win->client_surface_subtree_count) return;
-    if ((surface = select_client_surface_producer( win, &owner )))
-    {
-        if (*count < max_count) get_client_surface_handoff_desc( win, top, owner, surface, &data[*count] );
-        (*count)++;
-    }
-    LIST_FOR_EACH_ENTRY( child, &win->children, struct window, entry )
-        collect_client_surface_handoffs( child, top, data, max_count, count );
-}
-
-DECL_HANDLER(get_client_surface_handoffs)
-{
-    unsigned int count = 0;
-    unsigned int max_count = get_reply_max_size() / sizeof(struct client_surface_handoff_desc);
-    struct client_surface_handoff_desc *data = NULL;
-    struct window *top, *win = get_window( req->handle );
-
-    reply->count = 0;
-    reply->scene_generation = 0;
-    if (!win) return;
-    top = get_toplevel_window( win );
-    if (!top->thread || top->thread->process != current->process)
-    {
-        set_error( STATUS_ACCESS_DENIED );
-        return;
-    }
-    reply->scene_generation = top->client_surface_scene_generation;
-    if (max_count && !(data = mem_alloc( max_count * sizeof(*data) ))) return;
-    collect_client_surface_handoffs( top, top, data, max_count, &count );
-    reply->count = count;
-    if (data) set_reply_data_ptr( data, min( count, max_count ) * sizeof(*data) );
-}
-
 static unsigned int prepare_client_surface_generation( struct window *win, unsigned long long generation )
 {
     struct client_surface_owner *owner;
@@ -4923,113 +4882,6 @@ failed:
     free( data );
 }
 
-/* A bounded group shares one epoch check and one request/reply round trip.
- * Never expose partial records: an undersized reply only reports total_size. */
-DECL_HANDLER(get_client_surface_scene_regions)
-{
-    const struct client_surface_scene_region_request *members = get_req_data();
-    unsigned int count = get_req_data_size() / sizeof(*members), i;
-    unsigned int max_size = get_reply_max_size(), total = 0;
-    struct window *top = get_window( req->handle ), *win;
-    unsigned char *data = NULL;
-
-    if (!top) return;
-    if (get_toplevel_window( top ) != top || !top->thread || top->thread->process != current->process)
-    {
-        set_error( STATUS_ACCESS_DENIED );
-        return;
-    }
-    if (get_req_data_size() % sizeof(*members) || count > CLIENT_SURFACE_SCENE_BATCH_MAX)
-    {
-        set_error( STATUS_INVALID_PARAMETER );
-        return;
-    }
-    reply->scene_generation = top->client_surface_scene_generation;
-    if ((req->scene_generation & 1) || req->scene_generation != reply->scene_generation)
-    {
-        set_error( STATUS_RETRY );
-        return;
-    }
-    if (!count) return;
-    if (max_size && !(data = mem_alloc( max_size ))) return;
-    for (i = 0; i < count; ++i)
-    {
-        struct client_surface_scene_region header = {0};
-        const struct rectangle *rects = NULL;
-        struct client_surface_clip_window *clips = NULL;
-        struct region *visible = NULL;
-        unsigned int flags = members[i].flags, clip_max = 0, clip_count = 0;
-        size_t clip_offset, block_size;
-
-        if (!(win = get_window( members[i].handle ))) goto failed;
-        if (get_toplevel_window( win ) != top || !members[i].dpi.num || !members[i].dpi.den ||
-            (flags & ~(DCX_PARENTCLIP | DCX_CLIPSIBLINGS | DCX_CLIPCHILDREN |
-                       CLIENT_SURFACE_SCENE_PRESENT_RECT)) ||
-            ((flags & CLIENT_SURFACE_SCENE_PRESENT_RECT) && win != top))
-        {
-            set_error( STATUS_INVALID_PARAMETER );
-            goto failed;
-        }
-        header.handle = win->handle;
-        header.window_dpi = get_window_dpi( win );
-        if (!(flags & CLIENT_SURFACE_SCENE_PRESENT_RECT))
-        {
-            if (flags & DCX_PARENTCLIP) flags &= ~DCX_CLIPSIBLINGS;
-            if (!(visible = get_visible_region( win, flags ))) goto failed;
-            /* get_visible_region() is window-relative; SYSRGN at monitor DPI
-             * removes the client origin before scaling. Leave scaling to
-             * win32u's existing map_dpi_region(), including fractional DPI. */
-            offset_region( visible, win->window_rect.left - win->client_rect.left,
-                            win->window_rect.top - win->client_rect.top );
-            rects = get_region_rectangles( visible, &header.visible_count );
-        }
-        if (header.visible_count > (UINT_MAX - sizeof(header)) / sizeof(*rects))
-        {
-            if (visible) free_region( visible );
-            set_error( STATUS_INTEGER_OVERFLOW );
-            goto failed;
-        }
-        clip_offset = sizeof(header) + (size_t)header.visible_count * sizeof(*rects);
-        if (clip_offset <= max_size && total <= max_size - clip_offset)
-        {
-            if (header.visible_count) memcpy( data + total + sizeof(header), rects,
-                                               header.visible_count * sizeof(*rects) );
-            clips = (struct client_surface_clip_window *)(data + total + clip_offset);
-            clip_max = (max_size - total - clip_offset) / sizeof(*clips);
-        }
-        if (visible) free_region( visible );
-        if (!collect_client_surface_clips( win, top, members[i].dpi, &members[i].bounds,
-                                           clips, clip_max, &clip_count )) goto failed;
-        header.clip_count = clip_count;
-        if (clip_count > (UINT_MAX - clip_offset) / sizeof(*clips))
-        {
-            set_error( STATUS_INTEGER_OVERFLOW );
-            goto failed;
-        }
-        block_size = clip_offset + (size_t)clip_count * sizeof(*clips);
-        if (block_size > UINT_MAX - total)
-        {
-            set_error( STATUS_INTEGER_OVERFLOW );
-            goto failed;
-        }
-        if (block_size <= max_size && total <= max_size - block_size)
-            memcpy( data + total, &header, sizeof(header) );
-        total += block_size;
-    }
-    reply->total_size = total;
-    if (total > max_size)
-    {
-        set_error( STATUS_BUFFER_OVERFLOW );
-        goto failed;
-    }
-    if (data) set_reply_data_ptr( data, total );
-    return;
-
-failed:
-    free( data );
-}
-
-
 /* Match DCX_USESTYLE without consulting any process-local DC or window data. */
 static unsigned int get_client_surface_scene_clip_flags( struct window *win )
 {
@@ -5040,8 +4892,8 @@ static unsigned int get_client_surface_scene_clip_flags( struct window *win )
     if ((win->style & WS_CLIPCHILDREN) && !(win->style & WS_MINIMIZE)) flags |= DCX_CLIPCHILDREN;
     if (is_toplevel( win )) flags = (flags & ~DCX_PARENTCLIP) | DCX_CLIPSIBLINGS;
     if (flags & (DCX_CLIPSIBLINGS | DCX_CLIPCHILDREN)) flags &= ~DCX_PARENTCLIP;
-    /* The old owner batch dropped CLIPSIBLINGS after get_dc_flags() for
-     * PARENTCLIP, including its visible parent's CLIPSIBLINGS contribution. */
+    /* get_visible_region() handles ancestor sibling clipping from window
+     * styles; PARENTCLIP needs no additional DCX_CLIPSIBLINGS flag here. */
     return flags;
 }
 
