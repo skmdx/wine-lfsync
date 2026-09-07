@@ -323,6 +323,7 @@ static void client_surface_uncache_present_locked( struct client_surface *surfac
     if (InterlockedCompareExchange( &surface->server_cached, FALSE, TRUE ) != TRUE) return;
     toplevel = client_surface_set_server_state( surface->hwnd, surface,
                                                 CLIENT_SURFACE_STATE_UNCACHE, 0, 0, &wake );
+    if (!toplevel) InterlockedExchange( &surface->server_cached, TRUE );
     if (wake && toplevel) NtUserPostMessage( toplevel, WM_WINE_UPDATEWINDOWSTATE, 0, 0 );
 }
 
@@ -1609,6 +1610,15 @@ struct client_surface *get_unused_client_surface( HWND hwnd, int format, BOOL ra
     if (surface)
     {
         client_surface_uncache_present_locked( surface );
+        /* Uncaching an inactive surface ends its server registration.  Its
+         * old handoff or queued notification can still keep that identity
+         * retired, so detach the old mapping and use a fresh token for the
+         * replacement drawable.  Preserve the token if uncaching failed. */
+        if (!InterlockedCompareExchange( &surface->server_cached, 0, 0 ))
+        {
+            client_surface_release_handoff( surface );
+            renew_client_surface_identity( surface );
+        }
         if (InterlockedCompareExchangePointer( (void **)&surface->hwnd, NULL, NULL ))
             client_surface_update_present_locked( surface ); /* refresh before creating GL/VK drawable */
         pthread_mutex_unlock( &surface->present_lock );
