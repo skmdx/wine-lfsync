@@ -320,6 +320,8 @@ struct client_surface_handoff_desc
     process_id_t    process;
     client_ptr_t    surface;
     unsigned __int64 cookie; /* reusable owner binding, zero if it must be acquired */
+    unsigned int   visible; /* scene membership, independent of binding lifetime */
+    unsigned int   reserved;
 };
 
 /* Owner attestation for pixels already copied out of producer storage. */
@@ -4532,7 +4534,7 @@ enum inproc_sync_type
     int            accepted;
 @END
 
-/* Enumerate the selected producers in one stable top-level scene. */
+/* Enumerate selected producers, including hidden bindings, in one stable scene. */
 @REQ(get_client_surface_handoffs)
     user_handle_t  handle;
 @REPLY

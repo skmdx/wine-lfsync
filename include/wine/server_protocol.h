@@ -304,6 +304,8 @@ struct client_surface_handoff_desc
     process_id_t    process;
     client_ptr_t    surface;
     unsigned __int64 cookie;
+    unsigned int   visible;
+    unsigned int   reserved;
 };
 
 
@@ -7502,6 +7504,6 @@ union generic_reply
     struct get_client_surface_scene_regions_reply get_client_surface_scene_regions_reply;
 };
 
-#define SERVER_PROTOCOL_VERSION 1005
+#define SERVER_PROTOCOL_VERSION 1006
 
 #endif /* __WINE_WINE_SERVER_PROTOCOL_H */

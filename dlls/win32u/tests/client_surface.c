@@ -1049,6 +1049,8 @@ static void check_surface_handoff_cookie( HWND hwnd, UINT_PTR surface, UINT64 co
         desc.surface == surface, "unexpected handoff roster member\n" );
     ok( desc.cookie == cookie, "handoff roster cookie %s, expected %s\n",
         wine_dbgstr_longlong( desc.cookie ), wine_dbgstr_longlong( cookie ) );
+    ok( desc.visible == !!IsWindowVisible( hwnd ), "handoff roster visibility %u, expected %u\n",
+        desc.visible, !!IsWindowVisible( hwnd ) );
 }
 
 static unsigned int complete_surface_handoffs( HWND hwnd, UINT64 generation, UINT64 epoch,
@@ -1400,6 +1402,14 @@ static void test_handoff_consumer_retirement( BOOL failed )
     owner.mapping = NULL;
     ok( !!owner_view, "handoff recovery consumer map error %lu\n", GetLastError() );
     if (!owner_view) goto done;
+    check_surface_handoff_cookie( hwnd, identity, owner.cookie );
+
+    /* Hiding removes a layer from composition, not its authenticated channel
+     * or cached frame. The hidden roster must keep the selected producer and
+     * reusable owner binding. */
+    ShowWindow( hwnd, SW_HIDE );
+    check_surface_handoff_cookie( hwnd, identity, owner.cookie );
+    ShowWindow( hwnd, SW_SHOW );
     check_surface_handoff_cookie( hwnd, identity, owner.cookie );
 
     slot = (void *)((char *)producer_view + producer.offset);

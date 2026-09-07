@@ -2501,7 +2501,7 @@ static void collect_client_surface_handoffs( struct window *win, struct window *
     struct client_surface_ref *surface;
     struct window *child;
 
-    if (!win->client_surface_subtree_count || !is_visible( win )) return;
+    if (!win->client_surface_subtree_count) return;
     if ((surface = select_client_surface_producer( win, &owner )))
     {
         if (*count < max_count)
@@ -2509,6 +2509,8 @@ static void collect_client_surface_handoffs( struct window *win, struct window *
             data[*count].handle = win->handle;
             data[*count].process = owner->process->id;
             data[*count].surface = surface->id;
+            data[*count].visible = is_visible( win );
+            data[*count].reserved = 0;
             /* Shared endpoints alone cannot authorize reuse: A -> B -> A
              * leaves the old owner mapped until its checked reads finish. */
             data[*count].cookie = surface->handoff_pool && surface->handoff_top == top &&

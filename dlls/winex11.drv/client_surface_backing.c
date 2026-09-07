@@ -1223,6 +1223,13 @@ static int compare_client_surface_scene_layouts( const void *a, const void *b )
     return (l > r) - (l < r);
 }
 
+static int compare_client_surface_handoff_descs( const void *a, const void *b )
+{
+    const struct client_surface_handoff_desc *left = a, *right = b;
+
+    return (left->handle > right->handle) - (left->handle < right->handle);
+}
+
 /* Only the owner thread touches these binding references. Build an index for
  * this job rather than borrowing pointers from an invalidated ScenePlan. */
 static BOOL reuse_client_surface_compositor_handoffs( const struct client_surface_compositor_job *job )
@@ -1282,33 +1289,39 @@ static BOOL check_client_surface_compositor_scene( const struct client_surface_c
 {
     struct client_surface_compositor_target *target =
         find_client_surface_compositor_target( job->handoff_toplevel );
-    unsigned int i;
+    struct client_surface_compositor_binding *binding;
+    unsigned int i, count = 0, found = 0;
 
+    for (i = 0; i < job->handoff_count; ++i) count += !!job->handoffs[i].visible;
     if (!target || !target->scene.valid || target->scene.epoch != job->scene_epoch ||
-        target->scene.count != job->handoff_count) return FALSE;
-    for (i = 0; i < job->handoff_count; ++i)
+        target->scene.count != count) return FALSE;
+    for (binding = client_surface_compositor_bindings; binding; binding = binding->next)
     {
-        const struct client_surface_handoff_desc *desc = &job->handoffs[i];
-        const struct client_surface_compositor_binding *binding;
-        unsigned int low = 0, high = target->scene.count;
+        const struct client_surface_handoff_desc *desc;
+        unsigned int low = 0, high = job->handoff_count;
 
-        if (!desc->cookie) return FALSE;
-        /* Installed members are sorted by HWND; the server roster follows
-         * subtree order instead. Keep this check O(N log N). */
+        if (binding->toplevel != job->handoff_toplevel) continue;
+        /* The caller sorted this authoritative roster. Validate retained
+         * hidden bindings too; a changed producer or retired cookie must not
+         * survive merely because the visible scene is unchanged. */
         while (low < high)
         {
             unsigned int mid = low + (high - low) / 2;
 
-            if (wine_server_user_handle( target->scene.members[mid]->window ) < desc->handle) low = mid + 1;
+            if (job->handoffs[mid].handle < wine_server_user_handle( binding->window )) low = mid + 1;
             else high = mid;
         }
-        if (low == target->scene.count) return FALSE;
-        binding = target->scene.members[low];
+        if (low == job->handoff_count) return FALSE;
+        desc = &job->handoffs[low];
         if (wine_server_user_handle( binding->window ) != desc->handle ||
             binding->process != desc->process || binding->identity != desc->surface ||
             binding->cookie != desc->cookie || !client_surface_compositor_binding_is_live( binding )) return FALSE;
+        if (!desc->visible) continue;
+        if (binding->scene_index >= target->scene.count ||
+            target->scene.members[binding->scene_index] != binding) return FALSE;
+        ++found;
     }
-    return TRUE;
+    return found == count;
 }
 
 static BOOL install_client_surface_scene_plan( struct client_surface_compositor_target *target,
@@ -1316,14 +1329,14 @@ static BOOL install_client_surface_scene_plan( struct client_surface_compositor_
 {
     struct client_surface_compositor_binding *binding, **members = NULL;
     struct client_surface_handoff_receipt *receipts = NULL;
-    unsigned int count = 0, i = 0;
+    unsigned int count = job->layout_count, available = 0, i = 0, next = 0;
 
     for (binding = client_surface_compositor_bindings; binding; binding = binding->next)
-        if (binding->toplevel == target->toplevel) ++count;
-    if (count != job->layout_count) return FALSE;
+        if (binding->toplevel == target->toplevel) ++available;
+    if (count > available) return FALSE;
     if (count)
     {
-        if (!(members = malloc( count * sizeof(*members) ))) return FALSE;
+        if (!(members = malloc( available * sizeof(*members) ))) return FALSE;
         if (!(receipts = calloc( count, sizeof(*receipts) )))
         {
             free( members );
@@ -1331,17 +1344,25 @@ static BOOL install_client_surface_scene_plan( struct client_surface_compositor_
         }
         for (binding = client_surface_compositor_bindings; binding; binding = binding->next)
             if (binding->toplevel == target->toplevel) members[i++] = binding;
-        qsort( members, count, sizeof(*members), compare_client_surface_scene_members );
+        qsort( members, available, sizeof(*members), compare_client_surface_scene_members );
         qsort( job->layouts, count, sizeof(*job->layouts), compare_client_surface_scene_layouts );
         for (i = 0; i < count; ++i)
-            if (members[i]->window != job->layouts[i].window ||
-                members[i]->process != job->layouts[i].process ||
-                members[i]->identity != job->layouts[i].identity)
+        {
+            /* The binding cache includes hidden producers. Select only the
+             * visible scene's layers from this sorted list; visibility does
+             * not discard their last completed images. */
+            while (next < available && wine_server_user_handle( members[next]->window ) <
+                                       wine_server_user_handle( job->layouts[i].window )) ++next;
+            if (next == available || members[next]->window != job->layouts[i].window ||
+                members[next]->process != job->layouts[i].process ||
+                members[next]->identity != job->layouts[i].identity)
             {
                 free( members );
                 free( receipts );
                 return FALSE;
             }
+            members[i] = members[next++];
+        }
     }
     if (target->scene.valid && target->scene.epoch == job->scene_epoch && target->scene.count == count &&
         (!count || !memcmp( members, target->scene.members, count * sizeof(*members) )))
@@ -3442,25 +3463,29 @@ static BOOL get_client_surface_scene_layouts( HWND toplevel, UINT64 epoch, UINT 
 {
     struct client_surface_scene_member *members;
     BOOL ret = FALSE;
-    UINT i;
+    UINT i, visible = 0, index = 0;
 
-    if (!count) return TRUE;
-    if (!(members = calloc( count, sizeof(*members) ))) return FALSE;
-    for (i = 0; i < count; ++i) members[i].hwnd = wine_server_ptr_handle( descs[i].handle );
-    if (!client_surface_get_scene_members( toplevel, epoch, count, members )) goto done;
+    for (i = 0; i < count; ++i) visible += !!descs[i].visible;
+    if (!visible) return TRUE;
+    if (!(members = calloc( visible, sizeof(*members) ))) return FALSE;
+    for (i = 0; i < count; ++i)
+        if (descs[i].visible) members[index++].hwnd = wine_server_ptr_handle( descs[i].handle );
+    if (!client_surface_get_scene_members( toplevel, epoch, visible, members )) goto done;
     /* Keep the exact native rectangles, including an empty successful region,
      * in the immutable owner plan. No producer-owned region XID survives here. */
-    for (i = 0; i < count; ++i)
+    for (i = 0, index = 0; i < count; ++i)
     {
-        layouts[i].window = members[i].hwnd;
-        layouts[i].process = descs[i].process;
-        layouts[i].identity = descs[i].surface;
-        layouts[i].geometry = members[i].target;
-        if (!(layouts[i].clip = X11DRV_GetRegionData( members[i].region, 0 ))) goto done;
+        if (!descs[i].visible) continue;
+        layouts[index].window = members[index].hwnd;
+        layouts[index].process = descs[i].process;
+        layouts[index].identity = descs[i].surface;
+        layouts[index].geometry = members[index].target;
+        if (!(layouts[index].clip = X11DRV_GetRegionData( members[index].region, 0 ))) goto done;
+        ++index;
     }
     ret = TRUE;
 done:
-    for (i = 0; i < count; ++i)
+    for (i = 0; i < visible; ++i)
         if (members[i].region) NtGdiDeleteObjectApp( members[i].region );
     free( members );
     return ret;
@@ -3522,6 +3547,7 @@ static BOOL refresh_client_surface_handoffs( HWND toplevel )
         if (reply_size != count * sizeof(*descs) || (scene_generation & 1)) goto failed;
         break;
     }
+    qsort( descs, count, sizeof(*descs), compare_client_surface_handoff_descs );
     {
         struct client_surface_compositor_job job =
         {
@@ -3543,8 +3569,12 @@ static BOOL refresh_client_surface_handoffs( HWND toplevel )
             return TRUE;
         }
     }
-    if (count && !(layouts = calloc( count, sizeof(*layouts) ))) goto failed;
-    layout_count = count;
+    for (i = 0; i < count; ++i) layout_count += !!descs[i].visible;
+    if (layout_count && !(layouts = calloc( layout_count, sizeof(*layouts) )))
+    {
+        layout_count = 0;
+        goto failed;
+    }
     if (!get_client_surface_scene_layouts( toplevel, scene_generation, count, descs, layouts )) goto failed;
     if (count)
     {
@@ -3561,7 +3591,10 @@ static BOOL refresh_client_surface_handoffs( HWND toplevel )
         job.handoff_reused = reused;
         if (!submit_client_surface_compositor_job( &job )) goto failed;
         for (i = 0; i < count; ++i)
-            if (!reused[i] && !register_client_surface_handoff( toplevel, &descs[i], mark )) goto failed;
+            /* Do not provision channels for never-displayed hidden surfaces.
+             * Existing authenticated bindings are marked above and retained. */
+            if (descs[i].visible && !reused[i] &&
+                !register_client_surface_handoff( toplevel, &descs[i], mark )) goto failed;
     }
 
     if (!validate_client_surface_handoff_scene( toplevel, scene_generation )) goto failed;
