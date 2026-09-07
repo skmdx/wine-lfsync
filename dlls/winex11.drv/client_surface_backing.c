@@ -3199,6 +3199,30 @@ static BOOL submit_client_surface_compositor_job( struct client_surface_composit
     return ret;
 }
 
+/* Release notifications carry only values; the caller does not consume their
+ * result. Keep the synchronous path if ownership cannot pass to the actor. */
+static void post_client_surface_compositor_job( struct client_surface_compositor_job *job )
+{
+    struct client_surface_compositor_job *pending;
+
+    assert( job->op == CLIENT_SURFACE_COMPOSITOR_FINISH_UPDATE ||
+            job->op == CLIENT_SURFACE_COMPOSITOR_END_UPDATE );
+    if ((pending = malloc( sizeof(*pending) )))
+    {
+        BOOL queued;
+
+        *pending = *job;
+        pending->async = TRUE;
+        pthread_mutex_lock( &client_surface_compositor_mutex );
+        queued = queue_client_surface_compositor_job( pending );
+        pthread_mutex_unlock( &client_surface_compositor_mutex );
+        if (queued) return;
+        free( pending );
+    }
+    /* Dropping either notification would leave its target quiescent. */
+    submit_client_surface_compositor_job( job );
+}
+
 static BOOL client_surface_backing_copy_area( Drawable source, Drawable destination,
                                               int source_x, int source_y,
                                               int destination_x, int destination_y,
@@ -3383,7 +3407,6 @@ UINT X11DRV_client_surface_backing_resume_update( HWND hwnd, UINT64 serial )
 
 void X11DRV_client_surface_backing_finish_deferred_update( HWND hwnd, UINT64 serial )
 {
-    struct client_surface_compositor_job *pending;
     struct client_surface_compositor_job job =
     {
         .op = CLIENT_SURFACE_COMPOSITOR_FINISH_UPDATE,
@@ -3394,21 +3417,7 @@ void X11DRV_client_surface_backing_finish_deferred_update( HWND hwnd, UINT64 ser
     /* Even if the server no longer needs a prepare or backing transition,
      * release this notification's hold after every state handler returned.
      * A handler which deferred again leaves its reasons for the next wake. */
-    if ((pending = malloc( sizeof(*pending) )))
-    {
-        BOOL queued;
-
-        *pending = job;
-        pending->async = TRUE;
-        pthread_mutex_lock( &client_surface_compositor_mutex );
-        queued = queue_client_surface_compositor_job( pending );
-        pthread_mutex_unlock( &client_surface_compositor_mutex );
-        if (queued) return;
-        free( pending );
-    }
-    /* The hold must still be released if allocating or queuing the owned job
-     * fails. Only this failure path needs the actor's synchronous reply. */
-    submit_client_surface_compositor_job( &job );
+    post_client_surface_compositor_job( &job );
 }
 
 void X11DRV_client_surface_backing_end_update( struct x11drv_win_data *data )
@@ -3424,7 +3433,9 @@ void X11DRV_client_surface_backing_end_update( struct x11drv_win_data *data )
      * installed plan. No unrelated target participates in this barrier. */
     XSync( data->display, False );
     if (data->client_surface_backing) X11DRV_client_surface_backing_ensure( data );
-    submit_client_surface_compositor_job( &job );
+    /* Later native update and destruction jobs for this target remain behind
+     * its release in the actor queue. The GUI has no result to wait for. */
+    post_client_surface_compositor_job( &job );
 }
 
 static BOOL register_client_surface_handoff( HWND toplevel,
