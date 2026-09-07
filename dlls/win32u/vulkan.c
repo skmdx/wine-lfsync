@@ -161,6 +161,7 @@ struct device
     pthread_cond_t retirement_cond;
     struct list retired_swapchains;
     BOOL retirement_worker;
+    BOOL swapchain_maintenance1;
     struct vulkan_device obj;
 };
 
@@ -542,6 +543,7 @@ static VkResult convert_instance_create_info( struct mempool *pool, VkInstanceCr
         return VK_ERROR_LAYER_NOT_PRESENT;
     }
 
+    instance->enable_win32_surface = instance->obj.extensions.has_VK_KHR_win32_surface;
     driver_funcs->p_map_instance_extensions( &instance->obj.extensions );
     instance->obj.extensions.has_VK_KHR_win32_surface = 0;
 
@@ -551,8 +553,16 @@ static VkResult convert_instance_create_info( struct mempool *pool, VkInstanceCr
         pthread_rwlock_init( &instance->objects_lock, NULL );
     }
 
-    if (instance->obj.extensions.has_VK_KHR_win32_surface && vulkan_funcs.host_extensions.has_VK_EXT_surface_maintenance1)
-        instance->obj.extensions.has_VK_EXT_surface_maintenance1 = 1;
+    if (instance->enable_win32_surface && vulkan_funcs.host_extensions.has_VK_KHR_get_surface_capabilities2)
+    {
+        instance->obj.extensions.has_VK_EXT_surface_maintenance1 |=
+            vulkan_funcs.host_extensions.has_VK_EXT_surface_maintenance1;
+        instance->obj.extensions.has_VK_KHR_surface_maintenance1 |=
+            vulkan_funcs.host_extensions.has_VK_KHR_surface_maintenance1;
+        if (instance->obj.extensions.has_VK_EXT_surface_maintenance1 ||
+            instance->obj.extensions.has_VK_KHR_surface_maintenance1)
+            instance->obj.extensions.has_VK_KHR_get_surface_capabilities2 = 1;
+    }
     if (vulkan_funcs.host_extensions.has_VK_KHR_get_physical_device_properties2)
         instance->obj.extensions.has_VK_KHR_get_physical_device_properties2 = 1;
     if (use_external_memory())
@@ -772,12 +782,60 @@ static void win32u_vkDestroyInstance( VkInstance client_instance, const VkAlloca
     free( instance );
 }
 
+static VkResult enable_swapchain_maintenance1( struct vulkan_physical_device *physical_device,
+                                              VkDeviceCreateInfo *info, struct mempool *pool,
+                                              struct vulkan_device *device )
+{
+    struct vulkan_instance *instance = physical_device->instance;
+    struct device *impl = impl_from_vulkan_device( device );
+    VkPhysicalDeviceSwapchainMaintenance1FeaturesKHR maintenance =
+    {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SWAPCHAIN_MAINTENANCE_1_FEATURES_KHR,
+    }, *enable;
+    VkPhysicalDeviceFeatures2 features = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
+                                         .pNext = &maintenance};
+    const VkPhysicalDeviceSwapchainMaintenance1FeaturesKHR *application;
+    BOOL khr, ext;
+
+    if (!device->extensions.has_VK_KHR_swapchain) return VK_SUCCESS;
+    /* KHR and EXT use the same structure type. Preserve an explicit disabled
+     * feature and never put a duplicate structure in the application's chain. */
+    if ((application = find_next_struct( info->pNext, maintenance.sType )))
+    {
+        impl->swapchain_maintenance1 = application->swapchainMaintenance1 &&
+            (device->extensions.has_VK_KHR_swapchain_maintenance1 ||
+             device->extensions.has_VK_EXT_swapchain_maintenance1);
+        return VK_SUCCESS;
+    }
+    khr = instance->extensions.has_VK_KHR_surface_maintenance1 &&
+          physical_device->extensions.has_VK_KHR_swapchain_maintenance1;
+    ext = instance->extensions.has_VK_EXT_surface_maintenance1 &&
+          physical_device->extensions.has_VK_EXT_swapchain_maintenance1;
+    if (!khr && !ext) return VK_SUCCESS;
+
+    if (instance->p_vkGetPhysicalDeviceFeatures2)
+        instance->p_vkGetPhysicalDeviceFeatures2( physical_device->host.physical_device, &features );
+    else if (instance->p_vkGetPhysicalDeviceFeatures2KHR)
+        instance->p_vkGetPhysicalDeviceFeatures2KHR( physical_device->host.physical_device, &features );
+    if (!maintenance.swapchainMaintenance1) return VK_SUCCESS;
+
+    if (!(enable = mem_alloc( pool, sizeof(*enable) ))) return VK_ERROR_OUT_OF_HOST_MEMORY;
+    *enable = maintenance;
+    enable->pNext = (void *)info->pNext;
+    info->pNext = enable;
+    if (khr) device->extensions.has_VK_KHR_swapchain_maintenance1 = 1;
+    else device->extensions.has_VK_EXT_swapchain_maintenance1 = 1;
+    impl->swapchain_maintenance1 = TRUE;
+    return VK_SUCCESS;
+}
+
 static VkResult convert_device_create_info( struct vulkan_physical_device *physical_device, VkDeviceCreateInfo *info,
                                             struct mempool *pool, struct vulkan_device *device )
 {
     struct vulkan_instance *instance = physical_device->instance;
     const char **extensions;
     uint32_t count = 0;
+    VkResult res;
 
     /* Should be filtered out by loader as ICDs don't support layers. */
     info->enabledLayerCount = 0;
@@ -823,10 +881,9 @@ static VkResult convert_device_create_info( struct vulkan_physical_device *physi
         device->extensions.has_VK_EXT_external_memory_host = 1;
     }
 
-    /* win32u uses VkSwapchainPresentScalingCreateInfoEXT if available. */
-    if (device->extensions.has_VK_KHR_swapchain && instance->extensions.has_VK_EXT_surface_maintenance1 &&
-        physical_device->extensions.has_VK_EXT_swapchain_maintenance1)
-        device->extensions.has_VK_EXT_swapchain_maintenance1 = 1;
+    /* Both presentation scaling and present fences require the feature, not
+     * just an advertised extension name. */
+    if ((res = enable_swapchain_maintenance1( physical_device, info, pool, device ))) return res;
 
     /* An offscreen client surface is copied into its top-level window after
      * QueuePresent.  Since QueuePresent is asynchronous, enable the host's
@@ -2442,10 +2499,11 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
     get_win_monitor_dpi( surface->hwnd, &raw_dpi );
     if (get_surface_rect( surface->hwnd, &client_rect, raw_dpi ) &&
         !extents_equals( &create_info_host.imageExtent, &client_rect ) &&
-        instance->extensions.has_VK_EXT_surface_maintenance1 &&
-        physical_device->extensions.has_VK_KHR_swapchain_maintenance1)
+        impl_from_vulkan_device( device )->swapchain_maintenance1 &&
+        !find_next_struct( create_info_host.pNext, scaling.sType ))
     {
         scaling.scalingBehavior = VK_PRESENT_SCALING_STRETCH_BIT_EXT;
+        scaling.pNext = create_info_host.pNext;
         create_info_host.pNext = &scaling;
     }
 
