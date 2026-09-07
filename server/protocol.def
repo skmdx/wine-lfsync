@@ -4424,6 +4424,16 @@ enum inproc_sync_type
     unsigned __int64 surface;
 @END
 
+/* Seal the exact native owner while its target resources are replaced. */
+@REQ(set_client_surface_native_barrier)
+    user_handle_t handle;        /* exact native owner, not its current ancestor */
+    client_ptr_t token;          /* owner-local native target token */
+    int begin;                   /* acquire (1) or release (0) this token */
+@REPLY
+    unsigned __int64 generation; /* composition generation after the transition */
+    unsigned __int64 scene_generation; /* scene sequence of the exact owner */
+@END
+
 /* Track whether a client-rendered window has changed while its hierarchy was hidden. */
 @REQ(set_client_surface_state)
     user_handle_t  handle;        /* client surface window */
@@ -4460,8 +4470,6 @@ enum inproc_sync_type
 #define CLIENT_SURFACE_STATE_PREPARE_BEGIN   0x2000
 #define CLIENT_SURFACE_STATE_PREPARE_COMMIT  0x4000
 #define CLIENT_SURFACE_STATE_SCENE_PUBLICATION 0x8000
-#define CLIENT_SURFACE_STATE_NATIVE_BARRIER_BEGIN 0x40000
-#define CLIENT_SURFACE_STATE_NATIVE_BARRIER_END   0x80000
 #define CLIENT_SURFACE_STATE_DIRECT_PRESENTATION 0x200000
 #define CLIENT_SURFACE_STATE_UPDATE_CAPS         0x400000
 #define CLIENT_SURFACE_STATE_FAILED              0x800000

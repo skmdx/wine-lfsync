@@ -3561,6 +3561,19 @@ static void dump_release_client_surface_request( const struct release_client_sur
     dump_uint64( " surface=", &req->surface );
 }
 
+static void dump_set_client_surface_native_barrier_request( const struct set_client_surface_native_barrier_request *req )
+{
+    fprintf( stderr, " handle=%08x", req->handle );
+    dump_uint64( ", token=", &req->token );
+    fprintf( stderr, ", begin=%d", req->begin );
+}
+
+static void dump_set_client_surface_native_barrier_reply( const struct set_client_surface_native_barrier_reply *req )
+{
+    dump_uint64( " generation=", &req->generation );
+    dump_uint64( ", scene_generation=", &req->scene_generation );
+}
+
 static void dump_set_client_surface_state_request( const struct set_client_surface_state_request *req )
 {
     fprintf( stderr, " handle=%08x", req->handle );
@@ -4015,6 +4028,7 @@ static const dump_func req_dumpers[REQ_NB_REQUESTS] =
     (dump_func)dump_alpc_create_port_request,
     (dump_func)dump_allocate_client_surface_request,
     (dump_func)dump_release_client_surface_request,
+    (dump_func)dump_set_client_surface_native_barrier_request,
     (dump_func)dump_set_client_surface_state_request,
     (dump_func)dump_get_client_surface_clip_windows_request,
     (dump_func)dump_get_client_surface_handoff_request,
@@ -4340,6 +4354,7 @@ static const dump_func reply_dumpers[REQ_NB_REQUESTS] =
     (dump_func)dump_alpc_create_port_reply,
     (dump_func)dump_allocate_client_surface_reply,
     NULL,
+    (dump_func)dump_set_client_surface_native_barrier_reply,
     (dump_func)dump_set_client_surface_state_reply,
     (dump_func)dump_get_client_surface_clip_windows_reply,
     (dump_func)dump_get_client_surface_handoff_reply,
@@ -4665,6 +4680,7 @@ static const char * const req_names[REQ_NB_REQUESTS] =
     "alpc_create_port",
     "allocate_client_surface",
     "release_client_surface",
+    "set_client_surface_native_barrier",
     "set_client_surface_state",
     "get_client_surface_clip_windows",
     "get_client_surface_handoff",

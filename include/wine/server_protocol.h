@@ -6347,6 +6347,22 @@ struct release_client_surface_reply
 };
 
 
+struct set_client_surface_native_barrier_request
+{
+    struct request_header __header;
+    user_handle_t handle;
+    client_ptr_t token;
+    int begin;
+    char __pad_28[4];
+};
+struct set_client_surface_native_barrier_reply
+{
+    struct reply_header __header;
+    unsigned __int64 generation;
+    unsigned __int64 scene_generation;
+};
+
+
 struct set_client_surface_state_request
 {
     struct request_header __header;
@@ -6388,8 +6404,6 @@ struct set_client_surface_state_reply
 #define CLIENT_SURFACE_STATE_PREPARE_BEGIN   0x2000
 #define CLIENT_SURFACE_STATE_PREPARE_COMMIT  0x4000
 #define CLIENT_SURFACE_STATE_SCENE_PUBLICATION 0x8000
-#define CLIENT_SURFACE_STATE_NATIVE_BARRIER_BEGIN 0x40000
-#define CLIENT_SURFACE_STATE_NATIVE_BARRIER_END   0x80000
 #define CLIENT_SURFACE_STATE_DIRECT_PRESENTATION 0x200000
 #define CLIENT_SURFACE_STATE_UPDATE_CAPS         0x400000
 #define CLIENT_SURFACE_STATE_FAILED              0x800000
@@ -6868,6 +6882,7 @@ enum request
     REQ_alpc_create_port,
     REQ_allocate_client_surface,
     REQ_release_client_surface,
+    REQ_set_client_surface_native_barrier,
     REQ_set_client_surface_state,
     REQ_get_client_surface_clip_windows,
     REQ_get_client_surface_handoff,
@@ -7196,6 +7211,7 @@ union generic_request
     struct alpc_create_port_request alpc_create_port_request;
     struct allocate_client_surface_request allocate_client_surface_request;
     struct release_client_surface_request release_client_surface_request;
+    struct set_client_surface_native_barrier_request set_client_surface_native_barrier_request;
     struct set_client_surface_state_request set_client_surface_state_request;
     struct get_client_surface_clip_windows_request get_client_surface_clip_windows_request;
     struct get_client_surface_handoff_request get_client_surface_handoff_request;
@@ -7522,6 +7538,7 @@ union generic_reply
     struct alpc_create_port_reply alpc_create_port_reply;
     struct allocate_client_surface_reply allocate_client_surface_reply;
     struct release_client_surface_reply release_client_surface_reply;
+    struct set_client_surface_native_barrier_reply set_client_surface_native_barrier_reply;
     struct set_client_surface_state_reply set_client_surface_state_reply;
     struct get_client_surface_clip_windows_reply get_client_surface_clip_windows_reply;
     struct get_client_surface_handoff_reply get_client_surface_handoff_reply;
@@ -7534,6 +7551,6 @@ union generic_reply
     struct get_client_surface_scene_regions_reply get_client_surface_scene_regions_reply;
 };
 
-#define SERVER_PROTOCOL_VERSION 1007
+#define SERVER_PROTOCOL_VERSION 1008
 
 #endif /* __WINE_WINE_SERVER_PROTOCOL_H */

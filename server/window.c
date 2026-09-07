@@ -5051,6 +5051,45 @@ DECL_HANDLER(release_client_surface)
     else free_client_surface_ref_if_unused( surface );
 }
 
+/* A barrier belongs to the requested native owner even after reparenting. */
+DECL_HANDLER(set_client_surface_native_barrier)
+{
+    struct window *win;
+
+    if (!(win = get_window( req->handle ))) return;
+    if (!req->token || (req->begin != 0 && req->begin != 1) ||
+        !win->thread || win->thread->process != current->process)
+    {
+        set_error( STATUS_INVALID_PARAMETER );
+        return;
+    }
+    if (req->begin)
+    {
+        if (!win->client_surface_native_barrier)
+        {
+            win->client_surface_native_barrier = req->token;
+            begin_client_surface_scene_change( win );
+        }
+        else if (win->client_surface_native_barrier != req->token)
+        {
+            set_error( STATUS_DEVICE_BUSY );
+            return;
+        }
+    }
+    else
+    {
+        if (win->client_surface_native_barrier != req->token)
+        {
+            set_error( STATUS_INVALID_PARAMETER );
+            return;
+        }
+        win->client_surface_native_barrier = 0;
+        end_client_surface_scene_change( win );
+    }
+    reply->generation = client_surface_transaction_generation( win );
+    reply->scene_generation = win->client_surface_scene_generation;
+}
+
 /* Track client-rendered content across process boundaries.  A presentation
  * made while an ancestor is hidden invalidates the top-level composition.
  * Every visible surface must commit the same scene generation before the
@@ -5084,59 +5123,6 @@ DECL_HANDLER(set_client_surface_state)
             top->thread->process != current->process)
             set_error( STATUS_ACCESS_DENIED );
         else fail_client_surface_publication( top );
-        return;
-    }
-    if (req->flags & (CLIENT_SURFACE_STATE_NATIVE_BARRIER_BEGIN |
-                      CLIENT_SURFACE_STATE_NATIVE_BARRIER_END))
-    {
-        unsigned int barrier_flags = req->flags &
-            (CLIENT_SURFACE_STATE_NATIVE_BARRIER_BEGIN | CLIENT_SURFACE_STATE_NATIVE_BARRIER_END);
-
-        /* Seal the exact native owner being replaced, even if SetParent has
-         * already made it a child. The owner drains its compositor before
-         * ending this scene transition. */
-        top = win;
-        if (req->flags != barrier_flags || !req->surface ||
-            !top->thread || top->thread->process != current->process ||
-            barrier_flags == (CLIENT_SURFACE_STATE_NATIVE_BARRIER_BEGIN |
-                              CLIENT_SURFACE_STATE_NATIVE_BARRIER_END))
-        {
-            set_error( STATUS_INVALID_PARAMETER );
-            return;
-        }
-        if (barrier_flags == CLIENT_SURFACE_STATE_NATIVE_BARRIER_BEGIN)
-        {
-            if (!top->client_surface_native_barrier)
-            {
-                top->client_surface_native_barrier = req->surface;
-                begin_client_surface_scene_change( top );
-            }
-            else if (top->client_surface_native_barrier != req->surface)
-            {
-                set_error( STATUS_DEVICE_BUSY );
-                return;
-            }
-        }
-        else
-        {
-            if (top->client_surface_native_barrier != req->surface)
-            {
-                set_error( STATUS_INVALID_PARAMETER );
-                return;
-            }
-            top->client_surface_native_barrier = 0;
-            end_client_surface_scene_change( top );
-        }
-
-        reply->toplevel = top->handle;
-        reply->wake = was_pending && is_visible( top ) && !top->client_surface_dirty;
-        reply->generation = client_surface_transaction_generation( top );
-        reply->scene_generation = top->client_surface_scene_generation;
-        reply->staged = top->client_surface_transaction.staged;
-        reply->ready = client_surface_is_ready( top );
-        reply->mode = client_surface_presentation_mode( top );
-        reply->active = win->client_surface_count;
-        reply->cached = win->client_surface_cached_count;
         return;
     }
     owner = get_client_surface_owner( win, current->process,

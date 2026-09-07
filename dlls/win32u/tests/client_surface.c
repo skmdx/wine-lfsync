@@ -42,6 +42,12 @@ struct surface_state
     BOOL wake;
 };
 
+struct native_barrier_state
+{
+    UINT64 generation;
+    UINT64 scene_generation;
+};
+
 struct clip_state
 {
     HWND toplevel;
@@ -115,6 +121,25 @@ static unsigned int set_surface_state( HWND hwnd, UINT64 surface, UINT flags,
                                        UINT64 generation, struct surface_state *state )
 {
     return set_surface_state_scene( hwnd, surface, flags, generation, 0, state );
+}
+
+static unsigned int set_native_barrier( HWND hwnd, UINT_PTR token, int begin,
+                                        struct native_barrier_state *state )
+{
+    struct __server_request_info info = {0};
+    unsigned int status;
+
+    info.u.req.set_client_surface_native_barrier_request.__header.req = REQ_set_client_surface_native_barrier;
+    info.u.req.set_client_surface_native_barrier_request.handle = wine_server_user_handle( hwnd );
+    info.u.req.set_client_surface_native_barrier_request.token = token;
+    info.u.req.set_client_surface_native_barrier_request.begin = begin;
+    status = p_wine_server_call( &info );
+    if (!status && state)
+    {
+        state->generation = info.u.reply.set_client_surface_native_barrier_reply.generation;
+        state->scene_generation = info.u.reply.set_client_surface_native_barrier_reply.scene_generation;
+    }
+    return status;
 }
 
 static unsigned int set_server_parent( HWND hwnd, HWND parent )
@@ -2127,8 +2152,10 @@ static void test_unbacked_live_generation(void)
 
 static void test_native_backing_barrier(void)
 {
-    const UINT64 surface = allocate_surface(), barrier = 0x45670000;
-    struct surface_state state, composing, ready, sealed, blocked;
+    const UINT64 surface = allocate_surface();
+    const UINT_PTR barrier = ~(UINT_PTR)0 - 1;
+    struct native_barrier_state sealed, repeated;
+    struct surface_state state, composing, ready, blocked;
     HWND hwnd;
     unsigned int status;
 
@@ -2150,32 +2177,41 @@ static void test_native_backing_barrier(void)
     status = publish_surface_state( hwnd, &state );
     ok( !status && !state.generation, "native barrier publication failed, status %#x\n", status );
 
-    status = set_surface_state( hwnd, barrier, CLIENT_SURFACE_STATE_NATIVE_BARRIER_BEGIN,
-                                0, &sealed );
-    ok( !status && !sealed.pending && (sealed.scene_generation & 1),
-        "native barrier did not seal the scene: status %#x pending %u scene %s\n",
-        status, sealed.pending, wine_dbgstr_longlong( sealed.scene_generation ) );
-    status = set_surface_state( hwnd, barrier + 1, CLIENT_SURFACE_STATE_NATIVE_BARRIER_BEGIN,
-                                0, NULL );
+    status = set_native_barrier( hwnd, 0, TRUE, NULL );
+    ok( status == STATUS_INVALID_PARAMETER, "zero native barrier token returned %#x\n", status );
+    status = set_native_barrier( hwnd, barrier, 2, NULL );
+    ok( status == STATUS_INVALID_PARAMETER, "invalid native barrier operation returned %#x\n", status );
+    status = set_native_barrier( hwnd, barrier, FALSE, NULL );
+    ok( status == STATUS_INVALID_PARAMETER, "unmatched native barrier end returned %#x\n", status );
+    status = set_native_barrier( hwnd, barrier, TRUE, &sealed );
+    ok( !status && (sealed.scene_generation & 1),
+        "native barrier did not seal the scene: status %#x scene %s\n",
+        status, wine_dbgstr_longlong( sealed.scene_generation ) );
+    status = set_surface_state( hwnd, 0, 0, 0, &blocked );
+    ok( !status && !blocked.pending && blocked.scene_generation == sealed.scene_generation,
+        "native barrier acknowledgement differs from scene: status %#x pending %u scene %s\n",
+        status, blocked.pending, wine_dbgstr_longlong( blocked.scene_generation ) );
+    status = set_native_barrier( hwnd, barrier + 1, TRUE, NULL );
     ok( status == STATUS_DEVICE_BUSY, "competing native barrier returned %#x\n", status );
-    status = set_surface_state( hwnd, barrier + 1, CLIENT_SURFACE_STATE_NATIVE_BARRIER_END, 0, NULL );
+    status = set_native_barrier( hwnd, barrier + 1, FALSE, NULL );
     ok( status == STATUS_INVALID_PARAMETER, "wrong barrier token ended the scene, status %#x\n", status );
 
     status = begin_surface_state( hwnd, surface, &state, &blocked );
     ok( !status && !blocked.compose,
         "old composition crossed native barrier: status %#x compose %u\n", status, blocked.compose );
-    status = commit_surface_state( hwnd, surface, &state, &sealed );
+    status = commit_surface_state( hwnd, surface, &state, &blocked );
     ok( !status, "stale composition commit failed, status %#x\n", status );
-    status = set_surface_state( hwnd, barrier, CLIENT_SURFACE_STATE_NATIVE_BARRIER_BEGIN,
-                                0, &sealed );
-    ok( !status && !sealed.pending && (sealed.scene_generation & 1),
-        "native barrier lost its scene seal: status %#x pending %u scene %s\n",
-        status, sealed.pending, wine_dbgstr_longlong( sealed.scene_generation ) );
-    status = set_surface_state( hwnd, barrier, CLIENT_SURFACE_STATE_NATIVE_BARRIER_END,
-                                0, &sealed );
-    ok( !status && !(sealed.scene_generation & 1),
+    status = set_native_barrier( hwnd, barrier, TRUE, &repeated );
+    ok( !status && repeated.scene_generation == sealed.scene_generation &&
+        repeated.generation == sealed.generation,
+        "repeated native barrier changed its seal: status %#x scene %s generation %s\n",
+        status, wine_dbgstr_longlong( repeated.scene_generation ), wine_dbgstr_longlong( repeated.generation ) );
+    status = set_native_barrier( hwnd, barrier, FALSE, &repeated );
+    ok( !status && repeated.scene_generation == sealed.scene_generation + 1,
         "native barrier did not reopen scene: status %#x scene %s\n",
-        status, wine_dbgstr_longlong( sealed.scene_generation ) );
+        status, wine_dbgstr_longlong( repeated.scene_generation ) );
+    status = set_native_barrier( hwnd, barrier, FALSE, NULL );
+    ok( status == STATUS_INVALID_PARAMETER, "duplicate native barrier end returned %#x\n", status );
 
     set_surface_state( hwnd, surface, CLIENT_SURFACE_STATE_UNREGISTER, 0, NULL );
     DestroyWindow( hwnd );
@@ -2183,8 +2219,10 @@ static void test_native_backing_barrier(void)
 
 static void test_demoted_native_barrier(void)
 {
-    const UINT64 surface = allocate_surface(), barrier = 0x45676000;
-    struct surface_state sealed;
+    const UINT64 surface = allocate_surface();
+    const UINT_PTR barrier = 0x45676000;
+    struct native_barrier_state sealed;
+    struct surface_state parent_before, parent_after;
     HWND first, second;
     unsigned int status;
 
@@ -2199,11 +2237,19 @@ static void test_demoted_native_barrier(void)
      * server hierarchy has changed, not the newly selected top-level. */
     status = set_server_parent( first, second );
     ok( !status, "server demotion failed, status %#x\n", status );
-    status = set_surface_state( first, barrier, CLIENT_SURFACE_STATE_NATIVE_BARRIER_BEGIN, 0, &sealed );
-    ok( !status && sealed.toplevel == first && !sealed.pending,
-        "native barrier followed new hierarchy: status %#x target %p pending %u\n",
-        status, sealed.toplevel, sealed.pending );
-    status = set_surface_state( first, barrier, CLIENT_SURFACE_STATE_NATIVE_BARRIER_END, 0, &sealed );
+    status = set_surface_state( second, 0, 0, 0, &parent_before );
+    ok( !status, "demotion parent query failed, status %#x\n", status );
+    status = set_native_barrier( first, barrier, TRUE, &sealed );
+    ok( !status && (sealed.scene_generation & 1),
+        "native barrier did not seal demoted target: status %#x scene %s\n",
+        status, wine_dbgstr_longlong( sealed.scene_generation ) );
+    status = set_surface_state( second, 0, 0, 0, &parent_after );
+    ok( !status && parent_after.scene_generation == parent_before.scene_generation &&
+        parent_after.generation == parent_before.generation,
+        "native barrier followed new hierarchy: status %#x scene %s generation %s\n",
+        status, wine_dbgstr_longlong( parent_after.scene_generation ),
+        wine_dbgstr_longlong( parent_after.generation ) );
+    status = set_native_barrier( first, barrier, FALSE, &sealed );
     ok( !status && !(sealed.scene_generation & 1) && !sealed.generation,
         "demoted target retained its own transaction: status %#x scene %s generation %s\n",
         status, wine_dbgstr_longlong( sealed.scene_generation ), wine_dbgstr_longlong( sealed.generation ) );
@@ -2218,6 +2264,7 @@ done:
 struct lifetime_test_shared
 {
     HWND hwnd;
+    UINT_PTR barrier;
     UINT64 parent_id;
     UINT64 child_id;
 };
@@ -2240,6 +2287,10 @@ static void surface_lifetime_child( HANDLE mapping, HANDLE ready, HANDLE release
     ok( status == STATUS_INVALID_PARAMETER, "foreign reservation register status %#x\n", status );
     status = set_surface_state( shared->hwnd, shared->parent_id, CLIENT_SURFACE_STATE_CACHE, 0, NULL );
     ok( status == STATUS_INVALID_PARAMETER, "foreign reservation cache status %#x\n", status );
+    status = set_native_barrier( shared->hwnd, shared->barrier, TRUE, NULL );
+    ok( status == STATUS_INVALID_PARAMETER, "foreign owner acquired native barrier, status %#x\n", status );
+    status = set_native_barrier( shared->hwnd, shared->barrier, FALSE, NULL );
+    ok( status == STATUS_INVALID_PARAMETER, "foreign owner released native barrier, status %#x\n", status );
 
     shared->child_id = allocate_surface();
     ok( shared->child_id != shared->parent_id, "processes received the same lifetime ID\n" );
@@ -2258,9 +2309,12 @@ static void test_surface_lifetimes( char **argv )
     STARTUPINFOA startup = {.cb = sizeof(startup)};
     PROCESS_INFORMATION process = {0};
     struct lifetime_test_shared *shared = NULL;
+    struct native_barrier_state barrier_before, barrier_after;
     struct surface_state state;
     HWND first = create_test_window( FALSE ), second = create_test_window( FALSE ), invalid;
     HANDLE mapping = NULL, ready = NULL, release = NULL;
+    const UINT_PTR barrier = 0x45677000;
+    BOOL barrier_held = FALSE;
     UINT64 unused, surface, replacement;
     char command[MAX_PATH * 2];
     unsigned int status;
@@ -2333,7 +2387,12 @@ static void test_surface_lifetimes( char **argv )
     ok( !!shared, "lifetime parent mapping failed, error %lu\n", GetLastError() );
     if (!shared) goto release_reservation;
     shared->hwnd = first;
+    shared->barrier = barrier;
     shared->parent_id = replacement;
+    status = set_native_barrier( first, barrier, TRUE, &barrier_before );
+    ok( !status, "parent native barrier begin status %#x\n", status );
+    if (status) goto release_reservation;
+    barrier_held = TRUE;
     sprintf( command, "\"%s\" %s surface_lifetime_child %p %p %p", argv[0], argv[1], mapping, ready, release );
     if (!CreateProcessA( NULL, command, NULL, NULL, TRUE, 0, NULL, NULL, &startup, &process ))
     {
@@ -2349,6 +2408,14 @@ static void test_surface_lifetimes( char **argv )
     ok( status == STATUS_INVALID_PARAMETER, "foreign registered ID adopted, status %#x\n", status );
     status = claim_surface_state( first, shared->child_id, NULL );
     ok( status == STATUS_INVALID_PARAMETER, "foreign registered ID claimed, status %#x\n", status );
+    status = set_native_barrier( first, barrier, TRUE, &barrier_after );
+    ok( !status && barrier_after.scene_generation == barrier_before.scene_generation,
+        "foreign barrier request changed parent seal: status %#x scene %s\n",
+        status, wine_dbgstr_longlong( barrier_after.scene_generation ) );
+    status = set_native_barrier( first, barrier, FALSE, &barrier_after );
+    ok( !status && barrier_after.scene_generation == barrier_before.scene_generation + 1,
+        "parent barrier release status %#x scene %s\n", status, wine_dbgstr_longlong( barrier_after.scene_generation ) );
+    if (!status) barrier_held = FALSE;
     status = set_surface_state( first, replacement, CLIENT_SURFACE_STATE_REGISTER, 0, &state );
     ok( !status && state.active == 2 && !state.cached,
         "independent process registrations status %#x active %u cached %u\n", status, state.active, state.cached );
@@ -2367,6 +2434,7 @@ static void test_surface_lifetimes( char **argv )
 release_reservation:
     release_surface( replacement );
 done:
+    if (barrier_held) set_native_barrier( first, barrier, FALSE, NULL );
     if (process.hProcess)
     {
         SetEvent( release );

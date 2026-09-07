@@ -318,6 +318,7 @@ DECL_HANDLER(d3dkmt_mutex_release);
 DECL_HANDLER(alpc_create_port);
 DECL_HANDLER(allocate_client_surface);
 DECL_HANDLER(release_client_surface);
+DECL_HANDLER(set_client_surface_native_barrier);
 DECL_HANDLER(set_client_surface_state);
 DECL_HANDLER(get_client_surface_clip_windows);
 DECL_HANDLER(get_client_surface_handoff);
@@ -643,6 +644,7 @@ static const req_handler req_handlers[REQ_NB_REQUESTS] =
     (req_handler)req_alpc_create_port,
     (req_handler)req_allocate_client_surface,
     (req_handler)req_release_client_surface,
+    (req_handler)req_set_client_surface_native_barrier,
     (req_handler)req_set_client_surface_state,
     (req_handler)req_get_client_surface_clip_windows,
     (req_handler)req_get_client_surface_handoff,
@@ -2431,6 +2433,13 @@ C_ASSERT( offsetof(struct allocate_client_surface_reply, surface) == 8 );
 C_ASSERT( sizeof(struct allocate_client_surface_reply) == 16 );
 C_ASSERT( offsetof(struct release_client_surface_request, surface) == 16 );
 C_ASSERT( sizeof(struct release_client_surface_request) == 24 );
+C_ASSERT( offsetof(struct set_client_surface_native_barrier_request, handle) == 12 );
+C_ASSERT( offsetof(struct set_client_surface_native_barrier_request, token) == 16 );
+C_ASSERT( offsetof(struct set_client_surface_native_barrier_request, begin) == 24 );
+C_ASSERT( sizeof(struct set_client_surface_native_barrier_request) == 32 );
+C_ASSERT( offsetof(struct set_client_surface_native_barrier_reply, generation) == 8 );
+C_ASSERT( offsetof(struct set_client_surface_native_barrier_reply, scene_generation) == 16 );
+C_ASSERT( sizeof(struct set_client_surface_native_barrier_reply) == 24 );
 C_ASSERT( offsetof(struct set_client_surface_state_request, handle) == 12 );
 C_ASSERT( offsetof(struct set_client_surface_state_request, surface) == 16 );
 C_ASSERT( offsetof(struct set_client_surface_state_request, flags) == 24 );

@@ -1402,13 +1402,11 @@ BOOL client_surface_begin_native_barrier( HWND hwnd, UINT_PTR token )
 {
     BOOL ret = FALSE;
 
-    SERVER_START_REQ( set_client_surface_state )
+    SERVER_START_REQ( set_client_surface_native_barrier )
     {
         req->handle = wine_server_user_handle( hwnd );
-        req->surface = token;
-        req->flags = CLIENT_SURFACE_STATE_NATIVE_BARRIER_BEGIN;
-        req->generation = 0;
-        req->scene_generation = 0;
+        req->token = token;
+        req->begin = TRUE;
         ret = !wine_server_call( req );
     }
     SERVER_END_REQ;
@@ -1419,13 +1417,11 @@ BOOL client_surface_end_native_barrier( HWND hwnd, UINT_PTR token )
 {
     BOOL ret = FALSE;
 
-    SERVER_START_REQ( set_client_surface_state )
+    SERVER_START_REQ( set_client_surface_native_barrier )
     {
         req->handle = wine_server_user_handle( hwnd );
-        req->surface = token;
-        req->flags = CLIENT_SURFACE_STATE_NATIVE_BARRIER_END;
-        req->generation = 0;
-        req->scene_generation = 0;
+        req->token = token;
+        req->begin = FALSE;
         ret = !wine_server_call( req );
     }
     SERVER_END_REQ;
