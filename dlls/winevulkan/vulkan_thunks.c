@@ -15695,7 +15695,7 @@ static const VkCommandBuffer *convert_VkCommandBuffer_array_win64_to_host(struct
     out = conversion_context_alloc(ctx, count * sizeof(*out));
     for (i = 0; i < count; i++)
     {
-        out[i] = vulkan_command_buffer_from_handle(in[i])->host.command_buffer;
+        out[i] = in[i] ? vulkan_command_buffer_from_handle(in[i])->host.command_buffer : 0;
     }
 
     return out;
@@ -15712,7 +15712,7 @@ static const VkCommandBuffer *convert_VkCommandBuffer_array_win32_to_host(struct
     out = conversion_context_alloc(ctx, count * sizeof(*out));
     for (i = 0; i < count; i++)
     {
-        out[i] = vulkan_command_buffer_from_handle(UlongToPtr(in[i]))->host.command_buffer;
+        out[i] = in[i] ? vulkan_command_buffer_from_handle(UlongToPtr(in[i]))->host.command_buffer : 0;
     }
 
     return out;
@@ -19070,7 +19070,7 @@ static const VkPhysicalDevice *convert_VkPhysicalDevice_array_win64_to_host(stru
     out = conversion_context_alloc(ctx, count * sizeof(*out));
     for (i = 0; i < count; i++)
     {
-        out[i] = vulkan_physical_device_from_handle(in[i])->host.physical_device;
+        out[i] = in[i] ? vulkan_physical_device_from_handle(in[i])->host.physical_device : 0;
     }
 
     return out;
@@ -22469,7 +22469,7 @@ static const VkPhysicalDevice *convert_VkPhysicalDevice_array_win32_to_host(stru
     out = conversion_context_alloc(ctx, count * sizeof(*out));
     for (i = 0; i < count; i++)
     {
-        out[i] = vulkan_physical_device_from_handle(UlongToPtr(in[i]))->host.physical_device;
+        out[i] = in[i] ? vulkan_physical_device_from_handle(UlongToPtr(in[i]))->host.physical_device : 0;
     }
 
     return out;
@@ -47767,7 +47767,7 @@ static const VkSemaphore *convert_VkSemaphore_array_win64_to_host(struct convers
     out = conversion_context_alloc(ctx, count * sizeof(*out));
     for (i = 0; i < count; i++)
     {
-        out[i] = vulkan_semaphore_from_handle(in[i])->host.semaphore;
+        out[i] = in[i] ? vulkan_semaphore_from_handle(in[i])->host.semaphore : 0;
     }
 
     return out;
@@ -47972,7 +47972,7 @@ static const VkSemaphore *convert_VkSemaphore_array_win32_to_host(struct convers
     out = conversion_context_alloc(ctx, count * sizeof(*out));
     for (i = 0; i < count; i++)
     {
-        out[i] = vulkan_semaphore_from_handle(in[i])->host.semaphore;
+        out[i] = in[i] ? vulkan_semaphore_from_handle(in[i])->host.semaphore : 0;
     }
 
     return out;
@@ -48270,7 +48270,7 @@ static const VkFence *convert_VkFence_array_win64_to_host(struct conversion_cont
     out = conversion_context_alloc(ctx, count * sizeof(*out));
     for (i = 0; i < count; i++)
     {
-        out[i] = vulkan_fence_from_handle(in[i])->host.fence;
+        out[i] = in[i] ? vulkan_fence_from_handle(in[i])->host.fence : 0;
     }
 
     return out;
@@ -48531,7 +48531,7 @@ static const VkFence *convert_VkFence_array_win32_to_host(struct conversion_cont
     out = conversion_context_alloc(ctx, count * sizeof(*out));
     for (i = 0; i < count; i++)
     {
-        out[i] = vulkan_fence_from_handle(in[i])->host.fence;
+        out[i] = in[i] ? vulkan_fence_from_handle(in[i])->host.fence : 0;
     }
 
     return out;
@@ -48733,7 +48733,7 @@ static const VkDeviceMemory *convert_VkDeviceMemory_array_win64_to_host(struct c
     out = conversion_context_alloc(ctx, count * sizeof(*out));
     for (i = 0; i < count; i++)
     {
-        out[i] = vulkan_device_memory_from_handle(in[i])->host.device_memory;
+        out[i] = in[i] ? vulkan_device_memory_from_handle(in[i])->host.device_memory : 0;
     }
 
     return out;
@@ -48934,7 +48934,7 @@ static const VkDeviceMemory *convert_VkDeviceMemory_array_win32_to_host(struct c
     out = conversion_context_alloc(ctx, count * sizeof(*out));
     for (i = 0; i < count; i++)
     {
-        out[i] = vulkan_device_memory_from_handle(in[i])->host.device_memory;
+        out[i] = in[i] ? vulkan_device_memory_from_handle(in[i])->host.device_memory : 0;
     }
 
     return out;
@@ -49720,7 +49720,7 @@ static const VkSwapchainKHR *convert_VkSwapchainKHR_array_win64_to_host(struct c
     out = conversion_context_alloc(ctx, count * sizeof(*out));
     for (i = 0; i < count; i++)
     {
-        out[i] = vulkan_swapchain_from_handle(in[i])->host.swapchain;
+        out[i] = in[i] ? vulkan_swapchain_from_handle(in[i])->host.swapchain : 0;
     }
 
     return out;
@@ -49737,7 +49737,7 @@ static const VkSwapchainKHR *convert_VkSwapchainKHR_array_win32_to_host(struct c
     out = conversion_context_alloc(ctx, count * sizeof(*out));
     for (i = 0; i < count; i++)
     {
-        out[i] = vulkan_swapchain_from_handle(in[i])->host.swapchain;
+        out[i] = in[i] ? vulkan_swapchain_from_handle(in[i])->host.swapchain : 0;
     }
 
     return out;

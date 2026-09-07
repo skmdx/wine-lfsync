@@ -2273,7 +2273,7 @@ class ArrayConversionFunction(object):
                 if self.unwrap == Unwrap.NONE or not handle.is_wrapped():
                     body += "        out[i] = {0};\n".format(input)
                 elif self.direction == Direction.INPUT:
-                    body += "        out[i] = {0};\n".format(handle.unwrap_handle(input, self.unwrap))
+                    body += "        out[i] = in[i] ? {0} : 0;\n".format(handle.unwrap_handle(input, self.unwrap))
                 else:
                     LOGGER.warning("Unhandled handle output conversion")
             elif pointer_array:
