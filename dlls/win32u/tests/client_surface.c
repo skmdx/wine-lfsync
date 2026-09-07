@@ -507,7 +507,7 @@ static void test_clip_scene_snapshot(void)
         {65, 35, 70, 50}, {20, 20, 20, 30}, {200, 200, 210, 210}, {-5, -5, 20, 20},
     };
     HRGN shape, shape_part;
-    HWND parent, first, second, descendant;
+    HWND parent, first, second, descendant, hidden;
     unsigned int status, i;
 
     parent = create_test_window( TRUE );
@@ -556,6 +556,20 @@ static void test_clip_scene_snapshot(void)
     ok( before.count == 2, "clip count %u, expected two distinct windows\n", before.count );
     ok( clip_state_contains( &before, second ), "upper sibling missing from clip snapshot\n" );
     ok( clip_state_contains( &before, descendant ), "descendant missing from clip snapshot\n" );
+
+    hidden = CreateWindowExA( 0, "client_surface_test", "hidden non-producer", WS_CHILD,
+                              3, 4, 12, 13, parent, NULL, NULL, NULL );
+    ok( !!hidden, "failed to create hidden non-producer\n" );
+    if (hidden)
+    {
+        get_clip_state( first, &before );
+        ok( DestroyWindow( hidden ), "failed to destroy hidden non-producer\n" );
+        status = get_clip_state( first, &after );
+        ok( !status && after.scene_generation == before.scene_generation && after.count == before.count,
+            "hidden non-producer destruction changed scene %s/%u to %s/%u, status %#x\n",
+            wine_dbgstr_longlong( before.scene_generation ), before.count,
+            wine_dbgstr_longlong( after.scene_generation ), after.count, status );
+    }
 
     claim_surface_state( second, second_surface, NULL );
     status = get_clip_state( first, &after );

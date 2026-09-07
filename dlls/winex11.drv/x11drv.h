@@ -742,7 +742,8 @@ extern void set_window_parent( struct x11drv_win_data *data, Window parent );
 extern Window X11DRV_get_whole_window( HWND hwnd );
 extern void X11DRV_client_surface_backing_destroy( struct x11drv_win_data *data );
 extern BOOL X11DRV_client_surface_backing_ensure( struct x11drv_win_data *data );
-extern BOOL X11DRV_client_surface_backing_begin_update( HWND hwnd );
+extern BOOL X11DRV_client_surface_backing_begin_update( HWND hwnd, const struct window_rects *rects,
+                                                       UINT swp_flags );
 extern void X11DRV_client_surface_backing_end_update( struct x11drv_win_data *data );
 extern BOOL X11DRV_client_surface_backing_snapshot( struct x11drv_win_data *data, BOOL invalidate );
 extern BOOL X11DRV_client_surface_backing_publish( struct x11drv_win_data *data );

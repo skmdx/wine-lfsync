@@ -956,7 +956,7 @@ static int set_parent_window( struct window *win, struct window *parent )
     struct window *new_top = parent && !is_desktop_window( parent ) ?
                              get_toplevel_window( parent ) : win;
     unsigned int subtree_count = win->client_surface_subtree_count;
-    int has_surfaces = !!subtree_count, old_pending;
+    int has_surfaces = !!subtree_count, old_pending, scene_change;
 
     /* make sure parent is not a child of window */
     for (ptr = parent; ptr; ptr = ptr->parent)
@@ -968,8 +968,12 @@ static int set_parent_window( struct window *win, struct window *parent )
         }
     }
 
-    begin_client_surface_scene_change( old_top );
-    if (new_top != old_top) begin_client_surface_scene_change( new_top );
+    /* A hidden non-producer has no contribution to either scene. In
+     * particular, unlinking an already hidden/detached dying child must not
+     * make every surviving producer rebuild its unchanged plan. */
+    scene_change = has_surfaces || ((win->style & WS_VISIBLE) && (win->is_linked || parent));
+    if (scene_change) begin_client_surface_scene_change( old_top );
+    if (scene_change && new_top != old_top) begin_client_surface_scene_change( new_top );
     /* A top-level keeps its own subtree count when it becomes a child, and a
      * child already owns its count when it becomes a top-level.  Those two
      * topology transitions bypass adjust_client_surface_subtree_count(), so
@@ -1036,8 +1040,8 @@ static int set_parent_window( struct window *win, struct window *parent )
         win->is_linked = 0;
         win->is_orphan = 1;
     }
-    if (new_top != old_top) end_client_surface_scene_change( new_top );
-    end_client_surface_scene_change( old_top );
+    if (scene_change && new_top != old_top) end_client_surface_scene_change( new_top );
+    if (scene_change) end_client_surface_scene_change( old_top );
     return 1;
 }
 
@@ -4137,7 +4141,8 @@ void free_window_handle( struct window *win )
 
     assert( win->handle );
     client_surface_top = get_toplevel_window( win );
-    scene_change = !!client_surface_top->client_surface_subtree_count;
+    scene_change = client_surface_top->client_surface_subtree_count &&
+                   (win->client_surface_subtree_count || (win->is_linked && (win->style & WS_VISIBLE)));
     if (scene_change) begin_client_surface_scene_change( client_surface_top );
     if (client_surface_top == win) finish_client_surface_generation( win );
 

@@ -272,6 +272,7 @@ struct client_surface_compositor_job
     unsigned int layout_count;
     const struct client_surface_handoff_desc *handoffs;
     unsigned int handoff_count;
+    BOOL invalidate_scene;
     DWORD shrink_start;
 };
 
@@ -2667,7 +2668,7 @@ static BOOL execute_client_surface_compositor_job( struct client_surface_composi
         {
             ++target->native_updates;
             target->quiescing = TRUE;
-            target->scene.valid = FALSE;
+            if (job->invalidate_scene) target->scene.valid = FALSE;
         }
         else
         {
@@ -3059,8 +3060,10 @@ static void remove_client_surface_backing_target( HWND toplevel )
     submit_client_surface_compositor_job( &job );
 }
 
-BOOL X11DRV_client_surface_backing_begin_update( HWND hwnd )
+BOOL X11DRV_client_surface_backing_begin_update( HWND hwnd, const struct window_rects *rects,
+                                                UINT swp_flags )
 {
+    const UINT no_geometry = SWP_NOSIZE | SWP_NOMOVE | SWP_NOCLIENTSIZE | SWP_NOCLIENTMOVE | SWP_NOZORDER;
     struct x11drv_win_data *data;
     BOOL backing;
     struct client_surface_compositor_job job =
@@ -3071,6 +3074,14 @@ BOOL X11DRV_client_surface_backing_begin_update( HWND hwnd )
 
     if (!(data = get_win_data( hwnd ))) return FALSE;
     backing = !!data->client_surface_backing;
+    /* A state-only refresh still drains native work, but does not change
+     * the plan's placement or clip. The server roster/epoch check continues
+     * to invalidate topology and producer changes. Be conservative for
+     * fullscreen mappings, shape, frame and actual native geometry changes. */
+    job.invalidate_scene = !rects || (swp_flags & no_geometry) != no_geometry ||
+        (swp_flags & (SWP_SHOWWINDOW | SWP_HIDEWINDOW | SWP_FRAMECHANGED | SWP_STATECHANGED)) ||
+        data->is_fullscreen || (swp_flags & WINE_SWP_FULLSCREEN) ||
+        memcmp( &data->rects, rects, sizeof(*rects) );
     release_win_data( data );
     if (!backing) return FALSE;
 
@@ -3278,7 +3289,7 @@ static BOOL refresh_client_surface_handoffs( HWND toplevel )
         /* Backing ensure, snapshot and end-update can refresh the same plan
          * repeatedly. Its geometry and native clips are immutable at this
          * epoch. Reuse only a still-valid plan with the same live bindings;
-         * BEGIN_UPDATE and target changes keep their invalidation rules. */
+         * native geometry and target changes keep their invalidation rules. */
         if (submit_client_surface_compositor_job( &job ))
         {
             if (!validate_client_surface_handoff_scene( toplevel, scene_generation )) goto failed;
