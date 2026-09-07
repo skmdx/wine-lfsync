@@ -1041,6 +1041,10 @@ static void remove_client_surface_compositor_binding(
         finish_client_surface_compositor_assembly( target, TRUE );
         target->scene.valid = FALSE;
     }
+    /* Acknowledged descriptors refer to this binding's cached images. Once
+     * the cache is discarded, a new consumer needs a new channel and frame;
+     * it cannot resume at the old consumer sequence without those images. */
+    __atomic_store_n( &binding->channel->closed, 1, __ATOMIC_RELEASE );
     release_client_surface_compositor_binding_server( binding );
     release_client_surface_compositor_pool( binding->pool );
     free_client_surface_cached_image( &binding->latest_image );

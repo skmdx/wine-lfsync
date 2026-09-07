@@ -1133,6 +1133,13 @@ void client_surface_wait_present_locked( struct client_surface *surface, BOOL ex
     }
     if (!external_completion && !--surface->driver_completion_waiters)
         pthread_cond_broadcast( &surface->completion_cond );
+    /* Retire a discarded owner cache before the next native submission adds
+     * a completion reference. Otherwise that new frame can pin the closed
+     * channel while its capture needs to map the replacement channel. */
+    if (surface->handoff_channel &&
+        __atomic_load_n( &surface->handoff_channel->closed, __ATOMIC_ACQUIRE ) &&
+        !InterlockedCompareExchange( &surface->external_completion_count, 0, 0 ))
+        client_surface_release_handoff( surface );
 }
 
 void client_surface_prepare_present_locked( struct client_surface *surface,

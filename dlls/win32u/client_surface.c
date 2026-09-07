@@ -1237,8 +1237,10 @@ void client_surface_release( struct client_surface *surface )
 
 static BOOL client_surface_recompose( struct client_surface *surface, LONG64 seq )
 {
+    struct client_surface_handoff_channel *channel;
     struct client_surface_frame present;
     struct client_surface_completed_frame frame;
+    UINT64 produced;
     BOOL handed_off = FALSE;
 
     /* Cached replay reads the same native drawable that a deferred host
@@ -1251,6 +1253,24 @@ static BOOL client_surface_recompose( struct client_surface *surface, LONG64 seq
     {
         pthread_mutex_unlock( &surface->completion_lock );
         return FALSE;
+    }
+    channel = surface->handoff_channel;
+    if (client_surface_backend_has_cap( surface, CLIENT_SURFACE_BACKEND_OWNER_SCENE_PLAN ) &&
+        channel && !__atomic_load_n( &channel->closed, __ATOMIC_ACQUIRE ) &&
+        surface->content_valid && surface->composed_serial)
+    {
+        /* The owner retains its replay cache for the channel's lifetime.
+         * Once a completed frame has been handed off, scene changes need
+         * neither another native freeze nor publication. Destroying the
+         * cache closes the channel so a replacement receives content again. */
+        produced = __atomic_load_n( &channel->producer_sequence, __ATOMIC_RELAXED );
+        if (channel->slots[(produced - 1) & (CLIENT_SURFACE_HANDOFF_RING_SIZE - 1)].source_sequence ==
+            surface->composed_serial)
+        {
+            complete_client_surface_recompose( surface, seq );
+            pthread_mutex_unlock( &surface->completion_lock );
+            return TRUE;
+        }
     }
     client_surface_prepare_present_locked( surface, &present, TRUE );
     if (present.handoff_control)
