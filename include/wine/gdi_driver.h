@@ -219,7 +219,7 @@ struct gdi_dc_funcs
 };
 
 /* increment this when changing driver tables or shared driver-facing structures */
-#define WINE_GDI_DRIVER_VERSION 128
+#define WINE_GDI_DRIVER_VERSION 129
 
 #define GDI_PRIORITY_NULL_DRV        0  /* null driver */
 #define GDI_PRIORITY_FONT_DRV      100  /* any font driver */
@@ -259,15 +259,16 @@ struct client_surface_source
     BOOL published;
     UINT64 source;
     UINT64 source_visual;
-    UINT64 target_seq;
+    UINT64 target_epoch;
     UINT width, height;
     UINT flags;
 };
-/* Driver-ready native target.  seq is a seqlock and the sole invalidation
- * token for geometry, presentation mode, resize, detach and native replacement. */
+/* Driver-ready target. seq protects the complete geometry snapshot; epoch
+ * identifies the native lifetime against which a producer submits frames. */
 struct client_surface_target
 {
     LONG64 seq;
+    UINT64 epoch;
     HWND toplevel;
     RECT virtual_rect;
     RECT monitor_rect;
@@ -276,6 +277,13 @@ struct client_surface_target
     enum client_surface_presentation_mode mode;
     LONG offscreen;
     LONG valid;
+};
+
+enum client_surface_target_update
+{
+    CLIENT_SURFACE_TARGET_UPDATE_DEFAULT,   /* invalidate when the snapshot changes */
+    CLIENT_SURFACE_TARGET_UPDATE_PRESERVED, /* backend preserved the native target */
+    CLIENT_SURFACE_TARGET_UPDATE_CHANGED,   /* native change, even with identical geometry */
 };
 
 enum client_surface_backend_caps
@@ -310,8 +318,10 @@ struct client_surface_backend
     void (*detach)( struct client_surface *surface );
     /* backend-local geometry and clipping allow the server-selected DIRECT mode */
     BOOL (*direct_ready)( struct client_surface *surface );
-    /* prepare target for publication; the backend may select its offscreen mode */
-    BOOL (*update)( struct client_surface *surface, struct client_surface_target *target );
+    /* Prepare target for publication, reporting native mutations separately
+     * from geometry. Omitted reports retain conservative invalidation. */
+    BOOL (*update)( struct client_surface *surface, struct client_surface_target *target,
+                    enum client_surface_target_update *update );
     /* present the client surface if necessary, hdc != NULL when offscreen, called from render thread;
      * flush requires host completion before returning, defer_visible keeps a scene generation staged */
     BOOL (*present)( struct client_surface *surface, const struct client_surface_scene *scene,
@@ -359,7 +369,7 @@ struct client_surface_frame
     enum client_surface_presentation_mode mode;
     LONG64 serial;
     DWORD submission_time;
-    LONG64 target_seq;
+    UINT64 target_epoch;
     enum client_surface_frame_target target;
     UINT64 handoff_control;
     unsigned int handoff_index;

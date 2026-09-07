@@ -50,7 +50,8 @@ static void wayland_client_surface_detach(struct client_surface *client)
 }
 
 static BOOL wayland_client_surface_update(struct client_surface *client,
-                                          struct client_surface_target *target)
+                                          struct client_surface_target *target,
+                                          enum client_surface_target_update *update)
 {
     struct wayland_client_surface *surface = impl_from_client_surface(client);
     HWND hwnd = client->hwnd, toplevel = target->toplevel;

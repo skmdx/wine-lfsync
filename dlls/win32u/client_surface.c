@@ -86,9 +86,11 @@ static void client_surface_backend_detach( struct client_surface *surface )
 }
 
 static BOOL client_surface_backend_update( struct client_surface *surface,
-                                           struct client_surface_target *target )
+                                           struct client_surface_target *target,
+                                           enum client_surface_target_update *update )
 {
-    return !surface->backend->update || surface->backend->update( surface, target );
+    *update = CLIENT_SURFACE_TARGET_UPDATE_DEFAULT;
+    return !surface->backend->update || surface->backend->update( surface, target, update );
 }
 
 static unsigned int client_surface_backend_state_flags( struct client_surface *surface )
@@ -225,7 +227,7 @@ static void remove_client_surface_index_locked( struct client_surface *surface )
 /* present_lock protects the native target while this atomically moves the
  * lock-free geometry snapshot between top-level index buckets. */
 static void publish_client_surface_target( struct client_surface *surface,
-                                           const struct client_surface_target *target )
+                                           const struct client_surface_target *target, BOOL preserve_native )
 {
     unsigned int bucket;
 
@@ -237,6 +239,7 @@ static void publish_client_surface_target( struct client_surface *surface,
     }
 
     InterlockedIncrement64( &surface->target.seq );
+    if (!preserve_native) ++surface->target.epoch;
     surface->target.toplevel = target->toplevel;
     surface->target.virtual_rect = target->virtual_rect;
     surface->target.monitor_rect = target->monitor_rect;
@@ -256,6 +259,15 @@ static void publish_client_surface_target( struct client_surface *surface,
         client_surface_toplevel_index[bucket] = surface;
     }
     pthread_mutex_unlock( &surface_index_lock );
+    TRACE( "event=target identity=%s sequence=%s epoch=%s preserved=%u toplevel=%p "
+           "position=%d,%d size=%dx%d mode=%u valid=%u\n",
+           wine_dbgstr_longlong( client_surface_get_identity( surface ) ),
+           wine_dbgstr_longlong( surface->target.seq ), wine_dbgstr_longlong( surface->target.epoch ),
+           preserve_native, surface->target.toplevel, (int)surface->target.virtual_rect.left,
+           (int)surface->target.virtual_rect.top,
+           (int)(surface->target.virtual_rect.right - surface->target.virtual_rect.left),
+           (int)(surface->target.virtual_rect.bottom - surface->target.virtual_rect.top),
+           surface->target.mode, surface->target.valid );
 }
 
 #define MAX_UNUSED_CLIENT_SURFACES 64
@@ -487,7 +499,7 @@ static void client_surface_detach_locked( struct client_surface *surface )
     }
     client_surface_get_target( surface, &target );
     target.valid = FALSE;
-    publish_client_surface_target( surface, &target );
+    publish_client_surface_target( surface, &target, FALSE );
     client_surface_release_handoff( surface );
 
     if (surface->active)
@@ -508,7 +520,7 @@ static void client_surface_detach_locked( struct client_surface *surface )
     list_remove( &surface->entry );
     client_surface_backend_detach( surface );
     target.toplevel = NULL;
-    publish_client_surface_target( surface, &target );
+    publish_client_surface_target( surface, &target, FALSE );
     InterlockedExchangePointer( (void **)&surface->hwnd, NULL );
     pthread_mutex_unlock( &surface->present_lock );
     client_surface_unlock_target( surface );
@@ -789,7 +801,8 @@ static BOOL client_surface_update_present_scene_internal_locked(
     struct client_surface_target current, next, invalid;
     RECT old_source_rect, new_source_rect;
     struct client_surface_scene scene;
-    BOOL changed, defer_direct, ready, scene_valid;
+    enum client_surface_target_update update;
+    BOOL changed, defer_direct, ready, scene_valid, preserve_native;
 
     client_surface_get_target( surface, &current );
     next = current;
@@ -800,7 +813,7 @@ static BOOL client_surface_update_present_scene_internal_locked(
         {
             invalid = current;
             invalid.valid = FALSE;
-            publish_client_surface_target( surface, &invalid );
+            publish_client_surface_target( surface, &invalid, FALSE );
         }
         InterlockedExchange( &surface->content_valid, FALSE );
         return FALSE;
@@ -857,7 +870,7 @@ static BOOL client_surface_update_present_scene_internal_locked(
     TRACE( "updating %s, toplevel %p, virtual_rect %s, monitor_rect %s\n",
            debugstr_client_surface( surface ), next.toplevel,
            wine_dbgstr_rect( &next.virtual_rect ), wine_dbgstr_rect( &next.monitor_rect ) );
-    ready = client_surface_backend_update( surface, &next );
+    ready = client_surface_backend_update( surface, &next, &update );
 
     if (!ready)
     {
@@ -865,20 +878,29 @@ static BOOL client_surface_update_present_scene_internal_locked(
         {
             invalid = current;
             invalid.valid = FALSE;
-            publish_client_surface_target( surface, &invalid );
+            publish_client_surface_target( surface, &invalid, FALSE );
         }
         InterlockedExchange( &surface->content_valid, FALSE );
         return FALSE;
     }
 
     next.valid = TRUE;
-    /* Publish the complete target only after the driver has resized and
-     * reparented its native drawable.  Readers can therefore validate one
-     * sequence instead of pairing geometry and lifecycle counters. */
+    /* A backend may preserve an established offscreen target across position
+     * changes. Size, DPI, mode, ownership and validity still delimit native
+     * lifetimes even if the new snapshot later returns to the old values. */
+    preserve_native = update == CLIENT_SURFACE_TARGET_UPDATE_PRESERVED && current.valid &&
+        current.offscreen && next.offscreen && next.mode == current.mode &&
+        next.toplevel == current.toplevel && next.dpi_num == current.dpi_num && next.dpi_den == current.dpi_den &&
+        next.virtual_rect.right - next.virtual_rect.left == current.virtual_rect.right - current.virtual_rect.left &&
+        next.virtual_rect.bottom - next.virtual_rect.top == current.virtual_rect.bottom - current.virtual_rect.top &&
+        next.monitor_rect.right - next.monitor_rect.left == current.monitor_rect.right - current.monitor_rect.left &&
+        next.monitor_rect.bottom - next.monitor_rect.top == current.monitor_rect.bottom - current.monitor_rect.top;
+    /* Publish only after the native mutation. Geometry readers retain their
+     * seqlock, while completed frames validate the independent native epoch. */
     if (changed || next.mode != current.mode || next.offscreen != current.offscreen ||
-        next.valid != current.valid)
+        next.valid != current.valid || update == CLIENT_SURFACE_TARGET_UPDATE_CHANGED)
     {
-        publish_client_surface_target( surface, &next );
+        publish_client_surface_target( surface, &next, preserve_native );
         if (changed) InterlockedExchange( &surface->updated, TRUE );
     }
     if (!defer_direct && scene_valid && client_surface_scene_current( &scene ))

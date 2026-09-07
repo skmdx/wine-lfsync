@@ -149,8 +149,8 @@ static void x11drv_client_surface_detach( struct client_surface *client )
     }
 }
 
-static void client_surface_update_geometry( HWND hwnd, struct x11drv_client_surface *surface,
-                                            const struct client_surface_target *target )
+static unsigned int client_surface_update_geometry( HWND hwnd, struct x11drv_client_surface *surface,
+                                                    const struct client_surface_target *target )
 {
     RECT rect = surface->client.raw ? target->monitor_rect : target->virtual_rect;
     XWindowChanges changes = surface->changes;
@@ -165,7 +165,7 @@ static void client_surface_update_geometry( HWND hwnd, struct x11drv_client_surf
     if (changes.y != surface->changes.y) mask |= CWY;
     if (changes.width != surface->changes.width) mask |= CWWidth;
     if (changes.height != surface->changes.height) mask |= CWHeight;
-    if (!mask) return;
+    if (!mask) return 0;
 
     surface->changes = changes;
     TRACE( "client window %p/%lx, requesting position %d,%d size %d,%d mask %#x\n", hwnd,
@@ -179,6 +179,7 @@ static void client_surface_update_geometry( HWND hwnd, struct x11drv_client_surf
      * changes only need ordering on this Xlib connection. */
     if (mask & (CWWidth | CWHeight)) XSync( gdi_display, False );
     else XFlush( gdi_display );
+    return mask;
 }
 
 #ifdef SONAME_LIBXCOMPOSITE
@@ -244,13 +245,22 @@ static BOOL client_surface_update_offscreen( HWND hwnd, struct x11drv_client_sur
 }
 
 static BOOL x11drv_client_surface_update( struct client_surface *client,
-                                          struct client_surface_target *target )
+                                          struct client_surface_target *target,
+                                          enum client_surface_target_update *update )
 {
     struct x11drv_client_surface *surface = impl_from_client_surface( client );
     HWND hwnd = client->hwnd;
+    unsigned int mask;
 
-    client_surface_update_geometry( hwnd, surface, target );
-    return client_surface_update_offscreen( hwnd, surface, target );
+    mask = client_surface_update_geometry( hwnd, surface, target );
+    if (!client_surface_update_offscreen( hwnd, surface, target )) return FALSE;
+    if (mask & (CWWidth | CWHeight)) *update = CLIENT_SURFACE_TARGET_UPDATE_CHANGED;
+    /* update_offscreen returns without redirecting or attaching an existing
+     * offscreen window. Moving that window preserves its image; resizing it
+     * does not. The core also requires unchanged ownership, extent and DPI. */
+    else if (client->target.offscreen && target->offscreen && client->target.mode == target->mode)
+        *update = CLIENT_SURFACE_TARGET_UPDATE_PRESERVED;
+    return TRUE;
 }
 
 static int client_surface_clip_error( Display *display, XErrorEvent *event, void *arg )
@@ -503,11 +513,11 @@ static BOOL x11drv_client_surface_handoff_complete( struct client_surface *clien
 #ifdef SONAME_LIBXCOMPOSITE
     if (native)
     {
-        if (!surface->snapshot_import || surface->snapshot_import_seq != image->target_seq)
+        if (!surface->snapshot_import || surface->snapshot_import_epoch != image->target_epoch)
         {
             if (surface->snapshot_import) XFreePixmap( gdi_display, surface->snapshot_import );
             surface->snapshot_import = pXCompositeNameWindowPixmap( gdi_display, surface->window );
-            surface->snapshot_import_seq = image->target_seq;
+            surface->snapshot_import_epoch = image->target_epoch;
             XSync( gdi_display, False );
             X11DRV_check_error();
             if (error)

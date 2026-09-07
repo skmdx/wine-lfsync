@@ -61,7 +61,7 @@ struct client_surface_compositor_pool
 struct client_surface_source_cache
 {
     Pixmap pixmap;
-    UINT64 target_seq;
+    UINT64 target_epoch;
     VisualID visual;
     unsigned int width, height, depth;
 };
@@ -1687,7 +1687,7 @@ static BOOL validate_client_surface_pixmap( Pixmap pixmap, unsigned int min_widt
 static BOOL client_surface_source_cache_matches( const struct client_surface_source_cache *cache,
                                                  const struct client_surface_handoff_slot *slot )
 {
-    return cache->pixmap == slot->source && cache->target_seq == slot->target_seq &&
+    return cache->pixmap == slot->source && cache->target_epoch == slot->target_epoch &&
            cache->width == slot->width && cache->height == slot->height && cache->visual == slot->source_visual;
 }
 
@@ -1706,7 +1706,7 @@ static BOOL get_client_surface_compositor_source(
     {
         if (!validate_client_surface_pixmap( slot->source, slot->width, slot->height, source_depth ))
             return FALSE;
-        *cache = (struct client_surface_source_cache){slot->source, slot->target_seq,
+        *cache = (struct client_surface_source_cache){slot->source, slot->target_epoch,
             slot->source_visual, slot->width, slot->height, *source_depth};
         TRACE( "validated source pixmap %#lx visual %#lx depth %u size %ux%u slot %u\n",
                cache->pixmap, cache->visual, cache->depth, cache->width, cache->height, index );

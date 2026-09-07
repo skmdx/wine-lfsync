@@ -30,7 +30,7 @@ enum client_surface_presentation_mode
 #define CLIENT_SURFACE_HANDOFF_BITMAP_WORDS (CLIENT_SURFACE_HANDOFF_CHANNELS / 64)
 #define CLIENT_SURFACE_HANDOFF_MAX_POOLS_PER_CONSUMER 512
 #define CLIENT_SURFACE_HANDOFF_MAGIC ((UINT64)0x57435348414e444full)
-#define CLIENT_SURFACE_HANDOFF_VERSION 12
+#define CLIENT_SURFACE_HANDOFF_VERSION 13
 
 #define CLIENT_SURFACE_HANDOFF_NATIVE_X11 0x0001
 #define CLIENT_SURFACE_HANDOFF_FULL_DAMAGE 0x0002
@@ -50,7 +50,7 @@ struct DECLSPEC_ALIGN(64) client_surface_handoff_slot
 {
     UINT64 cookie;
     UINT64 identity;
-    UINT64 target_seq;
+    UINT64 target_epoch;
     UINT64 source;
     UINT64 source_visual;
     UINT producer_process;

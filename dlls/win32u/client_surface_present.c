@@ -383,7 +383,7 @@ static BOOL prepare_client_surface_handoff_locked( struct client_surface *surfac
         return FALSE;
     }
     source = surface->handoff_source + present->handoff_index;
-    source->target_seq = present->target_seq;
+    source->target_epoch = present->target_epoch;
     source->source = source->source_visual = 0;
     source->width = source->height = source->flags = 0;
     if (!surface->backend->handoff_prepare( surface, source ))
@@ -425,7 +425,7 @@ BOOL client_surface_freeze_frame_locked( struct client_surface *surface,
     pthread_mutex_lock( &surface->present_lock );
     valid = surface->handoff_channel &&
             !__atomic_load_n( &surface->handoff_channel->closed, __ATOMIC_ACQUIRE ) && present->handoff_control && present->result == CLIENT_SURFACE_FRAME_PENDING &&
-            surface->hwnd && surface->target.valid && present->target_seq == surface->target.seq &&
+            surface->hwnd && surface->target.valid && present->target_epoch == surface->target.epoch &&
             (surface->active || surface->server_cached) &&
             __atomic_load_n( &source->reservation, __ATOMIC_ACQUIRE ) == present->handoff_control &&
             (present->serial > surface->composed_serial ||
@@ -440,7 +440,7 @@ BOOL client_surface_freeze_frame_locked( struct client_surface *surface,
     {
         frame->surface_id = client_surface_get_identity( surface );
         frame->frame_id = present->serial;
-        frame->target_epoch = present->target_seq;
+        frame->target_epoch = present->target_epoch;
         frame->image = source->source;
         frame->visual = source->source_visual;
         frame->flags = source->flags;
@@ -479,12 +479,12 @@ BOOL client_surface_publish_handoff_locked( struct client_surface *surface,
     valid = !__atomic_load_n( &channel->closed, __ATOMIC_ACQUIRE ) &&
             produced - consumed < CLIENT_SURFACE_HANDOFF_RING_SIZE &&
             frame->surface_id == client_surface_get_identity( surface ) && frame->frame_id == present->serial &&
-            frame->target_epoch == present->target_seq && frame->image == source->source &&
+            frame->target_epoch == present->target_epoch && frame->image == source->source &&
             frame->visual == source->source_visual && frame->size.cx == source->width &&
             frame->size.cy == source->height && frame->flags == source->flags &&
             (frame->flags & CLIENT_SURFACE_HANDOFF_COPY_SOURCE) && surface->hwnd && surface->target.valid &&
             __atomic_load_n( &source->reservation, __ATOMIC_ACQUIRE ) == present->handoff_control &&
-            present->serial >= surface->composed_serial && present->target_seq == surface->target.seq &&
+            present->serial >= surface->composed_serial && present->target_epoch == surface->target.epoch &&
             client_surface_backend_has_cap( surface, CLIENT_SURFACE_BACKEND_OWNER_SCENE_PLAN );
     if (valid)
     {
@@ -496,7 +496,7 @@ BOOL client_surface_publish_handoff_locked( struct client_surface *surface,
             .cookie = channel->cookie, .identity = frame->surface_id,
             .producer_process = channel->producer_process, .window = channel->window,
             .toplevel = channel->toplevel, .source = frame->image, .source_visual = frame->visual,
-            .target_seq = frame->target_epoch, .width = frame->size.cx, .height = frame->size.cy,
+            .target_epoch = frame->target_epoch, .width = frame->size.cx, .height = frame->size.cy,
             .flags = frame->flags, .source_sequence = frame->frame_id,
             .damage = frame->damage, .damage_base_sequence = frame->damage_base_frame,
         };
@@ -507,10 +507,11 @@ BOOL client_surface_publish_handoff_locked( struct client_surface *surface,
         __atomic_store_n( &source->reservation, 0, __ATOMIC_RELEASE );
         ready_time = TRACE_ON(csperf) ? client_surface_perf_time() : 0;
         __atomic_store_n( &channel->producer_sequence, produced + 1, __ATOMIC_RELEASE );
-        TRACE_(csperf)( "ticks=%llu event=ready identity=%s cookie=%s token=%s sequence=%s\n",
+        TRACE_(csperf)( "ticks=%llu event=ready identity=%s cookie=%s token=%s sequence=%s target_epoch=%s\n",
                        ready_time, wine_dbgstr_longlong( client_surface_get_identity( surface ) ),
                        wine_dbgstr_longlong( surface->handoff_cookie ),
-                       wine_dbgstr_longlong( produced + 1 ), wine_dbgstr_longlong( frame->frame_id ) );
+                       wine_dbgstr_longlong( produced + 1 ), wine_dbgstr_longlong( frame->frame_id ),
+                       wine_dbgstr_longlong( frame->target_epoch ) );
         surface->composed_serial = present->serial;
         InterlockedExchange( &surface->content_valid, TRUE );
     }
@@ -845,7 +846,7 @@ static BOOL get_cached_client_surface_region( struct client_surface *surface, HW
 
     if (surface->clip_region_valid &&
         surface->clip_scene_epoch == present->scene.epoch &&
-        surface->clip_target_seq == present->target_seq)
+        surface->clip_target_seq == surface->target.seq)
     {
         *region = surface->clip_region;
         return TRUE;
@@ -862,7 +863,7 @@ static BOOL get_cached_client_surface_region( struct client_surface *surface, HW
 
     if (surface->clip_region) NtGdiDeleteObjectApp( surface->clip_region );
     surface->clip_scene_epoch = present->scene.epoch;
-    surface->clip_target_seq = present->target_seq;
+    surface->clip_target_seq = surface->target.seq;
     surface->clip_region = new_region;
     surface->clip_region_valid = TRUE;
     *region = new_region;
@@ -922,7 +923,7 @@ BOOL client_surface_end_present_internal( struct client_surface *surface,
      * target validation on the per-frame path. */
     pthread_mutex_lock( &surface->present_lock );
     if (present->target == CLIENT_SURFACE_FRAME_TARGET_INVALID ||
-        present->target_seq != surface->target.seq ||
+        present->target_epoch != surface->target.epoch ||
         present->scene.toplevel != surface->target.toplevel)
     {
         TRACE( "discarding %s presentation across target state change\n",
@@ -1223,7 +1224,7 @@ void client_surface_prepare_present_locked( struct client_surface *surface,
         surface->target_scene_epoch != present->scene.epoch ||
         surface->target_scene_mode != present->scene.mode)
         target.valid = FALSE;
-    present->target_seq = target.seq;
+    present->target_epoch = target.epoch;
     present->mode = target.mode;
     present->target = !target.valid ? CLIENT_SURFACE_FRAME_TARGET_INVALID :
                       target.offscreen ? CLIENT_SURFACE_FRAME_TARGET_OFFSCREEN :
@@ -1326,7 +1327,7 @@ static BOOL client_surface_complete_direct_present_locked(
      * to publish.  Retain only the completed source metadata needed by a
      * later DIRECT -> STAGED/COMPOSITED transition. */
     pthread_mutex_lock( &surface->present_lock );
-    if (present->target_seq != surface->target.seq ||
+    if (present->target_epoch != surface->target.epoch ||
         present->scene.toplevel != surface->target.toplevel ||
         !surface->hwnd || !surface->target.valid || surface->target.offscreen ||
         (!InterlockedCompareExchange( &surface->active, 0, 0 ) &&
@@ -1361,7 +1362,7 @@ static BOOL client_surface_capture_frame( struct client_surface *surface, struct
      * can replace their handoff while they sleep; it alone owns the mutable
      * native source when the wait returns. Capture never consumes the fence. */
     pthread_mutex_lock( &surface->present_lock );
-    if (!surface->hwnd || !surface->target.valid || present->target_seq != surface->target.seq ||
+    if (!surface->hwnd || !surface->target.valid || present->target_epoch != surface->target.epoch ||
         present->serial <= surface->composed_serial ||
         (present->handoff_control && (!surface->handoff_channel ||
          __atomic_load_n( &surface->handoff_channel->closed, __ATOMIC_ACQUIRE ) ||

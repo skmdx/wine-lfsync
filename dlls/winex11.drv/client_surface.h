@@ -56,7 +56,7 @@ struct x11drv_client_surface
     VisualID source_visual;
     unsigned int source_depth;
     Pixmap snapshot_import;
-    UINT64 snapshot_import_seq;
+    UINT64 snapshot_import_epoch;
     BOOL direct_snapshot;
     Pixmap gpu_snapshot;
     SIZE gpu_snapshot_size;

@@ -1729,7 +1729,7 @@ static void test_handoff_storage(void)
 
             frame->source = 0x12345678 + i;
             frame->source_sequence = i + 1;
-            frame->target_seq = ((UINT64)1 << 40) + round;
+            frame->target_epoch = ((UINT64)1 << 40) + round;
             frame->width = 640 + i;
             frame->height = 480 + i;
             SetRect( &frame->damage, i, i + 1, 100 + i, 101 + i );
@@ -1753,7 +1753,7 @@ static void test_handoff_storage(void)
 
             ok( frame->source == 0x12345678 + i && frame->source_sequence == i + 1,
                 "descriptor %u at round %u was overwritten\n", i, round );
-            ok( frame->target_seq == ((UINT64)1 << 40) + round && frame->width == 640 + i &&
+            ok( frame->target_epoch == ((UINT64)1 << 40) + round && frame->width == 640 + i &&
                 frame->height == 480 + i && EqualRect( &frame->damage, &damage ) &&
                 frame->damage_base_sequence == i,
                 "completed frame metadata %u at round %u did not survive the channel\n", i, round );

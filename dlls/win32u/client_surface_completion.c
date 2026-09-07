@@ -73,7 +73,7 @@ BOOL client_surface_wait_present_completion( struct client_surface *surface,
     /* The owner may still be preparing a scene. That prevents publication,
      * but does not invalidate a completion for this unchanged native target. */
     completed = target.valid &&
-                present->target_seq == target.seq &&
+                present->target_epoch == target.epoch &&
                 present->completion.wait( present->completion.context, timeout );
     pthread_mutex_unlock( &surface->completion_wait_lock );
     return completed;
