@@ -741,7 +741,7 @@ BOOL client_surface_scene_snapshot_current( HWND toplevel, UINT64 scene_id )
            current.epoch == scene_id;
 }
 
-BOOL client_surface_get_scene( struct client_surface *surface, struct client_surface_scene *scene )
+static BOOL read_client_surface_placement( struct client_surface *surface, struct client_surface_scene *scene )
 {
     struct object_lock producer_lock = OBJECT_LOCK_INIT;
     const window_shm_t *producer_shm = NULL;
@@ -781,7 +781,12 @@ BOOL client_surface_get_scene( struct client_surface *surface, struct client_sur
         scene->valid = FALSE;
     scene->authoritative = producer_process == (process_id_t)client_surface_process_id &&
                            producer_id == client_surface_get_identity( surface );
-    return scene->valid;
+    return TRUE;
+}
+
+BOOL client_surface_get_scene( struct client_surface *surface, struct client_surface_scene *scene )
+{
+    return read_client_surface_placement( surface, scene ) && scene->valid;
 }
 
 BOOL client_surface_scene_current( const struct client_surface_scene *scene )
@@ -1104,6 +1109,27 @@ static struct client_surface *find_client_surface_identity( UINT64 identity )
     return surface;
 }
 
+static BOOL client_surface_owner_handles_exposure( struct client_surface *surface, HWND hwnd, HWND toplevel )
+{
+    struct client_surface_target target, current;
+    struct client_surface_scene scene;
+
+    if (!client_surface_backend_has_cap( surface, CLIENT_SURFACE_BACKEND_OWNER_SCENE_PLAN )) return FALSE;
+    client_surface_get_target( surface, &target );
+    if (!target.valid || !target.offscreen || target.toplevel != toplevel ||
+        (target.mode != CLIENT_SURFACE_PRESENTATION_COMPOSITED &&
+         target.mode != CLIENT_SURFACE_PRESENTATION_STAGED)) return FALSE;
+    /* This routes incidental exposure to the owner, not proof of a warm
+     * image. The owner resolves its actual inventory and requests any cold
+     * source explicitly. PREPARING blocks publication, not layout reads. */
+    if (!read_client_surface_placement( surface, &scene ) || !scene.authoritative ||
+        scene.toplevel != toplevel || scene.mode != target.mode ||
+        NtUserGetAncestor( hwnd, GA_ROOT ) != toplevel ||
+        !client_surface_scene_snapshot_current( toplevel, scene.epoch )) return FALSE;
+    client_surface_get_target( surface, &current );
+    return current.seq == target.seq;
+}
+
 void update_client_surfaces( HWND hwnd )
 {
     struct client_surface *surface, *next;
@@ -1160,6 +1186,11 @@ void update_client_surfaces( HWND hwnd )
             if (!surface_hwnd || geometry.toplevel != hwnd || !NtUserIsWindowVisible( surface_hwnd ) ||
                 !NtGdiRectInRegion( exposed_region, &geometry.monitor_rect ))
                 continue;
+            if (client_surface_owner_handles_exposure( surface, surface_hwnd, hwnd ))
+            {
+                TRACE( "owner scene handles newly exposed %s\n", debugstr_client_surface( surface ) );
+                continue;
+            }
             if (!queue_client_surface_recompose( surface, &recompose_surfaces,
                                                  &recompose_count, &recompose_size ))
             {

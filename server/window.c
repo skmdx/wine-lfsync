@@ -586,6 +586,7 @@ static int has_client_surface( const struct window *win );
 static struct window *get_toplevel_window( struct window *win );
 static void adjust_client_surface_subtree_count( struct window *win, int delta );
 static void begin_client_surface_scene_change( struct window *top );
+static void begin_client_surface_cached_scene_change( struct window *top );
 static void end_client_surface_scene_change( struct window *top );
 static unsigned int clear_client_surface_subtree_generation( struct window *win,
                                                              unsigned long long generation );
@@ -936,6 +937,22 @@ static void retarget_client_surface_subtree_handoffs( struct window *win, struct
         retarget_client_surface_subtree_handoffs( child, top );
 }
 
+/* Placement changes may reuse images only within the same native owner.
+ * The owner still checks every selected image against the new scene; this
+ * predicate only excludes changes to the source's coordinate contract. */
+static int client_surface_child_placement_compatible( struct window *win, struct window *parent )
+{
+    if (!win->is_linked || !win->parent || is_desktop_window( win->parent ) ||
+        !parent || is_desktop_window( parent ) ||
+        get_toplevel_window( win ) != get_toplevel_window( parent )) return 0;
+    if (parent != win->parent &&
+        ((win->parent->ex_style ^ parent->ex_style) & WS_EX_LAYOUTRTL ||
+         win->shared->dpi.num != parent->shared->dpi.num || win->shared->dpi.den != parent->shared->dpi.den ||
+         win->shared->raw_dpi.num != parent->shared->raw_dpi.num ||
+         win->shared->raw_dpi.den != parent->shared->raw_dpi.den)) return 0;
+    return is_rect_empty( &win->present_rect );
+}
+
 /* change the parent of a window (or unlink the window if the new parent is NULL) */
 static int set_parent_window( struct window *win, struct window *parent )
 {
@@ -943,6 +960,7 @@ static int set_parent_window( struct window *win, struct window *parent )
     struct window *new_top = parent && !is_desktop_window( parent ) ?
                              get_toplevel_window( parent ) : win;
     unsigned int subtree_count = win->client_surface_subtree_count;
+    const unsigned int old_ex_style = win->ex_style;
     int has_surfaces = !!subtree_count, old_pending, scene_change;
 
     /* make sure parent is not a child of window */
@@ -959,7 +977,12 @@ static int set_parent_window( struct window *win, struct window *parent )
      * particular, unlinking an already hidden/detached dying child must not
      * make every surviving producer rebuild its unchanged plan. */
     scene_change = has_surfaces || ((win->style & WS_VISIBLE) && (win->is_linked || parent));
-    if (scene_change) begin_client_surface_scene_change( old_top );
+    if (scene_change)
+    {
+        if (client_surface_child_placement_compatible( win, parent ))
+            begin_client_surface_cached_scene_change( old_top );
+        else begin_client_surface_scene_change( old_top );
+    }
     if (scene_change && new_top != old_top) begin_client_surface_scene_change( new_top );
     /* A top-level keeps its own subtree count when it becomes a child, and a
      * child already owns its count when it becomes a top-level.  Those two
@@ -978,6 +1001,7 @@ static int set_parent_window( struct window *win, struct window *parent )
         win->parent = (struct window *)grab_object( parent );
         attach_parent_thread( win, true );
         link_window( win, WINPTR_TOP );
+        if (win->ex_style != old_ex_style) old_top->client_surface_transaction.source_pending = 0;
         if (subtree_count) adjust_client_surface_subtree_count( win->parent, subtree_count );
         if (subtree_count && new_top == win && new_top != old_top)
             post_message( new_top->handle, WM_WINE_UPDATEWINDOWSTATE,
@@ -4070,7 +4094,7 @@ static void set_window_pos( struct window *win, struct window *previous,
     struct window *client_surface_top = NULL;
     struct window *scene_top = get_toplevel_window( win );
     struct rectangle rect;
-    int client_changed, frame_changed, scene_change, zorder_only;
+    int client_changed, frame_changed, scene_change, placement_only;
     int visible = (win->style & WS_VISIBLE) || (swp_flags & SWP_SHOWWINDOW);
     int zorder_changed = 0;
 
@@ -4084,13 +4108,18 @@ static void set_window_pos( struct window *win, struct window *previous,
                    memcmp( visible_rect, &old_visible_rect, sizeof(*visible_rect) ) ||
                    memcmp( client_rect, &old_client_rect, sizeof(*client_rect) ) ||
                    memcmp( surface_rect, &old_surface_rect, sizeof(*surface_rect) );
-    /* Reordering linked children changes only their scene clips. Ask the
-     * owner about its retained images before waking the selected producers;
-     * native geometry, visibility and frame updates keep source recovery. */
-    zorder_only = !scene_change && win->is_linked && win->parent &&
-                  !is_desktop_window( win->parent ) &&
-                  !(swp_flags & (SWP_NOZORDER | SWP_SHOWWINDOW | SWP_HIDEWINDOW |
-                                 SWP_FRAMECHANGED | SWP_STATECHANGED));
+    /* Client and frame extents must survive the same translation. Visible
+     * and surface rectangles may change with clipping, but are not source
+     * image bounds. Visibility and order only change the selected roster's
+     * contribution; newly visible cold images still require owner inventory. */
+    rect = old_window_rect;
+    offset_rect( &rect, client_rect->left - old_client_rect.left,
+                        client_rect->top - old_client_rect.top );
+    placement_only = client_surface_child_placement_compatible( win, win->parent ) &&
+                     !(swp_flags & (SWP_FRAMECHANGED | SWP_STATECHANGED)) &&
+                     is_rect_equal( window_rect, &rect ) &&
+                     client_rect->right - client_rect->left == old_client_rect.right - old_client_rect.left &&
+                     client_rect->bottom - client_rect->top == old_client_rect.bottom - old_client_rect.top;
     scene_change = scene_change ||
                    (swp_flags & (SWP_SHOWWINDOW | SWP_HIDEWINDOW)) ||
                    (!(swp_flags & SWP_NOZORDER) && win->parent);
@@ -4098,7 +4127,7 @@ static void set_window_pos( struct window *win, struct window *previous,
                    (scene_top->client_surface_subtree_count || win->client_surface_subtree_count);
     if (scene_change)
     {
-        if (zorder_only) begin_client_surface_cached_scene_change( scene_top );
+        if (placement_only) begin_client_surface_cached_scene_change( scene_top );
         else begin_client_surface_scene_change( scene_top );
     }
 

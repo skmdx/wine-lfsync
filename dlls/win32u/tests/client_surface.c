@@ -1588,10 +1588,65 @@ static UINT set_scene_zorder( HWND hwnd, HWND previous, UINT flags )
     return p_wine_server_call( &info );
 }
 
-static UINT change_scene_sources( HWND hwnd, HWND reorder, unsigned int index )
+enum scene_source_change
 {
-    if (reorder) return set_scene_zorder( reorder, index & 1 ? HWND_TOP : HWND_BOTTOM, 0 );
-    return set_scene_shape( hwnd, index );
+    SCENE_SOURCE_ZORDER,
+    SCENE_SOURCE_MOVE,
+    SCENE_SOURCE_VISIBILITY,
+    SCENE_SOURCE_PARENT,
+};
+
+struct scene_source_mutation
+{
+    enum scene_source_change change;
+    const char *name;
+    HWND window, parent;
+};
+
+static UINT set_scene_placement( HWND hwnd, int offset, int grow, int frame, UINT flags )
+{
+    struct __server_request_info info = {0};
+    struct get_window_rectangles_reply rects;
+    struct rectangle extra[2];
+    UINT status;
+
+    info.u.req.get_window_rectangles_request.__header.req = REQ_get_window_rectangles;
+    info.u.req.get_window_rectangles_request.handle = wine_server_user_handle( hwnd );
+    info.u.req.get_window_rectangles_request.relative = COORDS_PARENT;
+    if ((status = p_wine_server_call( &info ))) return status;
+    rects = info.u.reply.get_window_rectangles_reply;
+    rects.window.left += offset;
+    rects.window.right += offset + grow;
+    rects.client.left += offset + frame;
+    rects.client.right += offset + frame + grow;
+    rects.visible.left += offset;
+    rects.visible.right += offset + grow;
+    memset( &info, 0, sizeof(info) );
+    info.u.req.set_window_pos_request.__header.req = REQ_set_window_pos;
+    info.u.req.set_window_pos_request.handle = wine_server_user_handle( hwnd );
+    info.u.req.set_window_pos_request.swp_flags = SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOREDRAW | flags;
+    info.u.req.set_window_pos_request.window = rects.window;
+    info.u.req.set_window_pos_request.client = rects.client;
+    extra[0] = extra[1] = rects.visible;
+    wine_server_add_data( &info, extra, sizeof(extra) );
+    return p_wine_server_call( &info );
+}
+
+static UINT change_scene_sources( HWND hwnd, const struct scene_source_mutation *mutation, unsigned int index )
+{
+    if (!mutation) return set_scene_shape( hwnd, index );
+    switch (mutation->change)
+    {
+    case SCENE_SOURCE_ZORDER:
+        return set_scene_zorder( mutation->window, index & 1 ? HWND_TOP : HWND_BOTTOM, 0 );
+    case SCENE_SOURCE_MOVE:
+        return set_scene_placement( mutation->window, index & 1 ? -3 : 3, 0, 0, 0 );
+    case SCENE_SOURCE_VISIBILITY:
+        return set_scene_placement( mutation->window, 0, 0, 0, index & 1 ? SWP_SHOWWINDOW : SWP_HIDEWINDOW );
+    case SCENE_SOURCE_PARENT:
+        return set_server_parent( mutation->window, index & 1 ? hwnd : mutation->parent );
+    }
+    return STATUS_INVALID_PARAMETER;
 }
 
 static UINT drain_scene_notifications_for_surface( UINT *owner_updates, UINT *prepares, UINT64 expected_surface )
@@ -1748,7 +1803,7 @@ static void check_owner_repair( HWND hwnd, const struct client_surface_handoff_r
 }
 
 static void check_scene_source_decisions( HWND hwnd, const struct client_surface_handoff_receipt *receipt,
-                                          HWND reorder )
+                                          const struct scene_source_mutation *mutation )
 {
     struct client_surface_handoff_receipt invalid[2] = {*receipt, *receipt};
     struct handoff_binding rebound = {0};
@@ -1759,7 +1814,7 @@ static void check_scene_source_decisions( HWND hwnd, const struct client_surface
 
     for (i = 0; i < 8; ++i)
     {
-        winetest_push_context( "%s source decision %u", reorder ? "z-order" : "shape", i );
+        winetest_push_context( "%s source decision %u", mutation ? mutation->name : "shape", i );
         set_surface_state( hwnd, 0, 0, 0, &before );
         drain_scene_notifications( &owner_updates, &prepares );
         if (i == 6)
@@ -1767,7 +1822,7 @@ static void check_scene_source_decisions( HWND hwnd, const struct client_surface
             set_surface_state( hwnd, 0, CLIENT_SURFACE_STATE_GEOMETRY_READY, 0, NULL );
             prepare_surface_state( hwnd, &state );
         }
-        status = change_scene_sources( hwnd, reorder, i );
+        status = change_scene_sources( hwnd, mutation, i );
         ok( !status, "scene update status %#x\n", status );
         set_surface_state( hwnd, 0, 0, 0, &state );
         ok( state.scene_generation > before.scene_generation && !(state.scene_generation & 1),
@@ -1875,7 +1930,7 @@ static void check_scene_source_decisions( HWND hwnd, const struct client_surface
 }
 
 static void check_scene_source_subset( HWND hwnd, const struct client_surface_handoff_receipt *receipt,
-                                       HWND reorder )
+                                       const struct scene_source_mutation *mutation )
 {
     struct client_surface_handoff_receipt receipts[2] = {*receipt};
     struct handoff_binding producer = {0}, owner = {0};
@@ -1913,7 +1968,7 @@ static void check_scene_source_subset( HWND hwnd, const struct client_surface_ha
     set_surface_state_scene( hwnd, 0, CLIENT_SURFACE_STATE_PUBLISH_COMMIT,
                              state.generation, state.scene_generation, &state );
     drain_scene_notifications( &updates, &prepares );
-    change_scene_sources( hwnd, reorder, 8 );
+    change_scene_sources( hwnd, mutation, 8 );
     prepare_surface_state( hwnd, &state );
     producers = drain_scene_notifications( &updates, &prepares );
     ok( !producers && state.pending == 2, "inventory broadcast before decision: %u notifications\n", producers );
@@ -1928,7 +1983,7 @@ static void check_scene_source_subset( HWND hwnd, const struct client_surface_ha
     {
         UINT64 previous_scene = state.scene_generation;
 
-        change_scene_sources( hwnd, reorder, 9 );
+        change_scene_sources( hwnd, mutation, 9 );
         prepare_surface_state( hwnd, &state );
         producers = drain_scene_notifications( &updates, &prepares );
         ok( producers == 2, "new scene suppressed outstanding cold-source recovery: %u\n", producers );
@@ -1946,7 +2001,7 @@ static void check_scene_source_subset( HWND hwnd, const struct client_surface_ha
     if (!view) goto done;
     channel = (void *)((char *)view + producer.offset);
     drain_scene_notifications( &updates, &prepares );
-    change_scene_sources( hwnd, reorder, 10 );
+    change_scene_sources( hwnd, mutation, 10 );
     __atomic_store_n( &channel->closed, 1, __ATOMIC_RELEASE );
     prepare_surface_state( hwnd, &state );
     producers = drain_scene_notifications( &updates, &prepares );
@@ -1984,6 +2039,7 @@ static void check_zorder_scene_sources( HWND hwnd, const struct client_surface_h
     struct surface_state state;
     struct native_barrier_state barrier;
     HWND first = create_test_child( hwnd, 10 ), second = create_test_child( hwnd, 20 );
+    const struct scene_source_mutation mutation = {SCENE_SOURCE_ZORDER, "z-order", first};
     UINT i, status, producers, owner_updates, prepares;
     BOOL accepted;
 
@@ -1994,9 +2050,9 @@ static void check_zorder_scene_sources( HWND hwnd, const struct client_surface_h
     ok( accepted, "z-order bootstrap receipt rejected\n" );
     set_surface_state_scene( hwnd, 0, CLIENT_SURFACE_STATE_PUBLISH_COMMIT,
                              state.generation, state.scene_generation, &state );
-    check_scene_source_decisions( hwnd, receipt, first );
+    check_scene_source_decisions( hwnd, receipt, &mutation );
     winetest_push_context( "z-order source subset" );
-    check_scene_source_subset( hwnd, receipt, first );
+    check_scene_source_subset( hwnd, receipt, &mutation );
     winetest_pop_context();
 
     for (i = 0; i < ARRAY_SIZE(conservative); ++i)
@@ -2035,6 +2091,220 @@ done:
     complete_surface_handoffs( hwnd, state.generation, state.scene_generation, receipt, 1, &accepted );
     set_surface_state_scene( hwnd, 0, CLIENT_SURFACE_STATE_PUBLISH_COMMIT,
                              state.generation, state.scene_generation, &state );
+}
+
+static void check_child_placement_sources( HWND hwnd, const struct client_surface_handoff_receipt *receipt )
+{
+    static const char *names[] = {"move", "visibility", "same-owner parent"};
+    static const struct { int grow, frame; UINT flags; } conservative[] =
+    {
+        {1, 0, 0}, {0, 1, 0}, {0, 0, SWP_FRAMECHANGED}, {0, 0, SWP_STATECHANGED},
+    };
+    struct surface_state state;
+    struct scene_source_mutation mutation;
+    UINT i, j, status, producers, owner_updates, prepares;
+    HWND first, second;
+    BOOL accepted;
+
+    for (i = 0; i < ARRAY_SIZE(names); ++i)
+    {
+        first = create_test_child( hwnd, 10 );
+        second = create_test_child( hwnd, 20 );
+        ok( !!first && !!second, "failed to create placement windows\n" );
+        if (!first || !second) goto done;
+        mutation = (struct scene_source_mutation){SCENE_SOURCE_MOVE + i, names[i], first, second};
+        prepare_surface_state( hwnd, &state );
+        complete_surface_handoffs( hwnd, state.generation, state.scene_generation, receipt, 1, &accepted );
+        ok( accepted, "placement bootstrap receipt rejected\n" );
+        set_surface_state_scene( hwnd, 0, CLIENT_SURFACE_STATE_PUBLISH_COMMIT,
+                                 state.generation, state.scene_generation, &state );
+        check_scene_source_decisions( hwnd, receipt, &mutation );
+        winetest_push_context( "%s source subset", mutation.name );
+        check_scene_source_subset( hwnd, receipt, &mutation );
+        winetest_pop_context();
+
+        for (j = 0; j < ARRAY_SIZE(conservative); ++j)
+        {
+            winetest_push_context( "%s source contract change %u", mutation.name, j );
+            drain_scene_notifications( &owner_updates, &prepares );
+            status = set_scene_placement( first, 1, conservative[j].grow,
+                                          conservative[j].frame, conservative[j].flags );
+            ok( !status, "source contract update status %#x\n", status );
+            prepare_surface_state( hwnd, &state );
+            producers = drain_scene_notifications( &owner_updates, &prepares );
+            ok( state.pending == 1 && producers == 1,
+                "source change omitted recovery: pending %u notifications %u\n", state.pending, producers );
+            status = resolve_scene_sources( hwnd, state.scene_generation, receipt, sizeof(*receipt), &accepted );
+            ok( !status && !accepted, "source change accepted placement inventory\n" );
+            complete_surface_handoffs( hwnd, state.generation, state.scene_generation, receipt, 1, &accepted );
+            ok( accepted, "source change receipt rejected\n" );
+            set_surface_state_scene( hwnd, 0, CLIENT_SURFACE_STATE_PUBLISH_COMMIT,
+                                     state.generation, state.scene_generation, &state );
+            winetest_pop_context();
+        }
+done:
+        if (first) DestroyWindow( first );
+        if (second) DestroyWindow( second );
+        prepare_surface_state( hwnd, &state );
+        complete_surface_handoffs( hwnd, state.generation, state.scene_generation, receipt, 1, &accepted );
+        set_surface_state_scene( hwnd, 0, CLIENT_SURFACE_STATE_PUBLISH_COMMIT,
+                                 state.generation, state.scene_generation, &state );
+    }
+}
+
+static void check_retained_subtree_parent( HWND top, HWND child,
+                                           const struct client_surface_handoff_receipt *receipt )
+{
+    HWND parents[2] = {create_test_child( top, 0 ), create_test_child( top, 20 )};
+    struct client_surface_scene_layer initial;
+    const struct client_surface_scene_layer *layer;
+    struct scene_snapshot snapshot;
+    struct surface_state state;
+    UINT status, i, notifications, updates, prepares;
+    BOOL accepted;
+
+    ok( !!parents[0] && !!parents[1], "could not create retained subtree parents\n" );
+    if (!parents[0] || !parents[1]) goto done;
+    prepare_surface_state( top, &state );
+    complete_surface_handoffs( top, state.generation, state.scene_generation, receipt, 1, &accepted );
+    ok( accepted, "subtree bootstrap receipt rejected\n" );
+    set_surface_state_scene( top, 0, CLIENT_SURFACE_STATE_PUBLISH_COMMIT,
+                             state.generation, state.scene_generation, &state );
+    status = get_scene_snapshot( top, state.scene_generation, sizeof(snapshot.data), &snapshot );
+    ok( !status, "subtree initial snapshot status %#x\n", status );
+    if (status || !(layer = find_scene_layer( &snapshot, child ))) goto done;
+    initial = *layer;
+    for (i = 0; i < 4; ++i)
+    {
+        winetest_push_context( "retained source subtree parent %u", i );
+        drain_scene_notifications( &updates, &prepares );
+        status = set_server_parent( i == 1 || i == 2 ? parents[0] : child,
+                                    !i ? parents[0] : i == 1 ? parents[1] : top );
+        ok( !status, "subtree reparent status %#x\n", status );
+        prepare_surface_state( top, &state );
+        notifications = drain_scene_notifications( &updates, &prepares );
+        ok( state.pending == 1 && !notifications, "retained subtree requested %u producers\n", notifications );
+        status = get_scene_snapshot( top, state.scene_generation, sizeof(snapshot.data), &snapshot );
+        ok( !status, "subtree snapshot status %#x\n", status );
+        if (!status && (layer = find_scene_layer( &snapshot, child )))
+            ok( !memcmp( &layer->producer, &initial.producer, sizeof(layer->producer) ) &&
+                !memcmp( &layer->window_dpi, &initial.window_dpi, sizeof(layer->window_dpi) ) &&
+                !memcmp( &layer->raw_dpi, &initial.raw_dpi, sizeof(layer->raw_dpi) ) &&
+                layer->source.right - layer->source.left == initial.source.right - initial.source.left &&
+                layer->source.bottom - layer->source.top == initial.source.bottom - initial.source.top,
+                "same-owner subtree changed source identity, endpoint, DPI or extent\n" );
+        status = resolve_scene_sources( top, state.scene_generation, receipt, sizeof(*receipt), &accepted );
+        ok( !status && accepted, "retained subtree inventory rejected\n" );
+        complete_surface_handoffs( top, state.generation, state.scene_generation, receipt, 1, &accepted );
+        ok( accepted, "retained subtree assembly rejected\n" );
+        set_surface_state_scene( top, 0, CLIENT_SURFACE_STATE_PUBLISH_COMMIT,
+                                 state.generation, state.scene_generation, &state );
+        winetest_pop_context();
+    }
+done:
+    if (parents[0]) DestroyWindow( parents[0] );
+    if (parents[1]) DestroyWindow( parents[1] );
+}
+
+static void test_child_visibility_sources(void)
+{
+    struct client_surface_handoff_receipt receipt;
+    struct handoff_binding producer = {0}, owner = {0};
+    struct scene_snapshot snapshot;
+    const struct client_surface_scene_layer *layer;
+    struct surface_state state, before;
+    HWND top = create_test_window( TRUE ), child = NULL;
+    UINT64 identity = allocate_surface();
+    UINT status, notifications, updates, prepares;
+    BOOL accepted;
+
+    ok( !!top, "could not create visibility owner\n" );
+    if (!top) return;
+    child = create_test_child( top, 10 );
+    ok( !!child, "could not create visibility source\n" );
+    if (!child) goto done;
+    set_surface_state( child, identity, CLIENT_SURFACE_STATE_REGISTER | CLIENT_SURFACE_STATE_SCENE_PUBLICATION, 0, NULL );
+    claim_surface_state( child, identity, NULL );
+    status = get_surface_handoff( child, 0, identity, FALSE, &producer );
+    ok( !status, "visibility producer bind status %#x\n", status );
+    if (status) goto done;
+    status = get_surface_handoff( child, GetCurrentProcessId(), identity, TRUE, &owner );
+    ok( !status, "visibility owner bind status %#x\n", status );
+    if (status) goto done;
+    receipt = (struct client_surface_handoff_receipt){
+        .handle = wine_server_user_handle( child ), .process = GetCurrentProcessId(),
+        .surface = identity, .cookie = producer.cookie, .source_generation = 1, .buffer_index = 0,
+    };
+    prepare_surface_state( top, &state );
+    complete_surface_handoffs( top, state.generation, state.scene_generation, &receipt, 1, &accepted );
+    ok( accepted, "visibility bootstrap receipt rejected\n" );
+    set_surface_state_scene( top, 0, CLIENT_SURFACE_STATE_PUBLISH_COMMIT,
+                             state.generation, state.scene_generation, &state );
+    before = state;
+    drain_scene_notifications( &updates, &prepares );
+
+    status = set_scene_placement( child, 0, 0, 0, SWP_HIDEWINDOW );
+    ok( !status, "last source hide status %#x\n", status );
+    set_surface_state( top, 0, 0, 0, &state );
+    ok( !state.generation && !state.pending && state.scene_generation > before.scene_generation,
+        "empty visible roster retained an assembly: generation %s pending %u\n",
+        wine_dbgstr_longlong( state.generation ), state.pending );
+    notifications = drain_scene_notifications( &updates, &prepares );
+    ok( !notifications, "empty visible roster requested %u producers\n", notifications );
+    status = get_scene_snapshot( top, state.scene_generation, sizeof(snapshot.data), &snapshot );
+    ok( !status && snapshot.count == 1, "hidden selected roster status %#x count %u\n", status, snapshot.count );
+    if (!status && snapshot.count == 1)
+    {
+        layer = (const void *)snapshot.data;
+        ok( layer->producer.surface == identity && layer->producer.cookie == producer.cookie &&
+            !layer->producer.visible, "hiding discarded or exposed the selected lifetime\n" );
+    }
+    status = resolve_scene_sources( top, state.scene_generation, NULL, 0, &accepted );
+    ok( !status && !accepted, "empty visible roster retained an inventory decision\n" );
+    status = set_scene_placement( child, 0, 0, 0, SWP_SHOWWINDOW );
+    ok( !status, "retained source show status %#x\n", status );
+    prepare_surface_state( top, &state );
+    notifications = drain_scene_notifications( &updates, &prepares );
+    ok( state.pending == 1 && !notifications, "shown retained source prematurely requested recovery\n" );
+    status = resolve_scene_sources( top, state.scene_generation, &receipt, sizeof(receipt), &accepted );
+    ok( !status && accepted, "shown retained source inventory rejected\n" );
+    complete_surface_handoffs( top, state.generation, state.scene_generation, &receipt, 1, &accepted );
+    ok( accepted, "shown source assembly rejected\n" );
+    set_surface_state_scene( top, 0, CLIENT_SURFACE_STATE_PUBLISH_COMMIT,
+                             state.generation, state.scene_generation, &state );
+    check_retained_subtree_parent( top, child, &receipt );
+done:
+    if (producer.cookie) release_surface_handoff( child, 0, identity, producer.cookie, FALSE );
+    if (owner.cookie) release_surface_handoff( child, GetCurrentProcessId(), identity, owner.cookie, TRUE );
+    if (producer.mapping) CloseHandle( producer.mapping );
+    if (owner.mapping) CloseHandle( owner.mapping );
+    if (child) DestroyWindow( child );
+    DestroyWindow( top );
+
+    /* A backend without scene publication needs real producer completion;
+     * placement must not leave it waiting for an owner inventory callback. */
+    top = create_test_window( TRUE );
+    child = top ? create_test_child( top, 10 ) : NULL;
+    ok( !!child, "could not create legacy placement source\n" );
+    if (child)
+    {
+        identity = allocate_surface();
+        set_surface_state( child, identity, CLIENT_SURFACE_STATE_REGISTER, 0, NULL );
+        claim_surface_state( child, identity, &state );
+        complete_single_surface_generation( child, identity, &state );
+        drain_scene_notifications( &updates, &prepares );
+        status = set_scene_placement( child, 3, 0, 0, 0 );
+        ok( !status, "legacy move status %#x\n", status );
+        set_surface_state( top, 0, 0, 0, &state );
+        notifications = drain_scene_notifications_for_surface( &updates, &prepares, identity );
+        ok( state.pending == 1 && notifications == 1,
+            "legacy placement lost recovery: pending %u notifications %u\n", state.pending, notifications );
+        status = resolve_scene_sources( top, state.scene_generation, NULL, 0, &accepted );
+        ok( !status && !accepted, "legacy source accepted an owner inventory decision\n" );
+        complete_single_surface_generation( child, identity, &state );
+        DestroyWindow( child );
+    }
+    if (top) DestroyWindow( top );
 }
 
 static void test_handoff_receipts(void)
@@ -2134,6 +2404,7 @@ static void test_handoff_receipts(void)
     check_scene_source_decisions( hwnd, &receipt, NULL );
     check_scene_source_subset( hwnd, &receipt, NULL );
     check_zorder_scene_sources( hwnd, &receipt );
+    check_child_placement_sources( hwnd, &receipt );
     set_surface_state( hwnd, 0, 0, 0, &state );
     drain_scene_notifications( &owner_updates, &prepares );
     status = request_owner_repair( hwnd, state.scene_generation, &receipt, sizeof(receipt), &accepted );
@@ -4426,6 +4697,7 @@ static BOOL run_focused_test_case( const char *name, char **argv )
         {"demoted-native-barrier", "native backing barrier after demotion", test_demoted_native_barrier},
         {"handoff-storage", "client surface generation handoff storage", test_handoff_storage},
         {"handoff-receipts", "source-independent assembly receipts", test_handoff_receipts},
+        {"child-visibility-sources", "retained hidden source and legacy placement", test_child_visibility_sources},
         {"notification-filter", "client surface notification filter bypass",
          test_notification_identity_aba},
         {"late-present-cutover", "late client surface publication cut-over",
@@ -4612,6 +4884,7 @@ START_TEST(client_surface)
     trace( "testing client surface generation handoff storage\n" );
     test_handoff_storage();
     test_handoff_receipts();
+    test_child_visibility_sources();
     test_handoff_lost_recovery();
     test_handoff_storage_process_exit( argv, FALSE );
     test_handoff_storage_process_exit( argv, TRUE );
