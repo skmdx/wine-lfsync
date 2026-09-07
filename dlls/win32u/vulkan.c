@@ -177,10 +177,18 @@ struct vulkan_snapshot_fence
     LONG refs;
 };
 
+struct swapchain_present_sync
+{
+    VkSemaphore semaphore;
+    VkFence fence;
+    BOOL pending;
+    BOOL orphaned;
+};
+
 struct swapchain_snapshot
 {
     VkImage *images;
-    VkSemaphore *semaphores;
+    struct swapchain_present_sync *present_sync;
     uint32_t image_count;
     VkBuffer buffer;
     VkDeviceMemory memory;
@@ -2101,7 +2109,7 @@ static void release_snapshot_reservation( struct swapchain *swapchain, struct sw
 }
 
 static VkResult acquire_snapshot_reservation( struct vulkan_device *device, struct swapchain *swapchain,
-                                              struct swapchain_snapshot **ret )
+                                              unsigned int image_index, struct swapchain_snapshot **ret )
 {
     struct swapchain_snapshot *snapshot = NULL;
     struct timespec deadline;
@@ -2158,6 +2166,38 @@ static VkResult acquire_snapshot_reservation( struct vulkan_device *device, stru
         release_snapshot_fence( snapshot->pending );
         snapshot->pending = NULL;
     }
+    if (snapshot->present_sync)
+    {
+        struct swapchain_present_sync *sync = &snapshot->present_sync[image_index];
+
+        /* An acquire can return before its semaphore is signaled. Wait for
+         * our previous Present's fence before resetting that fence on the
+         * host; the private copy fence only protects the staging storage. */
+        if (sync->pending)
+        {
+            DWORD elapsed = NtGetTickCount() - start;
+            DWORD remaining = elapsed < CLIENT_SURFACE_PRESENT_TIMEOUT ? CLIENT_SURFACE_PRESENT_TIMEOUT - elapsed : 0;
+
+            res = device->p_vkWaitForFences( device->host.device, 1, &sync->fence,
+                                            VK_TRUE, (uint64_t)remaining * 1000000 );
+            if (!res) res = device->p_vkResetFences( device->host.device, 1, &sync->fence );
+            if (res)
+            {
+                release_snapshot_reservation( swapchain, snapshot );
+                return res == VK_TIMEOUT ? VK_ERROR_OUT_OF_DEVICE_MEMORY : res;
+            }
+            sync->pending = FALSE;
+        }
+        /* An enqueue failure leaves the copy's signal unconsumed. The copy
+         * has completed above, so discard this signaled semaphore instead
+         * of signaling it a second time on the next use of the image. */
+        if (sync->orphaned)
+        {
+            device->p_vkDestroySemaphore( device->host.device, sync->semaphore, NULL );
+            sync->semaphore = 0;
+            sync->orphaned = FALSE;
+        }
+    }
     *ret = snapshot;
     return VK_SUCCESS;
 }
@@ -2199,20 +2239,24 @@ static void destroy_swapchain_snapshot( struct vulkan_device *device, struct swa
 {
     unsigned int i;
 
-    /* The retiring swapchain has checked completion of every private copy.
+    /* The retiring swapchain has checked both private copies and Presents.
      * Partial initialization has not submitted any work. */
     if (snapshot->pending)
         release_snapshot_fence( snapshot->pending );
     if (snapshot->pool) device->p_vkDestroyCommandPool( device->host.device, snapshot->pool, NULL );
-    if (snapshot->semaphores)
+    if (snapshot->present_sync)
         for (i = 0; i < snapshot->image_count; ++i)
-            if (snapshot->semaphores[i])
-                device->p_vkDestroySemaphore( device->host.device, snapshot->semaphores[i], NULL );
+        {
+            struct swapchain_present_sync *sync = &snapshot->present_sync[i];
+
+            if (sync->semaphore) device->p_vkDestroySemaphore( device->host.device, sync->semaphore, NULL );
+            if (sync->fence) device->p_vkDestroyFence( device->host.device, sync->fence, NULL );
+        }
     if (snapshot->pixels) device->p_vkUnmapMemory( device->host.device, snapshot->memory );
     if (snapshot->buffer) device->p_vkDestroyBuffer( device->host.device, snapshot->buffer, NULL );
     if (snapshot->memory) device->p_vkFreeMemory( device->host.device, snapshot->memory, NULL );
     client_surface_release_memory( CLIENT_SURFACE_MEMORY_STAGING, snapshot->memory_bytes );
-    free( snapshot->semaphores );
+    free( snapshot->present_sync );
     free( snapshot->images );
     memset( snapshot, 0, sizeof(*snapshot) );
 }
@@ -2230,6 +2274,7 @@ static VkResult prepare_swapchain_snapshot( struct vulkan_queue *queue, struct s
                                      .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT};
     VkMemoryAllocateInfo memory_info = {.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
     VkSemaphoreCreateInfo semaphore_info = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+    VkFenceCreateInfo fence_info = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
     VkMemoryRequirements requirements;
     unsigned int i;
     VkResult res;
@@ -2239,16 +2284,13 @@ static VkResult prepare_swapchain_snapshot( struct vulkan_queue *queue, struct s
         if ((res = device->p_vkGetSwapchainImagesKHR( device->host.device, swapchain->obj.host.swapchain,
                                                      &snapshot->image_count, NULL ))) goto failed;
         if (!(snapshot->images = calloc( snapshot->image_count, sizeof(*snapshot->images) )) ||
-            !(snapshot->semaphores = calloc( snapshot->image_count, sizeof(*snapshot->semaphores) )))
+            !(snapshot->present_sync = calloc( snapshot->image_count, sizeof(*snapshot->present_sync) )))
         {
             res = VK_ERROR_OUT_OF_HOST_MEMORY;
             goto failed;
         }
         if ((res = device->p_vkGetSwapchainImagesKHR( device->host.device, swapchain->obj.host.swapchain,
                                                      &snapshot->image_count, snapshot->images ))) goto failed;
-        for (i = 0; i < snapshot->image_count; ++i)
-            if ((res = device->p_vkCreateSemaphore( device->host.device, &semaphore_info,
-                                                    NULL, &snapshot->semaphores[i] ))) goto failed;
         buffer_info.size = (VkDeviceSize)swapchain->host_extents.width * swapchain->host_extents.height * 4;
         if ((res = device->p_vkCreateBuffer( device->host.device, &buffer_info, NULL, &snapshot->buffer ))) goto failed;
         device->p_vkGetBufferMemoryRequirements( device->host.device, snapshot->buffer, &requirements );
@@ -2272,6 +2314,15 @@ static VkResult prepare_swapchain_snapshot( struct vulkan_queue *queue, struct s
             (res = device->p_vkBindBufferMemory( device->host.device, snapshot->buffer, snapshot->memory, 0 )) ||
             (res = device->p_vkMapMemory( device->host.device, snapshot->memory, 0, VK_WHOLE_SIZE,
                                          0, &snapshot->pixels ))) goto failed;
+    }
+    for (i = 0; i < snapshot->image_count; ++i)
+    {
+        struct swapchain_present_sync *sync = &snapshot->present_sync[i];
+
+        if (!sync->semaphore && (res = device->p_vkCreateSemaphore( device->host.device, &semaphore_info,
+                                                                    NULL, &sync->semaphore ))) goto failed;
+        if (impl_from_vulkan_device( device )->swapchain_maintenance1 && !sync->fence &&
+            (res = device->p_vkCreateFence( device->host.device, &fence_info, NULL, &sync->fence ))) goto failed;
     }
     if (snapshot->pool && snapshot->queue_family != queue->info.queueFamilyIndex)
     {
@@ -2394,7 +2445,7 @@ static VkResult snapshot_vulkan_present( struct vulkan_queue *queue, VkPresentIn
         if ((res = device->p_vkEndCommandBuffer( snapshot->command ))) goto done;
         commands[count++] = snapshot->command;
         if (!semaphore)
-            semaphore = &snapshot->semaphores[present_info->pImageIndices[i]];
+            semaphore = &snapshot->present_sync[present_info->pImageIndices[i]].semaphore;
     }
     if (!count) goto done;
 
@@ -2546,7 +2597,7 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
 
 static BOOL destroy_swapchain( struct vulkan_device *device, struct swapchain *swapchain )
 {
-    unsigned int i;
+    unsigned int i, j;
     BOOL busy;
 
     pthread_mutex_lock( &swapchain->present_lock );
@@ -2556,17 +2607,28 @@ static BOOL destroy_swapchain( struct vulkan_device *device, struct swapchain *s
 
     for (i = 0; i < ARRAY_SIZE(swapchain->snapshots); ++i)
     {
-        struct vulkan_snapshot_fence *pending = swapchain->snapshots[i].pending;
+        struct swapchain_snapshot *snapshot = &swapchain->snapshots[i];
+        struct vulkan_snapshot_fence *pending = snapshot->pending;
         VkResult res;
 
-        if (!pending) continue;
-        res = device->p_vkGetFenceStatus( device->host.device, pending->fence );
         /* Timeout, allocation failure and unknown errors do not authorize
          * freeing storage which the GPU may still access. */
-        if (res != VK_SUCCESS && res != VK_ERROR_DEVICE_LOST) return FALSE;
+        if (pending)
+        {
+            res = device->p_vkGetFenceStatus( device->host.device, pending->fence );
+            if (res != VK_SUCCESS && res != VK_ERROR_DEVICE_LOST) return FALSE;
+        }
+        for (j = 0; snapshot->present_sync && j < snapshot->image_count; ++j)
+        {
+            struct swapchain_present_sync *sync = &snapshot->present_sync[j];
+
+            if (!sync->pending) continue;
+            res = device->p_vkGetFenceStatus( device->host.device, sync->fence );
+            if (res != VK_SUCCESS && res != VK_ERROR_DEVICE_LOST) return FALSE;
+        }
     }
 
-    TRACE( "destroying retired swapchain %p after its private copies\n", swapchain );
+    TRACE( "destroying retired swapchain %p after its private copies and Presents\n", swapchain );
     for (i = 0; i < ARRAY_SIZE(swapchain->snapshots); ++i)
         destroy_swapchain_snapshot( device, &swapchain->snapshots[i] );
     device->p_vkDestroySwapchainKHR( device->host.device, swapchain->obj.host.swapchain, NULL );
@@ -2786,12 +2848,14 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
     struct vulkan_snapshot_reservation reservations_buffer[16] = {{0}}, *reservations = reservations_buffer;
     uint64_t present_ids_buffer[16], *present_ids = present_ids_buffer;
     VkPresentIdKHR present_id_info = {VK_STRUCTURE_TYPE_PRESENT_ID_KHR};
+    VkFence present_fences_buffer[16] = {0}, *present_fences = present_fences_buffer;
+    VkSwapchainPresentFenceInfoKHR present_fence_info = {VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_FENCE_INFO_KHR};
     struct vulkan_device *device = queue->device;
     const VkSwapchainKHR *client_swapchains = present_info->pSwapchains;
     const VkPresentRegionsKHR *regions = find_next_struct( present_info->pNext,
                                                           VK_STRUCTURE_TYPE_PRESENT_REGIONS_KHR );
     uint32_t locked_count = 0, surface_locked_count = 0;
-    BOOL use_internal_present_wait, have_snapshots = FALSE, reserve_more;
+    BOOL use_internal_present_wait, use_internal_present_fences, have_snapshots = FALSE, reserve_more;
     VkResult res;
 
     TRACE( "queue %p, present_info %p\n", queue, present_info );
@@ -2801,6 +2865,8 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
      * namespace) and use the driver completion fallback for this call. */
     use_internal_present_wait = device->internal_present_wait &&
         !find_next_struct( present_info->pNext, VK_STRUCTURE_TYPE_PRESENT_ID_KHR );
+    use_internal_present_fences = impl_from_vulkan_device( device )->swapchain_maintenance1 &&
+        !find_next_struct( present_info->pNext, VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_FENCE_INFO_KHR );
 
     if (present_info->swapchainCount > ARRAY_SIZE(swapchains_buffer) &&
         !(swapchains = malloc( present_info->swapchainCount * sizeof(*swapchains) )))
@@ -2885,7 +2951,8 @@ reserve_snapshots:
         if (reservations[index].snapshot) continue;
         client_surface_get_target( swapchain->surface->client, &target );
         if (!reservations[index].required && !target.offscreen) continue;
-        if (!(res = acquire_snapshot_reservation( device, swapchain, &reservations[index].snapshot ))) continue;
+        if (!(res = acquire_snapshot_reservation( device, swapchain, present_info->pImageIndices[index],
+                                                  &reservations[index].snapshot ))) continue;
         if (present_info->pResults)
             for (uint32_t j = 0; j < present_info->swapchainCount; ++j) present_info->pResults[j] = res;
         goto done;
@@ -2968,9 +3035,49 @@ reserve_snapshots:
         }
     }
 
-    res = have_snapshots ? snapshot_vulkan_present( queue, present_info, client_swapchains,
-                                                   presents, reservations ) : VK_SUCCESS;
-    if (!res) res = device->p_vkQueuePresentKHR( queue->host.queue, present_info );
+    res = VK_SUCCESS;
+    if (have_snapshots && use_internal_present_fences &&
+        present_info->swapchainCount > ARRAY_SIZE(present_fences_buffer) &&
+        !(present_fences = calloc( present_info->swapchainCount, sizeof(*present_fences) )))
+        res = VK_ERROR_OUT_OF_HOST_MEMORY;
+    if (!res && have_snapshots)
+        res = snapshot_vulkan_present( queue, present_info, client_swapchains, presents, reservations );
+    if (!res)
+    {
+        if (have_snapshots && use_internal_present_fences)
+        {
+            for (uint32_t i = 0; i < present_info->swapchainCount; ++i)
+            {
+                struct swapchain_snapshot *snapshot = reservations[i].snapshot;
+
+                if (!presents[i].completion.resolve) continue;
+                present_fences[i] = snapshot->present_sync[present_info->pImageIndices[i]].fence;
+            }
+            present_fence_info.swapchainCount = present_info->swapchainCount;
+            present_fence_info.pFences = present_fences;
+            present_fence_info.pNext = present_info->pNext;
+            present_info->pNext = &present_fence_info;
+        }
+        res = device->p_vkQueuePresentKHR( queue->host.queue, present_info );
+        if (have_snapshots)
+            for (uint32_t i = 0; i < present_info->swapchainCount; ++i)
+            {
+                struct swapchain_snapshot *snapshot = reservations[i].snapshot;
+                struct swapchain_present_sync *sync;
+
+                if (!presents[i].completion.resolve) continue;
+                sync = &snapshot->present_sync[present_info->pImageIndices[i]];
+                /* OOM failed to enqueue and leaves the signaled semaphore
+                 * unconsumed. OUT_OF_DATE and SURFACE_LOST still enqueue
+                 * their waits, so those fences must remain quarantined. */
+                if (res == VK_ERROR_OUT_OF_HOST_MEMORY || res == VK_ERROR_OUT_OF_DEVICE_MEMORY)
+                    sync->orphaned = present_info->pWaitSemaphores == &sync->semaphore;
+                else if (use_internal_present_fences)
+                    sync->pending = TRUE;
+            }
+        if ((res == VK_ERROR_OUT_OF_HOST_MEMORY || res == VK_ERROR_OUT_OF_DEVICE_MEMORY) && present_info->pResults)
+            for (uint32_t i = 0; i < present_info->swapchainCount; ++i) present_info->pResults[i] = res;
+    }
     else if (present_info->pResults)
         for (uint32_t i = 0; i < present_info->swapchainCount; ++i) present_info->pResults[i] = res;
 
@@ -3110,6 +3217,7 @@ done:
                 release_snapshot_reservation( swapchain_from_handle( client_swapchains[i] ),
                                                reservations[i].snapshot );
     if (reservations != reservations_buffer) free( reservations );
+    if (present_fences != present_fences_buffer) free( present_fences );
     if (present_swapchains != present_swapchains_buffer) free( present_swapchains );
     if (present_ids != present_ids_buffer) free( present_ids );
     if (present_surfaces != present_surfaces_buffer) free( present_surfaces );
