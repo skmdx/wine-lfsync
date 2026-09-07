@@ -3010,6 +3010,7 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
     struct client_surface *present_surfaces_buffer[16], **present_surfaces = present_surfaces_buffer;
     struct client_surface_frame presents_buffer[16], *presents = presents_buffer;
     struct vulkan_snapshot_reservation reservations_buffer[16] = {{0}}, *reservations = reservations_buffer;
+    VkResult results_buffer[16], *results = results_buffer;
     uint64_t present_ids_buffer[16], *present_ids = present_ids_buffer;
     VkPresentIdKHR present_id_info = {VK_STRUCTURE_TYPE_PRESENT_ID_KHR};
     VkFence present_fences_buffer[16] = {0}, *present_fences = present_fences_buffer;
@@ -3073,6 +3074,22 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
         res = VK_ERROR_OUT_OF_HOST_MEMORY;
         goto done;
     }
+
+    /* The aggregate native result does not describe every swapchain. Even
+     * when the application omits pResults, successful snapshots in a batch
+     * must still be published if another swapchain is out of date or lost. */
+    if (!present_info->pResults)
+    {
+        if (present_info->swapchainCount > ARRAY_SIZE(results_buffer) &&
+            !(results = malloc( present_info->swapchainCount * sizeof(*results) )))
+        {
+            res = VK_ERROR_OUT_OF_HOST_MEMORY;
+            goto done;
+        }
+        present_info->pResults = results;
+    }
+    for (uint32_t i = 0; i < present_info->swapchainCount; ++i)
+        present_info->pResults[i] = VK_ERROR_UNKNOWN;
 
     for (uint32_t i = 0; i < present_info->waitSemaphoreCount; i++)
     {
@@ -3264,7 +3281,8 @@ reserve_snapshots:
                 else if (use_internal_present_fences)
                     sync->pending = TRUE;
             }
-        if ((res == VK_ERROR_OUT_OF_HOST_MEMORY || res == VK_ERROR_OUT_OF_DEVICE_MEMORY) && present_info->pResults)
+        if (res == VK_ERROR_OUT_OF_HOST_MEMORY || res == VK_ERROR_OUT_OF_DEVICE_MEMORY ||
+            res == VK_ERROR_DEVICE_LOST)
             for (uint32_t i = 0; i < present_info->swapchainCount; ++i) present_info->pResults[i] = res;
     }
     else if (present_info->pResults)
@@ -3317,7 +3335,8 @@ reserve_snapshots:
         {
             WARN( "Swapchain window %p is invalid, returning VK_ERROR_OUT_OF_DATE_KHR\n", surface->hwnd );
             if (present_info->pResults) present_info->pResults[i] = VK_ERROR_OUT_OF_DATE_KHR;
-            if (res >= VK_SUCCESS) res = VK_ERROR_OUT_OF_DATE_KHR;
+            if (res >= VK_SUCCESS || res == VK_ERROR_PRESENT_TIMING_QUEUE_FULL_EXT)
+                res = VK_ERROR_OUT_OF_DATE_KHR;
             compose = FALSE;
         }
         else if (swapchain_res > VK_SUCCESS)
@@ -3411,6 +3430,7 @@ done:
                                                reservations[i].snapshot );
         }
     if (reservations != reservations_buffer) free( reservations );
+    if (results != results_buffer) free( results );
     if (present_fences != present_fences_buffer) free( present_fences );
     if (present_swapchains != present_swapchains_buffer) free( present_swapchains );
     if (present_ids != present_ids_buffer) free( present_ids );
