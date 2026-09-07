@@ -2599,8 +2599,9 @@ static VkResult snapshot_vulkan_present( struct vulkan_queue *queue, VkPresentIn
         capture->device = device;
         capture->swapchain = swapchain;
         capture->snapshot = snapshot;
-        presents[i].capture = (struct client_surface_capture){capture_vulkan_snapshot,
-                                                            release_vulkan_snapshot_capture, capture};
+        presents[i].capture.capture = capture_vulkan_snapshot;
+        presents[i].capture.release = release_vulkan_snapshot_capture;
+        presents[i].capture.context = capture;
         image.image = snapshot->images[present_info->pImageIndices[i]];
         buffer.buffer = snapshot->buffer;
         if ((res = device->p_vkBeginCommandBuffer( snapshot->command, &begin ))) goto done;

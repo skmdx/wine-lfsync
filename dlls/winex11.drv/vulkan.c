@@ -90,7 +90,7 @@ static BOOL X11DRV_vulkan_surface_snapshot( struct client_surface *client,
     if (present->handoff_control) client->handoff_slot[present->handoff_index].source = surface->snapshot;
     /* Retain the completed image even while the owner prepares a new scene.
      * The common completion path freezes it before publishing its source. */
-    present->source_size = (SIZE){width, height};
+    present->capture.size = (SIZE){width, height};
     TRACE( "captured Vulkan snapshot %#lx size %ux%u format %u for %s\n",
            surface->snapshot, width, height, format, debugstr_client_surface( client ) );
     return TRUE;

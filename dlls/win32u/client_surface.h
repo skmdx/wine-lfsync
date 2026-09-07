@@ -45,8 +45,26 @@ extern void client_surface_invalidate_source_locked( struct client_surface *surf
 extern void client_surface_resume_recompose( struct client_surface *surface );
 extern BOOL client_surface_prepare_handoff_locked( struct client_surface *surface,
                                                     struct client_surface_frame *present );
+/* A completed image is independent of scene placement. Its native storage is
+ * pinned by the producer's handoff reservation until publication or abandonment. */
+struct client_surface_completed_frame
+{
+    UINT64 surface_id;
+    UINT64 frame_id;
+    UINT64 target_epoch;
+    UINT64 image;
+    UINT64 visual;
+    SIZE size;
+    RECT damage;
+    UINT64 damage_base_frame;
+};
+
+extern BOOL client_surface_freeze_frame_locked( struct client_surface *surface,
+                                               struct client_surface_frame *present,
+                                               struct client_surface_completed_frame *frame );
 extern BOOL client_surface_publish_handoff_locked( struct client_surface *surface,
-                                                    struct client_surface_frame *present, BOOL source_frozen );
+                                                    struct client_surface_frame *present,
+                                                    const struct client_surface_completed_frame *frame );
 extern void client_surface_abandon_handoff_locked( struct client_surface *surface,
                                                    struct client_surface_frame *present );
 extern void client_surface_release_handoff( struct client_surface *surface );

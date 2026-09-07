@@ -1542,7 +1542,8 @@ static BOOL snapshot_client_surface( struct opengl_drawable *base, struct client
     unsigned int i;
     BOOL ret;
 
-    if (present->target != CLIENT_SURFACE_FRAME_TARGET_OFFSCREEN && !source_framebuffer) return TRUE;
+    if (present->target != CLIENT_SURFACE_FRAME_TARGET_OFFSCREEN &&
+        present->completion.kind != CLIENT_SURFACE_COMPLETION_EXACT && !source_framebuffer) return TRUE;
     source = base->client->target.virtual_rect;
     if (size.cx != source.right - source.left || size.cy != source.bottom - source.top)
     {
@@ -1552,6 +1553,7 @@ static BOOL snapshot_client_surface( struct opengl_drawable *base, struct client
         TRACE( "Discarding resized snapshot %dx%d for %s\n", (int)size.cx, (int)size.cy,
                wine_dbgstr_rect( &source ) );
         present->target = CLIENT_SURFACE_FRAME_TARGET_INVALID;
+        present->result = CLIENT_SURFACE_FRAME_SUPERSEDED;
         return TRUE;
     }
     if (size.cx <= 0 || size.cy <= 0 || (SIZE_T)size.cx > ~(SIZE_T)0 / 4 / size.cy)
@@ -1598,7 +1600,7 @@ static BOOL snapshot_client_surface( struct opengl_drawable *base, struct client
     ret = x11drv_client_surface_snapshot( base->client, pixels, size.cx, size.cy, FALSE, FALSE );
     if (ret && present->handoff_control)
         base->client->handoff_slot[present->handoff_index].source = surface->snapshot;
-    if (ret && source_framebuffer) present->source_size = size;
+    if (ret) present->capture.size = size;
     pthread_mutex_unlock( &base->client->present_lock );
     return ret;
 }
@@ -1616,7 +1618,9 @@ static BOOL x11drv_surface_swap( struct opengl_drawable *base )
     use_oml = ctx && pglXGetSyncValuesOML && pglXSwapBuffersMscOML;
     client_surface_prepare_present( base->client, &present, use_oml || !usexcomposite );
     client_surface_begin_present( base->client );
-    if (!usexcomposite && present.target == CLIENT_SURFACE_FRAME_TARGET_OFFSCREEN)
+    /* A native offscreen target has an exact token even while the owner scene
+     * is preparing. Capture the application's first image before any swap. */
+    if (!usexcomposite && present.completion.kind == CLIENT_SURFACE_COMPLETION_EXACT)
     {
         submitted = completed = snapshot_client_surface( base, &present, 0,
                                                           base->doublebuffer ? GL_BACK : GL_FRONT );
@@ -1766,6 +1770,7 @@ static int snapshot_client_surface_gpu( struct opengl_drawable *base,
     if (slot->width != base->virtual_size.cx || slot->height != base->virtual_size.cy)
     {
         present->target = CLIENT_SURFACE_FRAME_TARGET_INVALID;
+        present->result = CLIENT_SURFACE_FRAME_SUPERSEDED;
         return 1;
     }
     pthread_mutex_lock( &base->client->present_lock );
@@ -1848,7 +1853,7 @@ static int snapshot_client_surface_gpu( struct opengl_drawable *base,
     {
         frame->gpu_control = present->handoff_control;
         slot->source = frame->pixmap;
-        present->source_size = (SIZE){slot->width, slot->height};
+        present->capture.size = (SIZE){slot->width, slot->height};
     }
 done:
     if (scissor) funcs->p_glEnable( GL_SCISSOR_TEST );

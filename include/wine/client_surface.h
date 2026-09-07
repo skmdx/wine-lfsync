@@ -94,9 +94,8 @@ struct client_surface_handoff_clip_rect
 C_ASSERT( sizeof(struct client_surface_handoff_clip_rect) == 8 );
 
 /* The producer owns the payload from SUBMITTED until READY. The owner acquires
- * it with READY -> READING and returns source storage with RELEASED. An owner
- * may reclaim the exact RELEASED generation for a new scene before a producer
- * reserves it again. Retirement must revoke returned tokens before freeing. */
+ * it with READY -> READING, copies the image into its local cache, and returns
+ * source storage with RELEASED. Replay uses that cache, never returned slots. */
 struct DECLSPEC_ALIGN(64) client_surface_handoff_slot
 {
     LONG64 control;
@@ -169,6 +168,9 @@ struct client_surface_frame;
 
 struct client_surface_capture
 {
+    /* Extent of prepared private storage. Neither its existence nor its size
+     * proves completion; the core must consume the host result and freeze it. */
+    SIZE size;
     /* Consume completed private storage under the surface submission lock.
      * This must not wait for GPU work. The core validates the frame's target
      * and source ownership before allowing capture to modify the native image. */

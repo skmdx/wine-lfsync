@@ -1238,6 +1238,7 @@ void client_surface_release( struct client_surface *surface )
 static BOOL client_surface_recompose( struct client_surface *surface, LONG64 seq )
 {
     struct client_surface_frame present;
+    struct client_surface_completed_frame frame;
     BOOL handed_off = FALSE;
 
     /* Cached replay reads the same native drawable that a deferred host
@@ -1259,7 +1260,8 @@ static BOOL client_surface_recompose( struct client_surface *surface, LONG64 seq
          * slot instead of leaking SUBMITTED and falling back to a producer
          * copy/RPC transaction. */
         present.serial = surface->composed_serial;
-        handed_off = client_surface_publish_handoff_locked( surface, &present, FALSE );
+        if (client_surface_freeze_frame_locked( surface, &present, &frame ))
+            handed_off = client_surface_publish_handoff_locked( surface, &present, &frame );
         if (!handed_off) client_surface_abandon_handoff_locked( surface, &present );
     }
     if (!handed_off)
