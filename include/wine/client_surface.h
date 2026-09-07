@@ -30,7 +30,7 @@ enum client_surface_presentation_mode
 #define CLIENT_SURFACE_HANDOFF_BITMAP_WORDS (CLIENT_SURFACE_HANDOFF_CHANNELS / 64)
 #define CLIENT_SURFACE_HANDOFF_MAX_POOLS_PER_CONSUMER 512
 #define CLIENT_SURFACE_HANDOFF_MAGIC ((UINT64)0x57435348414e444full)
-#define CLIENT_SURFACE_HANDOFF_VERSION 11
+#define CLIENT_SURFACE_HANDOFF_VERSION 12
 
 #define CLIENT_SURFACE_HANDOFF_NATIVE_X11 0x0001
 #define CLIENT_SURFACE_HANDOFF_FULL_DAMAGE 0x0002
@@ -39,21 +39,17 @@ enum client_surface_presentation_mode
 #define CLIENT_SURFACE_HANDOFF_PIXMAP_CLIP 0x0010
 /* Producer-owned snapshot: copy before acknowledging, without retaining its XID. */
 #define CLIENT_SURFACE_HANDOFF_COPY_SOURCE 0x0020
-/* Completed independent image. Placement is selected from the owner's current
- * scene after validating this binding and the image's actual dimensions. */
-#define CLIENT_SURFACE_HANDOFF_INDEPENDENT 0x0040
 #define CLIENT_SURFACE_HANDOFF_ENDPOINT_PRODUCER 0x0001
 #define CLIENT_SURFACE_HANDOFF_ENDPOINT_CONSUMER 0x0002
 
 /* Only completed immutable image metadata enters the ring. The producer owns
  * a slot until producer_sequence publishes it; consumer_sequence returns it
- * after the owner's checked cache copy. There is no shared per-slot state. */
+ * after the owner's checked cache copy. Placement and publication context
+ * belong to the owner's scene, never to the completed image descriptor. */
 struct DECLSPEC_ALIGN(64) client_surface_handoff_slot
 {
     UINT64 cookie;
     UINT64 identity;
-    UINT64 scene_epoch;
-    UINT64 scene_generation;
     UINT64 target_seq;
     UINT64 source;
     UINT64 source_visual;
@@ -61,7 +57,6 @@ struct DECLSPEC_ALIGN(64) client_surface_handoff_slot
     UINT window;
     UINT toplevel;
     UINT flags;
-    RECT destination;
     UINT width;
     UINT height;
     RECT damage;

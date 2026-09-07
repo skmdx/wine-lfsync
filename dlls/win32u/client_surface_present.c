@@ -393,7 +393,6 @@ static BOOL prepare_client_surface_handoff_locked( struct client_surface *surfac
                                      __ATOMIC_RELEASE, __ATOMIC_RELAXED );
         return FALSE;
     }
-    if (independent) source->flags |= CLIENT_SURFACE_HANDOFF_INDEPENDENT;
     present->handoff_control = token;
     return TRUE;
 }
@@ -439,8 +438,6 @@ BOOL client_surface_freeze_frame_locked( struct client_surface *surface,
         valid = source->source && source->width && source->height && (source->flags & CLIENT_SURFACE_HANDOFF_COPY_SOURCE);
     if (valid)
     {
-        if (client_surface_backend_has_cap( surface, CLIENT_SURFACE_BACKEND_OWNER_SCENE_PLAN ))
-            source->flags |= CLIENT_SURFACE_HANDOFF_INDEPENDENT;
         frame->surface_id = client_surface_get_identity( surface );
         frame->frame_id = present->serial;
         frame->target_epoch = present->target_seq;
@@ -488,7 +485,6 @@ BOOL client_surface_publish_handoff_locked( struct client_surface *surface,
             (frame->flags & CLIENT_SURFACE_HANDOFF_COPY_SOURCE) && surface->hwnd && surface->target.valid &&
             __atomic_load_n( &source->reservation, __ATOMIC_ACQUIRE ) == present->handoff_control &&
             present->serial >= surface->composed_serial && present->target_seq == surface->target.seq &&
-            (frame->flags & CLIENT_SURFACE_HANDOFF_INDEPENDENT) &&
             client_surface_backend_has_cap( surface, CLIENT_SURFACE_BACKEND_OWNER_SCENE_PLAN );
     if (valid)
     {

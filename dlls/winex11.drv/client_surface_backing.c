@@ -1773,7 +1773,6 @@ static BOOL cache_client_surface_handoff( struct client_surface_compositor_bindi
     binding->latest_image = *image;
     *image = previous;
     frame.source = binding->latest_image.pixmap;
-    frame.flags |= CLIENT_SURFACE_HANDOFF_INDEPENDENT;
     binding->latest_frame = frame;
     binding->latest_control = control;
     binding->latest_index = index;
@@ -1949,19 +1948,31 @@ static void discard_client_surface_compositor_gc( struct client_surface_composit
     frame->gc = NULL;
 }
 
+/* Owner-local placement of an immutable completed image. Source damage may
+ * become a full copy for scene replay without changing the cached frame. */
+struct client_surface_composition_plan
+{
+    UINT64 generation;
+    UINT64 epoch;
+    RECT destination;
+    RECT source_damage;
+    const RGNDATA *clip;
+};
+
 static BOOL copy_client_surface_handoff_to_frame(
     struct client_surface_compositor_target *target,
     struct client_surface_compositor_frame *frame, Pixmap source, unsigned int source_depth,
-    const struct client_surface_handoff_slot *slot, const RECT *damage, const RGNDATA *clip,
+    const struct client_surface_handoff_slot *slot,
+    const struct client_surface_composition_plan *plan, const RECT *damage,
     BOOL batch, BOOL *pending )
 {
     Display *display = client_surface_compositor_display;
-    const XRectangle *clips = (const XRectangle *)clip->Buffer;
-    unsigned int clip_count = clip->rdh.nCount;
+    const XRectangle *clips = (const XRectangle *)plan->clip->Buffer;
+    unsigned int clip_count = plan->clip->rdh.nCount;
     RECT catchup = {0};
     BOOL clipped, incoming_full, needs_catchup, native, overlay_copied = TRUE;
-    unsigned int destination_width = slot->destination.right - slot->destination.left;
-    unsigned int destination_height = slot->destination.bottom - slot->destination.top;
+    unsigned int destination_width = plan->destination.right - plan->destination.left;
+    unsigned int destination_height = plan->destination.bottom - plan->destination.top;
     int error = 0;
     GC gc;
 
@@ -1984,7 +1995,7 @@ static BOOL copy_client_surface_handoff_to_frame(
         assert( native );
         copied = client_surface_xcb_copy( display, source, frame->pixmap, &frame->xcb_gc,
             needs_catchup ? target->latest : 0, &catchup,
-            &slot->damage, &slot->destination, clips, clip_count, clipped,
+            &plan->source_damage, &plan->destination, clips, clip_count, clipped,
             &client_surface_copy_batch.requests[client_surface_copy_batch.count - 1], FALSE );
         /* Subsequent members append to this private image in request order;
          * another checkpoint copy would overwrite their earlier neighbors.
@@ -1995,16 +2006,16 @@ static BOOL copy_client_surface_handoff_to_frame(
 
     TRACE_(csperf)( "ticks=%llu event=copy_route native=%u full=%u transaction=%u assembly=%u "
                    "mailbox=%u ticket=%u latest=%u published=%u inflight=%u\n",
-                   client_surface_perf_time(), native, incoming_full, !!slot->scene_generation,
+                   client_surface_perf_time(), native, incoming_full, !!plan->generation,
                    target->assembly_pending, target->mailbox_pending,
                    !!target->mailbox_publish_generation, frame->pixmap == target->latest,
                    frame->pixmap == target->published, !!frame->serial );
-    if (!batch && !slot->scene_generation && native &&
+    if (!batch && !plan->generation && native &&
         !target->assembly_pending && !target->mailbox_pending &&
         frame->pixmap != target->latest && frame->pixmap != target->published &&
         client_surface_xcb_copy( display, source, frame->pixmap, &frame->xcb_gc,
                                  needs_catchup ? target->latest : 0, &catchup,
-                                 &slot->damage, &slot->destination, clips, clip_count, clipped,
+                                 &plan->source_damage, &plan->destination, clips, clip_count, clipped,
                                  &frame->copy_request, TRUE ))
     {
         *pending = TRUE;
@@ -2027,25 +2038,25 @@ static BOOL copy_client_surface_handoff_to_frame(
         if (clip_count)
         {
             if (clipped)
-                XSetClipRectangles( display, gc, slot->destination.left,
-                                    slot->destination.top, (XRectangle *)clips, clip_count, YXBanded );
+                XSetClipRectangles( display, gc, plan->destination.left,
+                                    plan->destination.top, (XRectangle *)clips, clip_count, YXBanded );
             if (overlay_copied && native)
                 XCopyArea( display, source, frame->pixmap, gc,
-                           slot->damage.left, slot->damage.top,
-                           slot->damage.right - slot->damage.left,
-                           slot->damage.bottom - slot->damage.top,
-                           slot->destination.left + slot->damage.left,
-                           slot->destination.top + slot->damage.top );
+                           plan->source_damage.left, plan->source_damage.top,
+                           plan->source_damage.right - plan->source_damage.left,
+                           plan->source_damage.bottom - plan->source_damage.top,
+                           plan->destination.left + plan->source_damage.left,
+                           plan->destination.top + plan->source_damage.top );
             else if (overlay_copied)
             {
                 overlay_copied = X11DRV_XRender_CopyClientSurface(
                     display, source, slot->source_visual, frame->pixmap, target->visual,
-                    slot->width, slot->height, &slot->destination,
+                    slot->width, slot->height, &plan->destination,
                     clipped ? clips : NULL, clipped ? clip_count : 0, 0, 0 );
                 if (!overlay_copied)
                     overlay_copied = copy_client_surface_image(
                         display, source, frame->pixmap, gc, slot->source_visual, target->visual,
-                        slot->width, slot->height, &slot->destination );
+                        slot->width, slot->height, &plan->destination );
             }
         }
     }
@@ -2348,13 +2359,13 @@ static BOOL process_client_surface_copy_replies(void)
 
 static BOOL compose_client_surface_cached_frame( struct client_surface_compositor_binding *binding )
 {
-    struct client_surface_handoff_slot *slot;
-    struct client_surface_handoff_slot source_frame;
+    const struct client_surface_handoff_slot *slot;
+    struct client_surface_composition_plan plan;
     struct client_surface_scene current;
     const struct client_surface_scene_layout *layout;
     struct client_surface_compositor_target *target;
     struct client_surface_compositor_frame *frame = NULL, *previous_publish = NULL;
-    UINT64 control, generation, epoch;
+    UINT64 control;
     unsigned int buffer_index;
     Pixmap source = 0;
     RECT damage;
@@ -2367,8 +2378,7 @@ static BOOL compose_client_surface_cached_frame( struct client_surface_composito
     if (!binding->latest_image.pixmap) return FALSE;
     /* From here onwards only owner storage is read. The producer has already
      * received its slot, and may overwrite or destroy it during publication. */
-    source_frame = binding->latest_frame;
-    slot = &source_frame;
+    slot = &binding->latest_frame;
     control = binding->latest_control;
     buffer_index = binding->latest_index;
     source = binding->latest_image.pixmap;
@@ -2379,37 +2389,36 @@ static BOOL compose_client_surface_cached_frame( struct client_surface_composito
         current.mode == CLIENT_SURFACE_PRESENTATION_DIRECT) return FALSE;
     if (replay) trace_client_surface_source( "replay_cache", binding, control,
                                              slot->source_sequence, target->window, source, TRUE );
-    if (slot->flags & CLIENT_SURFACE_HANDOFF_INDEPENDENT) slot->scene_epoch = current.epoch;
-    /* Publication may have completed since this snapshot was submitted.
-     * Use the owner's current transaction for the same immutable layout;
-     * a late source must not reopen an already published assembly. Native
-     * sources from an older layout still fail the epoch check below. */
-    if (slot->scene_epoch == current.epoch) slot->scene_generation = current.generation;
-    generation = slot->scene_generation;
-    epoch = slot->scene_epoch;
+    /* Only the owner's current transaction can publish this image. A new
+     * scene may reuse its pixels, and a late frame cannot reopen a completed
+     * assembly merely because it was submitted during that publication. */
+    plan.generation = current.generation;
+    plan.epoch = current.epoch;
+    plan.source_damage = slot->damage;
     /* Cache reception already validated the native source. Compatible scene
      * members can share the existing checked output batch without opening
      * another Xlib error scope or retaining any producer storage. */
     if (client_surface_copy_batch.count &&
-        (client_surface_copy_batch.target != target || !generation ||
-         client_surface_copy_batch.copies[0].generation != generation ||
-         client_surface_copy_batch.copies[0].epoch != epoch))
+        (client_surface_copy_batch.target != target || !plan.generation ||
+         client_surface_copy_batch.copies[0].generation != plan.generation ||
+         client_surface_copy_batch.copies[0].epoch != plan.epoch))
         flush_client_surface_copy_batch();
     if (target->copy_frame ||
         client_surface_pending_batch_count == ARRAY_SIZE(client_surface_pending_batches)) goto retry;
-    if (target->scene.epoch != epoch || binding->scene_index >= target->scene.count ||
+    if (target->scene.epoch != plan.epoch || binding->scene_index >= target->scene.count ||
         target->scene.members[binding->scene_index] != binding ||
-        (binding->source_epoch == epoch && slot->source_sequence < binding->source_sequence))
+        (binding->source_epoch == plan.epoch && slot->source_sequence < binding->source_sequence))
     {
         dropped = TRUE;
         goto release;
     }
     layout = &target->scene.layouts[binding->scene_index];
-    slot->destination = layout->geometry.monitor_rect;
-    destination_width = slot->destination.right > slot->destination.left ?
-                        slot->destination.right - slot->destination.left : 0;
-    destination_height = slot->destination.bottom > slot->destination.top ?
-                         slot->destination.bottom - slot->destination.top : 0;
+    plan.destination = layout->geometry.monitor_rect;
+    plan.clip = layout->clip;
+    destination_width = plan.destination.right > plan.destination.left ?
+                        plan.destination.right - plan.destination.left : 0;
+    destination_height = plan.destination.bottom > plan.destination.top ?
+                         plan.destination.bottom - plan.destination.top : 0;
     if (slot->cookie == binding->cookie && slot->identity == binding->identity &&
         slot->producer_process == binding->process &&
         slot->window == wine_server_user_handle( binding->window ) &&
@@ -2422,50 +2431,50 @@ static BOOL compose_client_surface_cached_frame( struct client_surface_composito
         ((slot->width == destination_width && slot->height == destination_height) ||
          (slot->width == layout->geometry.virtual_rect.right - layout->geometry.virtual_rect.left &&
           slot->height == layout->geometry.virtual_rect.bottom - layout->geometry.virtual_rect.top)) &&
-        slot->damage.left >= 0 && slot->damage.top >= 0 && !IsRectEmpty( &slot->damage ) &&
-        (unsigned int)slot->damage.right <= slot->width &&
-        (unsigned int)slot->damage.bottom <= slot->height)
+        plan.source_damage.left >= 0 && plan.source_damage.top >= 0 && !IsRectEmpty( &plan.source_damage ) &&
+        (unsigned int)plan.source_damage.right <= slot->width &&
+        (unsigned int)plan.source_damage.bottom <= slot->height)
     {
         dropped = FALSE;
         /* Placement and clip come from the owner's scene. Children may
          * extend outside the top-level; the scene clip and destination
          * drawable bound the copy, without changing its source mapping. */
-        damage = slot->destination;
+        damage = plan.destination;
         /* Transactions need each participant's complete visible contribution.
          * Steady frames may use source damage; align the owner journal with
          * the actual source rectangle instead of declaring it fully replaced. */
         /* A missed or superseded source breaks incremental continuity. The
          * immutable image always contains the full frame, so recover by
          * copying it in full. Scaled copies use a conservative full journal. */
-        if (generation || (slot->flags & CLIENT_SURFACE_HANDOFF_FULL_DAMAGE) ||
-            binding->source_epoch != epoch || !slot->damage_base_sequence ||
+        if (plan.generation || (slot->flags & CLIENT_SURFACE_HANDOFF_FULL_DAMAGE) ||
+            binding->source_epoch != plan.epoch || !slot->damage_base_sequence ||
             slot->damage_base_sequence != binding->source_sequence ||
             slot->width != destination_width || slot->height != destination_height)
-            SetRect( &slot->damage, 0, 0, slot->width, slot->height );
+            SetRect( &plan.source_damage, 0, 0, slot->width, slot->height );
         else
         {
             TRACE( "incremental owner copy hwnd %p sequence %s base %s damage %s\n", binding->window,
                    wine_dbgstr_longlong( slot->source_sequence ),
-                   wine_dbgstr_longlong( slot->damage_base_sequence ), wine_dbgstr_rect( &slot->damage ) );
-            damage.left += (UINT64)slot->damage.left * destination_width / slot->width;
-            damage.top += (UINT64)slot->damage.top * destination_height / slot->height;
-            damage.right = slot->destination.left +
-                ((UINT64)slot->damage.right * destination_width + slot->width - 1) / slot->width;
-            damage.bottom = slot->destination.top +
-                ((UINT64)slot->damage.bottom * destination_height + slot->height - 1) / slot->height;
+                   wine_dbgstr_longlong( slot->damage_base_sequence ), wine_dbgstr_rect( &plan.source_damage ) );
+            damage.left += (UINT64)plan.source_damage.left * destination_width / slot->width;
+            damage.top += (UINT64)plan.source_damage.top * destination_height / slot->height;
+            damage.right = plan.destination.left +
+                ((UINT64)plan.source_damage.right * destination_width + slot->width - 1) / slot->width;
+            damage.bottom = plan.destination.top +
+                ((UINT64)plan.source_damage.bottom * destination_height + slot->height - 1) / slot->height;
         }
-        if (slot->scene_generation)
+        if (plan.generation)
             previous_publish = find_client_surface_pending_publication(
-                target, slot->scene_generation, slot->scene_epoch );
+                target, plan.generation, plan.epoch );
         if (!previous_publish && target->assembly_pending &&
-            (target->assembly_generation != slot->scene_generation ||
-             target->assembly_epoch != slot->scene_epoch))
+            (target->assembly_generation != plan.generation ||
+             target->assembly_epoch != plan.epoch))
             finish_client_surface_compositor_assembly( target, TRUE );
-        if (!slot->scene_generation || previous_publish)
+        if (!plan.generation || previous_publish)
             frame = get_client_surface_compositor_frame( target );
         else if (target->assembly_pending &&
-                 target->assembly_generation == slot->scene_generation &&
-                 target->assembly_epoch == slot->scene_epoch)
+                 target->assembly_generation == plan.generation &&
+                 target->assembly_epoch == plan.epoch)
             frame = &target->frames[target->assembly_frame];
         else
             frame = acquire_client_surface_compositor_assembly_frame( target );
@@ -2479,18 +2488,18 @@ retry:
             target->replay_member = min( target->replay_member, binding->scene_index );
             return FALSE;
         }
-        if (slot->scene_generation && !previous_publish && !target->assembly_pending)
+        if (plan.generation && !previous_publish && !target->assembly_pending)
         {
             target->assembly_pending = TRUE;
-            target->assembly_generation = slot->scene_generation;
-            target->assembly_epoch = slot->scene_epoch;
+            target->assembly_generation = plan.generation;
+            target->assembly_epoch = plan.epoch;
             target->assembly_frame = frame - target->frames;
         }
 
         /* Every participant is copied into one private assembly frame. Its
          * receipt survives the source release, allowing the producer to make
          * progress while other participants are still completing. */
-        batch = slot->scene_generation && !previous_publish;
+        batch = plan.generation && !previous_publish;
         if (batch)
         {
             asynchronous = source_depth == target->depth && slot->source_visual == target->visual &&
@@ -2514,18 +2523,18 @@ retry:
             }
             assert( client_surface_copy_batch.frame == frame );
             client_surface_copy_batch.copies[client_surface_copy_batch.count++] =
-                (struct client_surface_owner_copy){binding, buffer_index, control, generation, epoch,
+                (struct client_surface_owner_copy){binding, buffer_index, control, plan.generation, plan.epoch,
                                                    slot->source_sequence, replay};
             client_surface_copy_batch.requests[client_surface_copy_batch.count - 1] =
                 (struct client_surface_xcb_request){0};
         }
         copied = copy_client_surface_handoff_to_frame( target, frame, source, source_depth,
-                                                       slot, &damage, layout->clip, batch, &pending );
+                                                       slot, &plan, &damage, batch, &pending );
         if (copied)
         {
-            binding->source_epoch = epoch;
+            binding->source_epoch = plan.epoch;
             binding->source_sequence = slot->source_sequence;
-            binding->replay_epoch = epoch;
+            binding->replay_epoch = plan.epoch;
             frame->width = target->window_width;
             frame->height = target->window_height;
         }
@@ -2564,9 +2573,9 @@ release:
         trace_client_surface_source( "discard", binding, control, slot->source_sequence,
                                      target->window, frame ? frame->pixmap : 0, dropped );
     if (!copied && !dropped) flush_client_surface_copy_batch();
-    if (!copied && !dropped && slot->scene_generation && !previous_publish && target &&
-        target->assembly_pending && target->assembly_generation == slot->scene_generation &&
-        target->assembly_epoch == slot->scene_epoch)
+    if (!copied && !dropped && plan.generation && !previous_publish && target &&
+        target->assembly_pending && target->assembly_generation == plan.generation &&
+        target->assembly_epoch == plan.epoch)
         finish_client_surface_compositor_assembly( target, TRUE );
     return composed;
 }

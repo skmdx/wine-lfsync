@@ -1716,6 +1716,11 @@ static void test_handoff_storage(void)
 
             frame->source = 0x12345678 + i;
             frame->source_sequence = i + 1;
+            frame->target_seq = ((UINT64)1 << 40) + round;
+            frame->width = 640 + i;
+            frame->height = 480 + i;
+            SetRect( &frame->damage, i, i + 1, 100 + i, 101 + i );
+            frame->damage_base_sequence = i;
             __atomic_store_n( &producer_slot->producer_sequence, start + i + 1, __ATOMIC_RELEASE );
             ok( !client_surface_handoff_consumed( producer_slot, start + i + 1 ),
                 "unread descriptor %u was returned at round %u\n", i, round );
@@ -1731,9 +1736,14 @@ static void test_handoff_storage(void)
         {
             const struct client_surface_handoff_slot *frame =
                 &owner_slot->slots[consumed & (CLIENT_SURFACE_HANDOFF_RING_SIZE - 1)];
+            RECT damage = {i, i + 1, 100 + i, 101 + i};
 
             ok( frame->source == 0x12345678 + i && frame->source_sequence == i + 1,
                 "descriptor %u at round %u was overwritten\n", i, round );
+            ok( frame->target_seq == ((UINT64)1 << 40) + round && frame->width == 640 + i &&
+                frame->height == 480 + i && EqualRect( &frame->damage, &damage ) &&
+                frame->damage_base_sequence == i,
+                "completed frame metadata %u at round %u did not survive the channel\n", i, round );
             __atomic_store_n( &owner_slot->consumer_sequence, ++consumed, __ATOMIC_RELEASE );
             ok( client_surface_handoff_consumed( producer_slot, consumed ),
                 "producer did not observe returned descriptor %u at round %u\n", i, round );
