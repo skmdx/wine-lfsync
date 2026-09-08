@@ -3501,7 +3501,7 @@ BOOL X11DRV_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_hint, UIN
     BOOL prepare_client_surface = !!(swp_flags & WINE_SWP_CLIENT_SURFACE_PREPARE);
     BOOL enable_client_surface_backing = !!(swp_flags & WINE_SWP_CLIENT_SURFACE_BACKING_ENABLE);
     BOOL disable_client_surface_backing = !!(swp_flags & WINE_SWP_CLIENT_SURFACE_BACKING_DISABLE);
-    BOOL owner_update, deferred;
+    BOOL owner_update, deferred, ret = TRUE;
 
     if ((is_managed = is_window_managed( hwnd, swp_flags, fullscreen ))) make_owner_managed( hwnd );
 
@@ -3602,12 +3602,16 @@ BOOL X11DRV_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_hint, UIN
     if (enable_client_surface_backing || disable_client_surface_backing)
     {
         if (enable_client_surface_backing)
-            X11DRV_client_surface_backing_snapshot( data, FALSE );
+        {
+            /* A combined activation/preparation takes its one checkpoint
+             * below, after applying the native window state. */
+            if (!prepare_client_surface) X11DRV_client_surface_backing_snapshot( data, FALSE );
+        }
         else if (!X11DRV_client_surface_backing_retire( data )) destroy_client_surface_backing( data );
     }
 
     window_set_wm_state( data, get_desired_wm_state( new_style, new_rects ), activate );
-    if (prepare_client_surface && !X11DRV_client_surface_prepare_owner( data ))
+    if (prepare_client_surface && !(ret = X11DRV_client_surface_prepare_owner( data )))
         client_surface_fail_scene( hwnd );
     if (publish_client_surface)
     {
@@ -3665,7 +3669,7 @@ BOOL X11DRV_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_hint, UIN
     release_win_data( data );
 
     if (was_fullscreen) NtUserClipCursor( NULL );
-    return TRUE;
+    return ret;
 }
 
 /* check if the window icon should be hidden (i.e. moved off-screen) */

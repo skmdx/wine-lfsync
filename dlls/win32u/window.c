@@ -4819,14 +4819,26 @@ void update_window_client_surface_backing( HWND hwnd )
 {
     struct object_lock lock = OBJECT_LOCK_INIT;
     const window_shm_t *window_shm = NULL;
-    BOOL enable = FALSE;
+    BOOL enable = FALSE, preparing = FALSE, prepare;
+    UINT driver_flags;
+    UINT64 scene_generation = 0;
     NTSTATUS status;
 
     while ((status = get_shared_window( hwnd, &lock, &window_shm )) == STATUS_PENDING)
+    {
         enable = !!(window_shm->client_surface_flags & WINDOW_SHM_CLIENT_SURFACE_BACKING);
-    if (!status)
-        update_window_state_flags( hwnd, enable ? WINE_SWP_CLIENT_SURFACE_BACKING_ENABLE :
-                                                 WINE_SWP_CLIENT_SURFACE_BACKING_DISABLE );
+        preparing = !!(window_shm->client_surface_flags & WINDOW_SHM_CLIENT_SURFACE_PREPARING);
+    }
+    if (status) return;
+
+    /* A published scene can need both backing activation and a new owner
+     * checkpoint. Apply its native/GDI state once, but only acknowledge the
+     * exact preparation admitted by the server, after the driver succeeds. */
+    prepare = enable && preparing && client_surface_begin_prepare( hwnd, &scene_generation );
+    driver_flags = enable ? WINE_SWP_CLIENT_SURFACE_BACKING_ENABLE : WINE_SWP_CLIENT_SURFACE_BACKING_DISABLE;
+    if (prepare) driver_flags |= WINE_SWP_CLIENT_SURFACE_PREPARE;
+    if (update_window_state_flags( hwnd, driver_flags ) && prepare)
+        client_surface_end_prepare( hwnd, scene_generation );
 }
 
 /***********************************************************************
