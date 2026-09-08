@@ -3589,7 +3589,11 @@ BOOL X11DRV_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_hint, UIN
 #endif
     }
 
-    if (data->client_surface_backing) X11DRV_client_surface_backing_ensure( data );
+    /* Snapshot installs its final checkpoint and target itself. A retiring
+     * pool only needs the existing lifetime drain, not a preceding refresh. */
+    if (data->client_surface_backing && !enable_client_surface_backing &&
+        !disable_client_surface_backing && !prepare_client_surface)
+        X11DRV_client_surface_backing_ensure( data );
     if (enable_client_surface_backing || disable_client_surface_backing)
     {
         if (enable_client_surface_backing)

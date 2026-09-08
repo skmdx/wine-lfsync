@@ -3297,6 +3297,15 @@ static BOOL client_surface_compositor_job_ready( struct client_surface_composito
     if (job->op == CLIENT_SURFACE_COMPOSITOR_TRY_BEGIN_UPDATE ||
         job->op == CLIENT_SURFACE_COMPOSITOR_CHECK_UPDATE ||
         job->op == CLIENT_SURFACE_COMPOSITOR_FINISH_UPDATE) return TRUE;
+    /* The copy uses immutable scene/binding references. Inspecting those
+     * references, or resolving source availability from completed owner
+     * caches, neither mutates nor releases its output. A queued resolve can
+     * arrive after replay resolved the inventory and started an assembly;
+     * making the GUI wait for that assembly would block its next scene
+     * change behind native completion. The resolver keeps the exact scene
+     * and receipt checks, including its already-resolved no-op. */
+    if (job->op == CLIENT_SURFACE_COMPOSITOR_CHECK_SCENE ||
+        job->op == CLIENT_SURFACE_COMPOSITOR_RESOLVE_SOURCES) return TRUE;
     /* Expose restoration records its own deferred work if necessary. */
     if (job->op == CLIENT_SURFACE_COMPOSITOR_RESTORE_TARGET) return TRUE;
     /* Preserve the scene, binding and frame referenced by the request. Only
@@ -4115,11 +4124,57 @@ BOOL X11DRV_client_surface_prepare_owner( struct x11drv_win_data *data )
     return X11DRV_client_surface_backing_snapshot( data, TRUE );
 }
 
+static BOOL copy_client_surface_backing_snapshot( struct x11drv_win_data *data, Pixmap pixmap,
+                                                  unsigned int width, unsigned int height,
+                                                  unsigned int window_width, unsigned int window_height )
+{
+    if (width < window_width || height < window_height) return FALSE;
+    /* The compositor uses another connection. Complete the owner's drawing
+     * before copying the complete checkpoint, including its GDI pixels. */
+    XSync( data->display, False );
+    return client_surface_backing_copy( data->whole_window, pixmap, window_width, window_height );
+}
+
+static BOOL snapshot_client_surface_backing( struct x11drv_win_data *data, BOOL invalidate, BOOL ensure_on_failure,
+                                             unsigned int window_width, unsigned int window_height )
+{
+    Pixmap previous;
+
+    if (!copy_client_surface_backing_snapshot( data, data->client_surface_backing_spare,
+            data->client_surface_backing_width, data->client_surface_backing_height,
+            window_width, window_height ))
+    {
+        /* A failed snapshot must still apply the capacity check's validity
+         * and native extent to the old target. Successful snapshots combine
+         * that update with their checkpoint rotation below. */
+        if (ensure_on_failure && update_client_surface_backing_target( data ))
+            refresh_client_surface_handoffs( data->hwnd );
+        return FALSE;
+    }
+    previous = data->client_surface_backing;
+    data->client_surface_backing = data->client_surface_backing_spare;
+    data->client_surface_backing_spare = previous;
+    TRACE( "rotated client-surface frame pool to %#lx (idle %#lx)\n",
+           data->client_surface_backing, data->client_surface_backing_spare );
+    data->client_surface_backing_valid = FALSE;
+    data->client_surface_backing_valid_width = 0;
+    data->client_surface_backing_valid_height = 0;
+    if (!update_client_surface_backing_target( data )) return FALSE;
+    refresh_client_surface_handoffs( data->hwnd );
+    if (!invalidate)
+    {
+        data->client_surface_backing_valid = TRUE;
+        data->client_surface_backing_valid_width = window_width;
+        data->client_surface_backing_valid_height = window_height;
+    }
+    return TRUE;
+}
+
 /* Align capacities to tiles, with modest growth slack and delayed shrinking.
  * Only the owner
  * compositor uses these Pixmaps, so replaced pools can be freed once its
  * target update has drained the old Present requests. */
-BOOL X11DRV_client_surface_backing_ensure( struct x11drv_win_data *data )
+static BOOL ensure_client_surface_backing( struct x11drv_win_data *data, BOOL snapshot, BOOL invalidate )
 {
     unsigned int width, height, window_width, window_height;
     unsigned int old_valid_width, old_valid_height;
@@ -4170,9 +4225,22 @@ BOOL X11DRV_client_surface_backing_ensure( struct x11drv_win_data *data )
             data->client_surface_backing_valid_height =
                 min( data->client_surface_backing_valid_height, window_height );
         }
+        if (snapshot)
+            return snapshot_client_surface_backing( data, invalidate, TRUE, window_width, window_height );
         if (!update_client_surface_backing_target( data )) return FALSE;
         refresh_client_surface_handoffs( data->hwnd );
         return TRUE;
+    }
+
+    if (snapshot && (data->client_surface_backing || data->client_surface_backing_spare))
+    {
+        /* Replacing a live pool must retain its old valid intersection as
+         * the published checkpoint, separate from the new GUI snapshot.
+         * Keep that capacity-only replacement before rotating the snapshot;
+         * the one-checkpoint shortcut below is only for an empty pool. */
+        if (!ensure_client_surface_backing( data, FALSE, FALSE )) return FALSE;
+        if (!get_client_surface_window_extent( data, &window_width, &window_height )) return FALSE;
+        return snapshot_client_surface_backing( data, invalidate, FALSE, window_width, window_height );
     }
 
     /* Grow the axis which needs space, without retaining the historical
@@ -4195,9 +4263,22 @@ BOOL X11DRV_client_surface_backing_ensure( struct x11drv_win_data *data )
                                        data->vis.depth, &pixmap, &spare ))
         return FALSE;
 
-    /* Seed the replacement before changing the compositor target.  Producers
-     * receive only source handoffs, never these owner-owned destination XIDs. */
-    if (!client_surface_backing_copy( data->whole_window, pixmap,
+    /* A snapshot installs one complete checkpoint. Spare images start at
+     * revision zero and catch up from it before any partial composition, so
+     * seeding both of them before taking that snapshot would copy the same
+     * owner pixels three times. Do not install either new XID until the
+     * checkpoint is complete; the old pool retains its native lifetime. */
+    if (snapshot)
+    {
+        if (!copy_client_surface_backing_snapshot( data, pixmap, width, height, window_width, window_height ))
+        {
+            client_surface_backing_free( pixmap, spare );
+            return FALSE;
+        }
+    }
+    /* Capacity-only replacement still preserves its old valid intersection.
+     * Producers never receive these owner-owned destination XIDs. */
+    else if (!client_surface_backing_copy( data->whole_window, pixmap,
                                       min( window_width, width ), min( window_height, height ) ) ||
         !client_surface_backing_copy( data->whole_window, spare,
                                       min( window_width, width ), min( window_height, height ) ) ||
@@ -4218,13 +4299,16 @@ BOOL X11DRV_client_surface_backing_ensure( struct x11drv_win_data *data )
     data->client_surface_backing_width = width;
     data->client_surface_backing_height = height;
     data->client_surface_backing_shrink_start = 0;
-    valid = old_valid && old_valid_width >= window_width && old_valid_height >= window_height;
+    valid = !snapshot && old_valid && old_valid_width >= window_width && old_valid_height >= window_height;
     data->client_surface_backing_valid = valid;
     if (valid)
     {
         data->client_surface_backing_valid_width = window_width;
         data->client_surface_backing_valid_height = window_height;
     }
+    if (snapshot)
+        TRACE( "rotated client-surface frame pool to %#lx (idle %#lx)\n",
+               data->client_surface_backing, data->client_surface_backing_spare );
     updated = update_client_surface_backing_target( data );
     /* The synchronous target update drains the old pool before detaching it.
      * If installation failed, discard any partially updated target first;
@@ -4233,42 +4317,23 @@ BOOL X11DRV_client_surface_backing_ensure( struct x11drv_win_data *data )
     if (old_pixmap || old_spare) client_surface_backing_free( old_pixmap, old_spare );
     if (!updated) return FALSE;
     refresh_client_surface_handoffs( data->hwnd );
-    return TRUE;
-}
-
-BOOL X11DRV_client_surface_backing_snapshot( struct x11drv_win_data *data, BOOL invalidate )
-{
-    unsigned int width, height, window_width, window_height;
-    Pixmap previous;
-
-    if (!X11DRV_client_surface_backing_ensure( data )) return FALSE;
-    if (!get_client_surface_window_extent( data, &window_width, &window_height )) return FALSE;
-    width = min( data->client_surface_backing_width, window_width );
-    height = min( data->client_surface_backing_height, window_height );
-    /* The compositor uses another X connection.  Establish all preceding
-     * owner-window drawing before it snapshots that drawable. */
-    XSync( data->display, False );
-    if (!client_surface_backing_copy( data->whole_window,
-                                      data->client_surface_backing_spare, width, height ))
-        return FALSE;
-    if (width != window_width || height != window_height) return FALSE;
-    previous = data->client_surface_backing;
-    data->client_surface_backing = data->client_surface_backing_spare;
-    data->client_surface_backing_spare = previous;
-    TRACE( "rotated client-surface frame pool to %#lx (idle %#lx)\n",
-           data->client_surface_backing, data->client_surface_backing_spare );
-    data->client_surface_backing_valid = FALSE;
-    data->client_surface_backing_valid_width = 0;
-    data->client_surface_backing_valid_height = 0;
-    if (!update_client_surface_backing_target( data )) return FALSE;
-    refresh_client_surface_handoffs( data->hwnd );
-    if (!invalidate)
+    if (snapshot && !invalidate)
     {
         data->client_surface_backing_valid = TRUE;
         data->client_surface_backing_valid_width = window_width;
         data->client_surface_backing_valid_height = window_height;
     }
     return TRUE;
+}
+
+BOOL X11DRV_client_surface_backing_ensure( struct x11drv_win_data *data )
+{
+    return ensure_client_surface_backing( data, FALSE, FALSE );
+}
+
+BOOL X11DRV_client_surface_backing_snapshot( struct x11drv_win_data *data, BOOL invalidate )
+{
+    return ensure_client_surface_backing( data, TRUE, invalidate );
 }
 
 BOOL X11DRV_client_surface_backing_publish( struct x11drv_win_data *data )
