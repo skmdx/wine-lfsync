@@ -1035,9 +1035,11 @@ BOOL WINAPI wglDeleteContext( HGLRC handle )
     if ((status = UNIX_CALL( wglDeleteContext, &args ))) WARN( "wglDeleteContext returned %#lx\n", status );
     if (status || !args.ret) return FALSE;
 
-    /* make sure there's a (dummy) context before releasing and destroying display list objects */
-    if (!teb->glCurrentRC) wglMakeContextCurrentARB( NULL, NULL, NULL );
+    /* Native deletion prepares a temporary context when no application context
+     * is current. Keep it until the last virtual namespace has deleted its host
+     * objects, then restore the public no-context state. */
     free_client_context( ptr );
+    if (!teb->glCurrentRC) return wglMakeContextCurrentARB( NULL, NULL, NULL );
     return TRUE;
 }
 

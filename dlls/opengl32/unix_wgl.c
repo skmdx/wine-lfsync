@@ -841,8 +841,7 @@ static void init_client_context( TEB *teb, struct opengl_client_context *client 
 BOOL wrap_wglDeleteContext( TEB *teb, HGLRC client_context )
 {
     const struct opengl_funcs *funcs = get_context_funcs( client_context );
-    funcs->p_context_destroy( context_from_client_context( client_context ) );
-    return TRUE;
+    return funcs->p_context_destroy( context_from_client_context( client_context ) );
 }
 
 static GLenum drawable_buffer_from_buffer( struct opengl_drawable *drawable, GLenum buffer )
@@ -872,7 +871,7 @@ static enum buffer_mask buffer_mask_from_enum( GLenum buffer )
     {
     case GL_BACK:           return MASK_BACK;
     case GL_BACK_LEFT:      return MASK_BACK_LEFT;
-    case GL_BACK_RIGHT:     return MASK_BACK_LEFT;
+    case GL_BACK_RIGHT:     return MASK_BACK_RIGHT;
     case GL_FRONT:          return MASK_FRONT;
     case GL_FRONT_LEFT:     return MASK_FRONT_LEFT;
     case GL_FRONT_RIGHT:    return MASK_FRONT_RIGHT;
@@ -1209,27 +1208,98 @@ void resolve_default_fbo( TEB *teb, BOOL read )
     }
 }
 
-static GLenum *set_default_fbo_draw_buffers( struct opengl_context *ctx, struct opengl_drawable *draw,
+static const GLenum *set_default_fbo_draw_buffers( TEB *teb, struct opengl_context *ctx, struct opengl_drawable *draw,
                                              GLsizei count, const GLenum *src, GLenum *dst )
 {
-    UINT used[4] = {0};
+    const struct opengl_funcs *funcs = teb->glTable;
+    GLenum logical[ARRAY_SIZE(ctx->draw_buffers)];
+    BOOL aliased = FALSE;
+    GLint max_buffers = 0;
 
-    for (GLsizei i = 0; i < count; i++) dst[i] = GL_BACK_LEFT; /* some invalid combination */
+    /* Reject invalid counts without indexing our fixed mapping or changing
+     * the cached logical state. */
+    if (count < 0 || count > ARRAY_SIZE(ctx->draw_buffers))
+    {
+        set_gl_error( teb, GL_INVALID_VALUE );
+        return NULL;
+    }
+    if (count > 1)
+    {
+        funcs->p_glGetIntegerv( GL_MAX_DRAW_BUFFERS, &max_buffers );
+        /* During Begin/End the query is invalid and leaves its result alone.
+         * Preserve that native error without changing state or promoting. */
+        if (!max_buffers) return NULL;
+        if (count > max_buffers)
+        {
+            set_gl_error( teb, GL_INVALID_VALUE );
+            return NULL;
+        }
+    }
     for (GLsizei i = 0; i < count; i++)
     {
-        if ((buffer_mask_from_enum( src[i] ) & MASK_FRONT_LEFT) && used[0]++) return dst;
-        if ((buffer_mask_from_enum( src[i] ) & MASK_FRONT_RIGHT) && used[1]++) return dst;
-        if ((buffer_mask_from_enum( src[i] ) & MASK_BACK_LEFT) && used[2]++) return dst;
-        if ((buffer_mask_from_enum( src[i] ) & MASK_BACK_RIGHT) && used[3]++) return dst;
-        if (src[i] && !drawable_buffer_from_buffer( draw, src[i] )) return dst;
+        switch (src[i])
+        {
+        case GL_NONE:
+        case GL_FRONT_LEFT:
+        case GL_FRONT_RIGHT:
+        case GL_BACK_LEFT:
+        case GL_BACK_RIGHT:
+        case GL_AUX0:
+        case GL_AUX1:
+        case GL_AUX2:
+        case GL_AUX3:
+            break;
+        case GL_BACK:
+            if (count == 1) break;
+            set_gl_error( teb, GL_INVALID_OPERATION );
+            return NULL;
+        default:
+            set_gl_error( teb, src[i] >= GL_COLOR_ATTACHMENT0 && src[i] <= GL_COLOR_ATTACHMENT31 ?
+                               GL_INVALID_OPERATION : GL_INVALID_ENUM );
+            return NULL;
+        }
+        for (GLsizei j = 0; j < i; ++j)
+        {
+            if (!src[i] || src[i] != src[j]) continue;
+            set_gl_error( teb, GL_INVALID_OPERATION );
+            return NULL;
+        }
+        if (src[i] && src[i] != GL_BACK && !drawable_buffer_from_buffer( draw, src[i] ))
+        {
+            set_gl_error( teb, GL_INVALID_OPERATION );
+            return NULL;
+        }
+    }
+
+    /* Context restore supplies ctx->draw_buffers itself. Preserve it across
+     * promotion/restoration and the final cached-state replacement below. */
+    memcpy( logical, src, count * sizeof(*src) );
+    src = logical;
+    /* Distinct application outputs may alias the same native EGL buffer.
+     * Keep the logical duplicate checks above before allocating any storage. */
+    for (GLsizei i = 0; i < count && !draw->draw_fbo; ++i)
+        for (GLsizei j = 0; j < i; ++j)
+            if (src[i] && drawable_buffer_from_buffer( draw, src[i] ) ==
+                          drawable_buffer_from_buffer( draw, src[j] )) aliased = TRUE;
+    if (aliased)
+    {
+        GLenum error = funcs->p_context_enable_framebuffer( ctx );
+
+        if (error)
+        {
+            set_gl_error( teb, error );
+            return NULL;
+        }
+        draw = ctx->draw;
+        pop_default_fbo( teb );
+        set_default_fbo_buffers( teb, ctx );
     }
 
     memset( ctx->draw_buffers, 0, sizeof(ctx->draw_buffers) );
     for (GLsizei i = 0; i < count; i++)
     {
-        dst[i] = drawable_buffer_from_buffer( draw, src[i] );
-        if (i >= ARRAY_SIZE(ctx->draw_buffers)) FIXME( "Needs %u draw buffers\n", i );
-        else ctx->draw_buffers[i] = src[i];
+        dst[i] = drawable_buffer_from_buffer( draw, src[i] == GL_BACK && !draw->doublebuffer ? GL_FRONT_LEFT : src[i] );
+        ctx->draw_buffers[i] = src[i];
     }
 
     ctx->draw_buffer_count = count;
@@ -1243,7 +1313,7 @@ void wrap_glDrawBuffers( TEB *teb, GLsizei n, const GLenum *bufs, PFN_glDrawBuff
     GLenum buffer[ARRAY_SIZE(ctx->draw_buffers)];
 
     if ((ctx = get_current_context( teb, &draw, NULL, NULL )) && !ctx->draw_fbo)
-        bufs = set_default_fbo_draw_buffers( ctx, draw, n, bufs, buffer );
+        if (!(bufs = set_default_fbo_draw_buffers( teb, ctx, draw, n, bufs, buffer ))) return;
 
     p_glDrawBuffers( n, bufs );
 }
@@ -1255,7 +1325,10 @@ void wrap_glFramebufferDrawBuffersEXT( TEB *teb, GLuint fbo, GLsizei n, const GL
     GLenum buffer[ARRAY_SIZE(ctx->draw_buffers)];
 
     if ((ctx = get_current_context( teb, &draw, NULL, NULL )) && !fbo)
-        bufs = set_default_fbo_draw_buffers( ctx, draw, n, bufs, buffer );
+    {
+        if (!(bufs = set_default_fbo_draw_buffers( teb, ctx, draw, n, bufs, buffer ))) return;
+        fbo = ctx->draw->draw_fbo;
+    }
 
     p_glFramebufferDrawBuffersEXT( fbo, n, bufs );
 }
@@ -1267,7 +1340,10 @@ void wrap_glNamedFramebufferDrawBuffers( TEB *teb, GLuint fbo, GLsizei n, const 
     GLenum buffer[ARRAY_SIZE(ctx->draw_buffers)];
 
     if ((ctx = get_current_context( teb, &draw, NULL, NULL )) && !fbo)
-        bufs = set_default_fbo_draw_buffers( ctx, draw, n, bufs, buffer );
+    {
+        if (!(bufs = set_default_fbo_draw_buffers( teb, ctx, draw, n, bufs, buffer ))) return;
+        fbo = ctx->draw->draw_fbo;
+    }
 
     p_glNamedFramebufferDrawBuffers( fbo, n, bufs );
 }

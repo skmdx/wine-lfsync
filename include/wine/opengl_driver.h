@@ -119,7 +119,7 @@ struct __GLsync
 #include "wine/gdi_driver.h"
 
 /* Wine internal opengl driver version, needs to be bumped upon opengl_funcs changes. */
-#define WINE_OPENGL_DRIVER_VERSION 43
+#define WINE_OPENGL_DRIVER_VERSION 44
 
 struct opengl_drawable;
 
@@ -181,6 +181,7 @@ struct opengl_funcs
     BOOL (*p_query_renderer)( UINT attribute, void *value );
     struct opengl_context *(*p_context_create)( HDC hdc, const int *attribs, BOOL *broken_sharing );
     BOOL (*p_context_flush)( struct opengl_context *context, void (*flush)(void), UINT flags );
+    GLenum (*p_context_enable_framebuffer)( struct opengl_context *context );
     BOOL (*p_context_destroy)( struct opengl_context *context );
     BOOL (*p_make_current)( HDC draw_hdc, HDC read_hdc, struct opengl_context *context );
     BOOL (*p_pbuffer_create)( HDC hdc, int format, int width, int height, const int *attribs, HPBUFFERARB client_pbuffer );

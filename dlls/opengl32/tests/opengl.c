@@ -3863,7 +3863,7 @@ static void test_framebuffer(void)
     buffers[0] = GL_FRONT_AND_BACK;
     buffers[1] = GL_FRONT_LEFT;
     ext.glDrawBuffers( 2, buffers );
-    todo_wine ok_ret( GL_INVALID_ENUM, glGetError() );
+    ok_ret( GL_INVALID_ENUM, glGetError() );
     glGetIntegerv( GL_DRAW_BUFFER, &value );
     ok_ret( GL_NO_ERROR, glGetError() );
     ok_x4( value, ==, GL_FRONT_AND_BACK );
@@ -3971,7 +3971,7 @@ static void test_framebuffer(void)
     buffers[0] = GL_FRONT_LEFT;
     buffers[1] = GL_BACK_LEFT;
     ext.glDrawBuffers( 2, buffers );
-    todo_wine ok_ret( GL_NO_ERROR, glGetError() );
+    ok_ret( GL_NO_ERROR, glGetError() );
     glGetIntegerv( GL_DRAW_BUFFER, &value );
     ok_ret( GL_NO_ERROR, glGetError() );
     ok_x4( value, ==, GL_FRONT_LEFT );
@@ -3997,7 +3997,7 @@ static void test_framebuffer(void)
     buffers[0] = GL_FRONT_LEFT;
     buffers[1] = GL_BACK_LEFT;
     ext.glDrawBuffers( 2, buffers );
-    todo_wine ok_ret( GL_NO_ERROR, glGetError() );
+    ok_ret( GL_NO_ERROR, glGetError() );
     glGetIntegerv( GL_DRAW_BUFFER, &value );
     ok_ret( GL_NO_ERROR, glGetError() );
     ok_x4( value, ==, GL_FRONT_LEFT );
@@ -4024,6 +4024,224 @@ static void test_framebuffer(void)
     ok_ret( TRUE, wglDeleteContext( ctx ) );
     DestroyWindow( hwnd );
     DestroyWindow( hwnd2 );
+}
+
+static void check_draw_buffer_pixel( GLenum buffer, int x, int y, UINT expected )
+{
+    UINT pixel = 0xdeadbeef;
+
+    glReadBuffer( buffer );
+    check_gl_error( GL_NO_ERROR );
+    glReadPixels( x, y, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, &pixel );
+    check_gl_error( GL_NO_ERROR );
+    ok( (pixel & 0xffffff) == expected, "buffer %#x at %d,%d is %#x, expected %#x\n",
+        buffer, x, y, pixel & 0xffffff, expected );
+}
+
+static void test_default_draw_buffers(void)
+{
+    static const char *names[] = {"glDrawBuffers", "glFramebufferDrawBuffersEXT", "glNamedFramebufferDrawBuffers"};
+    static const GLfloat red[] = {1.0f, 0.0f, 0.0f, 1.0f}, yellow[] = {1.0f, 1.0f, 0.0f, 1.0f};
+    PIXELFORMATDESCRIPTOR pfd =
+    {
+        .nSize = sizeof(pfd),
+        .nVersion = 1,
+        .dwFlags = PFD_DRAW_TO_WINDOW | PFD_SUPPORT_OPENGL | PFD_DOUBLEBUFFER,
+        .iPixelType = PFD_TYPE_RGBA,
+        .cColorBits = 24,
+    };
+    GLuint fbo, buffers[2];
+    GLint value, rect[4];
+    UINT pixel, previous_back;
+    HGLRC context;
+    int format;
+    HWND hwnd;
+    HDC hdc;
+    BOOL ret;
+
+    if (!ext.glDrawBuffers || !ext.glClearBufferfv || !ext.glGenFramebuffers || !ext.glBindFramebuffer)
+    {
+        skip( "Indexed draw buffer clears are not supported.\n" );
+        return;
+    }
+
+    for (unsigned int i = 0; i < ARRAY_SIZE(names); ++i)
+    {
+        if ((i == 1 && !ext.glFramebufferDrawBuffersEXT) || (i == 2 && !ext.glNamedFramebufferDrawBuffers))
+        {
+            skip( "%s is not supported.\n", names[i] );
+            continue;
+        }
+        winetest_push_context( "%s", names[i] );
+        hwnd = CreateWindowW( L"static", NULL, WS_POPUP | WS_VISIBLE, 0, 0, 64, 64, NULL, NULL, NULL, NULL );
+        ok( !!hwnd, "CreateWindow failed, error %lu.\n", GetLastError() );
+        if (!hwnd) goto next;
+        hdc = GetDC( hwnd );
+        format = ChoosePixelFormat( hdc, &pfd );
+        ret = SetPixelFormat( hdc, format, &pfd );
+        ok_ret( TRUE, ret );
+        if (!ret) goto release_dc;
+        context = wglCreateContext( hdc );
+        ok( !!context, "wglCreateContext failed, error %lu.\n", GetLastError() );
+        if (!context) goto release_dc;
+        ret = wglMakeCurrent( hdc, context );
+        ok_ret( TRUE, ret );
+        if (!ret) goto destroy_context;
+        flush_events();
+
+        /* The next front write has not reached wrapped Flush/Finish when
+         * the draw-buffer request separates the output destinations. */
+        glDrawBuffer( GL_BACK );
+        glClearColor( 0.0f, 0.0f, 1.0f, 1.0f );
+        glClear( GL_COLOR_BUFFER_BIT );
+        check_gl_error( GL_NO_ERROR );
+        ok_ret( TRUE, SwapBuffers( hdc ) );
+        glDrawBuffer( GL_FRONT_LEFT );
+        glClearColor( 0.0f, 1.0f, 0.0f, 1.0f );
+        glClear( GL_COLOR_BUFFER_BIT );
+        check_gl_error( GL_NO_ERROR );
+        check_draw_buffer_pixel( GL_FRONT_LEFT, 1, 1, 0x00ff00 );
+        /* Preserve the previous observable back image too. This invariant
+         * does not assume that earlier front emulation retained a separate
+         * back image before the multiple-output request. */
+        glReadBuffer( GL_BACK );
+        glReadPixels( 1, 1, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, &previous_back );
+        check_gl_error( GL_NO_ERROR );
+        previous_back &= 0xffffff;
+
+        ext.glGenFramebuffers( 1, &fbo );
+        ext.glBindFramebuffer( GL_READ_FRAMEBUFFER, fbo );
+        glReadBuffer( GL_COLOR_ATTACHMENT0 );
+        glViewport( 3, 4, 29, 31 );
+        glScissor( 5, 6, 13, 17 );
+        glEnable( GL_SCISSOR_TEST );
+        check_gl_error( GL_NO_ERROR );
+
+        buffers[0] = GL_FRONT_LEFT;
+        buffers[1] = GL_BACK_LEFT;
+        glBegin( GL_POINTS );
+        if (!i) ext.glDrawBuffers( 2, buffers );
+        else if (i == 1) ext.glFramebufferDrawBuffersEXT( 0, 2, buffers );
+        else ext.glNamedFramebufferDrawBuffers( 0, 2, buffers );
+        glEnd();
+        check_gl_error( GL_INVALID_OPERATION );
+        glGetIntegerv( GL_DRAW_BUFFER0, &value );
+        ok_x4( value, ==, GL_FRONT_LEFT );
+        glGetIntegerv( GL_DRAW_BUFFER1, &value );
+        ok_x4( value, ==, GL_NONE );
+
+        if (!i) ext.glDrawBuffers( 2, buffers );
+        else if (i == 1) ext.glFramebufferDrawBuffersEXT( 0, 2, buffers );
+        else ext.glNamedFramebufferDrawBuffers( 0, 2, buffers );
+        check_gl_error( GL_NO_ERROR );
+        ok_ptr( wglGetCurrentContext(), ==, context );
+        glGetIntegerv( GL_DRAW_FRAMEBUFFER_BINDING, &value );
+        ok_u4( value, ==, 0 );
+        glGetIntegerv( GL_READ_FRAMEBUFFER_BINDING, &value );
+        ok_u4( value, ==, fbo );
+        glGetIntegerv( GL_DRAW_BUFFER0, &value );
+        ok_x4( value, ==, GL_FRONT_LEFT );
+        glGetIntegerv( GL_DRAW_BUFFER1, &value );
+        ok_x4( value, ==, GL_BACK_LEFT );
+        glGetIntegerv( GL_VIEWPORT, rect );
+        ok( rect[0] == 3 && rect[1] == 4 && rect[2] == 29 && rect[3] == 31,
+            "Viewport changed to %d,%d %dx%d.\n", rect[0], rect[1], rect[2], rect[3] );
+        glGetIntegerv( GL_SCISSOR_BOX, rect );
+        ok( rect[0] == 5 && rect[1] == 6 && rect[2] == 13 && rect[3] == 17,
+            "Scissor changed to %d,%d %dx%d.\n", rect[0], rect[1], rect[2], rect[3] );
+        ok_ret( GL_TRUE, glIsEnabled( GL_SCISSOR_TEST ) );
+
+        /* Restoring the default read FBO must preserve its old BACK selector,
+         * even though a named read FBO was current during the operation. */
+        ext.glBindFramebuffer( GL_READ_FRAMEBUFFER, 0 );
+        glGetIntegerv( GL_READ_BUFFER, &value );
+        ok_x4( value, ==, GL_BACK );
+        glReadPixels( 1, 1, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, &pixel );
+        check_gl_error( GL_NO_ERROR );
+        ok_x4( pixel & 0xffffff, ==, previous_back );
+        check_draw_buffer_pixel( GL_FRONT_LEFT, 1, 1, 0x00ff00 );
+
+        buffers[1] = GL_FRONT_LEFT;
+        ext.glDrawBuffers( 2, buffers );
+        check_gl_error( GL_INVALID_OPERATION );
+        glGetIntegerv( GL_DRAW_BUFFER0, &value );
+        ok_x4( value, ==, GL_FRONT_LEFT );
+        glGetIntegerv( GL_DRAW_BUFFER1, &value );
+        ok_x4( value, ==, GL_BACK_LEFT );
+
+        buffers[0] = GL_FRONT;
+        buffers[1] = GL_BACK;
+        ext.glDrawBuffers( 2, buffers );
+        check_gl_error( GL_INVALID_ENUM );
+        glGetIntegerv( GL_DRAW_BUFFER0, &value );
+        ok_x4( value, ==, GL_FRONT_LEFT );
+        glGetIntegerv( GL_DRAW_BUFFER1, &value );
+        ok_x4( value, ==, GL_BACK_LEFT );
+
+        buffers[0] = GL_COLOR_ATTACHMENT0;
+        buffers[1] = GL_BACK_LEFT;
+        ext.glDrawBuffers( 2, buffers );
+        check_gl_error( GL_INVALID_OPERATION );
+        glGetIntegerv( GL_DRAW_BUFFER0, &value );
+        ok_x4( value, ==, GL_FRONT_LEFT );
+        glGetIntegerv( GL_DRAW_BUFFER1, &value );
+        ok_x4( value, ==, GL_BACK_LEFT );
+
+        /* Restoring the context must restore both actual output selections,
+         * including when the cached input array is reused by the driver. */
+        ok_ret( TRUE, wglMakeCurrent( NULL, NULL ) );
+        ok_ret( TRUE, wglMakeCurrent( hdc, context ) );
+        glGetIntegerv( GL_DRAW_BUFFER0, &value );
+        ok_x4( value, ==, GL_FRONT_LEFT );
+        glGetIntegerv( GL_DRAW_BUFFER1, &value );
+        ok_x4( value, ==, GL_BACK_LEFT );
+
+        /* These indexed clears write through the two actual draw-buffer
+         * destinations. Cached GL queries alone cannot prove separation. */
+        ext.glClearBufferfv( GL_COLOR, 0, red );
+        ext.glClearBufferfv( GL_COLOR, 1, yellow );
+        check_gl_error( GL_NO_ERROR );
+        check_draw_buffer_pixel( GL_FRONT_LEFT, 7, 9, 0x0000ff );
+        check_draw_buffer_pixel( GL_BACK_LEFT, 7, 9, 0x00ffff );
+        check_draw_buffer_pixel( GL_FRONT_LEFT, 1, 1, 0x00ff00 );
+        check_draw_buffer_pixel( GL_BACK_LEFT, 1, 1, previous_back );
+        ok_ret( TRUE, SwapBuffers( hdc ) );
+        check_draw_buffer_pixel( GL_FRONT_LEFT, 7, 9, 0x00ffff );
+
+        /* BACK is a valid singleton, including after the hidden default FBO
+         * has been installed. It must select real back storage, not NONE. */
+        buffers[0] = GL_BACK;
+        if (!i) ext.glDrawBuffers( 1, buffers );
+        else if (i == 1) ext.glFramebufferDrawBuffersEXT( 0, 1, buffers );
+        else ext.glNamedFramebufferDrawBuffers( 0, 1, buffers );
+        check_gl_error( GL_NO_ERROR );
+        glGetIntegerv( GL_DRAW_BUFFER0, &value );
+        ok_x4( value, ==, GL_BACK );
+        glGetIntegerv( GL_DRAW_BUFFER1, &value );
+        ok_x4( value, ==, GL_NONE );
+        ext.glClearBufferfv( GL_COLOR, 0, red );
+        check_gl_error( GL_NO_ERROR );
+        check_draw_buffer_pixel( GL_BACK_LEFT, 7, 9, 0x0000ff );
+        check_draw_buffer_pixel( GL_FRONT_LEFT, 7, 9, 0x00ffff );
+        ok_ret( TRUE, wglMakeCurrent( NULL, NULL ) );
+        ok_ret( TRUE, wglMakeCurrent( hdc, context ) );
+        glGetIntegerv( GL_DRAW_BUFFER0, &value );
+        ok_x4( value, ==, GL_BACK );
+        ext.glClearBufferfv( GL_COLOR, 0, yellow );
+        check_gl_error( GL_NO_ERROR );
+        check_draw_buffer_pixel( GL_BACK_LEFT, 7, 9, 0x00ffff );
+
+        glDisable( GL_SCISSOR_TEST );
+        ext.glDeleteFramebuffers( 1, &fbo );
+        ok_ret( TRUE, wglMakeCurrent( NULL, NULL ) );
+destroy_context:
+        ok_ret( TRUE, wglDeleteContext( context ) );
+release_dc:
+        ReleaseDC( hwnd, hdc );
+        DestroyWindow( hwnd );
+next:
+        winetest_pop_context();
+    }
 }
 
 static DWORD CALLBACK test_window_dc_thread( void *arg )
@@ -5389,6 +5607,7 @@ START_TEST(opengl)
     test_gdi_dbuf( hdc );
     test_acceleration( hdc );
     test_framebuffer();
+    test_default_draw_buffers();
     test_memory_map( hdc );
     test_gl_error( hdc );
 

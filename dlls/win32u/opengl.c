@@ -84,6 +84,10 @@ static BOOLEAN global_extensions[GL_EXTENSION_COUNT];
 static struct wgl_pixel_format *pixel_formats;
 static UINT formats_count, onscreen_count;
 
+static const struct opengl_drawable_funcs framebuffer_surface_funcs;
+static BOOL prepare_framebuffer_surface_destroy( struct opengl_drawable *drawable );
+static void destroy_retired_framebuffer_surfaces(void);
+
 static BOOL has_extension( const char *list, const char *ext )
 {
     size_t len = strlen( ext );
@@ -162,6 +166,21 @@ void opengl_drawable_add_ref( struct opengl_drawable *drawable )
     TRACE( "%s increasing refcount to %u\n", debugstr_opengl_drawable( drawable ), ref );
 }
 
+static void destroy_opengl_drawable( struct opengl_drawable *drawable )
+{
+    const struct opengl_funcs *funcs = &display_funcs;
+    const struct egl_platform *egl = &display_egl;
+
+    drawable->funcs->destroy( drawable );
+    if (drawable->surface) funcs->p_eglDestroySurface( egl->display, drawable->surface );
+    if (drawable->client)
+    {
+        if (drawable->client_registered) use_window_client_surface( drawable->client, FALSE );
+        client_surface_release( drawable->client );
+    }
+    free( drawable );
+}
+
 void opengl_drawable_release( struct opengl_drawable *drawable )
 {
     ULONG ref = InterlockedDecrement( &drawable->ref );
@@ -169,17 +188,8 @@ void opengl_drawable_release( struct opengl_drawable *drawable )
 
     if (!ref)
     {
-        const struct opengl_funcs *funcs = &display_funcs;
-        const struct egl_platform *egl = &display_egl;
-
-        drawable->funcs->destroy( drawable );
-        if (drawable->surface) funcs->p_eglDestroySurface( egl->display, drawable->surface );
-        if (drawable->client)
-        {
-            if (drawable->client_registered) use_window_client_surface( drawable->client, FALSE );
-            client_surface_release( drawable->client );
-        }
-        free( drawable );
+        if (drawable->funcs == &framebuffer_surface_funcs && !prepare_framebuffer_surface_destroy( drawable )) return;
+        destroy_opengl_drawable( drawable );
     }
 }
 
@@ -269,10 +279,12 @@ static BOOL make_null_context_current( struct opengl_drawable *drawable )
 {
     struct opengl_context *context = get_null_context();
 
+    if (!context || !context->driver_private) return FALSE;
     if (!drawable) drawable = get_null_surface( context );
 
     if (!driver_funcs->p_make_current( drawable, drawable, context->driver_private )) return FALSE;
     get_opengl_thread_data()->client_current = FALSE;
+    destroy_retired_framebuffer_surfaces();
     return TRUE;
 }
 
@@ -412,7 +424,9 @@ struct framebuffer_surface
     BOOL                   storage_valid;
 };
 
-static const struct opengl_drawable_funcs framebuffer_surface_funcs;
+static pthread_mutex_t retired_framebuffers_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct list retired_framebuffers = LIST_INIT( retired_framebuffers );
+static LONG retired_framebuffers_pending;
 
 static struct framebuffer_surface *framebuffer_from_opengl_drawable( struct opengl_drawable *base )
 {
@@ -464,11 +478,24 @@ static struct opengl_drawable *get_target( struct opengl_drawable *drawable )
     return drawable;
 }
 
-static void make_client_context_current(void)
+static BOOL clear_current_context(void)
+{
+    struct opengl_thread_data *data = get_user_thread_info()->opengl_data;
+
+    if (!driver_funcs->p_make_current( NULL, NULL, NULL )) return FALSE;
+    if (data) data->client_current = FALSE;
+    return TRUE;
+}
+
+static BOOL make_client_context_current(void)
 {
     struct opengl_context *context;
-    if (!(context = NtCurrentTeb()->glContext) || get_opengl_thread_data()->client_current) return;
-    get_opengl_thread_data()->client_current = driver_funcs->p_make_current(
+
+    /* With no WGL context, application GL calls must not reach our internal
+     * context and leave errors or state for the next internal operation. */
+    if (!(context = NtCurrentTeb()->glContext)) return clear_current_context();
+    if (get_opengl_thread_data()->client_current) return TRUE;
+    return get_opengl_thread_data()->client_current = driver_funcs->p_make_current(
         get_target( context->draw ), get_target( context->read ), context->driver_private );
 }
 
@@ -706,23 +733,70 @@ static void destroy_framebuffer( struct opengl_drawable *drawable, const struct 
     TRACE( "drawable %p destroyed framebuffer %u\n", drawable, fbo );
 }
 
-static void framebuffer_surface_destroy( struct opengl_drawable *drawable )
+static void destroy_framebuffer_surface_storage( struct opengl_drawable *drawable )
 {
-    struct framebuffer_surface *surface = framebuffer_from_opengl_drawable( drawable );
     struct wgl_pixel_format draw_desc = pixel_formats[drawable->format - 1], read_desc = draw_desc;
     read_desc.samples = read_desc.sample_buffers = 0;
-
-    TRACE( "%s\n", debugstr_opengl_drawable( drawable ) );
-
-    make_null_context_current( surface->target );
 
     if (drawable->draw_fbo && drawable->draw_fbo != drawable->read_fbo)
         destroy_framebuffer( drawable, &draw_desc, drawable->draw_fbo );
     if (drawable->read_fbo) destroy_framebuffer( drawable, &read_desc, drawable->read_fbo );
-    client_surface_release_memory( CLIENT_SURFACE_MEMORY_SOURCE, surface->storage_bytes );
+    drawable->read_fbo = drawable->draw_fbo = 0;
+}
 
+static void destroy_retired_framebuffer_surfaces(void)
+{
+    struct list retired = LIST_INIT( retired );
+    struct opengl_drawable *drawable, *next;
+
+    if (!ReadAcquire( &retired_framebuffers_pending )) return;
+
+    /* The caller has bound an internal context. Detach the owned objects
+     * before native deletion; no GL or client-surface work holds this lock. */
+    pthread_mutex_lock( &retired_framebuffers_lock );
+    list_move_tail( &retired, &retired_framebuffers );
+    InterlockedExchange( &retired_framebuffers_pending, FALSE );
+    pthread_mutex_unlock( &retired_framebuffers_lock );
+
+    LIST_FOR_EACH_ENTRY_SAFE( drawable, next, &retired, struct opengl_drawable, entry )
+    {
+        list_remove( &drawable->entry );
+        destroy_framebuffer_surface_storage( drawable );
+        destroy_opengl_drawable( drawable );
+    }
+}
+
+static BOOL prepare_framebuffer_surface_destroy( struct opengl_drawable *drawable )
+{
+    if (!drawable->draw_fbo && !drawable->read_fbo) return TRUE;
+
+    /* Storage is shared and does not need the old native window to survive.
+     * A failed bind must not delete objects in the application context. Keep
+     * the complete object, including its memory charge and lifetime refs,
+     * until another successful internal bind can perform the deletion. */
+    if (!make_null_context_current( NULL ))
+    {
+        WARN( "Deferring framebuffer destruction for %s after internal bind failure\n",
+              debugstr_opengl_drawable( drawable ) );
+        pthread_mutex_lock( &retired_framebuffers_lock );
+        list_add_tail( &retired_framebuffers, &drawable->entry );
+        InterlockedExchange( &retired_framebuffers_pending, TRUE );
+        pthread_mutex_unlock( &retired_framebuffers_lock );
+        return FALSE;
+    }
+
+    destroy_framebuffer_surface_storage( drawable );
     make_client_context_current();
+    return TRUE;
+}
 
+static void framebuffer_surface_destroy( struct opengl_drawable *drawable )
+{
+    struct framebuffer_surface *surface = framebuffer_from_opengl_drawable( drawable );
+
+    TRACE( "%s\n", debugstr_opengl_drawable( drawable ) );
+    assert( !drawable->read_fbo && !drawable->draw_fbo );
+    client_surface_release_memory( CLIENT_SURFACE_MEMORY_SOURCE, surface->storage_bytes );
     if (surface->target) opengl_drawable_release( surface->target );
 }
 
@@ -963,7 +1037,12 @@ static struct opengl_drawable *framebuffer_surface_create( int format, struct cl
         if (surface->base.doublebuffer) opengl_drawable_map_buffer( &surface->base, GL_BACK_RIGHT, GL_COLOR_ATTACHMENT3 );
     }
 
-    make_null_context_current( surface->target );
+    if (!make_null_context_current( NULL ))
+    {
+        opengl_drawable_release( &surface->base );
+        RtlSetLastWin32Error( ERROR_NOT_ENOUGH_MEMORY );
+        return NULL;
+    }
 
     read_desc.samples = read_desc.sample_buffers = 0;
     surface->base.read_fbo = create_framebuffer( &surface->base, &read_desc, surface->base.virtual_size );
@@ -973,14 +1052,15 @@ static struct opengl_drawable *framebuffer_surface_create( int format, struct cl
     else surface->base.draw_fbo = create_framebuffer( &surface->base, &draw_desc, surface->base.virtual_size );
     if (!surface->base.draw_fbo) ERR( "Failed to create draw framebuffer object\n" );
 
-    make_client_context_current();
-
     if (!surface->base.read_fbo || !surface->base.draw_fbo)
     {
+        destroy_framebuffer_surface_storage( &surface->base );
+        make_client_context_current();
         opengl_drawable_release( &surface->base );
         RtlSetLastWin32Error( ERROR_NOT_ENOUGH_MEMORY );
         return NULL;
     }
+    make_client_context_current();
     surface->storage_size = surface->base.virtual_size;
     surface->storage_valid = TRUE;
 
@@ -2447,7 +2527,7 @@ static BOOL win32u_make_current( HDC draw_hdc, HDC read_hdc, struct opengl_conte
     {
         struct opengl_drawable *draw = NULL, *read = NULL;
 
-        if (!make_null_context_current( NULL )) return FALSE;
+        if (!clear_current_context()) return FALSE;
         if (!(context = prev_context)) return TRUE;
         NtCurrentTeb()->glContext = NULL;
 
@@ -2457,7 +2537,8 @@ static BOOL win32u_make_current( HDC draw_hdc, HDC read_hdc, struct opengl_conte
         if (read->client) set_window_opengl_drawable( read->client->hwnd, read, FALSE );
         opengl_drawable_release( read );
 
-        return TRUE;
+        /* Releasing the pair can temporarily bind an internal context. */
+        return clear_current_context();
     }
 
     if ((format = get_dc_pixel_format( draw_hdc )) <= 0 &&
@@ -2879,11 +2960,21 @@ static struct opengl_context *win32u_context_create( HDC hdc, const int *attribs
 
 static BOOL win32u_context_destroy( struct opengl_context *context )
 {
+    BOOL cleanup = context->client_context && !NtCurrentTeb()->glContext &&
+                   !opengl_client_context_from_client( context->client_context )->broken_sharing;
+
     TRACE( "context %p\n", context );
 
+    /* The PE context owns a virtual namespace whose final release deletes
+     * shared host objects after this call. Give that narrow cleanup scope a
+     * context, without leaving one current after the public WGL call. Internal
+     * contexts have no client handle and must not prepare their own deletion. */
+    if (cleanup && !make_null_context_current( NULL )) return FALSE;
     if (context->driver_private && !driver_funcs->p_context_destroy( context->driver_private ))
     {
         WARN( "Failed to destroy driver context %p\n", context->driver_private );
+        if (cleanup && !clear_current_context())
+            ERR( "Failed to unbind internal context after context deletion failure\n" );
         return FALSE;
     }
     context->driver_private = NULL;
@@ -2930,6 +3021,142 @@ static BOOL win32u_context_flush( struct opengl_context *context, void (*flush)(
     return TRUE;
 }
 
+/* Preserve the existing logical images before separating aliased front/back
+ * destinations. All temporary GL state belongs to the internal context. */
+static GLenum copy_native_framebuffer( struct opengl_context *context, struct opengl_drawable *destination,
+                                      GLsync ready )
+{
+    static const GLenum buffers[] = {GL_FRONT_LEFT, GL_BACK_LEFT, GL_FRONT_RIGHT, GL_BACK_RIGHT};
+    struct opengl_drawable *source = context->draw;
+    const struct wgl_pixel_format *format = pixel_formats + source->format - 1;
+    const struct opengl_funcs *funcs = &display_funcs;
+    GLuint fbos[] = {destination->draw_fbo, destination->read_fbo};
+    SIZE size = source->virtual_size;
+    GLboolean scissor, srgb;
+    GLsync copied;
+    GLenum error;
+
+    if (!make_null_context_current( source )) return GL_INVALID_OPERATION;
+    funcs->p_glWaitSync( ready, 0, GL_TIMEOUT_IGNORED );
+    scissor = funcs->p_glIsEnabled( GL_SCISSOR_TEST );
+    srgb = funcs->p_glIsEnabled( GL_FRAMEBUFFER_SRGB );
+    funcs->p_glDisable( GL_SCISSOR_TEST );
+    if (source->srgb) funcs->p_glEnable( GL_FRAMEBUFFER_SRGB );
+    else funcs->p_glDisable( GL_FRAMEBUFFER_SRGB );
+    funcs->p_glBindFramebuffer( GL_READ_FRAMEBUFFER, 0 );
+
+    for (UINT i = 0; i < ARRAY_SIZE(fbos); ++i)
+    {
+        GLbitfield mask = GL_COLOR_BUFFER_BIT;
+
+        if (i && fbos[i] == fbos[0]) break;
+        if (format->pfd.cDepthBits) mask |= GL_DEPTH_BUFFER_BIT;
+        if (format->pfd.cStencilBits) mask |= GL_STENCIL_BUFFER_BIT;
+        funcs->p_glBindFramebuffer( GL_DRAW_FRAMEBUFFER, fbos[i] );
+        for (UINT buffer = 0; buffer < (source->stereo ? 4 : 2); ++buffer)
+        {
+            /* A logical front write need not have reached a wrapped Flush.
+             * Read through the old mapping, just as the application would. */
+            funcs->p_glReadBuffer( source->buffer_map[buffers[buffer] - GL_FRONT_LEFT] );
+            funcs->p_glDrawBuffer( GL_COLOR_ATTACHMENT0 + buffer );
+            funcs->p_glBlitFramebuffer( 0, 0, size.cx, size.cy, 0, 0, size.cx, size.cy, mask, GL_NEAREST );
+            mask = GL_COLOR_BUFFER_BIT;
+        }
+    }
+
+    /* A named read FBO can be current during promotion. Initialize the hidden
+     * default FBO too, so a later BindFramebuffer(READ, 0) keeps its selection. */
+    if (context->read == source)
+    {
+        GLenum read = context->read_buffer;
+
+        if (read) read = destination->buffer_map[read - GL_FRONT_LEFT];
+        funcs->p_glBindFramebuffer( GL_READ_FRAMEBUFFER, destination->read_fbo );
+        funcs->p_glReadBuffer( read );
+    }
+
+    copied = funcs->p_glFenceSync( GL_SYNC_GPU_COMMANDS_COMPLETE, 0 );
+    funcs->p_glFlush();
+    error = funcs->p_glGetError();
+    if (!copied && !error) error = GL_OUT_OF_MEMORY;
+    if (scissor) funcs->p_glEnable( GL_SCISSOR_TEST );
+    if (srgb) funcs->p_glEnable( GL_FRAMEBUFFER_SRGB );
+    else funcs->p_glDisable( GL_FRAMEBUFFER_SRGB );
+    make_client_context_current();
+    if (copied)
+    {
+        /* Order subsequent application draws after the preservation copy. */
+        if (get_opengl_thread_data()->client_current)
+            funcs->p_glWaitSync( copied, 0, GL_TIMEOUT_IGNORED );
+        funcs->p_glDeleteSync( copied );
+    }
+    if (!get_opengl_thread_data()->client_current) return GL_INVALID_OPERATION;
+    return error;
+}
+
+static GLenum win32u_context_enable_framebuffer( struct opengl_context *context )
+{
+    const struct opengl_funcs *funcs = &display_funcs;
+    struct opengl_drawable *source = context->draw, *framebuffer;
+    GLsync ready;
+    GLenum error;
+
+    if (source->draw_fbo) return GL_NO_ERROR;
+    if (!source->client || !source->doublebuffer || context != NtCurrentTeb()->glContext)
+        return GL_INVALID_OPERATION;
+    /* The copy runs in the shared internal context. Queue a GPU dependency on
+     * all preceding application writes without a CPU wait or a host Swap. */
+    if (!funcs->p_glFenceSync || !funcs->p_glWaitSync) return GL_INVALID_OPERATION;
+    if (!(ready = funcs->p_glFenceSync( GL_SYNC_GPU_COMMANDS_COMPLETE, 0 ))) return GL_OUT_OF_MEMORY;
+    funcs->p_glFlush();
+    if (!(framebuffer = framebuffer_surface_create( source->format, source->client, source )))
+    {
+        funcs->p_glDeleteSync( ready );
+        error = GL_OUT_OF_MEMORY;
+        goto failed;
+    }
+    error = copy_native_framebuffer( context, framebuffer, ready );
+    funcs->p_glDeleteSync( ready );
+    if (error)
+    {
+        opengl_drawable_release( framebuffer );
+        goto failed;
+    }
+
+    /* The native target survives under the wrapper, including all outstanding
+     * native completion references. Move its existing registration, without
+     * unregistering the surface or changing its lifetime/scene identity. */
+    framebuffer->client_registered = source->client_registered;
+    source->client_registered = FALSE;
+    framebuffer->interval = source->interval;
+    context->draw = framebuffer;
+    if (context->read == source)
+    {
+        opengl_drawable_add_ref( framebuffer );
+        context->read = framebuffer;
+        opengl_drawable_release( source );
+    }
+    /* This context already has a native viewport/scissor. Binding its new
+     * default FBO must not repeat first-context viewport initialization. */
+    context->has_viewport = GL_TRUE;
+    if (source->owner_hdc) set_dc_opengl_drawable( source->owner_hdc, framebuffer );
+    set_window_opengl_drawable( source->client->hwnd, framebuffer, TRUE );
+    TRACE( "Separated native draw buffers for context %p, %s -> %s\n", context,
+           debugstr_opengl_drawable( source ), debugstr_opengl_drawable( framebuffer ) );
+    opengl_drawable_release( source );
+    return GL_NO_ERROR;
+
+failed:
+    /* Do not leave a successfully bound internal context receiving later
+     * application commands when the host refuses to restore the old binding.
+     * Keep the old logical drawable/registration for an explicit WGL rebind.
+     * If both host operations fail, no binding guarantee can be recovered. */
+    if (!get_opengl_thread_data()->client_current &&
+        !driver_funcs->p_make_current( NULL, NULL, NULL ))
+        ERR( "Failed to unbind the internal context after application restore failure\n" );
+    return error;
+}
+
 static BOOL win32u_wglSwapBuffers( HDC hdc )
 {
     struct opengl_context *context = NtCurrentTeb()->glContext;
@@ -2961,8 +3188,8 @@ static BOOL win32u_wglSwapBuffers( HDC hdc )
 
     opengl_drawable_flush( draw, interval, 0 );
     ret = opengl_drawable_swap( draw );
-    if (!context && !make_null_context_current( NULL )) ret = FALSE;
     opengl_drawable_release( draw );
+    if (!context && !clear_current_context()) ret = FALSE;
 
     return ret;
 }
@@ -3292,6 +3519,7 @@ static void display_funcs_init(void)
 
     display_funcs.p_wglSwapBuffers = win32u_wglSwapBuffers;
     display_funcs.p_context_flush = win32u_context_flush;
+    display_funcs.p_context_enable_framebuffer = win32u_context_enable_framebuffer;
     display_funcs.p_context_create = win32u_context_create;
     display_funcs.p_context_destroy = win32u_context_destroy;
 
@@ -3410,10 +3638,13 @@ void cleanup_opengl_thread(void)
     struct opengl_thread_data *data;
 
     /* unset current context, this is sometimes missing from host drivers and leaks memory */
-    if (driver_funcs->p_make_current( NULL, NULL, NULL ) && context)
+    if (clear_current_context() && context)
     {
         struct opengl_drawable *draw = NULL, *read = NULL;
 
+        /* Final releases may restore the caller's binding. The application
+         * pair is no longer current and must not be restored after removal. */
+        NtCurrentTeb()->glContext = NULL;
         context_exchange_drawables( context, &draw, &read );
         if (draw->client) set_window_opengl_drawable( draw->client->hwnd, draw, FALSE );
         opengl_drawable_release( draw );
@@ -3422,6 +3653,7 @@ void cleanup_opengl_thread(void)
     }
 
     if (!(data = info->opengl_data)) return;
+    if (!clear_current_context()) WARN( "Failed to unbind internal context at thread cleanup\n" );
     if (data->null_context) win32u_context_destroy( data->null_context );
     if (data->null_surface) opengl_drawable_release( data->null_surface );
     free( data );
