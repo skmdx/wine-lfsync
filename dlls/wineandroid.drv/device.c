@@ -30,7 +30,7 @@
 #include <errno.h>
 #include <stdio.h>
 #include <stdarg.h>
-#include <sys/ioctl.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <sys/uio.h>
@@ -74,10 +74,6 @@ WINE_DEFAULT_DEBUG_CHANNEL(android);
 
 static int desktop_client_fd = -1;
 static jobject java_object;
-
-#ifndef SYNC_IOC_WAIT
-#define SYNC_IOC_WAIT _IOW('>', 0, __s32)
-#endif
 
 static HWND desktop_window;
 
@@ -150,6 +146,52 @@ struct ioctl_header
     int  hwnd;
     BOOL opengl;
 };
+
+/* The two optional reply descriptors have independent ownership and roles.
+ * Requests may carry only a fence, for queue/cancel. */
+struct ioctl_fds
+{
+    int buffer;
+    int fence;
+};
+
+struct android_ioctl_reply
+{
+    int status;
+    unsigned int fd_mask;
+};
+
+#define IOCTL_BUFFER_FD 1
+#define IOCTL_FENCE_FD  2
+
+static void close_ioctl_fds( struct ioctl_fds *fds )
+{
+    if (fds->buffer != -1) close( fds->buffer );
+    if (fds->fence != -1) close( fds->fence );
+    fds->buffer = fds->fence = -1;
+}
+
+static unsigned int get_message_fds( struct msghdr *msg, int *fds, unsigned int capacity )
+{
+    struct cmsghdr *cmsg;
+    unsigned int count = 0, i;
+
+    for (cmsg = CMSG_FIRSTHDR( msg ); cmsg; cmsg = CMSG_NXTHDR( msg, cmsg ))
+        if (cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SCM_RIGHTS &&
+            cmsg->cmsg_len >= CMSG_LEN(sizeof(int)))
+        {
+            unsigned int size = (cmsg->cmsg_len - CMSG_LEN(0)) / sizeof(int);
+            int *received = (int *)CMSG_DATA(cmsg);
+
+            for (i = 0; i < size; i++)
+            {
+                if (count < capacity) fds[count] = received[i];
+                else close( received[i] );
+                count++;
+            }
+        }
+    return count;
+}
 
 struct ioctl_android_create_desktop_view
 {
@@ -274,13 +316,18 @@ static int get_ioctl_win_parent( HWND parent )
     return HandleToLong( parent );
 }
 
-static void wait_fence_and_close( int fence )
+/* Only synchronous client CPU access and the deprecated dequeue wait here.
+ * Modern native-window entry points transfer fence ownership without waiting. */
+static int wait_fence( int fence )
 {
-    __s32 timeout = 1000;  /* FIXME: should be -1 for infinite timeout */
+    struct pollfd pollfd = { fence, POLLIN, 0 };
+    int ret;
 
-    if (fence == -1) return;
-    ioctl( fence, SYNC_IOC_WAIT, &timeout );
-    close( fence );
+    if (fence == -1) return 0;
+    do ret = poll( &pollfd, 1, -1 ); while (ret == -1 && errno == EINTR);
+    if (ret == -1) return -errno;
+    if (pollfd.revents & (POLLERR | POLLNVAL)) return -EINVAL;
+    return (pollfd.revents & POLLIN) ? 0 : -EIO;
 }
 
 static inline struct ANativeWindowBuffer *anwb_from_ahb(AHardwareBuffer *ahb)
@@ -492,7 +539,7 @@ static jobject load_java_method( JNIEnv* env, jmethodID *method, const char *nam
     return java_object;
 }
 
-static int createDesktopView_ioctl( JNIEnv* env, void *data, DWORD in_size, DWORD out_size, ULONG_PTR *ret_size, int *reply_fd )
+static int createDesktopView_ioctl( JNIEnv* env, void *data, DWORD in_size, DWORD out_size, ULONG_PTR *ret_size, struct ioctl_fds *fds )
 {
     static int event_pipe[2];
     static jmethodID method;
@@ -510,7 +557,7 @@ static int createDesktopView_ioctl( JNIEnv* env, void *data, DWORD in_size, DWOR
     }
 
     event_sink = event_pipe[1];
-    *reply_fd = event_pipe[0];
+    fds->buffer = event_pipe[0];
 
     log_flags = res->log_flags; /* Copy logging levels from client */
 
@@ -520,7 +567,7 @@ static int createDesktopView_ioctl( JNIEnv* env, void *data, DWORD in_size, DWOR
     return 0;
 }
 
-static int createWindow_ioctl( JNIEnv* env, void *data, DWORD in_size, DWORD out_size, ULONG_PTR *ret_size, int *reply_fd )
+static int createWindow_ioctl( JNIEnv* env, void *data, DWORD in_size, DWORD out_size, ULONG_PTR *ret_size, struct ioctl_fds *fds )
 {
     static jmethodID method;
     jobject object;
@@ -540,7 +587,7 @@ static int createWindow_ioctl( JNIEnv* env, void *data, DWORD in_size, DWORD out
     return 0;
 }
 
-static int destroyWindow_ioctl( JNIEnv* env, void *data, DWORD in_size, DWORD out_size, ULONG_PTR *ret_size, int *reply_fd )
+static int destroyWindow_ioctl( JNIEnv* env, void *data, DWORD in_size, DWORD out_size, ULONG_PTR *ret_size, struct ioctl_fds *fds )
 {
     static jmethodID method;
     jobject object;
@@ -560,7 +607,7 @@ static int destroyWindow_ioctl( JNIEnv* env, void *data, DWORD in_size, DWORD ou
     return 0;
 }
 
-static int windowPosChanged_ioctl( JNIEnv* env, void *data, DWORD in_size, DWORD out_size, ULONG_PTR *ret_size, int *reply_fd )
+static int windowPosChanged_ioctl( JNIEnv* env, void *data, DWORD in_size, DWORD out_size, ULONG_PTR *ret_size, struct ioctl_fds *fds )
 {
     static jmethodID method;
     jobject object;
@@ -582,7 +629,7 @@ static int windowPosChanged_ioctl( JNIEnv* env, void *data, DWORD in_size, DWORD
     return 0;
 }
 
-static int dequeueBuffer_ioctl( JNIEnv* env, void *data, DWORD in_size, DWORD out_size, ULONG_PTR *ret_size, int *reply_fd )
+static int dequeueBuffer_ioctl( JNIEnv* env, void *data, DWORD in_size, DWORD out_size, ULONG_PTR *ret_size, struct ioctl_fds *fds )
 {
     struct ANativeWindow *parent;
     struct ioctl_android_dequeueBuffer *res = data;
@@ -649,10 +696,10 @@ static int dequeueBuffer_ioctl( JNIEnv* env, void *data, DWORD in_size, DWORD ou
             goto failed;
         }
 
-        *reply_fd = sv[1];
+        fds->buffer = sv[1];
     }
 
-    wait_fence_and_close( fence );
+    fds->fence = fence;
     return 0;
 
 failed:
@@ -667,7 +714,7 @@ failed:
     return ret;
 }
 
-static int cancelBuffer_ioctl( JNIEnv* env, void *data, DWORD in_size, DWORD out_size, ULONG_PTR *ret_size, int *reply_fd )
+static int cancelBuffer_ioctl( JNIEnv* env, void *data, DWORD in_size, DWORD out_size, ULONG_PTR *ret_size, struct ioctl_fds *fds )
 {
     struct ioctl_android_cancelBuffer *res = data;
     struct ANativeWindow *parent;
@@ -684,14 +731,15 @@ static int cancelBuffer_ioctl( JNIEnv* env, void *data, DWORD in_size, DWORD out
     if (!(buffer = get_registered_buffer( win_data, res->buffer_id ))) return -ENOENT;
 
     LOG( TRACE, "%08x buffer %p\n", res->hdr.hwnd, buffer );
-    ret = parent->cancelBuffer( parent, buffer, -1 );
+    ret = parent->cancelBuffer( parent, buffer, fds->fence );
+    fds->fence = -1;
     if (res->discard) unregister_buffer( win_data, res->buffer_id );
     LOG( TRACE, "%08x id %d generation %d discard %d cancel returned %d\n",
          res->hdr.hwnd, res->buffer_id, res->generation, res->discard, ret );
     return ret;
 }
 
-static int queueBuffer_ioctl( JNIEnv* env, void *data, DWORD in_size, DWORD out_size, ULONG_PTR *ret_size, int *reply_fd )
+static int queueBuffer_ioctl( JNIEnv* env, void *data, DWORD in_size, DWORD out_size, ULONG_PTR *ret_size, struct ioctl_fds *fds )
 {
     struct ioctl_android_queueBuffer *res = data;
     struct ANativeWindow *parent;
@@ -708,11 +756,12 @@ static int queueBuffer_ioctl( JNIEnv* env, void *data, DWORD in_size, DWORD out_
     if (!(buffer = get_registered_buffer( win_data, res->buffer_id ))) return -ENOENT;
 
     LOG( TRACE, "%08x buffer %p\n", res->hdr.hwnd, buffer );
-    ret = parent->queueBuffer( parent, buffer, -1 );
+    ret = parent->queueBuffer( parent, buffer, fds->fence );
+    fds->fence = -1;
     return ret;
 }
 
-static int query_ioctl( JNIEnv* env, void *data, DWORD in_size, DWORD out_size, ULONG_PTR *ret_size, int *reply_fd )
+static int query_ioctl( JNIEnv* env, void *data, DWORD in_size, DWORD out_size, ULONG_PTR *ret_size, struct ioctl_fds *fds )
 {
     struct ioctl_android_query *res = data;
     struct ANativeWindow *parent;
@@ -729,7 +778,7 @@ static int query_ioctl( JNIEnv* env, void *data, DWORD in_size, DWORD out_size, 
     return ret;
 }
 
-static int perform_ioctl( JNIEnv* env, void *data, DWORD in_size, DWORD out_size, ULONG_PTR *ret_size, int *reply_fd )
+static int perform_ioctl( JNIEnv* env, void *data, DWORD in_size, DWORD out_size, ULONG_PTR *ret_size, struct ioctl_fds *fds )
 {
     struct ioctl_android_perform *res = data;
     struct ANativeWindow *parent;
@@ -796,7 +845,7 @@ static int perform_ioctl( JNIEnv* env, void *data, DWORD in_size, DWORD out_size
     return ret;
 }
 
-static int setSwapInterval_ioctl( JNIEnv* env, void *data, DWORD in_size, DWORD out_size, ULONG_PTR *ret_size, int *reply_fd )
+static int setSwapInterval_ioctl( JNIEnv* env, void *data, DWORD in_size, DWORD out_size, ULONG_PTR *ret_size, struct ioctl_fds *fds )
 {
     struct ioctl_android_set_swap_interval *res = data;
     struct ANativeWindow *parent;
@@ -813,7 +862,7 @@ static int setSwapInterval_ioctl( JNIEnv* env, void *data, DWORD in_size, DWORD 
     return ret;
 }
 
-static int setWindowParent_ioctl( JNIEnv* env, void *data, DWORD in_size, DWORD out_size, ULONG_PTR *ret_size, int *reply_fd )
+static int setWindowParent_ioctl( JNIEnv* env, void *data, DWORD in_size, DWORD out_size, ULONG_PTR *ret_size, struct ioctl_fds *fds )
 {
     static jmethodID method;
     jobject object;
@@ -832,7 +881,7 @@ static int setWindowParent_ioctl( JNIEnv* env, void *data, DWORD in_size, DWORD 
     return 0;
 }
 
-static int setCapture_ioctl( JNIEnv* env, void *data, DWORD in_size, DWORD out_size, ULONG_PTR *ret_size, int *reply_fd )
+static int setCapture_ioctl( JNIEnv* env, void *data, DWORD in_size, DWORD out_size, ULONG_PTR *ret_size, struct ioctl_fds *fds )
 {
     struct ioctl_android_set_capture *res = data;
 
@@ -845,7 +894,7 @@ static int setCapture_ioctl( JNIEnv* env, void *data, DWORD in_size, DWORD out_s
     return 0;
 }
 
-static int setCursor_ioctl( JNIEnv* env, void *data, DWORD in_size, DWORD out_size, ULONG_PTR *ret_size, int *reply_fd )
+static int setCursor_ioctl( JNIEnv* env, void *data, DWORD in_size, DWORD out_size, ULONG_PTR *ret_size, struct ioctl_fds *fds )
 {
     static jmethodID method;
     jobject object;
@@ -879,7 +928,7 @@ static int setCursor_ioctl( JNIEnv* env, void *data, DWORD in_size, DWORD out_si
     return 0;
 }
 
-typedef int (*ioctl_func)( JNIEnv* env, void *in, DWORD in_size, DWORD out_size, ULONG_PTR *ret_size, int *reply_fd );
+typedef int (*ioctl_func)( JNIEnv* env, void *in, DWORD in_size, DWORD out_size, ULONG_PTR *ret_size, struct ioctl_fds *fds );
 static const ioctl_func ioctl_funcs[] =
 {
     createDesktopView_ioctl,    /* IOCTL_CREATE_DESKTOP_VIEW */
@@ -910,17 +959,20 @@ static int handle_ioctl_message( JNIEnv *env, int fd )
     struct ANativeWindow *dequeued_parent = NULL;
     struct ANativeWindowBuffer *dequeued_buffer = NULL;
     AHardwareBuffer *dequeued_ahb = NULL;
-    char buffer[1024], control[CMSG_SPACE(sizeof(int))];
-    int code = 0, status = -EINVAL, reply_fd = -1;
+    char buffer[1024], control[CMSG_SPACE(2 * sizeof(int))];
+    struct ioctl_fds fds = { -1, -1 };
+    struct android_ioctl_reply result = { -EINVAL, 0 };
+    int code = 0, received[2] = { -1, -1 }, sent[2];
+    unsigned int count;
     ULONG_PTR reply_size = 0;
     ssize_t ret;
     struct iovec iov[2] = { { &code, sizeof(code) }, { buffer, sizeof(buffer) } };
-    struct iovec reply_iov[2] = { { &status, sizeof(status) }, { buffer, 0 } };
-    struct msghdr msg = { NULL, 0, iov, 2, NULL, 0, 0 };
+    struct iovec reply_iov[2] = { { &result, sizeof(result) }, { buffer, 0 } };
+    struct msghdr msg = { NULL, 0, iov, 2, control, sizeof(control), 0 };
     struct msghdr reply = { NULL, 0, reply_iov, 2, NULL, 0, 0 };
     struct cmsghdr *cmsg;
 
-    ret = recvmsg( fd, &msg, MSG_DONTWAIT );
+    ret = recvmsg( fd, &msg, MSG_DONTWAIT | MSG_CMSG_CLOEXEC );
     if (ret < 0)
     {
         if (errno == EINTR) return 0;
@@ -928,7 +980,15 @@ static int handle_ioctl_message( JNIEnv *env, int fd )
         return 1;
     }
 
-    if (!ret || ret < sizeof(code)) return 1;
+    count = get_message_fds( &msg, received, ARRAY_SIZE(received) );
+    if (!ret || ret < sizeof(code) || (msg.msg_flags & (MSG_TRUNC | MSG_CTRUNC)) ||
+        count > 1 || (count && code != IOCTL_QUEUE_BUFFER && code != IOCTL_CANCEL_BUFFER))
+    {
+        if (received[0] != -1) close( received[0] );
+        if (received[1] != -1) close( received[1] );
+        return 1;
+    }
+    fds.fence = received[0];
     ret -= sizeof(code);
 
     if ((unsigned int)code < NB_IOCTLS)
@@ -936,8 +996,8 @@ static int handle_ioctl_message( JNIEnv *env, int fd )
         if (ret >= sizeof(struct ioctl_header))
         {
             pthread_mutex_lock( &dispatch_ioctl_lock );
-            status = ioctl_funcs[code]( env, buffer, ret, sizeof(buffer), &reply_size, &reply_fd );
-            if (code == IOCTL_DEQUEUE_BUFFER && !status)
+            result.status = ioctl_funcs[code]( env, buffer, ret, sizeof(buffer), &reply_size, &fds );
+            if (code == IOCTL_DEQUEUE_BUFFER && !result.status)
             {
                 struct ioctl_android_dequeueBuffer *dequeue = (void *)buffer;
                 struct native_win_data *win = get_ioctl_native_win_data( &dequeue->hdr );
@@ -958,51 +1018,64 @@ static int handle_ioctl_message( JNIEnv *env, int fd )
     else
     {
         LOG( FIXME, "ioctl %x not supported\n", code );
-        status = -ENOTSUP;
+        result.status = -ENOTSUP;
     }
 
+    /* A stale or rejected queue/cancel still consumes the caller's fence. */
+    if ((code == IOCTL_QUEUE_BUFFER || code == IOCTL_CANCEL_BUFFER) && fds.fence != -1)
+    {
+        close( fds.fence );
+        fds.fence = -1;
+    }
+    count = 0;
+    if (fds.buffer != -1)
+    {
+        result.fd_mask |= IOCTL_BUFFER_FD;
+        sent[count++] = fds.buffer;
+    }
+    if (fds.fence != -1)
+    {
+        result.fd_mask |= IOCTL_FENCE_FD;
+        sent[count++] = fds.fence;
+    }
     reply_iov[1].iov_len = reply_size;
-    if (reply_fd != -1)
+    if (count)
     {
         reply.msg_control = control;
-        reply.msg_controllen = sizeof(control);
+        reply.msg_controllen = CMSG_SPACE(count * sizeof(int));
         cmsg = CMSG_FIRSTHDR( &reply );
         cmsg->cmsg_level = SOL_SOCKET;
         cmsg->cmsg_type = SCM_RIGHTS;
-        cmsg->cmsg_len = CMSG_LEN( sizeof(reply_fd) );
-        memcpy( CMSG_DATA(cmsg), &reply_fd, sizeof(reply_fd) );
-        reply.msg_controllen = cmsg->cmsg_len;
+        cmsg->cmsg_len = CMSG_LEN(count * sizeof(int));
+        memcpy( CMSG_DATA(cmsg), sent, count * sizeof(int) );
     }
 
     ret = sendmsg( fd, &reply, MSG_NOSIGNAL );
-    if (reply_fd != -1) close( reply_fd );
-    if (ret != sizeof(status) + reply_size)
+    if (ret != sizeof(result) + reply_size && dequeued_parent)
     {
-        if (dequeued_parent)
-        {
-            struct ioctl_android_dequeueBuffer *dequeue = (void *)buffer;
-            struct native_win_data *win;
-            int cancel_ret;
+        struct ioctl_android_dequeueBuffer *dequeue = (void *)buffer;
+        struct native_win_data *win;
+        int cancel_ret;
 
-            pthread_mutex_lock( &dispatch_ioctl_lock );
-            cancel_ret = dequeued_parent->cancelBuffer( dequeued_parent, dequeued_buffer, -1 );
-            win = get_ioctl_native_win_data( &dequeue->hdr );
-            if (win && win->parent == dequeued_parent && win->generation == dequeue->generation &&
-                anwb_from_ahb(win->buffers[dequeue->buffer_id]) == dequeued_buffer)
-                unregister_buffer( win, dequeue->buffer_id );
-            pthread_mutex_unlock( &dispatch_ioctl_lock );
-            if (cancel_ret) LOG( ERR, "failed reply buffer cancellation: %d\n", cancel_ret );
-            pAHardwareBuffer_release( dequeued_ahb );
-            dequeued_parent->common.decRef( &dequeued_parent->common );
-        }
-        return 1;
+        pthread_mutex_lock( &dispatch_ioctl_lock );
+        cancel_ret = dequeued_parent->cancelBuffer( dequeued_parent, dequeued_buffer, fds.fence );
+        fds.fence = -1; /* native cancellation owns even an unsignaled fence */
+        win = get_ioctl_native_win_data( &dequeue->hdr );
+        if (win && win->parent == dequeued_parent && win->generation == dequeue->generation &&
+            anwb_from_ahb(win->buffers[dequeue->buffer_id]) == dequeued_buffer)
+            unregister_buffer( win, dequeue->buffer_id );
+        pthread_mutex_unlock( &dispatch_ioctl_lock );
+        if (cancel_ret) LOG( ERR, "failed reply buffer cancellation: %d\n", cancel_ret );
     }
+    /* Successful SCM_RIGHTS transfer duplicated the descriptors for the client.
+     * Failed sends retain ownership here, except a fence passed to cancellation. */
+    close_ioctl_fds( &fds );
     if (dequeued_parent)
     {
         pAHardwareBuffer_release( dequeued_ahb );
         dequeued_parent->common.decRef( &dequeued_parent->common );
     }
-    return 0;
+    return ret == sizeof(result) + reply_size ? 0 : 1;
 }
 
 static int looper_handle_client( int fd, int events, void *data )
@@ -1089,25 +1162,30 @@ void wine_init_jni( JNIEnv *env, jobject obj )
 /* Client-side ioctl support */
 
 
-static int android_ioctl( enum android_ioctl code, void *in, DWORD in_size, void *out, DWORD *out_size, int *recv_fd )
+/* Takes ownership of send_fence, including on connection or send failure. */
+static int android_ioctl_fds( enum android_ioctl code, void *in, DWORD in_size, void *out, DWORD *out_size,
+                              int send_fence, int *recv_buffer, int *recv_fence )
 {
     static int device_fd = -1;
     static pthread_mutex_t device_mutex = PTHREAD_MUTEX_INITIALIZER;
-    int status, err = -ENOENT;
+    struct android_ioctl_reply result;
+    int err = -ENOENT, received[2] = { -1, -1 };
+    unsigned int count, expected, i = 0;
     ssize_t ret;
-    char control[CMSG_SPACE(sizeof(int))];
-    struct iovec iov[2] = { { &status, sizeof(status) }, { out, out_size ? *out_size : 0 } };
-    struct msghdr msg = { NULL, 0, iov, (out && out_size) ? 2 : 1,
-                          recv_fd ? control : NULL, recv_fd ? sizeof(control) : 0, 0 };
+    char control[CMSG_SPACE(2 * sizeof(int))];
+    struct iovec input[2] = { { &code, sizeof(code) }, { in, in_size } };
+    struct iovec output[2] = { { &result, sizeof(result) }, { out, out_size ? *out_size : 0 } };
+    struct msghdr request = { NULL, 0, input, 2, NULL, 0, 0 };
+    struct msghdr reply = { NULL, 0, output, (out && out_size) ? 2 : 1, control, sizeof(control), 0 };
     struct cmsghdr *cmsg;
 
     pthread_mutex_lock( &device_mutex );
-
-    if (recv_fd) *recv_fd = -1;
+    if (recv_buffer) *recv_buffer = -1;
+    if (recv_fence) *recv_fence = -1;
 
     if (device_fd == -1)
     {
-        device_fd = socket( AF_UNIX, SOCK_SEQPACKET, 0 );
+        device_fd = socket( AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0 );
         if (device_fd < 0) goto done;
         if (connect( device_fd, (const struct sockaddr *)&ipc_addr, IPC_SOCKET_ADDR_LEN ) < 0)
         {
@@ -1117,47 +1195,73 @@ static int android_ioctl( enum android_ioctl code, void *in, DWORD in_size, void
         }
     }
 
-    ret = writev( device_fd, (struct iovec[]){ { &code, sizeof(code) }, { in, in_size } }, 2 );
-    if (ret <= 0 || ret != sizeof(code) + in_size) goto disconnected;
+    if (send_fence != -1)
+    {
+        request.msg_control = control;
+        request.msg_controllen = CMSG_SPACE(sizeof(send_fence));
+        cmsg = CMSG_FIRSTHDR( &request );
+        cmsg->cmsg_level = SOL_SOCKET;
+        cmsg->cmsg_type = SCM_RIGHTS;
+        cmsg->cmsg_len = CMSG_LEN(sizeof(send_fence));
+        memcpy( CMSG_DATA(cmsg), &send_fence, sizeof(send_fence) );
+    }
+    do ret = sendmsg( device_fd, &request, MSG_NOSIGNAL ); while (ret == -1 && errno == EINTR);
+    if (send_fence != -1) close( send_fence );
+    send_fence = -1;
+    if (ret != sizeof(code) + in_size) goto disconnected;
 
-    ret = recvmsg( device_fd, &msg, MSG_CMSG_CLOEXEC );
+    do ret = recvmsg( device_fd, &reply, MSG_CMSG_CLOEXEC ); while (ret == -1 && errno == EINTR);
     if (ret < 0) goto disconnected;
-    if (recv_fd)
-        for (cmsg = CMSG_FIRSTHDR( &msg ); cmsg; cmsg = CMSG_NXTHDR( &msg, cmsg ))
-            if (cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SCM_RIGHTS &&
-                cmsg->cmsg_len >= CMSG_LEN(sizeof(int)))
-            {
-                unsigned int i, count = (cmsg->cmsg_len - CMSG_LEN(0)) / sizeof(int);
-                int *fds = (int *)CMSG_DATA(cmsg);
-
-                for (i = 0; i < count; i++)
-                {
-                    if (*recv_fd == -1) *recv_fd = fds[i];
-                    else close( fds[i] );
-                }
-            }
-    if (ret <= 0 || ret < sizeof(status)) goto disconnected;
-
-    if (out && out_size) *out_size = ret - sizeof(status);
-    err = (msg.msg_flags & (MSG_TRUNC | MSG_CTRUNC)) ? -EINVAL : status;
-
+    count = get_message_fds( &reply, received, ARRAY_SIZE(received) );
+    if (ret < sizeof(result)) goto disconnected;
+    expected = !!(result.fd_mask & IOCTL_BUFFER_FD) + !!(result.fd_mask & IOCTL_FENCE_FD);
+    if ((reply.msg_flags & (MSG_TRUNC | MSG_CTRUNC)) || count != expected ||
+        (result.fd_mask & ~(IOCTL_BUFFER_FD | IOCTL_FENCE_FD)) ||
+        ((result.fd_mask & IOCTL_BUFFER_FD) && !recv_buffer) ||
+        ((result.fd_mask & IOCTL_FENCE_FD) && !recv_fence))
+    {
+        if (out_size) *out_size = 0; /* no complete native identity may be inferred */
+        err = -EINVAL;
+        goto done;
+    }
+    if (result.fd_mask & IOCTL_BUFFER_FD)
+    {
+        *recv_buffer = received[i];
+        received[i++] = -1;
+    }
+    if (result.fd_mask & IOCTL_FENCE_FD)
+    {
+        *recv_fence = received[i];
+        received[i++] = -1;
+    }
+    if (out && out_size) *out_size = ret - sizeof(result);
+    err = result.status;
     goto done;
 
 disconnected:
-    if (recv_fd && *recv_fd != -1)
-    {
-        close( *recv_fd );
-        *recv_fd = -1;
-    }
     close( device_fd );
     device_fd = -1;
     WARN( "parent process is gone\n" );
+    /* Release acquired descriptors before the existing process termination. */
+    for (i = 0; i < ARRAY_SIZE(received); i++)
+    {
+        if (received[i] != -1) close( received[i] );
+        received[i] = -1;
+    }
     NtTerminateProcess( 0, 1 );
     err = -ENOENT;
 
 done:
+    if (send_fence != -1) close( send_fence );
+    for (i = 0; i < ARRAY_SIZE(received); i++)
+        if (received[i] != -1) close( received[i] );
     pthread_mutex_unlock( &device_mutex );
     return err;
+}
+
+static int android_ioctl( enum android_ioctl code, void *in, DWORD in_size, void *out, DWORD *out_size, int *recv_fd )
+{
+    return android_ioctl_fds( code, in, in_size, out, out_size, -1, recv_fd, NULL );
 }
 
 static void win_incRef( struct android_native_base_t *base )
@@ -1179,19 +1283,26 @@ void createDesktopView( int *event_source )
     android_ioctl( IOCTL_CREATE_DESKTOP_VIEW, &res, sizeof(res), NULL, NULL, event_source );
 }
 
-static int dequeueBuffer( struct ANativeWindow *window, struct ANativeWindowBuffer **buffer, int *fence )
+static int cancel_buffer( struct native_win_wrapper *win, int id, int generation, BOOL discard, int fence )
 {
-    struct native_win_wrapper *win = (struct native_win_wrapper *)window;
+    struct ioctl_android_cancelBuffer cancel = { { HandleToLong(win->hwnd), win->opengl }, id, generation, discard };
+
+    return android_ioctl_fds( IOCTL_CANCEL_BUFFER, &cancel, sizeof(cancel), NULL, NULL, fence, NULL, NULL );
+}
+
+static int dequeue_buffer( struct native_win_wrapper *win, struct ANativeWindowBuffer **buffer, int *fence,
+                           struct ioctl_android_dequeueBuffer *identity )
+{
     struct ioctl_android_dequeueBuffer res = {0};
     DWORD size = sizeof(res);
-    int ret, buffer_fd = -1;
+    int ret, buffer_fd = -1, acquire_fence = -1;
 
     res.hdr.hwnd = HandleToLong( win->hwnd );
     res.hdr.opengl = win->opengl;
     res.buffer_id = -1;
     res.generation = 0;
 
-    ret = android_ioctl( IOCTL_DEQUEUE_BUFFER, &res, size, &res, &size, &buffer_fd );
+    ret = android_ioctl_fds( IOCTL_DEQUEUE_BUFFER, &res, size, &res, &size, -1, &buffer_fd, &acquire_fence );
     if (ret) goto failed;
     if (size != sizeof(res) || res.buffer_id < 0 || res.buffer_id >= NB_CACHED_BUFFERS ||
         res.hdr.hwnd != HandleToLong(win->hwnd) || res.hdr.opengl != win->opengl)
@@ -1229,7 +1340,8 @@ static int dequeueBuffer( struct ANativeWindow *window, struct ANativeWindowBuff
     }
 
     *buffer = anwb_from_ahb(win->buffers[res.buffer_id].self);
-    *fence = -1;
+    *fence = acquire_fence;
+    if (identity) *identity = res;
 
     TRACE( "hwnd %p, buffer %p id %d gen %d fence %d\n",
            win->hwnd, *buffer, res.buffer_id, res.generation, *fence );
@@ -1240,15 +1352,21 @@ failed:
     if (size == sizeof(res) && res.buffer_id >= 0 && res.buffer_id < NB_CACHED_BUFFERS &&
         res.hdr.hwnd == HandleToLong(win->hwnd) && res.hdr.opengl == win->opengl)
     {
-        struct ioctl_android_cancelBuffer cancel = { res.hdr, res.buffer_id, res.generation, TRUE };
         int cancel_ret;
 
         /* The native dequeue succeeded, but no usable client buffer exists.
          * Forget its server cache entry so the next dequeue transfers it again. */
-        cancel_ret = android_ioctl( IOCTL_CANCEL_BUFFER, &cancel, sizeof(cancel), NULL, NULL, NULL );
+        cancel_ret = cancel_buffer( win, res.buffer_id, res.generation, TRUE, acquire_fence );
+        acquire_fence = -1;
         if (cancel_ret) WARN( "hwnd %p failed to cancel undelivered buffer: %d\n", win->hwnd, cancel_ret );
     }
+    if (acquire_fence != -1) close( acquire_fence );
     return ret;
+}
+
+static int dequeueBuffer( struct ANativeWindow *window, struct ANativeWindowBuffer **buffer, int *fence )
+{
+    return dequeue_buffer( (struct native_win_wrapper *)window, buffer, fence, NULL );
 }
 
 static int cancelBuffer( struct ANativeWindow *window, struct ANativeWindowBuffer *buffer, int fence )
@@ -1260,14 +1378,13 @@ static int cancelBuffer( struct ANativeWindow *window, struct ANativeWindowBuffe
 
     if (!ahb_from_anwb( win, buffer, &cancel.buffer_id, &cancel.generation ))
     {
-        wait_fence_and_close( fence );
+        if (fence != -1) close( fence );
         return -EINVAL;
     }
 
     cancel.hdr.hwnd = HandleToLong( win->hwnd );
     cancel.hdr.opengl = win->opengl;
-    wait_fence_and_close( fence );
-    return android_ioctl( IOCTL_CANCEL_BUFFER, &cancel, sizeof(cancel), NULL, NULL, NULL );
+    return android_ioctl_fds( IOCTL_CANCEL_BUFFER, &cancel, sizeof(cancel), NULL, NULL, fence, NULL, NULL );
 }
 
 static int queueBuffer( struct ANativeWindow *window, struct ANativeWindowBuffer *buffer, int fence )
@@ -1279,21 +1396,28 @@ static int queueBuffer( struct ANativeWindow *window, struct ANativeWindowBuffer
 
     if (!ahb_from_anwb( win, buffer, &queue.buffer_id, &queue.generation ))
     {
-        wait_fence_and_close( fence );
+        if (fence != -1) close( fence );
         return -EINVAL;
     }
 
     queue.hdr.hwnd = HandleToLong( win->hwnd );
     queue.hdr.opengl = win->opengl;
-    wait_fence_and_close( fence );
-    return android_ioctl( IOCTL_QUEUE_BUFFER, &queue, sizeof(queue), NULL, NULL, NULL );
+    return android_ioctl_fds( IOCTL_QUEUE_BUFFER, &queue, sizeof(queue), NULL, NULL, fence, NULL, NULL );
 }
 
 static int dequeueBuffer_DEPRECATED( struct ANativeWindow *window, struct ANativeWindowBuffer **buffer )
 {
-    int fence, ret = dequeueBuffer( window, buffer, &fence );
+    struct native_win_wrapper *win = (struct native_win_wrapper *)window;
+    struct ioctl_android_dequeueBuffer identity;
+    int fence, ret = dequeue_buffer( win, buffer, &fence, &identity );
 
-    if (!ret) wait_fence_and_close( fence );
+    if (ret) return ret;
+    if ((ret = wait_fence( fence )))
+    {
+        cancel_buffer( win, identity.buffer_id, identity.generation, FALSE, fence );
+        *buffer = NULL;
+    }
+    else if (fence != -1) close( fence );
     return ret;
 }
 
@@ -1410,27 +1534,33 @@ static int perform( ANativeWindow *window, int operation, ... )
     case NATIVE_WINDOW_LOCK:
     {
         struct ANativeWindowBuffer *buffer = NULL;
+        struct ioctl_android_dequeueBuffer identity;
         struct ANativeWindow_Buffer *buffer_ret = va_arg( args, ANativeWindow_Buffer * );
-        struct AHardwareBuffer* b = NULL;
+        struct AHardwareBuffer *b = NULL;
         ARect *bounds = va_arg( args, ARect * );
-        int ret = window->dequeueBuffer_DEPRECATED( window, &buffer );
-        if (!ret && !buffer)
-        {
-            ret = -EWOULDBLOCK;
-            TRACE( "got invalid buffer\n" );
-        }
+        int fence = -1, ret, cancel_ret;
+
+        buffer_ret->bits = NULL;
+        ret = dequeue_buffer( win, &buffer, &fence, &identity );
         if (!ret)
         {
-            if (!(b = ahb_from_anwb((struct native_win_wrapper*) window, buffer, NULL, NULL))) {
-                ret = -EINVAL;
-            }
-
-            if (b && (ret = pAHardwareBuffer_lock( b, AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN | AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN, -1, NULL, &buffer_ret->bits )))
+            b = ahb_from_anwb( win, buffer, NULL, NULL );
+            if (!b) ret = -EINVAL;
+            else if (!(ret = wait_fence( fence )))
+                ret = pAHardwareBuffer_lock( b, AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN |
+                                             AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN, -1, NULL,
+                                             &buffer_ret->bits );
+            if (ret)
             {
-                WARN( "AHardwareBuffer_lock %p failed %d %s\n", win->hwnd, ret, strerror(-ret) );
-                window->cancelBuffer( window, buffer, -1 );
+                /* This is the identity of the successful native dequeue,
+                 * independent of a failed AHB conversion/lock.  Cancellation
+                 * owns the original fence, including when its wait failed. */
+                cancel_ret = cancel_buffer( win, identity.buffer_id, identity.generation, FALSE, fence );
+                fence = -1;
+                if (cancel_ret) WARN( "hwnd %p failed lock cancellation: %d\n", win->hwnd, cancel_ret );
             }
         }
+        if (fence != -1) close( fence );
         if (!ret)
         {
             AHardwareBuffer_Desc d = {0};
