@@ -3505,6 +3505,29 @@ BOOL X11DRV_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_hint, UIN
 
     if ((is_managed = is_window_managed( hwnd, swp_flags, fullscreen ))) make_owner_managed( hwnd );
 
+    if ((swp_flags & SWP_HIDEWINDOW) || !win32_visible)
+    {
+        HWND toplevel = NtUserGetAncestor( hwnd, GA_ROOT );
+        DWORD process = 0;
+
+        /* Visible producers may have filled their first channel before the
+         * owner bound it. Provision its real consumer before waiting for a
+         * native update, even when this hide removes the last visible layer.
+         * No window-data or present lock may span the actor registration. */
+        NtUserGetWindowThread( toplevel, &process );
+        if (process == GetCurrentProcessId() && !X11DRV_client_surface_bind_producers( toplevel ))
+        {
+            /* Selection/retirement may race the snapshot, and allocation can
+             * fail. Neither failure may skip the native hide: an ordinary
+             * WindowPosChanged FALSE has no deferred continuation in win32u.
+             * Leave one normal owner refresh, without reposting when that
+             * refresh itself fails. Unread images stay owned by the channel;
+             * target writers can cancel an outstanding source-capacity wait. */
+            WARN( "Could not provision hidden client-surface producers for %p\n", toplevel );
+            if (swp_flags & SWP_HIDEWINDOW)
+                NtUserPostMessage( toplevel, WM_WINE_UPDATEWINDOWSTATE, WINE_UPDATE_CLIENT_SURFACE_HANDOFFS, 0 );
+        }
+    }
     owner_update = X11DRV_client_surface_backing_begin_update( hwnd, new_rects, swp_flags, &deferred );
     if (deferred) return FALSE;
     if (!(data = get_win_data( hwnd ))) return TRUE;

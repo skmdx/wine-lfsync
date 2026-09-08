@@ -2300,6 +2300,16 @@ DECL_HANDLER(get_client_surface_handoff)
     top = get_toplevel_window( win );
     if (!(surface = get_client_surface_handoff_ref( win, req->producer, req->surface,
                                                     req->owner ))) return;
+    /* A hidden producer hint may become stale before its owner registers.
+     * Do not turn that transport-only request into channel allocation or
+     * resurrect a closed lifetime. Ordinary visible provisioning is unchanged. */
+    if (req->require_producer && (!req->owner || !surface->handoff_pool ||
+        !surface->handoff_producer_mapped || surface->handoff_top != top ||
+        surface->handoff_retired || is_client_surface_handoff_lost( surface )))
+    {
+        set_error( STATUS_INVALID_HANDLE );
+        return;
+    }
     if (surface->handoff_pool &&
         (surface->handoff_top != top || surface->handoff_retired || is_client_surface_handoff_lost( surface )))
     {
@@ -2348,6 +2358,32 @@ DECL_HANDLER(get_client_surface_handoff_event)
     reply->event = alloc_handle( current->process,
         req->owner ? surface->handoff_pool->ready_read : surface->handoff_pool->ready_write,
         req->owner ? FILE_GENERIC_READ : FILE_GENERIC_WRITE, 0 );
+}
+
+DECL_HANDLER(get_client_surface_handoff_visibility)
+{
+    struct client_surface_owner *owner;
+    struct client_surface_ref *surface;
+    struct window *win;
+
+    if (!(win = get_window( req->handle ))) return;
+    if (!(surface = get_client_surface_handoff_ref( win, 0, req->surface, 0 ))) return;
+    if (!surface->handoff_pool || !surface->handoff_producer_mapped ||
+        surface->handoff_cookie != req->cookie || surface->handoff_retired ||
+        surface->handoff_top != get_toplevel_window( win ) ||
+        is_client_surface_handoff_lost( surface ))
+    {
+        set_error( STATUS_INVALID_HANDLE );
+        return;
+    }
+    if (select_client_surface_producer( win, &owner ) != surface)
+    {
+        set_error( STATUS_INVALID_PARAMETER );
+        return;
+    }
+    /* The registered HWND and server-owned binding authenticate this lookup;
+     * the writable channel's window/endpoint fields are not authority. */
+    reply->visible = is_visible( win );
 }
 
 DECL_HANDLER(release_client_surface_handoff)
@@ -2665,7 +2701,12 @@ static void get_client_surface_handoff_desc( struct window *win, struct window *
     desc->process = owner->process->id;
     desc->surface = surface->id;
     desc->visible = is_visible( win );
-    desc->reserved = 0;
+    /* Provisioning is transport work, independent of scene visibility and
+     * whether the first completion has published READY yet. Use the server
+     * endpoint lifetime, never the writable shared endpoint hints. */
+    desc->producer_mapped = surface->handoff_pool && surface->handoff_top == top &&
+                            surface->handoff_producer_mapped && !surface->handoff_retired &&
+                            !is_client_surface_handoff_lost( surface );
     /* Shared endpoints alone cannot authorize reuse: A -> B -> A
      * leaves the old owner mapped until its checked reads finish. */
     desc->cookie = surface->handoff_pool && surface->handoff_top == top &&

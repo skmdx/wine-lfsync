@@ -1720,8 +1720,8 @@ struct handoff_binding
     UINT64 mapping_id, cookie;
 };
 
-static unsigned int get_surface_handoff( HWND hwnd, DWORD producer, UINT64 surface,
-                                         BOOL owner, struct handoff_binding *binding )
+static unsigned int get_surface_handoff_ex( HWND hwnd, DWORD producer, UINT64 surface,
+                                            BOOL owner, BOOL require_producer, struct handoff_binding *binding )
 {
     struct __server_request_info info = {0};
     const struct get_client_surface_handoff_reply *reply =
@@ -1734,6 +1734,7 @@ static unsigned int get_surface_handoff( HWND hwnd, DWORD producer, UINT64 surfa
     info.u.req.get_client_surface_handoff_request.producer = producer;
     info.u.req.get_client_surface_handoff_request.surface = surface;
     info.u.req.get_client_surface_handoff_request.owner = owner;
+    info.u.req.get_client_surface_handoff_request.require_producer = require_producer;
     status = p_wine_server_call( &info );
     if (!status)
     {
@@ -1744,6 +1745,12 @@ static unsigned int get_surface_handoff( HWND hwnd, DWORD producer, UINT64 surfa
         binding->cookie = reply->cookie;
     }
     return status;
+}
+
+static unsigned int get_surface_handoff( HWND hwnd, DWORD producer, UINT64 surface,
+                                         BOOL owner, struct handoff_binding *binding )
+{
+    return get_surface_handoff_ex( hwnd, producer, surface, owner, FALSE, binding );
 }
 
 static unsigned int release_surface_handoff( HWND hwnd, DWORD producer, UINT64 surface,
@@ -1759,6 +1766,22 @@ static unsigned int release_surface_handoff( HWND hwnd, DWORD producer, UINT64 s
     info.u.req.release_client_surface_handoff_request.cookie = cookie;
     info.u.req.release_client_surface_handoff_request.owner = owner;
     return p_wine_server_call( &info );
+}
+
+static UINT get_surface_handoff_visibility( HWND hwnd, UINT64 surface, UINT64 cookie, BOOL *visible )
+{
+    struct __server_request_info info = {0};
+    UINT status;
+
+    *visible = FALSE;
+    info.u.req.get_client_surface_handoff_visibility_request.__header.req =
+        REQ_get_client_surface_handoff_visibility;
+    info.u.req.get_client_surface_handoff_visibility_request.handle = wine_server_user_handle( hwnd );
+    info.u.req.get_client_surface_handoff_visibility_request.surface = surface;
+    info.u.req.get_client_surface_handoff_visibility_request.cookie = cookie;
+    status = p_wine_server_call( &info );
+    if (!status) *visible = info.u.reply.get_client_surface_handoff_visibility_reply.visible;
+    return status;
 }
 
 static void test_scene_snapshot(void)
@@ -3450,6 +3473,161 @@ done:
     if (producer.mapping) CloseHandle( producer.mapping );
     if (owner.mapping) CloseHandle( owner.mapping );
     DestroyWindow( hwnd );
+}
+
+static void test_handoff_cold_visibility(void)
+{
+    const UINT flags = CLIENT_SURFACE_STATE_REGISTER | CLIENT_SURFACE_STATE_SCENE_PUBLICATION;
+    const UINT64 identity = allocate_surface(), alternate = allocate_surface(), unregistered = allocate_surface();
+    struct handoff_binding producer = {0}, owner = {0}, denied;
+    struct client_surface_handoff_channel *channel = NULL;
+    struct client_surface_handoff_shared *shared;
+    struct client_surface_handoff_slot descriptors[3];
+    struct scene_snapshot snapshot;
+    const struct client_surface_scene_layer *layer;
+    struct __server_request_info info = {0};
+    HWND top = create_test_window( FALSE ), other = create_test_window( FALSE ), child = NULL;
+    BOOL visible, producer_bound = FALSE, owner_bound = FALSE;
+    void *view = NULL;
+    UINT status, index, i;
+    user_handle_t saved_window;
+
+    ok( top && other, "failed to create cold handoff parents\n" );
+    if (!top || !other) goto done;
+    child = create_test_child( top, 0 );
+    ok( !!child, "failed to create cold handoff child\n" );
+    if (!child) goto done;
+    status = set_surface_state( child, identity, flags, 0, NULL );
+    ok( !status, "cold registration status %#x\n", status );
+    status = set_surface_state( child, alternate, flags | CLIENT_SURFACE_STATE_CLAIM, 0, NULL );
+    ok( !status, "unused producer claim status %#x\n", status );
+    status = get_surface_handoff_ex( child, GetCurrentProcessId(), alternate, TRUE, TRUE, &denied );
+    ok( status == STATUS_INVALID_HANDLE && !denied.mapping && !denied.cookie,
+        "transport-only bind allocated an unused channel, status %#x\n", status );
+    status = get_scene_snapshot( top, 0, sizeof(snapshot.data), &snapshot );
+    layer = status ? NULL : find_scene_layer( &snapshot, child );
+    ok( layer && !layer->producer.producer_mapped && !layer->producer.cookie,
+        "unused registration advertised a producer endpoint\n" );
+    status = get_surface_handoff( child, 0, identity, FALSE, &producer );
+    ok( !status, "cold producer bind status %#x\n", status );
+    if (status) goto done;
+    producer_bound = TRUE;
+    view = MapViewOfFile( producer.mapping, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, producer.size );
+    ok( !!view, "cold source map failed %lu\n", GetLastError() );
+    if (!view) goto done;
+    shared = view;
+    channel = (void *)((char *)view + producer.offset);
+    index = channel - shared->channels;
+
+    status = get_surface_handoff_visibility( child, identity, producer.cookie, &visible );
+    ok( status == STATUS_INVALID_PARAMETER && !visible, "unclaimed visibility status %#x\n", status );
+    status = claim_surface_state( child, identity, NULL );
+    ok( !status, "cold claim status %#x\n", status );
+    status = get_surface_handoff_visibility( child, identity, producer.cookie, &visible );
+    ok( !status && !visible, "hidden ancestor visibility status %#x visible %u\n", status, visible );
+    status = get_scene_snapshot( top, 0, sizeof(snapshot.data), &snapshot );
+    layer = status ? NULL : find_scene_layer( &snapshot, child );
+    ok( layer && layer->producer.producer_mapped && !layer->producer.visible && !layer->producer.cookie,
+        "mapped producer before READY is missing from hidden provisioning roster\n" );
+    channel->endpoints = CLIENT_SURFACE_HANDOFF_ENDPOINT_CONSUMER;
+    status = get_scene_snapshot( top, 0, sizeof(snapshot.data), &snapshot );
+    layer = status ? NULL : find_scene_layer( &snapshot, child );
+    ok( layer && layer->producer.producer_mapped && !layer->producer.cookie,
+        "writable endpoints changed server producer/reuse authority\n" );
+    channel->endpoints = CLIENT_SURFACE_HANDOFF_ENDPOINT_PRODUCER;
+    status = get_surface_handoff_visibility( child, identity, producer.cookie + 1, &visible );
+    ok( status == STATUS_INVALID_HANDLE && !visible, "wrong cookie visibility status %#x\n", status );
+    status = get_surface_handoff_visibility( other, identity, producer.cookie, &visible );
+    ok( status == STATUS_INVALID_PARAMETER && !visible, "wrong window visibility status %#x\n", status );
+    status = get_surface_handoff_visibility( child, alternate, producer.cookie, &visible );
+    ok( status == STATUS_INVALID_HANDLE && !visible, "other registered identity visibility status %#x\n", status );
+    status = get_surface_handoff_visibility( child, unregistered, producer.cookie, &visible );
+    ok( status == STATUS_INVALID_PARAMETER && !visible, "unregistered identity visibility status %#x\n", status );
+    status = set_scene_placement( top, 0, 0, 0, SWP_SHOWWINDOW );
+    ok( !status, "cold parent show status %#x\n", status );
+    status = get_surface_handoff_visibility( child, identity, producer.cookie, &visible );
+    ok( !status && visible, "visible cold binding status %#x visible %u\n", status, visible );
+    ok( channel->endpoints == CLIENT_SURFACE_HANDOFF_ENDPOINT_PRODUCER &&
+        !channel->producer_sequence && !channel->consumer_sequence,
+        "visibility query acquired an endpoint or changed a sequence\n" );
+    saved_window = channel->window;
+    channel->window = wine_server_user_handle( other );
+    status = get_surface_handoff_visibility( child, identity, producer.cookie, &visible );
+    ok( !status && visible, "writable HWND hint changed visibility authority, status %#x\n", status );
+    channel->window = saved_window;
+
+    /* Exercise the actual server lifecycle with an unread descriptor. These
+     * bytes test transport ownership, not a fabricated native copy receipt. */
+    for (i = 0; i < ARRAY_SIZE(descriptors); ++i)
+        descriptors[i] = (struct client_surface_handoff_slot){.cookie = producer.cookie, .identity = identity,
+            .target_epoch = 7, .source_sequence = i + 1, .width = 50, .height = 40};
+    memcpy( channel->slots, descriptors, sizeof(descriptors) );
+    __atomic_store_n( &channel->producer_sequence, ARRAY_SIZE(descriptors), __ATOMIC_RELEASE );
+    __atomic_fetch_or( &shared->ready_bitmap[index / 64], (UINT64)1 << (index % 64), __ATOMIC_RELEASE );
+    status = set_scene_placement( top, 0, 0, 0, SWP_HIDEWINDOW );
+    ok( !status, "cold parent hide status %#x\n", status );
+    status = get_surface_handoff_visibility( child, identity, producer.cookie, &visible );
+    ok( !status && !visible, "hide before bind visibility status %#x visible %u\n", status, visible );
+    status = get_scene_snapshot( top, 0, sizeof(snapshot.data), &snapshot );
+    layer = status ? NULL : find_scene_layer( &snapshot, child );
+    ok( layer && layer->producer.producer_mapped && !layer->producer.visible && !layer->producer.cookie,
+        "hiding three unread images lost the real producer provisioning obligation\n" );
+    status = get_surface_handoff_ex( child, GetCurrentProcessId(), identity, TRUE, TRUE, &owner );
+    ok( !status && owner.cookie == producer.cookie, "late hidden owner bind status %#x\n", status );
+    if (status) goto done;
+    owner_bound = TRUE;
+    ok( !channel->closed && channel->producer_sequence == ARRAY_SIZE(descriptors) && !channel->consumer_sequence &&
+        !memcmp( descriptors, channel->slots, sizeof(descriptors) ) &&
+        (shared->ready_bitmap[index / 64] & ((UINT64)1 << (index % 64))),
+        "hide/late bind changed an unread image, sequence or ready hint\n" );
+    status = set_scene_placement( top, 0, 0, 0, SWP_SHOWWINDOW );
+    ok( !status, "bound parent show status %#x\n", status );
+    status = set_surface_state( child, alternate, flags | CLIENT_SURFACE_STATE_CLAIM, 0, NULL );
+    ok( !status, "alternate claim status %#x\n", status );
+    status = get_surface_handoff_visibility( child, identity, producer.cookie, &visible );
+    ok( status == STATUS_INVALID_PARAMETER && !visible, "unselected source visibility status %#x\n", status );
+    status = claim_surface_state( child, identity, NULL );
+    ok( !status, "original reclaim status %#x\n", status );
+    status = get_surface_handoff_visibility( child, identity, producer.cookie, &visible );
+    ok( !status && visible, "reclaimed live visibility status %#x visible %u\n", status, visible );
+
+    info.u.req.set_parent_request.__header.req = REQ_set_parent;
+    info.u.req.set_parent_request.handle = wine_server_user_handle( child );
+    info.u.req.set_parent_request.parent = wine_server_user_handle( other );
+    status = p_wine_server_call( &info );
+    ok( !status, "cold channel reparent status %#x\n", status );
+    status = get_surface_handoff_visibility( child, identity, producer.cookie, &visible );
+    ok( status == STATUS_INVALID_HANDLE && !visible, "old owner visibility status %#x\n", status );
+    status = get_scene_snapshot( other, 0, sizeof(snapshot.data), &snapshot );
+    layer = status ? NULL : find_scene_layer( &snapshot, child );
+    ok( layer && !layer->producer.producer_mapped && !layer->producer.cookie,
+        "retargeted old endpoint advertised a current provisioning obligation\n" );
+    status = get_surface_handoff_ex( child, GetCurrentProcessId(), identity, TRUE, TRUE, &denied );
+    ok( status == STATUS_INVALID_HANDLE && !denied.mapping,
+        "transport-only bind resurrected a retired lifetime, status %#x\n", status );
+    status = set_surface_state( child, identity, CLIENT_SURFACE_STATE_UNREGISTER, 0, NULL );
+    ok( !status, "cold unregister status %#x\n", status );
+    status = get_surface_handoff_visibility( child, identity, producer.cookie, &visible );
+    ok( status == STATUS_INVALID_PARAMETER && !visible, "retired visibility status %#x\n", status );
+    ok( channel->closed && channel->producer_sequence == ARRAY_SIZE(descriptors) && !channel->consumer_sequence &&
+        !memcmp( descriptors, channel->slots, sizeof(descriptors) ),
+        "retirement acknowledged or changed an unread image\n" );
+
+done:
+    if (child)
+    {
+        set_surface_state( child, identity, CLIENT_SURFACE_STATE_UNREGISTER, 0, NULL );
+        set_surface_state( child, alternate, CLIENT_SURFACE_STATE_UNREGISTER, 0, NULL );
+    }
+    release_surface( unregistered );
+    if (producer_bound) release_surface_handoff( 0, 0, identity, producer.cookie, FALSE );
+    if (owner_bound) release_surface_handoff( top, GetCurrentProcessId(), identity, owner.cookie, TRUE );
+    if (view) UnmapViewOfFile( view );
+    if (producer.mapping) CloseHandle( producer.mapping );
+    if (owner.mapping) CloseHandle( owner.mapping );
+    if (child) DestroyWindow( child );
+    if (top) DestroyWindow( top );
+    if (other) DestroyWindow( other );
 }
 
 static void test_handoff_storage(void)
@@ -5938,6 +6116,7 @@ static BOOL run_focused_test_case( const char *name, char **argv )
          test_native_backing_barrier},
         {"demoted-native-barrier", "native backing barrier after demotion", test_demoted_native_barrier},
         {"handoff-storage", "client surface generation handoff storage", test_handoff_storage},
+        {"handoff-cold-visibility", "initial handoff visibility and lifetime", test_handoff_cold_visibility},
         {"handoff-receipts", "source-independent assembly receipts", test_handoff_receipts},
         {"child-visibility-sources", "retained hidden source and legacy placement", test_child_visibility_sources},
         {"notification-filter", "client surface notification filter bypass",
@@ -6149,6 +6328,7 @@ START_TEST(client_surface)
     test_completion_result_provenance();
     trace( "testing client surface generation handoff storage\n" );
     test_handoff_storage();
+    test_handoff_cold_visibility();
     test_handoff_receipts();
     test_child_visibility_sources();
     test_handoff_lost_recovery();

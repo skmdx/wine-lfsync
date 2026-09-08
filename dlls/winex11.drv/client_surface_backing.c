@@ -1318,9 +1318,13 @@ static BOOL check_client_surface_compositor_scene( const struct client_surface_c
     struct client_surface_compositor_target *target =
         find_client_surface_compositor_target( job->handoff_toplevel );
     struct client_surface_compositor_binding *binding;
-    unsigned int i, count = 0, found = 0;
+    unsigned int i, count = 0, found = 0, needed = 0, bound = 0;
 
-    for (i = 0; i < job->handoff_count; ++i) count += !!job->handoffs[i].visible;
+    for (i = 0; i < job->handoff_count; ++i)
+    {
+        count += !!job->handoffs[i].visible;
+        needed += !!(job->handoffs[i].visible || job->handoffs[i].producer_mapped);
+    }
     if (!target || !target->scene.valid || target->scene.strategy != OWNER_COMPOSITE ||
         target->scene.epoch != job->scene_epoch ||
         target->scene.count != count) return FALSE;
@@ -1345,12 +1349,13 @@ static BOOL check_client_surface_compositor_scene( const struct client_surface_c
         if (wine_server_user_handle( binding->window ) != desc->handle ||
             binding->process != desc->process || binding->identity != desc->surface ||
             binding->cookie != desc->cookie || !client_surface_compositor_binding_is_live( binding )) return FALSE;
+        bound += !!(desc->visible || desc->producer_mapped);
         if (!desc->visible) continue;
         if (binding->scene_index >= target->scene.count ||
             target->scene.members[binding->scene_index] != binding) return FALSE;
         ++found;
     }
-    return found == count;
+    return found == count && bound == needed;
 }
 
 static BOOL install_client_surface_scene_plan( struct client_surface_compositor_target *target,
@@ -3929,6 +3934,7 @@ static BOOL register_client_surface_handoff( HWND toplevel,
         req->producer = desc->process;
         req->surface = desc->surface;
         req->owner = 1;
+        req->require_producer = !desc->visible;
         status = wine_server_call( req );
         if (!status)
         {
@@ -3977,13 +3983,78 @@ release:
     return FALSE;
 }
 
+static BOOL bind_client_surface_handoffs( HWND toplevel, struct client_surface_handoff_desc *descs,
+                                          UINT count, UINT64 mark )
+{
+    struct client_surface_compositor_job job =
+    {
+        .op = CLIENT_SURFACE_COMPOSITOR_REUSE_HANDOFFS,
+        .handoff_toplevel = toplevel,
+        .handoffs = descs,
+        .handoff_count = count,
+        .mark = mark,
+    };
+    BOOL *reused, ret = FALSE;
+    UINT i;
+
+    if (!count) return TRUE;
+    if (!(reused = calloc( count, sizeof(*reused) ))) return FALSE;
+    job.handoff_reused = reused;
+    if (!submit_client_surface_compositor_job( &job )) goto done;
+    for (i = 0; i < count; ++i)
+        /* A live producer can have unread frames or a capture already
+         * waiting for storage. Hiding it does not cancel that obligation.
+         * Unused hidden registrations still need no channel. */
+        if ((descs[i].visible || descs[i].producer_mapped) && !reused[i] &&
+            !register_client_surface_handoff( toplevel, &descs[i], mark )) goto done;
+    ret = TRUE;
+done:
+    free( reused );
+    return ret;
+}
+
+BOOL X11DRV_client_surface_bind_producers( HWND toplevel )
+{
+    struct client_surface_scene_member *members = NULL;
+    struct client_surface_handoff_desc *descs = NULL;
+    UINT count = 0, live = 0, i;
+    UINT64 scene = 0, mark = InterlockedIncrement64( (LONG64 *)&client_surface_compositor_mark );
+    BOOL ret = FALSE;
+
+    if (!mark) mark = InterlockedIncrement64( (LONG64 *)&client_surface_compositor_mark );
+    if (!client_surface_get_scene_snapshot( toplevel, &scene, &count, &members )) goto done;
+    if (count && !(descs = calloc( count, sizeof(*descs) ))) goto done;
+    for (i = 0; i < count; ++i)
+    {
+        if (!members[i].producer_mapped) continue;
+        descs[live++] = (struct client_surface_handoff_desc)
+        {
+            .handle = wine_server_user_handle( members[i].hwnd ),
+            .process = members[i].process,
+            .surface = members[i].identity,
+            .cookie = members[i].cookie,
+            .visible = members[i].visible,
+            .producer_mapped = TRUE,
+        };
+    }
+    /* Bind only transport here. Installing or sweeping a scene before the
+     * native update barrier could alter an in-flight assembly. Registration
+     * authenticates the current selected producer and channel lifetime; the
+     * actor scans READY even without a visible layout or backing target. */
+    if (live) qsort( descs, live, sizeof(*descs), compare_client_surface_handoff_descs );
+    ret = bind_client_surface_handoffs( toplevel, descs, live, mark );
+done:
+    free( descs );
+    client_surface_free_scene_snapshot( count, members );
+    return ret;
+}
+
 static BOOL refresh_client_surface_handoffs( HWND toplevel )
 {
     struct client_surface_handoff_desc *descs = NULL;
     struct client_surface_scene_member *members = NULL;
     struct client_surface_scene_layout *layouts = NULL;
     struct client_surface_scene scene;
-    BOOL *reused = NULL;
     UINT count = 0, i, index;
     unsigned int layout_count = 0;
     UINT64 scene_generation = 0;
@@ -4009,6 +4080,7 @@ static BOOL refresh_client_surface_handoffs( HWND toplevel )
         descs[i].surface = members[i].identity;
         descs[i].cookie = members[i].cookie;
         descs[i].visible = members[i].visible;
+        descs[i].producer_mapped = members[i].producer_mapped;
     }
     if (count) qsort( descs, count, sizeof(*descs), compare_client_surface_handoff_descs );
     {
@@ -4051,26 +4123,7 @@ static BOOL refresh_client_surface_handoffs( HWND toplevel )
         if (!(layouts[index].clip = X11DRV_GetRegionData( members[i].region, 0 ))) goto failed;
         ++index;
     }
-    if (count)
-    {
-        struct client_surface_compositor_job job =
-        {
-            .op = CLIENT_SURFACE_COMPOSITOR_REUSE_HANDOFFS,
-            .handoff_toplevel = toplevel,
-            .handoffs = descs,
-            .handoff_count = count,
-            .mark = mark,
-        };
-
-        if (!(reused = calloc( count, sizeof(*reused) ))) goto failed;
-        job.handoff_reused = reused;
-        if (!submit_client_surface_compositor_job( &job )) goto failed;
-        for (i = 0; i < count; ++i)
-            /* Do not provision channels for never-displayed hidden surfaces.
-             * Existing authenticated bindings are marked above and retained. */
-            if (descs[i].visible && !reused[i] &&
-                !register_client_surface_handoff( toplevel, &descs[i], mark )) goto failed;
-    }
+    if (!bind_client_surface_handoffs( toplevel, descs, count, mark )) goto failed;
 
     if (!client_surface_scene_snapshot_current( toplevel, scene_generation )) goto failed;
     {
@@ -4092,14 +4145,12 @@ static BOOL refresh_client_surface_handoffs( HWND toplevel )
     }
     free_client_surface_scene_layouts( layouts, layout_count );
     free( descs );
-    free( reused );
     client_surface_free_scene_snapshot( count, members );
     return TRUE;
 
 failed:
     free_client_surface_scene_layouts( layouts, layout_count );
     free( descs );
-    free( reused );
     client_surface_free_scene_snapshot( count, members );
     return FALSE;
 }

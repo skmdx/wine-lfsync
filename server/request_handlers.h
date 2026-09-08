@@ -323,6 +323,7 @@ DECL_HANDLER(set_client_surface_state);
 DECL_HANDLER(get_client_surface_clip_windows);
 DECL_HANDLER(get_client_surface_handoff);
 DECL_HANDLER(get_client_surface_handoff_event);
+DECL_HANDLER(get_client_surface_handoff_visibility);
 DECL_HANDLER(release_client_surface_handoff);
 DECL_HANDLER(complete_client_surface_handoffs);
 DECL_HANDLER(cancel_client_surface_handoffs);
@@ -654,6 +655,7 @@ static const req_handler req_handlers[REQ_NB_REQUESTS] =
     (req_handler)req_get_client_surface_clip_windows,
     (req_handler)req_get_client_surface_handoff,
     (req_handler)req_get_client_surface_handoff_event,
+    (req_handler)req_get_client_surface_handoff_visibility,
     (req_handler)req_release_client_surface_handoff,
     (req_handler)req_complete_client_surface_handoffs,
     (req_handler)req_cancel_client_surface_handoffs,
@@ -2480,6 +2482,7 @@ C_ASSERT( offsetof(struct get_client_surface_handoff_request, handle) == 12 );
 C_ASSERT( offsetof(struct get_client_surface_handoff_request, producer) == 16 );
 C_ASSERT( offsetof(struct get_client_surface_handoff_request, surface) == 24 );
 C_ASSERT( offsetof(struct get_client_surface_handoff_request, owner) == 32 );
+C_ASSERT( offsetof(struct get_client_surface_handoff_request, require_producer) == 36 );
 C_ASSERT( sizeof(struct get_client_surface_handoff_request) == 40 );
 C_ASSERT( offsetof(struct get_client_surface_handoff_reply, mapping) == 8 );
 C_ASSERT( offsetof(struct get_client_surface_handoff_reply, size) == 12 );
@@ -2495,6 +2498,12 @@ C_ASSERT( offsetof(struct get_client_surface_handoff_event_request, owner) == 40
 C_ASSERT( sizeof(struct get_client_surface_handoff_event_request) == 48 );
 C_ASSERT( offsetof(struct get_client_surface_handoff_event_reply, event) == 8 );
 C_ASSERT( sizeof(struct get_client_surface_handoff_event_reply) == 16 );
+C_ASSERT( offsetof(struct get_client_surface_handoff_visibility_request, handle) == 12 );
+C_ASSERT( offsetof(struct get_client_surface_handoff_visibility_request, surface) == 16 );
+C_ASSERT( offsetof(struct get_client_surface_handoff_visibility_request, cookie) == 24 );
+C_ASSERT( sizeof(struct get_client_surface_handoff_visibility_request) == 32 );
+C_ASSERT( offsetof(struct get_client_surface_handoff_visibility_reply, visible) == 8 );
+C_ASSERT( sizeof(struct get_client_surface_handoff_visibility_reply) == 16 );
 C_ASSERT( offsetof(struct release_client_surface_handoff_request, handle) == 12 );
 C_ASSERT( offsetof(struct release_client_surface_handoff_request, producer) == 16 );
 C_ASSERT( offsetof(struct release_client_surface_handoff_request, surface) == 24 );

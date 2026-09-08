@@ -455,6 +455,25 @@ BOOL client_surface_freeze_frame_locked( struct client_surface *surface,
     return valid;
 }
 
+static BOOL client_surface_handoff_is_visible( const struct client_surface *surface )
+{
+    BOOL visible = FALSE;
+
+    /* Completion holds the surface locks. Query server-owned visibility only
+     * before the first consumer binds, without taking the process USER lock
+     * through IsWindowVisible/ancestor traversal. The normal channel path
+     * remains free of this request. */
+    SERVER_START_REQ( get_client_surface_handoff_visibility )
+    {
+        req->handle = wine_server_user_handle( surface->hwnd );
+        req->surface = client_surface_get_identity( surface );
+        req->cookie = surface->handoff_cookie;
+        if (!wine_server_call( req )) visible = reply->visible;
+    }
+    SERVER_END_REQ;
+    return visible;
+}
+
 BOOL client_surface_publish_handoff_locked( struct client_surface *surface,
                                             struct client_surface_frame *present,
                                             const struct client_surface_completed_frame *frame )
@@ -481,21 +500,23 @@ BOOL client_surface_publish_handoff_locked( struct client_surface *surface,
             __atomic_load_n( &source->reservation, __ATOMIC_ACQUIRE ) == present->handoff_control &&
             present->serial >= surface->composed_serial && present->target_epoch == surface->target.epoch &&
             client_surface_backend_has_cap( surface, CLIENT_SURFACE_BACKEND_OWNER_SCENE_PLAN );
-    /* A never-displayed producer can complete private images before an owner
-     * has acquired its channel. Keep the exact frozen source, but leave its
-     * reservation unpublished: READY images cannot be reused until consumed,
-     * so publishing here would exhaust the ring without a possible reader.
-     * The caller abandons this reservation and schedules source recovery;
-     * the first owner binding can then replay the latest completed image.
-     * Existing hidden bindings still consume normally. Endpoint presence is
-     * only publication availability, never permission to overwrite a slot. */
+    /* A hidden producer without a consumer keeps its latest completed source
+     * private instead of filling the ring with images no owner can consume.
+     * A visible producer may finish before the asynchronous owner binds:
+     * queue its exact READY image now, without requiring another application
+     * present or a producer message pump. Registration scans the retained
+     * ready bitmap even if this publication preceded the owner's event fd.
+     * Visibility never returns storage: a concurrent hide leaves every READY
+     * image immutable until checked consumption or channel retirement. */
     if (valid && !(__atomic_load_n( &channel->endpoints, __ATOMIC_ACQUIRE ) &
-                   CLIENT_SURFACE_HANDOFF_ENDPOINT_CONSUMER))
+                   CLIENT_SURFACE_HANDOFF_ENDPOINT_CONSUMER) &&
+        !client_surface_handoff_is_visible( surface ))
     {
         TRACE( "retaining source identity %s frame %s without compositor endpoint\n",
                wine_dbgstr_longlong( frame->surface_id ), wine_dbgstr_longlong( frame->frame_id ) );
         valid = FALSE;
     }
+    if (valid) valid = !__atomic_load_n( &channel->closed, __ATOMIC_ACQUIRE );
     if (valid)
     {
         /* completion_lock is the single publication domain, including callers
@@ -782,6 +803,7 @@ BOOL client_surface_get_scene_snapshot( HWND toplevel, UINT64 *scene_id, UINT *c
         result[i].cookie = layer->producer.cookie;
         result[i].direct_candidate = !!(layer->flags & CLIENT_SURFACE_SCENE_DIRECT_CANDIDATE);
         result[i].visible = !!layer->producer.visible;
+        result[i].producer_mapped = !!layer->producer.producer_mapped;
         dpis[i] = layer->window_dpi;
         monitor_rects[i].window = wine_server_get_rect( layer->top_window );
         monitor_rects[i].client = wine_server_get_rect( layer->top_client );

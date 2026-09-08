@@ -219,7 +219,7 @@ struct gdi_dc_funcs
 };
 
 /* increment this when changing driver tables or shared driver-facing structures */
-#define WINE_GDI_DRIVER_VERSION 136
+#define WINE_GDI_DRIVER_VERSION 137
 
 #define GDI_PRIORITY_NULL_DRV        0  /* null driver */
 #define GDI_PRIORITY_FONT_DRV      100  /* any font driver */
@@ -515,6 +515,7 @@ struct client_surface_scene_member
     UINT64 identity, cookie;
     BOOL visible;
     BOOL direct_candidate;
+    BOOL producer_mapped;
     struct client_surface_target target;
     HRGN region;
 };

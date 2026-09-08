@@ -303,7 +303,7 @@ struct client_surface_handoff_desc
     unsigned __int64 surface;
     unsigned __int64 cookie; /* reusable owner binding, zero if it must be acquired */
     unsigned int   visible; /* scene membership, independent of binding lifetime */
-    unsigned int   reserved;
+    unsigned int   producer_mapped; /* live producer endpoint needing an owner, even before READY */
 };
 
 /* One selected producer followed by visible_count client-relative rectangles
@@ -4501,6 +4501,7 @@ enum inproc_sync_type
     process_id_t   producer;
     unsigned __int64 surface;
     unsigned int   owner;        /* request the compositor-owner endpoint */
+    unsigned int   require_producer; /* only bind a live existing producer endpoint */
 @REPLY
     obj_handle_t   mapping;
     unsigned int   size;
@@ -4518,6 +4519,16 @@ enum inproc_sync_type
     unsigned int   owner;
 @REPLY
     obj_handle_t   event;
+@END
+
+/* Query cold-channel visibility without acquiring an endpoint or a USER lock.
+ * Visibility permits initial queueing, not source reuse or scene publication. */
+@REQ(get_client_surface_handoff_visibility)
+    user_handle_t  handle;
+    unsigned __int64 surface;
+    unsigned __int64 cookie;
+@REPLY
+    unsigned int   visible;
 @END
 
 /* Drop one producer or owner view. The binding is not reusable until both

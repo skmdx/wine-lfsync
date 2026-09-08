@@ -753,6 +753,7 @@ extern void X11DRV_client_surface_complete_direct( struct client_surface *surfac
                                                   const struct client_surface_frame *frame );
 extern BOOL X11DRV_client_surface_prepare_owner( struct x11drv_win_data *data );
 extern BOOL X11DRV_client_surface_backing_ensure( struct x11drv_win_data *data );
+extern BOOL X11DRV_client_surface_bind_producers( HWND toplevel );
 extern BOOL X11DRV_client_surface_backing_begin_update( HWND hwnd, const struct window_rects *rects,
                                                         UINT swp_flags, BOOL *deferred );
 extern UINT X11DRV_client_surface_backing_resume_update( HWND hwnd, UINT64 serial );

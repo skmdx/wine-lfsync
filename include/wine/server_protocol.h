@@ -287,7 +287,7 @@ struct client_surface_handoff_desc
     unsigned __int64 surface;
     unsigned __int64 cookie;
     unsigned int   visible;
-    unsigned int   reserved;
+    unsigned int   producer_mapped;
 };
 
 /* One selected producer followed by visible_count client-relative rectangles
@@ -6444,7 +6444,7 @@ struct get_client_surface_handoff_request
     char __pad_20[4];
     unsigned __int64 surface;
     unsigned int   owner;
-    char __pad_36[4];
+    unsigned int   require_producer;
 };
 struct get_client_surface_handoff_reply
 {
@@ -6473,6 +6473,22 @@ struct get_client_surface_handoff_event_reply
 {
     struct reply_header __header;
     obj_handle_t   event;
+    char __pad_12[4];
+};
+
+/* Query cold-channel visibility without acquiring an endpoint or a USER lock.
+ * Visibility permits initial queueing, not source reuse or scene publication. */
+struct get_client_surface_handoff_visibility_request
+{
+    struct request_header __header;
+    user_handle_t  handle;
+    unsigned __int64 surface;
+    unsigned __int64 cookie;
+};
+struct get_client_surface_handoff_visibility_reply
+{
+    struct reply_header __header;
+    unsigned int   visible;
     char __pad_12[4];
 };
 
@@ -6972,6 +6988,7 @@ enum request
     REQ_get_client_surface_clip_windows,
     REQ_get_client_surface_handoff,
     REQ_get_client_surface_handoff_event,
+    REQ_get_client_surface_handoff_visibility,
     REQ_release_client_surface_handoff,
     REQ_complete_client_surface_handoffs,
     REQ_cancel_client_surface_handoffs,
@@ -7306,6 +7323,7 @@ union generic_request
     struct get_client_surface_clip_windows_request get_client_surface_clip_windows_request;
     struct get_client_surface_handoff_request get_client_surface_handoff_request;
     struct get_client_surface_handoff_event_request get_client_surface_handoff_event_request;
+    struct get_client_surface_handoff_visibility_request get_client_surface_handoff_visibility_request;
     struct release_client_surface_handoff_request release_client_surface_handoff_request;
     struct complete_client_surface_handoffs_request complete_client_surface_handoffs_request;
     struct cancel_client_surface_handoffs_request cancel_client_surface_handoffs_request;
@@ -7638,6 +7656,7 @@ union generic_reply
     struct get_client_surface_clip_windows_reply get_client_surface_clip_windows_reply;
     struct get_client_surface_handoff_reply get_client_surface_handoff_reply;
     struct get_client_surface_handoff_event_reply get_client_surface_handoff_event_reply;
+    struct get_client_surface_handoff_visibility_reply get_client_surface_handoff_visibility_reply;
     struct release_client_surface_handoff_reply release_client_surface_handoff_reply;
     struct complete_client_surface_handoffs_reply complete_client_surface_handoffs_reply;
     struct cancel_client_surface_handoffs_reply cancel_client_surface_handoffs_reply;
@@ -7651,6 +7670,6 @@ union generic_reply
     struct set_window_present_rect_reply set_window_present_rect_reply;
 };
 
-#define SERVER_PROTOCOL_VERSION 1015
+#define SERVER_PROTOCOL_VERSION 1017
 
 #endif /* __WINE_WINE_SERVER_PROTOCOL_H */
