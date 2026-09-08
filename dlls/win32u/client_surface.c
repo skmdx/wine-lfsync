@@ -428,7 +428,14 @@ void client_surface_prepare_scene( struct client_surface *surface )
     UINT64 generation;
     BOOL wake = FALSE;
 
-    if (client_surface_get_scene( surface, &scene ) && scene.authoritative) return;
+    if (client_surface_get_scene( surface, &scene ) && scene.authoritative)
+    {
+        /* The owner can plan a strategy-only transition from an acknowledged
+         * scene at the actual native submission boundary. Restarting geometry
+         * preparation here races every foreign-thread producer against the
+         * owner's asynchronous prepare/ACK and can starve DIRECT forever. */
+        return;
+    }
 
     /* A first submission can select a new producer and require an owner
      * snapshot. Do that before acquiring a multi-surface submission's locks:
@@ -712,6 +719,7 @@ static BOOL read_client_surface_scene( HWND toplevel, struct client_surface_scen
                       CLIENT_SURFACE_PRESENTATION_STAGED : CLIENT_SURFACE_PRESENTATION_COMPOSITED;
         preparing = !!(window_shm->client_surface_flags & WINDOW_SHM_CLIENT_SURFACE_PREPARING);
         scene->source_pending = !!(window_shm->client_surface_flags & WINDOW_SHM_CLIENT_SURFACE_SOURCE_PENDING);
+        scene->direct_candidate = !!(window_shm->client_surface_flags & WINDOW_SHM_CLIENT_SURFACE_DIRECT_CANDIDATE);
         if (producer_process) *producer_process = window_shm->client_surface_process;
         if (producer_id) *producer_id = window_shm->client_surface_id;
     }
@@ -807,7 +815,7 @@ static BOOL client_surface_update_present_scene_internal_locked(
     RECT old_source_rect, new_source_rect;
     struct client_surface_scene scene;
     enum client_surface_target_update update;
-    BOOL changed, defer_direct, ready, scene_valid, preserve_native;
+    BOOL changed, defer_direct, ready, scene_valid, preserve_native, preparing_candidate;
 
     client_surface_get_target( surface, &current );
     next = current;
@@ -840,15 +848,33 @@ static BOOL client_surface_update_present_scene_internal_locked(
     }
     else
         scene_valid = client_surface_get_scene( surface, &scene );
-    next.mode = !scene_valid ? current.mode : scene.authoritative ? scene.mode :
+    if (allow_direct_transition && scene_valid && scene.authoritative && scene.direct_candidate &&
+        scene.mode != CLIENT_SURFACE_PRESENTATION_DIRECT && surface->backend->prepare_direct)
+    {
+        /* The owner selects from the final COMPOSING snapshot. Its admission
+         * changes the strategy but not the immutable scene. Resample before
+         * touching native geometry; never retag a PREPARING snapshot. */
+        if (surface->backend->prepare_direct( surface, &scene )) return FALSE;
+    }
+    /* PREPARING has an immutable layout but no publication token yet. An
+     * actual producer which cannot admit DIRECT must still preserve its new
+     * image through the private completion/handoff path. Candidate excludes
+     * native barriers; the even exact scene and identity remain mandatory.
+     * This applies only native geometry, never a valid scene or generation. */
+    preparing_candidate = allow_direct_transition && !scene_valid && scene.authoritative &&
+        scene.direct_candidate && !scene.generation && scene.epoch && !(scene.epoch & 1) &&
+        scene.toplevel == next.toplevel && client_surface_scene_snapshot_current( next.toplevel, scene.epoch );
+    next.mode = !scene_valid && !preparing_candidate ? current.mode : scene.authoritative ? scene.mode :
                 CLIENT_SURFACE_PRESENTATION_COMPOSITED;
     /* Reparenting an already presented offscreen drawable may discard its
      * front buffer.  Keep the last STAGED/COMPOSITED image visible until an
      * actual producer present is ready to replace it.  Geometry owners still
      * update an established DIRECT target in place. */
     defer_direct = !allow_direct_transition &&
-                   next.mode == CLIENT_SURFACE_PRESENTATION_DIRECT &&
-                   current.mode != CLIENT_SURFACE_PRESENTATION_DIRECT;
+                   ((next.mode == CLIENT_SURFACE_PRESENTATION_DIRECT &&
+                     current.mode != CLIENT_SURFACE_PRESENTATION_DIRECT) ||
+                    (scene_valid && scene.authoritative && scene.direct_candidate &&
+                     scene.mode != CLIENT_SURFACE_PRESENTATION_DIRECT));
     if (defer_direct) next.mode = current.mode;
     old_source_rect = surface->raw ? current.monitor_rect : current.virtual_rect;
     new_source_rect = surface->raw ? next.monitor_rect : next.virtual_rect;
@@ -922,9 +948,10 @@ static BOOL client_surface_update_present_scene_internal_locked(
 }
 
 BOOL client_surface_update_present_scene_locked( struct client_surface *surface,
-                                                  const struct client_surface_scene *scene )
+                                                  const struct client_surface_scene *scene,
+                                                  BOOL allow_direct_transition )
 {
-    return client_surface_update_present_scene_internal_locked( surface, scene, TRUE );
+    return client_surface_update_present_scene_internal_locked( surface, scene, allow_direct_transition );
 }
 
 BOOL client_surface_update_present_locked( struct client_surface *surface )
@@ -1340,7 +1367,7 @@ static BOOL client_surface_recompose( struct client_surface *surface, LONG64 seq
             return TRUE;
         }
     }
-    client_surface_prepare_present_locked( surface, &present, TRUE );
+    client_surface_prepare_recompose_locked( surface, &present );
     if (present.handoff_control)
     {
         /* Cached replay has no new native submission or completion token.
@@ -1583,7 +1610,9 @@ BOOL client_surface_update( struct client_surface *surface )
         ret = TRUE;
     else if (surface->hwnd)
     {
-        ret = client_surface_update_present_scene_internal_locked( surface, NULL, TRUE );
+        /* GL storage and flush paths need current geometry without selecting
+         * or attaching a DIRECT target before a real native presentation. */
+        ret = client_surface_update_present_scene_internal_locked( surface, NULL, FALSE );
         scene_valid = client_surface_get_scene( surface, &scene );
         ret = ret && scene_valid && surface->target.valid &&
               surface->target.toplevel == scene.toplevel &&

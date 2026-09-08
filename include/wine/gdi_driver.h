@@ -219,7 +219,7 @@ struct gdi_dc_funcs
 };
 
 /* increment this when changing driver tables or shared driver-facing structures */
-#define WINE_GDI_DRIVER_VERSION 133
+#define WINE_GDI_DRIVER_VERSION 134
 
 #define GDI_PRIORITY_NULL_DRV        0  /* null driver */
 #define GDI_PRIORITY_FONT_DRV      100  /* any font driver */
@@ -319,6 +319,8 @@ struct client_surface_backend
     void (*detach)( struct client_surface *surface );
     /* backend-local geometry and clipping allow the server-selected DIRECT mode */
     BOOL (*direct_ready)( struct client_surface *surface );
+    BOOL (*prepare_direct)( struct client_surface *surface, const struct client_surface_scene *scene );
+    void (*complete_direct)( struct client_surface *surface, const struct client_surface_frame *frame );
     /* Prepare target for publication, reporting native mutations separately
      * from geometry. Omitted reports retain conservative invalidation. */
     BOOL (*update)( struct client_surface *surface, struct client_surface_target *target,
@@ -349,6 +351,7 @@ struct client_surface_scene
     BOOL valid;
     BOOL authoritative;
     BOOL source_pending; /* current assembly awaits the owner's image inventory */
+    BOOL direct_candidate; /* server eligibility; the owner still selects the strategy */
 };
 
 enum client_surface_frame_result
@@ -511,6 +514,7 @@ struct client_surface_scene_member
     UINT process;
     UINT64 identity, cookie;
     BOOL visible;
+    BOOL direct_candidate;
     struct client_surface_target target;
     HRGN region;
 };

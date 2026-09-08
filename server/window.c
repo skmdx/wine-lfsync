@@ -466,6 +466,9 @@ struct window
     struct client_surface_transaction client_surface_transaction;
     client_ptr_t     client_surface_native_barrier; /* owner token sealing native target replacement */
     unsigned long long client_surface_scene_generation; /* even when the scene is stable */
+    unsigned long long client_surface_direct_scene; /* authenticated owner strategy */
+    unsigned long long client_surface_ack_scene; /* last successful owner publication */
+    unsigned long long client_surface_direct_surface;
     unsigned int     client_surface_scene_change_depth;
     int              prop_inuse;      /* number of in-use window properties */
     int              prop_alloc;      /* number of allocated window properties */
@@ -553,8 +556,10 @@ static void update_client_surface_publication( struct window *top )
     int direct = mode == CLIENT_SURFACE_PRESENTATION_DIRECT;
     int backing_required = top->client_surface_subtree_count &&
                            (top->client_surface_transaction.staged ||
-                            (!client_surface_direct_candidate( top ) &&
-                             !client_surface_direct_registration_candidate( top )));
+                            (!direct &&
+                             !client_surface_direct_registration_candidate( top )) ||
+                            (top->client_surface_backing_required &&
+                             (!direct || top->client_surface_transaction.phase != CLIENT_SURFACE_PHASE_IDLE)));
     int backing_changed = backing_required != top->client_surface_backing_required;
 
     assert( client_surface_is_composing( top ) == !!top->client_surface_transaction.epoch );
@@ -569,6 +574,8 @@ static void update_client_surface_publication( struct window *top )
             (client_surface_is_publishing( top ) ? WINDOW_SHM_CLIENT_SURFACE_PUBLISHING : 0) |
             (client_surface_is_preparing( top ) ? WINDOW_SHM_CLIENT_SURFACE_PREPARING : 0) |
             (direct ? WINDOW_SHM_CLIENT_SURFACE_DIRECT : 0) |
+            (!top->client_surface_transaction.staged && !top->client_surface_native_barrier &&
+             client_surface_direct_candidate( top ) ? WINDOW_SHM_CLIENT_SURFACE_DIRECT_CANDIDATE : 0) |
             (backing_required ? WINDOW_SHM_CLIENT_SURFACE_BACKING : 0) |
             (top->client_surface_transaction.source_pending ? WINDOW_SHM_CLIENT_SURFACE_SOURCE_PENDING : 0);
     }
@@ -1291,6 +1298,8 @@ static struct window *create_window( struct window *parent, struct window *owner
     win->client_surface_native_barrier = 0;
     win->present_rect = empty_rect;
     win->client_surface_scene_generation = 0;
+    win->client_surface_direct_scene = win->client_surface_direct_surface = 0;
+    win->client_surface_ack_scene = 0;
     win->client_surface_scene_change_depth = 0;
     win->prop_inuse     = 0;
     win->prop_alloc     = 0;
@@ -1729,7 +1738,7 @@ static int client_surface_direct_registration_candidate( struct window *top )
         LIST_FOR_EACH_ENTRY( surface, &owner->surfaces,
                              struct client_surface_ref, entry )
             if (surface->active)
-                return surface->direct_presentation && owner->process == top->thread->process;
+                return !surface->claimed && surface->direct_presentation && owner->process == top->thread->process;
     return 0;
 }
 
@@ -1737,6 +1746,8 @@ static int client_surface_direct_eligible( struct window *top )
 {
     return !(top->client_surface_scene_generation & 1) &&
            !top->client_surface_transaction.staged && !top->client_surface_native_barrier &&
+           top->client_surface_direct_scene == top->client_surface_scene_generation &&
+           top->client_surface_direct_surface &&
            client_surface_direct_candidate( top );
 }
 
@@ -1832,16 +1843,6 @@ static int mark_client_surface_generation_ready( struct window *top )
         top->client_surface_transaction.epoch != top->client_surface_scene_generation ||
         (top->client_surface_scene_generation & 1))
         return 0;
-
-    /* DIRECT publishes through the producer's attached native child.  There
-     * is no owner frame to expose after the producer commit, so retire this
-     * transitional generation instead of entering the backing publish loop. */
-    if (!top->client_surface_dirty && !top->client_surface_transaction.staged &&
-        client_surface_direct_eligible( top ))
-    {
-        finish_client_surface_generation( top );
-        return 0;
-    }
 
     /* Backends without an owner-managed scene target keep the legacy live
      * behavior: their driver presentation is already visible, so an empty
@@ -2584,6 +2585,7 @@ DECL_HANDLER(publish_client_surface_handoff)
         fail_client_surface_publication( top );
         return;
     }
+    if (!invalidated) top->client_surface_ack_scene = req->scene_generation;
     finish_client_surface_publication( top );
     if (invalidated && is_visible( top ) && has_client_surface( top ))
         restart_client_surface_generation( top );
@@ -2950,18 +2952,6 @@ static void restart_client_surface_generation_internal( struct window *top )
         return;
     }
 
-    /* DIRECT publishes through the producer's attached native child.  It has
-     * no owner snapshot, composition generation or backing publication to
-     * restart after a scene change.  Entering PREPARING here would make the
-     * otherwise stable DIRECT scene unreadable while the owner applies a
-     * resize and could recreate the offscreen completion path for that same
-     * drawable. */
-    if (!top->client_surface_dirty && !top->client_surface_transaction.staged &&
-        client_surface_direct_eligible( top ))
-    {
-        finish_client_surface_publication( top );
-        return;
-    }
     scene_published = client_surface_scene_published( top );
     if (!scene_published) top->client_surface_transaction.source_pending = 0;
 
@@ -4096,6 +4086,24 @@ static struct region *expose_window( struct window *win, const struct rectangle 
 }
 
 
+/* Scene clipping observes the covered visible/client rectangles, not the
+ * allocation extent of a rounded GDI surface. Retiring that padding after
+ * DIRECT publication must not revoke unchanged native geometry. Keep both
+ * intersections: the client can extend beyond the visible rectangle. */
+static int client_surface_surface_clip_changed( struct window *win, const struct rectangle *surface_rect )
+{
+    struct rectangle client, before, after;
+
+    if (is_rect_equal( &win->surface_rect, surface_rect )) return 0;
+    if (!intersect_rect( &before, &win->visible_rect, &win->surface_rect )) before = empty_rect;
+    if (!intersect_rect( &after, &win->visible_rect, surface_rect )) after = empty_rect;
+    if (!is_rect_equal( &before, &after )) return 1;
+    intersect_rect( &client, &win->window_rect, &win->client_rect );
+    if (!intersect_rect( &before, &client, &win->surface_rect )) before = empty_rect;
+    if (!intersect_rect( &after, &client, surface_rect )) after = empty_rect;
+    return !is_rect_equal( &before, &after );
+}
+
 /* set the window and client rectangles, updating the update region if necessary */
 static void set_window_pos( struct window *win, struct window *previous,
                             unsigned int swp_flags, const struct rectangle *window_rect,
@@ -4106,7 +4114,6 @@ static void set_window_pos( struct window *win, struct window *previous,
     const struct rectangle old_window_rect = win->window_rect;
     const struct rectangle old_visible_rect = win->visible_rect;
     const struct rectangle old_client_rect = win->client_rect;
-    const struct rectangle old_surface_rect = win->surface_rect;
     const unsigned int old_ex_style = win->ex_style;
     struct window *client_surface_top = NULL;
     struct window *scene_top = get_toplevel_window( win );
@@ -4124,7 +4131,7 @@ static void set_window_pos( struct window *win, struct window *previous,
     scene_change = memcmp( window_rect, &old_window_rect, sizeof(*window_rect) ) ||
                    memcmp( visible_rect, &old_visible_rect, sizeof(*visible_rect) ) ||
                    memcmp( client_rect, &old_client_rect, sizeof(*client_rect) ) ||
-                   memcmp( surface_rect, &old_surface_rect, sizeof(*surface_rect) );
+                   client_surface_surface_clip_changed( win, surface_rect );
     /* Client and frame extents must survive the same translation. Visible
      * and surface rectangles may change with clipping, but are not source
      * image bounds. Visibility and order only change the selected roster's
@@ -5277,6 +5284,9 @@ static int collect_client_surface_scene_snapshot( struct window *win, struct win
 
         get_client_surface_handoff_desc( win, top, owner, surface, &layer.producer );
         get_client_surface_scene_geometry( win, top, &layer );
+        if (win == top && !top->client_surface_transaction.staged &&
+            !top->client_surface_native_barrier && client_surface_direct_candidate( top ))
+            layer.flags |= CLIENT_SURFACE_SCENE_DIRECT_CANDIDATE;
         if (layer.producer.visible && !(layer.flags & CLIENT_SURFACE_SCENE_PRESENT_RECT))
         {
             if (!(visible = get_visible_region( win, get_client_surface_scene_clip_flags( win ) ))) return 0;
@@ -5356,6 +5366,109 @@ DECL_HANDLER(get_client_surface_scene_snapshot)
     return;
 failed:
     free( data );
+}
+
+/* Reuse acknowledged geometry for a strategy-only transition. This is not a
+ * geometry-ready notification: a new final scene is returned synchronously
+ * to the owner planner while the real producer retains its native target. */
+DECL_HANDLER(prepare_client_surface_direct_plan)
+{
+    struct client_surface_owner *owner;
+    struct client_surface_ref *surface;
+    struct window *top = get_window( req->handle );
+
+    reply->scene_id = 0;
+    if (!top) return;
+    if (get_toplevel_window( top ) != top || !top->thread || top->thread->process != current->process)
+    {
+        set_error( STATUS_ACCESS_DENIED );
+        return;
+    }
+    if (!req->scene_id || (req->scene_id & 1) || req->scene_id != top->client_surface_scene_generation ||
+        req->scene_id != top->client_surface_ack_scene ||
+        top->client_surface_transaction.phase != CLIENT_SURFACE_PHASE_IDLE ||
+        top->client_surface_transaction.staged || top->client_surface_transaction.restarting ||
+        top->client_surface_transaction.restart_pending || top->client_surface_native_barrier ||
+        top->client_surface_scene_change_depth || client_surface_direct_eligible( top ) ||
+        !client_surface_direct_candidate( top ) ||
+        !(surface = select_client_surface_producer( top, &owner )) || surface->id != req->surface ||
+        owner->process != current->process || !surface->scene_publication || surface->generation)
+        return;
+
+    /* The exact ACK already includes the owner's native/GDI preparation.
+     * Consume that proof only for this unchanged geometry. The restart must
+     * allocate a new scene; neither a late ACK nor a PREPARING snapshot may
+     * authorize its DIRECT plan. Real mutations still take ordinary PREPARING. */
+    top->client_surface_transaction.prepared = 1;
+    restart_client_surface_generation_internal( top );
+    top->client_surface_transaction.prepared = 0;
+    if (top->client_surface_transaction.phase == CLIENT_SURFACE_PHASE_COMPOSING &&
+        top->client_surface_scene_generation != req->scene_id &&
+        top->client_surface_transaction.epoch == top->client_surface_scene_generation &&
+        top->client_surface_transaction.pending == 1 && client_surface_direct_candidate( top ) &&
+        (surface = select_client_surface_producer( top, &owner )) && surface->id == req->surface &&
+        surface->generation == top->client_surface_scene_generation)
+        reply->scene_id = top->client_surface_scene_generation;
+}
+
+/* The candidate flag is only input to the owner's planner. Native attachment
+ * becomes an authorized strategy after it accepts this exact final scene. */
+DECL_HANDLER(select_client_surface_direct_plan)
+{
+    struct client_surface_owner *owner;
+    struct client_surface_ref *surface;
+    struct window *top = get_window( req->handle );
+
+    reply->accepted = 0;
+    if (!top) return;
+    if (get_toplevel_window( top ) != top || !top->thread || top->thread->process != current->process)
+    {
+        set_error( STATUS_ACCESS_DENIED );
+        return;
+    }
+    if (top->client_surface_transaction.phase != CLIENT_SURFACE_PHASE_COMPOSING ||
+        req->scene_id != top->client_surface_scene_generation || (req->scene_id & 1) ||
+        req->scene_id != top->client_surface_transaction.epoch ||
+        top->client_surface_transaction.staged || top->client_surface_native_barrier ||
+        !client_surface_direct_candidate( top ) ||
+        !(surface = select_client_surface_producer( top, &owner )) || surface->id != req->surface ||
+        !surface->scene_publication || surface->generation != req->scene_id ||
+        top->client_surface_transaction.pending != 1)
+        return;
+
+    top->client_surface_direct_scene = req->scene_id;
+    top->client_surface_direct_surface = req->surface;
+    top->client_surface_transaction.source_pending = 0;
+    top->client_surface_transaction.owner_repair = 0;
+    update_client_surface_publication( top );
+    reply->accepted = 1;
+}
+
+DECL_HANDLER(complete_client_surface_direct_plan)
+{
+    struct client_surface_owner *owner;
+    struct client_surface_ref *surface;
+    struct window *top = get_window( req->handle );
+
+    reply->accepted = 0;
+    if (!top) return;
+    if (get_toplevel_window( top ) != top || !top->thread || top->thread->process != current->process)
+    {
+        set_error( STATUS_ACCESS_DENIED );
+        return;
+    }
+    if (!client_surface_direct_eligible( top ) ||
+        top->client_surface_transaction.phase != CLIENT_SURFACE_PHASE_COMPOSING ||
+        req->scene_id != top->client_surface_direct_scene || req->surface != top->client_surface_direct_surface ||
+        !(surface = select_client_surface_producer( top, &owner )) || surface->id != req->surface ||
+        !complete_client_surface_generation( top, surface, req->scene_id ))
+        return;
+
+    /* The same reservation and ACK protect both owner copy and attachment.
+     * Only the native presentation which supplies the image proof differs. */
+    top->client_surface_transaction.phase = CLIENT_SURFACE_PHASE_PUBLISHING;
+    update_client_surface_publication( top );
+    reply->accepted = 1;
 }
 
 DECL_HANDLER(set_window_present_rect)
@@ -5461,7 +5574,7 @@ DECL_HANDLER(set_client_surface_state)
     struct client_surface_ref *surface, *selected_before, *selected_after;
     struct window *win, *top;
     unsigned int selected_caps_before;
-    int scene_change, was_pending;
+    int scene_change, was_pending, direct_before;
 
     reply->toplevel = 0;
     reply->wake = 0;
@@ -5507,6 +5620,7 @@ DECL_HANDLER(set_client_surface_state)
 
     selected_before = select_client_surface_producer( win, &selected_owner );
     selected_caps_before = selected_before ? get_client_surface_backend_caps( selected_before ) : 0;
+    direct_before = client_surface_direct_candidate( top );
 
     if ((req->flags & (CLIENT_SURFACE_STATE_REGISTER | CLIENT_SURFACE_STATE_CACHE |
                        CLIENT_SURFACE_STATE_UPDATE_CAPS)) && surface)
@@ -5554,13 +5668,14 @@ DECL_HANDLER(set_client_surface_state)
     selected_after = select_client_surface_producer( win, &selected_owner );
     scene_change = selected_before != selected_after ||
                    (selected_after && selected_caps_before !=
-                    get_client_surface_backend_caps( selected_after ));
+                    get_client_surface_backend_caps( selected_after )) ||
+                   direct_before != client_surface_direct_candidate( top );
     if (scene_change)
     {
         /* Membership is private server state.  Publish the changed producer
-         * only after the scene seqlock turns odd; dormant registrations and
-         * active/cache transitions retaining the same producer need no scene
-         * replay at all. */
+         * only after the scene seqlock turns odd. Dormant registrations need
+         * no replay unless they change the sole DIRECT candidate's eligibility:
+         * the owner must choose that strategy from a new immutable scene. */
         begin_client_surface_scene_change( top );
         update_client_surface_producer( win );
     }
@@ -5664,7 +5779,8 @@ DECL_HANDLER(set_client_surface_state)
         reply->compose = compose;
     }
     if ((req->flags & CLIENT_SURFACE_STATE_PRESENT_COMMIT) && surface &&
-        (surface->active || surface->cached) && is_visible( win ))
+        (surface->active || surface->cached) && is_visible( win ) &&
+        !client_surface_direct_eligible( top ))
     {
         if (req->scene_generation == top->client_surface_scene_generation)
             complete_client_surface_generation( top, surface, req->generation );
@@ -5693,6 +5809,7 @@ DECL_HANDLER(set_client_surface_state)
         int invalidated = top->client_surface_transaction.epoch !=
                           top->client_surface_scene_generation;
 
+        if (!invalidated) top->client_surface_ack_scene = req->scene_generation;
         finish_client_surface_publication( top );
         if (invalidated && is_visible( top ) && has_client_surface( top ))
             restart_client_surface_generation( top );

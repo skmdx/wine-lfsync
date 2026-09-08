@@ -2116,7 +2116,9 @@ static BOOL apply_window_pos( HWND hwnd, HWND insert_after, UINT swp_flags, stru
     HWND owner_hint, surface_win = 0, toplevel;
     struct ratio raw_dpi, dpi = get_thread_dpi();
     BOOL ret, is_layered, is_child, need_icons = FALSE, client_surface_pending = FALSE;
-    BOOL toplevel_size_changed;
+    BOOL frame_changed = !!(swp_flags & SWP_FRAMECHANGED);
+    BOOL toplevel_size_changed, surface_removed;
+    struct client_surface_scene scene;
     struct window_rects old_rects;
     RECT extra_rects[3];
     struct window_surface *old_surface;
@@ -2140,6 +2142,7 @@ static BOOL apply_window_pos( HWND hwnd, HWND insert_after, UINT swp_flags, stru
 
     if (!(win = get_win_ptr( hwnd )) || win == WND_DESKTOP || win == WND_OTHER_PROCESS) return FALSE;
     old_surface = win->surface;
+    surface_removed = old_surface && !new_surface;
     if (old_surface != new_surface) swp_flags |= SWP_FRAMECHANGED;  /* force refreshing non-client area */
 
     if (new_surface == &dummy_surface) swp_flags |= SWP_NOREDRAW;
@@ -2295,6 +2298,17 @@ static BOOL apply_window_pos( HWND hwnd, HWND insert_after, UINT swp_flags, stru
         /* fallback to any window that is right below our top left corner */
         if (!owner_hint) owner_hint = NtUserWindowFromPoint(new_rects->window.left - 1, new_rects->window.top - 1);
         if (owner_hint) owner_hint = NtUserGetAncestor(owner_hint, GA_ROOT);
+
+        /* Retiring the GDI surface after DIRECT publication needs the DCE
+         * refresh above, but does not change the native frame. Do not turn
+         * that synthetic refresh into a driver scene invalidation which
+         * would revoke the just-acknowledged attachment before pool retire.
+         * Caller frame changes and actual geometry changes keep their flag. */
+        if (!frame_changed && surface_removed && !is_child &&
+            !memcmp( &old_rects, new_rects, sizeof(old_rects) ) &&
+            client_surface_get_toplevel_scene( hwnd, &scene ) &&
+            scene.mode == CLIENT_SURFACE_PRESENTATION_DIRECT)
+            swp_flags &= ~SWP_FRAMECHANGED;
 
         if (!user_driver->pWindowPosChanged( hwnd, insert_after, owner_hint, swp_flags, &monitor_rects,
                                              get_driver_window_surface( new_surface, raw_dpi ) ))

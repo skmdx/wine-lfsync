@@ -749,7 +749,8 @@ BOOL client_surface_get_scene_snapshot( HWND toplevel, UINT64 *scene_id, UINT *c
         remaining -= sizeof(*layer);
         if (!layer->producer.handle || !layer->producer.surface || !layer->producer.process ||
             !layer->window_dpi.num || !layer->window_dpi.den || !layer->raw_dpi.num || !layer->raw_dpi.den ||
-            (layer->flags & ~CLIENT_SURFACE_SCENE_PRESENT_RECT) || layer->reserved ||
+            (layer->flags & ~(CLIENT_SURFACE_SCENE_PRESENT_RECT | CLIENT_SURFACE_SCENE_DIRECT_CANDIDATE)) ||
+            layer->reserved ||
             layer->visible_count > remaining / sizeof(RECT)) goto done;
         bytes = layer->visible_count * sizeof(RECT);
         cursor += bytes;
@@ -763,6 +764,7 @@ BOOL client_surface_get_scene_snapshot( HWND toplevel, UINT64 *scene_id, UINT *c
         result[i].process = layer->producer.process;
         result[i].identity = layer->producer.surface;
         result[i].cookie = layer->producer.cookie;
+        result[i].direct_candidate = !!(layer->flags & CLIENT_SURFACE_SCENE_DIRECT_CANDIDATE);
         result[i].visible = !!layer->producer.visible;
         dpis[i] = layer->window_dpi;
         monitor_rects[i].window = wine_server_get_rect( layer->top_window );
@@ -907,7 +909,7 @@ BOOL client_surface_end_present_internal( struct client_surface *surface,
     BOOL region_valid = TRUE, sync = !!present->scene.generation, wake = FALSE;
     BOOL authorized = present->scene.authoritative;
     BOOL begin_valid = TRUE, composition_retry = FALSE;
-    BOOL scene_retry = FALSE, source_valid = FALSE;
+    BOOL scene_retry = FALSE, source_valid = FALSE, direct = FALSE;
     HDC hdc = 0;
 
     assert( present );
@@ -947,6 +949,14 @@ BOOL client_surface_end_present_internal( struct client_surface *surface,
                    debugstr_client_surface( surface ) );
     }
     source_valid = compose && new_content;
+    if (compose && !offscreen && present->mode == CLIENT_SURFACE_PRESENTATION_DIRECT)
+    {
+        /* The native WSI call already presented on the owner's attached
+         * target. Keep the same source/epoch checks without a DC, copy, fence
+         * or per-frame server transaction on the generation-zero path. */
+        direct = composed = TRUE;
+        compose = FALSE;
+    }
     if (compose && offscreen && !present->scene.valid) compose = FALSE;
     if (compose && offscreen &&
         client_surface_backend_has_cap( surface, CLIENT_SURFACE_BACKEND_OWNER_COMPOSITOR ))
@@ -1049,12 +1059,17 @@ BOOL client_surface_end_present_internal( struct client_surface *surface,
         surface->composed_serial = present->serial;
         InterlockedExchange( &surface->content_valid, TRUE );
     }
-    if (composed && sync &&
+    if (composed && sync && !direct &&
         (InterlockedCompareExchange( &surface->active, 0, 0 ) ||
          InterlockedCompareExchange( &surface->server_cached, 0, 0 )))
         commit = TRUE;
     composition_retry = sync && authorized && !composed && !scene_retry;
     pthread_mutex_unlock( &surface->present_lock );
+
+    if (direct && new_content && sync && present->scene.mode == CLIENT_SURFACE_PRESENTATION_DIRECT &&
+        present->scene.authoritative && client_surface_scene_current( &present->scene ) &&
+        surface->backend->complete_direct)
+        surface->backend->complete_direct( surface, present );
 
     /* wineserver can block behind unrelated requests.  Do not serialize all
      * process-local surfaces while acknowledging one composition epoch. */
@@ -1157,9 +1172,9 @@ void client_surface_wait_present_locked( struct client_surface *surface, BOOL ex
         client_surface_release_handoff( surface );
 }
 
-void client_surface_prepare_present_locked( struct client_surface *surface,
-                                            struct client_surface_frame *present,
-                                            BOOL external_completion )
+static void prepare_client_surface_present_locked( struct client_surface *surface,
+                                                    struct client_surface_frame *present,
+                                                    BOOL external_completion, BOOL allow_direct_transition )
 {
     struct client_surface_target target;
     unsigned int retry;
@@ -1200,12 +1215,18 @@ void client_surface_prepare_present_locked( struct client_surface *surface,
          (!present->scene.valid || !surface->target.valid ||
           surface->target.toplevel != present->scene.toplevel ||
           surface->target_scene_epoch != present->scene.epoch ||
-          surface->target_scene_mode != present->scene.mode); ++retry)
+          surface->target_scene_mode != present->scene.mode ||
+          (allow_direct_transition && present->scene.authoritative &&
+           present->scene.direct_candidate &&
+           present->scene.mode != CLIENT_SURFACE_PRESENTATION_DIRECT)); ++retry)
     {
+        /* Geometry may already match an unselected candidate scene. The
+         * actual producer must still ask the owner to select its strategy
+         * before the native present; geometry application is not admission. */
         if (present->scene.valid)
-            client_surface_update_present_scene_locked( surface, &present->scene );
+            client_surface_update_present_scene_locked( surface, &present->scene, allow_direct_transition );
         else
-            client_surface_update_present_locked( surface );
+            client_surface_update_present_scene_locked( surface, NULL, allow_direct_transition );
         client_surface_get_scene( surface, &present->scene );
     }
     client_surface_get_target( surface, &target );
@@ -1214,10 +1235,15 @@ void client_surface_prepare_present_locked( struct client_surface *surface,
      * update.  A resize can advance the seqlock between the caller's sample
      * and that update.  Do not stamp the newer epoch onto the retained old
      * target or submit an offscreen completion against a DIRECT scene. */
-    if (!present->scene.valid || target.toplevel != present->scene.toplevel ||
-        surface->target_scene_epoch != present->scene.epoch ||
-        surface->target_scene_mode != present->scene.mode)
+    if ((!present->scene.valid || target.toplevel != present->scene.toplevel ||
+         surface->target_scene_epoch != present->scene.epoch ||
+         surface->target_scene_mode != present->scene.mode) &&
+        (target.offscreen || target.mode != CLIENT_SURFACE_PRESENTATION_DIRECT))
         target.valid = FALSE;
+    /* An established attachment remains a valid native WSI target while the
+     * owner prepares its next scene. Keep the native result and completed
+     * image metadata; only a matching admitted plan can acknowledge that new
+     * publication. Size, native epoch and lifetime checks still apply. */
     present->target_epoch = target.epoch;
     present->mode = target.mode;
     present->target = !target.valid ? CLIENT_SURFACE_FRAME_TARGET_INVALID :
@@ -1239,6 +1265,22 @@ void client_surface_prepare_present_locked( struct client_surface *surface,
             present->completion.kind = CLIENT_SURFACE_COMPLETION_SHARED;
     }
     pthread_mutex_unlock( &surface->present_lock );
+}
+
+void client_surface_prepare_present_locked( struct client_surface *surface,
+                                            struct client_surface_frame *present,
+                                            BOOL external_completion )
+{
+    prepare_client_surface_present_locked( surface, present, external_completion, TRUE );
+}
+
+void client_surface_prepare_recompose_locked( struct client_surface *surface,
+                                              struct client_surface_frame *present )
+{
+    /* A cached image can be replayed by a completion system thread. It has
+     * neither a producer TEB nor a new native Present to replace the image
+     * that attaching a DIRECT drawable may discard. */
+    prepare_client_surface_present_locked( surface, present, TRUE, FALSE );
 }
 
 void client_surface_prepare_present( struct client_surface *surface,
@@ -1309,42 +1351,6 @@ void client_surface_submit_present( struct client_surface *surface,
     if (!--surface->native_present_count)
         pthread_cond_broadcast( &surface->completion_cond );
     client_surface_unlock_present( surface );
-}
-
-static BOOL client_surface_complete_direct_present_locked(
-    struct client_surface *surface, struct client_surface_frame *present )
-{
-    BOOL completed = FALSE;
-
-    /* A DIRECT swap has already made the producer-owned native child visible.
-     * It has no compositor destination, completion token or scene generation
-     * to publish.  Retain only the completed source metadata needed by a
-     * later DIRECT -> STAGED/COMPOSITED transition. */
-    pthread_mutex_lock( &surface->present_lock );
-    if (present->target_epoch != surface->target.epoch ||
-        present->scene.toplevel != surface->target.toplevel ||
-        !surface->hwnd || !surface->target.valid || surface->target.offscreen ||
-        (!InterlockedCompareExchange( &surface->active, 0, 0 ) &&
-         !InterlockedCompareExchange( &surface->server_cached, 0, 0 )))
-    {
-        TRACE( "discarding direct %s presentation across target state change\n",
-               debugstr_client_surface( surface ) );
-    }
-    else if (present->serial <= surface->composed_serial)
-    {
-        present->result = CLIENT_SURFACE_FRAME_SUPERSEDED;
-        TRACE( "discarding superseded direct presentation %s serial %s, composed %s\n",
-               debugstr_client_surface( surface ), wine_dbgstr_longlong( present->serial ),
-               wine_dbgstr_longlong( surface->composed_serial ) );
-    }
-    else
-    {
-        surface->composed_serial = present->serial;
-        InterlockedExchange( &surface->content_valid, TRUE );
-        completed = TRUE;
-    }
-    pthread_mutex_unlock( &surface->present_lock );
-    return completed;
 }
 
 static BOOL client_surface_capture_frame( struct client_surface *surface, struct client_surface_frame *present,
@@ -1471,13 +1477,7 @@ BOOL client_surface_complete_present_locked( struct client_surface *surface,
     if (handed_off) completed = TRUE;
     if (completed && !handed_off && !source_valid && present->result != CLIENT_SURFACE_FRAME_SUPERSEDED)
     {
-        if (present->target == CLIENT_SURFACE_FRAME_TARGET_ONSCREEN &&
-            present->mode == CLIENT_SURFACE_PRESENTATION_DIRECT &&
-            !present->scene.generation &&
-            present->completion.kind == CLIENT_SURFACE_COMPLETION_NONE)
-            completed = client_surface_complete_direct_present_locked( surface, present );
-        else
-            completed = client_surface_end_present_internal( surface, expected_size, TRUE, present );
+        completed = client_surface_end_present_internal( surface, expected_size, TRUE, present );
     }
     if (!completed) client_surface_abandon_handoff_locked( surface, present );
     /* A composition failure may still have accepted a completed source; its

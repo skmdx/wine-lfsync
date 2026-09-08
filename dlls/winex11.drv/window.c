@@ -3523,11 +3523,11 @@ BOOL X11DRV_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_hint, UIN
     {
         if (enable_client_surface_backing)
             X11DRV_client_surface_backing_snapshot( data, FALSE );
-        else destroy_client_surface_backing( data );
+        else if (!X11DRV_client_surface_backing_retire( data )) destroy_client_surface_backing( data );
     }
 
     window_set_wm_state( data, get_desired_wm_state( new_style, new_rects ), activate );
-    if (prepare_client_surface && !X11DRV_client_surface_backing_snapshot( data, TRUE ))
+    if (prepare_client_surface && !X11DRV_client_surface_prepare_owner( data ))
         client_surface_fail_scene( hwnd );
     if (publish_client_surface)
     {

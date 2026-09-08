@@ -278,6 +278,7 @@ struct client_surface_clip_window
 };
 
 #define CLIENT_SURFACE_SCENE_PRESENT_RECT 0x80000000
+#define CLIENT_SURFACE_SCENE_DIRECT_CANDIDATE 0x40000000
 
 struct client_surface_handoff_desc
 {
@@ -1142,6 +1143,7 @@ typedef volatile struct
 #define WINDOW_SHM_CLIENT_SURFACE_PUBLISHING 0x04
 #define WINDOW_SHM_CLIENT_SURFACE_PREPARING 0x08
 #define WINDOW_SHM_CLIENT_SURFACE_DIRECT 0x10
+#define WINDOW_SHM_CLIENT_SURFACE_DIRECT_CANDIDATE 0x80
 #define WINDOW_SHM_CLIENT_SURFACE_BACKING 0x20
 #define WINDOW_SHM_CLIENT_SURFACE_SOURCE_PENDING 0x40
 
@@ -6555,6 +6557,53 @@ struct get_client_surface_scene_snapshot_reply
     /* VARARG(layers,bytes); */
 };
 
+/* Start a fresh final scene for a strategy-only transition from an exact
+ * acknowledged scene. Geometry mutations still require owner preparation. */
+struct prepare_client_surface_direct_plan_request
+{
+    struct request_header __header;
+    user_handle_t handle;
+    unsigned __int64 scene_id;
+    unsigned __int64 surface;
+};
+struct prepare_client_surface_direct_plan_reply
+{
+    struct reply_header __header;
+    unsigned __int64 scene_id;
+};
+
+/* Select the native attachment strategy for the final immutable owner scene.
+ * PREPARING snapshots cannot authorize a later COMPOSING scene. */
+struct select_client_surface_direct_plan_request
+{
+    struct request_header __header;
+    user_handle_t handle;
+    unsigned __int64 scene_id;
+    unsigned __int64 surface;
+};
+struct select_client_surface_direct_plan_reply
+{
+    struct reply_header __header;
+    int accepted;
+    char __pad_12[4];
+};
+
+/* The owner observed successful native presentation on its attached target.
+ * Reserve publication through the same READY/PUBLISHING transition as copies. */
+struct complete_client_surface_direct_plan_request
+{
+    struct request_header __header;
+    user_handle_t handle;
+    unsigned __int64 scene_id;
+    unsigned __int64 surface;
+};
+struct complete_client_surface_direct_plan_reply
+{
+    struct reply_header __header;
+    int accepted;
+    char __pad_12[4];
+};
+
 /* Request an owner cache replay after native repair. Receipts attest a
  * retained image for every visible selected producer in the exact scene. */
 struct request_client_surface_owner_repair_request
@@ -6925,6 +6974,9 @@ enum request
     REQ_cancel_client_surface_handoffs,
     REQ_publish_client_surface_handoff,
     REQ_get_client_surface_scene_snapshot,
+    REQ_prepare_client_surface_direct_plan,
+    REQ_select_client_surface_direct_plan,
+    REQ_complete_client_surface_direct_plan,
     REQ_request_client_surface_owner_repair,
     REQ_resolve_client_surface_scene_sources,
     REQ_set_window_present_rect,
@@ -7256,6 +7308,9 @@ union generic_request
     struct cancel_client_surface_handoffs_request cancel_client_surface_handoffs_request;
     struct publish_client_surface_handoff_request publish_client_surface_handoff_request;
     struct get_client_surface_scene_snapshot_request get_client_surface_scene_snapshot_request;
+    struct prepare_client_surface_direct_plan_request prepare_client_surface_direct_plan_request;
+    struct select_client_surface_direct_plan_request select_client_surface_direct_plan_request;
+    struct complete_client_surface_direct_plan_request complete_client_surface_direct_plan_request;
     struct request_client_surface_owner_repair_request request_client_surface_owner_repair_request;
     struct resolve_client_surface_scene_sources_request resolve_client_surface_scene_sources_request;
     struct set_window_present_rect_request set_window_present_rect_request;
@@ -7585,11 +7640,14 @@ union generic_reply
     struct cancel_client_surface_handoffs_reply cancel_client_surface_handoffs_reply;
     struct publish_client_surface_handoff_reply publish_client_surface_handoff_reply;
     struct get_client_surface_scene_snapshot_reply get_client_surface_scene_snapshot_reply;
+    struct prepare_client_surface_direct_plan_reply prepare_client_surface_direct_plan_reply;
+    struct select_client_surface_direct_plan_reply select_client_surface_direct_plan_reply;
+    struct complete_client_surface_direct_plan_reply complete_client_surface_direct_plan_reply;
     struct request_client_surface_owner_repair_reply request_client_surface_owner_repair_reply;
     struct resolve_client_surface_scene_sources_reply resolve_client_surface_scene_sources_reply;
     struct set_window_present_rect_reply set_window_present_rect_reply;
 };
 
-#define SERVER_PROTOCOL_VERSION 1012
+#define SERVER_PROTOCOL_VERSION 1014
 
 #endif /* __WINE_WINE_SERVER_PROTOCOL_H */

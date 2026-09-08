@@ -34,7 +34,9 @@ extern BOOL client_surface_get_scene( struct client_surface *surface,
                                       struct client_surface_scene *scene );
 extern BOOL client_surface_scene_current( const struct client_surface_scene *scene );
 extern BOOL client_surface_update_present_scene_locked(
-    struct client_surface *surface, const struct client_surface_scene *scene );
+    struct client_surface *surface, const struct client_surface_scene *scene, BOOL allow_direct_transition );
+extern void client_surface_prepare_recompose_locked( struct client_surface *surface,
+                                                      struct client_surface_frame *present );
 extern BOOL client_surface_update_present_locked( struct client_surface *surface );
 extern void client_surface_apply_pending_update( struct client_surface *surface );
 extern BOOL client_surface_end_present_internal( struct client_surface *surface,

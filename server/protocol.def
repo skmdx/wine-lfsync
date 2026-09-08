@@ -294,6 +294,7 @@ struct client_surface_clip_window
 };
 
 #define CLIENT_SURFACE_SCENE_PRESENT_RECT 0x80000000
+#define CLIENT_SURFACE_SCENE_DIRECT_CANDIDATE 0x40000000
 
 struct client_surface_handoff_desc
 {
@@ -1158,6 +1159,7 @@ typedef volatile struct
 #define WINDOW_SHM_CLIENT_SURFACE_PUBLISHING 0x04
 #define WINDOW_SHM_CLIENT_SURFACE_PREPARING 0x08
 #define WINDOW_SHM_CLIENT_SURFACE_DIRECT 0x10
+#define WINDOW_SHM_CLIENT_SURFACE_DIRECT_CANDIDATE 0x80
 #define WINDOW_SHM_CLIENT_SURFACE_BACKING 0x20
 #define WINDOW_SHM_CLIENT_SURFACE_SOURCE_PENDING 0x40
 
@@ -4565,6 +4567,36 @@ enum inproc_sync_type
     unsigned int count;
     unsigned int total_size;
     VARARG(layers,bytes); /* complete client_surface_scene_layer records */
+@END
+
+/* Start a fresh final scene for a strategy-only transition from an exact
+ * acknowledged scene. Geometry mutations still require owner preparation. */
+@REQ(prepare_client_surface_direct_plan)
+    user_handle_t handle;
+    unsigned __int64 scene_id;
+    unsigned __int64 surface;
+@REPLY
+    unsigned __int64 scene_id;
+@END
+
+/* Select the native attachment strategy for the final immutable owner scene.
+ * PREPARING snapshots cannot authorize a later COMPOSING scene. */
+@REQ(select_client_surface_direct_plan)
+    user_handle_t handle;
+    unsigned __int64 scene_id;
+    unsigned __int64 surface;
+@REPLY
+    int accepted;
+@END
+
+/* The owner observed successful native presentation on its attached target.
+ * Reserve publication through the same READY/PUBLISHING transition as copies. */
+@REQ(complete_client_surface_direct_plan)
+    user_handle_t handle;
+    unsigned __int64 scene_id;
+    unsigned __int64 surface;
+@REPLY
+    int accepted;
 @END
 
 /* Request an owner cache replay after native repair. Receipts attest a

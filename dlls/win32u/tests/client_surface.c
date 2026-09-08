@@ -60,6 +60,7 @@ struct clip_state
 
 static unsigned int (CDECL *p_wine_server_call)(void *);
 static void pump_messages( DWORD timeout );
+static UINT set_scene_placement( HWND hwnd, int offset, int grow, int frame, UINT flags );
 
 static UINT64 allocate_surface(void)
 {
@@ -367,6 +368,358 @@ static void complete_single_surface_generation( HWND hwnd, UINT64 surface,
     }
 }
 
+static UINT prepare_direct_plan( HWND hwnd, UINT64 surface, UINT64 scene, UINT64 *next_scene )
+{
+    struct __server_request_info info = {0};
+    UINT status;
+
+    *next_scene = 0;
+    info.u.req.prepare_client_surface_direct_plan_request.__header.req = REQ_prepare_client_surface_direct_plan;
+    info.u.req.prepare_client_surface_direct_plan_request.handle = wine_server_user_handle( hwnd );
+    info.u.req.prepare_client_surface_direct_plan_request.surface = surface;
+    info.u.req.prepare_client_surface_direct_plan_request.scene_id = scene;
+    status = p_wine_server_call( &info );
+    if (!status) *next_scene = info.u.reply.prepare_client_surface_direct_plan_reply.scene_id;
+    return status;
+}
+
+static UINT direct_plan_request( HWND hwnd, UINT64 surface, UINT64 scene, BOOL complete, BOOL *accepted )
+{
+    struct __server_request_info info = {0};
+    UINT status;
+
+    *accepted = FALSE;
+    if (complete)
+    {
+        info.u.req.complete_client_surface_direct_plan_request.__header.req = REQ_complete_client_surface_direct_plan;
+        info.u.req.complete_client_surface_direct_plan_request.handle = wine_server_user_handle( hwnd );
+        info.u.req.complete_client_surface_direct_plan_request.surface = surface;
+        info.u.req.complete_client_surface_direct_plan_request.scene_id = scene;
+        status = p_wine_server_call( &info );
+        if (!status) *accepted = info.u.reply.complete_client_surface_direct_plan_reply.accepted;
+    }
+    else
+    {
+        info.u.req.select_client_surface_direct_plan_request.__header.req = REQ_select_client_surface_direct_plan;
+        info.u.req.select_client_surface_direct_plan_request.handle = wine_server_user_handle( hwnd );
+        info.u.req.select_client_surface_direct_plan_request.surface = surface;
+        info.u.req.select_client_surface_direct_plan_request.scene_id = scene;
+        status = p_wine_server_call( &info );
+        if (!status) *accepted = info.u.reply.select_client_surface_direct_plan_reply.accepted;
+    }
+    return status;
+}
+
+static UINT direct_plan_ack( HWND hwnd, UINT64 scene, BOOL success, BOOL *accepted )
+{
+    struct __server_request_info info = {0};
+    UINT status;
+
+    info.u.req.publish_client_surface_handoff_request.__header.req = REQ_publish_client_surface_handoff;
+    info.u.req.publish_client_surface_handoff_request.handle = wine_server_user_handle( hwnd );
+    info.u.req.publish_client_surface_handoff_request.generation = scene;
+    info.u.req.publish_client_surface_handoff_request.scene_generation = scene;
+    info.u.req.publish_client_surface_handoff_request.success = success;
+    status = p_wine_server_call( &info );
+    *accepted = !status && info.u.reply.publish_client_surface_handoff_reply.accepted;
+    return status;
+}
+
+static void check_direct_candidate( HWND hwnd, UINT64 surface, UINT64 scene, BOOL expected );
+static void check_direct_snapshot_sealed( HWND hwnd, UINT64 scene );
+static void check_direct_snapshot_stale( HWND hwnd, UINT64 scene );
+
+static void check_direct_shared_state( HWND hwnd, UINT64 surface, UINT64 scene,
+                                       BOOL candidate, BOOL direct, BOOL backing )
+{
+    static const WCHAR section_name[] = L"\\KernelObjects\\__wine_session";
+    UNICODE_STRING name = RTL_CONSTANT_STRING( section_name );
+    NTSTATUS (WINAPI *open_section)( HANDLE *, ACCESS_MASK, const OBJECT_ATTRIBUTES * );
+    const shared_object_t *object;
+    const session_shm_t *session;
+    MEMORY_BASIC_INFORMATION memory;
+    OBJECT_ATTRIBUTES attr;
+    struct user_entry entry;
+    UINT64 seq, shared_scene, shared_surface;
+    UINT index = (LOWORD(hwnd) - FIRST_USER_HANDLE) >> 1, flags;
+    HANDLE section;
+    UINT status;
+
+    open_section = (void *)GetProcAddress( GetModuleHandleA( "ntdll.dll" ), "NtOpenSection" );
+    InitializeObjectAttributes( &attr, &name, 0, NULL, NULL );
+    status = open_section( &section, SECTION_MAP_READ, &attr );
+    ok( !status, "shared session open status %#x\n", status );
+    if (status) return;
+    session = MapViewOfFile( section, FILE_MAP_READ, 0, 0, 0 );
+    CloseHandle( section );
+    ok( !!session, "shared session map error %lu\n", GetLastError() );
+    if (!session) return;
+    ok( index < MAX_USER_HANDLES, "invalid window table index %u\n", index );
+    if (index >= MAX_USER_HANDLES) goto done;
+    entry = session->user_entries[index];
+    ok( entry.type == NTUSER_OBJ_WINDOW && entry.generation == HIWORD(hwnd),
+        "window table identity %#x/%#x\n", entry.type, entry.generation );
+    if (entry.type != NTUSER_OBJ_WINDOW || entry.generation != HIWORD(hwnd)) goto done;
+    VirtualQuery( (const void *)session, &memory, sizeof(memory) );
+    ok( entry.offset <= memory.RegionSize && sizeof(*object) <= memory.RegionSize - entry.offset,
+        "window shared object outside mapping: offset %s size %Iu\n",
+        wine_dbgstr_longlong( entry.offset ), memory.RegionSize );
+    if (entry.offset > memory.RegionSize || sizeof(*object) > memory.RegionSize - entry.offset) goto done;
+    object = (const void *)((const char *)session + entry.offset);
+    do
+    {
+        while ((seq = ReadNoFence64( &object->seq )) & 1) YieldProcessor();
+        MemoryBarrier();
+        shared_scene = object->shm.window.client_surface_scene_generation;
+        shared_surface = object->shm.window.client_surface_id;
+        flags = object->shm.window.client_surface_flags;
+        MemoryBarrier();
+    } while (ReadNoFence64( &object->seq ) != seq);
+    ok( object->id == entry.id, "window shared object lifetime changed\n" );
+    ok( shared_scene == scene && shared_surface == surface,
+        "shared scene/lifetime %s/%s expected %s/%s\n", wine_dbgstr_longlong( shared_scene ),
+        wine_dbgstr_longlong( shared_surface ), wine_dbgstr_longlong( scene ), wine_dbgstr_longlong( surface ) );
+    ok( !!(flags & WINDOW_SHM_CLIENT_SURFACE_DIRECT_CANDIDATE) == candidate &&
+        !!(flags & WINDOW_SHM_CLIENT_SURFACE_DIRECT) == direct,
+        "shared DIRECT flags %#x expected candidate %u authorized %u\n", flags, candidate, direct );
+    ok( !!(flags & WINDOW_SHM_CLIENT_SURFACE_BACKING) == backing,
+        "shared backing flag %#x expected %u\n", flags, backing );
+done:
+    UnmapViewOfFile( (const void *)session );
+}
+
+static void check_direct_owner_auth( HWND hwnd, UINT64 surface, UINT64 scene )
+{
+    STARTUPINFOA startup = {.cb = sizeof(startup)};
+    PROCESS_INFORMATION process;
+    char command[MAX_PATH * 2], **argv;
+    DWORD exit_code = ~0u;
+
+    winetest_get_mainargs( &argv );
+    sprintf( command, "\"%s\" %s direct_plan_owner_auth %p %I64x %I64x", argv[0], argv[1], hwnd, surface, scene );
+    if (!CreateProcessA( NULL, command, NULL, NULL, FALSE, 0, NULL, NULL, &startup, &process ))
+    {
+        ok( 0, "DIRECT auth child CreateProcess error %lu\n", GetLastError() );
+        return;
+    }
+    ok( WaitForSingleObject( process.hProcess, 10000 ) == WAIT_OBJECT_0, "DIRECT auth child did not exit\n" );
+    GetExitCodeProcess( process.hProcess, &exit_code );
+    ok( !exit_code, "DIRECT auth child returned %lu\n", exit_code );
+    CloseHandle( process.hThread );
+    CloseHandle( process.hProcess );
+}
+
+static void complete_direct_surface_generation( HWND hwnd, UINT64 surface, struct surface_state *state )
+{
+    struct surface_state preparing, generation;
+    UINT64 unused = allocate_surface();
+    UINT status;
+    BOOL accepted;
+
+    status = set_surface_state( hwnd, 0, CLIENT_SURFACE_STATE_PREPARE_BEGIN, 0, &preparing );
+    ok( !status, "DIRECT prepare begin status %#x\n", status );
+    if (preparing.publish)
+    {
+        status = direct_plan_request( hwnd, surface, preparing.scene_generation, FALSE, &accepted );
+        ok( !status && !accepted, "PREPARING plan status %#x accepted %u\n", status, accepted );
+        status = set_surface_state_scene( hwnd, 0, CLIENT_SURFACE_STATE_PREPARE_COMMIT,
+                                          0, preparing.scene_generation, state );
+        ok( !status && state->generation && state->scene_generation != preparing.scene_generation,
+            "DIRECT prepare commit status %#x generation %s old/new scenes %s/%s\n", status,
+            wine_dbgstr_longlong( state->generation ), wine_dbgstr_longlong( preparing.scene_generation ),
+            wine_dbgstr_longlong( state->scene_generation ) );
+        status = direct_plan_request( hwnd, surface, preparing.scene_generation, FALSE, &accepted );
+        ok( !status && !accepted, "retagged PREPARING plan status %#x accepted %u\n", status, accepted );
+    }
+    else *state = preparing;
+    generation = *state;
+    check_direct_candidate( hwnd, surface, generation.scene_generation, TRUE );
+    check_direct_shared_state( hwnd, surface, generation.scene_generation, TRUE, FALSE, TRUE );
+    ok( generation.generation && generation.pending == 1 && !generation.ready &&
+        generation.mode == CLIENT_SURFACE_PRESENTATION_COMPOSITED,
+        "candidate was already authorized: generation %s pending %u ready %u mode %u\n",
+        wine_dbgstr_longlong( generation.generation ), generation.pending, generation.ready, generation.mode );
+    status = direct_plan_request( hwnd, unused, generation.scene_generation, FALSE, &accepted );
+    ok( !status && !accepted, "wrong lifetime plan status %#x accepted %u\n", status, accepted );
+    status = direct_plan_request( hwnd, surface, generation.scene_generation | 1, FALSE, &accepted );
+    ok( !status && !accepted, "odd scene plan status %#x accepted %u\n", status, accepted );
+    status = direct_plan_request( hwnd, surface, generation.scene_generation, TRUE, &accepted );
+    ok( !status && !accepted, "unselected plan completion status %#x accepted %u\n", status, accepted );
+    status = direct_plan_request( hwnd, surface, generation.scene_generation, FALSE, &accepted );
+    ok( !status && accepted, "DIRECT owner selection status %#x accepted %u\n", status, accepted );
+    status = set_surface_state( hwnd, 0, 0, 0, state );
+    ok( !status && state->generation == generation.generation && state->pending == 1 && !state->ready &&
+        state->mode == CLIENT_SURFACE_PRESENTATION_DIRECT,
+        "selected DIRECT state status %#x generation %s pending %u ready %u mode %u\n", status,
+        wine_dbgstr_longlong( state->generation ), state->pending, state->ready, state->mode );
+    check_direct_shared_state( hwnd, surface, state->scene_generation, TRUE, TRUE, TRUE );
+    status = commit_surface_state( hwnd, surface, &generation, state );
+    ok( !status && state->pending == 1 && !state->ready,
+        "producer bypassed owner proof: status %#x pending %u ready %u\n", status, state->pending, state->ready );
+    status = direct_plan_request( hwnd, unused, generation.scene_generation, TRUE, &accepted );
+    ok( !status && !accepted, "wrong lifetime completion status %#x accepted %u\n", status, accepted );
+    status = direct_plan_request( hwnd, surface, generation.scene_generation, TRUE, &accepted );
+    ok( !status && accepted, "DIRECT owner completion status %#x accepted %u\n", status, accepted );
+    status = set_surface_state( hwnd, 0, 0, 0, state );
+    ok( !status && state->generation == generation.generation && !state->pending && state->ready,
+        "DIRECT bypassed publication: status %#x generation %s pending %u ready %u\n", status,
+        wine_dbgstr_longlong( state->generation ), state->pending, state->ready );
+    status = direct_plan_ack( hwnd, generation.scene_generation + 2, TRUE, &accepted );
+    ok( !status && !accepted, "wrong scene ACK status %#x accepted %u\n", status, accepted );
+    status = direct_plan_ack( hwnd, generation.scene_generation, TRUE, &accepted );
+    ok( !status && accepted, "common DIRECT publication ACK status %#x accepted %u\n", status, accepted );
+    status = set_surface_state( hwnd, 0, 0, 0, state );
+    ok( !status && !state->generation && !state->pending && !state->ready &&
+        state->mode == CLIENT_SURFACE_PRESENTATION_DIRECT,
+        "DIRECT ACK state status %#x generation %s pending %u ready %u mode %u\n", status,
+        wine_dbgstr_longlong( state->generation ), state->pending, state->ready, state->mode );
+    check_direct_shared_state( hwnd, surface, state->scene_generation, TRUE, TRUE, FALSE );
+    release_surface( unused );
+}
+
+static void test_direct_strategy_scene(void)
+{
+    const UINT flags = CLIENT_SURFACE_STATE_REGISTER | CLIENT_SURFACE_STATE_SCENE_PUBLICATION |
+                       CLIENT_SURFACE_STATE_DIRECT_PRESENTATION;
+    UINT64 surface = allocate_surface(), unused = allocate_surface(), dormant, old_scene, fresh, rejected;
+    struct surface_state state, generation, preparing;
+    struct native_barrier_state barrier;
+    HWND hwnd = create_test_window( TRUE );
+    UINT status;
+    BOOL accepted;
+
+    ok( !!hwnd, "failed to create strategy scene window\n" );
+    if (!hwnd) goto done;
+    pump_messages( 100 );
+    status = set_surface_state( hwnd, surface, flags, 0, &state );
+    ok( !status, "strategy register status %#x\n", status );
+    status = claim_surface_state( hwnd, surface, &state );
+    ok( !status, "strategy claim status %#x\n", status );
+    status = prepare_surface_state( hwnd, &state );
+    ok( !status, "initial strategy prepare status %#x\n", status );
+    status = prepare_direct_plan( hwnd, surface, state.scene_generation, &fresh );
+    ok( !status && !fresh, "unacknowledged scene prepared: status %#x scene %s\n",
+        status, wine_dbgstr_longlong( fresh ) );
+    status = set_surface_state( hwnd, 0, CLIENT_SURFACE_STATE_BYPASS, 0, &state );
+    ok( !status && !state.generation && !state.pending, "BYPASS status %#x did not leave IDLE\n", status );
+    status = prepare_direct_plan( hwnd, surface, state.scene_generation, &fresh );
+    ok( !status && !fresh, "IDLE without a native ACK authorized strategy: status %#x\n", status );
+    status = set_surface_state( hwnd, 0, CLIENT_SURFACE_STATE_GEOMETRY_READY, 0, &state );
+    ok( !status, "post-BYPASS recovery status %#x\n", status );
+    complete_single_surface_generation( hwnd, surface, &state );
+    ok( !state.generation && state.mode == CLIENT_SURFACE_PRESENTATION_COMPOSITED,
+        "initial strategy scene was not published by composition\n" );
+    old_scene = state.scene_generation;
+    check_direct_owner_auth( hwnd, surface, old_scene );
+    status = prepare_direct_plan( hwnd, unused, old_scene, &fresh );
+    ok( !status && !fresh, "wrong lifetime prepared: status %#x scene %s\n", status, wine_dbgstr_longlong( fresh ) );
+    status = prepare_direct_plan( hwnd, surface, old_scene | 1, &fresh );
+    ok( !status && !fresh, "odd scene prepared: status %#x scene %s\n", status, wine_dbgstr_longlong( fresh ) );
+    status = prepare_direct_plan( hwnd, surface, old_scene + 2, &fresh );
+    ok( !status && !fresh, "unissued scene prepared: status %#x scene %s\n", status, wine_dbgstr_longlong( fresh ) );
+
+    dormant = allocate_surface();
+    status = set_surface_state( hwnd, dormant, flags, 0, &state );
+    ok( !status, "strategy dormant registration status %#x\n", status );
+    complete_single_surface_generation( hwnd, surface, &state );
+    ok( !state.generation && state.active == 2, "dormant scene was not acknowledged\n" );
+    status = prepare_direct_plan( hwnd, surface, state.scene_generation, &fresh );
+    ok( !status && !fresh, "acknowledged dormant registration ignored: status %#x scene %s\n",
+        status, wine_dbgstr_longlong( fresh ) );
+    status = set_surface_state( hwnd, dormant, CLIENT_SURFACE_STATE_UNREGISTER, 0, &state );
+    ok( !status, "strategy dormant retirement status %#x\n", status );
+    status = prepare_direct_plan( hwnd, surface, old_scene, &fresh );
+    ok( !status && !fresh, "stale acknowledged scene prepared: status %#x scene %s\n",
+        status, wine_dbgstr_longlong( fresh ) );
+    complete_single_surface_generation( hwnd, surface, &state );
+    old_scene = state.scene_generation;
+    status = set_native_barrier( hwnd, 0x7640, TRUE, &barrier );
+    ok( !status, "strategy barrier begin status %#x\n", status );
+    status = prepare_direct_plan( hwnd, surface, old_scene, &fresh );
+    ok( !status && !fresh, "native barrier prepared: status %#x scene %s\n", status, wine_dbgstr_longlong( fresh ) );
+    status = prepare_direct_plan( hwnd, surface, barrier.scene_generation, &fresh );
+    ok( !status && !fresh, "sealed scene prepared: status %#x scene %s\n", status, wine_dbgstr_longlong( fresh ) );
+    status = set_native_barrier( hwnd, 0x7640, FALSE, &barrier );
+    ok( !status, "strategy barrier end status %#x\n", status );
+    set_surface_state( hwnd, 0, 0, 0, &state );
+    complete_single_surface_generation( hwnd, surface, &state );
+    old_scene = state.scene_generation;
+
+    status = prepare_direct_plan( hwnd, surface, old_scene, &fresh );
+    ok( !status && fresh && !(fresh & 1) && fresh != old_scene,
+        "strategy prepare status %#x old/new scenes %s/%s\n", status,
+        wine_dbgstr_longlong( old_scene ), wine_dbgstr_longlong( fresh ) );
+    set_surface_state( hwnd, 0, 0, 0, &state );
+    ok( state.generation == fresh && state.scene_generation == fresh && state.pending == 1 &&
+        !state.ready && state.mode == CLIENT_SURFACE_PRESENTATION_COMPOSITED,
+        "new strategy scene bypassed composition/admission\n" );
+    check_direct_snapshot_stale( hwnd, old_scene );
+    check_direct_candidate( hwnd, surface, fresh, TRUE );
+    check_direct_shared_state( hwnd, surface, fresh, TRUE, FALSE, TRUE );
+    status = prepare_direct_plan( hwnd, surface, fresh, &rejected );
+    ok( !status && !rejected, "unacknowledged strategy scene restarted: status %#x\n", status );
+    status = direct_plan_request( hwnd, surface, old_scene, FALSE, &accepted );
+    ok( !status && !accepted, "old snapshot was retagged: status %#x accepted %u\n", status, accepted );
+    status = direct_plan_request( hwnd, unused, fresh, FALSE, &accepted );
+    ok( !status && !accepted, "wrong new-plan lifetime accepted: status %#x\n", status );
+    status = direct_plan_ack( hwnd, old_scene, TRUE, &accepted );
+    ok( !status && !accepted, "old ACK completed a new scene: status %#x\n", status );
+    /* A failed second snapshot or owner admission must leave this fresh
+     * scene available to ordinary composition, without another prepare. */
+    complete_single_surface_generation( hwnd, surface, &state );
+    ok( !state.generation && state.scene_generation == fresh &&
+        state.mode == CLIENT_SURFACE_PRESENTATION_COMPOSITED, "strategy fallback did not ACK the same scene\n" );
+
+    old_scene = fresh;
+    status = prepare_direct_plan( hwnd, surface, old_scene, &fresh );
+    ok( !status && fresh && fresh != old_scene, "second strategy prepare status %#x\n", status );
+    check_direct_candidate( hwnd, surface, fresh, TRUE );
+    status = direct_plan_request( hwnd, surface, fresh, FALSE, &accepted );
+    ok( !status && accepted, "fresh DIRECT selection status %#x accepted %u\n", status, accepted );
+    status = direct_plan_request( hwnd, surface, fresh, TRUE, &accepted );
+    ok( !status && accepted, "fresh DIRECT completion status %#x accepted %u\n", status, accepted );
+    status = direct_plan_ack( hwnd, fresh, TRUE, &accepted );
+    ok( !status && accepted, "fresh DIRECT ACK status %#x accepted %u\n", status, accepted );
+    set_surface_state( hwnd, 0, 0, 0, &state );
+    ok( !state.generation && state.mode == CLIENT_SURFACE_PRESENTATION_DIRECT, "fresh DIRECT did not finish\n" );
+    status = prepare_direct_plan( hwnd, surface, fresh, &rejected );
+    ok( !status && !rejected, "steady DIRECT started another scene: status %#x\n", status );
+
+    /* Change actual server placement without pumping the GUI preparation
+     * message. Consuming one ACK cannot prepare this later geometry. */
+    status = set_scene_placement( hwnd, 3, 0, 0, 0 );
+    ok( !status, "post-strategy geometry mutation status %#x\n", status );
+    status = set_surface_state( hwnd, 0, CLIENT_SURFACE_STATE_PREPARE_BEGIN, 0, &preparing );
+    ok( !status && preparing.publish, "real mutation skipped PREPARING: status %#x publish %u\n",
+        status, preparing.publish );
+    status = prepare_direct_plan( hwnd, surface, preparing.scene_generation, &rejected );
+    ok( !status && !rejected, "PREPARING reused an old ACK: status %#x\n", status );
+    status = set_surface_state_scene( hwnd, 0, CLIENT_SURFACE_STATE_PREPARE_COMMIT,
+                                      0, preparing.scene_generation, &state );
+    ok( !status && state.pending == 1, "post-mutation prepare status %#x pending %u\n", status, state.pending );
+    generation = state;
+    status = commit_surface_state( hwnd, surface, &generation, &state );
+    ok( !status && state.ready, "failure-fixture composition status %#x ready %u\n", status, state.ready );
+    status = set_surface_state( hwnd, 0, CLIENT_SURFACE_STATE_PUBLISH_BEGIN, 0, &state );
+    ok( !status && state.publish, "failure-fixture publication status %#x publish %u\n", status, state.publish );
+    status = direct_plan_ack( hwnd, generation.scene_generation, FALSE, &accepted );
+    ok( !status && accepted, "failed native ACK status %#x accepted %u\n", status, accepted );
+    set_surface_state( hwnd, 0, 0, 0, &state );
+    ok( !state.generation && state.scene_generation != generation.scene_generation,
+        "failed ACK did not leave an invalidated idle scene\n" );
+    status = prepare_direct_plan( hwnd, surface, state.scene_generation, &rejected );
+    ok( !status && !rejected, "IDLE after failed ACK authorized strategy: status %#x\n", status );
+    status = prepare_direct_plan( hwnd, surface, fresh, &rejected );
+    ok( !status && !rejected, "old successful ACK survived failed new scene: status %#x\n", status );
+
+    set_surface_state( hwnd, surface, CLIENT_SURFACE_STATE_UNREGISTER, 0, NULL );
+    DestroyWindow( hwnd );
+    pump_messages( 100 );
+done:
+    release_surface( unused );
+    if (!hwnd) release_surface( surface );
+}
+
 static void test_presentation_modes(void)
 {
     const UINT64 surface = allocate_surface(), child_surface = allocate_surface();
@@ -374,8 +727,11 @@ static void test_presentation_modes(void)
                               CLIENT_SURFACE_STATE_SCENE_PUBLICATION |
                               CLIENT_SURFACE_STATE_DIRECT_PRESENTATION;
     struct surface_state state;
+    struct native_barrier_state barrier;
     HWND hwnd, child = NULL;
     unsigned int status;
+    UINT64 sealed_scene, next_scene;
+    BOOL accepted;
 
     hwnd = create_test_window( FALSE );
     ok( !!hwnd, "failed to create presentation mode window, error %lu\n", GetLastError() );
@@ -387,10 +743,52 @@ static void test_presentation_modes(void)
     ok( !status, "direct surface register failed, status %#x\n", status );
     status = claim_surface_state( hwnd, surface, &state );
     ok( !status, "direct surface claim failed, status %#x\n", status );
-    complete_single_surface_generation( hwnd, surface, &state );
+    complete_direct_surface_generation( hwnd, surface, &state );
     status = set_surface_state( hwnd, surface, 0, 0, &state );
     ok( !status && state.mode == CLIENT_SURFACE_PRESENTATION_DIRECT,
         "simple top-level mode %u, expected DIRECT, status %#x\n", state.mode, status );
+    check_direct_owner_auth( hwnd, surface, state.scene_generation );
+
+    {
+        const UINT64 dormant = allocate_surface();
+        UINT64 old_scene = state.scene_generation, dormant_scene;
+
+        status = set_surface_state( hwnd, dormant, direct_flags, 0, &state );
+        ok( !status && state.active == 2 && state.mode == CLIENT_SURFACE_PRESENTATION_COMPOSITED,
+            "dormant registration status %#x active %u mode %u\n", status, state.active, state.mode );
+        ok( state.scene_generation != old_scene, "DIRECT eligibility changed within the same scene\n" );
+        check_direct_snapshot_stale( hwnd, old_scene );
+        check_direct_shared_state( hwnd, surface, state.scene_generation, FALSE, FALSE, TRUE );
+        check_direct_candidate( hwnd, surface, state.scene_generation, FALSE );
+        prepare_surface_state( hwnd, &state );
+        status = direct_plan_request( hwnd, surface, state.scene_generation, FALSE, &accepted );
+        ok( !status && !accepted, "dormant registration was ignored: status %#x accepted %u\n", status, accepted );
+        dormant_scene = state.scene_generation;
+        status = set_surface_state( hwnd, dormant, CLIENT_SURFACE_STATE_UNREGISTER, 0, &state );
+        ok( !status && state.scene_generation != dormant_scene &&
+            state.mode == CLIENT_SURFACE_PRESENTATION_COMPOSITED,
+            "dormant cleanup reused an old plan: status %#x scene %s mode %u\n", status,
+            wine_dbgstr_longlong( state.scene_generation ), state.mode );
+        check_direct_snapshot_stale( hwnd, dormant_scene );
+        check_direct_shared_state( hwnd, surface, state.scene_generation, TRUE, FALSE, TRUE );
+        status = direct_plan_request( hwnd, surface, old_scene, FALSE, &accepted );
+        ok( !status && !accepted, "old plan was resurrected: status %#x accepted %u\n", status, accepted );
+        complete_direct_surface_generation( hwnd, surface, &state );
+    }
+
+    status = set_native_barrier( hwnd, 0x1234, TRUE, &barrier );
+    ok( !status, "DIRECT native barrier begin status %#x\n", status );
+    sealed_scene = barrier.scene_generation;
+    check_direct_snapshot_sealed( hwnd, sealed_scene );
+    check_direct_shared_state( hwnd, surface, sealed_scene, FALSE, FALSE, TRUE );
+    status = direct_plan_request( hwnd, surface, barrier.scene_generation, FALSE, &accepted );
+    ok( !status && !accepted, "sealed native target plan status %#x accepted %u\n", status, accepted );
+    status = set_native_barrier( hwnd, 0x1234, FALSE, &barrier );
+    ok( !status && !(barrier.scene_generation & 1) && barrier.scene_generation != sealed_scene,
+        "DIRECT native barrier end status %#x scene %s sealed %s\n", status,
+        wine_dbgstr_longlong( barrier.scene_generation ), wine_dbgstr_longlong( sealed_scene ) );
+    set_surface_state( hwnd, 0, 0, 0, &state );
+    complete_direct_surface_generation( hwnd, surface, &state );
 
     child = create_test_child( hwnd, 10 );
     ok( !!child, "failed to create presentation mode child, error %lu\n", GetLastError() );
@@ -401,13 +799,17 @@ static void test_presentation_modes(void)
         status = claim_surface_state( child, child_surface, &state );
         ok( !status && state.mode == CLIENT_SURFACE_PRESENTATION_COMPOSITED,
             "multi-window mode %u, expected COMPOSITED, status %#x\n", state.mode, status );
+        check_direct_candidate( hwnd, surface, state.scene_generation, FALSE );
+        status = direct_plan_request( child, child_surface, state.scene_generation, FALSE, &accepted );
+        ok( status == STATUS_ACCESS_DENIED && !accepted,
+            "child attachment plan status %#x accepted %u\n", status, accepted );
         status = set_surface_state( child, child_surface, CLIENT_SURFACE_STATE_UNREGISTER, 0, &state );
         ok( !status, "child surface unregister failed, status %#x\n", status );
         DestroyWindow( child );
         child = NULL;
         status = set_surface_state( hwnd, surface, 0, 0, &state );
         ok( !status, "post-child mode query failed, status %#x\n", status );
-        complete_single_surface_generation( hwnd, surface, &state );
+        complete_direct_surface_generation( hwnd, surface, &state );
         status = set_surface_state( hwnd, surface, 0, 0, &state );
         ok( !status && state.mode == CLIENT_SURFACE_PRESENTATION_DIRECT,
             "post-child mode %u, expected DIRECT, status %#x\n", state.mode, status );
@@ -422,10 +824,19 @@ static void test_presentation_modes(void)
     status = set_surface_state( hwnd, surface, CLIENT_SURFACE_STATE_STAGED, 0, &state );
     ok( !status && state.mode == CLIENT_SURFACE_PRESENTATION_STAGED,
         "show transition mode %u, expected STAGED, status %#x\n", state.mode, status );
+    check_direct_candidate( hwnd, surface, state.scene_generation, FALSE );
+    status = prepare_direct_plan( hwnd, surface, state.scene_generation, &next_scene );
+    ok( !status && !next_scene, "STAGED strategy prepare status %#x scene %s\n",
+        status, wine_dbgstr_longlong( next_scene ) );
+    status = direct_plan_request( hwnd, surface, state.scene_generation, FALSE, &accepted );
+    ok( !status && !accepted, "STAGED attachment plan status %#x accepted %u\n", status, accepted );
     complete_single_surface_generation( hwnd, surface, &state );
     status = set_surface_state( hwnd, surface, 0, 0, &state );
-    ok( !status && state.mode == CLIENT_SURFACE_PRESENTATION_DIRECT,
-        "published show mode %u, expected DIRECT, status %#x\n", state.mode, status );
+    ok( !status && state.mode == CLIENT_SURFACE_PRESENTATION_COMPOSITED,
+        "published staged scene mode %u, expected OWNER_COMPOSITE, status %#x\n", state.mode, status );
+    status = set_surface_state( hwnd, 0, CLIENT_SURFACE_STATE_GEOMETRY_READY, 0, &state );
+    ok( !status, "post-staged attachment scene status %#x\n", status );
+    complete_direct_surface_generation( hwnd, surface, &state );
 
     status = set_surface_state( hwnd, surface,
                                 CLIENT_SURFACE_STATE_REGISTER |
@@ -436,6 +847,7 @@ static void test_presentation_modes(void)
     set_surface_state( hwnd, surface, CLIENT_SURFACE_STATE_UNREGISTER, 0, NULL );
     DestroyWindow( hwnd );
     pump_messages( 200 );
+    test_direct_strategy_scene();
 }
 
 static void test_generation_membership(void)
@@ -749,6 +1161,202 @@ static const struct client_surface_scene_layer *find_scene_layer_data( const str
 static const struct client_surface_scene_layer *find_scene_layer( const struct scene_snapshot *snapshot, HWND hwnd )
 {
     return find_scene_layer_data( snapshot, snapshot->data, hwnd );
+}
+
+static void check_direct_candidate( HWND hwnd, UINT64 surface, UINT64 scene, BOOL expected )
+{
+    struct scene_snapshot snapshot;
+    const struct client_surface_scene_layer *layer;
+    UINT status = get_scene_snapshot( hwnd, scene, sizeof(snapshot.data), &snapshot );
+
+    ok( scene && !(scene & 1), "DIRECT candidate scene %s was not immutable\n", wine_dbgstr_longlong( scene ) );
+    ok( !status && snapshot.id == scene, "DIRECT candidate snapshot status %#x scene %s expected %s\n",
+        status, wine_dbgstr_longlong( snapshot.id ), wine_dbgstr_longlong( scene ) );
+    if (status) return;
+    layer = find_scene_layer( &snapshot, hwnd );
+    ok( layer && layer->producer.surface == surface, "DIRECT selected lifetime changed\n" );
+    ok( layer && !!(layer->flags & CLIENT_SURFACE_SCENE_DIRECT_CANDIDATE) == expected,
+        "DIRECT candidate flags %#x expected %u\n", layer ? layer->flags : 0, expected );
+}
+
+static void check_direct_snapshot_sealed( HWND hwnd, UINT64 scene )
+{
+    struct scene_snapshot snapshot;
+    UINT status = get_scene_snapshot( hwnd, scene, sizeof(snapshot.data), &snapshot );
+
+    /* Native BEGIN holds the scene seqlock odd through END. No immutable
+     * candidate roster exists until that exact native update finishes. */
+    ok( scene & 1, "native barrier did not seal scene %s\n", wine_dbgstr_longlong( scene ) );
+    ok( status == STATUS_RETRY && snapshot.id == scene && !snapshot.returned,
+        "sealed DIRECT snapshot status %#x scene %s expected %s bytes %u\n", status,
+        wine_dbgstr_longlong( snapshot.id ), wine_dbgstr_longlong( scene ), snapshot.returned );
+}
+
+static void check_direct_snapshot_stale( HWND hwnd, UINT64 scene )
+{
+    struct scene_snapshot snapshot;
+    UINT status = get_scene_snapshot( hwnd, scene, sizeof(snapshot.data), &snapshot );
+
+    ok( status == STATUS_RETRY && snapshot.id != scene && !snapshot.returned,
+        "old DIRECT eligibility snapshot status %#x scene %s old %s bytes %u\n", status,
+        wine_dbgstr_longlong( snapshot.id ), wine_dbgstr_longlong( scene ), snapshot.returned );
+}
+
+static UINT set_scene_surface_allocation( HWND hwnd, const struct get_window_rectangles_reply *rects,
+                                          const struct rectangle *surface, UINT paint_flags )
+{
+    struct __server_request_info info = {0};
+    struct rectangle extra[2] = {rects->visible, *surface};
+
+    info.u.req.set_window_pos_request.__header.req = REQ_set_window_pos;
+    info.u.req.set_window_pos_request.handle = wine_server_user_handle( hwnd );
+    info.u.req.set_window_pos_request.swp_flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER |
+        SWP_NOACTIVATE | SWP_NOCLIENTMOVE | SWP_NOCLIENTSIZE | SWP_NOREDRAW | SWP_FRAMECHANGED;
+    info.u.req.set_window_pos_request.paint_flags = paint_flags;
+    info.u.req.set_window_pos_request.window = rects->window;
+    info.u.req.set_window_pos_request.client = rects->client;
+    wine_server_add_data( &info, extra, sizeof(extra) );
+    return p_wine_server_call( &info );
+}
+
+static void check_scene_surface_allocation( HWND hwnd, const struct rectangle *surface, UINT paint_flags,
+                                            UINT visible_width, UINT client_width )
+{
+    struct __server_request_info info;
+    struct get_visible_region_reply *reply = &info.u.reply.get_visible_region_reply;
+    struct rectangle region[16];
+    UINT status, i, widths[2] = {visible_width, client_width};
+
+    for (i = 0; i < ARRAY_SIZE(widths); ++i)
+    {
+        memset( &info, 0, sizeof(info) );
+        info.u.req.get_visible_region_request.__header.req = REQ_get_visible_region;
+        info.u.req.get_visible_region_request.window = wine_server_user_handle( hwnd );
+        info.u.req.get_visible_region_request.flags = i ? 0 : DCX_WINDOW;
+        wine_server_set_reply( &info, region, sizeof(region) );
+        status = p_wine_server_call( &info );
+        ok( !status, "surface DC region %u status %#x\n", i, status );
+        if (status) continue;
+        ok( reply->top_win == wine_server_user_handle( hwnd ) &&
+            !memcmp( &reply->top_rect, surface, sizeof(*surface) ),
+            "surface allocation was not updated: top %#x rect %s expected %s\n", reply->top_win,
+            wine_dbgstr_rect( (const RECT *)&reply->top_rect ), wine_dbgstr_rect( (const RECT *)surface ) );
+        ok( reply->paint_flags == paint_flags, "paint flags %#x expected %#x\n", reply->paint_flags, paint_flags );
+        ok( reply->total_size == sizeof(*region) && wine_server_reply_size( reply ) == sizeof(*region),
+            "DC region %u size %u/%u\n", i, wine_server_reply_size( reply ), reply->total_size );
+        if (wine_server_reply_size( reply ) != sizeof(*region)) continue;
+        ok( region[0].right - region[0].left == widths[i] && region[0].bottom - region[0].top == 128,
+            "DC region %u bounds %s expected %ux128\n", i, wine_dbgstr_rect( (const RECT *)region ), widths[i] );
+    }
+}
+
+static void test_scene_surface_padding(void)
+{
+    static const struct
+    {
+        UINT visible_width, client_width, cut_width;
+    } cases[] =
+    {
+        {320, 320, 319}, /* The native resize regression: 384-pixel GDI allocation for 320 pixels. */
+        {160, 320, 256}, /* Client clipping changes even though visible coverage is identical. */
+        {320, 256, 300}, /* Visible clipping changes even though client coverage is identical. */
+    };
+    const UINT flags = CLIENT_SURFACE_STATE_REGISTER | CLIENT_SURFACE_STATE_SCENE_PUBLICATION |
+                       CLIENT_SURFACE_STATE_DIRECT_PRESENTATION;
+    struct __server_request_info info;
+    struct get_window_rectangles_reply rects;
+    struct scene_snapshot before, after;
+    struct surface_state state, preparing;
+    struct rectangle surface;
+    UINT status, i, j, paint_flags;
+    UINT64 identity, scene;
+    HWND hwnd;
+
+    for (i = 0; i < ARRAY_SIZE(cases); ++i)
+    {
+        winetest_push_context( "surface coverage %u", i );
+        hwnd = create_test_window( TRUE );
+        ok( !!hwnd, "failed to create surface padding window\n" );
+        if (!hwnd) goto next;
+        ok( SetWindowPos( hwnd, NULL, 0, 0, 320, 128, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE ),
+            "resize failed, error %lu\n", GetLastError() );
+        pump_messages( 100 );
+        memset( &info, 0, sizeof(info) );
+        info.u.req.get_window_rectangles_request.__header.req = REQ_get_window_rectangles;
+        info.u.req.get_window_rectangles_request.handle = wine_server_user_handle( hwnd );
+        info.u.req.get_window_rectangles_request.relative = COORDS_PARENT;
+        status = p_wine_server_call( &info );
+        ok( !status, "initial rectangles status %#x\n", status );
+        if (status) goto destroy;
+        rects = info.u.reply.get_window_rectangles_reply;
+        rects.visible.right = rects.visible.left + cases[i].visible_width;
+        rects.client.right = rects.client.left + cases[i].client_width;
+        surface = rects.window;
+        surface.right = surface.left + 384;
+        paint_flags = SET_WINPOS_PAINT_SURFACE | SET_WINPOS_PIXEL_FORMAT;
+        status = set_scene_surface_allocation( hwnd, &rects, &surface, paint_flags );
+        ok( !status, "initial allocation status %#x\n", status );
+        identity = allocate_surface();
+        status = set_surface_state( hwnd, identity, flags, 0, &state );
+        ok( !status, "padding surface register status %#x\n", status );
+        status = claim_surface_state( hwnd, identity, &state );
+        ok( !status, "padding surface claim status %#x\n", status );
+        complete_direct_surface_generation( hwnd, identity, &state );
+        scene = state.scene_generation;
+        status = get_scene_snapshot( hwnd, scene, sizeof(before.data), &before );
+        ok( !status && before.count == 1 && before.returned == before.size,
+            "initial snapshot status %#x count %u bytes %u/%u\n", status,
+            before.count, before.returned, before.size );
+        if (status) goto unregister;
+
+        /* Exercise DIB retirement and reallocation with the real paint flag
+         * and synthetic FRAMECHANGED boundary. The server keeps storing the
+         * allocation while the acknowledged immutable scene stays identical. */
+        for (j = 0; j < 2; ++j)
+        {
+            surface.right = surface.left + (j ? 384 : 320);
+            paint_flags = SET_WINPOS_PIXEL_FORMAT | (j ? SET_WINPOS_PAINT_SURFACE : 0);
+            status = set_scene_surface_allocation( hwnd, &rects, &surface, paint_flags );
+            ok( !status, "padding update %u status %#x\n", j, status );
+            check_scene_surface_allocation( hwnd, &surface, paint_flags,
+                                            cases[i].visible_width, cases[i].client_width );
+            status = set_surface_state( hwnd, 0, 0, 0, &state );
+            ok( !status && state.scene_generation == scene && !state.generation && !state.pending &&
+                !state.ready && state.mode == CLIENT_SURFACE_PRESENTATION_DIRECT,
+                "padding update %u revoked DIRECT: status %#x scene %s/%s generation %s mode %u\n",
+                j, status, wine_dbgstr_longlong( state.scene_generation ), wine_dbgstr_longlong( scene ),
+                wine_dbgstr_longlong( state.generation ), state.mode );
+            status = set_surface_state( hwnd, 0, CLIENT_SURFACE_STATE_PREPARE_BEGIN, 0, &preparing );
+            ok( !status && !preparing.publish, "padding update %u required preparation, status %#x\n", j, status );
+            status = get_scene_snapshot( hwnd, scene, sizeof(after.data), &after );
+            ok( !status && after.id == before.id && after.count == before.count &&
+                after.size == before.size && after.returned == before.returned &&
+                !memcmp( after.data, before.data, before.returned ),
+                "padding update %u changed immutable snapshot, status %#x\n", j, status );
+        }
+
+        /* Crossing either real coverage boundary still revokes the old scene;
+         * a new transaction must prepare before it can authorize DIRECT. */
+        surface.right = surface.left + cases[i].cut_width;
+        status = set_scene_surface_allocation( hwnd, &rects, &surface, paint_flags );
+        ok( !status, "coverage update status %#x\n", status );
+        check_scene_surface_allocation( hwnd, &surface, paint_flags,
+            min( cases[i].visible_width, cases[i].cut_width ), min( cases[i].client_width, cases[i].cut_width ) );
+        status = set_surface_state( hwnd, 0, CLIENT_SURFACE_STATE_PREPARE_BEGIN, 0, &preparing );
+        ok( !status && preparing.publish && preparing.scene_generation != scene &&
+            !(preparing.scene_generation & 1) && preparing.mode == CLIENT_SURFACE_PRESENTATION_COMPOSITED,
+            "coverage update did not prepare: status %#x publish %u scene %s/%s mode %u\n", status,
+            preparing.publish, wine_dbgstr_longlong( preparing.scene_generation ),
+            wine_dbgstr_longlong( scene ), preparing.mode );
+        check_direct_snapshot_stale( hwnd, scene );
+unregister:
+        set_surface_state( hwnd, identity, CLIENT_SURFACE_STATE_UNREGISTER, 0, NULL );
+        release_surface( identity );
+destroy:
+        DestroyWindow( hwnd );
+next:
+        winetest_pop_context();
+    }
 }
 
 static void test_scene_snapshot_limits(void)
@@ -5049,6 +5657,7 @@ static BOOL run_focused_test_case( const char *name, char **argv )
          test_clip_scene_snapshot},
         {"complex-clip-snapshot", "complex client surface clip snapshot", test_complex_clip_snapshot},
         {"scene-snapshot", "authoritative client surface scene snapshot", test_scene_snapshot},
+        {"scene-surface-padding", "client surface allocation padding and clipping", test_scene_surface_padding},
         {"scene-snapshot-limits", "complete client surface scene reply limits", test_scene_snapshot_limits},
         {"scene-snapshot-parent-clip", "client surface scene parent DC clipping", test_scene_snapshot_parent_clip},
         {"scene-snapshot-geometry", "client surface scene coordinate and clipping geometry", test_scene_snapshot_geometry},
@@ -5173,6 +5782,25 @@ START_TEST(client_surface)
         return;
     }
 
+    if (argc > 5 && !strcmp( argv[2], "direct_plan_owner_auth" ))
+    {
+        UINT64 surface = strtoull( argv[4], NULL, 16 ), scene = strtoull( argv[5], NULL, 16 );
+        UINT64 next_scene;
+        UINT status;
+        BOOL accepted;
+
+        sscanf( argv[3], "%p", &hwnd );
+        status = prepare_direct_plan( hwnd, surface, scene, &next_scene );
+        ok( status == STATUS_ACCESS_DENIED && !next_scene,
+            "foreign owner strategy prepare status %#x scene %s\n", status, wine_dbgstr_longlong( next_scene ) );
+        status = direct_plan_request( hwnd, surface, scene, FALSE, &accepted );
+        ok( status == STATUS_ACCESS_DENIED && !accepted,
+            "foreign owner selection status %#x accepted %u\n", status, accepted );
+        status = direct_plan_request( hwnd, surface, scene, TRUE, &accepted );
+        ok( status == STATUS_ACCESS_DENIED && !accepted,
+            "foreign owner completion status %#x accepted %u\n", status, accepted );
+        return;
+    }
     if (argc > 5 && !strcmp( argv[2], "surface_lifetime_child" ))
     {
         HANDLE mapping, ready, release;
@@ -5288,6 +5916,7 @@ START_TEST(client_surface)
     trace( "testing client surface clip scene snapshots\n" );
     test_clip_scene_snapshot();
     test_scene_snapshot();
+    test_scene_surface_padding();
     test_scene_snapshot_limits();
     test_scene_snapshot_parent_clip();
     test_scene_snapshot_geometry();

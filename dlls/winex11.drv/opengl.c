@@ -1290,7 +1290,8 @@ static void x11drv_surface_flush( struct opengl_drawable *base, UINT flags )
 
     client_surface_prepare_present( base->client, &present, TRUE );
     client_surface_begin_present( base->client );
-    if (present.target == CLIENT_SURFACE_FRAME_TARGET_OFFSCREEN)
+    /* Native completion remains required while PREPARING blocks publication. */
+    if (present.completion.kind == CLIENT_SURFACE_COMPLETION_EXACT)
     {
         if (!usexcomposite) ready = snapshot_client_surface( base, &present, 0, GL_FRONT );
         else if (!(flags & GL_FLUSH_FINISHED)) funcs->p_glFinish();
@@ -2101,7 +2102,8 @@ static void x11drv_egl_surface_flush( struct opengl_drawable *base, UINT flags )
 
     client_surface_prepare_present( base->client, &present, TRUE );
     client_surface_begin_present( base->client );
-    if (present.target == CLIENT_SURFACE_FRAME_TARGET_OFFSCREEN)
+    /* Native completion remains required while PREPARING blocks publication. */
+    if (present.completion.kind == CLIENT_SURFACE_COMPLETION_EXACT)
     {
         if (!usexcomposite) ready = snapshot_client_surface( base, &present, 0, GL_BACK );
         else if (!(flags & GL_FLUSH_FINISHED)) funcs->p_glFinish();
@@ -2167,7 +2169,10 @@ static BOOL x11drv_egl_surface_swap_framebuffer( struct opengl_drawable *base, G
         frame_id = 0;
     }
     client_surface_begin_present( base->client );
-    if ((!usexcomposite || surface->direct_snapshot) && present.target == CLIENT_SURFACE_FRAME_TARGET_OFFSCREEN)
+    /* The private native target has an exact completion even when PREPARING
+     * still invalidates publication. Preserve its new image independently,
+     * just as the GLX snapshot path does, before any native swap can lose it. */
+    if ((!usexcomposite || surface->direct_snapshot) && present.completion.kind == CLIENT_SURFACE_COMPLETION_EXACT)
     {
         int gpu = 0;
         BOOL copied;

@@ -328,6 +328,9 @@ DECL_HANDLER(complete_client_surface_handoffs);
 DECL_HANDLER(cancel_client_surface_handoffs);
 DECL_HANDLER(publish_client_surface_handoff);
 DECL_HANDLER(get_client_surface_scene_snapshot);
+DECL_HANDLER(prepare_client_surface_direct_plan);
+DECL_HANDLER(select_client_surface_direct_plan);
+DECL_HANDLER(complete_client_surface_direct_plan);
 DECL_HANDLER(request_client_surface_owner_repair);
 DECL_HANDLER(resolve_client_surface_scene_sources);
 DECL_HANDLER(set_window_present_rect);
@@ -656,6 +659,9 @@ static const req_handler req_handlers[REQ_NB_REQUESTS] =
     (req_handler)req_cancel_client_surface_handoffs,
     (req_handler)req_publish_client_surface_handoff,
     (req_handler)req_get_client_surface_scene_snapshot,
+    (req_handler)req_prepare_client_surface_direct_plan,
+    (req_handler)req_select_client_surface_direct_plan,
+    (req_handler)req_complete_client_surface_direct_plan,
     (req_handler)req_request_client_surface_owner_repair,
     (req_handler)req_resolve_client_surface_scene_sources,
     (req_handler)req_set_window_present_rect,
@@ -2519,6 +2525,24 @@ C_ASSERT( offsetof(struct get_client_surface_scene_snapshot_reply, scene_id) == 
 C_ASSERT( offsetof(struct get_client_surface_scene_snapshot_reply, count) == 16 );
 C_ASSERT( offsetof(struct get_client_surface_scene_snapshot_reply, total_size) == 20 );
 C_ASSERT( sizeof(struct get_client_surface_scene_snapshot_reply) == 24 );
+C_ASSERT( offsetof(struct prepare_client_surface_direct_plan_request, handle) == 12 );
+C_ASSERT( offsetof(struct prepare_client_surface_direct_plan_request, scene_id) == 16 );
+C_ASSERT( offsetof(struct prepare_client_surface_direct_plan_request, surface) == 24 );
+C_ASSERT( sizeof(struct prepare_client_surface_direct_plan_request) == 32 );
+C_ASSERT( offsetof(struct prepare_client_surface_direct_plan_reply, scene_id) == 8 );
+C_ASSERT( sizeof(struct prepare_client_surface_direct_plan_reply) == 16 );
+C_ASSERT( offsetof(struct select_client_surface_direct_plan_request, handle) == 12 );
+C_ASSERT( offsetof(struct select_client_surface_direct_plan_request, scene_id) == 16 );
+C_ASSERT( offsetof(struct select_client_surface_direct_plan_request, surface) == 24 );
+C_ASSERT( sizeof(struct select_client_surface_direct_plan_request) == 32 );
+C_ASSERT( offsetof(struct select_client_surface_direct_plan_reply, accepted) == 8 );
+C_ASSERT( sizeof(struct select_client_surface_direct_plan_reply) == 16 );
+C_ASSERT( offsetof(struct complete_client_surface_direct_plan_request, handle) == 12 );
+C_ASSERT( offsetof(struct complete_client_surface_direct_plan_request, scene_id) == 16 );
+C_ASSERT( offsetof(struct complete_client_surface_direct_plan_request, surface) == 24 );
+C_ASSERT( sizeof(struct complete_client_surface_direct_plan_request) == 32 );
+C_ASSERT( offsetof(struct complete_client_surface_direct_plan_reply, accepted) == 8 );
+C_ASSERT( sizeof(struct complete_client_surface_direct_plan_reply) == 16 );
 C_ASSERT( offsetof(struct request_client_surface_owner_repair_request, handle) == 12 );
 C_ASSERT( offsetof(struct request_client_surface_owner_repair_request, scene_id) == 16 );
 C_ASSERT( sizeof(struct request_client_surface_owner_repair_request) == 24 );
