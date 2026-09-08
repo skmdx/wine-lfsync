@@ -20,11 +20,15 @@
 #include <time.h>
 #include <unistd.h>
 #include <sys/socket.h>
+#ifdef __linux__
+#include <sys/syscall.h>
+#endif
 
 #include "client_surface.h"
 #include "wine/server.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(x11drv);
+WINE_DECLARE_DEBUG_CHANNEL(csperf);
 
 struct x11drv_client_surface_retirement
 {
@@ -36,6 +40,23 @@ struct x11drv_client_surface_retirement
     int ready_fd;
     struct x11drv_client_source_frame sources[CLIENT_SURFACE_SOURCE_FRAME_COUNT];
 };
+
+static void trace_source_retirement( const char *event, HWND hwnd,
+                                     const struct x11drv_client_surface_retirement *retirement )
+{
+    LARGE_INTEGER ticks;
+    unsigned long tid = 0;
+
+    if (!TRACE_ON(csperf) || !retirement->identity || !retirement->cookie) return;
+#ifdef __linux__
+    tid = syscall( SYS_gettid );
+#endif
+    NtQueryPerformanceCounter( &ticks, NULL );
+    TRACE_(csperf)( "ticks=%llu event=%s hwnd=%p retirement=%p identity=%s cookie=%s "
+                   "native_pid=%lu native_tid=%lu\n", (unsigned long long)ticks.QuadPart,
+                   event, hwnd, retirement, wine_dbgstr_longlong( retirement->identity ),
+                   wine_dbgstr_longlong( retirement->cookie ), (unsigned long)getpid(), tid );
+}
 
 #define MAX_SOURCE_RETIREMENTS 1024
 static pthread_mutex_t retirement_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -64,6 +85,9 @@ static void release_source_retirement( struct x11drv_client_surface_retirement *
         client_surface_release_memory( CLIENT_SURFACE_MEMORY_SOURCE, frame->bytes );
     }
     XFlush( gdi_display );
+    /* The native image release callbacks and XFreePixmap calls returned;
+     * this does not assert that the X server or GPU freed physical memory. */
+    trace_source_retirement( "source_retire_release", 0, retirement );
     pthread_mutex_lock( &retirement_lock );
     --retirement_count;
     pthread_mutex_unlock( &retirement_lock );
@@ -250,6 +274,7 @@ void x11drv_client_surface_retire_handoff( struct client_surface *client )
     TRACE( "retiring source mapping identity %s cookie %s view %p fd %d\n",
            wine_dbgstr_longlong( retirement->identity ), wine_dbgstr_longlong( retirement->cookie ),
            retirement->view, retirement->ready_fd );
+    trace_source_retirement( "source_retire_begin", client->hwnd, retirement );
     for (i = 0; i < ARRAY_SIZE(retirement->sources); ++i)
     {
         x11drv_client_surface_trace_image( "retire", "producer_slot", gdi_display,

@@ -30,6 +30,9 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <unistd.h>
+#ifdef __linux__
+#include <sys/syscall.h>
+#endif
 
 #include <X11/Xlib.h>
 #include <X11/Xresource.h>
@@ -56,6 +59,28 @@
 
 WINE_DEFAULT_DEBUG_CHANNEL(x11drv);
 WINE_DECLARE_DEBUG_CHANNEL(systray);
+WINE_DECLARE_DEBUG_CHANNEL(csperf);
+
+/* Observe existing operations only. A request/flush is not a server ACK. */
+static void trace_window_response( const char *event, HWND hwnd, Display *display, Window window,
+                                   unsigned long request, unsigned long received, const RECT *rect,
+                                   BOOL accepted )
+{
+    LARGE_INTEGER ticks;
+    unsigned long tid = 0;
+
+    if (!TRACE_ON(csperf)) return;
+#ifdef __linux__
+    tid = syscall( SYS_gettid );
+#endif
+    NtQueryPerformanceCounter( &ticks, NULL );
+    TRACE_(csperf)( "ticks=%llu event=%s hwnd=%p display=%p window=%lx request_serial=%lu "
+                   "received_serial=%lu left=%ld top=%ld width=%ld height=%ld accepted=%u "
+                   "native_pid=%lu native_tid=%lu\n", (unsigned long long)ticks.QuadPart,
+                   event, hwnd, display, window, request, received, rect ? (long)rect->left : 0,
+                   rect ? (long)rect->top : 0, rect ? (long)(rect->right - rect->left) : 0,
+                   rect ? (long)(rect->bottom - rect->top) : 0, accepted, (unsigned long)getpid(), tid );
+}
 
 #define _NET_WM_MOVERESIZE_SIZE_TOPLEFT      0
 #define _NET_WM_MOVERESIZE_SIZE_TOP          1
@@ -1650,6 +1675,8 @@ static void window_set_config( struct x11drv_win_data *data, RECT rect, BOOL abo
     data->configure_serial = NextRequest( data->display );
     TRACE( "window %p/%lx, requesting config %s mask %#x above %u, serial %lu\n", data->hwnd, data->whole_window,
            wine_dbgstr_rect(new_rect), mask, above, data->configure_serial );
+    trace_window_response( "window_config_request", data->hwnd, data->display, data->whole_window,
+                           data->configure_serial, 0, new_rect, TRUE );
     XReconfigureWMWindow( data->display, data->whole_window, data->vis.screen, mask, &changes );
 }
 
@@ -2147,6 +2174,8 @@ void window_configure_notify( struct x11drv_win_data *data, unsigned long serial
     RECT *desired = &data->desired_state.rect, *pending = &data->pending_state.rect, *current = &data->current_state.rect;
     unsigned long *expect_serial = &data->configure_serial;
     const char *expected, *received, *prefix;
+    unsigned long request = *expect_serial;
+    BOOL accepted;
 
     prefix = wine_dbg_sprintf( "window %p/%lx ", data->hwnd, data->whole_window );
     received = wine_dbg_sprintf( "config %s/%lu", wine_dbgstr_rect(value), serial );
@@ -2160,9 +2189,11 @@ void window_configure_notify( struct x11drv_win_data *data, unsigned long serial
         desired = pending;
     }
 
-    if (!handle_state_change( serial, expect_serial, sizeof(*value), value, desired, pending,
-                              current, expected, prefix, received, NULL ))
-        return;
+    accepted = handle_state_change( serial, expect_serial, sizeof(*value), value, desired, pending,
+                                    current, expected, prefix, received, NULL );
+    trace_window_response( "window_config_state_notify", data->hwnd, data->display, data->whole_window,
+                           request, serial, value, accepted );
+    if (!accepted) return;
     data->pending_state.above = FALSE; /* allow requesting it again */
 
     /* send any pending changes from the desired state */
@@ -2548,6 +2579,8 @@ void destroy_client_window( HWND hwnd, Window client_window )
     }
 
     XDestroyWindow( gdi_display, client_window );
+    trace_window_response( "window_client_destroy_return", hwnd, gdi_display, client_window,
+                           0, 0, NULL, TRUE );
 }
 
 
@@ -2642,6 +2675,10 @@ static void create_whole_window( struct x11drv_win_data *data )
     SetRect( &data->current_state.rect, pos.x, pos.y, pos.x + cx, pos.y + cy );
     data->pending_state.rect = data->current_state.rect;
     data->desired_state.rect = data->current_state.rect;
+    /* The post-call sequence is an upper bound on CreateWindow's request,
+     * allowing the observer to reject queued events from an older XID life. */
+    trace_window_response( "window_create_return", data->hwnd, data->display, data->whole_window,
+                           NextRequest( data->display ) - 1, 0, &data->current_state.rect, TRUE );
 
     x11drv_xinput2_enable( data->display, data->whole_window );
     set_initial_wm_hints( data->display, data->whole_window );
@@ -2722,6 +2759,8 @@ static void destroy_whole_window( struct x11drv_win_data *data, BOOL already_des
         {
             XSync( gdi_display, False ); /* make sure XReparentWindow requests have completed before destroying whole_window */
             XDestroyWindow( data->display, data->whole_window );
+            trace_window_response( "window_destroy_return", data->hwnd, data->display, data->whole_window,
+                                   0, 0, NULL, TRUE );
         }
     }
     if (data->whole_colormap) XFreeColormap( data->display, data->whole_colormap );
@@ -2878,6 +2917,9 @@ BOOL X11DRV_DestroyNotify( HWND hwnd, XEvent *event )
     struct x11drv_win_data *data;
     BOOL embedded;
 
+    trace_window_response( "window_destroy_notify", hwnd, event->xdestroywindow.display,
+                           event->xdestroywindow.window, 0, event->xdestroywindow.serial,
+                           NULL, !event->xdestroywindow.send_event );
     if (!(data = get_win_data( hwnd ))) return FALSE;
     embedded = data->embedded;
     if (!embedded) FIXME( "window %p/%lx destroyed from the outside\n", hwnd, data->whole_window );
