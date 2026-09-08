@@ -480,6 +480,21 @@ BOOL client_surface_publish_handoff_locked( struct client_surface *surface,
             __atomic_load_n( &source->reservation, __ATOMIC_ACQUIRE ) == present->handoff_control &&
             present->serial >= surface->composed_serial && present->target_epoch == surface->target.epoch &&
             client_surface_backend_has_cap( surface, CLIENT_SURFACE_BACKEND_OWNER_SCENE_PLAN );
+    /* A never-displayed producer can complete private images before an owner
+     * has acquired its channel. Keep the exact frozen source, but leave its
+     * reservation unpublished: READY images cannot be reused until consumed,
+     * so publishing here would exhaust the ring without a possible reader.
+     * The caller abandons this reservation and schedules source recovery;
+     * the first owner binding can then replay the latest completed image.
+     * Existing hidden bindings still consume normally. Endpoint presence is
+     * only publication availability, never permission to overwrite a slot. */
+    if (valid && !(__atomic_load_n( &channel->endpoints, __ATOMIC_ACQUIRE ) &
+                   CLIENT_SURFACE_HANDOFF_ENDPOINT_CONSUMER))
+    {
+        TRACE( "retaining source identity %s frame %s without compositor endpoint\n",
+               wine_dbgstr_longlong( frame->surface_id ), wine_dbgstr_longlong( frame->frame_id ) );
+        valid = FALSE;
+    }
     if (valid)
     {
         /* completion_lock is the single publication domain, including callers

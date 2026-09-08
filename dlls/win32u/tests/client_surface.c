@@ -5593,6 +5593,9 @@ static void test_paced_present_completion(void)
     color = get_gl_front_pixel( &rect );
     ok( color_matches( color, 32, 159, 223 ), "unexpected final paced-present pixel %#lx\n",
         color );
+    color = GetPixel( hdc, rect.right / 2, rect.bottom / 2 );
+    ok( color_matches( color, 32, 159, 223 ), "unexpected published paced-present pixel %#lx\n",
+        color );
 
 done:
     if (glrc) wglMakeCurrent( NULL, NULL );
