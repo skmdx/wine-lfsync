@@ -170,6 +170,7 @@ static INT mru = -1;
 
 static void *xrender_handle;
 static BOOL xrender_available;
+static BOOL xrender_repeat_pad;
 
 #define MAKE_FUNCPTR(f) static typeof(f) * p##f;
 MAKE_FUNCPTR(XRenderAddGlyphs)
@@ -192,6 +193,7 @@ MAKE_FUNCPTR(XRenderCreateLinearGradient)
 MAKE_FUNCPTR(XRenderSetPictureTransform)
 #endif
 MAKE_FUNCPTR(XRenderQueryExtension)
+MAKE_FUNCPTR(XRenderQueryVersion)
 
 #undef MAKE_FUNCPTR
 
@@ -321,7 +323,7 @@ static int load_xrender_formats(void)
  */
 const struct gdi_dc_funcs *X11DRV_XRender_Init(void)
 {
-    int event_base, i;
+    int event_base, major, minor, i;
 
     if (!client_side_with_render) return NULL;
     if (!(xrender_handle = dlopen(SONAME_LIBXRENDER, RTLD_NOW))) return NULL;
@@ -342,6 +344,7 @@ const struct gdi_dc_funcs *X11DRV_XRender_Init(void)
     LOAD_FUNCPTR(XRenderFreePicture);
     LOAD_FUNCPTR(XRenderSetPictureClipRectangles);
     LOAD_FUNCPTR(XRenderQueryExtension);
+    LOAD_FUNCPTR(XRenderQueryVersion);
 #ifdef HAVE_XRENDERCREATELINEARGRADIENT
     LOAD_OPTIONAL_FUNCPTR(XRenderCreateLinearGradient);
 #endif
@@ -352,6 +355,10 @@ const struct gdi_dc_funcs *X11DRV_XRender_Init(void)
 #undef LOAD_FUNCPTR
 
     if (!pXRenderQueryExtension(gdi_display, &event_base, &xrender_error_base)) return NULL;
+    /* Render 0.10 added edge padding. Older servers can still use ordinary
+     * XRender operations; scaled owner copies use the existing image fallback. */
+    xrender_repeat_pad = pXRenderQueryVersion( gdi_display, &major, &minor ) &&
+                        (major > 0 || minor >= 10);
 
     TRACE("Xrender is up and running error_base = %d\n", xrender_error_base);
     if(!load_xrender_formats()) /* This fails in buggy versions of libXrender.so */
@@ -471,7 +478,8 @@ BOOL X11DRV_XRender_ClientSurfaceAvailable( BOOL scaling )
         !pXRenderFreePicture || !pXRenderSetPictureClipRectangles)
         return FALSE;
 #ifdef HAVE_XRENDERSETPICTURETRANSFORM
-    if (scaling && (!pXRenderSetPictureTransform || !pXRenderSetPictureFilter)) return FALSE;
+    if (scaling && (!pXRenderSetPictureTransform || !pXRenderSetPictureFilter ||
+                    !xrender_repeat_pad)) return FALSE;
 #else
     if (scaling) return FALSE;
 #endif
@@ -495,6 +503,7 @@ BOOL X11DRV_XRender_CopyClientSurface( Display *display, Drawable source,
     XVisualInfo destination_template = {.visualid = destination_visual_id};
     XVisualInfo *source_visual = NULL, *destination_visual = NULL;
     Picture source_picture = 0, destination_picture = 0;
+    XRenderPictureAttributes source_attributes = {.repeat = RepeatPad};
     XRenderPictureAttributes attributes = {0};
     unsigned long attribute_mask = 0;
     int count;
@@ -528,7 +537,12 @@ BOOL X11DRV_XRender_CopyClientSurface( Display *display, Drawable source,
         attributes.clip_mask = clip_mask;
         attribute_mask = CPClipXOrigin | CPClipYOrigin | CPClipMask;
     }
-    if (!(source_picture = pXRenderCreatePicture( display, source, source_format, 0, NULL )) ||
+    /* Filtering a complete source must retain its edge colors. RepeatNone
+     * mixes transparent black into the first/last samples during upscaling.
+     * The destination clip still limits all writes to this scene member. */
+    if (!(source_picture = pXRenderCreatePicture( display, source, source_format,
+                                                 scaling ? CPRepeat : 0,
+                                                 scaling ? &source_attributes : NULL )) ||
         !(destination_picture = pXRenderCreatePicture( display, destination,
                                                        destination_format, attribute_mask, &attributes )))
         goto done;
