@@ -58,9 +58,17 @@ struct clip_state
     struct client_surface_clip_window windows[8];
 };
 
+struct scene_notification_counts
+{
+    HWND window;
+    UINT backing, prepare, publish;
+};
+
 static unsigned int (CDECL *p_wine_server_call)(void *);
 static void pump_messages( DWORD timeout );
 static UINT set_scene_placement( HWND hwnd, int offset, int grow, int frame, UINT flags );
+static UINT drain_scene_notification_counts( UINT *owner_updates, UINT *prepares, UINT64 expected_surface,
+                                             struct scene_notification_counts *counts );
 
 static UINT64 allocate_surface(void)
 {
@@ -551,9 +559,10 @@ static void check_direct_owner_auth( HWND hwnd, UINT64 surface, UINT64 scene )
 
 static void complete_direct_surface_generation( HWND hwnd, UINT64 surface, struct surface_state *state )
 {
+    struct scene_notification_counts counts = { .window = hwnd };
     struct surface_state preparing, generation;
     UINT64 unused = allocate_surface();
-    UINT status;
+    UINT status, updates, prepares;
     BOOL accepted;
 
     status = set_surface_state( hwnd, 0, CLIENT_SURFACE_STATE_PREPARE_BEGIN, 0, &preparing );
@@ -598,8 +607,11 @@ static void complete_direct_surface_generation( HWND hwnd, UINT64 surface, struc
         "producer bypassed owner proof: status %#x pending %u ready %u\n", status, state->pending, state->ready );
     status = direct_plan_request( hwnd, unused, generation.scene_generation, TRUE, &accepted );
     ok( !status && !accepted, "wrong lifetime completion status %#x accepted %u\n", status, accepted );
+    drain_scene_notification_counts( &updates, &prepares, 0, NULL );
     status = direct_plan_request( hwnd, surface, generation.scene_generation, TRUE, &accepted );
     ok( !status && accepted, "DIRECT owner completion status %#x accepted %u\n", status, accepted );
+    drain_scene_notification_counts( &updates, &prepares, 0, &counts );
+    ok( !counts.publish, "DIRECT native reservation queued %u GUI copies\n", counts.publish );
     status = set_surface_state( hwnd, 0, 0, 0, state );
     ok( !status && state->generation == generation.generation && !state->pending && state->ready,
         "DIRECT bypassed publication: status %#x generation %s pending %u ready %u\n", status,
@@ -608,6 +620,10 @@ static void complete_direct_surface_generation( HWND hwnd, UINT64 surface, struc
     ok( !status && !accepted, "wrong scene ACK status %#x accepted %u\n", status, accepted );
     status = direct_plan_ack( hwnd, generation.scene_generation, TRUE, &accepted );
     ok( !status && accepted, "common DIRECT publication ACK status %#x accepted %u\n", status, accepted );
+    drain_scene_notification_counts( &updates, &prepares, 0, &counts );
+    ok( counts.backing == 1 && !counts.prepare && !counts.publish,
+        "DIRECT ACK notifications backing %u prepare %u publish %u\n",
+        counts.backing, counts.prepare, counts.publish );
     status = set_surface_state( hwnd, 0, 0, 0, state );
     ok( !status && !state->generation && !state->pending && !state->ready &&
         state->mode == CLIENT_SURFACE_PRESENTATION_DIRECT,
@@ -2297,11 +2313,13 @@ static UINT change_scene_sources( HWND hwnd, const struct scene_source_mutation 
     return STATUS_INVALID_PARAMETER;
 }
 
-static UINT drain_scene_notifications_for_surface( UINT *owner_updates, UINT *prepares, UINT64 expected_surface )
+static UINT drain_scene_notification_counts( UINT *owner_updates, UINT *prepares, UINT64 expected_surface,
+                                             struct scene_notification_counts *counts )
 {
     UINT count = 0, i, status;
 
     *owner_updates = *prepares = 0;
+    if (counts) counts->backing = counts->prepare = counts->publish = 0;
     /* Read the real queue at the protocol boundary so win32u does not dispatch
      * these producer notifications before the test can count them. Owner
      * preparation/publication is driven explicitly by the protocol test. */
@@ -2329,7 +2347,27 @@ static UINT drain_scene_notifications_for_surface( UINT *owner_updates, UINT *pr
         if (reply->msg == WM_WINE_UPDATEWINDOWSTATE && reply->wparam == WINE_UPDATE_CLIENT_SURFACE_HANDOFFS)
             ++*owner_updates;
         if (reply->msg == WM_WINE_UPDATEWINDOWSTATE && reply->wparam == WINE_PREPARE_CLIENT_SURFACES)
+        {
             ++*prepares;
+            if (counts && reply->win == wine_server_user_handle( counts->window )) ++counts->prepare;
+        }
+        if (reply->msg == WM_WINE_UPDATEWINDOWSTATE && reply->wparam == WINE_UPDATE_CLIENT_SURFACE_BACKING)
+        {
+            struct surface_state state;
+            UINT status;
+
+            if (counts && reply->win == wine_server_user_handle( counts->window )) ++counts->backing;
+            /* A backing wake can now carry preparation too. PREPARE_BEGIN
+             * only reads eligibility: do not COMMIT or infer PREPARING from
+             * backing allocation, since disable and stale wakes use it too. */
+            status = set_surface_state( wine_server_ptr_handle( reply->win ), 0,
+                                        CLIENT_SURFACE_STATE_PREPARE_BEGIN, 0, &state );
+            ok( !status, "backing preparation query status %#x\n", status );
+            if (!status && state.publish) ++*prepares;
+        }
+        if (reply->msg == WM_WINE_UPDATEWINDOWSTATE && reply->wparam == WINE_PUBLISH_CLIENT_SURFACES &&
+            counts && reply->win == wine_server_user_handle( counts->window ))
+            ++counts->publish;
         if (reply->type != MSG_POSTED && reply->type != MSG_NOTIFY)
         {
             memset( &info, 0, sizeof(info) );
@@ -2340,6 +2378,11 @@ static UINT drain_scene_notifications_for_surface( UINT *owner_updates, UINT *pr
     }
     ok( i < 128, "scene notification queue did not settle\n" );
     return count;
+}
+
+static UINT drain_scene_notifications_for_surface( UINT *owner_updates, UINT *prepares, UINT64 expected_surface )
+{
+    return drain_scene_notification_counts( owner_updates, prepares, expected_surface, NULL );
 }
 
 static UINT drain_scene_notifications( UINT *owner_updates, UINT *prepares )
@@ -2502,6 +2545,7 @@ static void check_source_free_destruction( HWND hwnd, const struct client_surfac
 
 static void check_owner_repair( HWND hwnd, const struct client_surface_handoff_receipt *receipt )
 {
+    struct scene_notification_counts counts = { .window = hwnd };
     struct client_surface_handoff_receipt invalid[2] = {*receipt, *receipt};
     struct surface_state state, before;
     struct native_barrier_state barrier;
@@ -2539,17 +2583,35 @@ static void check_owner_repair( HWND hwnd, const struct client_surface_handoff_r
         winetest_push_context( "warm repair with superseding request %u", i );
         status = request_owner_repair( hwnd, state.scene_generation, receipt, sizeof(*receipt), &accepted );
         ok( !status && accepted, "warm repair rejected, status %#x\n", status );
-        producers = drain_scene_notifications( &owner_updates, &prepares );
+        producers = drain_scene_notification_counts( &owner_updates, &prepares, 0, &counts );
         ok( !producers && owner_updates && prepares, "warm prepare producer %u owner %u preparation %u\n",
             producers, owner_updates, prepares );
+        ok( counts.backing == 1 && !counts.prepare && !counts.publish,
+            "warm preparation notifications backing %u prepare %u publish %u\n",
+            counts.backing, counts.prepare, counts.publish );
         if (i == 1)
             set_surface_state( hwnd, 0, CLIENT_SURFACE_STATE_GEOMETRY_READY, 0, NULL );
         else if (i == 2)
         {
+            struct surface_state preparing, changed;
+
+            /* The combined wake has been removed and its callback admitted.
+             * A later mutation must enqueue work again; its old COMMIT must
+             * not consume preparation for the new scene. */
+            status = set_surface_state( hwnd, 0, CLIENT_SURFACE_STATE_PREPARE_BEGIN, 0, &preparing );
+            ok( !status && preparing.publish, "in-flight preparation status %#x\n", status );
             status = set_native_barrier( hwnd, 0x654321, TRUE, &barrier );
             ok( !status, "superseding scene mutation status %#x\n", status );
             status = set_native_barrier( hwnd, 0x654321, FALSE, &barrier );
             ok( !status, "superseding scene unseal status %#x\n", status );
+            status = set_surface_state_scene( hwnd, 0, CLIENT_SURFACE_STATE_PREPARE_COMMIT,
+                                              0, preparing.scene_generation, &changed );
+            ok( !status && !changed.generation && changed.scene_generation != preparing.scene_generation,
+                "old preparation committed the replacement scene, status %#x\n", status );
+            drain_scene_notification_counts( &owner_updates, &prepares, 0, &counts );
+            ok( counts.backing == 1 && counts.prepare == 1 && !counts.publish,
+                "in-flight restart notifications backing %u prepare %u publish %u\n",
+                counts.backing, counts.prepare, counts.publish );
         }
         status = prepare_surface_state( hwnd, &state );
         ok( !status && state.pending == 1 && state.generation, "repair prepare status %#x pending %u\n",
@@ -3120,12 +3182,13 @@ static DWORD WINAPI foreign_exposure_thread( void *arg )
 
 static void check_staged_handoff_exposure( HWND hwnd, const struct client_surface_handoff_receipt *receipt )
 {
+    struct scene_notification_counts counts = { .window = hwnd };
     struct surface_state state, native, reserved, changed;
     struct native_barrier_state barrier;
     struct exposure_thread_data thread_data;
     HANDLE thread;
     BOOL accepted, odd, after_begin, exposed;
-    UINT status, i;
+    UINT status, i, updates, prepares;
 
     for (i = 0; i < 10; ++i)
     {
@@ -3140,8 +3203,11 @@ static void check_staged_handoff_exposure( HWND hwnd, const struct client_surfac
         ok( !status && native.staged && native.pending == 1 && native.generation == native.scene_generation,
             "staged scene status %#x pending %u generation %s\n", status, native.pending,
             wine_dbgstr_longlong( native.generation ) );
+        drain_scene_notification_counts( &updates, &prepares, 0, NULL );
         status = complete_surface_handoffs( hwnd, native.generation, native.scene_generation, receipt, 1, &accepted );
         ok( !status && accepted, "receipt completion status %#x accepted %u\n", status, accepted );
+        drain_scene_notification_counts( &updates, &prepares, 0, &counts );
+        ok( !counts.publish, "native handoff reservation queued %u GUI copies\n", counts.publish );
         status = set_surface_state( hwnd, 0, CLIENT_SURFACE_STATE_PUBLISH_BEGIN, 0, &state );
         ok( !status && !state.publish && state.staged && state.generation == native.generation,
             "GUI began before native completion, status %#x action %u\n", status, state.publish );
@@ -3161,6 +3227,8 @@ static void check_staged_handoff_exposure( HWND hwnd, const struct client_surfac
         }
         status = publish_native_surface( hwnd, native.generation, native.scene_generation, i != 9, &accepted );
         ok( !status && accepted, "native completion status %#x accepted %u\n", status, accepted );
+        drain_scene_notification_counts( &updates, &prepares, 0, &counts );
+        ok( counts.publish == (i < 7), "native completion queued %u GUI exposures\n", counts.publish );
         status = set_surface_state( hwnd, 0, 0, 0, &state );
         if (i < 7)
         {

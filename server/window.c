@@ -1845,7 +1845,7 @@ static void finish_client_surface_publication( struct window *top )
     finish_client_surface_generation( top );
 }
 
-static int mark_client_surface_generation_ready( struct window *top )
+static int mark_client_surface_generation_ready( struct window *top, int notify )
 {
     if (!client_surface_is_composing( top ) || top->client_surface_transaction.pending ||
         top->client_surface_transaction.source_pending ||
@@ -1866,8 +1866,12 @@ static int mark_client_surface_generation_ready( struct window *top )
 
     top->client_surface_transaction.phase = CLIENT_SURFACE_PHASE_READY;
     top->client_surface_transaction.publication = CLIENT_SURFACE_PUBLICATION_COPY;
-    post_message_coalesced( top->handle, WM_WINE_UPDATEWINDOWSTATE,
-                            WINE_PUBLISH_CLIENT_SURFACES, 0 );
+    /* Native completion reserves HANDOFF before its server request returns.
+     * Its intermediate READY state cannot admit a GUI copy; only a later
+     * successful staged handoff needs the existing EXPOSURE_READY wake. */
+    if (notify)
+        post_message_coalesced( top->handle, WM_WINE_UPDATEWINDOWSTATE,
+                                WINE_PUBLISH_CLIENT_SURFACES, 0 );
     return 1;
 }
 
@@ -1981,7 +1985,7 @@ static void arm_client_surface_timeout( struct window *top )
 }
 
 static int complete_client_surface_generation( struct window *top, struct client_surface_ref *surface,
-                                               unsigned long long generation )
+                                               unsigned long long generation, int notify )
 {
     if (!client_surface_is_composing( top ) ||
         top->client_surface_transaction.source_pending ||
@@ -1993,7 +1997,7 @@ static int complete_client_surface_generation( struct window *top, struct client
     assert( top->client_surface_transaction.pending );
     if (--top->client_surface_transaction.pending) return 0;
 
-    return mark_client_surface_generation_ready( top );
+    return mark_client_surface_generation_ready( top, notify );
 }
 
 /* A composition generation describes a scene, not a single frame.  A selected
@@ -2077,7 +2081,7 @@ static int retire_client_surface_owner_generation( struct window *top,
     top->client_surface_transaction.pending -= count;
     if (top->client_surface_transaction.pending) return 0;
 
-    return mark_client_surface_generation_ready( top );
+    return mark_client_surface_generation_ready( top, 1 );
 }
 
 static int retire_client_surface_subtree_generation( struct window *top, struct window *win,
@@ -2094,7 +2098,7 @@ static int retire_client_surface_subtree_generation( struct window *top, struct 
     top->client_surface_transaction.pending -= count;
     if (top->client_surface_transaction.pending) return 0;
 
-    return mark_client_surface_generation_ready( top );
+    return mark_client_surface_generation_ready( top, 1 );
 }
 
 static void discard_client_surface_owner( struct window *win, struct client_surface_owner *owner,
@@ -2120,7 +2124,7 @@ static void discard_client_surface_owner( struct window *win, struct client_surf
             removed++;
         }
         complete_client_surface_generation( top, surface,
-                                            client_surface_transaction_generation( top ) );
+                                            client_surface_transaction_generation( top ), 1 );
         retire_client_surface_ref( surface );
     }
     if (removed) adjust_client_surface_subtree_count( win, -(int)removed );
@@ -2526,7 +2530,7 @@ DECL_HANDLER(complete_client_surface_handoffs)
     cleared = clear_client_surface_subtree_generation( top, req->generation );
     assert( cleared == count );
     top->client_surface_transaction.pending = 0;
-    if (!mark_client_surface_generation_ready( top ) || !client_surface_is_ready( top )) return;
+    if (!mark_client_surface_generation_ready( top, 0 ) || !client_surface_is_ready( top )) return;
 
     top->client_surface_transaction.phase = CLIENT_SURFACE_PHASE_PUBLISHING;
     top->client_surface_transaction.publication = CLIENT_SURFACE_PUBLICATION_HANDOFF;
@@ -3029,8 +3033,13 @@ static void restart_client_surface_generation_internal( struct window *top )
         }
         top->client_surface_transaction.phase = CLIENT_SURFACE_PHASE_PREPARING;
         update_client_surface_publication( top );
+        /* Backing activation and preparation share the owner's checked
+         * callback. Coalesce with an already queued backing update instead
+         * of leaving a PREPARE wake behind its successful COMMIT. A backing
+         * callback already in flight gets another wake for this restart. */
         post_message_coalesced( top->handle, WM_WINE_UPDATEWINDOWSTATE,
-                                WINE_PREPARE_CLIENT_SURFACES, 0 );
+                                top->client_surface_backing_required ? WINE_UPDATE_CLIENT_SURFACE_BACKING :
+                                                                     WINE_PREPARE_CLIENT_SURFACES, 0 );
         arm_client_surface_timeout( top );
         return;
     }
@@ -3066,7 +3075,7 @@ static void restart_client_surface_generation_internal( struct window *top )
             else if (!top->client_surface_transaction.owner_repair) notify_client_surface_geometry_ready( top );
         }
         else
-            mark_client_surface_generation_ready( top );
+            mark_client_surface_generation_ready( top, 1 );
         /* A nested mutation can request another pass while this loop owns
          * the transition. Only the first pass has the caller's cache proof;
          * every subsequent restart must retain producer recovery. */
@@ -5523,7 +5532,7 @@ DECL_HANDLER(complete_client_surface_direct_plan)
         top->client_surface_transaction.phase != CLIENT_SURFACE_PHASE_COMPOSING ||
         req->scene_id != top->client_surface_direct_scene || req->surface != top->client_surface_direct_surface ||
         !(surface = select_client_surface_producer( top, &owner )) || surface->id != req->surface ||
-        !complete_client_surface_generation( top, surface, req->scene_id ))
+        !complete_client_surface_generation( top, surface, req->scene_id, 0 ))
         return;
 
     /* The same reservation and ACK protect both owner copy and attachment.
@@ -5745,7 +5754,7 @@ DECL_HANDLER(set_client_surface_state)
     if (surface && !surface->active && !surface->cached)
     {
         complete_client_surface_generation( top, surface,
-                                            client_surface_transaction_generation( top ) );
+                                            client_surface_transaction_generation( top ), 1 );
         retire_client_surface_ref( surface );
         surface = NULL;
     }
@@ -5846,7 +5855,7 @@ DECL_HANDLER(set_client_surface_state)
         !client_surface_direct_eligible( top ))
     {
         if (req->scene_generation == top->client_surface_scene_generation)
-            complete_client_surface_generation( top, surface, req->generation );
+            complete_client_surface_generation( top, surface, req->generation, 1 );
     }
 
     if (scene_change) end_client_surface_scene_change( top );
