@@ -2111,6 +2111,15 @@ static int snapshot_client_surface_gpu( struct opengl_drawable *base,
     }
     if (ret > 0)
     {
+        /* A first PREPARING frame may have needed a CPU snapshot. Its upload
+         * already completed XSync, and no completion borrows these staging
+         * buffers. Native-present serialization excludes another writer.
+         * Keep the pixmap for replay, but stop retaining CPU storage once
+         * independent GPU capture works. A later fallback reallocates it. */
+        pthread_mutex_lock( &base->client->present_lock );
+        if (surface->snapshot_pixels || surface->snapshot_image)
+            x11drv_client_surface_release_snapshot_staging( surface );
+        pthread_mutex_unlock( &base->client->present_lock );
         frame->gpu_copy = TRUE;
         source->source = frame->pixmap;
         present->capture.size = (SIZE){source->width, source->height};

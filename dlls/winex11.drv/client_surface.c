@@ -100,6 +100,24 @@ HRGN get_dc_monitor_region( HWND hwnd, HDC hdc )
     return 0;
 }
 
+void x11drv_client_surface_release_snapshot_staging( struct x11drv_client_surface *surface )
+{
+    UINT64 bytes = surface->snapshot_pixels_size;
+
+    free( surface->snapshot_pixels );
+    surface->snapshot_pixels = NULL;
+    surface->snapshot_pixels_size = 0;
+    if (surface->snapshot_image)
+    {
+        bytes += (UINT64)surface->snapshot_image->bytes_per_line * surface->snapshot_image->height;
+        XDestroyImage( surface->snapshot_image );
+        surface->snapshot_image = NULL;
+    }
+    client_surface_release_memory( CLIENT_SURFACE_MEMORY_STAGING, bytes );
+    if (bytes) TRACE( "released CPU snapshot staging for %s, bytes %s\n",
+                      debugstr_client_surface( &surface->client ), wine_dbgstr_longlong( bytes ) );
+}
+
 static void x11drv_client_surface_destroy( struct client_surface *client )
 {
     struct x11drv_client_surface *surface = impl_from_client_surface( client );
@@ -110,8 +128,7 @@ static void x11drv_client_surface_destroy( struct client_surface *client )
 
     x11drv_client_surface_completion_destroy( surface );
     x11drv_client_surface_destroy_retirement( surface );
-    free( surface->snapshot_pixels );
-    client_surface_release_memory( CLIENT_SURFACE_MEMORY_STAGING, surface->snapshot_pixels_size );
+    x11drv_client_surface_release_snapshot_staging( surface );
     if (surface->snapshot_import) XFreePixmap( gdi_display, surface->snapshot_import );
     for (i = 0; i < ARRAY_SIZE(surface->sources); ++i)
     {
@@ -119,12 +136,6 @@ static void x11drv_client_surface_destroy( struct client_surface *client )
         if (surface->sources[i].gc) XFreeGC( gdi_display, surface->sources[i].gc );
         if (surface->sources[i].pixmap) XFreePixmap( gdi_display, surface->sources[i].pixmap );
         client_surface_release_memory( CLIENT_SURFACE_MEMORY_SOURCE, surface->sources[i].bytes );
-    }
-    if (surface->snapshot_image)
-    {
-        client_surface_release_memory( CLIENT_SURFACE_MEMORY_STAGING,
-            (UINT64)surface->snapshot_image->bytes_per_line * surface->snapshot_image->height );
-        XDestroyImage( surface->snapshot_image );
     }
     if (surface->snapshot_gc) XFreeGC( gdi_display, surface->snapshot_gc );
     if (surface->snapshot) XFreePixmap( gdi_display, surface->snapshot );
