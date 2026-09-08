@@ -578,6 +578,12 @@ static int dequeueBuffer_ioctl( JNIEnv* env, void *data, DWORD in_size, DWORD ou
     res->generation = 0;
     *ret_size = sizeof(*res);
 
+    /* The CPU lock is performed in the client process, so Surface::lock()
+     * cannot set the allocation usage for us before dequeuing the buffer. */
+    if (!win_data->opengl && (ret = parent->perform( parent, NATIVE_WINDOW_SET_USAGE,
+            (unsigned int)(AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN | AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN) )))
+        return ret;
+
     ret = parent->dequeueBuffer( parent, &buffer, &fence );
     if (ret)
     {
