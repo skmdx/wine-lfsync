@@ -1892,14 +1892,23 @@ static BOOL get_client_surface_compositor_source(
     const struct client_surface_handoff_slot *slot, Pixmap *source,
     unsigned int *source_depth )
 {
-    struct client_surface_source_cache *cache = &binding->sources[index];
+    struct client_surface_source_cache *cache;
+    unsigned int i;
 
     if (!(slot->flags & CLIENT_SURFACE_HANDOFF_COPY_SOURCE)) return FALSE;
     /* Cache validated metadata, without owning or retaining the producer's
      * XID. The slot pins this independent image through copy completion, and
      * every actual read still participates in the X error validation boundary. */
-    if (!client_surface_source_cache_matches( cache, slot ))
+    /* Transport slots and native images rotate independently. In particular,
+     * three source images through a four-slot ring never match the previous
+     * image at the same ring position. Reuse metadata by its exact native
+     * tuple within this binding; the ring index only selects a miss victim. */
+    for (i = 0; i < ARRAY_SIZE(binding->sources); ++i)
+        if (client_surface_source_cache_matches( &binding->sources[i], slot )) break;
+    if (i < ARRAY_SIZE(binding->sources)) cache = &binding->sources[i];
+    else
     {
+        cache = &binding->sources[index];
         if (!validate_client_surface_pixmap( slot->source, slot->width, slot->height, source_depth ))
             return FALSE;
         *cache = (struct client_surface_source_cache){slot->source, slot->target_epoch,
