@@ -180,6 +180,7 @@ static inline HRGN get_dc_region( DC *dc )
 extern DC *alloc_dc_ptr( DWORD magic );
 extern void free_dc_ptr( DC *dc );
 extern DC *get_dc_ptr( HDC hdc );
+extern DC *get_dc_ptr_for_update( HDC hdc );
 extern void release_dc_ptr( DC *dc );
 extern BOOL is_dc_display( HDC hdc );
 extern int get_dc_pixel_format( HDC hdc );

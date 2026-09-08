@@ -281,16 +281,11 @@ void free_dc_ptr( DC *dc )
 }
 
 
-/***********************************************************************
- *           get_dc_ptr
- *
- * Retrieve a DC pointer but release the GDI lock.
- */
-DC *get_dc_ptr( HDC hdc )
+static DC *get_dc_ptr_ex( HDC hdc, BOOL allow_disabled )
 {
     DC *dc = get_dc_obj( hdc );
     if (!dc) return NULL;
-    if (dc->attr->disabled)
+    if (dc->attr->disabled && !allow_disabled)
     {
         GDI_ReleaseObj( hdc );
         return NULL;
@@ -310,6 +305,24 @@ DC *get_dc_ptr( HDC hdc )
 
     GDI_ReleaseObj( hdc );
     return dc;
+}
+
+/***********************************************************************
+ *           get_dc_ptr
+ *
+ * Retrieve a DC pointer but release the GDI lock.
+ */
+DC *get_dc_ptr( HDC hdc )
+{
+    return get_dc_ptr_ex( hdc, FALSE );
+}
+
+/* Internal visible-region updates must also detach surfaces from disabled
+ * cache DCs. Keep the normal reference and thread ownership checks without
+ * making the DC available to application GDI calls. */
+DC *get_dc_ptr_for_update( HDC hdc )
+{
+    return get_dc_ptr_ex( hdc, TRUE );
 }
 
 

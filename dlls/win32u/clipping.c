@@ -208,7 +208,7 @@ void set_visible_region( HDC hdc, HRGN hrgn, const RECT *vis_rect, const RECT *d
 {
     DC * dc;
 
-    if (!(dc = get_dc_ptr( hdc ))) return;
+    if (!(dc = get_dc_ptr_for_update( hdc ))) return;
 
     TRACE( "%p %p %s %s %p\n", hdc, hrgn,
            wine_dbgstr_rect(vis_rect), wine_dbgstr_rect(device_rect), surface );
