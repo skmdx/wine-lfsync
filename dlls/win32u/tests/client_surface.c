@@ -3849,6 +3849,120 @@ done:
     if (other) DestroyWindow( other );
 }
 
+static void test_handoff_pool_boundary(void)
+{
+    const UINT flags = CLIENT_SURFACE_STATE_REGISTER | CLIENT_SURFACE_STATE_SCENE_PUBLICATION;
+    struct handoff_binding bindings[CLIENT_SURFACE_HANDOFF_CHANNELS + 1] = {{0}}, replacement;
+    UINT64 identities[ARRAY_SIZE(bindings)] = {0}, old_cookie, old_identity;
+    struct client_surface_handoff_shared *pools[2] = {0};
+    static const UINT boundaries[] = {63, 64, CLIENT_SURFACE_HANDOFF_CHANNELS - 1};
+    HWND hwnd = create_test_window( FALSE );
+    UINT i, j, status, offset, count = 0;
+    UINT64 bit;
+
+    ok( !!hwnd, "failed to create handoff pool window\n" );
+    if (!hwnd) return;
+    /* Real server allocations fill the first process-pair pool. No synthetic
+     * frame or native completion is needed to test transport ownership. */
+    for (i = 0; i < ARRAY_SIZE(bindings); ++i)
+    {
+        identities[i] = allocate_surface();
+        if (!identities[i]) goto done;
+        status = set_surface_state( hwnd, identities[i], flags, 0, NULL );
+        ok( !status, "channel %u registration status %#x\n", i, status );
+        if (status)
+        {
+            release_surface( identities[i] );
+            identities[i] = 0;
+            goto done;
+        }
+        count = i + 1;
+        status = get_surface_handoff( hwnd, 0, identities[i], FALSE, &bindings[i] );
+        ok( !status, "channel %u allocation status %#x\n", i, status );
+        if (status) goto done;
+        j = i / CLIENT_SURFACE_HANDOFF_CHANNELS;
+        if (!(i % CLIENT_SURFACE_HANDOFF_CHANNELS))
+        {
+            pools[j] = MapViewOfFile( bindings[i].mapping, FILE_MAP_READ | FILE_MAP_WRITE,
+                                      0, 0, bindings[i].size );
+            ok( !!pools[j], "pool %u mapping failed, error %lu\n", j, GetLastError() );
+        }
+        CloseHandle( bindings[i].mapping );
+        bindings[i].mapping = NULL;
+        if (!pools[j]) goto done;
+        offset = offsetof(struct client_surface_handoff_shared, channels) +
+                 (i % CLIENT_SURFACE_HANDOFF_CHANNELS) * sizeof(pools[j]->channels[0]);
+        ok( bindings[i].offset == offset && bindings[i].mapping_id == pools[j]->mapping_id,
+            "channel %u offset %u expected %u, mapping %s expected %s\n", i,
+            bindings[i].offset, offset, wine_dbgstr_longlong( bindings[i].mapping_id ),
+            wine_dbgstr_longlong( pools[j]->mapping_id ) );
+        ok( pools[j]->channels[i % CLIENT_SURFACE_HANDOFF_CHANNELS].identity == identities[i],
+            "channel %u identity did not reach the shared mapping\n", i );
+    }
+    ok( pools[0]->mapping_id != pools[1]->mapping_id, "full pool did not allocate another mapping\n" );
+    for (j = 0; j < ARRAY_SIZE(boundaries); ++j)
+    {
+        struct client_surface_handoff_channel *channel;
+        i = boundaries[j];
+        channel = &pools[0]->channels[i];
+        old_cookie = bindings[i].cookie;
+        old_identity = identities[i];
+        bit = (UINT64)1 << (i % 64);
+        status = set_surface_state( hwnd, old_identity, CLIENT_SURFACE_STATE_UNREGISTER, 0, NULL );
+        ok( !status && channel->closed, "channel %u retirement status %#x closed %ld\n",
+            i, status, channel->closed );
+        ok( (__atomic_load_n( &pools[0]->ready_bitmap[i / 64], __ATOMIC_ACQUIRE ) & bit) != 0,
+            "channel %u did not receive its real retirement bit\n", i );
+        status = release_surface_handoff( hwnd, 0, old_identity, old_cookie, FALSE );
+        ok( !status, "channel %u release status %#x\n", i, status );
+        bindings[i].cookie = 0;
+        identities[i] = 0;
+        ok( !channel->endpoints && !(pools[0]->ready_bitmap[i / 64] & bit),
+            "released channel %u retained endpoint or ready bit\n", i );
+        identities[i] = allocate_surface();
+        status = set_surface_state( hwnd, identities[i], flags, 0, NULL );
+        ok( !status, "replacement %u registration status %#x\n", i, status );
+        if (status) goto done;
+        status = get_surface_handoff( hwnd, 0, identities[i], FALSE, &replacement );
+        ok( !status, "replacement %u allocation status %#x\n", i, status );
+        if (status) goto done;
+        CloseHandle( replacement.mapping );
+        replacement.mapping = NULL;
+        ok( replacement.mapping_id == bindings[i].mapping_id && replacement.offset == bindings[i].offset &&
+            replacement.cookie != old_cookie && identities[i] != old_identity,
+            "replacement %u did not reuse the exact free slot with a new lifetime\n", i );
+        bindings[i] = replacement;
+        status = release_surface_handoff( hwnd, 0, identities[i], old_cookie, FALSE );
+        ok( status == STATUS_INVALID_PARAMETER, "stale cookie released channel %u, status %#x\n", i, status );
+        ok( channel->cookie == replacement.cookie && !channel->closed &&
+            channel->endpoints == CLIENT_SURFACE_HANDOFF_ENDPOINT_PRODUCER &&
+            !channel->producer_sequence && !channel->consumer_sequence,
+            "replacement channel %u was not empty, open and producer-owned\n", i );
+    }
+    for (i = 0; i < ARRAY_SIZE(bindings); ++i)
+    {
+        const struct client_surface_handoff_channel *channel =
+            &pools[i / CLIENT_SURFACE_HANDOFF_CHANNELS]->channels[i % CLIENT_SURFACE_HANDOFF_CHANNELS];
+        ok( channel->cookie == bindings[i].cookie && channel->identity == identities[i] && !channel->closed,
+            "channel %u changed while another channel was recycled\n", i );
+    }
+done:
+    for (i = 0; i < count; ++i)
+    {
+        if (identities[i]) set_surface_state( hwnd, identities[i], CLIENT_SURFACE_STATE_UNREGISTER, 0, NULL );
+        if (bindings[i].cookie) release_surface_handoff( hwnd, 0, identities[i], bindings[i].cookie, FALSE );
+        if (bindings[i].mapping) CloseHandle( bindings[i].mapping );
+    }
+    for (i = 0; i < ARRAY_SIZE(pools); ++i)
+    {
+        if (!pools[i]) continue;
+        for (j = 0; j < CLIENT_SURFACE_HANDOFF_BITMAP_WORDS; ++j)
+            ok( !pools[i]->ready_bitmap[j], "pool %u word %u has stale ready bits\n", i, j );
+        UnmapViewOfFile( pools[i] );
+    }
+    DestroyWindow( hwnd );
+}
+
 static void test_handoff_consumer_retirement( BOOL failed )
 {
     const UINT64 identity = allocate_surface();
@@ -6116,6 +6230,7 @@ static BOOL run_focused_test_case( const char *name, char **argv )
          test_native_backing_barrier},
         {"demoted-native-barrier", "native backing barrier after demotion", test_demoted_native_barrier},
         {"handoff-storage", "client surface generation handoff storage", test_handoff_storage},
+        {"handoff-pool-boundary", "full handoff channel pool and reuse", test_handoff_pool_boundary},
         {"handoff-cold-visibility", "initial handoff visibility and lifetime", test_handoff_cold_visibility},
         {"handoff-receipts", "source-independent assembly receipts", test_handoff_receipts},
         {"child-visibility-sources", "retained hidden source and legacy placement", test_child_visibility_sources},
@@ -6322,6 +6437,8 @@ START_TEST(client_surface)
     }
 
     GetDesktopWindow();
+    trace( "testing full handoff pool and reuse\n" );
+    test_handoff_pool_boundary();
     trace( "testing server-issued surface lifetimes\n" );
     test_surface_lifetimes( argv );
     trace( "testing client surface completion result provenance\n" );
