@@ -638,12 +638,12 @@ static BOOL android_surface_flush( struct window_surface *window_surface, const 
             src += color_info->bmiHeader.biWidth;
             dst += buffer.stride;
         }
-        surface->window->perform( surface->window, NATIVE_WINDOW_UNLOCK_AND_POST );
+        return !surface->window->perform( surface->window, NATIVE_WINDOW_UNLOCK_AND_POST );
     }
     else TRACE( "Unable to lock surface %p window %p buffer %p\n",
                 surface, window_surface->hwnd, surface->window );
 
-    return TRUE;
+    return FALSE;
 }
 
 /***********************************************************************
