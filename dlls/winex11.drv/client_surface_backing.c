@@ -1484,24 +1484,64 @@ static void drain_client_surface_compositor_target(
 #endif
 }
 
+static void quiesce_client_surface_compositor_target( struct client_surface_compositor_target *target );
+
 static BOOL update_client_surface_compositor_target( struct client_surface_compositor_job *job )
 {
     struct client_surface_compositor_target *target;
-    Pixmap old_mailbox = 0;
-    BOOL same_pool, checkpoint;
+    Pixmap mailbox = 0;
+    UINT64 mailbox_bytes = 0;
+    BOOL same_pool, checkpoint, created = FALSE;
 
     if (!(target = find_client_surface_compositor_target( job->handoff_toplevel )))
     {
         if (!(target = calloc( 1, sizeof(*target) ))) return FALSE;
-        target->next = client_surface_compositor_targets;
         target->toplevel = job->handoff_toplevel;
-        client_surface_compositor_targets = target;
+        created = TRUE;
     }
     same_pool = target->frames[2].pixmap &&
                 ((target->frames[0].pixmap == job->pixmaps[0] &&
                  target->frames[1].pixmap == job->pixmaps[1]) ||
                  (target->frames[0].pixmap == job->pixmaps[1] &&
                  target->frames[1].pixmap == job->pixmaps[0]));
+    if (!same_pool)
+    {
+        int error = 0;
+
+        /* Keep the complete old pool, including its published checkpoint,
+         * until every image of the replacement has a native allocation.
+         * Both pools remain charged while they coexist. */
+        mailbox_bytes = client_surface_pixmap_bytes( job->width, job->height, job->depth );
+        if (!client_surface_reserve_memory( CLIENT_SURFACE_MEMORY_OUTPUT, mailbox_bytes ))
+            goto failed;
+        X11DRV_expect_error( client_surface_compositor_display,
+                             client_surface_compositor_error, &error );
+        mailbox = XCreatePixmap( client_surface_compositor_display,
+            job->destination, job->width, job->height, job->depth );
+        XSync( client_surface_compositor_display, False );
+        X11DRV_check_error();
+        if (error || !mailbox)
+        {
+            if (mailbox)
+            {
+                X11DRV_expect_error( client_surface_compositor_display,
+                                     client_surface_compositor_error, &error );
+                XFreePixmap( client_surface_compositor_display, mailbox );
+                XSync( client_surface_compositor_display, False );
+                X11DRV_check_error();
+            }
+            client_surface_release_memory( CLIENT_SURFACE_MEMORY_OUTPUT, mailbox_bytes );
+            goto failed;
+        }
+    }
+    if (created)
+    {
+        target->next = client_surface_compositor_targets;
+        client_surface_compositor_targets = target;
+    }
+    if (target->window != job->destination || target->window_width != job->window_width ||
+        target->window_height != job->window_height || !same_pool)
+        quiesce_client_surface_compositor_target( target );
     checkpoint = !same_pool || target->backing != job->pixmaps[0];
     if (target->window != job->destination || target->window_width != job->window_width ||
         target->window_height != job->window_height || target->depth != job->depth || target->visual != job->visual)
@@ -1516,21 +1556,16 @@ static BOOL update_client_surface_compositor_target( struct client_surface_compo
         finish_client_surface_compositor_assembly( target, TRUE );
     if ((target->window && target->window != job->destination) ||
         (target->frames[0].pixmap && !same_pool))
-    {
         drain_client_surface_compositor_target( target );
-        old_mailbox = target->frames[2].pixmap;
-    }
     target->window = job->destination;
     if (!same_pool)
     {
-        int error = 0;
         unsigned int i;
 
-        if (old_mailbox)
+        if (target->frames[2].pixmap)
         {
-            XFreePixmap( client_surface_compositor_display, old_mailbox );
+            XFreePixmap( client_surface_compositor_display, target->frames[2].pixmap );
             client_surface_release_memory( CLIENT_SURFACE_MEMORY_OUTPUT, target->mailbox_bytes );
-            target->mailbox_bytes = 0;
         }
         for (i = 0; i < ARRAY_SIZE(target->frames); ++i)
         {
@@ -1540,25 +1575,8 @@ static BOOL update_client_surface_compositor_target( struct client_surface_compo
         memset( target->frames, 0, sizeof(target->frames) );
         target->frames[0].pixmap = job->pixmaps[0];
         target->frames[1].pixmap = job->pixmaps[1];
-        target->mailbox_bytes = client_surface_pixmap_bytes( job->width, job->height, job->depth );
-        if (!client_surface_reserve_memory( CLIENT_SURFACE_MEMORY_OUTPUT, target->mailbox_bytes ))
-        {
-            target->mailbox_bytes = 0;
-            return FALSE;
-        }
-        X11DRV_expect_error( client_surface_compositor_display,
-                             client_surface_compositor_error, &error );
-        target->frames[2].pixmap = XCreatePixmap( client_surface_compositor_display,
-            target->window, job->width, job->height, job->depth );
-        XSync( client_surface_compositor_display, False );
-        X11DRV_check_error();
-        if (error || !target->frames[2].pixmap)
-        {
-            target->frames[2].pixmap = 0;
-            client_surface_release_memory( CLIENT_SURFACE_MEMORY_OUTPUT, target->mailbox_bytes );
-            target->mailbox_bytes = 0;
-            return FALSE;
-        }
+        target->frames[2].pixmap = mailbox;
+        target->mailbox_bytes = mailbox_bytes;
         target->published = job->pixmaps[0];
         target->published_width = job->valid_width;
         target->published_height = job->valid_height;
@@ -1598,6 +1616,11 @@ static BOOL update_client_surface_compositor_target( struct client_surface_compo
     }
 #endif
     return TRUE;
+
+failed:
+    if (created) free( target );
+    else target->quiescing = target->native_updates || target->deferred_update;
+    return FALSE;
 }
 
 static BOOL remove_client_surface_compositor_target( HWND toplevel )
@@ -1680,8 +1703,6 @@ static BOOL client_surface_direct_plan_current( const struct client_surface_comp
            current.direct_candidate && current.epoch == job->scene_epoch &&
            (!current.generation || current.generation == job->scene_epoch);
 }
-
-static void quiesce_client_surface_compositor_target( struct client_surface_compositor_target *target );
 
 static BOOL get_client_surface_direct_snapshot( const struct client_surface_compositor_job *job,
                                                 UINT64 *scene_id, UINT *count,
@@ -3384,7 +3405,12 @@ static BOOL client_surface_compositor_job_ready( struct client_surface_composito
     {
         /* Stop producing work for this target while its previous native
          * scene drains. Other targets remain eligible in the same loop. */
-        quiesce_client_surface_compositor_target( target );
+        if (job->op == CLIENT_SURFACE_COMPOSITOR_UPDATE_TARGET)
+            /* Allocation may still fail. Preserve the pending publication
+             * until the replacement pool has been prepared successfully. */
+            target->quiescing = TRUE;
+        else
+            quiesce_client_surface_compositor_target( target );
     }
     for (i = 0; i < ARRAY_SIZE(target->frames); ++i)
     {
@@ -4286,6 +4312,8 @@ static BOOL ensure_client_surface_backing( struct x11drv_win_data *data, BOOL sn
 {
     unsigned int width, height, window_width, window_height;
     unsigned int old_valid_width, old_valid_height;
+    unsigned int old_width, old_height;
+    DWORD old_shrink_start;
     BOOL old_valid, valid, updated, shrink = FALSE;
     Pixmap pixmap, spare, old_pixmap, old_spare;
 
@@ -4402,6 +4430,9 @@ static BOOL ensure_client_surface_backing( struct x11drv_win_data *data, BOOL sn
 
     old_pixmap = data->client_surface_backing;
     old_spare = data->client_surface_backing_spare;
+    old_width = data->client_surface_backing_width;
+    old_height = data->client_surface_backing_height;
+    old_shrink_start = data->client_surface_backing_shrink_start;
     data->client_surface_backing = pixmap;
     data->client_surface_backing_spare = spare;
     data->client_surface_backing_width = width;
@@ -4414,16 +4445,28 @@ static BOOL ensure_client_surface_backing( struct x11drv_win_data *data, BOOL sn
         data->client_surface_backing_valid_width = window_width;
         data->client_surface_backing_valid_height = window_height;
     }
+    updated = update_client_surface_backing_target( data );
+    if (!updated)
+    {
+        /* The actor retained its old pool on failure. Restore the GUI's
+         * ownership too, without declaring that image complete for the new
+         * native extent. Only the uninstalled replacement pair is released. */
+        data->client_surface_backing = old_pixmap;
+        data->client_surface_backing_spare = old_spare;
+        data->client_surface_backing_width = old_width;
+        data->client_surface_backing_height = old_height;
+        data->client_surface_backing_shrink_start = old_shrink_start;
+        data->client_surface_backing_valid = FALSE;
+        data->client_surface_backing_valid_width = 0;
+        data->client_surface_backing_valid_height = 0;
+        client_surface_backing_free( pixmap, spare );
+        return FALSE;
+    }
     if (snapshot)
         TRACE( "rotated client-surface frame pool to %#lx (idle %#lx)\n",
                data->client_surface_backing, data->client_surface_backing_spare );
-    updated = update_client_surface_backing_target( data );
-    /* The synchronous target update drains the old pool before detaching it.
-     * If installation failed, discard any partially updated target first;
-     * the next ensure can install the new pool without dangling old XIDs. */
-    if (!updated) remove_client_surface_backing_target( data->hwnd );
+    /* Successful installation drained and detached every old native user. */
     if (old_pixmap || old_spare) client_surface_backing_free( old_pixmap, old_spare );
-    if (!updated) return FALSE;
     refresh_client_surface_handoffs( data->hwnd );
     if (snapshot && !invalidate)
     {
