@@ -2500,13 +2500,21 @@ static VkResult prepare_swapchain_snapshot( struct vulkan_queue *queue, struct s
     VkSemaphoreCreateInfo semaphore_info = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
     VkFenceCreateInfo fence_info = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
     VkMemoryRequirements requirements;
+    VkBuffer buffer;
+    VkDeviceMemory memory;
+    VkCommandPool pool;
+    VkCommandBuffer command;
+    uint32_t image_count;
+    void *pixels;
+    BOOL fresh = !snapshot->buffer;
     unsigned int i;
     VkResult res;
 
-    if (!snapshot->buffer)
+    if (fresh)
     {
         if ((res = device->p_vkGetSwapchainImagesKHR( device->host.device, swapchain->obj.host.swapchain,
-                                                     &snapshot->image_count, NULL ))) goto failed;
+                                                     &image_count, NULL ))) goto failed;
+        snapshot->image_count = image_count;
         if (!(snapshot->images = calloc( snapshot->image_count, sizeof(*snapshot->images) )) ||
             !(snapshot->present_sync = calloc( snapshot->image_count, sizeof(*snapshot->present_sync) )))
         {
@@ -2514,9 +2522,13 @@ static VkResult prepare_swapchain_snapshot( struct vulkan_queue *queue, struct s
             goto failed;
         }
         if ((res = device->p_vkGetSwapchainImagesKHR( device->host.device, swapchain->obj.host.swapchain,
-                                                     &snapshot->image_count, snapshot->images ))) goto failed;
+                                                     &image_count, snapshot->images ))) goto failed;
+        snapshot->image_count = image_count;
         buffer_info.size = (VkDeviceSize)swapchain->host_extents.width * swapchain->host_extents.height * 4;
-        if ((res = device->p_vkCreateBuffer( device->host.device, &buffer_info, NULL, &snapshot->buffer ))) goto failed;
+        /* Runtime errors leave output parameters undefined. Commit ownership
+         * only after success, so cleanup never consumes an unsuccessful output. */
+        if ((res = device->p_vkCreateBuffer( device->host.device, &buffer_info, NULL, &buffer ))) goto failed;
+        snapshot->buffer = buffer;
         device->p_vkGetBufferMemoryRequirements( device->host.device, snapshot->buffer, &requirements );
         for (i = 0; i < properties->memoryTypeCount; ++i)
             if ((requirements.memoryTypeBits & (1u << i)) &&
@@ -2534,39 +2546,53 @@ static VkResult prepare_swapchain_snapshot( struct vulkan_queue *queue, struct s
             goto failed;
         }
         snapshot->memory_bytes = requirements.size;
-        if ((res = device->p_vkAllocateMemory( device->host.device, &memory_info, NULL, &snapshot->memory )) ||
-            (res = device->p_vkBindBufferMemory( device->host.device, snapshot->buffer, snapshot->memory, 0 )) ||
-            (res = device->p_vkMapMemory( device->host.device, snapshot->memory, 0, VK_WHOLE_SIZE,
-                                         0, &snapshot->pixels ))) goto failed;
+        if ((res = device->p_vkAllocateMemory( device->host.device, &memory_info, NULL, &memory ))) goto failed;
+        snapshot->memory = memory;
+        if ((res = device->p_vkBindBufferMemory( device->host.device, snapshot->buffer, snapshot->memory, 0 ))) goto failed;
+        if ((res = device->p_vkMapMemory( device->host.device, snapshot->memory, 0, VK_WHOLE_SIZE,
+                                         0, &pixels ))) goto failed;
+        snapshot->pixels = pixels;
     }
     for (i = 0; i < snapshot->image_count; ++i)
     {
         struct swapchain_present_sync *sync = &snapshot->present_sync[i];
+        VkSemaphore semaphore;
+        VkFence fence;
 
-        if (!sync->semaphore && (res = device->p_vkCreateSemaphore( device->host.device, &semaphore_info,
-                                                                    NULL, &sync->semaphore ))) goto failed;
-        if (impl_from_vulkan_device( device )->swapchain_maintenance1 && !sync->fence &&
-            (res = device->p_vkCreateFence( device->host.device, &fence_info, NULL, &sync->fence ))) goto failed;
+        if (!sync->semaphore)
+        {
+            if ((res = device->p_vkCreateSemaphore( device->host.device, &semaphore_info, NULL, &semaphore ))) goto failed;
+            sync->semaphore = semaphore;
+        }
+        if (impl_from_vulkan_device( device )->swapchain_maintenance1 && !sync->fence)
+        {
+            if ((res = device->p_vkCreateFence( device->host.device, &fence_info, NULL, &fence ))) goto failed;
+            sync->fence = fence;
+        }
     }
     if (snapshot->pool && snapshot->queue_family != queue->info.queueFamilyIndex)
     {
         device->p_vkDestroyCommandPool( device->host.device, snapshot->pool, NULL );
         snapshot->pool = 0;
+        snapshot->command = 0;
     }
     if (!snapshot->pool)
     {
-        if ((res = device->p_vkCreateCommandPool( device->host.device, &pool_info, NULL, &snapshot->pool ))) goto failed;
+        if ((res = device->p_vkCreateCommandPool( device->host.device, &pool_info, NULL, &pool ))) goto failed;
+        snapshot->pool = pool;
         snapshot->queue_family = queue->info.queueFamilyIndex;
         command_info.commandPool = snapshot->pool;
-        if ((res = device->p_vkAllocateCommandBuffers( device->host.device, &command_info, &snapshot->command ))) goto failed;
+        if ((res = device->p_vkAllocateCommandBuffers( device->host.device, &command_info, &command ))) goto failed;
+        snapshot->command = command;
     }
-    return device->p_vkResetCommandPool( device->host.device, snapshot->pool, 0 );
+    if ((res = device->p_vkResetCommandPool( device->host.device, snapshot->pool, 0 ))) goto failed;
+    return VK_SUCCESS;
 
 failed:
     /* Only fresh storage may lose its image semaphores on allocation failure.
      * An earlier host Present may still be consuming those semaphores after
      * the readback fence has completed. */
-    if (!snapshot->pixels)
+    if (fresh)
     {
         destroy_swapchain_snapshot( device, snapshot );
         snapshot->busy = TRUE;
@@ -2591,6 +2617,7 @@ static VkResult snapshot_vulkan_present( struct vulkan_queue *queue, VkPresentIn
     VkSubmitInfo submit = {.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO};
     VkFenceCreateInfo fence_info = {.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
     struct vulkan_snapshot_fence *pending = NULL;
+    VkFence fence;
     VkSemaphore *semaphore = NULL;
     unsigned int i, count = 0;
     VkResult res = VK_SUCCESS;
@@ -2611,8 +2638,9 @@ static VkResult snapshot_vulkan_present( struct vulkan_queue *queue, VkPresentIn
     }
     pending->device = device;
     pending->refs = 1;
-    if ((res = device->p_vkCreateFence( device->host.device, &fence_info, NULL, &pending->fence )))
+    if ((res = device->p_vkCreateFence( device->host.device, &fence_info, NULL, &fence )))
         goto done;
+    pending->fence = fence;
     for (i = 0; i < present_info->swapchainCount; ++i)
     {
         struct swapchain *swapchain = swapchain_from_handle( client_swapchains[i] );
