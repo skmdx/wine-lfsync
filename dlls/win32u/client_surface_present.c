@@ -1229,6 +1229,20 @@ static void prepare_client_surface_present_locked( struct client_surface *surfac
             client_surface_update_present_scene_locked( surface, NULL, allow_direct_transition );
         client_surface_get_scene( surface, &present->scene );
     }
+    /* PREPARING can consume one geometry resample before the owner admits
+     * DIRECT in the next. Admission and native attachment are separate
+     * steps: finish applying that exact selected scene before choosing the
+     * completion path. Otherwise its first image is captured offscreen while
+     * the owner waits for a native DIRECT completion that cannot arrive.
+     * A concurrent scene change fails the existing exact-snapshot check. */
+    if (allow_direct_transition && present->scene.valid &&
+        present->scene.mode == CLIENT_SURFACE_PRESENTATION_DIRECT &&
+        (surface->target_scene_epoch != present->scene.epoch ||
+         surface->target_scene_mode != present->scene.mode))
+    {
+        client_surface_update_present_scene_locked( surface, &present->scene, TRUE );
+        client_surface_get_scene( surface, &present->scene );
+    }
     client_surface_get_target( surface, &target );
     /* Only client_surface_update_present_locked() may mark a server scene as
      * applied: it does so after validating the exact scene around the native
