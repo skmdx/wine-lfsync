@@ -726,7 +726,7 @@ static void framebuffer_surface_destroy( struct opengl_drawable *drawable )
     if (surface->target) opengl_drawable_release( surface->target );
 }
 
-static void blit_framebuffer_surface( struct opengl_drawable *drawable )
+static void blit_framebuffer_surface( struct opengl_drawable *drawable, const SIZE *destination )
 {
     static pthread_once_t once = PTHREAD_ONCE_INIT;
 
@@ -737,7 +737,8 @@ static void blit_framebuffer_surface( struct opengl_drawable *drawable )
 
     /* A source-copy target retains application pixels at virtual size; the
      * owner compositor, not this scratch window, applies DPI conversion. */
-    if (target->needs_framebuffer) dst = target->virtual_size;
+    if (destination) dst = *destination;
+    else if (target->needs_framebuffer) dst = target->virtual_size;
 
     TRACE( "%s src %s dst %s fbo %u\n", debugstr_opengl_drawable( drawable ), wine_dbgstr_point( (POINT *)&src ),
            wine_dbgstr_point( (POINT *)&dst ), drawable->read_fbo );
@@ -780,6 +781,15 @@ static void blit_framebuffer_surface( struct opengl_drawable *drawable )
     if (drawable->srgb) funcs->p_glDisable( GL_FRAMEBUFFER_SRGB );
 }
 
+static BOOL blit_framebuffer_surface_checked( struct opengl_drawable *drawable, const SIZE *destination )
+{
+    TRACE( "generic framebuffer blit %s resolve %u gamma %u\n", debugstr_opengl_drawable( drawable ),
+           drawable->read_fbo != drawable->draw_fbo, !use_default_gamma_ramp() );
+    if (display_funcs.p_glGetError() != GL_NO_ERROR) return FALSE;
+    blit_framebuffer_surface( drawable, destination );
+    return display_funcs.p_glGetError() == GL_NO_ERROR;
+}
+
 static BOOL present_framebuffer_surface( struct opengl_drawable *drawable )
 {
     struct framebuffer_surface *surface = framebuffer_from_opengl_drawable( drawable );
@@ -794,7 +804,13 @@ static BOOL present_framebuffer_surface( struct opengl_drawable *drawable )
         client_surface_update( target->client );
         return target->funcs->swap_framebuffer( target, drawable->read_fbo );
     }
-    blit_framebuffer_surface( drawable );
+    if (target->funcs->swap_blit)
+    {
+        if (!is_client_surface_window( target->client, 0 )) return FALSE;
+        client_surface_update( target->client );
+        return target->funcs->swap_blit( target, drawable, blit_framebuffer_surface_checked );
+    }
+    blit_framebuffer_surface( drawable, NULL );
     return opengl_drawable_swap( target );
 }
 

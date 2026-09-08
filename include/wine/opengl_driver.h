@@ -119,7 +119,7 @@ struct __GLsync
 #include "wine/gdi_driver.h"
 
 /* Wine internal opengl driver version, needs to be bumped upon opengl_funcs changes. */
-#define WINE_OPENGL_DRIVER_VERSION 42
+#define WINE_OPENGL_DRIVER_VERSION 43
 
 struct opengl_drawable;
 
@@ -218,6 +218,8 @@ struct egl_platform
     GUID                 driver_uuid;
 };
 
+typedef BOOL (*opengl_drawable_blit_func)( struct opengl_drawable *source, const SIZE *destination );
+
 struct opengl_drawable_funcs
 {
     void (*destroy)( struct opengl_drawable *iface );
@@ -228,6 +230,12 @@ struct opengl_drawable_funcs
     /* Optional presentation of COLOR_ATTACHMENT0 from a resolved internal FBO.
      * Called in the internal context, with default gamma and virtual dimensions. */
     BOOL (*swap_framebuffer)( struct opengl_drawable *iface, GLuint framebuffer );
+    /* Optional generic framebuffer presentation. Invoke blit synchronously in
+     * the current internal context, after preparing the native target and
+     * choosing its output extent. The source and callback are borrowed only
+     * for this call; blit includes Wine's resolve and gamma conversion. */
+    BOOL (*swap_blit)( struct opengl_drawable *iface, struct opengl_drawable *source,
+                      opengl_drawable_blit_func blit );
 };
 
 /* flags for opengl_drawable flush */
