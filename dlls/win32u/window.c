@@ -1506,10 +1506,33 @@ BOOL set_window_pixel_format( HWND hwnd, int format, BOOL internal )
         }
         win->pixel_format = format;
     }
-    if (format && !win->clip_clients) changed = win->clip_clients = TRUE;
+    if (format && !win->clip_clients)
+    {
+        /* The owner publishes the painting flags in update_window_state().
+         * Defer the local flag too, so that its message still observes the
+         * transition and invalidates DCs after that publication. */
+        if (!is_current_thread_window( hwnd ))
+        {
+            release_win_ptr( win );
+            NtUserPostMessage( hwnd, WM_WINE_SETPIXELFORMAT, format, TRUE );
+            return TRUE;
+        }
+        changed = win->clip_clients = TRUE;
+    }
     release_win_ptr( win );
 
-    if (changed) update_window_state( hwnd );
+    if (changed)
+    {
+        update_window_state( hwnd );
+        /* Geometry and the GDI surface may be unchanged. An existing owned
+         * or cached DC must nevertheless stop reading that surface's DIB
+         * and bind the native drawable for the pixel-format client area. */
+        if ((win = get_win_ptr( hwnd )) && win != WND_OTHER_PROCESS && win != WND_DESKTOP)
+        {
+            invalidate_dce( win, NULL );
+            release_win_ptr( win );
+        }
+    }
     return TRUE;
 }
 
