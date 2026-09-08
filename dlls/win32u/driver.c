@@ -786,7 +786,7 @@ static void nulldrv_FlashWindowEx( FLASHWINFO *info )
 }
 
 static void nulldrv_GetDC( HDC hdc, HWND hwnd, HWND top_win, const RECT *win_rect,
-                           const RECT *top_rect, DWORD flags )
+                           const RECT *top_rect, DWORD flags, UINT scale_num, UINT scale_den )
 {
 }
 
@@ -1209,9 +1209,9 @@ static BOOL loaderdrv_CreateWindow( HWND hwnd )
 }
 
 static void loaderdrv_GetDC( HDC hdc, HWND hwnd, HWND top_win, const RECT *win_rect,
-                             const RECT *top_rect, DWORD flags )
+                             const RECT *top_rect, DWORD flags, UINT scale_num, UINT scale_den )
 {
-    load_driver()->pGetDC( hdc, hwnd, top_win, win_rect, top_rect, flags );
+    load_driver()->pGetDC( hdc, hwnd, top_win, win_rect, top_rect, flags, scale_num, scale_den );
 }
 
 static void loaderdrv_FlashWindowEx( FLASHWINFO *info )

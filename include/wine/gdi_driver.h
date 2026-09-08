@@ -219,7 +219,7 @@ struct gdi_dc_funcs
 };
 
 /* increment this when changing driver tables or shared driver-facing structures */
-#define WINE_GDI_DRIVER_VERSION 135
+#define WINE_GDI_DRIVER_VERSION 136
 
 #define GDI_PRIORITY_NULL_DRV        0  /* null driver */
 #define GDI_PRIORITY_FONT_DRV      100  /* any font driver */
@@ -663,7 +663,7 @@ struct user_driver_funcs
     LRESULT (*pDesktopWindowProc)(HWND,UINT,WPARAM,LPARAM);
     void    (*pDestroyWindow)(HWND);
     void    (*pFlashWindowEx)(FLASHWINFO*);
-    void    (*pGetDC)(HDC,HWND,HWND,const RECT *,const RECT *,DWORD);
+    void    (*pGetDC)(HDC,HWND,HWND,const RECT *,const RECT *,DWORD,UINT,UINT);
     BOOL    (*pProcessEvents)(DWORD);
     void    (*pReleaseDC)(HWND,HDC);
     BOOL    (*pScrollDC)(HDC,INT,INT,HRGN);

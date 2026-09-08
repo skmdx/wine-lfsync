@@ -3251,7 +3251,7 @@ Window X11DRV_get_whole_window( HWND hwnd )
  *		X11DRV_GetDC   (X11DRV.@)
  */
 void X11DRV_GetDC( HDC hdc, HWND hwnd, HWND top, const RECT *win_rect,
-                   const RECT *top_rect, DWORD flags )
+                   const RECT *top_rect, DWORD flags, UINT scale_num, UINT scale_den )
 {
     struct x11drv_escape_set_drawable escape;
     struct x11drv_win_data *data;
@@ -3263,6 +3263,8 @@ void X11DRV_GetDC( HDC hdc, HWND hwnd, HWND top, const RECT *win_rect,
     escape.code = X11DRV_SET_DRAWABLE;
     escape.mode = IncludeInferiors;
     escape.drawable = 0;
+    escape.readback_scale_num = scale_num;
+    escape.readback_scale_den = scale_den;
 
     escape.dc_rect.left         = win_rect->left - top_rect->left;
     escape.dc_rect.top          = win_rect->top - top_rect->top;
@@ -3298,6 +3300,7 @@ void X11DRV_ReleaseDC( HWND hwnd, HDC hdc )
     escape.code = X11DRV_SET_DRAWABLE;
     escape.drawable = root_window;
     escape.mode = IncludeInferiors;
+    escape.readback_scale_num = escape.readback_scale_den = 1;
     escape.dc_rect = NtUserGetVirtualScreenRect( MDT_DEFAULT );
     OffsetRect( &escape.dc_rect, -2 * escape.dc_rect.left, -2 * escape.dc_rect.top );
     NtGdiExtEscape( hdc, NULL, 0, X11DRV_ESCAPE, sizeof(escape), (LPSTR)&escape, 0, NULL );

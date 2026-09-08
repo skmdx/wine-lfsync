@@ -1846,6 +1846,10 @@ static BOOL xrenderdrv_StretchBlt( PHYSDEV dst_dev, struct bitblt_coords *dst,
         return dst_dev->funcs->pStretchBlt( dst_dev, dst, src_dev, src, rop );
     }
 
+    /* The generic image path performs native-to-virtual source readback. */
+    if (physdev_src->x11dev->readback_scale_num != physdev_src->x11dev->readback_scale_den)
+        goto x11drv_fallback;
+
     /* XRender is of no use for color -> mono */
     if (physdev_dst->format == WXR_FORMAT_MONO && physdev_src->format != WXR_FORMAT_MONO)
         goto x11drv_fallback;
@@ -2055,7 +2059,8 @@ static BOOL xrenderdrv_AlphaBlend( PHYSDEV dst_dev, struct bitblt_coords *dst,
     Pixmap tmp_pixmap = 0;
     double xscale, yscale;
 
-    if (src_dev->funcs != dst_dev->funcs)
+    if (src_dev->funcs != dst_dev->funcs ||
+        physdev_src->x11dev->readback_scale_num != physdev_src->x11dev->readback_scale_den)
     {
         dst_dev = GET_NEXT_PHYSDEV( dst_dev, pAlphaBlend );
         return dst_dev->funcs->pAlphaBlend( dst_dev, dst, src_dev, src, blendfn );

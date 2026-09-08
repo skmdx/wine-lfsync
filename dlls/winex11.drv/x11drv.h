@@ -122,6 +122,7 @@ typedef struct
     GC            gc;          /* X Window GC */
     Drawable      drawable;
     RECT          dc_rect;       /* DC rectangle relative to drawable */
+    UINT          readback_scale_num, readback_scale_den; /* virtual DC to native pixels */
     RECT         *bounds;        /* Graphics bounds */
     HRGN          region;        /* Device region (visible region & clip region) */
     X_PHYSPEN     pen;
@@ -230,7 +231,7 @@ extern LRESULT X11DRV_DesktopWindowProc( HWND hwnd, UINT msg, WPARAM wp, LPARAM 
 extern void X11DRV_DestroyWindow( HWND hwnd );
 extern void X11DRV_FlashWindowEx( PFLASHWINFO pfinfo );
 extern void X11DRV_GetDC( HDC hdc, HWND hwnd, HWND top, const RECT *win_rect,
-                          const RECT *top_rect, DWORD flags );
+                         const RECT *top_rect, DWORD flags, UINT scale_num, UINT scale_den );
 extern void X11DRV_ReleaseDC( HWND hwnd, HDC hdc );
 extern BOOL X11DRV_ScrollDC( HDC hdc, INT dx, INT dy, HRGN update );
 extern void X11DRV_SetCapture( HWND hwnd, UINT flags, HWND previous );
@@ -376,6 +377,7 @@ struct x11drv_escape_set_drawable
     Drawable                 drawable;     /* X drawable */
     int                      mode;         /* ClipByChildren or IncludeInferiors */
     RECT                     dc_rect;      /* DC rectangle relative to drawable */
+    UINT                     readback_scale_num, readback_scale_den;
     XVisualInfo              visual;       /* X visual used by drawable, may be unspecified if no change is needed */
 };
 

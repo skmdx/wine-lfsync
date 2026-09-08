@@ -84,6 +84,7 @@ static X11DRV_PDEVICE *create_x11_physdev( Drawable drawable )
     if (!(physDev = calloc( 1, sizeof(*physDev) ))) return NULL;
 
     physDev->drawable = drawable;
+    physDev->readback_scale_num = physDev->readback_scale_den = 1;
     physDev->gc = XCreateGC( gdi_display, drawable, 0, NULL );
     XSetGraphicsExposures( gdi_display, physDev->gc, False );
     XSetSubwindowMode( gdi_display, physDev->gc, IncludeInferiors );
@@ -223,6 +224,8 @@ static INT X11DRV_ExtEscape( PHYSDEV dev, INT escape, INT in_count, LPCVOID in_d
                 {
                     const struct x11drv_escape_set_drawable *data = in_data;
                     physDev->dc_rect = data->dc_rect;
+                    physDev->readback_scale_num = data->readback_scale_num ? data->readback_scale_num : 1;
+                    physDev->readback_scale_den = data->readback_scale_den ? data->readback_scale_den : 1;
                     physDev->drawable = data->drawable;
                     XFreeGC( gdi_display, physDev->gc );
                     physDev->gc = XCreateGC( gdi_display, physDev->drawable, 0, NULL );

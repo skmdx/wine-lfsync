@@ -859,7 +859,9 @@ static HRGN get_window_visible_region( HWND hwnd, DWORD flags, HWND *top_win,
 static void update_visible_region( struct dce *dce )
 {
     struct window_surface *surface = NULL;
+    struct ratio dpi, raw_dpi = {0};
     DWORD flags = dce->flags, paint_flags;
+    UINT scale_num = 1, scale_den = 1;
     RECT win_rect, top_rect;
     HWND top_win;
     HRGN vis_rgn;
@@ -869,7 +871,18 @@ static void update_visible_region( struct dce *dce )
     if (!(vis_rgn = get_window_visible_region( dce->hwnd, flags, &top_win,
                                                &win_rect, &top_rect, &paint_flags ))) return;
 
-    user_driver->pGetDC( dce->hdc, dce->hwnd, top_win, &win_rect, &top_rect, flags );
+    /* A native drawable uses raw monitor pixels even when the DC has no DIB
+     * surface to perform DPI scaling. Keep the DC's virtual coordinates and
+     * pass the exact conversion for native image reads, without rounding the
+     * two DPIs independently through the public integer APIs. */
+    dpi = get_dpi_for_window( top_win );
+    get_win_monitor_dpi( top_win, &raw_dpi );
+    if (dpi.num && dpi.den && raw_dpi.num && raw_dpi.den)
+    {
+        scale_num = (UINT)raw_dpi.num * dpi.den;
+        scale_den = (UINT)dpi.num * raw_dpi.den;
+    }
+    user_driver->pGetDC( dce->hdc, dce->hwnd, top_win, &win_rect, &top_rect, flags, scale_num, scale_den );
 
     if (dce->clip_rgn) NtGdiCombineRgn( vis_rgn, vis_rgn, dce->clip_rgn,
                                         (flags & DCX_INTERSECTRGN) ? RGN_AND : RGN_DIFF );

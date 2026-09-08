@@ -817,6 +817,7 @@ BOOL X11DRV_StretchBlt( PHYSDEV dst_dev, struct bitblt_coords *dst,
     GC gc;
 
     if (src_dev->funcs != dst_dev->funcs ||
+        physDevSrc->readback_scale_num != physDevSrc->readback_scale_den ||
         src->width != dst->width || src->height != dst->height ||  /* no stretching with core X11 */
         (physDevDst->depth == 1 && physDevSrc->depth != 1) ||  /* color -> mono done by hand */
         (X11DRV_PALETTE_XPixelToPalette && physDevSrc->depth != 1))  /* needs palette mapping */
@@ -1309,6 +1310,94 @@ update_format:
     return ERROR_BAD_FORMAT;
 }
 
+static XImage *get_dc_image( X11DRV_PDEVICE *physdev, int x, int y, UINT width, UINT height )
+{
+    XImage *image;
+
+    X11DRV_expect_error( gdi_display, XGetImage_handler, NULL );
+    image = XGetImage( gdi_display, physdev->drawable, x, y, width, height, AllPlanes, ZPixmap );
+    if (X11DRV_check_error())
+    {
+        /* use a temporary pixmap to avoid the BadMatch error */
+        Pixmap pixmap = XCreatePixmap( gdi_display, root_window, width, height, physdev->depth );
+        GC gc = XCreateGC( gdi_display, pixmap, 0, NULL );
+
+        XSetGraphicsExposures( gdi_display, gc, False );
+        XCopyArea( gdi_display, physdev->drawable, pixmap, gc, x, y, width, height, 0, 0 );
+        image = XGetImage( gdi_display, pixmap, 0, 0, width, height, AllPlanes, ZPixmap );
+        XFreePixmap( gdi_display, pixmap );
+        XFreeGC( gdi_display, gc );
+    }
+    return image;
+}
+
+static int scale_readback_coord( X11DRV_PDEVICE *physdev, int value )
+{
+    LONGLONG scaled = (LONGLONG)value * physdev->readback_scale_num;
+    UINT den = physdev->readback_scale_den;
+
+    return (scaled + (scaled < 0 ? -(LONGLONG)(den / 2) : den / 2)) / den;
+}
+
+static int scale_readback_sample( X11DRV_PDEVICE *physdev, int value, int start, int end, int last )
+{
+    int sample = scale_readback_coord( physdev, value );
+
+    /* Rounding the last logical pixel can reach the exclusive native edge
+     * (e.g. 258 at 3/4 scale in a 259-pixel DC). Only extend that DC's last
+     * pixel; alignment padding and coordinates outside it retain their normal
+     * clipping semantics. A nonempty native window is at least one pixel. */
+    if (value >= start && value < end) sample = min( sample, last );
+    return sample;
+}
+
+static XImage *get_scaled_dc_image( X11DRV_PDEVICE *physdev, const XVisualInfo *vis,
+                                   int x, int y, UINT width, UINT height )
+{
+    XImage *native, *image;
+    const RECT *dc = &physdev->dc_rect;
+    int last_x = max( scale_readback_coord( physdev, dc->left ) + 1,
+                      scale_readback_coord( physdev, dc->right )) - 1;
+    int last_y = max( scale_readback_coord( physdev, dc->top ) + 1,
+                      scale_readback_coord( physdev, dc->bottom )) - 1;
+    int left = scale_readback_sample( physdev, x, dc->left, dc->right, last_x );
+    int top = scale_readback_sample( physdev, y, dc->top, dc->bottom, last_y );
+    int right = scale_readback_sample( physdev, x + width - 1, dc->left, dc->right, last_x ) + 1;
+    int bottom = scale_readback_sample( physdev, y + height - 1, dc->top, dc->bottom, last_y ) + 1;
+    UINT row, col;
+
+    /* Map samples, not the two edges of a one-pixel rectangle: downscaling
+     * can round both edges to the same native coordinate. All image callers
+     * must sample the same absolute virtual pixel regardless of clipping or
+     * the size of the requested image. The DC mapping and RTL transform have
+     * already been applied before this driver receives the source rectangle. */
+    TRACE( "drawable %lx virtual %d,%d %ux%u native %d,%d %dx%d scale %u/%u\n",
+           physdev->drawable, x, y, width, height, left, top, right - left, bottom - top,
+           physdev->readback_scale_num, physdev->readback_scale_den );
+    if (!(native = get_dc_image( physdev, left, top, right - left, bottom - top ))) return NULL;
+    image = XCreateImage( gdi_display, vis->visual, vis->depth, ZPixmap, 0, NULL, width, height, 32, 0 );
+    if (!image) goto done;
+    if (image->bytes_per_line <= 0 || height > UINT_MAX / image->bytes_per_line ||
+        !(image->data = calloc( height, image->bytes_per_line )))
+    {
+        XDestroyImage( image );
+        image = NULL;
+        goto done;
+    }
+    for (row = 0; row < height; row++)
+    {
+        int native_y = scale_readback_sample( physdev, y + row, dc->top, dc->bottom, last_y ) - top;
+        for (col = 0; col < width; col++)
+        {
+            int native_x = scale_readback_sample( physdev, x + col, dc->left, dc->right, last_x ) - left;
+            XPutPixel( image, col, row, XGetPixel( native, native_x, native_y ));
+        }
+    }
+done:
+    XDestroyImage( native );
+    return image;
+}
+
 /***********************************************************************
  *           X11DRV_GetImage
  */
@@ -1367,23 +1456,10 @@ DWORD X11DRV_GetImage( PHYSDEV dev, BITMAPINFO *info,
     src->y -= y;
     OffsetRect( &src->visrect, -x, -y );
 
-    X11DRV_expect_error( gdi_display, XGetImage_handler, NULL );
-    image = XGetImage( gdi_display, physdev->drawable,
-                       physdev->dc_rect.left + x, physdev->dc_rect.top + y,
-                       width, height, AllPlanes, ZPixmap );
-    if (X11DRV_check_error())
-    {
-        /* use a temporary pixmap to avoid the BadMatch error */
-        Pixmap pixmap = XCreatePixmap( gdi_display, root_window, width, height, vis.depth );
-        GC gc = XCreateGC( gdi_display, pixmap, 0, NULL );
-
-        XSetGraphicsExposures( gdi_display, gc, False );
-        XCopyArea( gdi_display, physdev->drawable, pixmap, gc,
-                   physdev->dc_rect.left + x, physdev->dc_rect.top + y, width, height, 0, 0 );
-        image = XGetImage( gdi_display, pixmap, 0, 0, width, height, AllPlanes, ZPixmap );
-        XFreePixmap( gdi_display, pixmap );
-        XFreeGC( gdi_display, gc );
-    }
+    if (physdev->readback_scale_num != physdev->readback_scale_den)
+        image = get_scaled_dc_image( physdev, &vis, physdev->dc_rect.left + x,
+                                      physdev->dc_rect.top + y, width, height );
+    else image = get_dc_image( physdev, physdev->dc_rect.left + x, physdev->dc_rect.top + y, width, height );
 
     if (!image) return ERROR_OUTOFMEMORY;
 
