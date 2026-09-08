@@ -106,6 +106,7 @@ static void client_surface_handoff_wake_release( struct client_surface_handoff_s
 #endif
 }
 
+/* The caller holds present_lock through both backend retirement and detachment. */
 void client_surface_release_handoff( struct client_surface *surface )
 {
     struct client_surface_handoff_channel *channel;
@@ -1144,6 +1145,7 @@ void client_surface_wait_present_locked( struct client_surface *surface, BOOL ex
     for (;;)
     {
         struct client_surface_handoff_shared *shared;
+        BOOL wait;
         LONG sequence;
 
         while (InterlockedCompareExchange( &surface->target_update_waiters, 0, 0 ) ||
@@ -1162,29 +1164,36 @@ void client_surface_wait_present_locked( struct client_surface *surface, BOOL ex
          * the completion mutex dropped so those writes can be published.
          * Retain the view even if the final callback or a target update asks
          * to detach it while this thread sleeps on its shared sequence. */
+        pthread_mutex_lock( &surface->present_lock );
         shared = surface->handoff_shared;
         ++surface->handoff_waiters;
         __atomic_store_n( &shared->release_parked, 1, __ATOMIC_RELEASE );
         sequence = __atomic_load_n( &shared->release_sequence, __ATOMIC_ACQUIRE );
-        if (!client_surface_handoff_write_available( surface ))
+        wait = !client_surface_handoff_write_available( surface );
+        pthread_mutex_unlock( &surface->present_lock );
+        if (wait)
         {
             pthread_mutex_unlock( &surface->completion_lock );
             client_surface_handoff_wait_sequence( &shared->release_sequence, sequence, 10 );
             pthread_mutex_lock( &surface->completion_lock );
         }
+        pthread_mutex_lock( &surface->present_lock );
         if (!--surface->handoff_waiters && surface->handoff_release_pending &&
             !InterlockedCompareExchange( &surface->external_completion_count, 0, 0 ))
             client_surface_release_handoff( surface );
+        pthread_mutex_unlock( &surface->present_lock );
     }
     if (!external_completion && !--surface->driver_completion_waiters)
         pthread_cond_broadcast( &surface->completion_cond );
     /* Retire a discarded owner cache before the next native submission adds
      * a completion reference. Otherwise that new frame can pin the closed
      * channel while its capture needs to map the replacement channel. */
+    pthread_mutex_lock( &surface->present_lock );
     if (surface->handoff_channel &&
         __atomic_load_n( &surface->handoff_channel->closed, __ATOMIC_ACQUIRE ) &&
         !InterlockedCompareExchange( &surface->external_completion_count, 0, 0 ))
         client_surface_release_handoff( surface );
+    pthread_mutex_unlock( &surface->present_lock );
 }
 
 static void prepare_client_surface_present_locked( struct client_surface *surface,
@@ -1522,6 +1531,9 @@ BOOL client_surface_complete_present_locked( struct client_surface *surface,
     {
         BOOL release_handoff = FALSE, wake = FALSE;
 
+        /* Target updates can retire the mapping as soon as this last token
+         * disappears. Serialize that transition and detachment with them. */
+        pthread_mutex_lock( &surface->present_lock );
         assert( InterlockedCompareExchange( &surface->external_completion_count, 0, 0 ) > 0 );
         if (present->completion.kind == CLIENT_SURFACE_COMPLETION_SHARED)
         {
@@ -1541,6 +1553,7 @@ BOOL client_surface_complete_present_locked( struct client_surface *surface,
         if (surface->handoff_waiters && (client_surface_handoff_write_available( surface ) ||
             !InterlockedCompareExchange( &surface->external_completion_count, 0, 0 )))
             client_surface_handoff_wake_release( surface->handoff_shared );
+        pthread_mutex_unlock( &surface->present_lock );
         if (wake) pthread_cond_broadcast( &surface->completion_cond );
     }
     return completed;
