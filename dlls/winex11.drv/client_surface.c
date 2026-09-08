@@ -22,6 +22,22 @@
 #include "wine/debug.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(x11drv);
+WINE_DECLARE_DEBUG_CHANNEL(csperf);
+
+/* Image ownership receipts, not new quota or allocation state. The analyser
+ * joins a native XID's acquire/retire/release lifetime, including XID reuse.
+ * Release records the existing XFreePixmap boundary, not server/VRAM timing. */
+void x11drv_client_surface_trace_image( const char *event, const char *kind,
+                                       Display *display, Pixmap pixmap, UINT64 bytes )
+{
+    LARGE_INTEGER ticks;
+
+    if (!TRACE_ON(csperf) || !kind || !pixmap || !bytes) return;
+    NtQueryPerformanceCounter( &ticks, NULL );
+    TRACE_(csperf)( "ticks=%llu event=image_%s kind=%s display=%p pixmap=%lx bytes=%llu\n",
+                   (unsigned long long)ticks.QuadPart, event, kind, display, pixmap,
+                   (unsigned long long)bytes );
+}
 
 static BOOL client_window_region_is_full( HWND hwnd )
 {
@@ -132,9 +148,13 @@ static void x11drv_client_surface_destroy( struct client_surface *client )
     if (surface->snapshot_import) XFreePixmap( gdi_display, surface->snapshot_import );
     for (i = 0; i < ARRAY_SIZE(surface->sources); ++i)
     {
+        x11drv_client_surface_trace_image( "retire", "producer_slot", gdi_display,
+                                          surface->sources[i].pixmap, surface->sources[i].bytes );
         if (surface->sources[i].image) surface->sources[i].release_image( surface->sources[i].image );
         if (surface->sources[i].gc) XFreeGC( gdi_display, surface->sources[i].gc );
         if (surface->sources[i].pixmap) XFreePixmap( gdi_display, surface->sources[i].pixmap );
+        x11drv_client_surface_trace_image( "free", "producer_slot", gdi_display,
+                                          surface->sources[i].pixmap, surface->sources[i].bytes );
         client_surface_release_memory( CLIENT_SURFACE_MEMORY_SOURCE, surface->sources[i].bytes );
     }
     if (surface->snapshot_gc) XFreeGC( gdi_display, surface->snapshot_gc );
@@ -288,17 +308,19 @@ static int client_surface_clip_error( Display *display, XErrorEvent *event, void
     return TRUE;
 }
 
-static void discard_client_surface_source( Pixmap *pixmap, GC *gc, UINT64 *bytes )
+static void discard_client_surface_source( Pixmap *pixmap, GC *gc, UINT64 *bytes, const char *kind )
 {
     int error = 0;
 
     /* Xlib may return handles before the server reports BadAlloc. Consume
      * cleanup errors locally and never cache a failed allocation for reuse. */
+    x11drv_client_surface_trace_image( "retire", kind, gdi_display, *pixmap, *bytes );
     X11DRV_expect_error( gdi_display, client_surface_clip_error, &error );
     if (*gc) XFreeGC( gdi_display, *gc );
     if (*pixmap) XFreePixmap( gdi_display, *pixmap );
     XSync( gdi_display, False );
     X11DRV_check_error();
+    x11drv_client_surface_trace_image( "free", kind, gdi_display, *pixmap, *bytes );
     *gc = NULL;
     *pixmap = 0;
     client_surface_release_memory( CLIENT_SURFACE_MEMORY_SOURCE, *bytes );
@@ -332,17 +354,20 @@ struct x11drv_client_source_frame *x11drv_client_surface_get_source(
     X11DRV_check_error();
     if (error || !next.pixmap || (preserve && !next.gc))
     {
-        discard_client_surface_source( &next.pixmap, &next.gc, &next.bytes );
+        discard_client_surface_source( &next.pixmap, &next.gc, &next.bytes, NULL );
         return NULL;
     }
+    x11drv_client_surface_trace_image( "acquire", "producer_slot", gdi_display, next.pixmap, next.bytes );
     if (frame->pixmap == surface->gpu_snapshot)
     {
         x11drv_client_surface_set_gpu_snapshot( surface, preserve ? next.pixmap : 0 );
         surface->gpu_snapshot_size = (SIZE){width, height};
     }
+    x11drv_client_surface_trace_image( "retire", "producer_slot", gdi_display, frame->pixmap, frame->bytes );
     if (frame->image) frame->release_image( frame->image );
     if (frame->gc) XFreeGC( gdi_display, frame->gc );
     if (frame->pixmap) XFreePixmap( gdi_display, frame->pixmap );
+    x11drv_client_surface_trace_image( "free", "producer_slot", gdi_display, frame->pixmap, frame->bytes );
     client_surface_release_memory( CLIENT_SURFACE_MEMORY_SOURCE, frame->bytes );
     *frame = next;
     return frame;
@@ -458,7 +483,7 @@ BOOL x11drv_client_surface_snapshot( struct client_surface *client, const BYTE *
     if (!gc || error)
     {
         discard_client_surface_source( &surface->snapshot, &surface->snapshot_gc,
-                                        &surface->snapshot_bytes );
+                                        &surface->snapshot_bytes, NULL );
         return FALSE;
     }
     TRACE( "uploaded producer snapshot %#lx from visual %#lx to %#lx\n",
@@ -569,7 +594,7 @@ static BOOL x11drv_client_surface_handoff_complete( struct client_surface *clien
         if (frame->pixmap == surface->gpu_snapshot) x11drv_client_surface_set_gpu_snapshot( surface, 0 );
         if (frame->image) frame->release_image( frame->image );
         frame->image = NULL;
-        discard_client_surface_source( &frame->pixmap, &frame->gc, &frame->bytes );
+        discard_client_surface_source( &frame->pixmap, &frame->gc, &frame->bytes, "producer_slot" );
         return FALSE;
     }
     if (source == surface->gpu_snapshot)

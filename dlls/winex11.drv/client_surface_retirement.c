@@ -57,6 +57,7 @@ static void release_source_retirement( struct x11drv_client_surface_retirement *
         if (frame->image) frame->release_image( frame->image );
         if (frame->gc) XFreeGC( gdi_display, frame->gc );
         if (frame->pixmap) XFreePixmap( gdi_display, frame->pixmap );
+        x11drv_client_surface_trace_image( "free", "producer_slot", gdi_display, frame->pixmap, frame->bytes );
         if (frame->pixmap)
             TRACE( "released retired source pixmap %#lx identity %s cookie %s\n", frame->pixmap,
                    wine_dbgstr_longlong( retirement->identity ), wine_dbgstr_longlong( retirement->cookie ) );
@@ -250,9 +251,13 @@ void x11drv_client_surface_retire_handoff( struct client_surface *client )
            wine_dbgstr_longlong( retirement->identity ), wine_dbgstr_longlong( retirement->cookie ),
            retirement->view, retirement->ready_fd );
     for (i = 0; i < ARRAY_SIZE(retirement->sources); ++i)
+    {
+        x11drv_client_surface_trace_image( "retire", "producer_slot", gdi_display,
+                                          retirement->sources[i].pixmap, retirement->sources[i].bytes );
         if (retirement->sources[i].pixmap)
             TRACE( "retaining source pixmap %#lx identity %s cookie %s\n", retirement->sources[i].pixmap,
                    wine_dbgstr_longlong( retirement->identity ), wine_dbgstr_longlong( retirement->cookie ) );
+    }
     pthread_mutex_lock( &retirement_lock );
     list_add_tail( &retirements, &retirement->entry );
     pthread_cond_signal( &retirement_cond );
