@@ -2753,6 +2753,17 @@ static BOOL compose_client_surface_cached_frame( struct client_surface_composito
             (target->assembly_generation != plan.generation ||
              target->assembly_epoch != plan.epoch))
             finish_client_surface_compositor_assembly( target, TRUE );
+#ifdef SONAME_LIBXPRESENT
+        /* A single steady layer can retain newer complete images in its
+         * owner cache until a native output can be submitted. Rewriting the
+         * mailbox while both Present credits are owned only replaces work
+         * that cannot become visible. Keep source_sequence at the last copy;
+         * a skipped damage base then takes the existing full-image recovery.
+         * Transactions and multi-layer replay keep their assembly ordering. */
+        if (!plan.generation && target->scene.count == 1 && usexpresent && target->present_event &&
+            count_client_surface_compositor_frames( target ) >= CLIENT_SURFACE_COMPOSITOR_MAX_INFLIGHT)
+            goto retry;
+#endif
         if (!plan.generation || previous_publish)
             frame = get_client_surface_compositor_frame( target );
         else if (target->assembly_pending &&
@@ -3043,6 +3054,10 @@ static void wait_client_surface_compositor_work(void)
     if (process_client_surface_present_replies()) return;
     if (process_client_surface_copy_replies()) return;
     if (process_client_surface_handoffs()) return;
+    /* Complete/Idle above can release the last output credit after the
+     * producer has stopped. Replay its retained cache before parking: no
+     * further source notification is required to publish that final image. */
+    if (replay_client_surface_scene_sources()) return;
     process_client_surface_compositor_mailboxes();
     /* A synchronous copy may have buffered events and replies while handling
      * the sources above. Recheck after those requests as well, before poll. */
