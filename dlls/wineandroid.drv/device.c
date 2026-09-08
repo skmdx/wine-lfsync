@@ -200,6 +200,7 @@ struct ioctl_android_cancelBuffer
     struct ioctl_header hdr;
     int                 buffer_id;
     int                 generation;
+    BOOL                discard;
 };
 
 struct ioctl_android_query
@@ -308,6 +309,7 @@ static AHardwareBuffer *ahb_from_anwb( struct native_win_wrapper *win, struct AN
     if (!buffer) return NULL;
 
     ahb = pANativeWindowBuffer_getHardwareBuffer(buffer);
+    if (!ahb) return NULL;
 
     if (win)
     {
@@ -319,6 +321,7 @@ static AHardwareBuffer *ahb_from_anwb( struct native_win_wrapper *win, struct AN
             if (generation) *generation = win->buffers[i].generation;
             break;
         }
+        if (i == NB_CACHED_BUFFERS) return NULL;
     }
 
     return ahb;
@@ -342,15 +345,17 @@ static void insert_buffer_lru( struct native_win_data *win, int index )
 
 static int register_buffer( struct native_win_data *win, struct AHardwareBuffer *buffer, int *is_new )
 {
-    unsigned int i;
+    unsigned int i, empty = NB_CACHED_BUFFERS;
 
+    assert( buffer );
     *is_new = 0;
     for (i = 0; i < NB_CACHED_BUFFERS; i++)
     {
         if (win->buffers[i] == buffer) goto done;
-        if (!win->buffers[i]) break;
+        if (!win->buffers[i] && empty == NB_CACHED_BUFFERS) empty = i;
     }
 
+    i = empty;
     if (i == NB_CACHED_BUFFERS)
     {
         /* reuse the least recently used buffer */
@@ -371,6 +376,23 @@ static int register_buffer( struct native_win_data *win, struct AHardwareBuffer 
 done:
     insert_buffer_lru( win, i );
     return i;
+}
+
+static void unregister_buffer( struct native_win_data *win, unsigned int id )
+{
+    unsigned int i;
+
+    assert( id < NB_CACHED_BUFFERS && win->buffers[id] );
+    LOG( TRACE, "%p %p discarding buffer %p id %u generation %d\n",
+         win->hwnd, win->parent, win->buffers[id], id, win->generation );
+    pAHardwareBuffer_release( win->buffers[id] );
+    win->buffers[id] = NULL;
+    for (i = 0; i < NB_CACHED_BUFFERS; i++)
+        if (win->buffer_lru[i] == id) break;
+    assert( i < NB_CACHED_BUFFERS );
+    memmove( win->buffer_lru + i, win->buffer_lru + i + 1,
+             (NB_CACHED_BUFFERS - i - 1) * sizeof(win->buffer_lru[0]) );
+    win->buffer_lru[NB_CACHED_BUFFERS - 1] = -1;
 }
 
 static struct ANativeWindowBuffer *get_registered_buffer( struct native_win_data *win, int id )
@@ -567,7 +589,7 @@ static int dequeueBuffer_ioctl( JNIEnv* env, void *data, DWORD in_size, DWORD ou
     struct native_win_data *win_data;
     struct ANativeWindowBuffer *buffer = NULL;
     AHardwareBuffer *ahb = NULL;
-    int fence, ret, is_new;
+    int fence = -1, ret, is_new = 0, cancel_ret;
 
     if (out_size < sizeof( *res ) || in_size < sizeof(res->hdr)) return -EINVAL;
 
@@ -593,12 +615,18 @@ static int dequeueBuffer_ioctl( JNIEnv* env, void *data, DWORD in_size, DWORD ou
 
     if (!buffer)
     {
-        LOG( TRACE, "got invalid buffer\n" );
-        return STATUS_UNSUCCESSFUL;
+        LOG( ERR, "got invalid buffer\n" );
+        if (fence != -1) close( fence );
+        return -EINVAL;
     }
 
     LOG( TRACE, "%08x got buffer %p fence %d\n", res->hdr.hwnd, buffer, fence );
     ahb = pANativeWindowBuffer_getHardwareBuffer( buffer );
+    if (!ahb)
+    {
+        ret = -EINVAL;
+        goto failed;
+    }
 
     res->buffer_id = register_buffer( win_data, ahb, &is_new );
     res->generation = win_data->generation;
@@ -607,16 +635,10 @@ static int dequeueBuffer_ioctl( JNIEnv* env, void *data, DWORD in_size, DWORD ou
     {
         int sv[2] = { -1, -1 };
 
-        if (!ahb)
-        {
-            wait_fence_and_close( fence );
-            return STATUS_UNSUCCESSFUL;
-        }
-
         if (socketpair( AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sv ) < 0)
         {
-            wait_fence_and_close( fence );
-            return STATUS_UNSUCCESSFUL;
+            ret = -errno;
+            goto failed;
         }
 
         ret = pAHardwareBuffer_sendHandleToUnixSocket( ahb, sv[0] );
@@ -624,8 +646,7 @@ static int dequeueBuffer_ioctl( JNIEnv* env, void *data, DWORD in_size, DWORD ou
         if (ret)
         {
             close( sv[1] );
-            wait_fence_and_close( fence );
-            return ret;
+            goto failed;
         }
 
         *reply_fd = sv[1];
@@ -633,6 +654,17 @@ static int dequeueBuffer_ioctl( JNIEnv* env, void *data, DWORD in_size, DWORD ou
 
     wait_fence_and_close( fence );
     return 0;
+
+failed:
+    /* No client owns this dequeue.  Return its acquire fence to the native
+     * window without waiting on, closing or reusing the transferred fd. */
+    cancel_ret = parent->cancelBuffer( parent, buffer, fence );
+    LOG( TRACE, "%08x transfer failed %d, cancel buffer %p fence %d returned %d\n",
+         res->hdr.hwnd, ret, buffer, fence, cancel_ret );
+    if (cancel_ret) LOG( ERR, "%08x failed to cancel undelivered buffer: %d\n", res->hdr.hwnd, cancel_ret );
+    if (is_new) unregister_buffer( win_data, res->buffer_id );
+    res->buffer_id = -1;
+    return ret;
 }
 
 static int cancelBuffer_ioctl( JNIEnv* env, void *data, DWORD in_size, DWORD out_size, ULONG_PTR *ret_size, int *reply_fd )
@@ -653,6 +685,9 @@ static int cancelBuffer_ioctl( JNIEnv* env, void *data, DWORD in_size, DWORD out
 
     LOG( TRACE, "%08x buffer %p\n", res->hdr.hwnd, buffer );
     ret = parent->cancelBuffer( parent, buffer, -1 );
+    if (res->discard) unregister_buffer( win_data, res->buffer_id );
+    LOG( TRACE, "%08x id %d generation %d discard %d cancel returned %d\n",
+         res->hdr.hwnd, res->buffer_id, res->generation, res->discard, ret );
     return ret;
 }
 
@@ -872,6 +907,9 @@ static JNIEnv *looper_env; /* JNIEnv for the main thread looper. Must only be us
  */
 static int handle_ioctl_message( JNIEnv *env, int fd )
 {
+    struct ANativeWindow *dequeued_parent = NULL;
+    struct ANativeWindowBuffer *dequeued_buffer = NULL;
+    AHardwareBuffer *dequeued_ahb = NULL;
     char buffer[1024], control[CMSG_SPACE(sizeof(int))];
     int code = 0, status = -EINVAL, reply_fd = -1;
     ULONG_PTR reply_size = 0;
@@ -899,6 +937,19 @@ static int handle_ioctl_message( JNIEnv *env, int fd )
         {
             pthread_mutex_lock( &dispatch_ioctl_lock );
             status = ioctl_funcs[code]( env, buffer, ret, sizeof(buffer), &reply_size, &reply_fd );
+            if (code == IOCTL_DEQUEUE_BUFFER && !status)
+            {
+                struct ioctl_android_dequeueBuffer *dequeue = (void *)buffer;
+                struct native_win_data *win = get_ioctl_native_win_data( &dequeue->hdr );
+
+                /* Keep the actual dequeue alive across an unlocked reply and
+                 * a concurrent UI replacement of this native window. */
+                dequeued_parent = win->parent;
+                dequeued_ahb = win->buffers[dequeue->buffer_id];
+                dequeued_buffer = anwb_from_ahb( dequeued_ahb );
+                dequeued_parent->common.incRef( &dequeued_parent->common );
+                pAHardwareBuffer_acquire( dequeued_ahb );
+            }
             if (IOCTL_CREATE_DESKTOP_VIEW == code) /* special case: desktop client */
                 desktop_client_fd = fd;
             pthread_mutex_unlock( &dispatch_ioctl_lock );
@@ -923,9 +974,35 @@ static int handle_ioctl_message( JNIEnv *env, int fd )
         reply.msg_controllen = cmsg->cmsg_len;
     }
 
-    ret = sendmsg( fd, &reply, 0 );
+    ret = sendmsg( fd, &reply, MSG_NOSIGNAL );
     if (reply_fd != -1) close( reply_fd );
-    return ret < 0 ? 1 : 0;
+    if (ret != sizeof(status) + reply_size)
+    {
+        if (dequeued_parent)
+        {
+            struct ioctl_android_dequeueBuffer *dequeue = (void *)buffer;
+            struct native_win_data *win;
+            int cancel_ret;
+
+            pthread_mutex_lock( &dispatch_ioctl_lock );
+            cancel_ret = dequeued_parent->cancelBuffer( dequeued_parent, dequeued_buffer, -1 );
+            win = get_ioctl_native_win_data( &dequeue->hdr );
+            if (win && win->parent == dequeued_parent && win->generation == dequeue->generation &&
+                anwb_from_ahb(win->buffers[dequeue->buffer_id]) == dequeued_buffer)
+                unregister_buffer( win, dequeue->buffer_id );
+            pthread_mutex_unlock( &dispatch_ioctl_lock );
+            if (cancel_ret) LOG( ERR, "failed reply buffer cancellation: %d\n", cancel_ret );
+            pAHardwareBuffer_release( dequeued_ahb );
+            dequeued_parent->common.decRef( &dequeued_parent->common );
+        }
+        return 1;
+    }
+    if (dequeued_parent)
+    {
+        pAHardwareBuffer_release( dequeued_ahb );
+        dequeued_parent->common.decRef( &dequeued_parent->common );
+    }
+    return 0;
 }
 
 static int looper_handle_client( int fd, int events, void *data )
@@ -1043,24 +1120,35 @@ static int android_ioctl( enum android_ioctl code, void *in, DWORD in_size, void
     ret = writev( device_fd, (struct iovec[]){ { &code, sizeof(code) }, { in, in_size } }, 2 );
     if (ret <= 0 || ret != sizeof(code) + in_size) goto disconnected;
 
-    ret = recvmsg( device_fd, &msg, 0 );
-    if (ret <= 0 || ret < sizeof(status)) goto disconnected;
-
-    if (out && out_size) *out_size = ret - sizeof(status);
-    err = status;
-
+    ret = recvmsg( device_fd, &msg, MSG_CMSG_CLOEXEC );
+    if (ret < 0) goto disconnected;
     if (recv_fd)
         for (cmsg = CMSG_FIRSTHDR( &msg ); cmsg; cmsg = CMSG_NXTHDR( &msg, cmsg ))
             if (cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SCM_RIGHTS &&
                 cmsg->cmsg_len >= CMSG_LEN(sizeof(int)))
             {
-                memcpy( recv_fd, CMSG_DATA(cmsg), sizeof(int) );
-                break;
+                unsigned int i, count = (cmsg->cmsg_len - CMSG_LEN(0)) / sizeof(int);
+                int *fds = (int *)CMSG_DATA(cmsg);
+
+                for (i = 0; i < count; i++)
+                {
+                    if (*recv_fd == -1) *recv_fd = fds[i];
+                    else close( fds[i] );
+                }
             }
+    if (ret <= 0 || ret < sizeof(status)) goto disconnected;
+
+    if (out && out_size) *out_size = ret - sizeof(status);
+    err = (msg.msg_flags & (MSG_TRUNC | MSG_CTRUNC)) ? -EINVAL : status;
 
     goto done;
 
 disconnected:
+    if (recv_fd && *recv_fd != -1)
+    {
+        close( *recv_fd );
+        *recv_fd = -1;
+    }
     close( device_fd );
     device_fd = -1;
     WARN( "parent process is gone\n" );
@@ -1104,17 +1192,27 @@ static int dequeueBuffer( struct ANativeWindow *window, struct ANativeWindowBuff
     res.generation = 0;
 
     ret = android_ioctl( IOCTL_DEQUEUE_BUFFER, &res, size, &res, &size, &buffer_fd );
-    if (ret) return ret;
-    if (size < sizeof(res)) return -EINVAL;
-
-    if (res.buffer_id < 0 || res.buffer_id >= NB_CACHED_BUFFERS) return -EINVAL;
+    if (ret) goto failed;
+    if (size != sizeof(res) || res.buffer_id < 0 || res.buffer_id >= NB_CACHED_BUFFERS ||
+        res.hdr.hwnd != HandleToLong(win->hwnd) || res.hdr.opengl != win->opengl)
+    {
+        ret = -EINVAL;
+        goto failed;
+    }
 
     if (buffer_fd != -1)
     {
         AHardwareBuffer *ahb = NULL;
+
         ret = pAHardwareBuffer_recvHandleFromUnixSocket( buffer_fd, &ahb );
         close( buffer_fd );
-        if (ret) return ret;
+        buffer_fd = -1;
+        if (ret) goto failed;
+        if (!ahb)
+        {
+            ret = -EINVAL;
+            goto failed;
+        }
 
         if (win->buffers[res.buffer_id].self)
             pAHardwareBuffer_release( win->buffers[res.buffer_id].self );
@@ -1124,7 +1222,11 @@ static int dequeueBuffer( struct ANativeWindow *window, struct ANativeWindowBuff
         win->buffers[res.buffer_id].generation = res.generation;
     }
 
-    if (!win->buffers[res.buffer_id].self) return -EINVAL;
+    if (!win->buffers[res.buffer_id].self || win->buffers[res.buffer_id].generation != res.generation)
+    {
+        ret = -EINVAL;
+        goto failed;
+    }
 
     *buffer = anwb_from_ahb(win->buffers[res.buffer_id].self);
     *fence = -1;
@@ -1132,12 +1234,27 @@ static int dequeueBuffer( struct ANativeWindow *window, struct ANativeWindowBuff
     TRACE( "hwnd %p, buffer %p id %d gen %d fence %d\n",
            win->hwnd, *buffer, res.buffer_id, res.generation, *fence );
     return 0;
+
+failed:
+    if (buffer_fd != -1) close( buffer_fd );
+    if (size == sizeof(res) && res.buffer_id >= 0 && res.buffer_id < NB_CACHED_BUFFERS &&
+        res.hdr.hwnd == HandleToLong(win->hwnd) && res.hdr.opengl == win->opengl)
+    {
+        struct ioctl_android_cancelBuffer cancel = { res.hdr, res.buffer_id, res.generation, TRUE };
+        int cancel_ret;
+
+        /* The native dequeue succeeded, but no usable client buffer exists.
+         * Forget its server cache entry so the next dequeue transfers it again. */
+        cancel_ret = android_ioctl( IOCTL_CANCEL_BUFFER, &cancel, sizeof(cancel), NULL, NULL, NULL );
+        if (cancel_ret) WARN( "hwnd %p failed to cancel undelivered buffer: %d\n", win->hwnd, cancel_ret );
+    }
+    return ret;
 }
 
 static int cancelBuffer( struct ANativeWindow *window, struct ANativeWindowBuffer *buffer, int fence )
 {
     struct native_win_wrapper *win = (struct native_win_wrapper *)window;
-    struct ioctl_android_cancelBuffer cancel;
+    struct ioctl_android_cancelBuffer cancel = {0};
 
     TRACE( "hwnd %p buffer %p fence %d\n", win->hwnd, buffer, fence );
 
