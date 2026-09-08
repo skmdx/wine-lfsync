@@ -2331,6 +2331,7 @@ static BOOL apply_window_pos( HWND hwnd, HWND insert_after, UINT swp_flags, stru
 static BOOL expose_window_surface( HWND hwnd, UINT flags, const RECT *rect )
 {
     struct window_surface *surface;
+    struct client_surface_scene scene;
     struct window_rects rects;
     RECT exposed_rect;
     WND *win;
@@ -2347,7 +2348,14 @@ static BOOL expose_window_surface( HWND hwnd, UINT flags, const RECT *rect )
         exposed_rect = map_dpi_rect( *rect, raw_dpi, get_dpi_for_window( hwnd ) );
     }
 
-    if (!surface || surface == &dummy_surface)
+    client_surface_get_toplevel_scene( hwnd, &scene );
+    /* A DIRECT attachment can receive Expose before the owner processes its
+     * deferred GDI surface removal. Its old CPU pixels no longer describe the
+     * native client image; request application repaint instead of replaying
+     * them over the first completed Present. Publication may still be pending:
+     * scene validity does not make the retired CPU image authoritative again. */
+    if (!surface || surface == &dummy_surface ||
+        scene.mode == CLIENT_SURFACE_PRESENTATION_DIRECT)
     {
         NtUserRedrawWindow( hwnd, rect ? &exposed_rect : NULL, NULL, flags );
         if (surface) window_surface_release( surface );

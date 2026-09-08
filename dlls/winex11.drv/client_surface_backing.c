@@ -1677,15 +1677,27 @@ static BOOL install_client_surface_direct_plan( const struct client_surface_comp
     struct client_surface_compositor_target *target = find_client_surface_compositor_target( job->handoff_toplevel );
     struct client_surface_scene_member *members = NULL;
     struct client_surface_scene current;
+    XWindowAttributes attributes;
     UINT64 scene_id = job->scene_epoch;
     UINT count = 0;
     BOOL accepted = FALSE, allocated = FALSE;
+    Status queried;
+    int error = 0;
 
     /* Selected roster size alone misses dormant registrations. The server's
      * candidate flag includes that count and all existing DIRECT constraints. */
     if (!job->source || !job->destination ||
         !get_client_surface_direct_snapshot( job, &scene_id, &count, &members, &current ))
         goto done;
+    /* A managed top-level may still be waiting for the WM to map it. A
+     * DIRECT image presented into that unmapped hierarchy can be discarded
+     * by the later map. Keep the first frame in the owner cache instead. */
+    X11DRV_expect_error( client_surface_compositor_display, client_surface_compositor_error, &error );
+    queried = XGetWindowAttributes( client_surface_compositor_display, job->destination, &attributes );
+    X11DRV_check_error();
+    TRACE( "DIRECT native admission hwnd %p window %#lx queried %u map state %d error %d\n",
+           job->handoff_toplevel, job->destination, queried, queried ? attributes.map_state : -1, error );
+    if (!queried || error || attributes.map_state != IsViewable) goto done;
     if (!current.generation)
     {
         UINT64 next_scene = 0;

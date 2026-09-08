@@ -3603,9 +3603,15 @@ BOOL X11DRV_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_hint, UIN
     {
         if (enable_client_surface_backing)
         {
-            /* A combined activation/preparation takes its one checkpoint
-             * below, after applying the native window state. */
-            if (!prepare_client_surface) X11DRV_client_surface_backing_snapshot( data, FALSE );
+            /* PREPARE may already have installed this pool and the owner can
+             * have published its first frame before this activation arrives.
+             * Resnapshotting the native window would overwrite that published
+             * image, possibly with unmapped window contents. */
+            if (!prepare_client_surface)
+            {
+                if (data->client_surface_backing) X11DRV_client_surface_backing_ensure( data );
+                else X11DRV_client_surface_backing_snapshot( data, FALSE );
+            }
         }
         else if (!X11DRV_client_surface_backing_retire( data )) destroy_client_surface_backing( data );
     }
