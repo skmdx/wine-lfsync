@@ -31,10 +31,13 @@
 #include <stdio.h>
 #include <stdarg.h>
 #include <poll.h>
+#include <sys/ioctl.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/un.h>
 #include <sys/uio.h>
 #include <unistd.h>
+#include <linux/sync_file.h>
 
 #include "windef.h"
 #include "winbase.h"
@@ -164,10 +167,65 @@ struct android_ioctl_reply
 #define IOCTL_BUFFER_FD 1
 #define IOCTL_FENCE_FD  2
 
+/* Java callbacks have no Wine TEB. Use their existing channel flags, and
+ * perform no diagnostic syscall unless the android trace channel is enabled.
+ * SCM_RIGHTS ordering and the socket peer identify the transfer; an anonymous
+ * inode or a fence name alone is not a unique buffer lifetime. */
+#define TRACE_FENCE(server, ...) \
+    do { if ((server) ? (log_flags & (1 << __WINE_DBCL_TRACE)) : TRACE_ON(android)) \
+        trace_fence( server, __VA_ARGS__ ); } while (0)
+
+static void trace_fence( BOOL server, const char *stage, int socket, int code, const void *data, size_t size,
+                         int fd, int result, int events )
+{
+    struct sync_file_info info = {{0}};
+    struct stat st = {0};
+    struct ucred peer = {0};
+    socklen_t len = sizeof(peer);
+    int identity[4] = {0, 0, -1, 0};
+    int saved_errno = errno, peer_ret = -1, stat_ret = -1, info_ret = -1, info_errno = 0;
+    char text[512];
+
+    if (data && size >= sizeof(identity)) memcpy( identity, data, sizeof(identity) );
+    if (socket != -1) peer_ret = getsockopt( socket, SOL_SOCKET, SO_PEERCRED, &peer, &len );
+    if (fd != -1)
+    {
+        stat_ret = fstat( fd, &st );
+        info_ret = ioctl( fd, SYNC_IOC_FILE_INFO, &info );
+        if (info_ret < 0) info_errno = errno;
+    }
+    snprintf( text, sizeof(text), "fence %s pid %u tid %u socket %d peer %d peer_ret %d code %d "
+              "hwnd %08x opengl %u id %d gen %d fd %d result %d events %x errno %d "
+              "stat %d dev %llu ino %llu info %d info_errno %d status %d count %u name %.32s\n",
+              stage, getpid(), gettid(), socket, peer.pid, peer_ret, code, identity[0], identity[1],
+              identity[2], identity[3], fd, result, events, saved_errno, stat_ret,
+              (unsigned long long)st.st_dev, (unsigned long long)st.st_ino, info_ret, info_errno,
+              info.status, info.num_fences, info.name );
+    if (server) LOG( TRACE, "%s", text );
+    else TRACE( "%s", text );
+    errno = saved_errno;
+}
+
+static void close_fence( BOOL server, int fd )
+{
+    int ret = close( fd ), saved_errno = errno;
+
+    if (server)
+    {
+        if (log_flags & (1 << __WINE_DBCL_TRACE))
+            LOG( TRACE, "fence close pid %u tid %u fd %d result %d errno %d\n",
+                 getpid(), gettid(), fd, ret, saved_errno );
+    }
+    else if (TRACE_ON(android))
+        TRACE( "fence close pid %u tid %u fd %d result %d errno %d\n",
+               getpid(), gettid(), fd, ret, saved_errno );
+    errno = saved_errno;
+}
+
 static void close_ioctl_fds( struct ioctl_fds *fds )
 {
     if (fds->buffer != -1) close( fds->buffer );
-    if (fds->fence != -1) close( fds->fence );
+    if (fds->fence != -1) close_fence( TRUE, fds->fence );
     fds->buffer = fds->fence = -1;
 }
 
@@ -324,7 +382,9 @@ static int wait_fence( int fence )
     int ret;
 
     if (fence == -1) return 0;
+    TRACE_FENCE( FALSE, "poll_begin", -1, -1, NULL, 0, fence, 0, pollfd.events );
     do ret = poll( &pollfd, 1, -1 ); while (ret == -1 && errno == EINTR);
+    TRACE_FENCE( FALSE, "poll_end", -1, -1, NULL, 0, fence, ret, pollfd.revents );
     if (ret == -1) return -errno;
     if (pollfd.revents & (POLLERR | POLLNVAL)) return -EINVAL;
     return (pollfd.revents & POLLIN) ? 0 : -EIO;
@@ -440,6 +500,15 @@ static void unregister_buffer( struct native_win_data *win, unsigned int id )
     memmove( win->buffer_lru + i, win->buffer_lru + i + 1,
              (NB_CACHED_BUFFERS - i - 1) * sizeof(win->buffer_lru[0]) );
     win->buffer_lru[NB_CACHED_BUFFERS - 1] = -1;
+    if (log_flags & (1 << __WINE_DBCL_TRACE))
+    {
+        int saved_errno = errno;
+
+        LOG( TRACE, "%p %p released and cleared id %u generation %d cache %p lru %d,%d,%d,%d\n",
+             win->hwnd, win->parent, id, win->generation, win->buffers[id],
+             win->buffer_lru[0], win->buffer_lru[1], win->buffer_lru[2], win->buffer_lru[3] );
+        errno = saved_errno;
+    }
 }
 
 static struct ANativeWindowBuffer *get_registered_buffer( struct native_win_data *win, int id )
@@ -677,6 +746,7 @@ static int dequeueBuffer_ioctl( JNIEnv* env, void *data, DWORD in_size, DWORD ou
 
     res->buffer_id = register_buffer( win_data, ahb, &is_new );
     res->generation = win_data->generation;
+    TRACE_FENCE( TRUE, "native_dequeue", -1, IOCTL_DEQUEUE_BUFFER, res, sizeof(*res), fence, ret, 0 );
 
     if (is_new)
     {
@@ -689,6 +759,14 @@ static int dequeueBuffer_ioctl( JNIEnv* env, void *data, DWORD in_size, DWORD ou
         }
 
         ret = pAHardwareBuffer_sendHandleToUnixSocket( ahb, sv[0] );
+        if (log_flags & (1 << __WINE_DBCL_TRACE))
+        {
+            int saved_errno = errno;
+
+            LOG( TRACE, "%08x opengl %u id %d generation %d ahb %p send fd %d receive fd %d handle returned %d\n",
+                 res->hdr.hwnd, res->hdr.opengl, res->buffer_id, res->generation, ahb, sv[0], sv[1], ret );
+            errno = saved_errno;
+        }
         close( sv[0] );
         if (ret)
         {
@@ -990,6 +1068,8 @@ static int handle_ioctl_message( JNIEnv *env, int fd )
     }
     fds.fence = received[0];
     ret -= sizeof(code);
+    if (code == IOCTL_QUEUE_BUFFER || code == IOCTL_CANCEL_BUFFER)
+        TRACE_FENCE( TRUE, "request_received", fd, code, buffer, ret, fds.fence, ret, msg.msg_flags );
 
     if ((unsigned int)code < NB_IOCTLS)
     {
@@ -1024,7 +1104,7 @@ static int handle_ioctl_message( JNIEnv *env, int fd )
     /* A stale or rejected queue/cancel still consumes the caller's fence. */
     if ((code == IOCTL_QUEUE_BUFFER || code == IOCTL_CANCEL_BUFFER) && fds.fence != -1)
     {
-        close( fds.fence );
+        close_fence( TRUE, fds.fence );
         fds.fence = -1;
     }
     count = 0;
@@ -1050,7 +1130,11 @@ static int handle_ioctl_message( JNIEnv *env, int fd )
         memcpy( CMSG_DATA(cmsg), sent, count * sizeof(int) );
     }
 
+    if (code == IOCTL_DEQUEUE_BUFFER)
+        TRACE_FENCE( TRUE, "reply_send", fd, code, buffer, reply_size, fds.fence, result.status, result.fd_mask );
     ret = sendmsg( fd, &reply, MSG_NOSIGNAL );
+    if (code == IOCTL_DEQUEUE_BUFFER)
+        TRACE_FENCE( TRUE, "reply_sent", fd, code, buffer, reply_size, fds.fence, ret, result.fd_mask );
     if (ret != sizeof(result) + reply_size && dequeued_parent)
     {
         struct ioctl_android_dequeueBuffer *dequeue = (void *)buffer;
@@ -1205,8 +1289,12 @@ static int android_ioctl_fds( enum android_ioctl code, void *in, DWORD in_size, 
         cmsg->cmsg_len = CMSG_LEN(sizeof(send_fence));
         memcpy( CMSG_DATA(cmsg), &send_fence, sizeof(send_fence) );
     }
+    if (code == IOCTL_QUEUE_BUFFER || code == IOCTL_CANCEL_BUFFER)
+        TRACE_FENCE( FALSE, "request_send", device_fd, code, in, in_size, send_fence, 0, 0 );
     do ret = sendmsg( device_fd, &request, MSG_NOSIGNAL ); while (ret == -1 && errno == EINTR);
-    if (send_fence != -1) close( send_fence );
+    if (code == IOCTL_QUEUE_BUFFER || code == IOCTL_CANCEL_BUFFER)
+        TRACE_FENCE( FALSE, "request_sent", device_fd, code, in, in_size, send_fence, ret, 0 );
+    if (send_fence != -1) close_fence( FALSE, send_fence );
     send_fence = -1;
     if (ret != sizeof(code) + in_size) goto disconnected;
 
@@ -1235,6 +1323,9 @@ static int android_ioctl_fds( enum android_ioctl code, void *in, DWORD in_size, 
         received[i++] = -1;
     }
     if (out && out_size) *out_size = ret - sizeof(result);
+    if (code == IOCTL_DEQUEUE_BUFFER)
+        TRACE_FENCE( FALSE, "reply_received", device_fd, code, out, out && out_size ? *out_size : 0,
+                     recv_fence ? *recv_fence : -1, result.status, result.fd_mask );
     err = result.status;
     goto done;
 
@@ -1252,7 +1343,7 @@ disconnected:
     err = -ENOENT;
 
 done:
-    if (send_fence != -1) close( send_fence );
+    if (send_fence != -1) close_fence( FALSE, send_fence );
     for (i = 0; i < ARRAY_SIZE(received); i++)
         if (received[i] != -1) close( received[i] );
     pthread_mutex_unlock( &device_mutex );
@@ -1316,6 +1407,14 @@ static int dequeue_buffer( struct native_win_wrapper *win, struct ANativeWindowB
         AHardwareBuffer *ahb = NULL;
 
         ret = pAHardwareBuffer_recvHandleFromUnixSocket( buffer_fd, &ahb );
+        if (TRACE_ON(android))
+        {
+            int saved_errno = errno;
+
+            TRACE( "%08x opengl %u id %d generation %d ahb %p handle fd %d received %d\n",
+                   res.hdr.hwnd, res.hdr.opengl, res.buffer_id, res.generation, ahb, buffer_fd, ret );
+            errno = saved_errno;
+        }
         close( buffer_fd );
         buffer_fd = -1;
         if (ret) goto failed;
@@ -1360,7 +1459,7 @@ failed:
         acquire_fence = -1;
         if (cancel_ret) WARN( "hwnd %p failed to cancel undelivered buffer: %d\n", win->hwnd, cancel_ret );
     }
-    if (acquire_fence != -1) close( acquire_fence );
+    if (acquire_fence != -1) close_fence( FALSE, acquire_fence );
     return ret;
 }
 
@@ -1417,7 +1516,7 @@ static int dequeueBuffer_DEPRECATED( struct ANativeWindow *window, struct ANativ
         cancel_buffer( win, identity.buffer_id, identity.generation, FALSE, fence );
         *buffer = NULL;
     }
-    else if (fence != -1) close( fence );
+    else if (fence != -1) close_fence( FALSE, fence );
     return ret;
 }
 
@@ -1547,9 +1646,13 @@ static int perform( ANativeWindow *window, int operation, ... )
             b = ahb_from_anwb( win, buffer, NULL, NULL );
             if (!b) ret = -EINVAL;
             else if (!(ret = wait_fence( fence )))
+            {
                 ret = pAHardwareBuffer_lock( b, AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN |
                                              AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN, -1, NULL,
                                              &buffer_ret->bits );
+                TRACE_FENCE( FALSE, "cpu_locked", -1, IOCTL_DEQUEUE_BUFFER, &identity, sizeof(identity),
+                             fence, ret, 0 );
+            }
             if (ret)
             {
                 /* This is the identity of the successful native dequeue,
@@ -1560,7 +1663,7 @@ static int perform( ANativeWindow *window, int operation, ... )
                 if (cancel_ret) WARN( "hwnd %p failed lock cancellation: %d\n", win->hwnd, cancel_ret );
             }
         }
-        if (fence != -1) close( fence );
+        if (fence != -1) close_fence( FALSE, fence );
         if (!ret)
         {
             AHardwareBuffer_Desc d = {0};
