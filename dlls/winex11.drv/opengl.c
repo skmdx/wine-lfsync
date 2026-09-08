@@ -2144,6 +2144,58 @@ static void release_egl_present_completion( void *context )
     free( completion );
 }
 
+static BOOL blit_client_surface_framebuffer( struct opengl_drawable *base,
+                                             const struct client_surface_frame *present, GLuint framebuffer )
+{
+    struct client_surface_target target;
+    GLint read_fbo, draw_fbo, read_buffer, draw_buffer;
+    SIZE size = base->virtual_size, destination;
+    GLboolean scissor, srgb;
+    BOOL ret;
+
+    pthread_mutex_lock( &base->client->present_lock );
+    target = base->client->target;
+    pthread_mutex_unlock( &base->client->present_lock );
+    if (base->client->raw)
+        destination = (SIZE){target.monitor_rect.right - target.monitor_rect.left,
+                             target.monitor_rect.bottom - target.monitor_rect.top};
+    else destination = size;
+    if (!target.valid || target.offscreen || target.epoch != present->target_epoch ||
+        size.cx != target.virtual_rect.right - target.virtual_rect.left ||
+        size.cy != target.virtual_rect.bottom - target.virtual_rect.top)
+        return FALSE;
+
+    /* swap_framebuffer runs in the wrapper's internal context with resolved
+     * COLOR_ATTACHMENT0 and default gamma. DIRECT may have been selected
+     * while preparing this frame; its pixels must reach the native back
+     * buffer before eglSwapBuffers can authorize the owner publication. */
+    if (funcs->p_glGetError() != GL_NO_ERROR) return FALSE;
+    funcs->p_glGetIntegerv( GL_READ_FRAMEBUFFER_BINDING, &read_fbo );
+    funcs->p_glGetIntegerv( GL_DRAW_FRAMEBUFFER_BINDING, &draw_fbo );
+    scissor = funcs->p_glIsEnabled( GL_SCISSOR_TEST );
+    srgb = funcs->p_glIsEnabled( GL_FRAMEBUFFER_SRGB );
+    funcs->p_glBindFramebuffer( GL_READ_FRAMEBUFFER, framebuffer );
+    funcs->p_glGetIntegerv( GL_READ_BUFFER, &read_buffer );
+    funcs->p_glBindFramebuffer( GL_DRAW_FRAMEBUFFER, 0 );
+    funcs->p_glGetIntegerv( GL_DRAW_BUFFER, &draw_buffer );
+    funcs->p_glReadBuffer( GL_COLOR_ATTACHMENT0 );
+    funcs->p_glDrawBuffer( base->buffer_map[(base->doublebuffer ? GL_BACK : GL_FRONT) - GL_FRONT_LEFT] );
+    funcs->p_glDisable( GL_SCISSOR_TEST );
+    if (base->srgb) funcs->p_glEnable( GL_FRAMEBUFFER_SRGB );
+    else funcs->p_glDisable( GL_FRAMEBUFFER_SRGB );
+    funcs->p_glBlitFramebuffer( 0, 0, size.cx, size.cy, 0, 0, destination.cx, destination.cy,
+                                GL_COLOR_BUFFER_BIT, GL_LINEAR );
+    ret = funcs->p_glGetError() == GL_NO_ERROR;
+    if (scissor) funcs->p_glEnable( GL_SCISSOR_TEST );
+    if (srgb) funcs->p_glEnable( GL_FRAMEBUFFER_SRGB );
+    else funcs->p_glDisable( GL_FRAMEBUFFER_SRGB );
+    funcs->p_glReadBuffer( read_buffer );
+    funcs->p_glDrawBuffer( draw_buffer );
+    funcs->p_glBindFramebuffer( GL_READ_FRAMEBUFFER, read_fbo );
+    funcs->p_glBindFramebuffer( GL_DRAW_FRAMEBUFFER, draw_fbo );
+    return ret;
+}
+
 static BOOL x11drv_egl_surface_swap_framebuffer( struct opengl_drawable *base, GLuint framebuffer )
 {
     struct gl_drawable *gl = impl_from_opengl_drawable( base );
@@ -2196,7 +2248,7 @@ static BOOL x11drv_egl_surface_swap_framebuffer( struct opengl_drawable *base, G
             WARN( "client-surface snapshot did not complete for %s\n", debugstr_opengl_drawable( base ) );
         return ret;
     }
-    if (framebuffer)
+    if (framebuffer && present.target != CLIENT_SURFACE_FRAME_TARGET_ONSCREEN)
     {
         /* A native scene transition does not invalidate the rendered FBO.
          * Freeze it for replay when the owner has installed the new plan. */
@@ -2205,7 +2257,15 @@ static BOOL x11drv_egl_surface_swap_framebuffer( struct opengl_drawable *base, G
         client_surface_complete_present( base->client, &present, ret, ret, NULL, 0 );
         return ret;
     }
+    if (framebuffer && !blit_client_surface_framebuffer( base, &present, framebuffer ))
+    {
+        client_surface_submit_present( base->client, &present );
+        client_surface_complete_present( base->client, &present, FALSE, FALSE, NULL, 0 );
+        return FALSE;
+    }
     ret = funcs->p_eglSwapBuffers( egl->display, gl->base.surface );
+    if (framebuffer) TRACE( "native EGL framebuffer %u presentation for %s returned %u\n",
+                            framebuffer, debugstr_opengl_drawable( base ), ret );
     client_surface_submit_present( base->client, &present );
     if (!ret)
     {
@@ -2241,7 +2301,7 @@ static BOOL x11drv_egl_surface_swap_framebuffer( struct opengl_drawable *base, G
     else timestamp_completion = FALSE;
 
     if (!client_surface_complete_present( base->client, &present, TRUE,
-                                          timestamp_completion, NULL,
+                                          timestamp_completion, framebuffer ? &base->virtual_size : NULL,
                                           CLIENT_SURFACE_PRESENT_TIMEOUT ))
         WARN( "client-surface composition did not complete for %s\n",
               debugstr_opengl_drawable( base ) );
