@@ -452,20 +452,25 @@ static BOOL x11drv_client_surface_handoff_prepare(
     struct client_surface *client, struct client_surface_source *image )
 {
     struct x11drv_client_surface *surface = impl_from_client_surface( client );
-    RECT source = client->raw ? client->target.monitor_rect : client->target.virtual_rect;
+    BOOL native = usexcomposite && !surface->direct_snapshot;
+    /* Native raw drawables use monitor pixels. Private GL/Vulkan snapshots
+     * retain the rendered virtual extent; the owner scales their immutable
+     * pixels to its monitor layout. Advertise the storage actually captured,
+     * including when PREPARING delayed this reservation until after capture. */
+    RECT source = native && client->raw ? client->target.monitor_rect : client->target.virtual_rect;
     unsigned int width, height;
 
     if (!x11drv_client_surface_prepare_retirement( surface )) return FALSE;
     if (source.right <= source.left || source.bottom <= source.top) return FALSE;
     width = source.right - source.left;
     height = source.bottom - source.top;
-    image->source = usexcomposite && !surface->direct_snapshot ? surface->window : surface->snapshot;
+    image->source = native ? surface->window : surface->snapshot;
     if (surface->gpu_snapshot) image->source = surface->gpu_snapshot;
-    image->source_visual = usexcomposite && !surface->direct_snapshot ? surface->source_visual : default_visual.visualid;
+    image->source_visual = native ? surface->source_visual : default_visual.visualid;
     image->flags = CLIENT_SURFACE_HANDOFF_NATIVE_X11 | CLIENT_SURFACE_HANDOFF_FULL_DAMAGE;
     image->width = width;
     image->height = height;
-    if (!usexcomposite || surface->direct_snapshot) image->flags |= CLIENT_SURFACE_HANDOFF_COPY_SOURCE;
+    if (!native) image->flags |= CLIENT_SURFACE_HANDOFF_COPY_SOURCE;
     surface->sources[image - client->handoff_source].gpu_copy = FALSE;
     return TRUE;
 }
