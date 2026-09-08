@@ -49,6 +49,7 @@ struct wayland_gl_drawable
 {
     struct opengl_drawable base;
     struct wl_egl_window *wl_egl_window;
+    int native_interval;
 };
 
 static struct wayland_gl_drawable *impl_from_opengl_drawable(struct opengl_drawable *base)
@@ -88,6 +89,7 @@ static BOOL wayland_opengl_surface_create(struct client_surface *client, int for
     *attrib++ = EGL_NONE;
 
     if (!(gl = opengl_drawable_create(sizeof(*gl), &wayland_drawable_funcs, format, client))) return FALSE;
+    gl->native_interval = -1;
     size = client->raw ? gl->base.monitor_size : gl->base.virtual_size;
 
     opengl_drawable_map_buffer(&gl->base, GL_FRONT_LEFT, GL_BACK_LEFT);
@@ -117,6 +119,32 @@ static void wayland_init_egl_platform(struct egl_platform *platform)
     egl = platform;
 }
 
+static BOOL wayland_drawable_update_interval(struct opengl_drawable *base)
+{
+    struct wayland_gl_drawable *gl = impl_from_opengl_drawable(base);
+    struct wayland_client_surface *client = impl_from_client_surface(base->client);
+    struct wayland_win_data *data;
+    int interval = 0;
+
+    /* A client surface created hidden has no subsurface role, so its frame
+     * callbacks cannot pace rendering. Keep real EGL swaps, using the native
+     * non-frame-callback path until the client is actually attached. The
+     * application's requested interval remains in base->interval. */
+    if ((data = wayland_win_data_get(base->client->hwnd)))
+    {
+        if (data->client_surface == client && client->wl_subsurface)
+            interval = abs(base->interval);
+        wayland_win_data_release(data);
+    }
+
+    if (gl->native_interval == interval) return TRUE;
+    if (!funcs->p_eglSwapInterval(egl->display, interval)) return FALSE;
+    gl->native_interval = interval;
+    TRACE("drawable %s requested interval %d native interval %d\n",
+          debugstr_opengl_drawable(base), base->interval, interval);
+    return TRUE;
+}
+
 static void wayland_drawable_flush(struct opengl_drawable *base, UINT flags)
 {
     struct wayland_gl_drawable *gl = impl_from_opengl_drawable(base);
@@ -124,7 +152,7 @@ static void wayland_drawable_flush(struct opengl_drawable *base, UINT flags)
 
     TRACE("drawable %s, flags %#x\n", debugstr_opengl_drawable(base), flags);
 
-    if (flags & GL_FLUSH_INTERVAL) funcs->p_eglSwapInterval(egl->display, abs(base->interval));
+    if (flags & GL_FLUSH_INTERVAL) wayland_drawable_update_interval(base);
 
     /* Since context_flush is called from operations that may latch the native size,
      * perform any pending resizes before calling them. */
@@ -136,9 +164,9 @@ static BOOL wayland_drawable_swap(struct opengl_drawable *base)
     struct wayland_gl_drawable *gl = impl_from_opengl_drawable(base);
 
     client_surface_present(base->client);
-    funcs->p_eglSwapBuffers(egl->display, gl->base.surface);
-
-    return TRUE;
+    /* Attachment can change without a size or requested-interval change. */
+    if (!wayland_drawable_update_interval(base)) return FALSE;
+    return funcs->p_eglSwapBuffers(egl->display, gl->base.surface);
 }
 
 struct wayland_pbuffer
