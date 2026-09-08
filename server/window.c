@@ -411,6 +411,14 @@ enum client_surface_phase
 struct client_surface_transaction
 {
     enum client_surface_phase phase;
+    enum
+    {
+        CLIENT_SURFACE_PUBLICATION_NONE,
+        CLIENT_SURFACE_PUBLICATION_COPY = CLIENT_SURFACE_PUBLISH_COPY,
+        CLIENT_SURFACE_PUBLICATION_EXPOSE = CLIENT_SURFACE_PUBLISH_EXPOSE,
+        CLIENT_SURFACE_PUBLICATION_HANDOFF,
+        CLIENT_SURFACE_PUBLICATION_EXPOSURE_READY,
+    } publication;
     unsigned long long epoch;       /* stable scene epoch captured at start */
     unsigned int pending;            /* producers which have not completed */
     unsigned int staged : 1;         /* host is mapped into unpublished backing */
@@ -1819,6 +1827,7 @@ static void finish_client_surface_generation( struct window *top )
     cancel_client_surface_timeout( top );
     top->client_surface_transaction.deadline = 0;
     top->client_surface_transaction.phase = CLIENT_SURFACE_PHASE_IDLE;
+    top->client_surface_transaction.publication = CLIENT_SURFACE_PUBLICATION_NONE;
     top->client_surface_transaction.pending = 0;
     top->client_surface_transaction.epoch = 0;
     top->client_surface_transaction.owner_repair = 0;
@@ -1856,6 +1865,7 @@ static int mark_client_surface_generation_ready( struct window *top )
     if (client_surface_is_ready( top )) return 0;
 
     top->client_surface_transaction.phase = CLIENT_SURFACE_PHASE_READY;
+    top->client_surface_transaction.publication = CLIENT_SURFACE_PUBLICATION_COPY;
     post_message_coalesced( top->handle, WM_WINE_UPDATEWINDOWSTATE,
                             WINE_PUBLISH_CLIENT_SURFACES, 0 );
     return 1;
@@ -1872,6 +1882,33 @@ static void fail_client_surface_publication( struct window *top )
      * publication. A new epoch lets subsequent geometry/renderer activity
      * rebuild the scene; late ACKs cannot expose the rejected output. */
     invalidate_client_surface_scene( top );
+}
+
+static void retire_stale_client_surface_exposure( struct window *top, int exposed )
+{
+    abstime_t deadline = top->client_surface_transaction.deadline;
+
+    assert( top->client_surface_transaction.staged );
+    assert( top->client_surface_transaction.epoch != top->client_surface_scene_generation );
+    /* The native owner has finished; no future callback can retire this old
+     * token. Its scene already changed, so do not invalidate it again (it
+     * may be odd inside a native barrier). Preserve staging and the episode's
+     * deadline while the current scene takes over. */
+    clear_client_surface_subtree_generation( top, client_surface_transaction_generation( top ) );
+    /* A successful GUI exposure already released native/local staging. A
+     * failed or unreserved exposure still owns it. Neither acknowledges the
+     * invalidated scene, but recovery must match that actual native state. */
+    if (exposed)
+    {
+        top->client_surface_dirty = 0;
+        top->client_surface_transaction.staged = 0;
+    }
+    finish_client_surface_generation( top );
+    top->client_surface_transaction.prepared = 0;
+    top->client_surface_transaction.deadline = deadline;
+    if (!top->client_surface_scene_change_depth && is_visible( top ) && has_client_surface( top ))
+        restart_client_surface_generation( top );
+    /* An active barrier's existing END hook restarts the even scene. */
 }
 
 static void client_surface_publication_timeout( void *private )
@@ -1980,6 +2017,7 @@ static int reopen_client_surface_generation( struct window *top, struct window *
     surface->generation = generation;
     top->client_surface_transaction.pending++;
     top->client_surface_transaction.phase = CLIENT_SURFACE_PHASE_COMPOSING;
+    top->client_surface_transaction.publication = CLIENT_SURFACE_PUBLICATION_NONE;
     update_client_surface_publication( top );
     return 1;
 }
@@ -2491,6 +2529,7 @@ DECL_HANDLER(complete_client_surface_handoffs)
     if (!mark_client_surface_generation_ready( top ) || !client_surface_is_ready( top )) return;
 
     top->client_surface_transaction.phase = CLIENT_SURFACE_PHASE_PUBLISHING;
+    top->client_surface_transaction.publication = CLIENT_SURFACE_PUBLICATION_HANDOFF;
     update_client_surface_publication( top );
     reply->accepted = 1;
 }
@@ -2574,6 +2613,8 @@ DECL_HANDLER(publish_client_surface_handoff)
         return;
     }
     if (!client_surface_is_publishing( top ) ||
+        (top->client_surface_transaction.publication != CLIENT_SURFACE_PUBLICATION_HANDOFF &&
+         (req->success || current != top->thread)) ||
         req->generation != client_surface_transaction_generation( top ) ||
         req->scene_generation != top->client_surface_transaction.epoch)
         return;
@@ -2582,7 +2623,27 @@ DECL_HANDLER(publish_client_surface_handoff)
     reply->accepted = 1;
     if (!req->success)
     {
-        fail_client_surface_publication( top );
+        if (top->client_surface_transaction.staged && invalidated)
+            retire_stale_client_surface_exposure( top, 0 );
+        else fail_client_surface_publication( top );
+        return;
+    }
+    if (top->client_surface_transaction.staged)
+    {
+        if (invalidated)
+        {
+            /* Native completion of an old image cannot authorize exposure
+             * of the new scene. Preserve staging while its replay starts. */
+            retire_stale_client_surface_exposure( top, 0 );
+            return;
+        }
+        /* The checked native image is complete, but opacity/unredirect and
+         * input shape still belong to the GUI connection. Keep the original
+         * epoch and deadline until that asynchronous continuation ACKs. */
+        top->client_surface_transaction.publication = CLIENT_SURFACE_PUBLICATION_EXPOSURE_READY;
+        update_client_surface_publication( top );
+        post_message_coalesced( top->handle, WM_WINE_UPDATEWINDOWSTATE,
+                                WINE_PUBLISH_CLIENT_SURFACES, 0 );
         return;
     }
     if (!invalidated) top->client_surface_ack_scene = req->scene_generation;
@@ -2988,6 +3049,7 @@ static void restart_client_surface_generation_internal( struct window *top )
         top->client_surface_transaction.restart_pending = 0;
         invalidate_client_surface_scene( top );
         top->client_surface_transaction.phase = CLIENT_SURFACE_PHASE_COMPOSING;
+        top->client_surface_transaction.publication = CLIENT_SURFACE_PUBLICATION_NONE;
         top->client_surface_transaction.epoch = top->client_surface_scene_generation;
         top->client_surface_transaction.pending =
             prepare_client_surface_generation( top,
@@ -5467,6 +5529,7 @@ DECL_HANDLER(complete_client_surface_direct_plan)
     /* The same reservation and ACK protect both owner copy and attachment.
      * Only the native presentation which supplies the image proof differs. */
     top->client_surface_transaction.phase = CLIENT_SURFACE_PHASE_PUBLISHING;
+    top->client_surface_transaction.publication = CLIENT_SURFACE_PUBLICATION_HANDOFF;
     update_client_surface_publication( top );
     reply->accepted = 1;
 }
@@ -5792,27 +5855,45 @@ DECL_HANDLER(set_client_surface_state)
      * between invalidate the image but cannot strand the publication; a
      * freshly prepared live generation follows the ACK. */
     if ((req->flags & CLIENT_SURFACE_STATE_PUBLISH_BEGIN) && top->thread == current &&
-        client_surface_is_composing( top ) &&
-        client_surface_is_ready( top ) && !client_surface_is_publishing( top ) &&
+        client_surface_is_publishing( top ) &&
+        top->client_surface_transaction.publication == CLIENT_SURFACE_PUBLICATION_EXPOSURE_READY &&
+        top->client_surface_transaction.epoch != top->client_surface_scene_generation)
+    {
+        retire_stale_client_surface_exposure( top, 0 );
+    }
+    else if ((req->flags & CLIENT_SURFACE_STATE_PUBLISH_BEGIN) && top->thread == current &&
+        (top->client_surface_transaction.phase == CLIENT_SURFACE_PHASE_READY ||
+         (client_surface_is_publishing( top ) && top->client_surface_transaction.publication ==
+                                                CLIENT_SURFACE_PUBLICATION_EXPOSURE_READY)) &&
         !(top->client_surface_scene_generation & 1) &&
         top->client_surface_transaction.epoch == top->client_surface_scene_generation)
     {
         top->client_surface_transaction.phase = CLIENT_SURFACE_PHASE_PUBLISHING;
+        if (top->client_surface_transaction.publication == CLIENT_SURFACE_PUBLICATION_EXPOSURE_READY)
+            top->client_surface_transaction.publication = CLIENT_SURFACE_PUBLICATION_EXPOSE;
         update_client_surface_publication( top );
-        reply->publish = 1;
+        reply->publish = top->client_surface_transaction.publication;
     }
     if ((req->flags & CLIENT_SURFACE_STATE_PUBLISH_COMMIT) && top->thread == current &&
         client_surface_is_publishing( top ) &&
+        (top->client_surface_transaction.publication == CLIENT_SURFACE_PUBLICATION_COPY ||
+         top->client_surface_transaction.publication == CLIENT_SURFACE_PUBLICATION_EXPOSE) &&
         req->generation == client_surface_transaction_generation( top ) &&
         req->scene_generation == top->client_surface_transaction.epoch)
     {
         int invalidated = top->client_surface_transaction.epoch !=
                           top->client_surface_scene_generation;
 
-        if (!invalidated) top->client_surface_ack_scene = req->scene_generation;
-        finish_client_surface_publication( top );
-        if (invalidated && is_visible( top ) && has_client_surface( top ))
-            restart_client_surface_generation( top );
+        if (invalidated && top->client_surface_transaction.publication == CLIENT_SURFACE_PUBLICATION_EXPOSE)
+            retire_stale_client_surface_exposure( top, 1 );
+        else
+        {
+            if (!invalidated) top->client_surface_ack_scene = req->scene_generation;
+            finish_client_surface_publication( top );
+            if (invalidated && is_visible( top ) && has_client_surface( top ))
+                restart_client_surface_generation( top );
+        }
+        reply->publish = 1;
     }
 
     reply->toplevel = top->handle;

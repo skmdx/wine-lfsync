@@ -219,7 +219,7 @@ struct gdi_dc_funcs
 };
 
 /* increment this when changing driver tables or shared driver-facing structures */
-#define WINE_GDI_DRIVER_VERSION 134
+#define WINE_GDI_DRIVER_VERSION 135
 
 #define GDI_PRIORITY_NULL_DRV        0  /* null driver */
 #define GDI_PRIORITY_FONT_DRV      100  /* any font driver */
@@ -526,8 +526,8 @@ W32KAPI void client_surface_set_staged( HWND hwnd );
 W32KAPI void client_surface_bypass_staging( HWND hwnd );
 W32KAPI BOOL client_surface_begin_native_barrier( HWND hwnd, UINT_PTR token );
 W32KAPI BOOL client_surface_end_native_barrier( HWND hwnd, UINT_PTR token );
-W32KAPI BOOL client_surface_begin_publish( HWND hwnd, UINT64 *generation, UINT64 *scene_generation );
-W32KAPI void client_surface_end_publish( HWND hwnd, UINT64 generation, UINT64 scene_generation );
+W32KAPI UINT client_surface_begin_publish( HWND hwnd, UINT64 *generation, UINT64 *scene_generation );
+W32KAPI BOOL client_surface_end_publish( HWND hwnd, UINT64 generation, UINT64 scene_generation, BOOL success );
 W32KAPI BOOL client_surface_begin_prepare( HWND hwnd, UINT64 *scene_generation );
 W32KAPI void client_surface_end_prepare( HWND hwnd, UINT64 scene_generation );
 W32KAPI void update_client_surfaces( HWND hwnd );
@@ -686,6 +686,8 @@ struct user_driver_funcs
     struct client_surface *(*pCreateClientSurface)(HWND,int,BOOL);
     /* TRUE if native owner images can service this repair without a producer. */
     BOOL    (*pRepairClientSurfaceOwner)(HWND,BOOL);
+    /* Release staging after the actor completed this exact native scene. */
+    BOOL    (*pExposeClientSurface)(HWND,UINT64);
     BOOL    (*pCreateWindowSurface)(HWND,BOOL,const RECT *,struct window_surface**);
     void    (*pMoveWindowBits)(HWND,const struct window_rects *,const struct window_rects *,const RECT *);
     BOOL    (*pWindowPosChanged)(HWND,HWND,HWND,UINT,const struct window_rects*,struct window_surface*);

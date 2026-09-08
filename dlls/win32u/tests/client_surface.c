@@ -410,18 +410,58 @@ static UINT direct_plan_request( HWND hwnd, UINT64 surface, UINT64 scene, BOOL c
     return status;
 }
 
-static UINT direct_plan_ack( HWND hwnd, UINT64 scene, BOOL success, BOOL *accepted )
+static UINT publish_native_surface( HWND hwnd, UINT64 generation, UINT64 scene,
+                                    BOOL success, BOOL *accepted )
 {
     struct __server_request_info info = {0};
     UINT status;
 
     info.u.req.publish_client_surface_handoff_request.__header.req = REQ_publish_client_surface_handoff;
     info.u.req.publish_client_surface_handoff_request.handle = wine_server_user_handle( hwnd );
-    info.u.req.publish_client_surface_handoff_request.generation = scene;
+    info.u.req.publish_client_surface_handoff_request.generation = generation;
     info.u.req.publish_client_surface_handoff_request.scene_generation = scene;
     info.u.req.publish_client_surface_handoff_request.success = success;
     status = p_wine_server_call( &info );
     *accepted = !status && info.u.reply.publish_client_surface_handoff_reply.accepted;
+    return status;
+}
+
+static UINT direct_plan_ack( HWND hwnd, UINT64 scene, BOOL success, BOOL *accepted )
+{
+    return publish_native_surface( hwnd, scene, scene, success, accepted );
+}
+
+/* A handoff receipt reserves the native operation. Report its real protocol
+ * completion before performing the separate GUI exposure, if it was staged. */
+#define publish_handoff_state(hwnd, generation, scene, state) \
+    publish_handoff_state_( __LINE__, hwnd, generation, scene, state )
+static UINT publish_handoff_state_( UINT line, HWND hwnd, UINT64 generation, UINT64 scene,
+                                    struct surface_state *state )
+{
+    struct surface_state current = {0};
+    BOOL accepted;
+    UINT status;
+
+    status = publish_native_surface( hwnd, generation, scene, TRUE, &accepted );
+    ok_( __FILE__, line )( !status && accepted,
+        "native handoff completion hwnd %p generation %s scene %s status %#x accepted %u\n",
+        hwnd, wine_dbgstr_longlong( generation ), wine_dbgstr_longlong( scene ), status, accepted );
+    if (status) return status;
+    status = set_surface_state( hwnd, 0, 0, 0, &current );
+    if (!accepted)
+        trace( "rejected handoff current generation %s scene %s pending %u ready %u staged %u\n",
+               wine_dbgstr_longlong( current.generation ), wine_dbgstr_longlong( current.scene_generation ),
+               current.pending, current.ready, current.staged );
+    if (!status && current.staged && current.generation == generation && current.scene_generation == scene)
+    {
+        status = set_surface_state( hwnd, 0, CLIENT_SURFACE_STATE_PUBLISH_BEGIN, 0, &current );
+        ok( !status && current.publish == CLIENT_SURFACE_PUBLISH_EXPOSE,
+            "handoff requested action %u instead of exposure, status %#x\n", current.publish, status );
+        if (!status && current.publish)
+            status = set_surface_state_scene( hwnd, 0, CLIENT_SURFACE_STATE_PUBLISH_COMMIT,
+                                              generation, scene, &current );
+    }
+    if (state) *state = current;
     return status;
 }
 
@@ -2376,8 +2416,7 @@ static void check_source_free_destruction( HWND hwnd, const struct client_surfac
         prepare_surface_state( hwnd, &state );
         complete_surface_handoffs( hwnd, state.generation, state.scene_generation, receipt, 1, &accepted );
         ok( accepted, "destruction bootstrap receipt rejected\n" );
-        set_surface_state_scene( hwnd, 0, CLIENT_SURFACE_STATE_PUBLISH_COMMIT,
-                                 state.generation, state.scene_generation, &state );
+        publish_handoff_state( hwnd, state.generation, state.scene_generation, &state );
         status = get_scene_snapshot( hwnd, state.scene_generation, sizeof(snapshot.data), &snapshot );
         ok( !status && snapshot.count == 1, "initial source snapshot status %#x count %u\n", status, snapshot.count );
         layer = !status ? find_scene_layer( &snapshot, hwnd ) : NULL;
@@ -2432,8 +2471,7 @@ static void check_source_free_destruction( HWND hwnd, const struct client_surfac
                 "occluder teardown changed surviving source identity, endpoint, extent or DPI\n" );
         status = complete_surface_handoffs( hwnd, state.generation, state.scene_generation, receipt, 1, &accepted );
         ok( !status && accepted, "remaining source publication rejected, status %#x\n", status );
-        set_surface_state_scene( hwnd, 0, CLIENT_SURFACE_STATE_PUBLISH_COMMIT,
-                                 state.generation, state.scene_generation, &state );
+        publish_handoff_state( hwnd, state.generation, state.scene_generation, &state );
         ok( !state.pending && !state.generation && !state.staged, "teardown scene did not settle\n" );
         winetest_pop_context();
     }
@@ -2493,8 +2531,7 @@ static void check_owner_repair( HWND hwnd, const struct client_surface_handoff_r
     ok( !status, "repair scene unseal status %#x\n", status );
     prepare_surface_state( hwnd, &state );
     complete_surface_handoffs( hwnd, state.generation, state.scene_generation, receipt, 1, &accepted );
-    set_surface_state_scene( hwnd, 0, CLIENT_SURFACE_STATE_PUBLISH_COMMIT,
-                             state.generation, state.scene_generation, &state );
+    publish_handoff_state( hwnd, state.generation, state.scene_generation, &state );
     drain_scene_notifications( &owner_updates, &prepares );
 
     for (i = 0; i < 3; ++i)
@@ -2543,8 +2580,7 @@ static void check_owner_repair( HWND hwnd, const struct client_surface_handoff_r
         }
         status = complete_surface_handoffs( hwnd, state.generation, state.scene_generation, receipt, 1, &accepted );
         ok( !status && accepted, "repaired assembly rejected retained receipt, status %#x\n", status );
-        status = set_surface_state_scene( hwnd, 0, CLIENT_SURFACE_STATE_PUBLISH_COMMIT,
-                                          state.generation, state.scene_generation, &state );
+        status = publish_handoff_state( hwnd, state.generation, state.scene_generation, &state );
         ok( !status && !state.generation && !state.staged, "repair publication status %#x\n", status );
         drain_scene_notifications( &owner_updates, &prepares );
         winetest_pop_context();
@@ -2679,8 +2715,7 @@ static void check_scene_source_decisions( HWND hwnd, const struct client_surface
             state.pending == before.pending, "inventory changed the assembly token or completed sources\n" );
         status = complete_surface_handoffs( hwnd, state.generation, state.scene_generation, receipt, 1, &accepted );
         ok( !status && accepted, "scene assembly receipt rejected, status %#x\n", status );
-        status = set_surface_state_scene( hwnd, 0, CLIENT_SURFACE_STATE_PUBLISH_COMMIT,
-                                          state.generation, state.scene_generation, &state );
+        status = publish_handoff_state( hwnd, state.generation, state.scene_generation, &state );
         ok( !status && !state.generation && !state.pending && !state.staged, "scene did not settle\n" );
         status = resolve_scene_sources( hwnd, state.scene_generation, receipt, sizeof(*receipt), &accepted );
         ok( !status && !accepted, "late decision reopened a published scene, status %#x\n", status );
@@ -2728,8 +2763,7 @@ static void check_scene_source_subset( HWND hwnd, const struct client_surface_ha
     prepare_surface_state( hwnd, &state );
     status = complete_surface_handoffs( hwnd, state.generation, state.scene_generation, receipts, 2, &accepted );
     ok( !status && accepted, "partial inventory bootstrap status %#x\n", status );
-    set_surface_state_scene( hwnd, 0, CLIENT_SURFACE_STATE_PUBLISH_COMMIT,
-                             state.generation, state.scene_generation, &state );
+    publish_handoff_state( hwnd, state.generation, state.scene_generation, &state );
     drain_scene_notifications( &updates, &prepares );
     change_scene_sources( hwnd, mutation, 8 );
     prepare_surface_state( hwnd, &state );
@@ -2757,8 +2791,7 @@ static void check_scene_source_subset( HWND hwnd, const struct client_surface_ha
     }
     status = complete_surface_handoffs( hwnd, state.generation, state.scene_generation, receipts, 2, &accepted );
     ok( !status && accepted, "full assembly after partial inventory status %#x\n", status );
-    set_surface_state_scene( hwnd, 0, CLIENT_SURFACE_STATE_PUBLISH_COMMIT,
-                             state.generation, state.scene_generation, &state );
+    publish_handoff_state( hwnd, state.generation, state.scene_generation, &state );
     view = MapViewOfFile( producer.mapping, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, producer.size );
     ok( !!view, "could not map partial inventory channel\n" );
     if (!view) goto done;
@@ -2781,8 +2814,7 @@ done:
     DestroyWindow( child );
     prepare_surface_state( hwnd, &state );
     complete_surface_handoffs( hwnd, state.generation, state.scene_generation, receipt, 1, &accepted );
-    set_surface_state_scene( hwnd, 0, CLIENT_SURFACE_STATE_PUBLISH_COMMIT,
-                             state.generation, state.scene_generation, &state );
+    publish_handoff_state( hwnd, state.generation, state.scene_generation, &state );
 }
 
 static void check_zorder_scene_sources( HWND hwnd, const struct client_surface_handoff_receipt *receipt )
@@ -2811,8 +2843,7 @@ static void check_zorder_scene_sources( HWND hwnd, const struct client_surface_h
     prepare_surface_state( hwnd, &state );
     complete_surface_handoffs( hwnd, state.generation, state.scene_generation, receipt, 1, &accepted );
     ok( accepted, "z-order bootstrap receipt rejected\n" );
-    set_surface_state_scene( hwnd, 0, CLIENT_SURFACE_STATE_PUBLISH_COMMIT,
-                             state.generation, state.scene_generation, &state );
+    publish_handoff_state( hwnd, state.generation, state.scene_generation, &state );
     check_scene_source_decisions( hwnd, receipt, &mutation );
     winetest_push_context( "z-order source subset" );
     check_scene_source_subset( hwnd, receipt, &mutation );
@@ -2842,8 +2873,7 @@ static void check_zorder_scene_sources( HWND hwnd, const struct client_surface_h
         ok( !status && !accepted, "conservative update accepted warm inventory, status %#x\n", status );
         status = complete_surface_handoffs( hwnd, state.generation, state.scene_generation, receipt, 1, &accepted );
         ok( !status && accepted, "conservative update receipt rejected, status %#x\n", status );
-        set_surface_state_scene( hwnd, 0, CLIENT_SURFACE_STATE_PUBLISH_COMMIT,
-                                 state.generation, state.scene_generation, &state );
+        publish_handoff_state( hwnd, state.generation, state.scene_generation, &state );
         ok( !state.pending && !state.generation && !state.staged, "conservative update did not settle\n" );
         winetest_pop_context();
     }
@@ -2851,9 +2881,13 @@ done:
     if (second) DestroyWindow( second );
     if (first) DestroyWindow( first );
     prepare_surface_state( hwnd, &state );
-    complete_surface_handoffs( hwnd, state.generation, state.scene_generation, receipt, 1, &accepted );
-    set_surface_state_scene( hwnd, 0, CLIENT_SURFACE_STATE_PUBLISH_COMMIT,
-                             state.generation, state.scene_generation, &state );
+    /* Removing the source-free siblings preserves the source and requests
+     * the current owner's inventory. Receipts cannot bypass that decision. */
+    status = resolve_scene_sources( hwnd, state.scene_generation, receipt, sizeof(*receipt), &accepted );
+    ok( !status && accepted, "z-order cleanup inventory status %#x accepted %u\n", status, accepted );
+    status = complete_surface_handoffs( hwnd, state.generation, state.scene_generation, receipt, 1, &accepted );
+    ok( !status && accepted, "z-order cleanup assembly status %#x accepted %u\n", status, accepted );
+    publish_handoff_state( hwnd, state.generation, state.scene_generation, &state );
 }
 
 static void check_child_placement_sources( HWND hwnd, const struct client_surface_handoff_receipt *receipt )
@@ -2879,8 +2913,7 @@ static void check_child_placement_sources( HWND hwnd, const struct client_surfac
         prepare_surface_state( hwnd, &state );
         complete_surface_handoffs( hwnd, state.generation, state.scene_generation, receipt, 1, &accepted );
         ok( accepted, "placement bootstrap receipt rejected\n" );
-        set_surface_state_scene( hwnd, 0, CLIENT_SURFACE_STATE_PUBLISH_COMMIT,
-                                 state.generation, state.scene_generation, &state );
+        publish_handoff_state( hwnd, state.generation, state.scene_generation, &state );
         check_scene_source_decisions( hwnd, receipt, &mutation );
         winetest_push_context( "%s source subset", mutation.name );
         check_scene_source_subset( hwnd, receipt, &mutation );
@@ -2901,8 +2934,7 @@ static void check_child_placement_sources( HWND hwnd, const struct client_surfac
             ok( !status && !accepted, "source change accepted placement inventory\n" );
             complete_surface_handoffs( hwnd, state.generation, state.scene_generation, receipt, 1, &accepted );
             ok( accepted, "source change receipt rejected\n" );
-            set_surface_state_scene( hwnd, 0, CLIENT_SURFACE_STATE_PUBLISH_COMMIT,
-                                     state.generation, state.scene_generation, &state );
+            publish_handoff_state( hwnd, state.generation, state.scene_generation, &state );
             winetest_pop_context();
         }
 done:
@@ -2910,8 +2942,7 @@ done:
         if (second) DestroyWindow( second );
         prepare_surface_state( hwnd, &state );
         complete_surface_handoffs( hwnd, state.generation, state.scene_generation, receipt, 1, &accepted );
-        set_surface_state_scene( hwnd, 0, CLIENT_SURFACE_STATE_PUBLISH_COMMIT,
-                                 state.generation, state.scene_generation, &state );
+        publish_handoff_state( hwnd, state.generation, state.scene_generation, &state );
     }
 }
 
@@ -2931,8 +2962,7 @@ static void check_retained_subtree_parent( HWND top, HWND child,
     prepare_surface_state( top, &state );
     complete_surface_handoffs( top, state.generation, state.scene_generation, receipt, 1, &accepted );
     ok( accepted, "subtree bootstrap receipt rejected\n" );
-    set_surface_state_scene( top, 0, CLIENT_SURFACE_STATE_PUBLISH_COMMIT,
-                             state.generation, state.scene_generation, &state );
+    publish_handoff_state( top, state.generation, state.scene_generation, &state );
     status = get_scene_snapshot( top, state.scene_generation, sizeof(snapshot.data), &snapshot );
     ok( !status, "subtree initial snapshot status %#x\n", status );
     if (status || !(layer = find_scene_layer( &snapshot, child ))) goto done;
@@ -2960,8 +2990,7 @@ static void check_retained_subtree_parent( HWND top, HWND child,
         ok( !status && accepted, "retained subtree inventory rejected\n" );
         complete_surface_handoffs( top, state.generation, state.scene_generation, receipt, 1, &accepted );
         ok( accepted, "retained subtree assembly rejected\n" );
-        set_surface_state_scene( top, 0, CLIENT_SURFACE_STATE_PUBLISH_COMMIT,
-                                 state.generation, state.scene_generation, &state );
+        publish_handoff_state( top, state.generation, state.scene_generation, &state );
         winetest_pop_context();
     }
 done:
@@ -3001,8 +3030,7 @@ static void test_child_visibility_sources(void)
     prepare_surface_state( top, &state );
     complete_surface_handoffs( top, state.generation, state.scene_generation, &receipt, 1, &accepted );
     ok( accepted, "visibility bootstrap receipt rejected\n" );
-    set_surface_state_scene( top, 0, CLIENT_SURFACE_STATE_PUBLISH_COMMIT,
-                             state.generation, state.scene_generation, &state );
+    publish_handoff_state( top, state.generation, state.scene_generation, &state );
     before = state;
     drain_scene_notifications( &updates, &prepares );
 
@@ -3033,8 +3061,7 @@ static void test_child_visibility_sources(void)
     ok( !status && accepted, "shown retained source inventory rejected\n" );
     complete_surface_handoffs( top, state.generation, state.scene_generation, &receipt, 1, &accepted );
     ok( accepted, "shown source assembly rejected\n" );
-    set_surface_state_scene( top, 0, CLIENT_SURFACE_STATE_PUBLISH_COMMIT,
-                             state.generation, state.scene_generation, &state );
+    publish_handoff_state( top, state.generation, state.scene_generation, &state );
     check_retained_subtree_parent( top, child, &receipt );
 done:
     if (producer.cookie) release_surface_handoff( child, 0, identity, producer.cookie, FALSE );
@@ -3068,6 +3095,173 @@ done:
         DestroyWindow( child );
     }
     if (top) DestroyWindow( top );
+}
+
+struct exposure_thread_data
+{
+    HWND hwnd;
+    UINT64 generation, scene;
+};
+
+static DWORD WINAPI foreign_exposure_thread( void *arg )
+{
+    const struct exposure_thread_data *data = arg;
+    struct surface_state state;
+    UINT status;
+
+    status = set_surface_state( data->hwnd, 0, CLIENT_SURFACE_STATE_PUBLISH_BEGIN, 0, &state );
+    ok( !status && !state.publish, "foreign thread reserved exposure, status %#x\n", status );
+    status = set_surface_state_scene( data->hwnd, 0, CLIENT_SURFACE_STATE_PUBLISH_COMMIT,
+                                      data->generation, data->scene, &state );
+    ok( !status && !state.publish && state.staged && state.generation == data->generation,
+        "foreign thread acknowledged exposure, status %#x\n", status );
+    return 0;
+}
+
+static void check_staged_handoff_exposure( HWND hwnd, const struct client_surface_handoff_receipt *receipt )
+{
+    struct surface_state state, native, reserved, changed;
+    struct native_barrier_state barrier;
+    struct exposure_thread_data thread_data;
+    HANDLE thread;
+    BOOL accepted, odd, after_begin, exposed;
+    UINT status, i;
+
+    for (i = 0; i < 10; ++i)
+    {
+        winetest_push_context( "staged handoff exposure boundary %u", i );
+        /* Use real server visibility and STAGED, without dispatching owner
+         * messages which would hide these native/GUI protocol boundaries. */
+        status = set_scene_placement( hwnd, 0, 0, 0, SWP_HIDEWINDOW );
+        ok( !status, "hide status %#x\n", status );
+        status = set_scene_placement( hwnd, 0, 0, 0, SWP_SHOWWINDOW );
+        ok( !status, "show status %#x\n", status );
+        status = set_surface_state( hwnd, 0, CLIENT_SURFACE_STATE_STAGED, 0, &native );
+        ok( !status && native.staged && native.pending == 1 && native.generation == native.scene_generation,
+            "staged scene status %#x pending %u generation %s\n", status, native.pending,
+            wine_dbgstr_longlong( native.generation ) );
+        status = complete_surface_handoffs( hwnd, native.generation, native.scene_generation, receipt, 1, &accepted );
+        ok( !status && accepted, "receipt completion status %#x accepted %u\n", status, accepted );
+        status = set_surface_state( hwnd, 0, CLIENT_SURFACE_STATE_PUBLISH_BEGIN, 0, &state );
+        ok( !status && !state.publish && state.staged && state.generation == native.generation,
+            "GUI began before native completion, status %#x action %u\n", status, state.publish );
+        status = set_surface_state_scene( hwnd, 0, CLIENT_SURFACE_STATE_PUBLISH_COMMIT,
+                                          native.generation, native.scene_generation, &state );
+        ok( !status && !state.publish && state.staged && state.generation == native.generation,
+            "GUI ACK bypassed native completion, status %#x\n", status );
+
+        odd = i == 2 || i == 4 || i == 6 || i == 8;
+        after_begin = i >= 3 && i <= 6;
+        exposed = i == 5 || i == 6;
+        if (i == 7 || i == 8)
+        {
+            if (odd) status = set_native_barrier( hwnd, 0x8600 + i, TRUE, &barrier );
+            else status = set_scene_placement( hwnd, 1, 0, 0, 0 );
+            ok( !status, "mutation before native completion status %#x\n", status );
+        }
+        status = publish_native_surface( hwnd, native.generation, native.scene_generation, i != 9, &accepted );
+        ok( !status && accepted, "native completion status %#x accepted %u\n", status, accepted );
+        status = set_surface_state( hwnd, 0, 0, 0, &state );
+        if (i < 7)
+        {
+            ok( !status && state.staged && state.ready && !state.pending &&
+                state.generation == native.generation && state.scene_generation == native.scene_generation,
+                "native completion exposed or retagged scene, status %#x staged %u generation %s\n",
+                status, state.staged, wine_dbgstr_longlong( state.generation ) );
+            status = publish_native_surface( hwnd, native.generation, native.scene_generation, TRUE, &accepted );
+            ok( !status && !accepted, "native completion consumed twice, status %#x\n", status );
+            status = set_surface_state_scene( hwnd, 0, CLIENT_SURFACE_STATE_PUBLISH_COMMIT,
+                                              native.generation, native.scene_generation, &state );
+            ok( !status && !state.publish && state.staged && state.generation == native.generation,
+                "GUI ACK skipped exposure reservation, status %#x\n", status );
+        }
+        if (!i)
+        {
+            thread_data = (struct exposure_thread_data){ hwnd, native.generation, native.scene_generation };
+            thread = CreateThread( NULL, 0, foreign_exposure_thread, &thread_data, 0, NULL );
+            ok( !!thread, "foreign exposure thread error %lu\n", GetLastError() );
+            if (thread)
+            {
+                ok( WaitForSingleObject( thread, 5000 ) == WAIT_OBJECT_0, "foreign exposure thread stalled\n" );
+                CloseHandle( thread );
+            }
+        }
+        if (!i || after_begin)
+        {
+            status = set_surface_state( hwnd, 0, CLIENT_SURFACE_STATE_PUBLISH_BEGIN, 0, &reserved );
+            ok( !status && reserved.publish == CLIENT_SURFACE_PUBLISH_EXPOSE &&
+                reserved.generation == native.generation && reserved.scene_generation == native.scene_generation,
+                "GUI exposure action %u status %#x\n", reserved.publish, status );
+            status = set_surface_state( hwnd, 0, CLIENT_SURFACE_STATE_PUBLISH_BEGIN, 0, &state );
+            ok( !status && !state.publish, "GUI exposure reserved twice, status %#x\n", status );
+        }
+        if (i && i < 7)
+        {
+            if (odd) status = set_native_barrier( hwnd, 0x8600 + i, TRUE, &barrier );
+            else status = set_scene_placement( hwnd, 1, 0, 0, 0 );
+            ok( !status, "mutation during exposure status %#x\n", status );
+            set_surface_state( hwnd, 0, 0, 0, &changed );
+            ok( changed.staged && changed.generation == native.generation &&
+                changed.scene_generation != native.scene_generation,
+                "mutation retired the still-owned publication too early\n" );
+            if (after_begin)
+            {
+                if (exposed)
+                {
+                    status = set_surface_state_scene( hwnd, 0, CLIENT_SURFACE_STATE_PUBLISH_COMMIT,
+                                                      reserved.generation, reserved.scene_generation, &state );
+                    ok( !status && state.publish, "completed exposure retirement status %#x\n", status );
+                }
+                else
+                {
+                    status = publish_native_surface( hwnd, reserved.generation, reserved.scene_generation,
+                                                     FALSE, &accepted );
+                    ok( !status && accepted, "failed exposure retirement status %#x\n", status );
+                }
+            }
+            else
+            {
+                status = set_surface_state( hwnd, 0, CLIENT_SURFACE_STATE_PUBLISH_BEGIN, 0, &state );
+                ok( !status && !state.publish, "stale image exposed, status %#x\n", status );
+            }
+        }
+        if (!i)
+        {
+            status = set_surface_state_scene( hwnd, 0, CLIENT_SURFACE_STATE_PUBLISH_COMMIT,
+                                              reserved.generation, reserved.scene_generation + 2, &state );
+            ok( !status && !state.publish && state.staged, "wrong scene exposure ACK accepted\n" );
+            status = set_surface_state_scene( hwnd, 0, CLIENT_SURFACE_STATE_PUBLISH_COMMIT,
+                                              reserved.generation, reserved.scene_generation, &state );
+            ok( !status && state.publish && !state.staged && !state.generation && !state.pending,
+                "exact exposure ACK did not finish, status %#x\n", status );
+        }
+        else
+        {
+            set_surface_state( hwnd, 0, 0, 0, &state );
+            ok( !!state.staged == !exposed && state.generation != native.generation,
+                "retired exposure stranded token or lost native staging: staged %u generation %s\n",
+                state.staged, wine_dbgstr_longlong( state.generation ) );
+            if (odd)
+            {
+                ok( !state.generation && (state.scene_generation & 1), "odd barrier spawned a publication\n" );
+                status = set_native_barrier( hwnd, 0x8600 + i, FALSE, &barrier );
+                ok( !status, "exposure barrier END status %#x\n", status );
+            }
+            if (i == 9) set_surface_state( hwnd, 0, CLIENT_SURFACE_STATE_GEOMETRY_READY, 0, NULL );
+            status = prepare_surface_state( hwnd, &state );
+            ok( !status && state.pending == 1 && state.generation && state.generation != native.generation,
+                "current scene did not recover without another producer frame, status %#x pending %u\n",
+                status, state.pending );
+            status = complete_surface_handoffs( hwnd, state.generation, state.scene_generation, receipt, 1, &accepted );
+            ok( !status && accepted, "recovery receipt status %#x\n", status );
+            publish_handoff_state( hwnd, state.generation, state.scene_generation, &state );
+        }
+        status = set_surface_state_scene( hwnd, 0, CLIENT_SURFACE_STATE_PUBLISH_COMMIT,
+                                          native.generation, native.scene_generation, &state );
+        ok( !status && !state.publish && !state.staged && !state.generation,
+            "late/duplicate ACK changed the recovered scene, status %#x\n", status );
+        winetest_pop_context();
+    }
 }
 
 static void test_handoff_receipts(void)
@@ -3156,14 +3350,13 @@ static void test_handoff_receipts(void)
         "failed publication did not restart on owner activity, status %#x pending %u\n", status, state.pending );
     status = complete_surface_handoffs( hwnd, state.generation, state.scene_generation, &receipt, 1, &accepted );
     ok( !status && accepted, "replacement publication receipt rejected, status %#x\n", status );
-    status = set_surface_state_scene( hwnd, 0, CLIENT_SURFACE_STATE_PUBLISH_COMMIT,
-        state.generation, state.scene_generation, &state );
+    status = publish_handoff_state( hwnd, state.generation, state.scene_generation, &state );
     ok( !status && !state.staged, "receipt publication failed, status %#x staged %u\n", status, state.staged );
+    check_staged_handoff_exposure( hwnd, &receipt );
     check_owner_repair( hwnd, &receipt );
     prepare_surface_state( hwnd, &state );
     complete_surface_handoffs( hwnd, state.generation, state.scene_generation, &receipt, 1, &accepted );
-    set_surface_state_scene( hwnd, 0, CLIENT_SURFACE_STATE_PUBLISH_COMMIT,
-                             state.generation, state.scene_generation, &state );
+    publish_handoff_state( hwnd, state.generation, state.scene_generation, &state );
     check_scene_source_decisions( hwnd, &receipt, NULL );
     check_scene_source_subset( hwnd, &receipt, NULL );
     check_zorder_scene_sources( hwnd, &receipt );

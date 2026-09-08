@@ -1537,9 +1537,9 @@ BOOL client_surface_end_native_barrier( HWND hwnd, UINT_PTR token )
     return ret;
 }
 
-BOOL client_surface_begin_publish( HWND hwnd, UINT64 *generation, UINT64 *scene_generation )
+UINT client_surface_begin_publish( HWND hwnd, UINT64 *generation, UINT64 *scene_generation )
 {
-    BOOL publish = FALSE;
+    UINT publish = 0;
 
     *generation = 0;
     *scene_generation = 0;
@@ -1554,17 +1554,50 @@ BOOL client_surface_begin_publish( HWND hwnd, UINT64 *generation, UINT64 *scene_
         {
             *generation = reply->generation;
             *scene_generation = reply->scene_generation;
-            publish = TRUE;
+            publish = reply->publish;
         }
     }
     SERVER_END_REQ;
     return publish;
 }
 
-void client_surface_end_publish( HWND hwnd, UINT64 generation, UINT64 scene_generation )
+BOOL client_surface_end_publish( HWND hwnd, UINT64 generation, UINT64 scene_generation, BOOL success )
 {
-    client_surface_set_server_state( hwnd, NULL, CLIENT_SURFACE_STATE_PUBLISH_COMMIT,
-                                     generation, scene_generation, NULL );
+    BOOL accepted = FALSE;
+    NTSTATUS status;
+
+    if (success)
+    {
+        SERVER_START_REQ( set_client_surface_state )
+        {
+            req->handle = wine_server_user_handle( hwnd );
+            req->flags = CLIENT_SURFACE_STATE_PUBLISH_COMMIT;
+            req->generation = generation;
+            req->scene_generation = scene_generation;
+            status = wine_server_call( req );
+            if (!status) accepted = reply->publish;
+        }
+        SERVER_END_REQ;
+    }
+    else
+    {
+        /* A failed native exposure retires only the publication this GUI
+         * reserved, never a newer scene reached while it was running. */
+        SERVER_START_REQ( publish_client_surface_handoff )
+        {
+            req->handle = wine_server_user_handle( hwnd );
+            req->generation = generation;
+            req->scene_generation = scene_generation;
+            req->success = FALSE;
+            status = wine_server_call( req );
+            if (!status) accepted = reply->accepted;
+        }
+        SERVER_END_REQ;
+    }
+    TRACE( "published GUI generation %s epoch %s status %#lx accepted %u success %u\n",
+           wine_dbgstr_longlong( generation ), wine_dbgstr_longlong( scene_generation ),
+           (unsigned long)status, accepted, success );
+    return !status && accepted && success;
 }
 
 BOOL client_surface_begin_prepare( HWND hwnd, UINT64 *scene_generation )

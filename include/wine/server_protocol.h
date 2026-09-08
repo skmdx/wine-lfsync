@@ -6411,6 +6411,9 @@ struct set_client_surface_state_reply
 #define CLIENT_SURFACE_STATE_UPDATE_CAPS         0x400000
 #define CLIENT_SURFACE_STATE_FAILED              0x800000
 
+#define CLIENT_SURFACE_PUBLISH_COPY   1
+#define CLIENT_SURFACE_PUBLISH_EXPOSE 2
+
 
 
 struct get_client_surface_clip_windows_request
@@ -7648,6 +7651,6 @@ union generic_reply
     struct set_window_present_rect_reply set_window_present_rect_reply;
 };
 
-#define SERVER_PROTOCOL_VERSION 1014
+#define SERVER_PROTOCOL_VERSION 1015
 
 #endif /* __WINE_WINE_SERVER_PROTOCOL_H */

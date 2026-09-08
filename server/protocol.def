@@ -4452,7 +4452,7 @@ enum inproc_sync_type
     unsigned int   pending;       /* window producers pending in that generation */
     unsigned int   staged;        /* whether the generation is unpublished */
     unsigned int   ready;         /* generation is composed and awaits owner publish */
-    unsigned int   publish;       /* owner may expose the returned publication token */
+    unsigned int   publish;       /* CLIENT_SURFACE_PUBLISH_* action, or zero */
     unsigned int   compose;       /* this surface is the selected producer */
     unsigned int   mode;          /* enum client_surface_presentation_mode */
     unsigned int   active;        /* active surfaces on the requested window */
@@ -4476,6 +4476,9 @@ enum inproc_sync_type
 #define CLIENT_SURFACE_STATE_DIRECT_PRESENTATION 0x200000
 #define CLIENT_SURFACE_STATE_UPDATE_CAPS         0x400000
 #define CLIENT_SURFACE_STATE_FAILED              0x800000
+
+#define CLIENT_SURFACE_PUBLISH_COPY   1  /* GUI must publish its completed backing */
+#define CLIENT_SURFACE_PUBLISH_EXPOSE 2  /* native image is complete; release staging only */
 
 
 /* Get visible client-surface windows above a target in one stable scene. */

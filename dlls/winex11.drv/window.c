@@ -648,10 +648,8 @@ static BOOL prepare_client_surface_staging( struct x11drv_win_data *data )
     return TRUE;
 }
 
-static void finish_client_surface_staging( struct x11drv_win_data *data )
+static void release_client_surface_staging( struct x11drv_win_data *data )
 {
-    TRACE( "win %p/%lx publishing staged client-surface composition\n",
-           data->hwnd, data->whole_window );
 #ifdef SONAME_LIBXCOMPOSITE
     if (data->client_surface_redirected)
         pXCompositeUnredirectWindow( data->display, data->whole_window, CompositeRedirectManual );
@@ -666,10 +664,80 @@ static void finish_client_surface_staging( struct x11drv_win_data *data )
             XDeleteProperty( data->display, data->whole_window,
                              x11drv_atom(_NET_WM_WINDOW_OPACITY) );
     }
+}
+
+static void finish_client_surface_staging( struct x11drv_win_data *data )
+{
+    TRACE( "win %p/%lx publishing staged client-surface composition\n",
+           data->hwnd, data->whole_window );
+    release_client_surface_staging( data );
     data->client_surface_redirected = FALSE;
     data->client_surface_opacity_staged = FALSE;
     data->client_surface_staged = FALSE;
     sync_window_input_shape( data );
+}
+
+static int client_surface_expose_error( Display *display, XErrorEvent *event, void *arg )
+{
+    *(int *)arg = event->error_code;
+    return TRUE;
+}
+
+BOOL X11DRV_ExposeClientSurface( HWND hwnd, UINT64 scene_generation )
+{
+    struct client_surface_scene scene;
+    struct x11drv_win_data *data;
+    int error = 0, restore_error = 0;
+    BOOL redirected, opacity;
+    BOOL success = FALSE;
+
+    if (!client_surface_get_toplevel_scene( hwnd, &scene ) || scene.epoch != scene_generation ||
+        scene.generation != scene_generation || scene.mode != CLIENT_SURFACE_PRESENTATION_STAGED)
+        return FALSE;
+    if (!(data = get_win_data( hwnd ))) return FALSE;
+    redirected = data->client_surface_redirected;
+    opacity = data->client_surface_opacity_staged;
+    if (data->whole_window && data->client_surface_staged && (redirected != opacity))
+    {
+        /* The actor already checked the copy/Present Complete for this scene.
+         * Do not drain its Idle event or publish the older GUI backing again.
+         * Only these GUI-owned exposure requests precede the common ACK. */
+        /* Check the input-shape change before issuing the single request
+         * which exposes pixels. Keep local staging ownership until that
+         * request succeeds; a partial error must not lose a live redirect. */
+        data->client_surface_redirected = data->client_surface_opacity_staged = FALSE;
+        X11DRV_expect_error( data->display, client_surface_expose_error, &error );
+        sync_window_input_shape( data );
+        XSync( data->display, False );
+        X11DRV_check_error();
+        data->client_surface_redirected = redirected;
+        data->client_surface_opacity_staged = opacity;
+        if (!error)
+        {
+            X11DRV_expect_error( data->display, client_surface_expose_error, &error );
+            release_client_surface_staging( data );
+            XSync( data->display, False );
+            X11DRV_check_error();
+        }
+        if (!(success = !error))
+        {
+            /* Exposure failed atomically. The old opacity/redirect still
+             * withholds pixels; restore its input exclusion as well. */
+            X11DRV_expect_error( data->display, client_surface_expose_error, &restore_error );
+            set_empty_window_input_shape( data );
+            XSync( data->display, False );
+            X11DRV_check_error();
+        }
+        else
+        {
+            data->client_surface_redirected = data->client_surface_opacity_staged = FALSE;
+            data->client_surface_staged = FALSE;
+        }
+    }
+    TRACE( "exposed staged window %p scene %s success %u error %u restore_error %u\n", hwnd,
+           wine_dbgstr_longlong( scene_generation ), success, error, restore_error );
+    release_win_data( data );
+    return success;
 }
 
 /***********************************************************************

@@ -398,6 +398,7 @@ static const struct user_driver_funcs x11drv_funcs =
     .pGetWindowStateUpdates = X11DRV_GetWindowStateUpdates,
     .pCreateClientSurface = X11DRV_CreateClientSurface,
     .pRepairClientSurfaceOwner = X11DRV_RepairClientSurfaceOwner,
+    .pExposeClientSurface = X11DRV_ExposeClientSurface,
     .pCreateWindowSurface = X11DRV_CreateWindowSurface,
     .pMoveWindowBits = X11DRV_MoveWindowBits,
     .pWindowPosChanged = X11DRV_WindowPosChanged,
