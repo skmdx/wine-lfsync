@@ -48,6 +48,15 @@
 
 WINE_DEFAULT_DEBUG_CHANNEL(wgl);
 WINE_DECLARE_DEBUG_CHANNEL(winediag);
+WINE_DECLARE_DEBUG_CHANNEL(csperf);
+
+static unsigned long long client_surface_perf_time(void)
+{
+    LARGE_INTEGER counter;
+
+    NtQueryPerformanceCounter( &counter, NULL );
+    return counter.QuadPart;
+}
 
 #include "wine/opengl_driver.h"
 
@@ -2025,6 +2034,8 @@ static int snapshot_client_surface_gpu( struct opengl_drawable *base,
     GLboolean scissor, srgb;
     GLenum status, error;
     int ret = 0;
+    unsigned long long begin = TRACE_ON(csperf) ? client_surface_perf_time() : 0;
+    unsigned long long imported, blit = 0, copied = 0, flushed = 0;
 
     if (source->width != base->virtual_size.cx || source->height != base->virtual_size.cy)
     {
@@ -2055,6 +2066,7 @@ static int snapshot_client_surface_gpu( struct opengl_drawable *base,
         TRACE( "imported EGL source pixmap %#lx size %ux%u from visual %#lx to %#lx\n",
                frame->pixmap, frame->width, frame->height, surface->source_visual, default_visual.visualid );
     }
+    imported = begin ? client_surface_perf_time() : 0;
     if (funcs->p_glGetError() != GL_NO_ERROR) return -1;
     funcs->p_glGetIntegerv( GL_READ_FRAMEBUFFER_BINDING, &read_fbo );
     funcs->p_glGetIntegerv( GL_DRAW_FRAMEBUFFER_BINDING, &draw_fbo );
@@ -2078,9 +2090,11 @@ static int snapshot_client_surface_gpu( struct opengl_drawable *base,
     funcs->p_glDisable( GL_SCISSOR_TEST );
     funcs->p_glDisable( GL_FRAMEBUFFER_SRGB );
     /* Native X pixmap coordinates have their origin at the top left. */
+    blit = begin ? client_surface_perf_time() : 0;
     funcs->p_glBlitFramebuffer( 0, 0, source->width, source->height, 0, source->height, source->width, 0,
                                 GL_COLOR_BUFFER_BIT, GL_NEAREST );
     ret = funcs->p_glGetError() == GL_NO_ERROR ? 1 : -1;
+    copied = begin ? client_surface_perf_time() : 0;
     /* Keep the source's fence reference even if the common completion times
      * out or discards a stale scene. get_source() refuses to reuse it until
      * this exact GPU write completes. The worker owns a separate reference. */
@@ -2109,6 +2123,7 @@ static int snapshot_client_surface_gpu( struct opengl_drawable *base,
         funcs->p_glFinish();
         if (funcs->p_glGetError() != GL_NO_ERROR) ret = -1;
     }
+    flushed = begin ? client_surface_perf_time() : 0;
     if (ret > 0)
     {
         /* A first PREPARING frame may have needed a CPU snapshot. Its upload
@@ -2133,6 +2148,15 @@ done:
     funcs->p_glBindFramebuffer( GL_DRAW_FRAMEBUFFER, draw_fbo );
     if (fbo) funcs->p_glDeleteFramebuffers( 1, &fbo );
     if (buffer) funcs->p_glDeleteRenderbuffers( 1, &buffer );
+    /* Host submission spans plus the worker's actual fence wait distinguish
+     * queueing from native readiness; they are not GPU execution timestamps. */
+    TRACE_(csperf)( "ticks=%llu event=gpu_snapshot identity=%s control=%s target_epoch=%s "
+                   "begin=%llu imported=%llu blit=%llu copied=%llu flushed=%llu "
+                   "width=%u height=%u pixmap=%lx fence=%u result=%d\n", client_surface_perf_time(),
+                   wine_dbgstr_longlong( __atomic_load_n( &base->client->identity, __ATOMIC_ACQUIRE ) ),
+                   wine_dbgstr_longlong( present->handoff_control ), wine_dbgstr_longlong( present->target_epoch ),
+                   begin, imported, blit, copied, flushed, source->width, source->height,
+                   frame->pixmap, !!present->completion.wait, ret );
     return ret;
 }
 

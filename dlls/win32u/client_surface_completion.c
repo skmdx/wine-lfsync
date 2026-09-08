@@ -21,6 +21,15 @@
 #include "wine/debug.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(win);
+WINE_DECLARE_DEBUG_CHANNEL(csperf);
+
+static unsigned long long client_surface_perf_time(void)
+{
+    LARGE_INTEGER counter;
+
+    NtQueryPerformanceCounter( &counter, NULL );
+    return counter.QuadPart;
+}
 
 struct client_surface_completion_job
 {
@@ -78,12 +87,15 @@ static struct client_surface_completion_result client_surface_poll_present_compl
 {
     struct client_surface_completion_result result = client_surface_completion_result( CLIENT_SURFACE_COMPLETION_FAILED );
     struct client_surface_target target;
+    unsigned long long begin = TRACE_ON(csperf) ? client_surface_perf_time() : 0;
+    unsigned long long native = 0, end;
 
     client_surface_get_target( surface, &target );
     /* The owner may still be preparing a scene. That prevents publication,
      * but does not invalidate a completion for this unchanged native target. */
     if (target.valid && present->target_epoch == target.epoch)
     {
+        native = begin ? client_surface_perf_time() : 0;
         if (present->completion.wait)
             result = present->completion.wait( present->completion.context, timeout );
         else
@@ -93,6 +105,7 @@ static struct client_surface_completion_result client_surface_poll_present_compl
             result = surface->backend->completion->wait( surface, timeout );
         }
     }
+    end = begin ? client_surface_perf_time() : 0;
     assert( result.worker != CLIENT_SURFACE_COMPLETION_WORKER_RETIRE ||
             result.status == CLIENT_SURFACE_COMPLETION_FAILED );
     TRACE( "event=completion_poll surface=%p serial=%s target=%s completion=%p capture=%p "
@@ -101,6 +114,11 @@ static struct client_surface_completion_result client_surface_poll_present_compl
            present->completion.context, present->capture.context, wine_dbgstr_longlong( present->handoff_control ),
            present->submission_time, (unsigned int)InterlockedCompareExchange( &surface->external_completion_count, 0, 0 ),
            result.status, result.worker, timeout );
+    TRACE_(csperf)( "ticks=%llu event=completion_poll identity=%s serial=%s control=%s target_epoch=%s "
+                   "begin=%llu native=%llu status=%u worker=%u timeout=%u\n", end,
+                   wine_dbgstr_longlong( client_surface_get_identity( surface ) ),
+                   wine_dbgstr_longlong( present->serial ), wine_dbgstr_longlong( present->handoff_control ),
+                   wine_dbgstr_longlong( present->target_epoch ), begin, native, result.status, result.worker, timeout );
     return result;
 }
 
@@ -244,6 +262,9 @@ static void finish_deferred_present( struct client_surface *surface, struct clie
 {
     struct client_surface_completion completion = present->completion;
     struct client_surface_capture capture = present->capture;
+    UINT64 control = present->handoff_control;
+    unsigned long long begin = TRACE_ON(csperf) ? client_surface_perf_time() : 0;
+    unsigned long long completed, released;
 
     TRACE( "event=completion_finish surface=%p serial=%s status=%u worker=%u polled=%u\n",
            surface, wine_dbgstr_longlong( present->serial ), result.status, result.worker, polled );
@@ -252,13 +273,20 @@ static void finish_deferred_present( struct client_surface *surface, struct clie
         present->result == CLIENT_SURFACE_FRAME_PENDING)
         WARN( "deferred client-surface composition did not complete for %s\n",
               debugstr_client_surface( surface ) );
+    completed = begin ? client_surface_perf_time() : 0;
     /* The FIFO execution lease includes capture, publication and both final
      * releases. Return the fence reference before the image reservation. A
      * failed or cancelled frame cannot capture, but still retires both. */
     completion.release( completion.context );
     if (capture.release) capture.release( capture.context );
+    released = begin ? client_surface_perf_time() : 0;
     TRACE( "event=completion_release surface=%p serial=%s completion=%p capture=%p\n",
            surface, wine_dbgstr_longlong( present->serial ), completion.context, capture.context );
+    TRACE_(csperf)( "ticks=%llu event=completion_finish identity=%s serial=%s control=%s "
+                   "begin=%llu completed=%llu status=%u worker=%u polled=%u\n", released,
+                   wine_dbgstr_longlong( client_surface_get_identity( surface ) ),
+                   wine_dbgstr_longlong( present->serial ), wine_dbgstr_longlong( control ),
+                   begin, completed, result.status, result.worker, polled );
 }
 
 static struct client_surface_completion_result poll_completion_job( struct client_surface *surface,
@@ -456,6 +484,11 @@ static void queue_completion_job_locked( struct client_surface *surface,
 
     list_add_tail( &surface->completion_queue, &job->entry );
     if (empty) queue_ready_surface_locked( surface );
+    TRACE_(csperf)( "ticks=%llu event=completion_queue identity=%s serial=%s control=%s target_epoch=%s "
+                   "deferred=%u inline=%u head=%u\n", client_surface_perf_time(),
+                   wine_dbgstr_longlong( client_surface_get_identity( surface ) ),
+                   wine_dbgstr_longlong( job->present.serial ), wine_dbgstr_longlong( job->present.handoff_control ),
+                   wine_dbgstr_longlong( job->present.target_epoch ), job->deferred, !job->allocated, empty );
     TRACE( "event=completion_enqueue surface=%p serial=%s completion=%p capture=%p deferred=%u inline=%u\n",
            surface, wine_dbgstr_longlong( job->present.serial ), job->present.completion.context,
            job->present.capture.context, job->deferred, !job->allocated );
