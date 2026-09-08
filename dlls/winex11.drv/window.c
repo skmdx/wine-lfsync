@@ -3590,9 +3590,14 @@ BOOL X11DRV_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_hint, UIN
     }
 
     /* Snapshot installs its final checkpoint and target itself. A retiring
-     * pool only needs the existing lifetime drain, not a preceding refresh. */
+     * pool only needs the existing lifetime drain, not a preceding refresh.
+     * A successful BEGIN_UPDATE holds this target quiescent through the
+     * native changes below. Ordinary updates can install their final extent
+     * and scene in END_UPDATE once, after its GUI-connection barrier. A
+     * publication still needs its target before reading the backing. */
     if (data->client_surface_backing && !enable_client_surface_backing &&
-        !disable_client_surface_backing && !prepare_client_surface)
+        !disable_client_surface_backing && !prepare_client_surface &&
+        (!owner_update || publish_client_surface))
         X11DRV_client_surface_backing_ensure( data );
     if (enable_client_surface_backing || disable_client_surface_backing)
     {
