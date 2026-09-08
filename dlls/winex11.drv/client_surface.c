@@ -152,7 +152,15 @@ static void x11drv_client_surface_detach( struct client_surface *client )
 static unsigned int client_surface_update_geometry( HWND hwnd, struct x11drv_client_surface *surface,
                                                     const struct client_surface_target *target )
 {
-    RECT rect = surface->client.raw ? target->monitor_rect : target->virtual_rect;
+    BOOL native = usexcomposite && !surface->direct_snapshot;
+    /* A private offscreen window is also the generic GL resolve/gamma scratch
+     * buffer. It must contain the whole virtual image before snapshot capture,
+     * including when the native destination is smaller. DIRECT and named
+     * native sources still use monitor pixels. This update precedes attach
+     * and the actual Present, so a DIRECT transition restores native geometry
+     * before any pixels or publication proof can be submitted. */
+    RECT rect = surface->client.raw && (native || target->mode == CLIENT_SURFACE_PRESENTATION_DIRECT)
+                ? target->monitor_rect : target->virtual_rect;
     XWindowChanges changes = surface->changes;
     int mask = 0;
 

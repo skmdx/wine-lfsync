@@ -212,6 +212,7 @@ struct gl_drawable
     struct opengl_drawable         base;
     GLXDrawable                    drawable;     /* drawable for rendering with GL */
     BOOL                           gpu_snapshot_failed;
+    LONG64                         egl_geometry_epoch; /* last native target observed by EGL */
     struct glx_completion_context *completion;
 };
 
@@ -2252,6 +2253,56 @@ static BOOL blit_client_surface_framebuffer( struct opengl_drawable *base,
     return ret;
 }
 
+static BOOL refresh_prepared_egl_surface( struct opengl_drawable *base,
+                                          const struct client_surface_frame *present )
+{
+    struct x11drv_client_surface *surface = impl_from_client_surface( base->client );
+    struct gl_drawable *gl = impl_from_opengl_drawable( base );
+    struct client_surface_target target;
+    EGLint width, height;
+    BOOL queried, current;
+    SIZE size;
+
+    pthread_mutex_lock( &base->client->present_lock );
+    target = base->client->target;
+    size = (SIZE){surface->changes.width, surface->changes.height};
+    pthread_mutex_unlock( &base->client->present_lock );
+    /* The existing blit/capture checks discard stale targets. Never cache a
+     * native observation for one of those frames. */
+    if (!target.valid || target.epoch != present->target_epoch) return TRUE;
+    if (ReadAcquire64( &gl->egl_geometry_epoch ) == target.epoch) return TRUE;
+
+    /* The internal context was made current before prepare_present could
+     * resize a private scratch window or attach DIRECT. A logical rectangle
+     * need not change, so GL_FLUSH_UPDATED alone cannot invalidate EGL's old
+     * default buffers. Query after the native geometry update and before any
+     * blit. This observes the existing target epoch, not a new lifetime. */
+    queried = funcs->p_eglQuerySurface( egl->display, base->surface, EGL_WIDTH, &width ) &&
+              funcs->p_eglQuerySurface( egl->display, base->surface, EGL_HEIGHT, &height );
+    pthread_mutex_lock( &base->client->present_lock );
+    current = base->client->target.valid && base->client->target.epoch == target.epoch;
+    pthread_mutex_unlock( &base->client->present_lock );
+    /* A concurrent resize can make the query observe a newer native target.
+     * Leave that frame to the existing SUPERSEDED checks without changing
+     * its native swap result or caching this obsolete observation. */
+    if (!current) return TRUE;
+    if (!queried)
+    {
+        ERR( "Failed to refresh prepared EGL surface %s\n", debugstr_opengl_drawable( base ) );
+        return FALSE;
+    }
+    if (width != size.cx || height != size.cy)
+    {
+        WARN( "Prepared EGL surface %s is %dx%d, expected %dx%d\n", debugstr_opengl_drawable( base ),
+              width, height, (int)size.cx, (int)size.cy );
+        return FALSE;
+    }
+    WriteRelease64( &gl->egl_geometry_epoch, target.epoch );
+    TRACE( "Refreshed prepared EGL surface %s target %s to %dx%d\n",
+           debugstr_opengl_drawable( base ), wine_dbgstr_longlong( target.epoch ), width, height );
+    return TRUE;
+}
+
 static BOOL x11drv_egl_surface_present( struct opengl_drawable *base, GLuint framebuffer,
                                        struct opengl_drawable *source, opengl_drawable_blit_func blit )
 {
@@ -2280,6 +2331,12 @@ static BOOL x11drv_egl_surface_present( struct opengl_drawable *base, GLuint fra
         frame_id = 0;
     }
     client_surface_begin_present( base->client );
+    if ((blit || framebuffer) && !refresh_prepared_egl_surface( base, &present ))
+    {
+        client_surface_submit_present( base->client, &present );
+        client_surface_complete_present( base->client, &present, FALSE, FALSE, expected_size, 0 );
+        return FALSE;
+    }
     if (blit && !blit_client_surface_output( base, &present, source, blit,
                    (!usexcomposite || surface->direct_snapshot) &&
                    present.completion.kind == CLIENT_SURFACE_COMPLETION_EXACT ))
