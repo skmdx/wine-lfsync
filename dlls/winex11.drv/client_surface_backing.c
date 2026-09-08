@@ -470,10 +470,14 @@ static BOOL client_surface_copy_on_compositor_unchecked(
     {
         XCopyArea( display, source, destination, gc, source_x, source_y,
                    width, height, destination_x, destination_y );
+        TRACE_(csperf)( "ticks=%llu event=xlib_copy_request source=%lx destination=%lx width=%u height=%u clipped=0 route=restore\n",
+                       client_surface_perf_time(), source, destination, width, height );
         XFreeGC( display, gc );
     }
     XSync( display, False );
     X11DRV_check_error();
+    TRACE_(csperf)( "ticks=%llu event=xlib_restore_checked source=%lx destination=%lx copied=%u error=%d sync_calls=1\n",
+                   client_surface_perf_time(), source, destination, !!gc, error );
     return gc && !error;
 }
 
@@ -894,6 +898,8 @@ static void wake_client_surface_compositor(void)
         ret = send( client_surface_compositor_notify[1], &value, sizeof(value), 0 );
 #endif
     while (ret < 0 && errno == EINTR);
+    TRACE_(csperf)( "ticks=%llu event=actor_signal fd=%d result=%d\n",
+                   client_surface_perf_time(), client_surface_compositor_notify[1], ret );
 }
 
 static void client_surface_handoff_wake_release( struct client_surface_handoff_shared *shared )
@@ -901,6 +907,8 @@ static void client_surface_handoff_wake_release( struct client_surface_handoff_s
     if (!__atomic_exchange_n( &shared->release_parked, 0, __ATOMIC_ACQ_REL )) return;
     __atomic_add_fetch( &shared->release_sequence, 1, __ATOMIC_RELEASE );
     client_surface_handoff_futex_wake( &shared->release_sequence );
+    TRACE_(csperf)( "ticks=%llu event=release_signal mapping=%s\n",
+                   client_surface_perf_time(), wine_dbgstr_longlong( shared->mapping_id ) );
 }
 
 static void finish_client_surface_compositor_assembly(
@@ -1932,6 +1940,8 @@ static BOOL validate_client_surface_pixmap( Pixmap pixmap, unsigned int min_widt
                         &width, &height, &border, &pixmap_depth );
     XSync( client_surface_compositor_display, False );
     X11DRV_check_error();
+    TRACE_(csperf)( "ticks=%llu event=source_geometry pixmap=%lx result=%u error=%d geometry_calls=1 sync_calls=1\n",
+                   client_surface_perf_time(), pixmap, ret, error );
     if (!ret || error || width < min_width || height < min_height) return FALSE;
     *source_depth = pixmap_depth;
     return TRUE;
@@ -2027,6 +2037,13 @@ static BOOL cache_client_surface_handoff( struct client_surface_compositor_bindi
                             0, 0, frame.width, frame.height, 0, 0 );
     XSync( display, False );
     X11DRV_check_error();
+    TRACE_(csperf)( "ticks=%llu event=cache_native_copy identity=%s cookie=%s token=%s sequence=%s "
+                   "source=%lx destination=%lx width=%u height=%u depth=%u pixel_bits=%u copied=%u error=%d sync_calls=1\n",
+                   client_surface_perf_time(), wine_dbgstr_longlong( binding->identity ),
+                   wine_dbgstr_longlong( binding->cookie ), wine_dbgstr_longlong( control ),
+                   wine_dbgstr_longlong( frame.source_sequence ), source, image->pixmap,
+                   frame.width, frame.height, depth,
+                   pixmap_formats[depth] ? pixmap_formats[depth]->bits_per_pixel : 0, !!image->gc, error );
     if (!image->gc || error)
     {
         free_client_surface_cached_image( image );
@@ -2295,22 +2312,33 @@ static BOOL copy_client_surface_handoff_to_frame(
         XSetClipMask( display, gc, None );
         XSetClipOrigin( display, gc, 0, 0 );
         if (needs_catchup)
+        {
             XCopyArea( display, target->latest, frame->pixmap, gc,
                        catchup.left, catchup.top,
                        catchup.right - catchup.left, catchup.bottom - catchup.top,
                        catchup.left, catchup.top );
+            TRACE_(csperf)( "ticks=%llu event=xlib_copy_request source=%lx destination=%lx width=%u height=%u clipped=0 route=checkpoint\n",
+                           client_surface_perf_time(), target->latest, frame->pixmap,
+                           catchup.right - catchup.left, catchup.bottom - catchup.top );
+        }
         if (clip_count)
         {
             if (clipped)
                 XSetClipRectangles( display, gc, plan->destination.left,
                                     plan->destination.top, (XRectangle *)clips, clip_count, YXBanded );
             if (overlay_copied && native)
+            {
                 XCopyArea( display, source, frame->pixmap, gc,
                            plan->source_damage.left, plan->source_damage.top,
                            plan->source_damage.right - plan->source_damage.left,
                            plan->source_damage.bottom - plan->source_damage.top,
                            plan->destination.left + plan->source_damage.left,
                            plan->destination.top + plan->source_damage.top );
+                TRACE_(csperf)( "ticks=%llu event=xlib_copy_request source=%lx destination=%lx width=%u height=%u clipped=%u route=overlay\n",
+                               client_surface_perf_time(), source, frame->pixmap,
+                               plan->source_damage.right - plan->source_damage.left,
+                               plan->source_damage.bottom - plan->source_damage.top, clipped );
+            }
             else if (overlay_copied)
             {
                 overlay_copied = X11DRV_XRender_CopyClientSurface(
@@ -2328,6 +2356,8 @@ static BOOL copy_client_surface_handoff_to_frame(
     {
         XSync( display, False );
         X11DRV_check_error();
+        TRACE_(csperf)( "ticks=%llu event=xlib_output_checked destination=%lx copied=%u error=%d sync_calls=1\n",
+                       client_surface_perf_time(), frame->pixmap, !!gc && overlay_copied, error );
     }
     if (!gc || error || !overlay_copied)
     {

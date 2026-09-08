@@ -22,6 +22,7 @@
 #include "wine/debug.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(win);
+WINE_DECLARE_DEBUG_CHANNEL(csperf);
 
 static const struct client_surface_backend default_client_surface_backend;
 
@@ -38,6 +39,21 @@ static UINT64 unused_surface_bytes;
 #define CLIENT_SURFACE_IMAGE_MEMORY_LIMIT ((UINT64)1024 * 1024 * 1024)
 static pthread_mutex_t image_memory_lock = PTHREAD_MUTEX_INITIALIZER;
 static UINT64 image_memory[CLIENT_SURFACE_MEMORY_CLASS_COUNT], image_memory_total;
+
+static void trace_client_surface_memory( const char *event, enum client_surface_memory_class type,
+                                         UINT64 bytes, BOOL accepted )
+{
+    LARGE_INTEGER counter;
+
+    if (!TRACE_ON(csperf)) return;
+    NtQueryPerformanceCounter( &counter, NULL );
+    TRACE_(csperf)( "ticks=%llu event=%s class=%u bytes=%llu accepted=%u source=%llu staging=%llu output=%llu total=%llu\n",
+                   (unsigned long long)counter.QuadPart, event, type, (unsigned long long)bytes, accepted,
+                   (unsigned long long)image_memory[CLIENT_SURFACE_MEMORY_SOURCE],
+                   (unsigned long long)image_memory[CLIENT_SURFACE_MEMORY_STAGING],
+                   (unsigned long long)image_memory[CLIENT_SURFACE_MEMORY_OUTPUT],
+                   (unsigned long long)image_memory_total );
+}
 
 BOOL client_surface_reserve_memory( enum client_surface_memory_class type, UINT64 bytes )
 {
@@ -56,6 +72,7 @@ BOOL client_surface_reserve_memory( enum client_surface_memory_class type, UINT6
            wine_dbgstr_longlong( image_memory[CLIENT_SURFACE_MEMORY_SOURCE] ),
            wine_dbgstr_longlong( image_memory[CLIENT_SURFACE_MEMORY_STAGING] ),
            wine_dbgstr_longlong( image_memory[CLIENT_SURFACE_MEMORY_OUTPUT] ) );
+    trace_client_surface_memory( "image_reserve", type, bytes, ret );
     pthread_mutex_unlock( &image_memory_lock );
     return ret;
 }
@@ -67,6 +84,7 @@ void client_surface_release_memory( enum client_surface_memory_class type, UINT6
     assert( image_memory[type] >= bytes && image_memory_total >= bytes );
     image_memory[type] -= bytes;
     image_memory_total -= bytes;
+    trace_client_surface_memory( "image_release", type, bytes, TRUE );
     pthread_mutex_unlock( &image_memory_lock );
 }
 

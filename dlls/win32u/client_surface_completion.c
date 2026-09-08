@@ -15,6 +15,10 @@
 
 #include <assert.h>
 #include <time.h>
+#ifdef __linux__
+#include <unistd.h>
+#include <sys/syscall.h>
+#endif
 
 #include "ntstatus.h"
 #include "client_surface.h"
@@ -29,6 +33,18 @@ static unsigned long long client_surface_perf_time(void)
 
     NtQueryPerformanceCounter( &counter, NULL );
     return counter.QuadPart;
+}
+
+static void trace_client_surface_worker( const char *event, unsigned int slot, BOOL retire )
+{
+#ifdef __linux__
+    TRACE_(csperf)( "ticks=%llu event=%s slot=%u retire=%u native_pid=%lu native_tid=%lu\n",
+                   client_surface_perf_time(), event, slot, retire,
+                   (unsigned long)getpid(), (unsigned long)syscall( SYS_gettid ) );
+#else
+    TRACE_(csperf)( "ticks=%llu event=%s slot=%u retire=%u\n",
+                   client_surface_perf_time(), event, slot, retire );
+#endif
 }
 
 struct client_surface_completion_job
@@ -431,6 +447,7 @@ static void client_surface_completion_thread( void *context )
         pthread_cond_wait( &completion_executor_cond, &completion_executor_lock );
     pthread_mutex_unlock( &completion_executor_lock );
     TRACE( "event=completion_executor_start slot=%u\n", (unsigned int)(worker - completion_workers) );
+    trace_client_surface_worker( "executor_start", worker - completion_workers, FALSE );
     for (;;)
     {
         start_client_surface_completion_thread( NULL );
@@ -448,6 +465,7 @@ static void client_surface_completion_thread( void *context )
                 pthread_mutex_unlock( &completion_executor_lock );
                 TRACE( "event=completion_executor_exit slot=%u retire=0\n",
                        (unsigned int)(worker - completion_workers) );
+                trace_client_surface_worker( "executor_exit", worker - completion_workers, FALSE );
                 return;
             }
             else delay = min( delay, CLIENT_SURFACE_COMPLETION_WORKER_IDLE_TIMEOUT_MS - (now - idle_started) );
@@ -472,6 +490,7 @@ static void client_surface_completion_thread( void *context )
             if (!start_client_surface_completion_thread( NULL )) cancel_ready_completion_jobs();
             TRACE( "event=completion_executor_exit slot=%u retire=1\n",
                    (unsigned int)(worker - completion_workers) );
+            trace_client_surface_worker( "executor_exit", worker - completion_workers, TRUE );
             return;
         }
     }

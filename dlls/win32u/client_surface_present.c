@@ -82,6 +82,9 @@ static void client_surface_handoff_wake_ready( struct client_surface *surface )
         ret = send( surface->handoff_ready_fd, &value, sizeof(value), 0 );
 #endif
     while (ret < 0 && errno == EINTR);
+    TRACE_(csperf)( "ticks=%llu event=ready_signal identity=%s cookie=%s fd=%d result=%d\n",
+                   client_surface_perf_time(), wine_dbgstr_longlong( client_surface_get_identity( surface ) ),
+                   wine_dbgstr_longlong( surface->handoff_cookie ), surface->handoff_ready_fd, ret );
 }
 
 static void client_surface_handoff_wait_sequence( LONG *address, LONG sequence, DWORD timeout )
@@ -538,11 +541,14 @@ BOOL client_surface_publish_handoff_locked( struct client_surface *surface,
         __atomic_store_n( &source->reservation, 0, __ATOMIC_RELEASE );
         ready_time = TRACE_ON(csperf) ? client_surface_perf_time() : 0;
         __atomic_store_n( &channel->producer_sequence, produced + 1, __ATOMIC_RELEASE );
-        TRACE_(csperf)( "ticks=%llu event=ready identity=%s cookie=%s token=%s sequence=%s target_epoch=%s\n",
+        TRACE_(csperf)( "ticks=%llu event=ready identity=%s cookie=%s token=%s sequence=%s target_epoch=%s "
+                       "image=%s width=%u height=%u flags=%x damage=%s damage_base=%s\n",
                        ready_time, wine_dbgstr_longlong( client_surface_get_identity( surface ) ),
                        wine_dbgstr_longlong( surface->handoff_cookie ),
                        wine_dbgstr_longlong( produced + 1 ), wine_dbgstr_longlong( frame->frame_id ),
-                       wine_dbgstr_longlong( frame->target_epoch ) );
+                       wine_dbgstr_longlong( frame->target_epoch ), wine_dbgstr_longlong( frame->image ),
+                       frame->size.cx, frame->size.cy, slot->flags, wine_dbgstr_rect( &slot->damage ),
+                       wine_dbgstr_longlong( slot->damage_base_sequence ) );
         surface->composed_serial = present->serial;
         InterlockedExchange( &surface->content_valid, TRUE );
     }

@@ -22,6 +22,7 @@
 #include "client_surface_xcb.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(x11drv);
+WINE_DECLARE_DEBUG_CHANNEL(csperf);
 
 #if defined(SONAME_LIBX11_XCB) && defined(SONAME_LIBXCB) && defined(SONAME_LIBXCB_PRESENT)
 
@@ -43,6 +44,14 @@ static typeof(xcb_copy_area_checked) *pxcb_copy_area_checked;
 static typeof(xcb_free_gc_checked) *pxcb_free_gc_checked;
 static pthread_once_t client_surface_xcb_once = PTHREAD_ONCE_INIT;
 static BOOL client_surface_xcb_initialized;
+
+static unsigned long long client_surface_xcb_perf_time(void)
+{
+    LARGE_INTEGER counter;
+
+    NtQueryPerformanceCounter( &counter, NULL );
+    return counter.QuadPart;
+}
 
 static void client_surface_xcb_init(void)
 {
@@ -86,6 +95,8 @@ void client_surface_xcb_flush( Display *display, struct client_surface_xcb_reque
 
     request->barrier = pxcb_get_input_focus( connection ).sequence;
     pxcb_flush( connection );
+    TRACE_(csperf)( "ticks=%llu event=xcb_barrier display=%p barrier=%u\n",
+                   client_surface_xcb_perf_time(), display, request->barrier );
 }
 
 BOOL client_surface_xcb_present( Display *display, Window window, Pixmap pixmap,
@@ -132,10 +143,17 @@ BOOL client_surface_xcb_copy( Display *display, Pixmap source, Pixmap destinatio
     request->cookies[request->count++] = pxcb_change_gc_checked( connection, *gc,
         XCB_GC_CLIP_MASK, &value ).sequence;
     if (checkpoint)
+    {
         request->cookies[request->count++] = pxcb_copy_area_checked( connection, checkpoint,
             destination, *gc, catchup->left, catchup->top,
             catchup->left, catchup->top, catchup->right - catchup->left,
             catchup->bottom - catchup->top ).sequence;
+        TRACE_(csperf)( "ticks=%llu event=xcb_copy_request display=%p cookie=%u source=%x destination=%x "
+                       "width=%u height=%u checkpoint=1 clipped=0\n",
+                       client_surface_xcb_perf_time(), display, request->cookies[request->count - 1],
+                       (unsigned int)checkpoint, (unsigned int)destination,
+                       catchup->right - catchup->left, catchup->bottom - catchup->top );
+    }
     if (clip_count)
     {
         if (clipped)
@@ -146,6 +164,11 @@ BOOL client_surface_xcb_copy( Display *display, Pixmap source, Pixmap destinatio
             destination, *gc, damage->left, damage->top,
             placement->left + damage->left, placement->top + damage->top,
             damage->right - damage->left, damage->bottom - damage->top ).sequence;
+        TRACE_(csperf)( "ticks=%llu event=xcb_copy_request display=%p cookie=%u source=%x destination=%x "
+                       "width=%u height=%u checkpoint=0 clipped=%u\n",
+                       client_surface_xcb_perf_time(), display, request->cookies[request->count - 1],
+                       (unsigned int)source, (unsigned int)destination,
+                       damage->right - damage->left, damage->bottom - damage->top, clipped );
     }
     assert( request->count <= ARRAY_SIZE(request->cookies) );
     if (flush) client_surface_xcb_flush( display, request );
@@ -184,6 +207,8 @@ BOOL client_surface_xcb_poll_batch( Display *display, struct client_surface_xcb_
     assert( count );
     if (!pxcb_poll_for_reply( connection, requests[count - 1].barrier, &reply, &error )) return FALSE;
     *success = reply && !error;
+    TRACE_(csperf)( "ticks=%llu event=xcb_barrier_reply display=%p barrier=%u success=%u\n",
+                   client_surface_xcb_perf_time(), display, requests[count - 1].barrier, *success );
     free( reply );
     free( error );
     /* A later reply has arrived: request_check cannot need another sync.
@@ -197,6 +222,8 @@ BOOL client_surface_xcb_poll_batch( Display *display, struct client_surface_xcb_
             xcb_void_cookie_t cookie = {request->cookies[i]};
 
             error = pxcb_request_check( connection, cookie );
+            TRACE_(csperf)( "ticks=%llu event=xcb_checked display=%p cookie=%u error=%u\n",
+                           client_surface_xcb_perf_time(), display, cookie.sequence, error ? error->error_code : 0 );
             if (error)
             {
                 WARN( "owner request %u failed with X error %u opcode %u:%u\n",
