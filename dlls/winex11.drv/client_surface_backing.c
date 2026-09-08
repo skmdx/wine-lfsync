@@ -108,6 +108,16 @@ static void trace_client_surface_source( const char *event,
                    wine_dbgstr_longlong( sequence ), window, pixmap, success );
 }
 
+/* A queued native request is not a committed source checkpoint. Newer cache
+ * reception may race an asynchronous copy, and must keep its replay dirty. */
+static void note_client_surface_source_copy( struct client_surface_compositor_binding *binding,
+                                             UINT64 epoch, UINT64 sequence )
+{
+    binding->source_epoch = epoch;
+    binding->source_sequence = sequence;
+    if (binding->latest_frame.source_sequence == sequence) binding->replay_epoch = epoch;
+}
+
 struct client_surface_scene_layout
 {
     HWND window;
@@ -176,6 +186,7 @@ struct client_surface_compositor_frame
     unsigned int copy_index;
     UINT64 copy_control;
     UINT64 copy_sequence;
+    UINT64 copy_epoch;
     BOOL copy_replay;
     RECT copy_damage;
     struct client_surface_xcb_request copy_request;
@@ -726,12 +737,20 @@ static struct client_surface_compositor_frame *get_client_surface_compositor_fra
     unsigned int i;
 
     process_client_surface_present_events();
-    if (target->mailbox_pending) return &target->frames[target->mailbox_frame];
+    /* A reserved scene's complete image owns its publication ticket until
+     * submission. New source images remain in the independent owner cache. */
+    if (target->mailbox_pending && target->mailbox_publish_generation) return NULL;
     for (i = 0; i < ARRAY_SIZE(target->frames); ++i)
     {
         unsigned int index = (target->next_frame + i) % ARRAY_SIZE(target->frames);
 
-        if (target->frames[index].serial ||
+        /* Neither a failed copy nor a rejected publication may damage the
+         * native published image or the complete catchup checkpoint. When
+         * all three images are owned, keep coalescing in the source caches;
+         * the existing two Present credits and mailbox still make progress. */
+        if (target->frames[index].serial || target->frames[index].pixmap == target->latest ||
+            target->frames[index].pixmap == target->published ||
+            (target->mailbox_pending && index == target->mailbox_frame) ||
             (target->assembly_pending && index == target->assembly_frame)) continue;
         target->next_frame = (index + 1) % ARRAY_SIZE(target->frames);
         return &target->frames[index];
@@ -2286,7 +2305,13 @@ static BOOL copy_client_surface_handoff_to_frame(
     }
     if (!gc || error || !overlay_copied)
     {
-        if (!batch) discard_client_surface_compositor_gc( frame );
+        if (!batch)
+        {
+            /* A native sequence may have copied only part of this private
+             * image. Its old journal revision cannot describe those bytes. */
+            frame->revision = 0;
+            discard_client_surface_compositor_gc( frame );
+        }
         return FALSE;
     }
     /* A successful full source also consumes the checkpoint. Later partial
@@ -2438,6 +2463,7 @@ static void complete_client_surface_copy_batch( struct client_surface_copy_batch
         {
             struct client_surface_handoff_receipt *receipt = &target->receipts[binding->scene_index];
 
+            note_client_surface_source_copy( binding, copy->epoch, copy->sequence );
             if (!receipt->source_generation) ++target->received;
             *receipt = (struct client_surface_handoff_receipt){
                 .handle = wine_server_user_handle( binding->window ),
@@ -2571,6 +2597,7 @@ static BOOL process_client_surface_copy_replies(void)
         }
         if (success)
         {
+            note_client_surface_source_copy( binding, frame->copy_epoch, frame->copy_sequence );
             note_client_surface_compositor_damage( target, frame, &frame->copy_damage );
             publish_client_surface_handoff_frame( target, frame, NULL );
         }
@@ -2847,9 +2874,8 @@ retry:
                                                        slot, &plan, &damage, batch, &pending );
         if (copied)
         {
-            binding->source_epoch = plan.epoch;
-            binding->source_sequence = slot->source_sequence;
-            binding->replay_epoch = plan.epoch;
+            if (!pending && !batch)
+                note_client_surface_source_copy( binding, plan.epoch, slot->source_sequence );
             frame->width = target->window_width;
             frame->height = target->window_height;
         }
@@ -2860,6 +2886,7 @@ retry:
             frame->copy_index = buffer_index;
             frame->copy_control = control;
             frame->copy_sequence = slot->source_sequence;
+            frame->copy_epoch = plan.epoch;
             frame->copy_replay = replay;
             frame->copy_damage = damage;
             return TRUE;
@@ -2869,7 +2896,7 @@ retry:
             if (!copied) client_surface_copy_batch.error = 1;
             if (!copied || client_surface_copy_batch.count == CLIENT_SURFACE_COPY_BATCH_SIZE)
                 flush_client_surface_copy_batch();
-            return TRUE;
+            return copied;
         }
         else if (copied)
         {
@@ -2883,7 +2910,7 @@ release:
     /* A resized or otherwise incompatible image is still valid storage.
      * Metadata rejection leaves it returned; a real copy/import error
      * still retires the binding through the normal failure path. */
-    if (replay) binding->replay_epoch = target->scene.epoch;
+    if (replay && (copied || dropped)) binding->replay_epoch = target->scene.epoch;
     if (!copied)
         trace_client_surface_source( "discard", binding, control, slot->source_sequence,
                                      target->window, frame ? frame->pixmap : 0, dropped );
@@ -2956,7 +2983,11 @@ static BOOL process_client_surface_handoffs(void)
                                                       consumed + 1 ))
                     {
                         binding->replay_epoch = 0;
-                        if (target) target->replay_member = min( target->replay_member, binding->scene_index );
+                        /* A preceding member may still have a valid cache
+                         * whose earlier private copy failed. An actual new
+                         * source notification retries those dirty members
+                         * too; a failed reply alone does not restart them. */
+                        if (target) target->replay_member = 0;
                     }
                     --budget;
                     progressed = TRUE;
@@ -3017,8 +3048,13 @@ static BOOL replay_client_surface_scene_sources(void)
 
             if (binding->latest_image.pixmap && binding->replay_epoch != target->scene.epoch)
             {
-                compose_client_surface_cached_frame( binding );
-                if (binding->latest_image.pixmap && binding->replay_epoch != target->scene.epoch) break;
+                BOOL queued = compose_client_surface_cached_frame( binding );
+
+                /* Accepted asynchronous copies advance this bounded scan,
+                 * but commit their source checkpoint only with their real
+                 * reply. A newer source resets the scan above. */
+                if (!queued && binding->latest_image.pixmap &&
+                    binding->replay_epoch != target->scene.epoch) break;
             }
             ++target->replay_member;
             --budget;
