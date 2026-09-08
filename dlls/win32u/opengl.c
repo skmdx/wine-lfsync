@@ -2642,6 +2642,7 @@ static BOOL win32u_wglBindTexImageARB( HPBUFFERARB client_pbuffer, int buffer )
     struct pbuffer *pbuffer = pbuffer_from_client_pbuffer( client_pbuffer );
     int prev_texture = 0, format = win32u_wglGetPixelFormat( pbuffer->hdc );
     struct wgl_pixel_format desc;
+    BOOL empty = FALSE;
     GLenum source;
     UINT ret;
 
@@ -2667,18 +2668,24 @@ static BOOL win32u_wglBindTexImageARB( HPBUFFERARB client_pbuffer, int buffer )
         break;
     case WGL_FRONT_RIGHT_ARB:
         source = GL_FRONT_RIGHT;
+        empty = !(desc.pfd.dwFlags & PFD_STEREO);
         break;
     case WGL_BACK_LEFT_ARB:
         if (desc.pfd.dwFlags & PFD_STEREO) source = GL_BACK_LEFT;
         else source = GL_BACK;
+        empty = !(desc.pfd.dwFlags & PFD_DOUBLEBUFFER);
         break;
     case WGL_BACK_RIGHT_ARB:
         source = GL_BACK_RIGHT;
+        empty = (desc.pfd.dwFlags & (PFD_DOUBLEBUFFER | PFD_STEREO)) != (PFD_DOUBLEBUFFER | PFD_STEREO);
         break;
-    case WGL_AUX0_ARB: source = GL_AUX0; break;
-    case WGL_AUX1_ARB: source = GL_AUX1; break;
-    case WGL_AUX2_ARB: source = GL_AUX2; break;
-    case WGL_AUX3_ARB: source = GL_AUX3; break;
+    case WGL_AUX0_ARB:
+    case WGL_AUX1_ARB:
+    case WGL_AUX2_ARB:
+    case WGL_AUX3_ARB:
+        source = GL_AUX0 + buffer - WGL_AUX0_ARB;
+        empty = buffer - WGL_AUX0_ARB >= desc.pfd.cAuxBuffers;
+        break;
 
     case WGL_AUX4_ARB:
     case WGL_AUX5_ARB:
@@ -2706,10 +2713,40 @@ static BOOL win32u_wglBindTexImageARB( HPBUFFERARB client_pbuffer, int buffer )
     /* Make sure that the prev_texture is set as the current texture state isn't shared
      * between contexts. After that copy the pbuffer texture data. */
     funcs->p_glBindTexture( pbuffer->texture_target, prev_texture );
-    funcs->p_glBindFramebuffer( GL_READ_FRAMEBUFFER, 0 );
-    funcs->p_glReadBuffer( source );
-    funcs->p_glCopyTexImage2D( pbuffer->texture_target, 0, pbuffer->texture_format, 0, 0,
-                                        pbuffer->width, pbuffer->height, 0 );
+    if (empty)
+    {
+        /* A valid WGL buffer selector without storage binds an empty image.
+         * Passing it to glReadBuffer would leave an internal context error
+         * which makes a later, unrelated framebuffer allocation fail. */
+        TRACE( "Binding empty pbuffer image for source %#x, format %d\n", source, format );
+        /* The texture's internal format may be a floating-point NV format;
+         * RGBA describes the empty input, independently of that storage. */
+        switch (pbuffer->texture_target)
+        {
+        case GL_TEXTURE_1D:
+            funcs->p_glTexImage1D( GL_TEXTURE_1D, 0, pbuffer->texture_format, 0, 0,
+                                 GL_RGBA, GL_UNSIGNED_BYTE, NULL );
+            break;
+        case GL_TEXTURE_CUBE_MAP:
+            /* WGL binding defines the complete cube, not just the face
+             * selected for subsequent pbuffer rendering. */
+            for (GLenum face = GL_TEXTURE_CUBE_MAP_POSITIVE_X; face <= GL_TEXTURE_CUBE_MAP_NEGATIVE_Z; ++face)
+                funcs->p_glTexImage2D( face, 0, pbuffer->texture_format, 0, 0, 0,
+                                     GL_RGBA, GL_UNSIGNED_BYTE, NULL );
+            break;
+        default: /* GL_TEXTURE_2D or GL_TEXTURE_RECTANGLE_NV */
+            funcs->p_glTexImage2D( pbuffer->texture_target, 0, pbuffer->texture_format, 0, 0, 0,
+                                 GL_RGBA, GL_UNSIGNED_BYTE, NULL );
+            break;
+        }
+    }
+    else
+    {
+        funcs->p_glBindFramebuffer( GL_READ_FRAMEBUFFER, 0 );
+        funcs->p_glReadBuffer( source );
+        funcs->p_glCopyTexImage2D( pbuffer->texture_target, 0, pbuffer->texture_format, 0, 0,
+                                            pbuffer->width, pbuffer->height, 0 );
+    }
 
     make_client_context_current();
     return GL_TRUE;

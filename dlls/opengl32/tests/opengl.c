@@ -664,13 +664,13 @@ static void test_pbuffers( HDC old_hdc )
     ok( value == texture, "got %u\n", value );
     value = 0xdeadbeef;
     glGetTexLevelParameteriv( GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH, &value );
-    todo_wine ok( value == 0 || broken(value == 8) /* AMD */, "got %u\n", value );
+    ok( value == 0 || broken(value == 8) /* AMD */, "got %u\n", value );
     value = 0xdeadbeef;
     glGetTexLevelParameteriv( GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT, &value );
-    todo_wine ok( value == 0 || broken(value == 8) /* AMD */, "got %u\n", value );
+    ok( value == 0 || broken(value == 8) /* AMD */, "got %u\n", value );
     memset( pixels, 0xcd, sizeof(pixels) );
     glGetTexImage( GL_TEXTURE_2D, 0, GL_RGB, GL_UNSIGNED_BYTE, pixels );
-    todo_wine ok( pixels[0] == 0xcdcdcdcd || broken(pixels[0] == 0xa5a5a5a5) /* AMD */, "got %#x\n", pixels[0] );
+    ok( pixels[0] == 0xcdcdcdcd || broken(pixels[0] == 0xa5a5a5a5) /* AMD */, "got %#x\n", pixels[0] );
 
     ret = ext.wglReleaseTexImageARB( pbuffer, WGL_FRONT_RIGHT_ARB );
     ok( ret == 1 || broken(ret == 0) /* AMD */, "got %u\n", ret );
