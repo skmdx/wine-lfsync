@@ -121,6 +121,15 @@ struct client_surface *WAYLAND_CreateClientSurface(HWND hwnd, int pixel_format, 
 {
     struct wayland_client_surface *client;
     struct wl_region *empty_region;
+    DWORD process_id;
+
+    /* A subsurface and its parent must belong to the same Wayland connection.
+     * This backend cannot attach a client surface to another process's HWND. */
+    if (!NtUserGetWindowThread(hwnd, &process_id) || process_id != GetCurrentProcessId())
+    {
+        WARN("Cannot create a client surface for foreign window %p\n", hwnd);
+        return NULL;
+    }
 
     if (!(client = client_surface_create(sizeof(*client), &wayland_client_surface_backend, hwnd, pixel_format, raw))) return NULL;
 
