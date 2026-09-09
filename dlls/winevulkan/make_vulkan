@@ -321,6 +321,7 @@ STRUCT_CHAIN_CONVERSIONS = {
     "VkFenceCreateInfo": {},
     "VkSubmitInfo": {},
     "VkSubmitInfo2": {},
+    "VkSwapchainCreateInfoKHR": {},
 
     # Ignore to not confuse host loader.
     "VkDeviceCreateInfo": {"strip": ["VK_STRUCTURE_TYPE_LOADER_DEVICE_CREATE_INFO"]},

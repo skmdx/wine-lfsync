@@ -373,18 +373,23 @@ struct x11drv_client_source_frame *x11drv_client_surface_get_source(
     return frame;
 }
 
-static unsigned long snapshot_component( BYTE value, unsigned long mask )
+const struct x11drv_snapshot_format x11drv_snapshot_rgba8 = {4, 0xff, 0xff00, 0xff0000, 0xff000000};
+
+static unsigned long snapshot_component( unsigned int pixel, unsigned int source_mask, unsigned long mask )
 {
-    unsigned int shift = 0;
+    unsigned int shift = 0, source_shift = 0;
 
     if (!mask) return 0;
+    if (!source_mask) return mask; /* formats without alpha are opaque */
     while (!(mask & (1ul << shift))) ++shift;
-    return ((UINT64)value * (mask >> shift) / 255) << shift;
+    while (!(source_mask & (1u << source_shift))) ++source_shift;
+    return ((UINT64)((pixel & source_mask) >> source_shift) * (mask >> shift) /
+            (source_mask >> source_shift)) << shift;
 }
 
 BOOL x11drv_client_surface_snapshot( struct client_surface *client, const BYTE *pixels,
                                      unsigned int width, unsigned int height,
-                                     BOOL top_down, BOOL bgra )
+                                     BOOL top_down, const struct x11drv_snapshot_format *format )
 {
     struct x11drv_client_surface *surface = impl_from_client_surface( client );
     XImage *image;
@@ -420,7 +425,9 @@ BOOL x11drv_client_surface_snapshot( struct client_surface *client, const BYTE *
         }
         surface->snapshot_image = image;
     }
-    if (image->bits_per_pixel == 32 && image->byte_order == LSBFirst &&
+    if (format->texel_size == 4 && format->green_mask == 0xff00 &&
+        (format->red_mask == 0xff || format->red_mask == 0xff0000) &&
+        image->bits_per_pixel == 32 && image->byte_order == LSBFirst &&
         default_visual.red_mask == 0xff0000 && default_visual.green_mask == 0xff00 &&
         default_visual.blue_mask == 0xff)
     {
@@ -429,7 +436,7 @@ BOOL x11drv_client_surface_snapshot( struct client_surface *client, const BYTE *
             BYTE *row = (BYTE *)image->data +
                         (SIZE_T)(top_down ? y : height - y - 1) * image->bytes_per_line;
 
-            if (bgra)
+            if (format->red_mask == 0xff0000)
             {
                 memcpy( row, pixels, (SIZE_T)width * 4 );
                 pixels += (SIZE_T)width * 4;
@@ -447,12 +454,17 @@ BOOL x11drv_client_surface_snapshot( struct client_surface *client, const BYTE *
     }
     else
         for (y = 0; y < height; ++y)
-            for (x = 0; x < width; ++x, pixels += 4)
+            for (x = 0; x < width; ++x, pixels += format->texel_size)
+            {
+                unsigned int pixel = 0;
+
+                memcpy( &pixel, pixels, format->texel_size );
                 XPutPixel( image, x, top_down ? y : height - y - 1,
-                           snapshot_component( pixels[bgra ? 2 : 0], default_visual.red_mask ) |
-                           snapshot_component( pixels[1], default_visual.green_mask ) |
-                           snapshot_component( pixels[bgra ? 0 : 2], default_visual.blue_mask ) |
-                           snapshot_component( pixels[3], alpha ) );
+                           snapshot_component( pixel, format->red_mask, default_visual.red_mask ) |
+                           snapshot_component( pixel, format->green_mask, default_visual.green_mask ) |
+                           snapshot_component( pixel, format->blue_mask, default_visual.blue_mask ) |
+                           snapshot_component( pixel, format->alpha_mask, alpha ) );
+            }
 
     X11DRV_expect_error( gdi_display, client_surface_clip_error, &error );
     if (!surface->snapshot || surface->snapshot_size.cx != width || surface->snapshot_size.cy != height)

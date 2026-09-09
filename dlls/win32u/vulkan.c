@@ -201,7 +201,7 @@ struct swapchain
     VkExtent2D extents;
     VkExtent2D host_extents;
     VkFormat format;
-    BOOL needs_snapshot;
+    struct vulkan_surface_source source;
     struct swapchain_snapshot snapshots[2];
     unsigned int next_snapshot;
     pthread_mutex_t present_lock;
@@ -218,6 +218,11 @@ static struct swapchain *swapchain_from_handle( VkSwapchainKHR handle )
 {
     struct vulkan_swapchain *obj = vulkan_swapchain_from_handle( handle );
     return CONTAINING_RECORD( obj, struct swapchain, obj );
+}
+
+static BOOL swapchain_needs_snapshot( const struct swapchain *swapchain )
+{
+    return swapchain->source.type == VULKAN_SURFACE_SOURCE_READBACK;
 }
 
 struct vulkan_present_completion
@@ -1914,10 +1919,23 @@ static BOOL get_surface_rect( HWND hwnd, RECT *rect, struct ratio dpi )
     return TRUE;
 }
 
+static VkResult get_vulkan_surface_source( struct surface *surface, VkFormat format,
+                                           struct vulkan_surface_source *source )
+{
+    *source = (struct vulkan_surface_source){VULKAN_SURFACE_SOURCE_NATIVE};
+    if (!driver_funcs->p_vulkan_surface_get_source) return VK_SUCCESS;
+    return driver_funcs->p_vulkan_surface_get_source( surface->client, format, source );
+}
+
 static void adjust_surface_capabilities( struct vulkan_instance *instance, struct surface *surface,
                                          VkSurfaceCapabilitiesKHR *capabilities )
 {
+    struct vulkan_surface_source source;
     RECT client_rect;
+
+    if (!get_vulkan_surface_source( surface, VK_FORMAT_UNDEFINED, &source ) &&
+        source.type == VULKAN_SURFACE_SOURCE_READBACK)
+        capabilities->maxImageArrayLayers = 1;
 
     /* Many Windows games, for example Strange Brigade, No Man's Sky, Path of Exile
      * and World War Z, do not expect that maxImageCount can be set to 0.
@@ -2090,15 +2108,108 @@ static void win32u_vkGetPhysicalDeviceProperties2KHR( VkPhysicalDevice client_ph
     get_physical_device_properties2( physical_device, properties2, physical_device->instance->p_vkGetPhysicalDeviceProperties2KHR );
 }
 
+static VkResult get_vulkan_surface_formats( struct vulkan_physical_device *physical_device, struct surface *surface,
+                                            const VkPhysicalDeviceSurfaceInfo2KHR *info, uint32_t *count,
+                                            VkSurfaceFormatKHR *formats, VkSurfaceFormat2KHR *formats2 )
+{
+    struct vulkan_instance *instance = physical_device->instance;
+    VkSurfaceFormatKHR *host_formats = NULL;
+    VkSurfaceFormat2KHR *host_formats2 = NULL;
+    VkImageCompressionPropertiesEXT *compression = NULL, *out;
+    struct vulkan_surface_source source;
+    uint32_t host_count, capacity = formats || formats2 ? *count : 0, written = 0, supported = 0, i;
+    BOOL want_compression = FALSE;
+    VkResult res;
+
+    if ((res = get_vulkan_surface_source( surface, VK_FORMAT_UNDEFINED, &source ))) return res;
+    if (source.type == VULKAN_SURFACE_SOURCE_NATIVE)
+    {
+        if (info) return instance->p_vkGetPhysicalDeviceSurfaceFormats2KHR( physical_device->host.physical_device,
+                                                                          info, count, formats2 );
+        return instance->p_vkGetPhysicalDeviceSurfaceFormatsKHR( physical_device->host.physical_device,
+                                                                  surface->obj.host.surface, count, formats );
+    }
+
+    if (formats2) for (i = 0; i < capacity; ++i)
+        want_compression |= !!find_next_struct( formats2[i].pNext, VK_STRUCTURE_TYPE_IMAGE_COMPRESSION_PROPERTIES_EXT );
+
+    /* Count and output queries use the same backend source contract. Preserve
+     * native order and per-format extension outputs when compacting the list. */
+    for (;;)
+    {
+        if (info) res = instance->p_vkGetPhysicalDeviceSurfaceFormats2KHR( physical_device->host.physical_device,
+                                                                          info, &host_count, NULL );
+        else res = instance->p_vkGetPhysicalDeviceSurfaceFormatsKHR( physical_device->host.physical_device,
+                                                                    surface->obj.host.surface, &host_count, NULL );
+        if (res) return res;
+        if (!host_count) break;
+        if (info)
+        {
+            if (!(host_formats2 = calloc( host_count, sizeof(*host_formats2) ))) return VK_ERROR_OUT_OF_HOST_MEMORY;
+            if (want_compression && !(compression = calloc( host_count, sizeof(*compression) )))
+            {
+                free( host_formats2 );
+                return VK_ERROR_OUT_OF_HOST_MEMORY;
+            }
+            for (i = 0; i < host_count; ++i)
+            {
+                host_formats2[i].sType = VK_STRUCTURE_TYPE_SURFACE_FORMAT_2_KHR;
+                if (!compression) continue;
+                compression[i].sType = VK_STRUCTURE_TYPE_IMAGE_COMPRESSION_PROPERTIES_EXT;
+                host_formats2[i].pNext = &compression[i];
+            }
+            res = instance->p_vkGetPhysicalDeviceSurfaceFormats2KHR( physical_device->host.physical_device,
+                                                                      info, &host_count, host_formats2 );
+        }
+        else
+        {
+            if (!(host_formats = calloc( host_count, sizeof(*host_formats) ))) return VK_ERROR_OUT_OF_HOST_MEMORY;
+            res = instance->p_vkGetPhysicalDeviceSurfaceFormatsKHR( physical_device->host.physical_device,
+                                                                    surface->obj.host.surface, &host_count, host_formats );
+        }
+        if (res != VK_INCOMPLETE) break;
+        free( host_formats );
+        free( host_formats2 );
+        free( compression );
+        host_formats = NULL;
+        host_formats2 = NULL;
+        compression = NULL;
+    }
+
+    if (!res) for (i = 0; i < host_count; ++i)
+    {
+        VkSurfaceFormatKHR format = info ? host_formats2[i].surfaceFormat : host_formats[i];
+
+        if (get_vulkan_surface_source( surface, format.format, &source )) continue;
+        ++supported;
+        if ((!formats && !formats2) || written == capacity) continue;
+        if (formats) formats[written] = format;
+        else
+        {
+            formats2[written].surfaceFormat = format;
+            out = find_vk_struct( formats2[written].pNext, VK_STRUCTURE_TYPE_IMAGE_COMPRESSION_PROPERTIES_EXT );
+            if (out && compression)
+            {
+                out->imageCompressionFlags = compression[i].imageCompressionFlags;
+                out->imageCompressionFixedRateFlags = compression[i].imageCompressionFixedRateFlags;
+            }
+        }
+        ++written;
+    }
+    free( host_formats );
+    free( host_formats2 );
+    free( compression );
+    if (res) return res;
+    *count = formats || formats2 ? written : supported;
+    return (formats || formats2) && written < supported ? VK_INCOMPLETE : VK_SUCCESS;
+}
+
 static VkResult win32u_vkGetPhysicalDeviceSurfaceFormatsKHR( VkPhysicalDevice client_physical_device, VkSurfaceKHR client_surface,
                                                              uint32_t *format_count, VkSurfaceFormatKHR *formats )
 {
     struct vulkan_physical_device *physical_device = vulkan_physical_device_from_handle( client_physical_device );
     struct surface *surface = surface_from_handle( client_surface );
-    struct vulkan_instance *instance = physical_device->instance;
-
-    return instance->p_vkGetPhysicalDeviceSurfaceFormatsKHR( physical_device->host.physical_device,
-                                                                surface->obj.host.surface, format_count, formats );
+    return get_vulkan_surface_formats( physical_device, surface, NULL, format_count, formats, NULL );
 }
 
 static VkResult win32u_vkGetPhysicalDeviceSurfaceFormats2KHR( VkPhysicalDevice client_physical_device, const VkPhysicalDeviceSurfaceInfo2KHR *surface_info,
@@ -2119,7 +2230,7 @@ static VkResult win32u_vkGetPhysicalDeviceSurfaceFormats2KHR( VkPhysicalDevice c
         if (surface_info->pNext) FIXME( "Emulating vkGetPhysicalDeviceSurfaceFormats2KHR, ignoring pNext.\n" );
         if (!formats) return win32u_vkGetPhysicalDeviceSurfaceFormatsKHR( client_physical_device, surface_info->surface, format_count, NULL );
 
-        surface_formats = calloc( *format_count, sizeof(*surface_formats) );
+        surface_formats = calloc( max( *format_count, 1 ), sizeof(*surface_formats) );
         if (!surface_formats) return VK_ERROR_OUT_OF_HOST_MEMORY;
 
         res = win32u_vkGetPhysicalDeviceSurfaceFormatsKHR( client_physical_device, surface_info->surface, format_count, surface_formats );
@@ -2131,20 +2242,13 @@ static VkResult win32u_vkGetPhysicalDeviceSurfaceFormats2KHR( VkPhysicalDevice c
 
     surface_info_host.surface = surface->obj.host.surface;
 
-    return instance->p_vkGetPhysicalDeviceSurfaceFormats2KHR( physical_device->host.physical_device,
-                                                                 &surface_info_host, format_count, formats );
+    return get_vulkan_surface_formats( physical_device, surface, &surface_info_host, format_count, NULL, formats );
 }
 
 static VkBool32 win32u_vkGetPhysicalDeviceWin32PresentationSupportKHR( VkPhysicalDevice client_physical_device, uint32_t queue )
 {
     struct vulkan_physical_device *physical_device = vulkan_physical_device_from_handle( client_physical_device );
     return driver_funcs->p_get_physical_device_presentation_support( physical_device, queue );
-}
-
-static BOOL vulkan_surface_needs_snapshot( struct surface *surface )
-{
-    return driver_funcs->p_vulkan_surface_needs_snapshot &&
-           driver_funcs->p_vulkan_surface_needs_snapshot( surface->client );
 }
 
 static VkResult get_vulkan_source_capabilities( struct vulkan_physical_device *physical_device,
@@ -2162,7 +2266,8 @@ static VkResult get_vulkan_source_capabilities( struct vulkan_physical_device *p
     res = instance->p_vkGetPhysicalDeviceSurfaceCapabilities2KHR( physical_device->host.physical_device,
                                                                 &info, &caps );
     if (res) return res;
-    if (!source.supported) return VK_ERROR_FEATURE_NOT_PRESENT;
+    if (!source.supported || !(caps.surfaceCapabilities.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_SRC_BIT))
+        return VK_ERROR_FEATURE_NOT_PRESENT;
     *capabilities = caps.surfaceCapabilities;
     return VK_SUCCESS;
 }
@@ -2174,18 +2279,26 @@ static VkResult win32u_vkGetPhysicalDeviceSurfaceSupportKHR( VkPhysicalDevice cl
     struct vulkan_physical_device *physical_device = vulkan_physical_device_from_handle( client_physical_device );
     struct vulkan_instance *instance = physical_device->instance;
     struct surface *surface = surface_from_handle( client_surface );
+    struct vulkan_surface_source source;
     VkSurfaceCapabilitiesKHR capabilities;
+    uint32_t format_count;
     VkResult res;
 
+    if ((res = get_vulkan_surface_source( surface, VK_FORMAT_UNDEFINED, &source ))) return res;
     res = instance->p_vkGetPhysicalDeviceSurfaceSupportKHR( physical_device->host.physical_device,
                                                            queue, surface->obj.host.surface, supported );
-    if (!res && *supported && vulkan_surface_needs_snapshot( surface ))
+    if (!res && *supported && source.type == VULKAN_SURFACE_SOURCE_READBACK)
     {
         res = get_vulkan_source_capabilities( physical_device, surface, &capabilities );
         if (res == VK_ERROR_FEATURE_NOT_PRESENT)
         {
             *supported = VK_FALSE;
             res = VK_SUCCESS;
+        }
+        else if (!res)
+        {
+            res = get_vulkan_surface_formats( physical_device, surface, NULL, &format_count, NULL, NULL );
+            if (!res && !format_count) *supported = VK_FALSE;
         }
     }
     return res;
@@ -2383,7 +2496,8 @@ static VkResult prepare_swapchain_snapshot( struct vulkan_queue *queue, struct s
         if ((res = device->p_vkGetSwapchainImagesKHR( device->host.device, swapchain->obj.host.swapchain,
                                                      &image_count, snapshot->images ))) goto failed;
         snapshot->image_count = image_count;
-        buffer_info.size = (VkDeviceSize)swapchain->host_extents.width * swapchain->host_extents.height * 4;
+        buffer_info.size = (VkDeviceSize)swapchain->host_extents.width * swapchain->host_extents.height *
+                           swapchain->source.texel_size;
         /* Runtime errors leave output parameters undefined. Commit ownership
          * only after success, so cleanup never consumes an unsuccessful output. */
         if ((res = device->p_vkCreateBuffer( device->host.device, &buffer_info, NULL, &buffer ))) goto failed;
@@ -2431,9 +2545,8 @@ static VkResult prepare_swapchain_snapshot( struct vulkan_queue *queue, struct s
     return VK_SUCCESS;
 
 failed:
-    /* Only fresh storage may lose its image semaphores on allocation failure.
-     * An earlier host Present may still be consuming those semaphores after
-     * the readback fence has completed. */
+    /* Fresh storage has no submitted source read. Previously used storage
+     * reached its source fence before admission and keeps its allocations. */
     if (fresh)
     {
         destroy_swapchain_snapshot( device, snapshot );
@@ -2503,7 +2616,7 @@ static VkResult snapshot_vulkan_present( struct vulkan_queue *queue, VkPresentIn
 
         /* An exact completion is armed for a valid offscreen native target,
          * including while its owner scene is still preparing. */
-        if (!swapchain->needs_snapshot || presents[i].completion.kind != CLIENT_SURFACE_COMPLETION_EXACT) continue;
+        if (!swapchain_needs_snapshot( swapchain ) || presents[i].completion.kind != CLIENT_SURFACE_COMPLETION_EXACT) continue;
         assert( snapshot && snapshot->busy );
         if ((res = prepare_swapchain_snapshot( queue, swapchain, snapshot ))) goto done;
         if (!(capture = malloc( sizeof(*capture) )))
@@ -2591,7 +2704,8 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
     VkBool32 source_enabled = VK_FALSE;
     struct wine_vk_swapchain_source_create_info source = {WINE_VK_SWAPCHAIN_SOURCE_CREATE_INFO, NULL,
                                                           WINE_VK_SOURCE_ABI_VERSION, &source_enabled};
-    BOOL needs_snapshot = vulkan_surface_needs_snapshot( surface );
+    struct vulkan_surface_source source_caps;
+    BOOL needs_snapshot;
     struct ratio raw_dpi;
     RECT client_rect;
     VkResult res;
@@ -2605,6 +2719,9 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
     if (surface) create_info_host.surface = surface->obj.host.surface;
     if (old_swapchain) create_info_host.oldSwapchain = old_swapchain->obj.host.swapchain;
 
+    if ((res = get_vulkan_surface_source( surface, create_info->imageFormat, &source_caps ))) return res;
+    needs_snapshot = source_caps.type == VULKAN_SURFACE_SOURCE_READBACK;
+
     /* Windows allows client rect to be empty, but host Vulkan often doesn't, adjust extents back to the host capabilities */
     if (needs_snapshot)
         res = get_vulkan_source_capabilities( physical_device, surface, &capabilities );
@@ -2615,20 +2732,15 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
 
     if (needs_snapshot)
     {
-        if (!(capabilities.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) ||
-            (create_info->flags & VK_SWAPCHAIN_CREATE_PROTECTED_BIT_KHR))
+        /* The thunk owns this chain, including the 64-bit usage override.
+         * Updating imageUsage alone has no effect when that override exists. */
+        VkImageUsageFlags2CreateInfoKHR *usage = (VkImageUsageFlags2CreateInfoKHR *)find_next_struct( create_info_host.pNext,
+            VK_STRUCTURE_TYPE_IMAGE_USAGE_FLAGS_2_CREATE_INFO_KHR );
+
+        if ((create_info->flags & VK_SWAPCHAIN_CREATE_PROTECTED_BIT_KHR) || create_info->imageArrayLayers != 1)
             return VK_ERROR_FEATURE_NOT_PRESENT;
-        switch (create_info->imageFormat)
-        {
-        case VK_FORMAT_R8G8B8A8_UNORM:
-        case VK_FORMAT_R8G8B8A8_SRGB:
-        case VK_FORMAT_B8G8R8A8_UNORM:
-        case VK_FORMAT_B8G8R8A8_SRGB:
-            break;
-        default:
-            return VK_ERROR_FORMAT_NOT_SUPPORTED;
-        }
         create_info_host.imageUsage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+        if (usage) usage->usage |= VK_IMAGE_USAGE_2_TRANSFER_SRC_BIT_KHR;
         source.pNext = create_info_host.pNext;
         create_info_host.pNext = &source;
     }
@@ -2691,7 +2803,7 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
     swapchain->extents = create_info->imageExtent;
     swapchain->host_extents = create_info_host.imageExtent;
     swapchain->format = create_info->imageFormat;
-    swapchain->needs_snapshot = needs_snapshot;
+    swapchain->source = source_caps;
     swapchain->incremental_damage = create_info->preTransform == VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR &&
                                    create_info->imageArrayLayers == 1 &&
                                    swapchain->extents.width == swapchain->host_extents.width &&
@@ -3071,7 +3183,7 @@ reserve_snapshots:
         struct client_surface_target target;
         unsigned int index;
 
-        if (!swapchain->needs_snapshot) continue;
+        if (!swapchain_needs_snapshot( swapchain )) continue;
         for (index = 0; index < present_info->swapchainCount; ++index)
             if (swapchain_from_handle( client_swapchains[index] ) == swapchain) break;
         assert( index < present_info->swapchainCount );
@@ -3104,7 +3216,7 @@ reserve_snapshots:
             struct swapchain *swapchain = swapchain_from_handle( client_swapchains[j] );
 
             if (swapchain->surface->client != present_surfaces[i]) continue;
-            if (!swapchain->needs_snapshot && !(use_internal_present_wait && present_ids[j]))
+            if (!swapchain_needs_snapshot( swapchain ) && !(use_internal_present_wait && present_ids[j]))
                 external_completion = FALSE;
         }
         /* A shared monitor has no per-frame identity. All non-snapshot
@@ -3126,10 +3238,10 @@ reserve_snapshots:
         struct swapchain *swapchain = swapchain_from_handle( client_swapchains[i] );
 
         client_surface_prepare_present_locked( swapchain->surface->client, &presents[i],
-                                               (use_internal_present_wait && present_ids[i]) || swapchain->needs_snapshot );
-        have_snapshots |= swapchain->needs_snapshot &&
+                                               (use_internal_present_wait && present_ids[i]) || swapchain_needs_snapshot( swapchain ) );
+        have_snapshots |= swapchain_needs_snapshot( swapchain ) &&
                           presents[i].completion.kind == CLIENT_SURFACE_COMPLETION_EXACT;
-        if (swapchain->needs_snapshot && presents[i].completion.kind == CLIENT_SURFACE_COMPLETION_EXACT &&
+        if (swapchain_needs_snapshot( swapchain ) && presents[i].completion.kind == CLIENT_SURFACE_COMPLETION_EXACT &&
             !reservations[i].snapshot)
             reserve_more = reservations[i].required = TRUE;
     }
@@ -3153,6 +3265,16 @@ reserve_snapshots:
         while (surface_locked_count)
             client_surface_unlock_present( present_surfaces[--surface_locked_count] );
         goto reserve_snapshots;
+    }
+
+    if (TRACE_ON(vulkan)) for (uint32_t i = 0; i < present_info->swapchainCount; ++i)
+    {
+        struct swapchain *swapchain = swapchain_from_handle( client_swapchains[i] );
+
+        TRACE( "source selection swapchain %p format %u type %u mode %u readback %u\n",
+               swapchain, swapchain->format, swapchain->source.type, presents[i].mode,
+               swapchain_needs_snapshot( swapchain ) &&
+               presents[i].completion.kind == CLIENT_SURFACE_COMPLETION_EXACT );
     }
 
     if (use_internal_present_wait)

@@ -359,10 +359,28 @@ struct vulkan_funcs
 /* interface between win32u and the user drivers */
 struct client_surface;
 struct client_surface_frame;
+
+enum vulkan_surface_source_type
+{
+    /* Image capture and completion are owned by the backend. */
+    VULKAN_SURFACE_SOURCE_NATIVE,
+    /* Native WSI accepts the readback and Present together. A source fence
+     * owns the readback storage; WSI separately owns presentation retirement. */
+    VULKAN_SURFACE_SOURCE_READBACK,
+};
+
+struct vulkan_surface_source
+{
+    enum vulkan_surface_source_type type;
+    unsigned int texel_size; /* READBACK only; zero when querying VK_FORMAT_UNDEFINED */
+};
+
 struct vulkan_driver_funcs
 {
     VkResult (*p_vulkan_surface_create)(struct client_surface *, const struct vulkan_instance *, VkSurfaceKHR *);
-    BOOL (*p_vulkan_surface_needs_snapshot)(struct client_surface *);
+    /* The source contract covers the surface lifetime, including a later
+     * DIRECT -> COMPOSITED transition. Querying it never allocates an image. */
+    VkResult (*p_vulkan_surface_get_source)(struct client_surface *, VkFormat, struct vulkan_surface_source *);
     BOOL (*p_vulkan_surface_snapshot)(struct client_surface *, struct client_surface_frame *,
                                      const void *, uint32_t, uint32_t, VkFormat);
     VkBool32 (*p_get_physical_device_presentation_support)(struct vulkan_physical_device *, uint32_t);

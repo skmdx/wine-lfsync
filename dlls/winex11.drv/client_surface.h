@@ -72,9 +72,15 @@ extern struct x11drv_client_surface *impl_from_client_surface( struct client_sur
 extern const struct client_surface_completion_ops x11drv_client_surface_completion_ops;
 extern BOOL x11drv_client_surface_completion_init( struct x11drv_client_surface *surface );
 extern void x11drv_client_surface_completion_destroy( struct x11drv_client_surface *surface );
+struct x11drv_snapshot_format
+{
+    unsigned int texel_size;
+    unsigned int red_mask, green_mask, blue_mask, alpha_mask;
+};
+extern const struct x11drv_snapshot_format x11drv_snapshot_rgba8;
 extern BOOL x11drv_client_surface_snapshot( struct client_surface *client, const BYTE *pixels,
                                             unsigned int width, unsigned int height,
-                                            BOOL top_down, BOOL bgra );
+                                            BOOL top_down, const struct x11drv_snapshot_format *format );
 extern void x11drv_client_surface_release_snapshot_staging( struct x11drv_client_surface *surface );
 extern void x11drv_client_surface_trace_image( const char *event, const char *kind,
                                               Display *display, Pixmap pixmap, UINT64 bytes );

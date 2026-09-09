@@ -1809,7 +1809,7 @@ static BOOL snapshot_client_surface( struct opengl_drawable *base, struct client
     if (source_framebuffer && funcs->p_glGetError() != GL_NO_ERROR) return FALSE;
 
     pthread_mutex_lock( &base->client->present_lock );
-    ret = x11drv_client_surface_snapshot( base->client, pixels, size.cx, size.cy, FALSE, FALSE );
+    ret = x11drv_client_surface_snapshot( base->client, pixels, size.cx, size.cy, FALSE, &x11drv_snapshot_rgba8 );
     if (ret && present->handoff_control)
         base->client->handoff_source[present->handoff_index].source = surface->snapshot;
     if (ret) present->capture.size = size;

@@ -632,14 +632,34 @@ static void test_win32_surface_hwnd(VkInstance vk_instance, VkPhysicalDevice vk_
     vr = vkGetPhysicalDeviceSurfaceFormatsKHR(vk_physical_device, surface, &count, formats);
     ok(vr == VK_SUCCESS, "Got unexpected vr %d.\n", vr);
 
+    if (count)
+    {
+        VkSurfaceFormatKHR partial = {VK_FORMAT_UNDEFINED, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR};
+        uint32_t capacity = 0;
+
+        vr = vkGetPhysicalDeviceSurfaceFormatsKHR(vk_physical_device, surface, &capacity, &partial);
+        ok(vr == VK_INCOMPLETE, "Got zero-capacity result %d.\n", vr);
+        ok(!capacity, "Got zero-capacity count %u.\n", capacity);
+        ok(partial.format == VK_FORMAT_UNDEFINED, "Zero-capacity query changed format to %u.\n", partial.format);
+        capacity = 1;
+        vr = vkGetPhysicalDeviceSurfaceFormatsKHR(vk_physical_device, surface, &capacity, &partial);
+        ok(vr == (count > 1 ? VK_INCOMPLETE : VK_SUCCESS), "Got partial result %d for %u formats.\n", vr, count);
+        ok(capacity == 1, "Got partial count %u.\n", capacity);
+        ok(partial.format == formats[0].format && partial.colorSpace == formats[0].colorSpace,
+                "Partial query differs from the first format.\n");
+    }
+
     todo_wine
     ok(formats[0].format == VK_FORMAT_B8G8R8A8_UNORM, "Got formats[0].format %#x\n", formats[0].format);
     ok(formats[0].colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR,
             "Got formats[0].colorSpace %#x\n", formats[0].colorSpace);
-    todo_wine
-    ok(formats[1].format == VK_FORMAT_B8G8R8A8_SRGB, "Got formats[1].format %#x\n", formats[1].format);
-    ok(formats[1].colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR,
-            "Got formats[1].colorSpace %#x\n", formats[1].colorSpace);
+    if (count > 1)
+    {
+        todo_wine
+        ok(formats[1].format == VK_FORMAT_B8G8R8A8_SRGB, "Got formats[1].format %#x\n", formats[1].format);
+        ok(formats[1].colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR,
+                "Got formats[1].colorSpace %#x\n", formats[1].colorSpace);
+    }
 
     if (!pvkGetPhysicalDeviceSurfaceFormats2KHR)
         win_skip("vkGetPhysicalDeviceSurfaceFormats2KHR not found, skipping tests\n");
@@ -660,6 +680,26 @@ static void test_win32_surface_hwnd(VkInstance vk_instance, VkPhysicalDevice vk_
         vr = pvkGetPhysicalDeviceSurfaceFormats2KHR(vk_physical_device, &surface_info, &count, formats2);
         ok(vr == VK_SUCCESS, "Got unexpected vr %d.\n", vr);
         ok(count, "Got zero count.\n");
+
+        if (count)
+        {
+            VkSurfaceFormat2KHR partial = {.sType = VK_STRUCTURE_TYPE_SURFACE_FORMAT_2_KHR};
+            uint32_t capacity = 0;
+
+            vr = pvkGetPhysicalDeviceSurfaceFormats2KHR(vk_physical_device, &surface_info, &capacity, &partial);
+            ok(vr == VK_INCOMPLETE, "Got zero-capacity result %d.\n", vr);
+            ok(!capacity, "Got zero-capacity count %u.\n", capacity);
+            ok(partial.surfaceFormat.format == VK_FORMAT_UNDEFINED, "Zero-capacity query changed the format.\n");
+            capacity = 1;
+            vr = pvkGetPhysicalDeviceSurfaceFormats2KHR(vk_physical_device, &surface_info, &capacity, &partial);
+            ok(vr == (count > 1 ? VK_INCOMPLETE : VK_SUCCESS), "Got partial result %d for %u formats.\n", vr, count);
+            ok(capacity == 1, "Got partial count %u.\n", capacity);
+            ok(partial.sType == VK_STRUCTURE_TYPE_SURFACE_FORMAT_2_KHR && !partial.pNext,
+                    "Partial query changed the output header.\n");
+            ok(partial.surfaceFormat.format == formats[0].format &&
+                    partial.surfaceFormat.colorSpace == formats[0].colorSpace,
+                    "Partial query differs from the first format.\n");
+        }
 
         while (count--)
         {

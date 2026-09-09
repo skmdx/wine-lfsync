@@ -29721,6 +29721,139 @@ static const VkShaderCreateInfoEXT *convert_VkShaderCreateInfoEXT_array_win32_to
     return out;
 }
 
+#ifdef _WIN64
+static void convert_VkSwapchainCreateInfoKHR_win64_to_unwrapped_host(struct conversion_context *ctx, const VkSwapchainCreateInfoKHR *in, VkSwapchainCreateInfoKHR *out)
+{
+    const VkBaseInStructure *in_header;
+    VkBaseOutStructure *out_header = (void *)out;
+
+    if (!in) return;
+
+    out->sType = in->sType;
+    out->pNext = NULL;
+    out->flags = in->flags;
+    out->surface = in->surface;
+    out->minImageCount = in->minImageCount;
+    out->imageFormat = in->imageFormat;
+    out->imageColorSpace = in->imageColorSpace;
+    out->imageExtent = in->imageExtent;
+    out->imageArrayLayers = in->imageArrayLayers;
+    out->imageUsage = in->imageUsage;
+    out->imageSharingMode = in->imageSharingMode;
+    out->queueFamilyIndexCount = in->queueFamilyIndexCount;
+    out->pQueueFamilyIndices = in->pQueueFamilyIndices;
+    out->preTransform = in->preTransform;
+    out->compositeAlpha = in->compositeAlpha;
+    out->presentMode = in->presentMode;
+    out->clipped = in->clipped;
+    out->oldSwapchain = in->oldSwapchain;
+
+    for (in_header = (void *)in->pNext; in_header; in_header = (void *)in_header->pNext)
+    {
+        switch (in_header->sType)
+        {
+        case VK_STRUCTURE_TYPE_DEVICE_GROUP_SWAPCHAIN_CREATE_INFO_KHR:
+        {
+            VkDeviceGroupSwapchainCreateInfoKHR *out_ext = conversion_context_alloc(ctx, sizeof(*out_ext));
+            const VkDeviceGroupSwapchainCreateInfoKHR *in_ext = (const VkDeviceGroupSwapchainCreateInfoKHR *)in_header;
+            out_ext->sType = VK_STRUCTURE_TYPE_DEVICE_GROUP_SWAPCHAIN_CREATE_INFO_KHR;
+            out_ext->pNext = NULL;
+            out_ext->modes = in_ext->modes;
+            out_header->pNext = (void *)out_ext;
+            out_header = (void *)out_ext;
+            break;
+        }
+        case VK_STRUCTURE_TYPE_IMAGE_COMPRESSION_CONTROL_EXT:
+        {
+            VkImageCompressionControlEXT *out_ext = conversion_context_alloc(ctx, sizeof(*out_ext));
+            const VkImageCompressionControlEXT *in_ext = (const VkImageCompressionControlEXT *)in_header;
+            out_ext->sType = VK_STRUCTURE_TYPE_IMAGE_COMPRESSION_CONTROL_EXT;
+            out_ext->pNext = NULL;
+            out_ext->flags = in_ext->flags;
+            out_ext->compressionControlPlaneCount = in_ext->compressionControlPlaneCount;
+            out_ext->pFixedRateFlags = in_ext->pFixedRateFlags;
+            out_header->pNext = (void *)out_ext;
+            out_header = (void *)out_ext;
+            break;
+        }
+        case VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO:
+        {
+            VkImageFormatListCreateInfo *out_ext = conversion_context_alloc(ctx, sizeof(*out_ext));
+            const VkImageFormatListCreateInfo *in_ext = (const VkImageFormatListCreateInfo *)in_header;
+            out_ext->sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO;
+            out_ext->pNext = NULL;
+            out_ext->viewFormatCount = in_ext->viewFormatCount;
+            out_ext->pViewFormats = in_ext->pViewFormats;
+            out_header->pNext = (void *)out_ext;
+            out_header = (void *)out_ext;
+            break;
+        }
+        case VK_STRUCTURE_TYPE_IMAGE_USAGE_FLAGS_2_CREATE_INFO_KHR:
+        {
+            VkImageUsageFlags2CreateInfoKHR *out_ext = conversion_context_alloc(ctx, sizeof(*out_ext));
+            const VkImageUsageFlags2CreateInfoKHR *in_ext = (const VkImageUsageFlags2CreateInfoKHR *)in_header;
+            out_ext->sType = VK_STRUCTURE_TYPE_IMAGE_USAGE_FLAGS_2_CREATE_INFO_KHR;
+            out_ext->pNext = NULL;
+            out_ext->usage = in_ext->usage;
+            out_header->pNext = (void *)out_ext;
+            out_header = (void *)out_ext;
+            break;
+        }
+        case VK_STRUCTURE_TYPE_SWAPCHAIN_LATENCY_CREATE_INFO_NV:
+        {
+            VkSwapchainLatencyCreateInfoNV *out_ext = conversion_context_alloc(ctx, sizeof(*out_ext));
+            const VkSwapchainLatencyCreateInfoNV *in_ext = (const VkSwapchainLatencyCreateInfoNV *)in_header;
+            out_ext->sType = VK_STRUCTURE_TYPE_SWAPCHAIN_LATENCY_CREATE_INFO_NV;
+            out_ext->pNext = NULL;
+            out_ext->latencyModeEnable = in_ext->latencyModeEnable;
+            out_header->pNext = (void *)out_ext;
+            out_header = (void *)out_ext;
+            break;
+        }
+        case VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_BARRIER_CREATE_INFO_NV:
+        {
+            VkSwapchainPresentBarrierCreateInfoNV *out_ext = conversion_context_alloc(ctx, sizeof(*out_ext));
+            const VkSwapchainPresentBarrierCreateInfoNV *in_ext = (const VkSwapchainPresentBarrierCreateInfoNV *)in_header;
+            out_ext->sType = VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_BARRIER_CREATE_INFO_NV;
+            out_ext->pNext = NULL;
+            out_ext->presentBarrierEnable = in_ext->presentBarrierEnable;
+            out_header->pNext = (void *)out_ext;
+            out_header = (void *)out_ext;
+            break;
+        }
+        case VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_MODES_CREATE_INFO_KHR:
+        {
+            VkSwapchainPresentModesCreateInfoKHR *out_ext = conversion_context_alloc(ctx, sizeof(*out_ext));
+            const VkSwapchainPresentModesCreateInfoKHR *in_ext = (const VkSwapchainPresentModesCreateInfoKHR *)in_header;
+            out_ext->sType = VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_MODES_CREATE_INFO_KHR;
+            out_ext->pNext = NULL;
+            out_ext->presentModeCount = in_ext->presentModeCount;
+            out_ext->pPresentModes = in_ext->pPresentModes;
+            out_header->pNext = (void *)out_ext;
+            out_header = (void *)out_ext;
+            break;
+        }
+        case VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_SCALING_CREATE_INFO_KHR:
+        {
+            VkSwapchainPresentScalingCreateInfoKHR *out_ext = conversion_context_alloc(ctx, sizeof(*out_ext));
+            const VkSwapchainPresentScalingCreateInfoKHR *in_ext = (const VkSwapchainPresentScalingCreateInfoKHR *)in_header;
+            out_ext->sType = VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_SCALING_CREATE_INFO_KHR;
+            out_ext->pNext = NULL;
+            out_ext->scalingBehavior = in_ext->scalingBehavior;
+            out_ext->presentGravityX = in_ext->presentGravityX;
+            out_ext->presentGravityY = in_ext->presentGravityY;
+            out_header->pNext = (void *)out_ext;
+            out_header = (void *)out_ext;
+            break;
+        }
+        default:
+            FIXME("Unhandled sType %u.\n", in_header->sType);
+            break;
+        }
+    }
+}
+#endif /* _WIN64 */
+
 static void convert_VkSwapchainCreateInfoKHR_win32_to_unwrapped_host(struct conversion_context *ctx, const VkSwapchainCreateInfoKHR32 *in, VkSwapchainCreateInfoKHR *out)
 {
     const VkBaseInStructure32 *in_header;
@@ -60745,10 +60878,16 @@ static NTSTATUS thunk32_vkCreateShadersEXT(void *args)
 static NTSTATUS thunk64_vkCreateSwapchainKHR(void *args)
 {
     struct vkCreateSwapchainKHR_params *params = args;
+    VkSwapchainCreateInfoKHR pCreateInfo_host;
+    struct conversion_context local_ctx;
+    struct conversion_context *ctx = &local_ctx;
 
     TRACE("%p, %p, %p, %p\n", params->device, params->pCreateInfo, params->pAllocator, params->pSwapchain);
 
-    params->result = vk_funcs->p_vkCreateSwapchainKHR(params->device, params->pCreateInfo, params->pAllocator, params->pSwapchain);
+    init_conversion_context(ctx);
+    convert_VkSwapchainCreateInfoKHR_win64_to_unwrapped_host(ctx, params->pCreateInfo, &pCreateInfo_host);
+    params->result = vk_funcs->p_vkCreateSwapchainKHR(params->device, &pCreateInfo_host, params->pAllocator, params->pSwapchain);
+    free_conversion_context(ctx);
     return STATUS_SUCCESS;
 }
 #endif /* _WIN64 */

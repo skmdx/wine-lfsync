@@ -73,9 +73,39 @@ static VkBool32 X11DRV_get_physical_device_presentation_support( struct vulkan_p
                                                                       default_visual.visual->visualid );
 }
 
-static BOOL X11DRV_vulkan_surface_needs_snapshot( struct client_surface *client )
+static const struct x11drv_snapshot_format *get_snapshot_format( VkFormat format )
 {
-    return !usexcomposite;
+    static const struct x11drv_snapshot_format bgra8 = {4, 0xff0000, 0xff00, 0xff, 0xff000000};
+    static const struct x11drv_snapshot_format rgb565 = {2, 0xf800, 0x7e0, 0x1f, 0};
+    static const struct x11drv_snapshot_format bgr565 = {2, 0x1f, 0x7e0, 0xf800, 0};
+    static const struct x11drv_snapshot_format a2rgb10 = {4, 0x3ff00000, 0xffc00, 0x3ff, 0xc0000000};
+    static const struct x11drv_snapshot_format a2bgr10 = {4, 0x3ff, 0xffc00, 0x3ff00000, 0xc0000000};
+
+    switch (format)
+    {
+    case VK_FORMAT_R8G8B8A8_UNORM:
+    case VK_FORMAT_R8G8B8A8_SRGB: return &x11drv_snapshot_rgba8;
+    case VK_FORMAT_B8G8R8A8_UNORM:
+    case VK_FORMAT_B8G8R8A8_SRGB: return &bgra8;
+    case VK_FORMAT_R5G6B5_UNORM_PACK16: return &rgb565;
+    case VK_FORMAT_B5G6R5_UNORM_PACK16: return &bgr565;
+    case VK_FORMAT_A2R10G10B10_UNORM_PACK32: return &a2rgb10;
+    case VK_FORMAT_A2B10G10R10_UNORM_PACK32: return &a2bgr10;
+    default: return NULL;
+    }
+}
+
+static VkResult X11DRV_vulkan_surface_get_source( struct client_surface *client, VkFormat format,
+                                                 struct vulkan_surface_source *source )
+{
+    const struct x11drv_snapshot_format *snapshot;
+
+    source->type = usexcomposite ? VULKAN_SURFACE_SOURCE_NATIVE : VULKAN_SURFACE_SOURCE_READBACK;
+    source->texel_size = 0;
+    if (usexcomposite || format == VK_FORMAT_UNDEFINED) return VK_SUCCESS;
+    if (!(snapshot = get_snapshot_format( format ))) return VK_ERROR_FORMAT_NOT_SUPPORTED;
+    source->texel_size = snapshot->texel_size;
+    return VK_SUCCESS;
 }
 
 static BOOL X11DRV_vulkan_surface_snapshot( struct client_surface *client,
@@ -84,9 +114,9 @@ static BOOL X11DRV_vulkan_surface_snapshot( struct client_surface *client,
                                            VkFormat format )
 {
     struct x11drv_client_surface *surface = impl_from_client_surface( client );
-    BOOL bgra = format == VK_FORMAT_B8G8R8A8_UNORM || format == VK_FORMAT_B8G8R8A8_SRGB;
+    const struct x11drv_snapshot_format *snapshot = get_snapshot_format( format );
 
-    if (!x11drv_client_surface_snapshot( client, pixels, width, height, TRUE, bgra )) return FALSE;
+    if (!snapshot || !x11drv_client_surface_snapshot( client, pixels, width, height, TRUE, snapshot )) return FALSE;
     if (present->handoff_control) client->handoff_source[present->handoff_index].source = surface->snapshot;
     /* Retain the completed image even while the owner prepares a new scene.
      * The common completion path freezes it before publishing its source. */
@@ -115,7 +145,7 @@ static void X11DRV_map_device_extensions( struct vulkan_device_extensions *exten
 static const struct vulkan_driver_funcs x11drv_vulkan_driver_funcs =
 {
     .p_vulkan_surface_create = X11DRV_vulkan_surface_create,
-    .p_vulkan_surface_needs_snapshot = X11DRV_vulkan_surface_needs_snapshot,
+    .p_vulkan_surface_get_source = X11DRV_vulkan_surface_get_source,
     .p_vulkan_surface_snapshot = X11DRV_vulkan_surface_snapshot,
     .p_get_physical_device_presentation_support = X11DRV_get_physical_device_presentation_support,
     .p_map_instance_extensions = X11DRV_map_instance_extensions,
