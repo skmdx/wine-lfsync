@@ -256,6 +256,7 @@ enum client_surface_compositor_op
     CLIENT_SURFACE_COMPOSITOR_REGISTER_HANDOFF,
     CLIENT_SURFACE_COMPOSITOR_REUSE_HANDOFFS,
     CLIENT_SURFACE_COMPOSITOR_CHECK_SCENE,
+    CLIENT_SURFACE_COMPOSITOR_CHECK_CACHE,
     CLIENT_SURFACE_COMPOSITOR_REPAIR_OWNER,
     CLIENT_SURFACE_COMPOSITOR_RESOLVE_SOURCES,
     CLIENT_SURFACE_COMPOSITOR_SWEEP_HANDOFFS,
@@ -3326,6 +3327,24 @@ static BOOL execute_client_surface_compositor_job( struct client_surface_composi
         return reuse_client_surface_compositor_handoffs( job );
     if (job->op == CLIENT_SURFACE_COMPOSITOR_CHECK_SCENE)
         return check_client_surface_compositor_scene( job );
+    if (job->op == CLIENT_SURFACE_COMPOSITOR_CHECK_CACHE)
+    {
+        struct client_surface_compositor_binding *binding;
+        BOOL cached = FALSE;
+
+        /* Only completed owner images can support a repair. Keep this
+         * inventory on the actor, independent of the current layout
+         * and native output ownership. A positive hint still needs the
+         * complete scene, binding and image checks in the actual repair. */
+        for (binding = client_surface_compositor_bindings; binding; binding = binding->next)
+            if (binding->toplevel == job->handoff_toplevel && binding->latest_image.pixmap)
+            {
+                cached = TRUE;
+                break;
+            }
+        TRACE( "owner cache probe hwnd %p cached %u\n", job->handoff_toplevel, cached );
+        return cached;
+    }
     if (job->op == CLIENT_SURFACE_COMPOSITOR_REPAIR_OWNER)
         return repair_client_surface_compositor_owner( job->handoff_toplevel, FALSE );
     if (job->op == CLIENT_SURFACE_COMPOSITOR_RESOLVE_SOURCES)
@@ -3432,6 +3451,7 @@ static BOOL client_surface_compositor_job_ready( struct client_surface_composito
      * change behind native completion. The resolver keeps the exact scene
      * and receipt checks, including its already-resolved no-op. */
     if (job->op == CLIENT_SURFACE_COMPOSITOR_CHECK_SCENE ||
+        job->op == CLIENT_SURFACE_COMPOSITOR_CHECK_CACHE ||
         job->op == CLIENT_SURFACE_COMPOSITOR_RESOLVE_SOURCES) return TRUE;
     /* Expose restoration records its own deferred work if necessary. */
     if (job->op == CLIENT_SURFACE_COMPOSITOR_RESTORE_TARGET) return TRUE;
@@ -3522,13 +3542,16 @@ static BOOL process_client_surface_compositor_jobs(void)
         struct client_surface_compositor_target *target = client_surface_compositor_job_target( job );
 
         /* Preserve ordering within a target, including GUI publication ACKs,
-         * while allowing later jobs for independent targets to run. */
+         * while allowing later jobs for independent targets to run. The
+         * read-only cache probe can pass older work: its hint grants no
+         * repair or publication rights. */
         for (earlier = client_surface_compositor_pending; earlier != job; earlier = earlier->next)
             if ((target && target == client_surface_compositor_job_target( earlier )) ||
                 (job->handoff_toplevel && job->handoff_toplevel == earlier->handoff_toplevel)) break;
         if (earlier != job && job->op != CLIENT_SURFACE_COMPOSITOR_TRY_BEGIN_UPDATE &&
             job->op != CLIENT_SURFACE_COMPOSITOR_CHECK_UPDATE &&
-            job->op != CLIENT_SURFACE_COMPOSITOR_FINISH_UPDATE)
+            job->op != CLIENT_SURFACE_COMPOSITOR_FINISH_UPDATE &&
+            job->op != CLIENT_SURFACE_COMPOSITOR_CHECK_CACHE)
         {
             cursor = &job->next;
             continue;
@@ -4270,6 +4293,16 @@ BOOL X11DRV_RepairClientSurfaceOwner( HWND hwnd, BOOL resolve )
         .handoff_toplevel = hwnd,
     };
 
+    if (!resolve)
+    {
+        /* A cold cache needs the common producer-recovery path. Do not
+         * build a scene or provision channels merely to discover that no
+         * completed owner image exists. Source-resolution must still bind
+         * and inspect channels, including newly completed producer images. */
+        job.op = CLIENT_SURFACE_COMPOSITOR_CHECK_CACHE;
+        if (!submit_client_surface_compositor_job( &job )) return FALSE;
+        job.op = CLIENT_SURFACE_COMPOSITOR_REPAIR_OWNER;
+    }
     /* The authoritative snapshot selects the exact bindings and layouts to
      * inspect. The actor owns their images and attestations; no channel state
      * is interpreted by the application thread as proof of a completed copy. */
