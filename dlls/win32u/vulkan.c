@@ -4542,7 +4542,7 @@ static VkResult win32u_vkImportFenceWin32HandleKHR( VkDevice client_device, cons
         fence->global = global;
         fence->local = local;
     }
-    return VK_SUCCESS;
+    return res;
 }
 
 static void get_physical_device_external_fence_properties( struct vulkan_physical_device *physical_device, const VkPhysicalDeviceExternalFenceInfo *client_fence_info,
