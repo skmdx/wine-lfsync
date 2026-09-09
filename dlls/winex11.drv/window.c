@@ -3534,6 +3534,12 @@ NTSTATUS X11DRV_UpdateClientSurfaceBacking( HWND hwnd, BOOL enable, BOOL prepare
     NTSTATUS status = STATUS_NOT_SUPPORTED;
 
     if (!(data = get_win_data( hwnd ))) return status;
+    TRACE( "win %p backing candidate enable %u prepare %u rects %s native %s desired %s pending %s "
+           "locks %u serials %lu/%lu alpha %u opacity %u fullscreen %u\n",
+           hwnd, enable, prepare, debugstr_window_rects(rects), debugstr_window_rects(&data->rects),
+           wine_dbgstr_rect(&data->desired_state.rect), wine_dbgstr_rect(&data->pending_state.rect),
+           data->state_locks, data->wm_state_serial, data->net_wm_state_serial,
+           data->use_alpha, data->client_surface_opacity_valid, data->is_fullscreen );
     /* A retained native client draws directly, so no GDI surface needs to
      * be created or retired. Geometry, staging and an existing output pool
      * still require the ordinary window update and its quiescing boundary. */
