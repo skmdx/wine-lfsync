@@ -1528,12 +1528,31 @@ static void drain_client_surface_compositor_target(
     target->mailbox_pending = FALSE;
     target->mailbox_publish_generation = 0;
     target->mailbox_publish_epoch = 0;
+#else
+    (void)target;
+#endif
+}
+
+static void free_client_surface_compositor_present_input( struct client_surface_compositor_target *target )
+{
+#ifdef SONAME_LIBXPRESENT
     if (target->present_event)
     {
+        int error = 0;
+
+        /* The GUI can destroy the native window before its asynchronous
+         * target removal reaches the actor. The server already discarded
+         * that window's event selection; check the late unregistration too. */
+        X11DRV_expect_error( client_surface_compositor_display, client_surface_compositor_error, &error );
         pXPresentFreeInput( client_surface_compositor_display, target->window,
                             target->present_event );
+        XSync( client_surface_compositor_display, False );
+        X11DRV_check_error();
+        TRACE_(csperf)( "ticks=%llu event=present_input_free window=%lx event_id=%lx error=%d\n",
+                       client_surface_perf_time(), target->window, target->present_event, error );
+        if (error && error != BadWindow) WARN( "failed to release Present input for window %#lx, error %d\n",
+                                              target->window, error );
         target->present_event = 0;
-        XFlush( client_surface_compositor_display );
     }
 #else
     (void)target;
@@ -1592,6 +1611,10 @@ static BOOL update_client_surface_compositor_target( struct client_surface_compo
     if ((target->window && target->window != job->destination) ||
         (target->frames[0].pixmap && !same_pool))
         drain_client_surface_compositor_target( target );
+    /* Selection belongs to the native window, not its replaceable images.
+     * Keep it across pool replacement and an acknowledged DIRECT plan. */
+    if (target->window && target->window != job->destination)
+        free_client_surface_compositor_present_input( target );
     target->window = job->destination;
     if (!same_pool)
     {
@@ -1675,6 +1698,7 @@ static BOOL remove_client_surface_compositor_target( HWND toplevel )
 
         if (target->toplevel != toplevel) continue;
         drain_client_surface_compositor_target( target );
+        free_client_surface_compositor_present_input( target );
         for (i = 0; i < ARRAY_SIZE(target->frames); ++i)
         {
             client_surface_xcb_free_gc( client_surface_compositor_display, &target->frames[i].xcb_gc );
