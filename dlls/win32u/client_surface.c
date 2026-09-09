@@ -738,6 +738,7 @@ static BOOL read_client_surface_scene( HWND toplevel, struct client_surface_scen
         preparing = !!(window_shm->client_surface_flags & WINDOW_SHM_CLIENT_SURFACE_PREPARING);
         scene->source_pending = !!(window_shm->client_surface_flags & WINDOW_SHM_CLIENT_SURFACE_SOURCE_PENDING);
         scene->direct_candidate = !!(window_shm->client_surface_flags & WINDOW_SHM_CLIENT_SURFACE_DIRECT_CANDIDATE);
+        scene->publication_pending = !!(window_shm->client_surface_flags & WINDOW_SHM_CLIENT_SURFACE_PUBLISHING);
         if (producer_process) *producer_process = window_shm->client_surface_process;
         if (producer_id) *producer_id = window_shm->client_surface_id;
     }

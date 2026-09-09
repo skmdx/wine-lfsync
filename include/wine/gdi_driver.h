@@ -219,7 +219,7 @@ struct gdi_dc_funcs
 };
 
 /* increment this when changing driver tables or shared driver-facing structures */
-#define WINE_GDI_DRIVER_VERSION 138
+#define WINE_GDI_DRIVER_VERSION 139
 
 #define GDI_PRIORITY_NULL_DRV        0  /* null driver */
 #define GDI_PRIORITY_FONT_DRV      100  /* any font driver */
@@ -352,6 +352,7 @@ struct client_surface_scene
     BOOL authoritative;
     BOOL source_pending; /* current assembly awaits the owner's image inventory */
     BOOL direct_candidate; /* server eligibility; the owner still selects the strategy */
+    BOOL publication_pending; /* assembly accepted; native output or GUI exposure still owns its token */
 };
 
 enum client_surface_frame_result

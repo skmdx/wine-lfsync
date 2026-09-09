@@ -2972,10 +2972,15 @@ static BOOL compose_client_surface_cached_frame( struct client_surface_composito
         return FALSE;
     if (replay) trace_client_surface_source( "replay_cache", binding, control,
                                              slot->source_sequence, target->window, source, TRUE );
-    /* Only the owner's current transaction can publish this image. A new
-     * scene may reuse its pixels, and a late frame cannot reopen a completed
-     * assembly merely because it was submitted during that publication. */
-    plan.generation = current.generation;
+    /* PUBLISHING still carries the transaction generation while the GUI
+     * exposes its native output, even after its Present ticket is released.
+     * Its assembly was already accepted: newer images use the steady path
+     * in the same scene, never another completion of that transaction. */
+    plan.generation = current.publication_pending ? 0 : current.generation;
+    TRACE( "owner source window %#lx generation %s epoch %s publication %u output %s sequence %s\n",
+           target->window, wine_dbgstr_longlong( current.generation ), wine_dbgstr_longlong( current.epoch ),
+           current.publication_pending, wine_dbgstr_longlong( plan.generation ),
+           wine_dbgstr_longlong( slot->source_sequence ) );
     plan.epoch = current.epoch;
     plan.source_damage = slot->damage;
     /* Cache reception already validated the native source. Compatible scene
