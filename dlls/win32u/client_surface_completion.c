@@ -50,11 +50,23 @@ static void trace_client_surface_worker( const char *event, unsigned int slot, B
 struct client_surface_completion_job
 {
     struct list entry;
+    struct client_surface *surface;
     struct client_surface_frame present;
     struct client_surface_completion_result result;
     SIZE expected_size;
     DWORD wait_started, wait_timeout, poll_due, poll_delay;
-    BOOL has_expected_size, deferred, allocated, pending, done;
+    BOOL has_expected_size, deferred, allocated, reserved, pending, done;
+};
+
+/* The scheduler owns all transitions under completion_executor_lock. Queued
+ * jobs and unsubmitted reservations pin surface; the queue's pointer is weak. */
+struct client_surface_completion_queue
+{
+    struct client_surface *surface;
+    struct list jobs;
+    struct list ready_entry;
+    unsigned int reservations;
+    BOOL in_progress;
 };
 
 #define CLIENT_SURFACE_MAX_DEFERRED_PRESENTS 64
@@ -70,6 +82,7 @@ static pthread_cond_t completion_executor_cond;
 static int completion_executor_init_status;
 static struct list completion_ready_surfaces = LIST_INIT(completion_ready_surfaces);
 static unsigned int completion_busy_workers;
+static unsigned int completion_reservation_count;
 
 struct client_surface_completion_worker
 {
@@ -126,9 +139,29 @@ static void init_completion_executor(void)
     completion_executor_init_status = client_surface_cond_init( &completion_executor_cond );
 }
 
-BOOL client_surface_completion_init(void)
+BOOL client_surface_completion_init( struct client_surface *surface )
 {
-    return !pthread_once( &completion_executor_once, init_completion_executor ) && !completion_executor_init_status;
+    struct client_surface_completion_queue *queue;
+
+    if (pthread_once( &completion_executor_once, init_completion_executor ) || completion_executor_init_status)
+        return FALSE;
+    if (!(queue = calloc( 1, sizeof(*queue) ))) return FALSE;
+    queue->surface = surface;
+    list_init( &queue->jobs );
+    list_init( &queue->ready_entry );
+    surface->completion_queue = queue;
+    return TRUE;
+}
+
+void client_surface_completion_destroy( struct client_surface *surface )
+{
+    struct client_surface_completion_queue *queue = surface->completion_queue;
+
+    assert( list_empty( &queue->jobs ) );
+    assert( list_empty( &queue->ready_entry ) );
+    assert( !queue->in_progress && !queue->reservations );
+    free( queue );
+    surface->completion_queue = NULL;
 }
 
 static BOOL client_surface_reserve_completion_slot(void)
@@ -201,15 +234,15 @@ void client_surface_set_present_completion( struct client_surface_frame *present
 
 static struct client_surface_completion_job *completion_head( struct client_surface *surface )
 {
-    return LIST_ENTRY( list_head( &surface->completion_queue ), struct client_surface_completion_job, entry );
+    return LIST_ENTRY( list_head( &surface->completion_queue->jobs ), struct client_surface_completion_job, entry );
 }
 
 static void queue_ready_surface_locked( struct client_surface *surface )
 {
-    assert( !surface->completion_in_progress );
-    assert( list_empty( &surface->completion_ready_entry ) );
-    if (!list_empty( &surface->completion_queue ))
-        list_add_tail( &completion_ready_surfaces, &surface->completion_ready_entry );
+    assert( !surface->completion_queue->in_progress );
+    assert( list_empty( &surface->completion_queue->ready_entry ) );
+    if (!list_empty( &surface->completion_queue->jobs ))
+        list_add_tail( &completion_ready_surfaces, &surface->completion_queue->ready_entry );
     pthread_cond_broadcast( &completion_executor_cond );
 }
 
@@ -287,7 +320,10 @@ static BOOL start_client_surface_completion_thread( struct client_surface *prosp
     active = active_completion_workers_locked();
     demand = completion_busy_workers;
     LIST_FOR_EACH( entry, &completion_ready_surfaces ) ++demand;
-    if (prospective && list_empty( &prospective->completion_queue )) ++demand;
+    if (prospective && list_empty( &prospective->completion_queue->jobs )) ++demand;
+    /* One clean owner suffices for unsubmitted tickets. Grow the pool when
+     * independent FIFO heads become runnable, not for each reserved frame. */
+    if (!demand && completion_reservation_count) demand = 1;
     if (active + starting_completion_workers_locked() <
         min( demand, (unsigned int)ARRAY_SIZE(completion_workers) ))
         for (i = 0; i < ARRAY_SIZE(completion_workers); ++i)
@@ -397,9 +433,9 @@ static enum client_surface_completion_worker_disposition execute_completion_job(
                                  job->has_expected_size ? &job->expected_size : NULL, result, poll );
 
     pthread_mutex_lock( &completion_executor_lock );
-    assert( surface->completion_in_progress && completion_head( surface ) == job );
+    assert( surface->completion_queue->in_progress && completion_head( surface ) == job );
     if (worker) --completion_busy_workers;
-    surface->completion_in_progress = FALSE;
+    surface->completion_queue->in_progress = FALSE;
     job->result = result;
     job->pending = result.status == CLIENT_SURFACE_COMPLETION_PENDING;
     if (result.status != CLIENT_SURFACE_COMPLETION_PENDING)
@@ -423,21 +459,22 @@ static enum client_surface_completion_worker_disposition execute_completion_job(
 
 static struct client_surface_completion_job *claim_completion_head_locked( struct client_surface *surface )
 {
-    assert( !surface->completion_in_progress );
-    assert( !list_empty( &surface->completion_queue ) );
-    assert( !list_empty( &surface->completion_ready_entry ) );
-    list_remove( &surface->completion_ready_entry );
-    list_init( &surface->completion_ready_entry );
-    surface->completion_in_progress = TRUE;
+    assert( !surface->completion_queue->in_progress );
+    assert( !list_empty( &surface->completion_queue->jobs ) );
+    assert( !list_empty( &surface->completion_queue->ready_entry ) );
+    list_remove( &surface->completion_queue->ready_entry );
+    list_init( &surface->completion_queue->ready_entry );
+    surface->completion_queue->in_progress = TRUE;
     return completion_head( surface );
 }
 
 static struct client_surface *next_completion_surface_locked( DWORD now, DWORD *delay, BOOL cancel )
 {
-    struct client_surface *surface;
+    struct client_surface_completion_queue *queue;
 
-    LIST_FOR_EACH_ENTRY( surface, &completion_ready_surfaces, struct client_surface, completion_ready_entry )
+    LIST_FOR_EACH_ENTRY( queue, &completion_ready_surfaces, struct client_surface_completion_queue, ready_entry )
     {
+        struct client_surface *surface = queue->surface;
         struct client_surface_completion_job *job = completion_head( surface );
         if (cancel || !job->pending || (INT)(now - job->poll_due) >= 0) return surface;
         *delay = min( *delay, job->poll_due - now );
@@ -459,10 +496,14 @@ static void cancel_ready_completion_jobs(void)
     for (;;)
     {
         pthread_mutex_lock( &completion_executor_lock );
-        /* Creation reservations cap resources but are not successful owners.
+        /* Thread-creation reservations cap resources but are not successful owners.
          * If the final clean worker retired during an unrelated creation,
-         * that creation's failure must not strand the older ready queues. */
-        while (!active_completion_workers_locked() && starting_completion_workers_locked())
+         * that creation's failure must not strand the older ready queues.
+         * Unsubmitted frame tickets retain this cancellation owner until a
+         * clean worker takes over or the tickets are queued or cancelled. */
+        while (!active_completion_workers_locked() &&
+               (starting_completion_workers_locked() ||
+                (completion_reservation_count && list_empty( &completion_ready_surfaces ))))
             pthread_cond_wait( &completion_executor_cond, &completion_executor_lock );
         if (active_completion_workers_locked() ||
             !(surface = next_completion_surface_locked( 0, &delay, TRUE )))
@@ -499,7 +540,7 @@ static void client_surface_completion_thread( void *context )
             now = NtGetTickCount();
             delay = CLIENT_SURFACE_COMPLETION_WORKER_IDLE_TIMEOUT_MS;
             if ((surface = next_completion_surface_locked( now, &delay, FALSE ))) break;
-            if (!list_empty( &completion_ready_surfaces )) idle_started = now;
+            if (!list_empty( &completion_ready_surfaces ) || completion_reservation_count) idle_started = now;
             else if (now - idle_started >= CLIENT_SURFACE_COMPLETION_WORKER_IDLE_TIMEOUT_MS)
             {
                 worker->state = COMPLETION_WORKER_EXITING;
@@ -541,9 +582,9 @@ static void client_surface_completion_thread( void *context )
 static void queue_completion_job_locked( struct client_surface *surface,
                                          struct client_surface_completion_job *job )
 {
-    BOOL empty = list_empty( &surface->completion_queue );
+    BOOL empty = list_empty( &surface->completion_queue->jobs );
 
-    list_add_tail( &surface->completion_queue, &job->entry );
+    list_add_tail( &surface->completion_queue->jobs, &job->entry );
     if (empty) queue_ready_surface_locked( surface );
     TRACE_(csperf)( "ticks=%llu event=completion_queue identity=%s serial=%s control=%s target_epoch=%s "
                    "deferred=%u inline=%u head=%u\n", client_surface_perf_time(),
@@ -576,7 +617,7 @@ static void complete_inline_job( struct client_surface *surface, struct client_s
         }
         job = completion_head( surface );
         now = NtGetTickCount();
-        if (!surface->completion_in_progress &&
+        if (!surface->completion_queue->in_progress &&
             (!reusable || !job->pending || (INT)(now - job->poll_due) >= 0))
         {
             job = claim_completion_head_locked( surface );
@@ -587,7 +628,7 @@ static void complete_inline_job( struct client_surface *surface, struct client_s
         else
         {
             delay = CLIENT_SURFACE_COMPLETION_POLL_TIMEOUT_MS;
-            if (!surface->completion_in_progress && job->pending) delay = min( delay, job->poll_due - now );
+            if (!surface->completion_queue->in_progress && job->pending) delay = min( delay, job->poll_due - now );
             wait_completion_executor_locked( delay );
             pthread_mutex_unlock( &completion_executor_lock );
         }
@@ -608,7 +649,7 @@ static void complete_inline_job( struct client_surface *surface, struct client_s
     if (!own->deferred && own->present.completion.kind == CLIENT_SURFACE_COMPLETION_SHARED)
     {
         pthread_mutex_lock( &completion_executor_lock );
-        assert( list_empty( &surface->completion_queue ) );
+        assert( list_empty( &surface->completion_queue->jobs ) );
         pthread_mutex_unlock( &completion_executor_lock );
     }
     else if (!start_client_surface_completion_thread( NULL ))
@@ -616,8 +657,8 @@ static void complete_inline_job( struct client_surface *surface, struct client_s
         for (;;)
         {
             pthread_mutex_lock( &completion_executor_lock );
-            if (active_completion_workers_locked() || surface->completion_in_progress ||
-                list_empty( &surface->completion_queue ))
+            if (active_completion_workers_locked() || surface->completion_queue->in_progress ||
+                list_empty( &surface->completion_queue->jobs ))
             {
                 pthread_mutex_unlock( &completion_executor_lock );
                 break;
@@ -655,13 +696,94 @@ struct client_surface_completion_result client_surface_wait_present_completion(
 static BOOL completion_queue_has_room_locked( struct client_surface *surface )
 {
     struct list *entry;
-    unsigned int count = 0;
+    unsigned int count = surface->completion_queue->reservations;
 
-    /* Include the executing head through its final releases. Synchronous
-     * stack nodes cannot allocate more retained heap work under pressure. */
-    LIST_FOR_EACH( entry, &surface->completion_queue )
+    /* Include unsubmitted reservations and the head through final releases.
+     * Synchronous stack nodes cannot allocate more retained heap work under pressure. */
+    if (count >= CLIENT_SURFACE_MAX_DEFERRED_PRESENTS) return FALSE;
+    LIST_FOR_EACH( entry, &surface->completion_queue->jobs )
         if (++count >= CLIENT_SURFACE_MAX_DEFERRED_PRESENTS) return FALSE;
     return TRUE;
+}
+
+/* Reserve outside native and surface locks. Once admitted, this reference and
+ * capacity belong to the ticket until cancellation or FIFO terminal release.
+ * Outstanding tickets keep a worker alive even before native submission. */
+struct client_surface_completion_job *client_surface_reserve_completion( struct client_surface *surface )
+{
+    struct client_surface_completion_job *job;
+    BOOL admitted = FALSE;
+
+    if (!(job = calloc( 1, sizeof(*job) ))) return NULL;
+    if (!client_surface_reserve_completion_slot())
+    {
+        free( job );
+        return NULL;
+    }
+    client_surface_add_ref( surface );
+    start_client_surface_completion_thread( surface );
+    pthread_mutex_lock( &completion_executor_lock );
+    if (active_completion_workers_locked() && completion_queue_has_room_locked( surface ))
+    {
+        ++surface->completion_queue->reservations;
+        ++completion_reservation_count;
+        job->surface = surface;
+        job->allocated = job->reserved = TRUE;
+        admitted = TRUE;
+        pthread_cond_broadcast( &completion_executor_cond );
+    }
+    pthread_mutex_unlock( &completion_executor_lock );
+    if (admitted) return job;
+    InterlockedDecrement( &client_surface_deferred_present_count );
+    client_surface_release( surface );
+    free( job );
+    return NULL;
+}
+
+void client_surface_cancel_completion( struct client_surface_completion_job *job )
+{
+    struct client_surface *surface;
+
+    if (!job) return;
+    surface = job->surface;
+    pthread_mutex_lock( &completion_executor_lock );
+    assert( job->reserved && surface->completion_queue->reservations && completion_reservation_count );
+    --surface->completion_queue->reservations;
+    --completion_reservation_count;
+    InterlockedDecrement( &client_surface_deferred_present_count );
+    pthread_cond_broadcast( &completion_executor_cond );
+    pthread_mutex_unlock( &completion_executor_lock );
+    client_surface_release( surface );
+    free( job );
+}
+
+void client_surface_defer_reserved_present( struct client_surface_completion_job *job,
+                                            struct client_surface_frame *present, const SIZE *expected_size )
+{
+    struct client_surface *surface = job->surface;
+
+    assert( job->reserved && present->serial );
+    assert( present->completion.kind != CLIENT_SURFACE_COMPLETION_NONE );
+    assert( present->completion.external_result && present->completion.wait && present->completion.release );
+    assert( InterlockedCompareExchange( &surface->external_completion_count, 0, 0 ) > 0 );
+    job->present = *present;
+    job->deferred = TRUE;
+    job->has_expected_size = !!expected_size;
+    if (expected_size) job->expected_size = *expected_size;
+    job->wait_started = present->submission_time;
+    job->wait_timeout = CLIENT_SURFACE_PRESENT_TIMEOUT;
+    job->poll_delay = 1;
+    memset( present, 0, sizeof(*present) );
+    pthread_mutex_lock( &completion_executor_lock );
+    assert( surface->completion_queue->reservations && completion_reservation_count );
+    job->reserved = FALSE;
+    --surface->completion_queue->reservations;
+    --completion_reservation_count;
+    /* Publishing the job and consuming its reservation are atomic to worker
+     * exit. A retiring last worker remains the cancellation owner until all
+     * accepted tickets have either entered this FIFO or been cancelled. */
+    queue_completion_job_locked( surface, job );
+    pthread_mutex_unlock( &completion_executor_lock );
 }
 
 void client_surface_defer_present( struct client_surface *surface,

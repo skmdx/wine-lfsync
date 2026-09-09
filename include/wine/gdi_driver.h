@@ -219,7 +219,7 @@ struct gdi_dc_funcs
 };
 
 /* increment this when changing driver tables or shared driver-facing structures */
-#define WINE_GDI_DRIVER_VERSION 139
+#define WINE_GDI_DRIVER_VERSION 140
 
 #define GDI_PRIORITY_NULL_DRV        0  /* null driver */
 #define GDI_PRIORITY_FONT_DRV      100  /* any font driver */
@@ -413,11 +413,9 @@ struct client_surface
     pthread_mutex_t                    present_lock;   /* serializes driver operations for this surface */
     pthread_mutex_t                    completion_lock; /* protects host completion state */
     pthread_cond_t                     completion_cond; /* completion-mode and target handoff */
-    /* The process completion executor protects these, independently of the
-     * native presentation locks. Its FIFO head owns each poll and finish. */
-    struct list                        completion_queue;
-    struct list                        completion_ready_entry;
-    BOOL                               completion_in_progress;
+    /* Private scheduler state; only the completion module owns its FIFO and
+     * admission counts, independently of native presentation locks. */
+    struct client_surface_completion_queue *completion_queue;
     LONG                               ref;            /* reference count */
     HWND                               hwnd;           /* window the surface was created for */
     int                                format;         /* pixel format of the surface */
@@ -496,6 +494,13 @@ W32KAPI void client_surface_set_present_completion( struct client_surface_frame 
 W32KAPI void client_surface_defer_present( struct client_surface *surface,
                                            struct client_surface_frame *present,
                                            const SIZE *expected_size );
+/* Reserve before any native submission and outside every surface/native lock.
+ * Cancellation returns an unused reservation; defer transfers frame ownership. */
+W32KAPI struct client_surface_completion_job *client_surface_reserve_completion( struct client_surface *surface );
+W32KAPI void client_surface_cancel_completion( struct client_surface_completion_job *job );
+W32KAPI void client_surface_defer_reserved_present( struct client_surface_completion_job *job,
+                                                   struct client_surface_frame *present,
+                                                   const SIZE *expected_size );
 W32KAPI void client_surface_lock_present( struct client_surface *surface );
 W32KAPI void client_surface_unlock_present( struct client_surface *surface );
 W32KAPI void client_surface_prepare_present_locked( struct client_surface *surface,

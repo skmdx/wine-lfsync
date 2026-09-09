@@ -230,7 +230,6 @@ struct vulkan_present_completion
     struct vulkan_device *device;
     struct swapchain *swapchain;
     uint64_t present_id;
-    BOOL wait_skipped;
 };
 
 struct vulkan_snapshot_capture
@@ -240,9 +239,11 @@ struct vulkan_snapshot_capture
     struct swapchain_snapshot *snapshot;
 };
 
-struct vulkan_snapshot_reservation
+struct vulkan_present_reservation
 {
     struct swapchain_snapshot *snapshot;
+    struct client_surface_completion_job *job;
+    struct vulkan_present_completion *completion;
     BOOL required;
 };
 
@@ -252,11 +253,9 @@ static struct client_surface_completion_result wait_vulkan_present_completion( v
     struct swapchain *swapchain = completion->swapchain;
     VkResult res;
 
-    completion->wait_skipped = FALSE;
     pthread_mutex_lock( &swapchain->present_lock );
     if (swapchain->retired)
     {
-        completion->wait_skipped = TRUE;
         pthread_mutex_unlock( &swapchain->present_lock );
         TRACE( "Skipping present wait for retired swapchain %p, id %s\n",
                swapchain, wine_dbgstr_longlong( completion->present_id ) );
@@ -2565,7 +2564,7 @@ failed:
 static VkResult snapshot_vulkan_present( struct vulkan_queue *queue, VkPresentInfoKHR *present_info,
                                          const VkSwapchainKHR *client_swapchains,
                                          struct client_surface_frame *presents,
-                                         struct vulkan_snapshot_reservation *reservations )
+                                         struct vulkan_present_reservation *reservations )
 {
     struct vulkan_device *device = queue->device;
     VkCommandBuffer commands_buffer[16], *commands = commands_buffer;
@@ -3057,7 +3056,7 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
     struct swapchain *present_swapchains_buffer[16], **present_swapchains = present_swapchains_buffer;
     struct client_surface *present_surfaces_buffer[16], **present_surfaces = present_surfaces_buffer;
     struct client_surface_frame presents_buffer[16], *presents = presents_buffer;
-    struct vulkan_snapshot_reservation reservations_buffer[16] = {{0}}, *reservations = reservations_buffer;
+    struct vulkan_present_reservation reservations_buffer[16] = {{0}}, *reservations = reservations_buffer;
     VkResult results_buffer[16], *results = results_buffer;
     uint64_t present_ids_buffer[16], *present_ids = present_ids_buffer;
     VkPresentIdKHR present_id_info = {VK_STRUCTURE_TYPE_PRESENT_ID_KHR};
@@ -3171,22 +3170,32 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
         present_info->pNext = &present_id_info;
     }
 
-reserve_snapshots:
+reserve_completions:
     for (uint32_t i = 0; i < present_info->swapchainCount; ++i)
     {
         struct swapchain *swapchain = present_swapchains[i];
         struct client_surface_target target;
         unsigned int index;
 
-        if (!swapchain_needs_snapshot( swapchain )) continue;
         for (index = 0; index < present_info->swapchainCount; ++index)
             if (swapchain_from_handle( client_swapchains[index] ) == swapchain) break;
         assert( index < present_info->swapchainCount );
-        if (reservations[index].snapshot) continue;
         client_surface_get_target( swapchain->surface->client, &target );
         if (!reservations[index].required && !target.offscreen) continue;
-        if (!(res = acquire_snapshot_reservation( device, swapchain,
-                                                  &reservations[index].snapshot ))) continue;
+        /* Reserve every batch member's completion owner before any native
+         * acceptance. Admission and allocation cannot fall back to a wait on
+         * the submitting thread after its guest semaphore has been consumed. */
+        res = VK_ERROR_OUT_OF_HOST_MEMORY;
+        if (!reservations[index].job &&
+            !(reservations[index].job = client_surface_reserve_completion( swapchain->surface->client )))
+            goto reservation_failed;
+        if (!swapchain_needs_snapshot( swapchain ) && use_internal_present_wait && present_ids[index] &&
+            !reservations[index].completion &&
+            !(reservations[index].completion = malloc( sizeof(*reservations[index].completion) )))
+            goto reservation_failed;
+        if (!swapchain_needs_snapshot( swapchain ) || reservations[index].snapshot ||
+            !(res = acquire_snapshot_reservation( device, swapchain, &reservations[index].snapshot ))) continue;
+reservation_failed:
         if (present_info->pResults)
             for (uint32_t j = 0; j < present_info->swapchainCount; ++j) present_info->pResults[j] = res;
         goto done;
@@ -3236,16 +3245,17 @@ reserve_snapshots:
                                                (use_internal_present_wait && present_ids[i]) || swapchain_needs_snapshot( swapchain ) );
         have_snapshots |= swapchain_needs_snapshot( swapchain ) &&
                           presents[i].completion.kind == CLIENT_SURFACE_COMPLETION_EXACT;
-        if (swapchain_needs_snapshot( swapchain ) && presents[i].completion.kind == CLIENT_SURFACE_COMPLETION_EXACT &&
-            !reservations[i].snapshot)
+        if (presents[i].completion.kind != CLIENT_SURFACE_COMPLETION_NONE &&
+            (!reservations[i].job ||
+             (swapchain_needs_snapshot( swapchain ) && !reservations[i].snapshot)))
             reserve_more = reservations[i].required = TRUE;
     }
     if (reserve_more)
     {
         /* A scene may become offscreen between the lock-free inspection and
          * preparation. Cancel only our unsubmitted tokens, then reserve its
-         * independent staging storage outside every surface lock. DIRECT
-         * calls never wait for a staging buffer they will not use. */
+         * completion owner and staging storage outside every surface lock.
+         * DIRECT calls do not reserve resources they will not use. */
         for (uint32_t i = 0; i < present_info->swapchainCount; ++i)
         {
             struct client_surface *surface = swapchain_from_handle( client_swapchains[i] )->surface->client;
@@ -3259,7 +3269,7 @@ reserve_snapshots:
         }
         while (surface_locked_count)
             client_surface_unlock_present( present_surfaces[--surface_locked_count] );
-        goto reserve_snapshots;
+        goto reserve_completions;
     }
 
     if (TRACE_ON(vulkan)) for (uint32_t i = 0; i < present_info->swapchainCount; ++i)
@@ -3374,7 +3384,8 @@ reserve_snapshots:
 
         if (compose && snapshot_submitted)
         {
-            client_surface_defer_present( surface->client, &presents[i], &expected_size );
+            client_surface_defer_reserved_present( reservations[i].job, &presents[i], &expected_size );
+            reservations[i].job = NULL;
             continue;
         }
         if (compose && presents[i].completion.kind == CLIENT_SURFACE_COMPLETION_SHARED)
@@ -3385,51 +3396,38 @@ reserve_snapshots:
             retain_swapchain_completion( swapchain );
             client_surface_set_present_completion( &presents[i], wait_vulkan_driver_completion,
                                                    release_vulkan_driver_completion, swapchain );
-            client_surface_defer_present( surface->client, &presents[i], &expected_size );
+            client_surface_defer_reserved_present( reservations[i].job, &presents[i], &expected_size );
+            reservations[i].job = NULL;
             continue;
         }
         if (compose && presents[i].completion.kind == CLIENT_SURFACE_COMPLETION_EXACT &&
             use_internal_present_wait && present_ids[i] && !snapshot_submitted)
         {
-            struct vulkan_present_completion *completion;
+            struct vulkan_present_completion *completion = reservations[i].completion;
 
-            if ((completion = malloc( sizeof(*completion) )))
-            {
-                completion->device = device;
-                completion->swapchain = swapchain;
-                completion->present_id = present_ids[i];
-                completion->wait_skipped = FALSE;
-                retain_swapchain_completion( swapchain );
-                client_surface_set_present_completion( &presents[i], wait_vulkan_present_completion,
-                                                       release_vulkan_present_completion, completion );
-                client_surface_defer_present( surface->client, &presents[i], &expected_size );
-                continue;
-            }
+            assert( completion );
+            completion->device = device;
+            completion->swapchain = swapchain;
+            completion->present_id = present_ids[i];
+            retain_swapchain_completion( swapchain );
+            client_surface_set_present_completion( &presents[i], wait_vulkan_present_completion,
+                                                   release_vulkan_present_completion, completion );
+            reservations[i].completion = NULL;
+            client_surface_defer_reserved_present( reservations[i].job, &presents[i], &expected_size );
+            reservations[i].job = NULL;
+            continue;
         }
 
         {
             BOOL completed;
-            BOOL external_completed = FALSE;
             BOOL wait_skipped = use_internal_present_wait && !present_ids[i] &&
                                 presents[i].completion.kind == CLIENT_SURFACE_COMPLETION_NONE;
             DWORD elapsed = NtGetTickCount() - presents[i].submission_time;
             DWORD remaining = elapsed < CLIENT_SURFACE_PRESENT_TIMEOUT ?
                               CLIENT_SURFACE_PRESENT_TIMEOUT - elapsed : 0;
 
-            if (compose && presents[i].completion.kind == CLIENT_SURFACE_COMPLETION_EXACT &&
-                use_internal_present_wait && present_ids[i] && !snapshot_submitted)
-            {
-                struct vulkan_present_completion fallback = {device, swapchain, present_ids[i], FALSE};
-
-                client_surface_set_present_completion( &presents[i], wait_vulkan_present_completion,
-                                                       NULL, &fallback );
-                external_completed = client_surface_wait_present_completion(
-                    surface->client, &presents[i], remaining ).status == CLIENT_SURFACE_COMPLETION_SIGNALED;
-                wait_skipped = fallback.wait_skipped;
-            }
-
             completed = client_surface_complete_present( surface->client, &presents[i], compose,
-                                                         external_completed, &expected_size,
+                                                         FALSE, &expected_size,
                                                          use_internal_present_wait && present_ids[i] ? 0 : remaining );
             if (!completed && compose)
             {
@@ -3459,6 +3457,8 @@ done:
     if (reservations)
         for (uint32_t i = 0; i < present_info->swapchainCount; ++i)
         {
+            client_surface_cancel_completion( reservations[i].job );
+            free( reservations[i].completion );
             if (reservations[i].snapshot)
                 release_snapshot_reservation( swapchain_from_handle( client_swapchains[i] ),
                                                reservations[i].snapshot );
