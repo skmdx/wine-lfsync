@@ -147,6 +147,7 @@ struct client_surface_output_allocation
 {
     struct client_surface_output_allocation *next;
     Pixmap pixmaps[2];
+    Pixmap mailbox; /* owned here until the pair is installed in a target */
     UINT64 bytes;
 };
 
@@ -503,7 +504,7 @@ static BOOL client_surface_alloc_on_compositor( Drawable drawable, unsigned int 
 
     if (!(allocation = malloc( sizeof(*allocation) ))) return FALSE;
     allocation->bytes = 2 * client_surface_pixmap_bytes( width, height, depth );
-    if (!client_surface_reserve_memory( CLIENT_SURFACE_MEMORY_OUTPUT, allocation->bytes ))
+    if (!client_surface_reserve_memory( CLIENT_SURFACE_MEMORY_OUTPUT, allocation->bytes * 3 / 2 ))
     {
         free( allocation );
         return FALSE;
@@ -511,8 +512,15 @@ static BOOL client_surface_alloc_on_compositor( Drawable drawable, unsigned int 
     X11DRV_expect_error( display, client_surface_compositor_error, &error );
     pixmaps[0] = XCreatePixmap( display, drawable, width, height, depth );
     pixmaps[1] = XCreatePixmap( display, drawable, width, height, depth );
+    /* All three images belong to the replacement pool. Check their native
+     * allocation together, before copying its checkpoint or installing it.
+     * The old target remains intact if any request fails. */
+    allocation->mailbox = XCreatePixmap( display, drawable, width, height, depth );
     XSync( display, False );
     X11DRV_check_error();
+    TRACE_(csperf)( "ticks=%llu event=output_pool_alloc first=%lx second=%lx mailbox=%lx "
+                   "width=%u height=%u depth=%u sync_calls=1 error=%d\n", client_surface_perf_time(),
+                   pixmaps[0], pixmaps[1], allocation->mailbox, width, height, depth, error );
     if (!error)
     {
         memcpy( allocation->pixmaps, pixmaps, sizeof(allocation->pixmaps) );
@@ -520,16 +528,19 @@ static BOOL client_surface_alloc_on_compositor( Drawable drawable, unsigned int 
         client_surface_output_allocations = allocation;
         x11drv_client_surface_trace_image( "acquire", "output_pair", display, pixmaps[0], allocation->bytes / 2 );
         x11drv_client_surface_trace_image( "acquire", "output_pair", display, pixmaps[1], allocation->bytes / 2 );
+        x11drv_client_surface_trace_image( "acquire", "output_mailbox", display,
+                                          allocation->mailbox, allocation->bytes / 2 );
         return TRUE;
     }
 
     X11DRV_expect_error( display, client_surface_compositor_error, &error );
     XFreePixmap( display, pixmaps[0] );
     XFreePixmap( display, pixmaps[1] );
+    XFreePixmap( display, allocation->mailbox );
     XSync( display, False );
     X11DRV_check_error();
     pixmaps[0] = pixmaps[1] = 0;
-    client_surface_release_memory( CLIENT_SURFACE_MEMORY_OUTPUT, allocation->bytes );
+    client_surface_release_memory( CLIENT_SURFACE_MEMORY_OUTPUT, allocation->bytes * 3 / 2 );
     free( allocation );
     return FALSE;
 }
@@ -540,21 +551,30 @@ static BOOL client_surface_free_on_compositor( const Pixmap pixmaps[2] )
     struct client_surface_output_allocation **cursor, *allocation;
     int error = 0;
 
+    for (cursor = &client_surface_output_allocations; (allocation = *cursor); cursor = &allocation->next)
+        if ((allocation->pixmaps[0] == pixmaps[0] && allocation->pixmaps[1] == pixmaps[1]) ||
+            (allocation->pixmaps[0] == pixmaps[1] && allocation->pixmaps[1] == pixmaps[0])) break;
     X11DRV_expect_error( display, client_surface_compositor_error, &error );
     if (pixmaps[0]) XFreePixmap( display, pixmaps[0] );
     if (pixmaps[1]) XFreePixmap( display, pixmaps[1] );
+    if (allocation && allocation->mailbox) XFreePixmap( display, allocation->mailbox );
     XSync( display, False );
     X11DRV_check_error();
-    for (cursor = &client_surface_output_allocations; (allocation = *cursor); cursor = &allocation->next)
+    if (allocation)
     {
-        if (!((allocation->pixmaps[0] == pixmaps[0] && allocation->pixmaps[1] == pixmaps[1]) ||
-              (allocation->pixmaps[0] == pixmaps[1] && allocation->pixmaps[1] == pixmaps[0]))) continue;
+        UINT64 bytes = allocation->bytes;
+
         *cursor = allocation->next;
         x11drv_client_surface_trace_image( "free", "output_pair", display, pixmaps[0], allocation->bytes / 2 );
         x11drv_client_surface_trace_image( "free", "output_pair", display, pixmaps[1], allocation->bytes / 2 );
-        client_surface_release_memory( CLIENT_SURFACE_MEMORY_OUTPUT, allocation->bytes );
+        if (allocation->mailbox)
+        {
+            x11drv_client_surface_trace_image( "free", "output_mailbox", display,
+                                              allocation->mailbox, allocation->bytes / 2 );
+            bytes += allocation->bytes / 2;
+        }
+        client_surface_release_memory( CLIENT_SURFACE_MEMORY_OUTPUT, bytes );
         free( allocation );
-        break;
     }
     if (error) WARN( "failed to release client-surface frame pool %#lx/%#lx, error %d\n",
                      pixmaps[0], pixmaps[1], error );
@@ -1507,8 +1527,7 @@ static void quiesce_client_surface_compositor_target( struct client_surface_comp
 static BOOL update_client_surface_compositor_target( struct client_surface_compositor_job *job )
 {
     struct client_surface_compositor_target *target;
-    Pixmap mailbox = 0;
-    UINT64 mailbox_bytes = 0;
+    struct client_surface_output_allocation *allocation = NULL;
     BOOL same_pool, checkpoint, created = FALSE;
 
     if (!(target = find_client_surface_compositor_target( job->handoff_toplevel )))
@@ -1524,35 +1543,13 @@ static BOOL update_client_surface_compositor_target( struct client_surface_compo
                  target->frames[1].pixmap == job->pixmaps[0]));
     if (!same_pool)
     {
-        int error = 0;
-
-        /* Keep the complete old pool, including its published checkpoint,
-         * until every image of the replacement has a native allocation.
-         * Both pools remain charged while they coexist. */
-        mailbox_bytes = client_surface_pixmap_bytes( job->width, job->height, job->depth );
-        if (!client_surface_reserve_memory( CLIENT_SURFACE_MEMORY_OUTPUT, mailbox_bytes ))
-            goto failed;
-        X11DRV_expect_error( client_surface_compositor_display,
-                             client_surface_compositor_error, &error );
-        mailbox = XCreatePixmap( client_surface_compositor_display,
-            job->destination, job->width, job->height, job->depth );
-        XSync( client_surface_compositor_display, False );
-        X11DRV_check_error();
-        if (error || !mailbox)
-        {
-            if (mailbox)
-            {
-                X11DRV_expect_error( client_surface_compositor_display,
-                                     client_surface_compositor_error, &error );
-                XFreePixmap( client_surface_compositor_display, mailbox );
-                XSync( client_surface_compositor_display, False );
-                X11DRV_check_error();
-            }
-            client_surface_release_memory( CLIENT_SURFACE_MEMORY_OUTPUT, mailbox_bytes );
-            goto failed;
-        }
-        x11drv_client_surface_trace_image( "acquire", "output_mailbox", client_surface_compositor_display,
-                                          mailbox, mailbox_bytes );
+        /* The allocation record owns the already checked third image until
+         * installation succeeds. A failed checkpoint or target allocation
+         * leaves the complete replacement available for normal pool cleanup. */
+        for (allocation = client_surface_output_allocations; allocation; allocation = allocation->next)
+            if ((allocation->pixmaps[0] == job->pixmaps[0] && allocation->pixmaps[1] == job->pixmaps[1]) ||
+                (allocation->pixmaps[0] == job->pixmaps[1] && allocation->pixmaps[1] == job->pixmaps[0])) break;
+        if (!allocation || !allocation->mailbox) goto failed;
     }
     if (created)
     {
@@ -1599,8 +1596,9 @@ static BOOL update_client_surface_compositor_target( struct client_surface_compo
         memset( target->frames, 0, sizeof(target->frames) );
         target->frames[0].pixmap = job->pixmaps[0];
         target->frames[1].pixmap = job->pixmaps[1];
-        target->frames[2].pixmap = mailbox;
-        target->mailbox_bytes = mailbox_bytes;
+        target->frames[2].pixmap = allocation->mailbox;
+        target->mailbox_bytes = allocation->bytes / 2;
+        allocation->mailbox = 0;
         target->published = job->pixmaps[0];
         target->published_width = job->valid_width;
         target->published_height = job->valid_height;
@@ -3512,6 +3510,9 @@ static BOOL process_client_surface_compositor_jobs(void)
                                                   job->pixmaps[0], allocation->bytes / 2 );
                 x11drv_client_surface_trace_image( "retire", "output_pair", client_surface_compositor_display,
                                                   job->pixmaps[1], allocation->bytes / 2 );
+                if (allocation->mailbox)
+                    x11drv_client_surface_trace_image( "retire", "output_mailbox", client_surface_compositor_display,
+                                                      allocation->mailbox, allocation->bytes / 2 );
                 break;
             }
         }
