@@ -1403,6 +1403,30 @@ done:
     DestroyWindow(parent);
 }
 
+static BOOL supports_win32_surface(VkInstance instance, VkPhysicalDevice physical_device)
+{
+    VkWin32SurfaceCreateInfoKHR info = {.sType = VK_STRUCTURE_TYPE_WIN32_SURFACE_CREATE_INFO_KHR};
+    VkSurfaceKHR surface;
+    VkBool32 supported = VK_FALSE;
+    uint32_t family;
+    VkResult vr;
+
+    info.hwnd = CreateWindowW(L"static", L"surface support", WS_OVERLAPPEDWINDOW,
+            100, 100, 200, 200, 0, 0, 0, NULL);
+    ok(!!info.hwnd, "Failed to create support query window.\n");
+    vr = vkCreateWin32SurfaceKHR(instance, &info, NULL, &surface);
+    ok(vr == VK_SUCCESS, "Got surface creation result %d.\n", vr);
+    if (vr == VK_SUCCESS)
+    {
+        find_queue_family(physical_device, VK_QUEUE_GRAPHICS_BIT, &family);
+        vr = vkGetPhysicalDeviceSurfaceSupportKHR(physical_device, family, surface, &supported);
+        ok(vr == VK_SUCCESS, "Got surface support result %d.\n", vr);
+        vkDestroySurfaceKHR(instance, surface, NULL);
+    }
+    DestroyWindow(info.hwnd);
+    return supported;
+}
+
 static void test_win32_surface(VkInstance instance, VkPhysicalDevice physical_device)
 {
     static const char *const device_extensions[] = {"VK_KHR_swapchain", "VK_KHR_device_group",
@@ -1425,6 +1449,12 @@ static void test_win32_surface(VkInstance instance, VkPhysicalDevice physical_de
     BOOL pixels_only = argc > 2 && !strcmp(argv[2], "composition-pixels");
     BOOL retirement_only = argc > 2 && !strcmp(argv[2], "retirement-pixels");
     BOOL incremental;
+
+    if (!supports_win32_surface(instance, physical_device))
+    {
+        skip("Graphics queue cannot present to a Win32 surface on this device.\n");
+        return;
+    }
 
     vr = create_device(physical_device, ARRAY_SIZE(device_extensions), device_extensions, NULL, &device);
     incremental = vr == VK_SUCCESS;

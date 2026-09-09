@@ -70284,10 +70284,16 @@ static NTSTATUS thunk32_vkResetEvent(void *args)
 static NTSTATUS thunk64_vkResetFences(void *args)
 {
     struct vkResetFences_params *params = args;
+    const VkFence *pFences_host;
+    struct conversion_context local_ctx;
+    struct conversion_context *ctx = &local_ctx;
 
     TRACE("%p, %u, %p\n", params->device, params->fenceCount, params->pFences);
 
-    params->result = vk_funcs->p_vkResetFences(params->device, params->fenceCount, params->pFences);
+    init_conversion_context(ctx);
+    pFences_host = convert_VkFence_array_win64_to_host(ctx, params->pFences, params->fenceCount);
+    params->result = vulkan_device_from_handle(params->device)->p_vkResetFences(vulkan_device_from_handle(params->device)->host.device, params->fenceCount, pFences_host);
+    free_conversion_context(ctx);
     return STATUS_SUCCESS;
 }
 #endif /* _WIN64 */
@@ -70301,10 +70307,16 @@ static NTSTATUS thunk32_vkResetFences(void *args)
         PTR32 pFences;
         VkResult result;
     } *params = args;
+    const VkFence *pFences_host;
+    struct conversion_context local_ctx;
+    struct conversion_context *ctx = &local_ctx;
 
     TRACE("%#x, %u, %#x\n", params->device, params->fenceCount, params->pFences);
 
-    params->result = vk_funcs->p_vkResetFences((VkDevice)UlongToPtr(params->device), params->fenceCount, (const VkFence *)UlongToPtr(params->pFences));
+    init_conversion_context(ctx);
+    pFences_host = convert_VkFence_array_win32_to_host(ctx, (const VkFence *)UlongToPtr(params->pFences), params->fenceCount);
+    params->result = vulkan_device_from_handle((VkDevice)UlongToPtr(params->device))->p_vkResetFences(vulkan_device_from_handle((VkDevice)UlongToPtr(params->device))->host.device, params->fenceCount, pFences_host);
+    free_conversion_context(ctx);
     return STATUS_SUCCESS;
 }
 
