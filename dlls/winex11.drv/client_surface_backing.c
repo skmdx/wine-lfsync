@@ -1725,46 +1725,37 @@ static BOOL retire_client_surface_compositor_pool( HWND toplevel )
     return TRUE;
 }
 
+static BOOL get_client_surface_direct_scene( HWND toplevel, UINT64 epoch, struct client_surface_scene *scene )
+{
+    return client_surface_get_toplevel_scene( toplevel, scene ) && scene->direct_candidate &&
+           scene->epoch == epoch && (!scene->generation || scene->generation == epoch);
+}
+
 static BOOL client_surface_direct_plan_current( const struct client_surface_compositor_job *job,
                                                 const struct client_surface_compositor_target *target )
 {
     struct client_surface_scene current;
 
     return job->source && job->destination && (!target || target->window == job->destination) &&
-           client_surface_get_toplevel_scene( job->handoff_toplevel, &current ) &&
-           current.direct_candidate && current.epoch == job->scene_epoch &&
-           (!current.generation || current.generation == job->scene_epoch);
-}
-
-static BOOL get_client_surface_direct_snapshot( const struct client_surface_compositor_job *job,
-                                                UINT64 *scene_id, UINT *count,
-                                                struct client_surface_scene_member **members,
-                                                struct client_surface_scene *current )
-{
-    return client_surface_get_scene_snapshot( job->handoff_toplevel, scene_id, count, members ) &&
-           *count == 1 && (*members)[0].direct_candidate && (*members)[0].visible &&
-           (*members)[0].hwnd == job->handoff_toplevel && (*members)[0].identity == job->identity &&
-           (*members)[0].process == job->process &&
-           client_surface_get_toplevel_scene( job->handoff_toplevel, current ) &&
-           current->epoch == *scene_id && (!current->generation || current->generation == *scene_id);
+           get_client_surface_direct_scene( job->handoff_toplevel, job->scene_epoch, &current );
 }
 
 static BOOL install_client_surface_direct_plan( const struct client_surface_compositor_job *job )
 {
     struct client_surface_compositor_target *target = find_client_surface_compositor_target( job->handoff_toplevel );
-    struct client_surface_scene_member *members = NULL;
     struct client_surface_scene current;
     XWindowAttributes attributes;
     UINT64 scene_id = job->scene_epoch;
-    UINT count = 0;
     BOOL accepted = FALSE, allocated = FALSE;
     Status queried;
     int error = 0;
 
-    /* Selected roster size alone misses dormant registrations. The server's
-     * candidate flag includes that count and all existing DIRECT constraints. */
+    /* The shared candidate is only an early rejection hint. The prepare and
+     * select requests authenticate the sole selected identity, owner process
+     * and exact scene before changing the plan. No geometry or clip from a
+     * roster snapshot is consumed by native attachment. */
     if (!job->source || !job->destination ||
-        !get_client_surface_direct_snapshot( job, &scene_id, &count, &members, &current ))
+        !get_client_surface_direct_scene( job->handoff_toplevel, scene_id, &current ))
         goto done;
     /* A managed top-level may still be waiting for the WM to map it. A
      * DIRECT image presented into that unmapped hierarchy can be discarded
@@ -1796,14 +1787,11 @@ static BOOL install_client_surface_direct_plan( const struct client_surface_comp
         TRACE( "owner DIRECT strategy scene hwnd %p old %s new %s identity %s\n",
                job->handoff_toplevel, wine_dbgstr_longlong( scene_id ), wine_dbgstr_longlong( next_scene ),
                wine_dbgstr_longlong( job->identity ) );
-        /* This is a new immutable scene, not a retagged copy of the old
-         * snapshot. A failed read/admission leaves the channels and old plan
-         * intact; the restart's ordinary owner wake can compose the new scene. */
-        client_surface_free_scene_snapshot( count, members );
-        members = NULL;
-        count = 0;
+        /* Read the new immutable scene rather than retagging the old one.
+         * Failed admission leaves the channels and old plan intact; the
+         * restart's ordinary owner wake can compose the new scene. */
         scene_id = next_scene;
-        if (!get_client_surface_direct_snapshot( job, &scene_id, &count, &members, &current ) ||
+        if (!get_client_surface_direct_scene( job->handoff_toplevel, scene_id, &current ) ||
             current.generation != scene_id) goto done;
     }
     if (!target)
@@ -1848,7 +1836,6 @@ static BOOL install_client_surface_direct_plan( const struct client_surface_comp
            target->toplevel, wine_dbgstr_longlong( scene_id ), wine_dbgstr_longlong( job->identity ), job->source );
 done:
     if (allocated && !accepted) free( target );
-    client_surface_free_scene_snapshot( count, members );
     return accepted;
 }
 
@@ -3757,9 +3744,6 @@ BOOL X11DRV_client_surface_prepare_direct( struct client_surface *surface,
         .scene_epoch = scene->epoch,
         .identity = ReadAcquire64( (LONG64 *)&surface->identity ),
         .source = impl_from_client_surface( surface )->window,
-        /* The compositor system thread has no TEB. Capture the authenticated
-         * producer's process here, before submitting this scalar job. */
-        .process = HandleToULong( NtCurrentTeb()->ClientId.UniqueProcess ),
     };
 
     if ((scene->generation && scene->generation != scene->epoch) ||
