@@ -137,6 +137,7 @@ static int client_surface_direct_candidate( struct window *top );
 static int client_surface_direct_registration_candidate( struct window *top );
 static int client_surface_direct_eligible( struct window *top );
 static enum client_surface_presentation_mode client_surface_presentation_mode( struct window *top );
+static void update_window_first_child( struct window *win );
 
 static unsigned int client_surface_ref_hash( struct process *process, UINT64 id )
 {
@@ -667,6 +668,7 @@ static void window_destroy( struct object *obj )
     if (win->parent)
     {
         list_remove( &win->entry );
+        update_window_first_child( win->parent );
         release_object( win->parent );
     }
 
@@ -736,6 +738,19 @@ static inline struct window *get_first_child( struct window *win )
 {
     struct list *ptr = list_head( &win->children );
     return ptr ? LIST_ENTRY( ptr, struct window, entry ) : NULL;
+}
+
+static void update_window_first_child( struct window *win )
+{
+    struct window *child = get_first_child( win );
+    user_handle_t handle = child ? child->handle : 0;
+
+    if (win->shared->first_child == handle) return;
+    SHARED_WRITE_BEGIN( win->shared, window_shm_t )
+    {
+        shared->first_child = handle;
+    }
+    SHARED_WRITE_END;
 }
 
 /* get last child in Z-order list */
@@ -908,6 +923,7 @@ static int link_window( struct window *win, struct window *previous )
     }
 
     win->is_linked = 1;
+    update_window_first_child( win->parent );
     return old_prev != win->entry.prev;
 }
 
@@ -972,6 +988,7 @@ static int client_surface_child_placement_compatible( struct window *win, struct
 static int set_parent_window( struct window *win, struct window *parent )
 {
     struct window *ptr, *old_top = get_toplevel_window( win );
+    struct window *old_parent = win->parent;
     struct window *new_top = parent && !is_desktop_window( parent ) ?
                              get_toplevel_window( parent ) : win;
     unsigned int subtree_count = win->client_surface_subtree_count;
@@ -1012,10 +1029,14 @@ static int set_parent_window( struct window *win, struct window *parent )
     if (parent)
     {
         attach_parent_thread( win, false );
-        if (win->parent) release_object( win->parent );
         win->parent = (struct window *)grab_object( parent );
         attach_parent_thread( win, true );
         link_window( win, WINPTR_TOP );
+        if (old_parent)
+        {
+            update_window_first_child( old_parent );
+            release_object( old_parent );
+        }
         if (win->ex_style != old_ex_style) old_top->client_surface_transaction.source_pending = 0;
         if (subtree_count) adjust_client_surface_subtree_count( win->parent, subtree_count );
         if (subtree_count && new_top == win && new_top != old_top)
@@ -1065,6 +1086,7 @@ static int set_parent_window( struct window *win, struct window *parent )
         list_add_head( &win->parent->unlinked, &win->entry );
         win->is_linked = 0;
         win->is_orphan = 1;
+        update_window_first_child( win->parent );
     }
     if (scene_change && new_top != old_top) end_client_surface_scene_change( new_top );
     if (scene_change) end_client_surface_scene_change( old_top );
@@ -1323,6 +1345,7 @@ static struct window *create_window( struct window *parent, struct window *owner
         shared->class           = class_locator;
         shared->dpi_context     = is_toplevel( win ) ? dpi_context : parent->shared->dpi_context;
         shared->fnid            = fnid;
+        shared->first_child     = 0;
         shared->private_size    = private_size;
         shared->dpi             = dpi;
         shared->raw_dpi         = raw_dpi;
@@ -6283,6 +6306,7 @@ void set_window_rect_visible( user_handle_t window, struct rectangle rect )
         {
             list_remove( &win->entry );
             list_add_before( &ptr->entry, &win->entry );
+            update_window_first_child( win->parent );
         }
         break;
     }

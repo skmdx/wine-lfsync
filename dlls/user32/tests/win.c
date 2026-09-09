@@ -3520,6 +3520,64 @@ static void test_window_tree(HWND parent, const DWORD *style, const int *order, 
         ok(DestroyWindow(child[i]), "DestroyWindow failed\n");
 }
 
+static void test_child_window_order(void)
+{
+    HWND parent, other, first, second, child;
+    UINT flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE;
+
+    parent = CreateWindowA( "static", "parent", WS_POPUP, 0, 0, 100, 100, 0, 0, 0, NULL );
+    other = CreateWindowA( "static", "other", WS_POPUP, 0, 0, 100, 100, 0, 0, 0, NULL );
+    ok( parent && other, "Failed to create parents, error %lu\n", GetLastError() );
+    if (!parent || !other) goto done;
+
+    child = GetWindow( parent, GW_CHILD );
+    ok( !child, "Unexpected child %p\n", child );
+    first = CreateWindowA( "static", "first", WS_CHILD | WS_VISIBLE, 0, 0, 20, 20, parent, 0, 0, NULL );
+    second = CreateWindowA( "static", "second", WS_CHILD | WS_VISIBLE, 0, 0, 20, 20, parent, 0, 0, NULL );
+    ok( first && second, "Failed to create children, error %lu\n", GetLastError() );
+    if (!first || !second) goto done;
+
+    child = GetWindow( parent, GW_CHILD );
+    ok( child == first, "Got child %p, expected %p\n", child, first );
+    ok( SetWindowPos( second, HWND_TOP, 0, 0, 0, 0, flags ), "SetWindowPos failed\n" );
+    child = GetWindow( parent, GW_CHILD );
+    ok( child == second, "Got child %p, expected %p\n", child, second );
+    ShowWindow( second, SW_HIDE );
+    child = GetWindow( parent, GW_CHILD );
+    ok( child == second, "Hidden child %p, expected %p\n", child, second );
+    ShowWindow( second, SW_SHOWNA );
+    ok( SetWindowPos( second, HWND_BOTTOM, 0, 0, 0, 0, flags ), "SetWindowPos failed\n" );
+    child = GetWindow( parent, GW_CHILD );
+    ok( child == first, "Got child %p, expected %p\n", child, first );
+
+    ok( SetParent( first, other ) == parent, "SetParent failed\n" );
+    child = GetWindow( parent, GW_CHILD );
+    ok( child == second, "Old parent child %p, expected %p\n", child, second );
+    child = GetWindow( other, GW_CHILD );
+    ok( child == first, "New parent child %p, expected %p\n", child, first );
+    ok( SetParent( first, other ) == other, "SetParent to same parent failed\n" );
+    child = GetWindow( other, GW_CHILD );
+    ok( child == first, "Same parent child %p, expected %p\n", child, first );
+    ok( SetParent( first, parent ) == other, "SetParent back failed\n" );
+    child = GetWindow( other, GW_CHILD );
+    ok( !child, "Unexpected child %p in old parent\n", child );
+    child = GetWindow( parent, GW_CHILD );
+    ok( child == first, "Reparented child %p, expected %p\n", child, first );
+
+    ok( DestroyWindow( first ), "DestroyWindow failed\n" );
+    child = GetWindow( parent, GW_CHILD );
+    ok( child == second, "Remaining child %p, expected %p\n", child, second );
+    ok( DestroyWindow( second ), "DestroyWindow failed\n" );
+    child = GetWindow( parent, GW_CHILD );
+    ok( !child, "Unexpected child %p after destruction\n", child );
+    child = GetWindow( second, GW_CHILD );
+    ok( !child, "Unexpected child %p for destroyed window\n", child );
+
+done:
+    if (parent) DestroyWindow( parent );
+    if (other) DestroyWindow( other );
+}
+
 static void test_children_zorder(HWND parent)
 {
     const DWORD simple_style[5] = { WS_CHILD, WS_CHILD, WS_CHILD, WS_CHILD,
@@ -14616,6 +14674,12 @@ START_TEST(win)
         return;
     }
 
+    if (argc == 3 && !strcmp( argv[2], "child_order" ))
+    {
+        test_child_window_order();
+        return;
+    }
+
     if (argc == 4 && !strcmp( argv[2], "SetActiveWindow_0" ))
     {
         test_SetActiveWindow_0_proc( argv );
@@ -14705,6 +14769,7 @@ START_TEST(win)
     test_SetActiveWindow(hwndMain);
     test_NCRedraw();
 
+    test_child_window_order();
     test_children_zorder(hwndMain);
     test_popup_zorder(hwndMain2, hwndMain, WS_POPUP);
     test_popup_zorder(hwndMain2, hwndMain, 0);

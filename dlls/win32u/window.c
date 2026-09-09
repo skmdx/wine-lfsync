@@ -569,6 +569,19 @@ HWND get_window_relative( HWND hwnd, UINT rel )
 {
     HWND retval = 0;
 
+    if (rel == GW_CHILD)
+    {
+        struct object_lock lock = OBJECT_LOCK_INIT;
+        const window_shm_t *window_shm = NULL;
+        NTSTATUS status;
+
+        while ((status = get_shared_window( hwnd, &lock, &window_shm )) == STATUS_PENDING)
+            retval = wine_server_ptr_handle( window_shm->first_child );
+        if (!status) return retval;
+        /* Preserve the server's invalid-window error if the handle vanished. */
+        retval = 0;
+    }
+
     if (rel == GW_ENABLEDPOPUP)
     {
         HWND *list;

@@ -1124,7 +1124,7 @@ typedef volatile struct
     unsigned int         dpi_context;
     unsigned int         fnid;
     unsigned int         ansi;
-    int                  __pad;
+    user_handle_t        first_child;
     struct ratio         dpi;
     struct ratio         raw_dpi;
     data_size_t          private_size;
@@ -7670,6 +7670,6 @@ union generic_reply
     struct set_window_present_rect_reply set_window_present_rect_reply;
 };
 
-#define SERVER_PROTOCOL_VERSION 1017
+#define SERVER_PROTOCOL_VERSION 1018
 
 #endif /* __WINE_WINE_SERVER_PROTOCOL_H */
