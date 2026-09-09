@@ -4851,9 +4851,6 @@ static NTSTATUS update_client_surface_backing_state( HWND hwnd, BOOL enable, BOO
     supported = !win->surface && win->parent == get_desktop_window() &&
                 (win->dwStyle & (WS_VISIBLE | WS_MINIMIZE)) == WS_VISIBLE &&
                 IsRectEmpty( &win->present_rect );
-    TRACE( "hwnd %p backing candidate surface %p parent %p style %#x ex_style %#x present %s supported %u\n",
-           hwnd, win->surface, win->parent, win->dwStyle, win->dwExStyle,
-           wine_dbgstr_rect(&win->present_rect), supported );
     release_win_ptr( win );
     if (!supported) return status;
     if (layered)

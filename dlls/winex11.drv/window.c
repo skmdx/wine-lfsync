@@ -3534,28 +3534,19 @@ NTSTATUS X11DRV_UpdateClientSurfaceBacking( HWND hwnd, BOOL enable, BOOL prepare
     NTSTATUS status = STATUS_NOT_SUPPORTED;
 
     if (!(data = get_win_data( hwnd ))) return status;
-    TRACE( "win %p backing candidate enable %u prepare %u rects %s native %s desired %s pending %s "
-           "locks %u serials %lu/%lu alpha %u opacity %u fullscreen %u native %lx/%lx "
-           "embedded %u shaped %u reparenting %u invalid %u pool %lx/%lx staging %u/%u/%u state %u/%u/%u\n",
-           hwnd, enable, prepare, debugstr_window_rects(rects), debugstr_window_rects(&data->rects),
-           wine_dbgstr_rect(&data->desired_state.rect), wine_dbgstr_rect(&data->pending_state.rect),
-           data->state_locks, data->wm_state_serial, data->net_wm_state_serial,
-           data->use_alpha, data->client_surface_opacity_valid, data->is_fullscreen,
-           data->whole_window, data->client_window, data->embedded, data->shaped,
-           data->reparenting, data->parent_invalid, data->client_surface_backing, data->client_surface_backing_spare,
-           data->client_surface_redirected, data->client_surface_opacity_staged, data->client_surface_staged,
-           data->desired_state.wm_state, data->pending_state.wm_state, data->current_state.wm_state );
     /* A retained native client draws directly, so no GDI surface needs to
      * be created or retired. Geometry, staging and an existing output pool
-     * still require the ordinary window update and its quiescing boundary. */
+     * still require the ordinary window update and its quiescing boundary.
+     * Only managed windows receive WM_STATE property changes. */
     if (!data->whole_window || !data->client_window || data->embedded || data->shaped ||
         data->state_locks || data->reparenting || data->parent_invalid ||
-        data->use_alpha || data->client_surface_opacity_valid || data->is_fullscreen || data->client_surface_backing ||
-        data->client_surface_backing_spare || data->client_surface_redirected ||
+        data->use_alpha || data->client_surface_opacity_valid || data->is_fullscreen ||
+        data->client_surface_backing || data->client_surface_backing_spare || data->client_surface_redirected ||
         data->client_surface_opacity_staged || data->client_surface_staged ||
         data->wm_state_serial || data->net_wm_state_serial ||
         data->desired_state.wm_state != NormalState || data->pending_state.wm_state != NormalState ||
-        data->current_state.wm_state != NormalState || memcmp( &data->rects, rects, sizeof(*rects) ))
+        (data->managed && data->current_state.wm_state != NormalState) ||
+        memcmp( &data->rects, rects, sizeof(*rects) ))
         goto done;
     /* ConfigureNotify may still be queued after the native resize completed.
      * Require the requested geometry to have been sent, with no delayed
