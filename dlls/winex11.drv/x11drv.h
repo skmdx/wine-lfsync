@@ -454,6 +454,7 @@ struct x11drv_thread_data
 
 extern struct x11drv_thread_data *x11drv_init_thread_data(void);
 extern pthread_key_t x11drv_thread_data_key;
+extern void X11DRV_sync_window_changes( Display *display );
 
 static inline struct x11drv_thread_data *x11drv_thread_data(void)
 {

@@ -3726,7 +3726,7 @@ BOOL X11DRV_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_hint, UIN
          * client-surface owners.  Their geometry update will recompose the
          * cached content only after this ordering barrier has completed. */
         if (size_changed && NtUserGetAncestor( hwnd, GA_ROOT ) == hwnd)
-            XSync( data->display, False );
+            X11DRV_sync_window_changes( data->display );
 #ifdef HAVE_LIBXSHAPE
         if (IsRectEmpty( &old_rects.window ) != IsRectEmpty( &new_rects->window ))
             sync_empty_window_shape( data, surface );
@@ -3783,13 +3783,13 @@ BOOL X11DRV_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_hint, UIN
         if (!published) client_surface_fail_scene( hwnd );
         if (published && (data->client_surface_redirected || data->client_surface_opacity_staged))
             finish_client_surface_staging( data );
-        XSync( data->display, False );
+        X11DRV_sync_window_changes( data->display );
     }
     else if (client_surface_pending && !data->client_surface_staged)
     {
         /* The redirect and map must reach the X server before another process
          * is allowed to commit into this publication generation. */
-        XSync( data->display, False );
+        X11DRV_sync_window_changes( data->display );
         if (X11DRV_client_surface_backing_snapshot( data, TRUE ))
         {
             client_surface_set_staged( hwnd );

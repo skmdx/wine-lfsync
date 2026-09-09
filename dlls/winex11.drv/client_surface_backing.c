@@ -4188,7 +4188,7 @@ void X11DRV_client_surface_backing_end_update( struct x11drv_win_data *data )
     /* The GUI connection owns native geometry, shape and staging. Its changes
      * finish while this target is quiescent, before the owner activates the
      * installed plan. No unrelated target participates in this barrier. */
-    XSync( data->display, False );
+    X11DRV_sync_window_changes( data->display );
     if (data->client_surface_backing) X11DRV_client_surface_backing_ensure( data );
     /* Later native update and destruction jobs for this target remain behind
      * its release in the actor queue. The GUI has no result to wait for. */
@@ -4556,7 +4556,7 @@ BOOL X11DRV_client_surface_prepare_owner( struct x11drv_win_data *data )
             .window_height = data->rects.visible.bottom - data->rects.visible.top,
         };
 
-        XSync( data->display, False );
+        X11DRV_sync_window_changes( data->display );
         if (submit_client_surface_compositor_job( &job )) return TRUE;
     }
     /* Without an authenticated retained attachment, preserve GDI/background

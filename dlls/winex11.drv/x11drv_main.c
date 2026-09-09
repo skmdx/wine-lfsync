@@ -235,6 +235,25 @@ static inline BOOL ignore_error( Display *display, XErrorEvent *event )
 
 
 /***********************************************************************
+ *		X11DRV_sync_window_changes
+ */
+void X11DRV_sync_window_changes( Display *display )
+{
+    unsigned long serial, processed;
+
+    XLockDisplay( display );
+    serial = NextRequest( display ) - 1;
+    processed = LastKnownRequestProcessed( display );
+    /* A reply or event may already acknowledge all native window changes on
+     * this connection. Only outstanding requests need another round trip. */
+    if (processed != serial) XSync( display, False );
+    TRACE( "display %p serial %lu processed %lu synchronized %u\n",
+           display, serial, processed, processed != serial );
+    XUnlockDisplay( display );
+}
+
+
+/***********************************************************************
  *		X11DRV_expect_error
  *
  * Setup a callback function that will be called on an X error.  The
