@@ -314,6 +314,21 @@ static void retain_swapchain_completion( struct swapchain *swapchain )
     pthread_mutex_unlock( &swapchain->present_lock );
 }
 
+static struct client_surface_completion_result wait_vulkan_driver_completion( void *context, DWORD timeout )
+{
+    struct swapchain *swapchain = context;
+    struct client_surface *surface = swapchain->surface->client;
+
+    /* A driver monitor remains valid for an acquired image presented after
+     * retirement. It does not call the retired swapchain's present-wait API. */
+    return surface->backend->completion->wait( surface, timeout );
+}
+
+static void release_vulkan_driver_completion( void *context )
+{
+    release_swapchain_completion( context );
+}
+
 static void retire_swapchain_present_waits( struct swapchain *swapchain )
 {
     pthread_mutex_lock( &swapchain->present_lock );
@@ -3496,6 +3511,17 @@ reserve_snapshots:
 
         if (compose && snapshot_submitted)
         {
+            client_surface_defer_present( surface->client, &presents[i], &expected_size );
+            continue;
+        }
+        if (compose && presents[i].completion.kind == CLIENT_SURFACE_COMPLETION_SHARED)
+        {
+            /* Queue idle does not drain a host WSI worker's pending Present.
+             * Keep its swapchain alive through driver completion and capture,
+             * even when the application destroys an already retired chain. */
+            retain_swapchain_completion( swapchain );
+            client_surface_set_present_completion( &presents[i], wait_vulkan_driver_completion,
+                                                   release_vulkan_driver_completion, swapchain );
             client_surface_defer_present( surface->client, &presents[i], &expected_size );
             continue;
         }
