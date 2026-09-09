@@ -596,7 +596,18 @@ static void handle_wm_protocols( HWND hwnd, XClientMessageEvent *event )
     }
     else if (protocol == x11drv_atom(WM_TAKE_FOCUS))
     {
-        HWND last_focus = x11drv_thread_data()->last_focus, foreground = NtUserGetForegroundWindow();
+        struct x11drv_thread_data *data = x11drv_thread_data();
+        HWND last_focus = data->last_focus, foreground = NtUserGetForegroundWindow();
+
+        /* A later Win32 activation may supersede our outstanding request
+         * before the window manager asks us to take the native focus. */
+        if (hwnd != foreground && data->net_active_window_serial &&
+            data->pending_state.net_active_window == event->window)
+        {
+            TRACE( "Ignoring superseded WM_TAKE_FOCUS for %p/%lx serial %lu, foreground %p\n",
+                   hwnd, event->window, event->serial, foreground );
+            return;
+        }
 
         if (window_has_pending_wm_state( hwnd, -1 ) || (hwnd != foreground && !window_should_take_focus( foreground, event_time )))
         {

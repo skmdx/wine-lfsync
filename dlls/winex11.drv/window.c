@@ -2269,7 +2269,11 @@ void set_net_active_window( HWND hwnd, HWND previous )
 
     if (!is_net_supported( x11drv_atom(_NET_ACTIVE_WINDOW) )) return;
     if (!(window = X11DRV_get_whole_window( hwnd ))) return;
-    if (data->pending_state.net_active_window == window) return;
+    /* Another thread may have requested a different window since our last
+     * activation. An outstanding request may also have been superseded
+     * before WM_TAKE_FOCUS, so only skip a completed, unchanged activation. */
+    if (previous == hwnd && !data->net_active_window_serial &&
+        data->pending_state.net_active_window == window) return;
     if (window_set_pending_activate( hwnd, &withdrawn )) return;
 
     xev.xclient.type = ClientMessage;
