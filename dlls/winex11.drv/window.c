@@ -3538,12 +3538,20 @@ NTSTATUS X11DRV_UpdateClientSurfaceBacking( HWND hwnd, BOOL enable, BOOL prepare
      * be created or retired. Geometry, staging and an existing output pool
      * still require the ordinary window update and its quiescing boundary. */
     if (!data->whole_window || !data->client_window || data->embedded || data->shaped ||
+        data->state_locks || data->reparenting || data->parent_invalid ||
         data->layered || data->is_fullscreen || data->client_surface_backing ||
         data->client_surface_backing_spare || data->client_surface_redirected ||
         data->client_surface_opacity_staged || data->client_surface_staged ||
-        data->configure_serial || data->wm_state_serial || data->net_wm_state_serial ||
+        data->wm_state_serial || data->net_wm_state_serial ||
         data->desired_state.wm_state != NormalState || data->pending_state.wm_state != NormalState ||
         data->current_state.wm_state != NormalState || memcmp( &data->rects, rects, sizeof(*rects) ))
+        goto done;
+    /* ConfigureNotify may still be queued after the native resize completed.
+     * Require the requested geometry to have been sent, with no delayed
+     * change. Preparation still synchronizes the GUI connection and checks
+     * the actual native parentage and extents before renewing DIRECT. */
+    if (!EqualRect( &data->desired_state.rect, &data->pending_state.rect ) ||
+        !EqualRect( &data->pending_state.rect, &rects->visible ))
         goto done;
     client_surface_get_toplevel_scene( hwnd, &scene );
     if (enable ? (!prepare || scene.valid || !scene.direct_candidate) :
