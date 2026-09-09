@@ -893,6 +893,12 @@ static BOOL nulldrv_ExposeClientSurface( HWND hwnd, UINT64 scene_generation )
     return FALSE;
 }
 
+static NTSTATUS nulldrv_UpdateClientSurfaceBacking( HWND hwnd, BOOL enable, BOOL prepare,
+                                                   const struct window_rects *rects )
+{
+    return STATUS_NOT_SUPPORTED;
+}
+
 static BOOL nulldrv_CreateWindowSurface( HWND hwnd, BOOL layered, const RECT *surface_rect, struct window_surface **surface )
 {
     return FALSE;
@@ -1320,6 +1326,7 @@ static const struct user_driver_funcs lazy_load_driver =
     nulldrv_CreateClientSurface,
     nulldrv_RepairClientSurfaceOwner,
     nulldrv_ExposeClientSurface,
+    nulldrv_UpdateClientSurfaceBacking,
     nulldrv_CreateWindowSurface,
     nulldrv_MoveWindowBits,
     nulldrv_WindowPosChanged,
@@ -1422,6 +1429,7 @@ void __wine_set_user_driver( const struct user_driver_funcs *funcs, UINT version
     SET_USER_FUNC(CreateClientSurface);
     SET_USER_FUNC(RepairClientSurfaceOwner);
     SET_USER_FUNC(ExposeClientSurface);
+    SET_USER_FUNC(UpdateClientSurfaceBacking);
     SET_USER_FUNC(CreateWindowSurface);
     SET_USER_FUNC(MoveWindowBits);
     SET_USER_FUNC(WindowPosChanged);

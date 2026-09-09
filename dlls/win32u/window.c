@@ -4836,6 +4836,37 @@ BOOL prepare_window_client_surfaces( HWND hwnd )
     return update_window_state_flags( hwnd, WINE_SWP_CLIENT_SURFACE_PREPARE );
 }
 
+static NTSTATUS update_client_surface_backing_state( HWND hwnd, BOOL enable, BOOL prepare )
+{
+    struct window_rects rects;
+    NTSTATUS status = STATUS_NOT_SUPPORTED;
+    BOOL supported;
+    UINT context;
+    WND *win;
+
+    if (!is_current_thread_window( hwnd )) return status;
+    if (!(win = get_win_ptr( hwnd ))) return STATUS_INVALID_HANDLE;
+    if (win == WND_DESKTOP || win == WND_OTHER_PROCESS) return status;
+    supported = !win->surface && win->parent == get_desktop_window() &&
+                (win->dwStyle & (WS_VISIBLE | WS_MINIMIZE)) == WS_VISIBLE &&
+                !(win->dwExStyle & WS_EX_LAYERED) && IsRectEmpty( &win->present_rect );
+    release_win_ptr( win );
+    if (!supported) return status;
+
+    /* Backing notifications change neither Win32 geometry nor the GDI
+     * surface. Let the driver handle its retained native state directly,
+     * provided its current geometry agrees with the authoritative window. */
+    context = set_thread_dpi_awareness_context( get_window_dpi_awareness_context( hwnd ));
+    if (get_window_rects( hwnd, COORDS_PARENT, &rects, get_thread_dpi() ))
+    {
+        rects = map_window_rects_virt_to_raw( rects, get_thread_dpi() );
+        status = user_driver->pUpdateClientSurfaceBacking( hwnd, enable, prepare, &rects );
+    }
+    if (!status) update_client_surfaces( hwnd );
+    set_thread_dpi_awareness_context( context );
+    return status;
+}
+
 void update_window_client_surface_backing( HWND hwnd )
 {
     struct object_lock lock = OBJECT_LOCK_INIT;
@@ -4858,8 +4889,10 @@ void update_window_client_surface_backing( HWND hwnd )
     prepare = enable && preparing && client_surface_begin_prepare( hwnd, &scene_generation );
     driver_flags = enable ? WINE_SWP_CLIENT_SURFACE_BACKING_ENABLE : WINE_SWP_CLIENT_SURFACE_BACKING_DISABLE;
     if (prepare) driver_flags |= WINE_SWP_CLIENT_SURFACE_PREPARE;
-    if (update_window_state_flags( hwnd, driver_flags ) && prepare)
-        client_surface_end_prepare( hwnd, scene_generation );
+    status = update_client_surface_backing_state( hwnd, enable, prepare );
+    if (status == STATUS_NOT_SUPPORTED)
+        status = update_window_state_flags( hwnd, driver_flags ) ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
+    if (!status && prepare) client_surface_end_prepare( hwnd, scene_generation );
 }
 
 /***********************************************************************

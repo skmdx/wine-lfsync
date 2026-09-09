@@ -3526,6 +3526,52 @@ static BOOL get_desired_wm_state( DWORD style, const struct window_rects *rects 
     return WithdrawnState;
 }
 
+NTSTATUS X11DRV_UpdateClientSurfaceBacking( HWND hwnd, BOOL enable, BOOL prepare,
+                                           const struct window_rects *rects )
+{
+    struct x11drv_win_data *data;
+    struct client_surface_scene scene;
+    NTSTATUS status = STATUS_NOT_SUPPORTED;
+
+    if (!(data = get_win_data( hwnd ))) return status;
+    /* A retained native client draws directly, so no GDI surface needs to
+     * be created or retired. Geometry, staging and an existing output pool
+     * still require the ordinary window update and its quiescing boundary. */
+    if (!data->whole_window || !data->client_window || data->embedded || data->shaped ||
+        data->layered || data->is_fullscreen || data->client_surface_backing ||
+        data->client_surface_backing_spare || data->client_surface_redirected ||
+        data->client_surface_opacity_staged || data->client_surface_staged ||
+        data->configure_serial || data->wm_state_serial || data->net_wm_state_serial ||
+        data->desired_state.wm_state != NormalState || data->pending_state.wm_state != NormalState ||
+        data->current_state.wm_state != NormalState || memcmp( &data->rects, rects, sizeof(*rects) ))
+        goto done;
+    client_surface_get_toplevel_scene( hwnd, &scene );
+    if (enable ? (!prepare || scene.valid || !scene.direct_candidate) :
+        (!scene.valid || scene.generation || scene.mode != CLIENT_SURFACE_PRESENTATION_DIRECT))
+        goto done;
+
+    XFlush( gdi_display );
+    data->client_surface_backing_enabled = enable;
+    status = STATUS_SUCCESS;
+    if (prepare)
+    {
+        /* This keeps the exact native geometry/identity checks, failed
+         * renewal checkpoint fallback and server preparation handshake. */
+        if (!X11DRV_client_surface_prepare_owner( data ))
+        {
+            client_surface_fail_scene( hwnd );
+            status = STATUS_UNSUCCESSFUL;
+        }
+    }
+    else if (!X11DRV_client_surface_backing_retire( data )) destroy_client_surface_backing( data );
+    TRACE( "win %p backing state enable %u prepare %u scene %s status %#x\n",
+           hwnd, enable, prepare, wine_dbgstr_longlong(scene.epoch), (unsigned int)status );
+    XFlush( data->display );
+done:
+    release_win_data( data );
+    return status;
+}
+
 
 /***********************************************************************
  *		WindowPosChanged   (X11DRV.@)
