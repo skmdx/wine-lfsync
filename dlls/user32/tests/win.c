@@ -10750,6 +10750,7 @@ static LRESULT WINAPI static_hook_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
 
 static void window_from_point_proc(HWND parent)
 {
+    LARGE_INTEGER ready = {{0}}, finished = {{0}}, frequency = {{0}};
     HANDLE start_event, end_event;
     HANDLE win, child_static, child_button;
     BOOL got_click;
@@ -10786,6 +10787,8 @@ static void window_from_point_proc(HWND parent)
     def_static_proc = (void*)SetWindowLongPtrA(child_static,
             GWLP_WNDPROC, (LONG_PTR)static_hook_proc);
     flush_events(TRUE);
+    QueryPerformanceFrequency(&frequency);
+    QueryPerformanceCounter(&ready);
     SetEvent(start_event);
 
     got_hittest = FALSE;
@@ -10797,8 +10800,12 @@ static void window_from_point_proc(HWND parent)
         }
         DispatchMessageA(&msg);
     }
+    QueryPerformanceCounter(&finished);
     ok(got_hittest, "transparent window didn't get WM_NCHITTEST message\n");
     ok(got_click, "button under static window didn't get WM_LBUTTONUP\n");
+    trace("window_from_point child tid %04lx parent %p static %p button %p, ready %s finished %s frequency %s, hittest %u click %u\n",
+          GetCurrentThreadId(), parent, child_static, win, wine_dbgstr_longlong(ready.QuadPart),
+          wine_dbgstr_longlong(finished.QuadPart), wine_dbgstr_longlong(frequency.QuadPart), got_hittest, got_click);
 
     ret = WaitForSingleObject(end_event, 5000);
     ok(ret == WAIT_OBJECT_0, "WaitForSingleObject returned %lx\n", ret);
@@ -10809,6 +10816,7 @@ static void window_from_point_proc(HWND parent)
 
 static void test_window_from_point(HWND main_window, const char *argv0)
 {
+    LARGE_INTEGER waiting = {{0}}, ready = {{0}}, clicking = {{0}}, clicked = {{0}}, frequency = {{0}};
     HWND hwnd, child, win;
     POINT pt;
     PROCESS_INFORMATION info;
@@ -10860,13 +10868,18 @@ static void test_window_from_point(HWND main_window, const char *argv0)
     startup.cb = sizeof(startup);
     ok(CreateProcessA(NULL, cmd, NULL, NULL, FALSE, 0, NULL, NULL,
                 &startup, &info), "CreateProcess failed.\n");
+    QueryPerformanceFrequency(&frequency);
+    QueryPerformanceCounter(&waiting);
     ok(wait_for_events(1, &start_event, 1000) == 0, "didn't get start_event\n");
+    QueryPerformanceCounter(&ready);
 
     child = GetWindow(hwnd, GW_CHILD);
     win = WindowFromPoint(pt);
     ok(win == child, "WindowFromPoint returned %p, expected %p\n", win, child);
 
+    QueryPerformanceCounter(&clicking);
     simulate_click(pt.x, pt.y);
+    QueryPerformanceCounter(&clicked);
     flush_events(TRUE);
 
     child = GetWindow(child, GW_HWNDNEXT);
@@ -10876,6 +10889,10 @@ static void test_window_from_point(HWND main_window, const char *argv0)
     win = WindowFromPoint(pt);
     ok(win == child, "WindowFromPoint returned %p, expected %p\n", win, child);
 
+    trace("window_from_point parent tid %04lx child tid %04lx hwnd %p, waiting %s ready %s clicking %s clicked %s frequency %s\n",
+          GetCurrentThreadId(), info.dwThreadId, hwnd, wine_dbgstr_longlong(waiting.QuadPart),
+          wine_dbgstr_longlong(ready.QuadPart), wine_dbgstr_longlong(clicking.QuadPart),
+          wine_dbgstr_longlong(clicked.QuadPart), wine_dbgstr_longlong(frequency.QuadPart));
     SetEvent(end_event);
     wait_child_process(&info);
     CloseHandle(start_event);
