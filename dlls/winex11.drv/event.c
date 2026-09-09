@@ -1146,7 +1146,7 @@ static void handle_net_wm_state_notify( HWND hwnd, XPropertyEvent *event )
     UINT value = 0;
 
     if (!(data = get_win_data( hwnd ))) return;
-    if (event->state == PropertyNewValue) value = get_window_net_wm_state( event->display, event->window );
+    if (event->state == PropertyNewValue) value = get_window_net_wm_state( event->display, event->window, NULL );
     window_net_wm_state_notify( data, event->serial, value );
     release_win_data( data );
 

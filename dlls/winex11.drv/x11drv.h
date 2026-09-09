@@ -554,6 +554,7 @@ enum x11drv_atoms
     XATOM__NET_WM_STATE_ABOVE,
     XATOM__NET_WM_STATE_DEMANDS_ATTENTION,
     XATOM__NET_WM_STATE_FULLSCREEN,
+    XATOM__NET_WM_STATE_HIDDEN,
     XATOM__NET_WM_STATE_MAXIMIZED_HORZ,
     XATOM__NET_WM_STATE_MAXIMIZED_VERT,
     XATOM__NET_WM_STATE_SKIP_PAGER,
@@ -789,7 +790,7 @@ extern BOOL is_net_supported( Atom atom );
 
 extern Window init_clip_window(void);
 extern void window_set_user_time( struct x11drv_win_data *data, Time time, BOOL init );
-extern UINT get_window_net_wm_state( Display *display, Window window );
+extern UINT get_window_net_wm_state( Display *display, Window window, BOOL *hidden );
 extern void make_window_embedded( struct x11drv_win_data *data );
 extern Window create_client_window( HWND hwnd, RECT client_rect, const XVisualInfo *visual, Colormap colormap );
 extern void detach_client_window( struct x11drv_win_data *data, Window client_window );

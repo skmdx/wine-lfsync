@@ -1726,7 +1726,7 @@ static void update_net_wm_states( struct x11drv_win_data *data )
 /***********************************************************************
  *     read_net_wm_states
  */
-UINT get_window_net_wm_state( Display *display, Window window )
+UINT get_window_net_wm_state( Display *display, Window window, BOOL *hidden )
 {
     Atom type, *state;
     int format;
@@ -1734,6 +1734,7 @@ UINT get_window_net_wm_state( Display *display, Window window )
     UINT new_state = 0;
     BOOL maximized_horz = FALSE;
 
+    if (hidden) *hidden = FALSE;
     if (!XGetWindowProperty( display, window, x11drv_atom(_NET_WM_STATE), 0,
                              65536/sizeof(CARD32), False, XA_ATOM, &type, &format, &count,
                              &remaining, (unsigned char **)&state ))
@@ -1742,6 +1743,7 @@ UINT get_window_net_wm_state( Display *display, Window window )
         {
             for (i = 0; i < count; i++)
             {
+                if (hidden && state[i] == x11drv_atom(_NET_WM_STATE_HIDDEN)) *hidden = TRUE;
                 if (state[i] == x11drv_atom(_NET_WM_STATE_MAXIMIZED_HORZ))
                     maximized_horz = TRUE;
                 for (j=0; j < NB_NET_WM_STATES; j++)
@@ -1922,6 +1924,19 @@ static UINT window_update_client_state( struct x11drv_win_data *data )
     {
         if ((old_style & WS_MINIMIZEBOX) && !(old_style & WS_DISABLED))
         {
+            /* Mutter can report IconicState while waiting for a window frame.
+             * Use the EWMH hidden state to distinguish this from minimization. */
+            if (is_net_supported( x11drv_atom(_NET_WM_STATE_HIDDEN) ))
+            {
+                BOOL hidden;
+
+                get_window_net_wm_state( data->display, data->whole_window, &hidden );
+                if (!hidden)
+                {
+                    TRACE( "window %p/%lx is iconic without _NET_WM_STATE_HIDDEN\n", data->hwnd, data->whole_window );
+                    return 0;
+                }
+            }
             TRACE( "minimizing win %p/%lx\n", data->hwnd, data->whole_window );
             return SC_MINIMIZE;
         }
