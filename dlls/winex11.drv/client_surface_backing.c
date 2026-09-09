@@ -4164,8 +4164,17 @@ static BOOL refresh_client_surface_handoffs( HWND toplevel )
     UINT count = 0, i, index;
     unsigned int layout_count = 0;
     UINT64 scene_generation = 0;
-    UINT64 mark = InterlockedIncrement64( (LONG64 *)&client_surface_compositor_mark );
+    UINT64 mark;
 
+    /* DIRECT admission already proves a sole selected producer. No roster
+     * or clip is consumed below for this strategy; avoid building that
+     * snapshot after every native update. Candidates and changed scenes
+     * still follow the complete owner-plan path. */
+    if (client_surface_get_toplevel_scene( toplevel, &scene ) &&
+        scene.mode == CLIENT_SURFACE_PRESENTATION_DIRECT && scene.direct_candidate)
+        return client_surface_scene_snapshot_current( toplevel, scene.epoch );
+
+    mark = InterlockedIncrement64( (LONG64 *)&client_surface_compositor_mark );
     if (!mark) mark = InterlockedIncrement64( (LONG64 *)&client_surface_compositor_mark );
     if (!client_surface_get_scene_snapshot( toplevel, &scene_generation, &count, &members )) goto failed;
     if (count == 1 && members[0].direct_candidate &&
