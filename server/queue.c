@@ -574,7 +574,7 @@ static void update_desktop_cursor_handle( struct desktop *desktop, struct thread
 }
 
 /* set the cursor position and queue the corresponding mouse message */
-static void set_cursor_pos( struct desktop *desktop, int x, int y )
+static void set_cursor_pos( struct desktop *desktop, user_handle_t win, int x, int y )
 {
     static const struct hw_msg_source source = { IMDT_UNAVAILABLE, IMO_SYSTEM };
     const struct rawinput_device *device;
@@ -582,16 +582,17 @@ static void set_cursor_pos( struct desktop *desktop, int x, int y )
 
     if ((device = current->process->rawinput_mouse) && (device->flags & RIDEV_NOLEGACY))
     {
-        update_desktop_cursor_pos( desktop, 0, x, y );
+        update_desktop_cursor_pos( desktop, win, x, y );
         return;
     }
 
     if (!(msg = alloc_hardware_message( 0xff515700, source, get_tick_count(), 0 ))) return;
 
+    msg->win = get_user_full_handle( win );
     msg->msg = WM_MOUSEMOVE;
     msg->x   = x;
     msg->y   = y;
-    queue_hardware_message( desktop, msg, 1 );
+    queue_hardware_message( desktop, msg, !win );
 }
 
 /* sync cursor position after window change */
@@ -600,7 +601,7 @@ void update_cursor_pos( struct desktop *desktop )
     desktop_shm_t *desktop_shm;
 
     desktop_shm = desktop->shared;
-    set_cursor_pos( desktop, desktop_shm->cursor.x, desktop_shm->cursor.y );
+    set_cursor_pos( desktop, 0, desktop_shm->cursor.x, desktop_shm->cursor.y );
 }
 
 /* retrieve default position and time for synthesized messages */
@@ -646,7 +647,7 @@ void set_clip_rectangle( struct desktop *desktop, const struct rectangle *rect, 
     /* warp the mouse to be inside the clip rect */
     x = max( min( desktop_shm->cursor.x, new_rect.right - 1 ), new_rect.left );
     y = max( min( desktop_shm->cursor.y, new_rect.bottom - 1 ), new_rect.top );
-    if (x != desktop_shm->cursor.x || y != desktop_shm->cursor.y) set_cursor_pos( desktop, x, y );
+    if (x != desktop_shm->cursor.x || y != desktop_shm->cursor.y) set_cursor_pos( desktop, 0, x, y );
 
     /* request clip cursor rectangle reset to the desktop thread */
     if (reset) post_desktop_message( desktop, WM_WINE_CLIPCURSOR, flags, FALSE );
@@ -2296,7 +2297,12 @@ static int queue_mouse_message( struct desktop *desktop, user_handle_t win, cons
             y = desktop_shm->cursor.y + input->mouse.y;
         }
         if (x == desktop_shm->cursor.x && y == desktop_shm->cursor.y)
+        {
+            /* A native window change needs a synthetic move, without updating pointer state. */
+            if (win && get_user_full_handle( win ) != desktop->cursor_win)
+                set_cursor_pos( desktop, win, x, y );
             flags &= ~MOUSEEVENTF_MOVE;
+        }
     }
     else
     {
@@ -4181,7 +4187,7 @@ DECL_HANDLER(set_cursor)
     }
     SHARED_WRITE_END;
 
-    if (req->flags & SET_CURSOR_POS) set_cursor_pos( desktop, req->x, req->y );
+    if (req->flags & SET_CURSOR_POS) set_cursor_pos( desktop, 0, req->x, req->y );
     if (req->flags & SET_CURSOR_CLIP) set_clip_rectangle( desktop, &req->clip, req->flags, 0 );
     if (req->flags & SET_CURSOR_NOCLIP) set_clip_rectangle( desktop, NULL, SET_CURSOR_NOCLIP, 0 );
 
