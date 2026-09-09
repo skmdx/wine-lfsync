@@ -1961,18 +1961,29 @@ static BOOL renew_client_surface_direct_plan( const struct client_surface_compos
     /* The GUI has completed its native changes. Check the retained child
      * itself, including its parent and exact client extent, rather than
      * treating the old scene's geometry or a DIRECT candidate as that proof. */
-    X11DRV_expect_error( client_surface_compositor_display, client_surface_compositor_error, &error );
-    native = XGetWindowAttributes( client_surface_compositor_display, job->destination, &window ) &&
-             XGetWindowAttributes( client_surface_compositor_display, target->scene.direct_drawable, &drawable ) &&
-             XQueryTree( client_surface_compositor_display, target->scene.direct_drawable,
-                         &root, &parent, &children, &count );
-    if (children) XFree( children );
-    X11DRV_check_error();
-    if (!native || error || window.map_state != IsViewable || drawable.map_state != IsViewable ||
-        parent != job->destination || drawable.border_width ||
-        window.width != job->window_width || window.height != job->window_height ||
-        drawable.x != job->source_x || drawable.y != job->source_y ||
-        drawable.width != job->width || drawable.height != job->height) return FALSE;
+    if (client_surface_xcb_available( client_surface_compositor_display ))
+    {
+        RECT rect = {job->source_x, job->source_y, job->source_x + job->width, job->source_y + job->height};
+
+        if (!client_surface_xcb_check_direct( client_surface_compositor_display, job->destination,
+                                              target->scene.direct_drawable, job->window_width,
+                                              job->window_height, &rect )) return FALSE;
+    }
+    else
+    {
+        X11DRV_expect_error( client_surface_compositor_display, client_surface_compositor_error, &error );
+        native = XGetWindowAttributes( client_surface_compositor_display, job->destination, &window ) &&
+                 XGetWindowAttributes( client_surface_compositor_display, target->scene.direct_drawable, &drawable ) &&
+                 XQueryTree( client_surface_compositor_display, target->scene.direct_drawable,
+                             &root, &parent, &children, &count );
+        if (children) XFree( children );
+        X11DRV_check_error();
+        if (!native || error || window.map_state != IsViewable || drawable.map_state != IsViewable ||
+            parent != job->destination || drawable.border_width ||
+            window.width != job->window_width || window.height != job->window_height ||
+            drawable.x != job->source_x || drawable.y != job->source_y ||
+            drawable.width != job->width || drawable.height != job->height) return FALSE;
+    }
 
     SERVER_START_REQ( prepare_client_surface_direct_plan )
     {
@@ -1985,8 +1996,8 @@ static BOOL renew_client_surface_direct_plan( const struct client_surface_compos
     SERVER_END_REQ;
     if (!scene_id) return FALSE;
     target->scene.epoch = scene_id;
-    target->window_width = window.width;
-    target->window_height = window.height;
+    target->window_width = job->window_width;
+    target->window_height = job->window_height;
     SetRectEmpty( &target->restore_rect );
     TRACE( "owner DIRECT_ATTACH hwnd %p scene %s identity %s drawable %#lx renewed=1 size=%ux%u\n",
            target->toplevel, wine_dbgstr_longlong( scene_id ),

@@ -13,6 +13,8 @@ struct client_surface_xcb_request
 BOOL client_surface_xcb_present( Display *display, Window window, Pixmap pixmap,
                                  unsigned int serial, struct client_surface_xcb_request *request );
 BOOL client_surface_xcb_available( Display *display );
+BOOL client_surface_xcb_check_direct( Display *display, Window owner, Window drawable,
+                                      unsigned int width, unsigned int height, const RECT *rect );
 void client_surface_xcb_flush( Display *display, struct client_surface_xcb_request *request );
 BOOL client_surface_xcb_poll( Display *display, struct client_surface_xcb_request *request,
                               BOOL *success );

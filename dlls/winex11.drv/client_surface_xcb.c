@@ -42,6 +42,12 @@ static typeof(xcb_change_gc_checked) *pxcb_change_gc_checked;
 static typeof(xcb_set_clip_rectangles_checked) *pxcb_set_clip_rectangles_checked;
 static typeof(xcb_copy_area_checked) *pxcb_copy_area_checked;
 static typeof(xcb_free_gc_checked) *pxcb_free_gc_checked;
+static typeof(xcb_get_window_attributes) *pxcb_get_window_attributes;
+static typeof(xcb_get_window_attributes_reply) *pxcb_get_window_attributes_reply;
+static typeof(xcb_get_geometry) *pxcb_get_geometry;
+static typeof(xcb_get_geometry_reply) *pxcb_get_geometry_reply;
+static typeof(xcb_query_tree) *pxcb_query_tree;
+static typeof(xcb_query_tree_reply) *pxcb_query_tree_reply;
 static pthread_once_t client_surface_xcb_once = PTHREAD_ONCE_INIT;
 static BOOL client_surface_xcb_initialized;
 
@@ -73,6 +79,12 @@ static void client_surface_xcb_init(void)
     LOAD_FUNCPTR( xcb, xcb_set_clip_rectangles_checked );
     LOAD_FUNCPTR( xcb, xcb_copy_area_checked );
     LOAD_FUNCPTR( xcb, xcb_free_gc_checked );
+    LOAD_FUNCPTR( xcb, xcb_get_window_attributes );
+    LOAD_FUNCPTR( xcb, xcb_get_window_attributes_reply );
+    LOAD_FUNCPTR( xcb, xcb_get_geometry );
+    LOAD_FUNCPTR( xcb, xcb_get_geometry_reply );
+    LOAD_FUNCPTR( xcb, xcb_query_tree );
+    LOAD_FUNCPTR( xcb, xcb_query_tree_reply );
 #undef LOAD_FUNCPTR
     client_surface_xcb_initialized = TRUE;
     return;
@@ -87,6 +99,62 @@ BOOL client_surface_xcb_available( Display *display )
 {
     pthread_once( &client_surface_xcb_once, client_surface_xcb_init );
     return client_surface_xcb_initialized && pXGetXCBConnection( display );
+}
+
+BOOL client_surface_xcb_check_direct( Display *display, Window owner, Window drawable,
+                                      unsigned int width, unsigned int height, const RECT *rect )
+{
+    xcb_connection_t *connection = pXGetXCBConnection( display );
+    xcb_get_window_attributes_cookie_t attributes[2];
+    xcb_get_window_attributes_reply_t *owner_attributes, *drawable_attributes;
+    xcb_get_geometry_cookie_t geometry[2];
+    xcb_get_geometry_reply_t *owner_geometry, *drawable_geometry;
+    xcb_query_tree_cookie_t tree;
+    xcb_query_tree_reply_t *parent;
+    xcb_generic_error_t *errors[5] = {0};
+    unsigned int i;
+    BOOL valid;
+
+    /* Preserve Xlib's event ownership and request order, but issue all
+     * independent queries before waiting for any of their replies. */
+    XLockDisplay( display );
+    XFlush( display );
+    attributes[0] = pxcb_get_window_attributes( connection, owner );
+    geometry[0] = pxcb_get_geometry( connection, owner );
+    attributes[1] = pxcb_get_window_attributes( connection, drawable );
+    geometry[1] = pxcb_get_geometry( connection, drawable );
+    tree = pxcb_query_tree( connection, drawable );
+    pxcb_flush( connection );
+    owner_attributes = pxcb_get_window_attributes_reply( connection, attributes[0], &errors[0] );
+    owner_geometry = pxcb_get_geometry_reply( connection, geometry[0], &errors[1] );
+    drawable_attributes = pxcb_get_window_attributes_reply( connection, attributes[1], &errors[2] );
+    drawable_geometry = pxcb_get_geometry_reply( connection, geometry[1], &errors[3] );
+    parent = pxcb_query_tree_reply( connection, tree, &errors[4] );
+    XUnlockDisplay( display );
+
+    valid = owner_attributes && owner_geometry && drawable_attributes && drawable_geometry && parent;
+    for (i = 0; i < ARRAY_SIZE(errors); ++i)
+    {
+        if (!errors[i]) continue;
+        TRACE( "DIRECT query %u failed: error %u request %u resource %#x\n",
+               i, errors[i]->error_code, errors[i]->major_code, errors[i]->resource_id );
+        valid = FALSE;
+        free( errors[i] );
+    }
+    valid = valid && owner_attributes->map_state == XCB_MAP_STATE_VIEWABLE &&
+            drawable_attributes->map_state == XCB_MAP_STATE_VIEWABLE && parent->parent == owner &&
+            !drawable_geometry->border_width && owner_geometry->width == width && owner_geometry->height == height &&
+            drawable_geometry->x == rect->left && drawable_geometry->y == rect->top &&
+            drawable_geometry->width == rect->right - rect->left &&
+            drawable_geometry->height == rect->bottom - rect->top;
+    TRACE_(csperf)( "ticks=%llu event=direct_native_query owner=%lx drawable=%lx requests=5 valid=%u\n",
+                   client_surface_xcb_perf_time(), owner, drawable, valid );
+    free( owner_attributes );
+    free( owner_geometry );
+    free( drawable_attributes );
+    free( drawable_geometry );
+    free( parent );
+    return valid;
 }
 
 void client_surface_xcb_flush( Display *display, struct client_surface_xcb_request *request )
@@ -237,6 +305,12 @@ BOOL client_surface_xcb_poll_batch( Display *display, struct client_surface_xcb_
 }
 
 #else
+
+BOOL client_surface_xcb_check_direct( Display *display, Window owner, Window drawable,
+                                      unsigned int width, unsigned int height, const RECT *rect )
+{
+    return FALSE;
+}
 
 BOOL client_surface_xcb_available( Display *display )
 {
