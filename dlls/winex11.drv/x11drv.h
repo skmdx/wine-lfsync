@@ -486,6 +486,7 @@ extern XVisualInfo argb_visual;
 extern Colormap default_colormap;
 extern XPixmapFormatValues **pixmap_formats;
 extern Window root_window;
+extern Atom net_wm_cm_selection;
 extern BOOL clipping_cursor;
 extern BOOL keyboard_grabbed;
 extern unsigned int screen_bpp;

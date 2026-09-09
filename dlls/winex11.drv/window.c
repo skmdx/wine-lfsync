@@ -648,12 +648,9 @@ static BOOL prepare_client_surface_staging( struct x11drv_win_data *data )
         else
 #endif
         {
-            char selection[32];
-
             /* A missing client library does not imply that the window manager
              * cannot keep an opacity-staged window drawable. */
-            snprintf( selection, sizeof(selection), "_NET_WM_CM_S%d", DefaultScreen( data->display ) );
-            if (!XGetSelectionOwner( data->display, XInternAtom( data->display, selection, False ) ))
+            if (!XGetSelectionOwner( data->display, net_wm_cm_selection ))
                 return FALSE;
         }
         if (!error) data->client_surface_redirected = TRUE;

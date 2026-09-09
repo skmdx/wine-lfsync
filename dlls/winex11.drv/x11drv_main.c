@@ -65,6 +65,7 @@ Atom systray_atom = 0;
 HWND systray_hwnd = 0;
 unsigned int screen_bpp;
 Window root_window;
+Atom net_wm_cm_selection;
 BOOL usexvidmode = TRUE;
 BOOL usexrandr = TRUE;
 BOOL usexcomposite = TRUE;
@@ -695,6 +696,7 @@ static void detect_window_manager( Display *display )
 NTSTATUS __wine_unix_lib_init(void)
 {
     Display *display;
+    char selection[32];
     void *libx11 = dlopen( SONAME_LIBX11, RTLD_NOW|RTLD_GLOBAL );
 
     if (!libx11)
@@ -727,6 +729,8 @@ NTSTATUS __wine_unix_lib_init(void)
     screen_bpp = pixmap_formats[default_visual.depth]->bits_per_pixel;
 
     XInternAtoms( display, (char **)X11DRV_atom_names, NB_XATOMS - FIRST_XATOM, False, X11DRV_Atoms );
+    snprintf( selection, sizeof(selection), "_NET_WM_CM_S%d", DefaultScreen( display ) );
+    net_wm_cm_selection = XInternAtom( display, selection, False );
 
     init_win_context();
 

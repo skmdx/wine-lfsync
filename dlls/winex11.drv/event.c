@@ -869,13 +869,20 @@ static BOOL X11DRV_Expose( HWND hwnd, XEvent *xev )
         abs_rect = rect;
         OffsetRect( &abs_rect, data->rects.client.left, data->rects.client.top );
 
-        SERVER_START_REQ( update_window_zorder )
+        /* Redirected windows can be exposed even when obscured. Only infer
+         * screen stacking from exposures of non-composited windows. */
+        if (!data->client_surface_redirected &&
+            (is_virtual_desktop() || !XGetSelectionOwner( data->display, net_wm_cm_selection )))
         {
-            req->window      = wine_server_user_handle( hwnd );
-            req->rect        = wine_server_rectangle( abs_rect );
-            wine_server_call( req );
+            SERVER_START_REQ( update_window_zorder )
+            {
+                req->window      = wine_server_user_handle( hwnd );
+                req->rect        = wine_server_rectangle( abs_rect );
+                wine_server_call( req );
+            }
+            SERVER_END_REQ;
         }
-        SERVER_END_REQ;
+        else TRACE( "ignoring composited expose for window %p/%lx z-order\n", hwnd, event->window );
     }
     else flags &= ~RDW_ALLCHILDREN;
 
