@@ -4790,7 +4790,7 @@ static void test_mouse_input(HWND hwnd)
        the first click has been processed.  Use a child window to ensure that Wine's graphics
        driver isn't managing the non-client area. */
 
-    GetWindowRect(hwnd, &rc);
+    GetClientRect(hwnd, &rc);
     child = CreateWindowExA(0, "MainWindowClass", NULL, WS_CHILD | WS_CAPTION | WS_SYSMENU | WS_VISIBLE,
                             rc.left, rc.top, rc.right-rc.left, rc.bottom-rc.top,
                             hwnd, 0, 0, NULL);
