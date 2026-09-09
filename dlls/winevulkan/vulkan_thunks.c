@@ -67711,7 +67711,7 @@ static NTSTATUS thunk64_vkGetPhysicalDeviceSurfaceSupportKHR(void *args)
 
     TRACE("%p, %u, 0x%s, %p\n", params->physicalDevice, params->queueFamilyIndex, wine_dbgstr_longlong(params->surface), params->pSupported);
 
-    params->result = vulkan_physical_device_from_handle(params->physicalDevice)->instance->p_vkGetPhysicalDeviceSurfaceSupportKHR(vulkan_physical_device_from_handle(params->physicalDevice)->host.physical_device, params->queueFamilyIndex, vulkan_surface_from_handle(params->surface)->host.surface, params->pSupported);
+    params->result = vk_funcs->p_vkGetPhysicalDeviceSurfaceSupportKHR(params->physicalDevice, params->queueFamilyIndex, params->surface, params->pSupported);
     return STATUS_SUCCESS;
 }
 #endif /* _WIN64 */
@@ -67729,7 +67729,7 @@ static NTSTATUS thunk32_vkGetPhysicalDeviceSurfaceSupportKHR(void *args)
 
     TRACE("%#x, %u, 0x%s, %#x\n", params->physicalDevice, params->queueFamilyIndex, wine_dbgstr_longlong(params->surface), params->pSupported);
 
-    params->result = vulkan_physical_device_from_handle((VkPhysicalDevice)UlongToPtr(params->physicalDevice))->instance->p_vkGetPhysicalDeviceSurfaceSupportKHR(vulkan_physical_device_from_handle((VkPhysicalDevice)UlongToPtr(params->physicalDevice))->host.physical_device, params->queueFamilyIndex, vulkan_surface_from_handle(params->surface)->host.surface, (VkBool32 *)UlongToPtr(params->pSupported));
+    params->result = vk_funcs->p_vkGetPhysicalDeviceSurfaceSupportKHR((VkPhysicalDevice)UlongToPtr(params->physicalDevice), params->queueFamilyIndex, params->surface, (VkBool32 *)UlongToPtr(params->pSupported));
     return STATUS_SUCCESS;
 }
 

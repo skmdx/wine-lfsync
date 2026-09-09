@@ -994,20 +994,39 @@ static void win32u_vkDestroyInstance( VkInstance client_instance, const VkAlloca
     free( instance );
 }
 
+static BOOL get_swapchain_maintenance1_features( struct vulkan_physical_device *physical_device,
+                                                VkPhysicalDeviceSwapchainMaintenance1FeaturesKHR *maintenance,
+                                                BOOL *khr )
+{
+    struct vulkan_instance *instance = physical_device->instance;
+    VkPhysicalDeviceFeatures2 features = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
+                                         .pNext = maintenance};
+    BOOL ext;
+
+    *khr = instance->extensions.has_VK_KHR_surface_maintenance1 &&
+           physical_device->extensions.has_VK_KHR_swapchain_maintenance1;
+    ext = instance->extensions.has_VK_EXT_surface_maintenance1 &&
+          physical_device->extensions.has_VK_EXT_swapchain_maintenance1;
+    if (!*khr && !ext) return FALSE;
+
+    if (instance->p_vkGetPhysicalDeviceFeatures2)
+        instance->p_vkGetPhysicalDeviceFeatures2( physical_device->host.physical_device, &features );
+    else if (instance->p_vkGetPhysicalDeviceFeatures2KHR)
+        instance->p_vkGetPhysicalDeviceFeatures2KHR( physical_device->host.physical_device, &features );
+    return maintenance->swapchainMaintenance1;
+}
+
 static VkResult enable_swapchain_maintenance1( struct vulkan_physical_device *physical_device,
                                               VkDeviceCreateInfo *info, struct mempool *pool,
                                               struct vulkan_device *device )
 {
-    struct vulkan_instance *instance = physical_device->instance;
     struct device *impl = impl_from_vulkan_device( device );
     VkPhysicalDeviceSwapchainMaintenance1FeaturesKHR maintenance =
     {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SWAPCHAIN_MAINTENANCE_1_FEATURES_KHR,
     }, *enable;
-    VkPhysicalDeviceFeatures2 features = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
-                                         .pNext = &maintenance};
     VkPhysicalDeviceSwapchainMaintenance1FeaturesKHR *application;
-    BOOL khr, ext;
+    BOOL khr;
 
     if (!device->extensions.has_VK_KHR_swapchain) return VK_SUCCESS;
     /* The thunk copied the application chain. A disabled feature must not
@@ -1021,17 +1040,7 @@ static VkResult enable_swapchain_maintenance1( struct vulkan_physical_device *ph
              device->extensions.has_VK_EXT_swapchain_maintenance1);
         return VK_SUCCESS;
     }
-    khr = instance->extensions.has_VK_KHR_surface_maintenance1 &&
-          physical_device->extensions.has_VK_KHR_swapchain_maintenance1;
-    ext = instance->extensions.has_VK_EXT_surface_maintenance1 &&
-          physical_device->extensions.has_VK_EXT_swapchain_maintenance1;
-    if (!khr && !ext) return VK_SUCCESS;
-
-    if (instance->p_vkGetPhysicalDeviceFeatures2)
-        instance->p_vkGetPhysicalDeviceFeatures2( physical_device->host.physical_device, &features );
-    else if (instance->p_vkGetPhysicalDeviceFeatures2KHR)
-        instance->p_vkGetPhysicalDeviceFeatures2KHR( physical_device->host.physical_device, &features );
-    if (!maintenance.swapchainMaintenance1) return VK_SUCCESS;
+    if (!get_swapchain_maintenance1_features( physical_device, &maintenance, &khr )) return VK_SUCCESS;
 
     if (application) application->swapchainMaintenance1 = VK_TRUE;
     else
@@ -2285,6 +2294,34 @@ static VkBool32 win32u_vkGetPhysicalDeviceWin32PresentationSupportKHR( VkPhysica
     return driver_funcs->p_get_physical_device_presentation_support( physical_device, queue );
 }
 
+static BOOL vulkan_surface_needs_snapshot( struct surface *surface )
+{
+    return driver_funcs->p_vulkan_surface_needs_snapshot &&
+           driver_funcs->p_vulkan_surface_needs_snapshot( surface->client );
+}
+
+static VkResult win32u_vkGetPhysicalDeviceSurfaceSupportKHR( VkPhysicalDevice client_physical_device,
+                                                            uint32_t queue, VkSurfaceKHR client_surface,
+                                                            VkBool32 *supported )
+{
+    struct vulkan_physical_device *physical_device = vulkan_physical_device_from_handle( client_physical_device );
+    struct vulkan_instance *instance = physical_device->instance;
+    struct surface *surface = surface_from_handle( client_surface );
+    VkPhysicalDeviceSwapchainMaintenance1FeaturesKHR maintenance =
+    {
+        .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SWAPCHAIN_MAINTENANCE_1_FEATURES_KHR,
+    };
+    VkResult res;
+    BOOL khr;
+
+    res = instance->p_vkGetPhysicalDeviceSurfaceSupportKHR( physical_device->host.physical_device,
+                                                           queue, surface->obj.host.surface, supported );
+    if (!res && *supported && vulkan_surface_needs_snapshot( surface ) &&
+        !get_swapchain_maintenance1_features( physical_device, &maintenance, &khr ))
+        *supported = VK_FALSE;
+    return res;
+}
+
 static BOOL extents_equals( const VkExtent2D *extents, const RECT *rect )
 {
     return extents->width == rect->right - rect->left && extents->height == rect->bottom - rect->top;
@@ -2579,7 +2616,7 @@ static VkResult prepare_swapchain_snapshot( struct vulkan_queue *queue, struct s
             if ((res = device->p_vkCreateSemaphore( device->host.device, &semaphore_info, NULL, &semaphore ))) goto failed;
             sync->semaphore = semaphore;
         }
-        if (impl_from_vulkan_device( device )->swapchain_maintenance1 && !sync->fence)
+        if (!sync->fence)
         {
             if ((res = device->p_vkCreateFence( device->host.device, &fence_info, NULL, &fence ))) goto failed;
             sync->fence = fence;
@@ -2774,8 +2811,7 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
     VkSwapchainCreateInfoKHR create_info_host = *create_info;
     VkSurfaceCapabilitiesKHR capabilities;
     VkSwapchainKHR host_swapchain;
-    BOOL needs_snapshot = driver_funcs->p_vulkan_surface_needs_snapshot &&
-                          driver_funcs->p_vulkan_surface_needs_snapshot( surface->client );
+    BOOL needs_snapshot = vulkan_surface_needs_snapshot( surface );
     struct ratio raw_dpi;
     RECT client_rect;
     VkResult res;
@@ -2784,6 +2820,16 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
     {
         ERR( "surface %p, hwnd %p is invalid!\n", surface, surface->hwnd );
         return VK_ERROR_INITIALIZATION_FAILED;
+    }
+
+    /* Copy completion does not prove that WSI has released our private wait
+     * semaphore. Reacquisition cannot prove final shutdown either. Admit a
+     * snapshot swapchain only when every Present can carry a release fence,
+     * including a DIRECT surface which may later require composition. */
+    if (needs_snapshot && !impl_from_vulkan_device( device )->swapchain_maintenance1)
+    {
+        WARN( "Snapshot presentation requires native swapchain maintenance release fences.\n" );
+        return VK_ERROR_FEATURE_NOT_PRESENT;
     }
 
     if (surface) create_info_host.surface = surface->obj.host.surface;
@@ -4579,6 +4625,7 @@ static struct vulkan_funcs vulkan_funcs =
     .p_vkGetPhysicalDeviceSurfaceCapabilitiesKHR = win32u_vkGetPhysicalDeviceSurfaceCapabilitiesKHR,
     .p_vkGetPhysicalDeviceSurfaceFormats2KHR = win32u_vkGetPhysicalDeviceSurfaceFormats2KHR,
     .p_vkGetPhysicalDeviceSurfaceFormatsKHR = win32u_vkGetPhysicalDeviceSurfaceFormatsKHR,
+    .p_vkGetPhysicalDeviceSurfaceSupportKHR = win32u_vkGetPhysicalDeviceSurfaceSupportKHR,
     .p_vkGetPhysicalDeviceWin32PresentationSupportKHR = win32u_vkGetPhysicalDeviceWin32PresentationSupportKHR,
     .p_vkGetSemaphoreWin32HandleKHR = win32u_vkGetSemaphoreWin32HandleKHR,
     .p_vkImportFenceWin32HandleKHR = win32u_vkImportFenceWin32HandleKHR,
