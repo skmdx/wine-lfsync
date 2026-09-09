@@ -248,7 +248,7 @@ static UINT64 client_surface_compositor_mark;
 
 enum client_surface_compositor_op
 {
-    CLIENT_SURFACE_COMPOSITOR_ALLOC_POOL,
+    CLIENT_SURFACE_COMPOSITOR_REPLACE_POOL,
     CLIENT_SURFACE_COMPOSITOR_COPY,
     CLIENT_SURFACE_COMPOSITOR_FREE_POOL,
     CLIENT_SURFACE_COMPOSITOR_PRESENT,
@@ -287,6 +287,8 @@ struct client_surface_compositor_job
     unsigned int window_width;
     unsigned int window_height;
     unsigned int copy_count;
+    unsigned int preserve_width;
+    unsigned int preserve_height;
     unsigned int valid_width;
     unsigned int valid_height;
     unsigned int depth;
@@ -499,7 +501,8 @@ static BOOL client_surface_alloc_on_compositor( struct client_surface_compositor
 {
     Display *display = client_surface_compositor_display;
     struct client_surface_output_allocation *allocation;
-    unsigned int i;
+    unsigned int i, copy_width = min( job->window_width, job->width );
+    unsigned int copy_height = min( job->window_height, job->height );
     GC gc;
     int error = 0;
 
@@ -523,10 +526,21 @@ static BOOL client_surface_alloc_on_compositor( struct client_surface_compositor
         for (i = 0; i < job->copy_count; ++i)
         {
             XCopyArea( display, job->destination, job->pixmaps[i], gc, 0, 0,
-                       job->window_width, job->window_height, 0, 0 );
+                       copy_width, copy_height, 0, 0 );
             TRACE_(csperf)( "ticks=%llu event=xlib_copy_request source=%lx destination=%lx width=%u height=%u clipped=0 route=restore\n",
                            client_surface_perf_time(), job->destination, job->pixmaps[i],
-                           job->window_width, job->window_height );
+                           copy_width, copy_height );
+            /* The replacement job drained the old target before entering.
+             * Preserve its completed intersection over the GUI seed without
+             * exposing either new image before the common error boundary. */
+            if (job->source && job->preserve_width && job->preserve_height)
+            {
+                XCopyArea( display, job->source, job->pixmaps[i], gc, 0, 0,
+                           job->preserve_width, job->preserve_height, 0, 0 );
+                TRACE_(csperf)( "ticks=%llu event=xlib_copy_request source=%lx destination=%lx width=%u height=%u clipped=0 route=restore\n",
+                               client_surface_perf_time(), job->source, job->pixmaps[i],
+                               job->preserve_width, job->preserve_height );
+            }
         }
         XFreeGC( display, gc );
     }
@@ -536,7 +550,7 @@ static BOOL client_surface_alloc_on_compositor( struct client_surface_compositor
                    "width=%u height=%u depth=%u checkpoint_copies=%u copy_width=%u copy_height=%u sync_calls=1 error=%d success=%u\n",
                    client_surface_perf_time(), job->pixmaps[0], job->pixmaps[1],
                    job->width, job->height, job->depth, gc ? job->copy_count : 0,
-                   job->window_width, job->window_height, error, !!gc && !error );
+                   copy_width, copy_height, error, !!gc && !error );
     if (gc && !error)
     {
         memcpy( allocation->pixmaps, job->pixmaps, sizeof(allocation->pixmaps) );
@@ -1707,6 +1721,23 @@ static BOOL update_client_surface_compositor_target( struct client_surface_compo
 failed:
     if (created) free( target );
     else target->quiescing = target->native_updates || target->deferred_update;
+    return FALSE;
+}
+
+static BOOL replace_client_surface_compositor_pool( struct client_surface_compositor_job *job )
+{
+    struct client_surface_compositor_target *target;
+
+    /* Allocation, checkpoint copies and installation are one transaction.
+     * The GUI keeps the old pair until this job succeeds; an allocation or
+     * target failure leaves that pair and its pending publication intact. */
+    if (!client_surface_compositor_open() || !client_surface_alloc_on_compositor( job )) goto failed;
+    if (update_client_surface_compositor_target( job )) return TRUE;
+    client_surface_free_on_compositor( job->pixmaps );
+    job->pixmaps[0] = job->pixmaps[1] = 0;
+failed:
+    if ((target = find_client_surface_compositor_target( job->handoff_toplevel )))
+        target->quiescing = target->native_updates || target->deferred_update;
     return FALSE;
 }
 
@@ -3419,6 +3450,8 @@ static BOOL execute_client_surface_compositor_job( struct client_surface_composi
                                                           job );
     if (job->op == CLIENT_SURFACE_COMPOSITOR_UPDATE_TARGET)
         return update_client_surface_compositor_target( job );
+    if (job->op == CLIENT_SURFACE_COMPOSITOR_REPLACE_POOL)
+        return replace_client_surface_compositor_pool( job );
     if (job->op == CLIENT_SURFACE_COMPOSITOR_REMOVE_TARGET)
         return remove_client_surface_compositor_target( job->handoff_toplevel );
     if (job->op == CLIENT_SURFACE_COMPOSITOR_RETIRE_POOL)
@@ -3432,8 +3465,6 @@ static BOOL execute_client_surface_compositor_job( struct client_surface_composi
     if (!client_surface_compositor_open()) return FALSE;
     switch (job->op)
     {
-    case CLIENT_SURFACE_COMPOSITOR_ALLOC_POOL:
-        return client_surface_alloc_on_compositor( job );
     case CLIENT_SURFACE_COMPOSITOR_FREE_POOL:
         return client_surface_free_on_compositor( job->pixmaps );
     case CLIENT_SURFACE_COMPOSITOR_PRESENT:
@@ -3523,7 +3554,8 @@ static BOOL client_surface_compositor_job_ready( struct client_surface_composito
      * this target waits; jobs for independent targets remain eligible. */
     if (target->copy_frame) return FALSE;
     if (job->op == CLIENT_SURFACE_COMPOSITOR_REMOVE_TARGET ||
-        job->op == CLIENT_SURFACE_COMPOSITOR_BEGIN_UPDATE) drain = TRUE;
+        job->op == CLIENT_SURFACE_COMPOSITOR_BEGIN_UPDATE ||
+        job->op == CLIENT_SURFACE_COMPOSITOR_REPLACE_POOL) drain = TRUE;
     if (job->op == CLIENT_SURFACE_COMPOSITOR_UPDATE_TARGET)
         drain = target->window != job->destination ||
                 target->window_width != job->window_width || target->window_height != job->window_height ||
@@ -3533,7 +3565,8 @@ static BOOL client_surface_compositor_job_ready( struct client_surface_composito
     {
         /* Stop producing work for this target while its previous native
          * scene drains. Other targets remain eligible in the same loop. */
-        if (job->op == CLIENT_SURFACE_COMPOSITOR_UPDATE_TARGET)
+        if (job->op == CLIENT_SURFACE_COMPOSITOR_UPDATE_TARGET ||
+            job->op == CLIENT_SURFACE_COMPOSITOR_REPLACE_POOL)
             /* Allocation may still fail. Preserve the pending publication
              * until the replacement pool has been prepared successfully. */
             target->quiescing = TRUE;
@@ -3882,21 +3915,29 @@ static BOOL client_surface_backing_copy_area( Drawable source, Drawable destinat
     return submit_client_surface_compositor_job( &job );
 }
 
-static BOOL client_surface_backing_alloc( struct x11drv_win_data *data, unsigned int width,
-                                          unsigned int height, unsigned int window_width,
-                                          unsigned int window_height, BOOL snapshot,
-                                          Pixmap *first, Pixmap *second )
+static BOOL replace_client_surface_backing( struct x11drv_win_data *data, unsigned int width,
+                                            unsigned int height, unsigned int window_width,
+                                            unsigned int window_height, BOOL snapshot,
+                                            unsigned int preserve_width, unsigned int preserve_height,
+                                            Pixmap *first, Pixmap *second )
 {
     struct client_surface_compositor_job job =
     {
-        .op = CLIENT_SURFACE_COMPOSITOR_ALLOC_POOL,
+        .op = CLIENT_SURFACE_COMPOSITOR_REPLACE_POOL,
+        .handoff_toplevel = data->hwnd,
+        .source = snapshot ? 0 : data->client_surface_backing,
         .destination = data->whole_window,
         .width = width,
         .height = height,
         .depth = data->vis.depth,
-        .window_width = min( window_width, width ),
-        .window_height = min( window_height, height ),
+        .window_width = window_width,
+        .window_height = window_height,
         .copy_count = snapshot ? 1 : 2,
+        .preserve_width = preserve_width,
+        .preserve_height = preserve_height,
+        .valid_width = preserve_width >= window_width && preserve_height >= window_height ? window_width : 0,
+        .valid_height = preserve_width >= window_width && preserve_height >= window_height ? window_height : 0,
+        .visual = data->vis.visualid,
     };
 
     if (snapshot && (width < window_width || height < window_height)) return FALSE;
@@ -4487,9 +4528,7 @@ static BOOL ensure_client_surface_backing( struct x11drv_win_data *data, BOOL sn
 {
     unsigned int width, height, window_width, window_height;
     unsigned int old_valid_width, old_valid_height;
-    unsigned int old_width, old_height;
-    DWORD old_shrink_start;
-    BOOL old_valid, valid, updated, shrink = FALSE;
+    BOOL old_valid, valid, shrink = FALSE;
     Pixmap pixmap, spare, old_pixmap, old_spare;
 
     if (!data->whole_window) return FALSE;
@@ -4570,29 +4609,15 @@ static BOOL ensure_client_surface_backing( struct x11drv_win_data *data, BOOL sn
     data->client_surface_backing_valid_width = 0;
     data->client_surface_backing_valid_height = 0;
 
-    if (!client_surface_backing_alloc( data, width, height, window_width, window_height,
-                                       snapshot, &pixmap, &spare ))
+    if (!replace_client_surface_backing( data, width, height, window_width, window_height,
+                                         snapshot, !snapshot && old_valid ? old_valid_width : 0,
+                                         !snapshot && old_valid ? old_valid_height : 0, &pixmap, &spare ))
         return FALSE;
 
-    /* Allocation includes one complete snapshot checkpoint, or seeds both
-     * capacity-only replacements. A snapshot's spare stays at revision zero
-     * until its first composition catches up from the completed checkpoint.
-     * Capacity replacement still overlays the old valid intersection. */
-    if (!snapshot && data->client_surface_backing && old_valid &&
-        (!client_surface_backing_copy( data->client_surface_backing, pixmap,
-                                       old_valid_width, old_valid_height ) ||
-         !client_surface_backing_copy( data->client_surface_backing, spare,
-                                       old_valid_width, old_valid_height )))
-    {
-        client_surface_backing_free( pixmap, spare );
-        return FALSE;
-    }
-
+    /* The actor installed the checked checkpoint pair. Publish GUI ownership
+     * only after success, so failure never requires restoring these handles. */
     old_pixmap = data->client_surface_backing;
     old_spare = data->client_surface_backing_spare;
-    old_width = data->client_surface_backing_width;
-    old_height = data->client_surface_backing_height;
-    old_shrink_start = data->client_surface_backing_shrink_start;
     data->client_surface_backing = pixmap;
     data->client_surface_backing_spare = spare;
     data->client_surface_backing_width = width;
@@ -4604,23 +4629,6 @@ static BOOL ensure_client_surface_backing( struct x11drv_win_data *data, BOOL sn
     {
         data->client_surface_backing_valid_width = window_width;
         data->client_surface_backing_valid_height = window_height;
-    }
-    updated = update_client_surface_backing_target( data );
-    if (!updated)
-    {
-        /* The actor retained its old pool on failure. Restore the GUI's
-         * ownership too, without declaring that image complete for the new
-         * native extent. Only the uninstalled replacement pair is released. */
-        data->client_surface_backing = old_pixmap;
-        data->client_surface_backing_spare = old_spare;
-        data->client_surface_backing_width = old_width;
-        data->client_surface_backing_height = old_height;
-        data->client_surface_backing_shrink_start = old_shrink_start;
-        data->client_surface_backing_valid = FALSE;
-        data->client_surface_backing_valid_width = 0;
-        data->client_surface_backing_valid_height = 0;
-        client_surface_backing_free( pixmap, spare );
-        return FALSE;
     }
     if (snapshot)
         TRACE( "rotated client-surface frame pool to %#lx (idle %#lx)\n",
