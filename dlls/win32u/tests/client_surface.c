@@ -2607,7 +2607,9 @@ static void check_owner_repair( HWND hwnd, const struct client_surface_handoff_r
         status = request_owner_repair( hwnd, state.scene_generation, receipt, sizeof(*receipt), &accepted );
         ok( !status && accepted, "warm repair rejected, status %#x\n", status );
         producers = drain_scene_notification_counts( &owner_updates, &prepares, 0, &counts );
-        ok( !producers && owner_updates && prepares, "warm prepare producer %u owner %u preparation %u\n",
+        /* The queued backing callback refreshes the owner too. It must keep
+         * preparation without leaving a separate handoff-only callback. */
+        ok( !producers && !owner_updates && prepares, "warm prepare producer %u owner %u preparation %u\n",
             producers, owner_updates, prepares );
         ok( counts.backing == 1 && !counts.prepare && !counts.publish,
             "warm preparation notifications backing %u prepare %u publish %u\n",
@@ -2639,9 +2641,11 @@ static void check_owner_repair( HWND hwnd, const struct client_surface_handoff_r
         status = prepare_surface_state( hwnd, &state );
         ok( !status && state.pending == 1 && state.generation, "repair prepare status %#x pending %u\n",
             status, state.pending );
-        producers = drain_scene_notifications( &owner_updates, &prepares );
-        ok( producers == !!i && owner_updates, "repair composition producer %u owner %u\n",
-            producers, owner_updates );
+        producers = drain_scene_notification_counts( &owner_updates, &prepares, 0, &counts );
+        ok( producers == !!i && owner_updates == (i != 1) && counts.backing == (i == 1) &&
+            !counts.prepare && !counts.publish,
+            "repair composition producer %u owner %u backing %u prepare %u publish %u\n",
+            producers, owner_updates, counts.backing, counts.prepare, counts.publish );
         before = state;
         status = request_owner_repair( hwnd, state.scene_generation, receipt, sizeof(*receipt), &accepted );
         ok( !status && accepted, "existing assembly repair rejected, status %#x\n", status );

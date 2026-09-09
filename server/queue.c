@@ -2976,9 +2976,22 @@ void post_message_coalesced( user_handle_t win, unsigned int message,
     if (thread->queue) LIST_FOR_EACH_ENTRY( msg, &thread->queue->msg_list[POST_MESSAGE],
                                            struct message, entry )
     {
-        if (msg->type == MSG_POSTED && msg->win == full_win && msg->msg == message &&
-            msg->wparam == wparam && msg->lparam == lparam)
+        if (msg->type != MSG_POSTED || msg->win != full_win || msg->msg != message ||
+            msg->lparam != lparam) continue;
+        if (msg->wparam == wparam) goto done;
+        /* A backing callback applies the latest window state and refreshes
+         * its handoffs too. Keep that stronger request when both updates are
+         * still queued. An update already being handled is no longer here,
+         * so a scene change during its callback still gets another wake. */
+        if (message == WM_WINE_UPDATEWINDOWSTATE && !lparam &&
+            (wparam == WINE_UPDATE_CLIENT_SURFACE_BACKING ||
+             wparam == WINE_UPDATE_CLIENT_SURFACE_HANDOFFS) &&
+            (msg->wparam == WINE_UPDATE_CLIENT_SURFACE_BACKING ||
+             msg->wparam == WINE_UPDATE_CLIENT_SURFACE_HANDOFFS))
+        {
+            msg->wparam = WINE_UPDATE_CLIENT_SURFACE_BACKING;
             goto done;
+        }
     }
     post_thread_message( thread, win, message, wparam, lparam );
 done:
