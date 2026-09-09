@@ -287,6 +287,7 @@ struct client_surface_compositor_job
     unsigned int height;
     unsigned int window_width;
     unsigned int window_height;
+    unsigned int copy_count;
     unsigned int valid_width;
     unsigned int valid_height;
     unsigned int depth;
@@ -495,52 +496,68 @@ static BOOL client_surface_copy_on_compositor( Drawable source, Drawable destina
         source, destination, source_x, source_y, destination_x, destination_y, width, height );
 }
 
-static BOOL client_surface_alloc_on_compositor( Drawable drawable, unsigned int width,
-                                                unsigned int height, unsigned int depth,
-                                                Pixmap pixmaps[2] )
+static BOOL client_surface_alloc_on_compositor( struct client_surface_compositor_job *job )
 {
     Display *display = client_surface_compositor_display;
     struct client_surface_output_allocation *allocation;
+    unsigned int i;
+    GC gc;
     int error = 0;
 
+    assert( job->copy_count && job->copy_count <= ARRAY_SIZE(job->pixmaps) );
     if (!(allocation = malloc( sizeof(*allocation) ))) return FALSE;
-    allocation->bytes = 2 * client_surface_pixmap_bytes( width, height, depth );
+    allocation->bytes = 2 * client_surface_pixmap_bytes( job->width, job->height, job->depth );
     if (!client_surface_reserve_memory( CLIENT_SURFACE_MEMORY_OUTPUT, allocation->bytes * 3 / 2 ))
     {
         free( allocation );
         return FALSE;
     }
     X11DRV_expect_error( display, client_surface_compositor_error, &error );
-    pixmaps[0] = XCreatePixmap( display, drawable, width, height, depth );
-    pixmaps[1] = XCreatePixmap( display, drawable, width, height, depth );
-    /* All three images belong to the replacement pool. Check their native
-     * allocation together, before copying its checkpoint or installing it.
-     * The old target remains intact if any request fails. */
-    allocation->mailbox = XCreatePixmap( display, drawable, width, height, depth );
+    job->pixmaps[0] = XCreatePixmap( display, job->destination, job->width, job->height, job->depth );
+    job->pixmaps[1] = XCreatePixmap( display, job->destination, job->width, job->height, job->depth );
+    allocation->mailbox = XCreatePixmap( display, job->destination, job->width, job->height, job->depth );
+    /* The owner completed its drawing before this job. All destinations are
+     * private new images, so allocation and checkpoint errors can share one
+     * reply boundary. Do not register or install any of them before it. */
+    gc = XCreateGC( display, job->pixmaps[0], 0, NULL );
+    if (gc)
+    {
+        for (i = 0; i < job->copy_count; ++i)
+        {
+            XCopyArea( display, job->destination, job->pixmaps[i], gc, 0, 0,
+                       job->window_width, job->window_height, 0, 0 );
+            TRACE_(csperf)( "ticks=%llu event=xlib_copy_request source=%lx destination=%lx width=%u height=%u clipped=0 route=restore\n",
+                           client_surface_perf_time(), job->destination, job->pixmaps[i],
+                           job->window_width, job->window_height );
+        }
+        XFreeGC( display, gc );
+    }
     XSync( display, False );
     X11DRV_check_error();
     TRACE_(csperf)( "ticks=%llu event=output_pool_alloc first=%lx second=%lx mailbox=%lx "
-                   "width=%u height=%u depth=%u sync_calls=1 error=%d\n", client_surface_perf_time(),
-                   pixmaps[0], pixmaps[1], allocation->mailbox, width, height, depth, error );
-    if (!error)
+                   "width=%u height=%u depth=%u checkpoint_copies=%u copy_width=%u copy_height=%u sync_calls=1 error=%d success=%u\n",
+                   client_surface_perf_time(), job->pixmaps[0], job->pixmaps[1], allocation->mailbox,
+                   job->width, job->height, job->depth, gc ? job->copy_count : 0,
+                   job->window_width, job->window_height, error, !!gc && !error );
+    if (gc && !error)
     {
-        memcpy( allocation->pixmaps, pixmaps, sizeof(allocation->pixmaps) );
+        memcpy( allocation->pixmaps, job->pixmaps, sizeof(allocation->pixmaps) );
         allocation->next = client_surface_output_allocations;
         client_surface_output_allocations = allocation;
-        x11drv_client_surface_trace_image( "acquire", "output_pair", display, pixmaps[0], allocation->bytes / 2 );
-        x11drv_client_surface_trace_image( "acquire", "output_pair", display, pixmaps[1], allocation->bytes / 2 );
+        x11drv_client_surface_trace_image( "acquire", "output_pair", display, job->pixmaps[0], allocation->bytes / 2 );
+        x11drv_client_surface_trace_image( "acquire", "output_pair", display, job->pixmaps[1], allocation->bytes / 2 );
         x11drv_client_surface_trace_image( "acquire", "output_mailbox", display,
                                           allocation->mailbox, allocation->bytes / 2 );
         return TRUE;
     }
 
     X11DRV_expect_error( display, client_surface_compositor_error, &error );
-    XFreePixmap( display, pixmaps[0] );
-    XFreePixmap( display, pixmaps[1] );
+    XFreePixmap( display, job->pixmaps[0] );
+    XFreePixmap( display, job->pixmaps[1] );
     XFreePixmap( display, allocation->mailbox );
     XSync( display, False );
     X11DRV_check_error();
-    pixmaps[0] = pixmaps[1] = 0;
+    job->pixmaps[0] = job->pixmaps[1] = 0;
     client_surface_release_memory( CLIENT_SURFACE_MEMORY_OUTPUT, allocation->bytes * 3 / 2 );
     free( allocation );
     return FALSE;
@@ -3368,8 +3385,7 @@ static BOOL execute_client_surface_compositor_job( struct client_surface_composi
     switch (job->op)
     {
     case CLIENT_SURFACE_COMPOSITOR_ALLOC_POOL:
-        return client_surface_alloc_on_compositor( job->destination, job->width,
-                                                   job->height, job->depth, job->pixmaps );
+        return client_surface_alloc_on_compositor( job );
     case CLIENT_SURFACE_COMPOSITOR_FREE_POOL:
         return client_surface_free_on_compositor( job->pixmaps );
     case CLIENT_SURFACE_COMPOSITOR_PRESENT:
@@ -3821,19 +3837,26 @@ static BOOL client_surface_backing_copy_area( Drawable source, Drawable destinat
     return submit_client_surface_compositor_job( &job );
 }
 
-static BOOL client_surface_backing_alloc( Drawable drawable, unsigned int width,
-                                          unsigned int height, unsigned int depth,
+static BOOL client_surface_backing_alloc( struct x11drv_win_data *data, unsigned int width,
+                                          unsigned int height, unsigned int window_width,
+                                          unsigned int window_height, BOOL snapshot,
                                           Pixmap *first, Pixmap *second )
 {
     struct client_surface_compositor_job job =
     {
         .op = CLIENT_SURFACE_COMPOSITOR_ALLOC_POOL,
-        .destination = drawable,
+        .destination = data->whole_window,
         .width = width,
         .height = height,
-        .depth = depth,
+        .depth = data->vis.depth,
+        .window_width = min( window_width, width ),
+        .window_height = min( window_height, height ),
+        .copy_count = snapshot ? 1 : 2,
     };
 
+    if (snapshot && (width < window_width || height < window_height)) return FALSE;
+    /* Complete the GUI connection's drawing before the actor reads it. */
+    XSync( data->display, False );
     if (!submit_client_surface_compositor_job( &job )) return FALSE;
     *first = job.pixmaps[0];
     *second = job.pixmaps[1];
@@ -4502,34 +4525,19 @@ static BOOL ensure_client_surface_backing( struct x11drv_win_data *data, BOOL sn
     data->client_surface_backing_valid_width = 0;
     data->client_surface_backing_valid_height = 0;
 
-    if (!client_surface_backing_alloc( data->whole_window, width, height,
-                                       data->vis.depth, &pixmap, &spare ))
+    if (!client_surface_backing_alloc( data, width, height, window_width, window_height,
+                                       snapshot, &pixmap, &spare ))
         return FALSE;
 
-    /* A snapshot installs one complete checkpoint. Spare images start at
-     * revision zero and catch up from it before any partial composition, so
-     * seeding both of them before taking that snapshot would copy the same
-     * owner pixels three times. Do not install either new XID until the
-     * checkpoint is complete; the old pool retains its native lifetime. */
-    if (snapshot)
-    {
-        if (!copy_client_surface_backing_snapshot( data, pixmap, width, height, window_width, window_height ))
-        {
-            client_surface_backing_free( pixmap, spare );
-            return FALSE;
-        }
-    }
-    /* Capacity-only replacement still preserves its old valid intersection.
-     * Producers never receive these owner-owned destination XIDs. */
-    else if (!client_surface_backing_copy( data->whole_window, pixmap,
-                                      min( window_width, width ), min( window_height, height ) ) ||
-        !client_surface_backing_copy( data->whole_window, spare,
-                                      min( window_width, width ), min( window_height, height ) ) ||
-        (data->client_surface_backing && old_valid &&
-         (!client_surface_backing_copy( data->client_surface_backing, pixmap,
-                                        old_valid_width, old_valid_height ) ||
-          !client_surface_backing_copy( data->client_surface_backing, spare,
-                                        old_valid_width, old_valid_height ))))
+    /* Allocation includes one complete snapshot checkpoint, or seeds both
+     * capacity-only replacements. A snapshot's spare stays at revision zero
+     * until its first composition catches up from the completed checkpoint.
+     * Capacity replacement still overlays the old valid intersection. */
+    if (!snapshot && data->client_surface_backing && old_valid &&
+        (!client_surface_backing_copy( data->client_surface_backing, pixmap,
+                                       old_valid_width, old_valid_height ) ||
+         !client_surface_backing_copy( data->client_surface_backing, spare,
+                                       old_valid_width, old_valid_height )))
     {
         client_surface_backing_free( pixmap, spare );
         return FALSE;
