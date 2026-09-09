@@ -4840,18 +4840,30 @@ static NTSTATUS update_client_surface_backing_state( HWND hwnd, BOOL enable, BOO
 {
     struct window_rects rects;
     NTSTATUS status = STATUS_NOT_SUPPORTED;
-    BOOL supported;
+    BOOL supported, layered;
     UINT context;
     WND *win;
 
     if (!is_current_thread_window( hwnd )) return status;
     if (!(win = get_win_ptr( hwnd ))) return STATUS_INVALID_HANDLE;
     if (win == WND_DESKTOP || win == WND_OTHER_PROCESS) return status;
+    layered = !!(win->dwExStyle & WS_EX_LAYERED);
     supported = !win->surface && win->parent == get_desktop_window() &&
                 (win->dwStyle & (WS_VISIBLE | WS_MINIMIZE)) == WS_VISIBLE &&
-                !(win->dwExStyle & WS_EX_LAYERED) && IsRectEmpty( &win->present_rect );
+                IsRectEmpty( &win->present_rect );
     release_win_ptr( win );
     if (!supported) return status;
+    if (layered)
+    {
+        DWORD flags;
+        BYTE alpha;
+
+        /* Constant opaque alpha does not require a layered GDI surface.
+         * Keep color keys, translucency and per-pixel alpha on the full path. */
+        if (!NtUserGetLayeredWindowAttributes( hwnd, NULL, &alpha, &flags ) ||
+            flags != LWA_ALPHA || alpha != 255)
+            return status;
+    }
 
     /* Backing notifications change neither Win32 geometry nor the GDI
      * surface. Let the driver handle its retained native state directly,

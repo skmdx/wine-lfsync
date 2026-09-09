@@ -3539,7 +3539,7 @@ NTSTATUS X11DRV_UpdateClientSurfaceBacking( HWND hwnd, BOOL enable, BOOL prepare
      * still require the ordinary window update and its quiescing boundary. */
     if (!data->whole_window || !data->client_window || data->embedded || data->shaped ||
         data->state_locks || data->reparenting || data->parent_invalid ||
-        data->layered || data->is_fullscreen || data->client_surface_backing ||
+        data->use_alpha || data->client_surface_opacity_valid || data->is_fullscreen || data->client_surface_backing ||
         data->client_surface_backing_spare || data->client_surface_redirected ||
         data->client_surface_opacity_staged || data->client_surface_staged ||
         data->wm_state_serial || data->net_wm_state_serial ||
