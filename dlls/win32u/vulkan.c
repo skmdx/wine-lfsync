@@ -1089,7 +1089,7 @@ static VkResult win32u_vkCreateDevice( VkPhysicalDevice client_physical_device, 
         free( impl );
         return VK_ERROR_OUT_OF_HOST_MEMORY;
     }
-    if (pthread_cond_init( &impl->retirement_cond, NULL ))
+    if (client_surface_cond_init( &impl->retirement_cond ))
     {
         pthread_mutex_destroy( &impl->retirement_lock );
         free( impl );
@@ -2346,7 +2346,6 @@ static VkResult acquire_snapshot_reservation( struct vulkan_device *device, stru
                                               struct swapchain_snapshot **ret )
 {
     struct swapchain_snapshot *snapshot = NULL;
-    struct timespec deadline;
     DWORD start = NtGetTickCount();
     unsigned int i;
     VkResult res;
@@ -2354,11 +2353,11 @@ static VkResult acquire_snapshot_reservation( struct vulkan_device *device, stru
     /* Reserve storage before acquiring any surface submission mutex. The
      * previous completion owns this storage through its CPU upload, but it
      * must not prevent window geometry and unrelated surfaces from moving. */
-    clock_gettime( CLOCK_REALTIME, &deadline );
-    deadline.tv_sec += CLIENT_SURFACE_PRESENT_TIMEOUT / 1000;
     pthread_mutex_lock( &swapchain->present_lock );
     for (;;)
     {
+        DWORD elapsed, remaining;
+
         for (i = 0; i < ARRAY_SIZE(swapchain->snapshots); ++i)
         {
             unsigned int index = (swapchain->next_snapshot + i) % ARRAY_SIZE(swapchain->snapshots);
@@ -2369,8 +2368,10 @@ static VkResult acquire_snapshot_reservation( struct vulkan_device *device, stru
             break;
         }
         if (snapshot) break;
-        if (pthread_cond_timedwait( &swapchain->completion_cond, &swapchain->present_lock,
-                                    &deadline ) == ETIMEDOUT)
+        elapsed = NtGetTickCount() - start;
+        remaining = elapsed < CLIENT_SURFACE_PRESENT_TIMEOUT ? CLIENT_SURFACE_PRESENT_TIMEOUT - elapsed : 0;
+        if (!remaining || client_surface_cond_timedwait( &swapchain->completion_cond, &swapchain->present_lock,
+                                                        remaining ) == ETIMEDOUT)
         {
             pthread_mutex_unlock( &swapchain->present_lock );
             return VK_ERROR_OUT_OF_DEVICE_MEMORY;
@@ -2769,7 +2770,7 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
         free( swapchain );
         return VK_ERROR_OUT_OF_HOST_MEMORY;
     }
-    if (pthread_cond_init( &swapchain->completion_cond, NULL ))
+    if (client_surface_cond_init( &swapchain->completion_cond ))
     {
         pthread_mutex_destroy( &swapchain->present_lock );
         free( swapchain );
@@ -2865,8 +2866,6 @@ static void retire_swapchains( struct device *device, BOOL worker )
     pthread_mutex_lock( &device->retirement_lock );
     while (!list_empty( &device->retired_swapchains ))
     {
-        struct timespec deadline;
-
         list_move_tail( &pending, &device->retired_swapchains );
         pthread_mutex_unlock( &device->retirement_lock );
         /* No state mutex spans a host call. One stalled copy cannot hold
@@ -2880,11 +2879,7 @@ static void retire_swapchains( struct device *device, BOOL worker )
         pthread_mutex_lock( &device->retirement_lock );
         list_move_tail( &device->retired_swapchains, &retry );
         if (list_empty( &device->retired_swapchains )) break;
-        clock_gettime( CLOCK_REALTIME, &deadline );
-        deadline.tv_nsec += 10000000;
-        deadline.tv_sec += deadline.tv_nsec / 1000000000;
-        deadline.tv_nsec %= 1000000000;
-        pthread_cond_timedwait( &device->retirement_cond, &device->retirement_lock, &deadline );
+        client_surface_cond_timedwait( &device->retirement_cond, &device->retirement_lock, 10 );
     }
     device->retirement_worker = FALSE;
     pthread_cond_broadcast( &device->retirement_cond );

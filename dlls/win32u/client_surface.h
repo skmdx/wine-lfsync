@@ -21,6 +21,11 @@ struct client_surface_geometry
     RECT monitor_rect;
 };
 
+/* Timed conditions pair this initializer with the monotonic/relative wait. */
+extern int client_surface_cond_init( pthread_cond_t *cond );
+extern int client_surface_cond_timedwait( pthread_cond_t *cond, pthread_mutex_t *mutex, DWORD timeout );
+extern BOOL client_surface_completion_init(void);
+
 extern HWND client_surface_set_server_state( HWND hwnd, const struct client_surface *surface,
                                              UINT flags, UINT64 generation,
                                              UINT64 scene_generation, BOOL *wake );

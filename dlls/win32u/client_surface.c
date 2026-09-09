@@ -1285,6 +1285,7 @@ void *client_surface_create( UINT size, const struct client_surface_backend *bac
     if (!backend) backend = &default_client_surface_backend;
     if (backend->completion &&
         (!backend->completion->prepare || !backend->completion->wait)) return NULL;
+    if (!client_surface_completion_init()) return NULL;
     if (!(surface = calloc( 1, size ))) return NULL;
     if (pthread_mutex_init( &surface->present_lock, NULL )) goto failed_present_lock;
     if (pthread_mutex_init( &surface->completion_lock, NULL )) goto failed_completion_lock;

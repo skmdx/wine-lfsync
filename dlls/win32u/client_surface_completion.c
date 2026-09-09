@@ -65,7 +65,9 @@ struct client_surface_completion_job
 static LONG client_surface_deferred_present_count;
 
 static pthread_mutex_t completion_executor_lock = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t completion_executor_cond = PTHREAD_COND_INITIALIZER;
+static pthread_once_t completion_executor_once = PTHREAD_ONCE_INIT;
+static pthread_cond_t completion_executor_cond;
+static int completion_executor_init_status;
 static struct list completion_ready_surfaces = LIST_INIT(completion_ready_surfaces);
 static unsigned int completion_busy_workers;
 
@@ -82,6 +84,52 @@ struct client_surface_completion_worker
     } state;
 };
 static struct client_surface_completion_worker completion_workers[CLIENT_SURFACE_COMPLETION_MAX_WORKERS];
+
+/* Native timed waits and the caller's remaining budget must both ignore wall
+ * clock changes. Darwin provides a relative wait instead of a clock attribute. */
+int client_surface_cond_init( pthread_cond_t *cond )
+{
+#ifdef __APPLE__
+    return pthread_cond_init( cond, NULL );
+#else
+    pthread_condattr_t attr;
+    int ret;
+
+    if ((ret = pthread_condattr_init( &attr ))) return ret;
+    if (!(ret = pthread_condattr_setclock( &attr, CLOCK_MONOTONIC )))
+        ret = pthread_cond_init( cond, &attr );
+    pthread_condattr_destroy( &attr );
+    return ret;
+#endif
+}
+
+int client_surface_cond_timedwait( pthread_cond_t *cond, pthread_mutex_t *mutex, DWORD timeout )
+{
+    struct timespec time;
+
+#ifdef __APPLE__
+    time.tv_sec = timeout / 1000;
+    time.tv_nsec = (timeout % 1000) * 1000000;
+    return pthread_cond_timedwait_relative_np( cond, mutex, &time );
+#else
+    clock_gettime( CLOCK_MONOTONIC, &time );
+    time.tv_sec += timeout / 1000;
+    time.tv_nsec += (timeout % 1000) * 1000000;
+    time.tv_sec += time.tv_nsec / 1000000000;
+    time.tv_nsec %= 1000000000;
+    return pthread_cond_timedwait( cond, mutex, &time );
+#endif
+}
+
+static void init_completion_executor(void)
+{
+    completion_executor_init_status = client_surface_cond_init( &completion_executor_cond );
+}
+
+BOOL client_surface_completion_init(void)
+{
+    return !pthread_once( &completion_executor_once, init_completion_executor ) && !completion_executor_init_status;
+}
 
 static BOOL client_surface_reserve_completion_slot(void)
 {
@@ -167,13 +215,7 @@ static void queue_ready_surface_locked( struct client_surface *surface )
 
 static void wait_completion_executor_locked( DWORD timeout )
 {
-    struct timespec abstime;
-
-    clock_gettime( CLOCK_REALTIME, &abstime );
-    abstime.tv_nsec += timeout * 1000000;
-    abstime.tv_sec += abstime.tv_nsec / 1000000000;
-    abstime.tv_nsec %= 1000000000;
-    pthread_cond_timedwait( &completion_executor_cond, &completion_executor_lock, &abstime );
+    client_surface_cond_timedwait( &completion_executor_cond, &completion_executor_lock, timeout );
 }
 
 static unsigned int active_completion_workers_locked(void)
