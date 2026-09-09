@@ -2272,6 +2272,22 @@ static BOOL window_set_pending_activate( HWND hwnd, BOOL *withdrawn )
     return pending;
 }
 
+static void window_cancel_pending_activate( HWND hwnd )
+{
+    struct x11drv_win_data *data;
+
+    if (!(data = get_win_data( hwnd ))) return;
+    if (data->wm_state_serial && data->pending_state.wm_state == NormalState)
+    {
+        /* The WM may still be preparing this window's frame when another
+         * window becomes foreground. Do not activate the old window on map. */
+        data->desired_state.activate = data->pending_state.activate = FALSE;
+        window_set_user_time( data, 0, TRUE );
+        XFlush( data->display );
+    }
+    release_win_data( data );
+}
+
 void set_net_active_window( HWND hwnd, HWND previous )
 {
     struct x11drv_thread_data *data = x11drv_thread_data();
@@ -2280,6 +2296,7 @@ void set_net_active_window( HWND hwnd, HWND previous )
     XEvent xev;
 
     if (!is_net_supported( x11drv_atom(_NET_ACTIVE_WINDOW) )) return;
+    if (previous != hwnd) window_cancel_pending_activate( previous );
     if (!(window = X11DRV_get_whole_window( hwnd ))) return;
     /* Another thread may have requested a different window since our last
      * activation. An outstanding request may also have been superseded

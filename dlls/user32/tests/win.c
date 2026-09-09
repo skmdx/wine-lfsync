@@ -4104,6 +4104,59 @@ static void test_SetActiveWindow(HWND hwnd)
     DestroyWindow(hwnd2);
 }
 
+static void test_show_window_activation(void)
+{
+    static const DWORD styles[] = { WS_OVERLAPPEDWINDOW, WS_POPUP };
+    HWND previous = GetForegroundWindow(), first, second, expected, ret;
+    unsigned int i, reselect;
+
+    for (i = 0; i < ARRAY_SIZE(styles); ++i)
+    for (reselect = 0; reselect < 2; ++reselect)
+    {
+        winetest_push_context("style %#lx, reselect %u", styles[i], reselect);
+        first = CreateWindowA("static", "First window", styles[i], 100, 100, 200, 200, 0, 0, 0, 0);
+        second = CreateWindowA("static", "Second window", styles[1 - i], 120, 120, 200, 200, 0, 0, 0, 0);
+        ok(!!first && !!second, "Failed to create windows, error %lu\n", GetLastError());
+        if (!first || !second) goto cleanup;
+
+        /* The native window manager may still be mapping the first window
+         * when the application activates the second one. */
+        ShowWindow(first, SW_SHOW);
+        ShowWindow(second, SW_SHOW);
+        ret = GetActiveWindow();
+        ok(ret == second, "Expected active window %p, got %p\n", second, ret);
+        expected = second;
+        if (reselect)
+        {
+            ret = SetActiveWindow(first);
+            ok(ret == second, "Expected previous active window %p, got %p\n", second, ret);
+            expected = first;
+        }
+        flush_events(TRUE);
+        ret = GetActiveWindow();
+        ok(ret == expected, "Expected active window %p after mapping, got %p\n", expected, ret);
+        ret = GetForegroundWindow();
+        ok(ret == expected, "Expected foreground window %p after mapping, got %p\n", expected, ret);
+
+        /* Cancelling initial activation must not prevent a later explicit
+         * activation of either window. */
+        expected = reselect ? second : first;
+        SetActiveWindow(expected);
+        flush_events(TRUE);
+        ret = GetActiveWindow();
+        ok(ret == expected, "Expected reactivated window %p, got %p\n", expected, ret);
+        ret = GetForegroundWindow();
+        ok(ret == expected, "Expected reactivated foreground window %p, got %p\n", expected, ret);
+
+    cleanup:
+        if (second) DestroyWindow(second);
+        if (first) DestroyWindow(first);
+        flush_events(TRUE);
+        winetest_pop_context();
+    }
+    if (previous) SetForegroundWindow(previous);
+}
+
 struct create_window_thread_params
 {
     HWND window;
@@ -14680,6 +14733,12 @@ START_TEST(win)
         return;
     }
 
+    if (argc == 3 && !strcmp( argv[2], "show_activation" ))
+    {
+        test_show_window_activation();
+        return;
+    }
+
     if (argc == 4 && !strcmp( argv[2], "SetActiveWindow_0" ))
     {
         test_SetActiveWindow_0_proc( argv );
@@ -14767,6 +14826,7 @@ START_TEST(win)
     test_SetFocus(hwndMain);
     test_SetActiveWindow_0( argv );
     test_SetActiveWindow(hwndMain);
+    test_show_window_activation();
     test_NCRedraw();
 
     test_child_window_order();
