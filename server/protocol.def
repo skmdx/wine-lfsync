@@ -4589,6 +4589,7 @@ enum inproc_sync_type
     user_handle_t handle;
     unsigned __int64 scene_id;
     unsigned __int64 surface;
+    unsigned __int64 previous_scene; /* checked retained attachment, or zero for a strategy change */
 @REPLY
     unsigned __int64 scene_id;
 @END

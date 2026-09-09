@@ -6584,6 +6584,7 @@ struct prepare_client_surface_direct_plan_request
     user_handle_t handle;
     unsigned __int64 scene_id;
     unsigned __int64 surface;
+    unsigned __int64 previous_scene;
 };
 struct prepare_client_surface_direct_plan_reply
 {
@@ -7670,6 +7671,6 @@ union generic_reply
     struct set_window_present_rect_reply set_window_present_rect_reply;
 };
 
-#define SERVER_PROTOCOL_VERSION 1018
+#define SERVER_PROTOCOL_VERSION 1019
 
 #endif /* __WINE_WINE_SERVER_PROTOCOL_H */

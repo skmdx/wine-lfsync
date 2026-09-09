@@ -376,7 +376,8 @@ static void complete_single_surface_generation( HWND hwnd, UINT64 surface,
     }
 }
 
-static UINT prepare_direct_plan( HWND hwnd, UINT64 surface, UINT64 scene, UINT64 *next_scene )
+static UINT prepare_direct_scene( HWND hwnd, UINT64 surface, UINT64 scene,
+                                  UINT64 previous_scene, UINT64 *next_scene )
 {
     struct __server_request_info info = {0};
     UINT status;
@@ -386,9 +387,15 @@ static UINT prepare_direct_plan( HWND hwnd, UINT64 surface, UINT64 scene, UINT64
     info.u.req.prepare_client_surface_direct_plan_request.handle = wine_server_user_handle( hwnd );
     info.u.req.prepare_client_surface_direct_plan_request.surface = surface;
     info.u.req.prepare_client_surface_direct_plan_request.scene_id = scene;
+    info.u.req.prepare_client_surface_direct_plan_request.previous_scene = previous_scene;
     status = p_wine_server_call( &info );
     if (!status) *next_scene = info.u.reply.prepare_client_surface_direct_plan_reply.scene_id;
     return status;
+}
+
+static UINT prepare_direct_plan( HWND hwnd, UINT64 surface, UINT64 scene, UINT64 *next_scene )
+{
+    return prepare_direct_scene( hwnd, surface, scene, 0, next_scene );
 }
 
 static UINT direct_plan_request( HWND hwnd, UINT64 surface, UINT64 scene, BOOL complete, BOOL *accepted )
@@ -776,6 +783,87 @@ done:
     if (!hwnd) release_surface( surface );
 }
 
+static void test_direct_renewal_scene(void)
+{
+    const UINT flags = CLIENT_SURFACE_STATE_REGISTER | CLIENT_SURFACE_STATE_SCENE_PUBLICATION |
+                       CLIENT_SURFACE_STATE_DIRECT_PRESENTATION;
+    UINT64 surface = allocate_surface(), unused = allocate_surface(), previous, preparing, fresh;
+    struct surface_state state;
+    struct native_barrier_state barrier;
+    HWND hwnd = create_test_window( TRUE );
+    BOOL accepted;
+    UINT status;
+
+    ok( !!hwnd, "failed to create DIRECT renewal window\n" );
+    if (!hwnd) goto done;
+    pump_messages( 100 );
+    status = set_surface_state( hwnd, surface, flags, 0, &state );
+    ok( !status, "renewal register status %#x\n", status );
+    status = claim_surface_state( hwnd, surface, &state );
+    ok( !status, "renewal claim status %#x\n", status );
+    complete_direct_surface_generation( hwnd, surface, &state );
+    previous = state.scene_generation;
+    status = prepare_direct_scene( hwnd, surface, previous, previous, &fresh );
+    ok( !status && !fresh, "steady DIRECT renewal status %#x scene %s\n", status, wine_dbgstr_longlong( fresh ) );
+
+    /* Exercise the real server transition without pumping its native owner
+     * preparation. Backend tests separately prove the new attachment check. */
+    status = set_scene_placement( hwnd, 3, 0, 0, 0 );
+    ok( !status, "renewal placement status %#x\n", status );
+    status = set_surface_state( hwnd, 0, CLIENT_SURFACE_STATE_PREPARE_BEGIN, 0, &state );
+    ok( !status && state.publish && !state.generation, "renewal did not require native preparation\n" );
+    preparing = state.scene_generation;
+    status = prepare_direct_plan( hwnd, surface, preparing, &fresh );
+    ok( !status && !fresh, "old ACK alone authorized changed native geometry\n" );
+    status = prepare_direct_scene( hwnd, unused, preparing, previous, &fresh );
+    ok( !status && !fresh, "wrong surface renewed DIRECT\n" );
+    status = prepare_direct_scene( hwnd, surface, preparing, previous | 1, &fresh );
+    ok( !status && !fresh, "odd previous scene renewed DIRECT\n" );
+    status = prepare_direct_scene( hwnd, surface, preparing, preparing, &fresh );
+    ok( !status && !fresh, "unacknowledged previous scene renewed DIRECT\n" );
+    status = prepare_direct_scene( hwnd, surface, previous, previous, &fresh );
+    ok( !status && !fresh, "stale current scene renewed DIRECT\n" );
+    status = prepare_direct_scene( hwnd, surface, preparing | 1, previous, &fresh );
+    ok( !status && !fresh, "odd current scene renewed DIRECT\n" );
+    status = set_native_barrier( hwnd, 0x7641, TRUE, &barrier );
+    ok( !status, "renewal barrier begin status %#x\n", status );
+    status = prepare_direct_scene( hwnd, surface, barrier.scene_generation, previous, &fresh );
+    ok( !status && !fresh, "native barrier renewed DIRECT\n" );
+    status = set_native_barrier( hwnd, 0x7641, FALSE, &barrier );
+    ok( !status, "renewal barrier end status %#x\n", status );
+    set_surface_state( hwnd, 0, CLIENT_SURFACE_STATE_PREPARE_BEGIN, 0, &state );
+    preparing = state.scene_generation;
+    status = prepare_direct_scene( hwnd, surface, preparing, previous, &fresh );
+    ok( !status && fresh && fresh != preparing && !(fresh & 1),
+        "renewal status %#x scene %s\n", status, wine_dbgstr_longlong( fresh ) );
+    set_surface_state( hwnd, 0, 0, 0, &state );
+    ok( state.mode == CLIENT_SURFACE_PRESENTATION_DIRECT && state.generation == fresh &&
+        state.scene_generation == fresh && state.pending == 1 && !state.ready,
+        "renewal acknowledged an image before native completion\n" );
+    status = direct_plan_request( hwnd, surface, previous, TRUE, &accepted );
+    ok( !status && !accepted, "old native completion completed renewed DIRECT\n" );
+    status = direct_plan_ack( hwnd, fresh, TRUE, &accepted );
+    ok( !status && !accepted, "new ACK bypassed native completion\n" );
+    status = direct_plan_request( hwnd, surface, fresh, TRUE, &accepted );
+    ok( !status && accepted, "renewed native completion status %#x accepted %u\n", status, accepted );
+    status = direct_plan_ack( hwnd, fresh, TRUE, &accepted );
+    ok( !status && accepted, "renewed native ACK status %#x accepted %u\n", status, accepted );
+    set_surface_state( hwnd, 0, 0, 0, &state );
+    ok( !state.generation && state.mode == CLIENT_SURFACE_PRESENTATION_DIRECT,
+        "renewed DIRECT did not finish\n" );
+    status = set_scene_placement( hwnd, 4, 0, 0, 0 );
+    ok( !status, "second renewal placement status %#x\n", status );
+    set_surface_state( hwnd, 0, CLIENT_SURFACE_STATE_PREPARE_BEGIN, 0, &state );
+    status = prepare_direct_scene( hwnd, surface, state.scene_generation, previous, &fresh );
+    ok( !status && !fresh, "superseded ACK renewed DIRECT again\n" );
+    set_surface_state( hwnd, surface, CLIENT_SURFACE_STATE_UNREGISTER, 0, NULL );
+    DestroyWindow( hwnd );
+    pump_messages( 100 );
+done:
+    release_surface( unused );
+    if (!hwnd) release_surface( surface );
+}
+
 static void test_presentation_modes(void)
 {
     const UINT64 surface = allocate_surface(), child_surface = allocate_surface();
@@ -904,6 +992,7 @@ static void test_presentation_modes(void)
     DestroyWindow( hwnd );
     pump_messages( 200 );
     test_direct_strategy_scene();
+    test_direct_renewal_scene();
 }
 
 static void test_generation_membership(void)

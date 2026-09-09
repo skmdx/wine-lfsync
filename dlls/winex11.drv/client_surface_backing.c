@@ -270,6 +270,7 @@ enum client_surface_compositor_op
     CLIENT_SURFACE_COMPOSITOR_DIRECT_PLAN,
     CLIENT_SURFACE_COMPOSITOR_DIRECT_COMPLETE,
     CLIENT_SURFACE_COMPOSITOR_RETIRE_POOL,
+    CLIENT_SURFACE_COMPOSITOR_RENEW_DIRECT,
 };
 
 struct client_surface_compositor_job
@@ -1875,6 +1876,7 @@ static BOOL install_client_surface_direct_plan( const struct client_surface_comp
             req->handle = wine_server_user_handle( job->handoff_toplevel );
             req->scene_id = scene_id;
             req->surface = job->identity;
+            req->previous_scene = 0;
             if (!wine_server_call( req )) next_scene = reply->scene_id;
         }
         SERVER_END_REQ;
@@ -1932,6 +1934,65 @@ static BOOL install_client_surface_direct_plan( const struct client_surface_comp
 done:
     if (allocated && !accepted) free( target );
     return accepted;
+}
+
+static BOOL renew_client_surface_direct_plan( const struct client_surface_compositor_job *job )
+{
+    struct client_surface_compositor_target *target = find_client_surface_compositor_target( job->handoff_toplevel );
+    struct client_surface_scene current;
+    XWindowAttributes window, drawable;
+    Window root, parent, *children = NULL;
+    unsigned int count, i;
+    UINT64 scene_id = 0;
+    BOOL native;
+    int error = 0;
+
+    /* Only a previously admitted attachment with its output pool already
+     * retired can renew without preserving a composition checkpoint. */
+    if (!target || !target->scene.valid || target->scene.strategy != DIRECT_ATTACH ||
+        !target->scene.direct_drawable || target->window != job->destination ||
+        target->copy_frame || target->native_updates || target->deferred_update) return FALSE;
+    for (i = 0; i < ARRAY_SIZE(target->frames); ++i)
+        if (target->frames[i].pixmap) return FALSE;
+    client_surface_get_toplevel_scene( job->handoff_toplevel, &current );
+    if (current.valid || !current.direct_candidate || current.generation ||
+        current.epoch != job->scene_epoch || (current.epoch & 1)) return FALSE;
+
+    /* The GUI has completed its native changes. Check the retained child
+     * itself, including its parent and exact client extent, rather than
+     * treating the old scene's geometry or a DIRECT candidate as that proof. */
+    X11DRV_expect_error( client_surface_compositor_display, client_surface_compositor_error, &error );
+    native = XGetWindowAttributes( client_surface_compositor_display, job->destination, &window ) &&
+             XGetWindowAttributes( client_surface_compositor_display, target->scene.direct_drawable, &drawable ) &&
+             XQueryTree( client_surface_compositor_display, target->scene.direct_drawable,
+                         &root, &parent, &children, &count );
+    if (children) XFree( children );
+    X11DRV_check_error();
+    if (!native || error || window.map_state != IsViewable || drawable.map_state != IsViewable ||
+        parent != job->destination || drawable.border_width ||
+        window.width != job->window_width || window.height != job->window_height ||
+        drawable.x != job->source_x || drawable.y != job->source_y ||
+        drawable.width != job->width || drawable.height != job->height) return FALSE;
+
+    SERVER_START_REQ( prepare_client_surface_direct_plan )
+    {
+        req->handle = wine_server_user_handle( job->handoff_toplevel );
+        req->scene_id = job->scene_epoch;
+        req->surface = target->scene.direct_identity;
+        req->previous_scene = target->scene.epoch;
+        if (!wine_server_call( req )) scene_id = reply->scene_id;
+    }
+    SERVER_END_REQ;
+    if (!scene_id) return FALSE;
+    target->scene.epoch = scene_id;
+    target->window_width = window.width;
+    target->window_height = window.height;
+    SetRectEmpty( &target->restore_rect );
+    TRACE( "owner DIRECT_ATTACH hwnd %p scene %s identity %s drawable %#lx renewed=1 size=%ux%u\n",
+           target->toplevel, wine_dbgstr_longlong( scene_id ),
+           wine_dbgstr_longlong( target->scene.direct_identity ), target->scene.direct_drawable,
+           target->window_width, target->window_height );
+    return TRUE;
 }
 
 static BOOL complete_client_surface_direct_plan( const struct client_surface_compositor_job *job )
@@ -3458,6 +3519,8 @@ static BOOL execute_client_surface_compositor_job( struct client_surface_composi
         return retire_client_surface_compositor_pool( job->handoff_toplevel );
     if (job->op == CLIENT_SURFACE_COMPOSITOR_DIRECT_PLAN)
         return install_client_surface_direct_plan( job );
+    if (job->op == CLIENT_SURFACE_COMPOSITOR_RENEW_DIRECT)
+        return renew_client_surface_direct_plan( job );
     if (job->op == CLIENT_SURFACE_COMPOSITOR_DIRECT_COMPLETE)
         return complete_client_surface_direct_plan( job );
     if (job->op == CLIENT_SURFACE_COMPOSITOR_RESTORE_TARGET)
@@ -4469,8 +4532,35 @@ BOOL X11DRV_client_surface_backing_retire( struct x11drv_win_data *data )
 
 BOOL X11DRV_client_surface_prepare_owner( struct x11drv_win_data *data )
 {
-    /* PREPARING has no final strategy yet. Keep GDI/background pixels for
-     * OWNER_COMPOSITE until the producer admits a final DIRECT plan. */
+    struct client_surface_scene scene;
+
+    /* A sole retained native child can continue DIRECT after the owner and
+     * producer applied the new geometry. Any Win32 child requires the normal
+     * clipping/checkpoint path, even before its producer is registered. */
+    client_surface_get_toplevel_scene( data->hwnd, &scene );
+    if (!data->client_surface_backing && !data->client_surface_backing_spare &&
+        !scene.valid && scene.direct_candidate && scene.epoch && !(scene.epoch & 1) &&
+        !NtUserGetWindowRelative( data->hwnd, GW_CHILD ))
+    {
+        struct client_surface_compositor_job job =
+        {
+            .op = CLIENT_SURFACE_COMPOSITOR_RENEW_DIRECT,
+            .handoff_toplevel = data->hwnd,
+            .scene_epoch = scene.epoch,
+            .destination = data->whole_window,
+            .source_x = data->rects.client.left - data->rects.visible.left,
+            .source_y = data->rects.client.top - data->rects.visible.top,
+            .width = data->rects.client.right - data->rects.client.left,
+            .height = data->rects.client.bottom - data->rects.client.top,
+            .window_width = data->rects.visible.right - data->rects.visible.left,
+            .window_height = data->rects.visible.bottom - data->rects.visible.top,
+        };
+
+        XSync( data->display, False );
+        if (submit_client_surface_compositor_job( &job )) return TRUE;
+    }
+    /* Without an authenticated retained attachment, preserve GDI/background
+     * pixels before the next producer can choose or fall back to composition. */
     return X11DRV_client_surface_backing_snapshot( data, TRUE );
 }
 

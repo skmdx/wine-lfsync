@@ -3719,6 +3719,7 @@ static void dump_prepare_client_surface_direct_plan_request( const struct prepar
     fprintf( stderr, " handle=%08x", req->handle );
     dump_uint64( ", scene_id=", &req->scene_id );
     dump_uint64( ", surface=", &req->surface );
+    dump_uint64( ", previous_scene=", &req->previous_scene );
 }
 
 static void dump_prepare_client_surface_direct_plan_reply( const struct prepare_client_surface_direct_plan_reply *req )

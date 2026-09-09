@@ -5503,9 +5503,9 @@ failed:
     free( data );
 }
 
-/* Reuse acknowledged geometry for a strategy-only transition. This is not a
- * geometry-ready notification: a new final scene is returned synchronously
- * to the owner planner while the real producer retains its native target. */
+/* Prepare a final scene for the owner's native attachment. A strategy-only
+ * change reuses acknowledged geometry. Renewing a previous DIRECT attachment
+ * instead requires the owner to check its current native geometry first. */
 DECL_HANDLER(prepare_client_surface_direct_plan)
 {
     struct client_surface_owner *owner;
@@ -5520,8 +5520,6 @@ DECL_HANDLER(prepare_client_surface_direct_plan)
         return;
     }
     if (!req->scene_id || (req->scene_id & 1) || req->scene_id != top->client_surface_scene_generation ||
-        req->scene_id != top->client_surface_ack_scene ||
-        top->client_surface_transaction.phase != CLIENT_SURFACE_PHASE_IDLE ||
         top->client_surface_transaction.staged || top->client_surface_transaction.restarting ||
         top->client_surface_transaction.restart_pending || top->client_surface_native_barrier ||
         top->client_surface_scene_change_depth || client_surface_direct_eligible( top ) ||
@@ -5530,10 +5528,22 @@ DECL_HANDLER(prepare_client_surface_direct_plan)
         owner->process != current->process || !surface->scene_publication || surface->generation)
         return;
 
-    /* The exact ACK already includes the owner's native/GDI preparation.
-     * Consume that proof only for this unchanged geometry. The restart must
-     * allocate a new scene; neither a late ACK nor a PREPARING snapshot may
-     * authorize its DIRECT plan. Real mutations still take ordinary PREPARING. */
+    if (req->previous_scene)
+    {
+        if (!client_surface_is_preparing( top ) || req->previous_scene == req->scene_id ||
+            req->previous_scene != top->client_surface_ack_scene ||
+            req->previous_scene != top->client_surface_direct_scene ||
+            req->surface != top->client_surface_direct_surface)
+            return;
+    }
+    else if (top->client_surface_transaction.phase != CLIENT_SURFACE_PHASE_IDLE ||
+             req->scene_id != top->client_surface_ack_scene)
+        return;
+
+    /* A retained native attachment needs no owner copy of GDI/background
+     * pixels. Select it atomically with the new final scene; a failed renewal
+     * must never leave an unprepared scene available to ordinary composition.
+     * This authorizes a strategy only, not a completed new-size image. */
     top->client_surface_transaction.prepared = 1;
     restart_client_surface_generation_internal( top );
     top->client_surface_transaction.prepared = 0;
@@ -5543,7 +5553,19 @@ DECL_HANDLER(prepare_client_surface_direct_plan)
         top->client_surface_transaction.pending == 1 && client_surface_direct_candidate( top ) &&
         (surface = select_client_surface_producer( top, &owner )) && surface->id == req->surface &&
         surface->generation == top->client_surface_scene_generation)
+    {
+        if (req->previous_scene)
+        {
+            top->client_surface_direct_scene = top->client_surface_scene_generation;
+            top->client_surface_direct_surface = req->surface;
+            top->client_surface_transaction.source_pending = 0;
+            top->client_surface_transaction.owner_repair = 0;
+            update_client_surface_publication( top );
+        }
         reply->scene_id = top->client_surface_scene_generation;
+    }
+    else if (req->previous_scene)
+        restart_client_surface_generation( top );
 }
 
 /* The candidate flag is only input to the owner's planner. Native attachment
