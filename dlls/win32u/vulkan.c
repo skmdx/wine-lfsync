@@ -161,7 +161,9 @@ struct device
     pthread_mutex_t retirement_lock;
     pthread_cond_t retirement_cond;
     struct list retired_swapchains;
-    BOOL retirement_worker;
+    HANDLE retirement_worker;
+    BOOL retirement_starting;
+    BOOL retirement_shutdown;
     BOOL swapchain_maintenance1;
     struct vulkan_device obj;
 };
@@ -170,6 +172,9 @@ static struct device *impl_from_vulkan_device( struct vulkan_device *device )
 {
     return CONTAINING_RECORD( device, struct device, obj );
 }
+
+#define MAX_SWAPCHAIN_RETIREMENT_WORKERS 64
+static LONG swapchain_retirement_workers;
 
 struct vulkan_snapshot_fence
 {
@@ -1134,6 +1139,7 @@ static void win32u_vkDestroyDevice( VkDevice client_device, const VkAllocationCa
     struct vulkan_device *device = vulkan_device_from_handle( client_device );
     struct vulkan_instance *instance;
     struct device *impl;
+    HANDLE worker;
     unsigned int i;
 
     if (!device) return;
@@ -1144,10 +1150,19 @@ static void win32u_vkDestroyDevice( VkDevice client_device, const VkAllocationCa
      * teardown is the final drain; individual window/swapchain destruction
      * does not wait for another surface's GPU work. */
     pthread_mutex_lock( &impl->retirement_lock );
-    while (impl->retirement_worker)
-        pthread_cond_wait( &impl->retirement_cond, &impl->retirement_lock );
-    assert( list_empty( &impl->retired_swapchains ) );
+    assert( !impl->retirement_starting );
+    impl->retirement_shutdown = TRUE;
+    worker = impl->retirement_worker;
+    pthread_cond_broadcast( &impl->retirement_cond );
     pthread_mutex_unlock( &impl->retirement_lock );
+    if (worker)
+    {
+        NtWaitForSingleObject( worker, FALSE, NULL );
+        NtClose( worker );
+        /* The slot belongs to this device until actual native thread exit. */
+        InterlockedDecrement( &swapchain_retirement_workers );
+    }
+    assert( list_empty( &impl->retired_swapchains ) );
 
     device->p_vkDestroyDevice( device->host.device, NULL /* pAllocator */ );
     for (i = 0; i < device->queue_count; i++)
@@ -2854,17 +2869,20 @@ static BOOL destroy_swapchain( struct vulkan_device *device, struct swapchain *s
     return TRUE;
 }
 
-#define MAX_SWAPCHAIN_RETIREMENT_WORKERS 64
-static LONG swapchain_retirement_workers;
-
-static void retire_swapchains( struct device *device, BOOL worker )
+static void swapchain_retirement_thread( void *context )
 {
+    struct device *device = context;
     struct swapchain *swapchain, *next;
     struct list pending = LIST_INIT(pending), retry = LIST_INIT(retry);
 
     pthread_mutex_lock( &device->retirement_lock );
-    while (!list_empty( &device->retired_swapchains ))
+    while (!device->retirement_shutdown || !list_empty( &device->retired_swapchains ))
     {
+        if (list_empty( &device->retired_swapchains ))
+        {
+            pthread_cond_wait( &device->retirement_cond, &device->retirement_lock );
+            continue;
+        }
         list_move_tail( &pending, &device->retired_swapchains );
         pthread_mutex_unlock( &device->retirement_lock );
         /* No state mutex spans a host call. One stalled copy cannot hold
@@ -2877,18 +2895,52 @@ static void retire_swapchains( struct device *device, BOOL worker )
         }
         pthread_mutex_lock( &device->retirement_lock );
         list_move_tail( &device->retired_swapchains, &retry );
-        if (list_empty( &device->retired_swapchains )) break;
-        client_surface_cond_timedwait( &device->retirement_cond, &device->retirement_lock, 10 );
+        if (!list_empty( &device->retired_swapchains ))
+            client_surface_cond_timedwait( &device->retirement_cond, &device->retirement_lock, 10 );
     }
-    device->retirement_worker = FALSE;
-    pthread_cond_broadcast( &device->retirement_cond );
     pthread_mutex_unlock( &device->retirement_lock );
-    if (worker) InterlockedDecrement( &swapchain_retirement_workers );
 }
 
-static void swapchain_retirement_thread( void *context )
+/* Acquire the device's retirement owner before accepting any asynchronous
+ * presentation. It remains available through the device's last destruction,
+ * including periods with no retired chains. No future destroy or completion
+ * callback then needs to allocate a job, start a thread or poll on its caller. */
+static BOOL start_swapchain_retirement_thread( struct device *device )
 {
-    retire_swapchains( context, TRUE );
+    NTSTATUS status = STATUS_NO_MEMORY;
+    HANDLE thread = NULL;
+    LONG count;
+
+    pthread_mutex_lock( &device->retirement_lock );
+    while (device->retirement_starting)
+        pthread_cond_wait( &device->retirement_cond, &device->retirement_lock );
+    assert( !device->retirement_shutdown );
+    if (device->retirement_worker)
+    {
+        pthread_mutex_unlock( &device->retirement_lock );
+        return TRUE;
+    }
+    device->retirement_starting = TRUE;
+    pthread_mutex_unlock( &device->retirement_lock );
+
+    count = ReadAcquire( &swapchain_retirement_workers );
+    while (count < MAX_SWAPCHAIN_RETIREMENT_WORKERS)
+    {
+        LONG previous = InterlockedCompareExchange( &swapchain_retirement_workers, count + 1, count );
+
+        if (previous != count) { count = previous; continue; }
+        status = PsCreateSystemThread( &thread, THREAD_ALL_ACCESS, NULL, 0, NULL,
+                                       swapchain_retirement_thread, device );
+        if (status) InterlockedDecrement( &swapchain_retirement_workers );
+        break;
+    }
+    pthread_mutex_lock( &device->retirement_lock );
+    device->retirement_worker = status ? NULL : thread;
+    device->retirement_starting = FALSE;
+    pthread_cond_broadcast( &device->retirement_cond );
+    pthread_mutex_unlock( &device->retirement_lock );
+    if (status) WARN( "Failed to admit swapchain retirement worker, status %#lx\n", (unsigned long)status );
+    return !status;
 }
 
 static void win32u_vkDestroySwapchainKHR( VkDevice client_device, VkSwapchainKHR client_swapchain,
@@ -2898,9 +2950,6 @@ static void win32u_vkDestroySwapchainKHR( VkDevice client_device, VkSwapchainKHR
     struct vulkan_instance *instance = device->physical_device->instance;
     struct device *impl = impl_from_vulkan_device( device );
     struct swapchain *swapchain = swapchain_from_handle( client_swapchain );
-    LONG count;
-    HANDLE thread;
-    NTSTATUS status;
 
     if (allocator) FIXME( "Support for allocation callbacks not implemented yet\n" );
     if (!swapchain) return;
@@ -2909,39 +2958,20 @@ static void win32u_vkDestroySwapchainKHR( VkDevice client_device, VkSwapchainKHR
     swapchain->retired = TRUE;
     pthread_mutex_unlock( &swapchain->present_lock );
     instance->p_remove_object( instance, &swapchain->obj.obj );
-    if (destroy_swapchain( device, swapchain )) return;
-    TRACE( "quarantining swapchain %p with pending private copies\n", swapchain );
     pthread_mutex_lock( &impl->retirement_lock );
-    list_add_tail( &impl->retired_swapchains, &swapchain->retirement_entry );
     if (impl->retirement_worker)
     {
+        /* Intrusive queue storage is part of the original swapchain. Native
+         * destruction also belongs to this owner, outside the caller's path. */
+        list_add_tail( &impl->retired_swapchains, &swapchain->retirement_entry );
         pthread_cond_signal( &impl->retirement_cond );
         pthread_mutex_unlock( &impl->retirement_lock );
         return;
     }
-    impl->retirement_worker = TRUE;
     pthread_mutex_unlock( &impl->retirement_lock );
-
-    count = ReadAcquire( &swapchain_retirement_workers );
-    while (count < MAX_SWAPCHAIN_RETIREMENT_WORKERS)
-    {
-        LONG previous = InterlockedCompareExchange( &swapchain_retirement_workers, count + 1, count );
-
-        if (previous != count) { count = previous; continue; }
-        status = PsCreateSystemThread( &thread, THREAD_ALL_ACCESS, NULL, 0, NULL,
-                                       swapchain_retirement_thread, impl );
-        if (!status)
-        {
-            NtClose( thread );
-            return;
-        }
-        InterlockedDecrement( &swapchain_retirement_workers );
-        WARN( "Failed to create swapchain retirement worker, status %#lx\n", (unsigned long)status );
-        break;
-    }
-    /* Thread exhaustion provides backpressure instead of freeing live GPU
-     * resources or allocating an unbounded number of waiting threads. */
-    retire_swapchains( impl, FALSE );
+    /* A device which never admitted asynchronous presentation has no private
+     * copy or completion references. Its native-only destruction stays direct. */
+    if (!destroy_swapchain( device, swapchain )) assert( 0 );
 }
 
 static VkResult win32u_vkAcquireNextImage2KHR( VkDevice client_device, const VkAcquireNextImageInfoKHR *acquire_info,
@@ -3188,6 +3218,8 @@ reserve_completions:
         res = VK_ERROR_OUT_OF_HOST_MEMORY;
         if (!reservations[index].job &&
             !(reservations[index].job = client_surface_reserve_completion( swapchain->surface->client )))
+            goto reservation_failed;
+        if (!start_swapchain_retirement_thread( impl_from_vulkan_device( device ) ))
             goto reservation_failed;
         if (!swapchain_needs_snapshot( swapchain ) && use_internal_present_wait && present_ids[index] &&
             !reservations[index].completion &&
