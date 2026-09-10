@@ -401,7 +401,7 @@ static BOOL prepare_client_surface_handoff_locked( struct client_surface *surfac
     source->target_epoch = present->target_epoch;
     source->source = source->source_visual = 0;
     source->width = source->height = source->flags = 0;
-    if (!surface->backend->handoff_prepare( surface, source, present->handoff_index ))
+    if (!surface->backend->handoff_prepare( surface, source, present ))
     {
         UINT64 expected = token;
         __atomic_compare_exchange_n( &source->reservation, &expected, 0, 0,

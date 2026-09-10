@@ -221,6 +221,7 @@ struct gl_drawable
     struct opengl_drawable         base;
     GLXDrawable                    drawable;     /* drawable for rendering with GL */
     BOOL                           gpu_snapshot_failed;
+    BOOL                           memory_registered;
     LONG64                         egl_geometry_epoch; /* last native target observed by EGL */
     struct glx_completion_context *completion;
 };
@@ -572,6 +573,11 @@ static BOOL x11drv_egl_surface_create( struct client_surface *client, int format
     DWORD process = 0;
 
     if (!(gl = opengl_drawable_create( sizeof(*gl), &x11drv_egl_surface_funcs, format, client ))) return FALSE;
+    if (!(gl->memory_registered = x11drv_client_surface_acquire_gl_memory( surface )))
+    {
+        opengl_drawable_release( &gl->base );
+        return FALSE;
+    }
     /* A foreign-process target always uses the owner compositor. Retain its
      * application front/back buffers in the existing FBO wrapper and copy
      * completed images directly into independent GPU source storage. */
@@ -957,6 +963,7 @@ static void destroy_glx_completion_objects( struct glx_completion_context *compl
 static void x11drv_surface_destroy( struct opengl_drawable *base )
 {
     struct gl_drawable *gl = impl_from_opengl_drawable( base );
+    struct x11drv_client_surface *surface = impl_from_client_surface( base->client );
 
     TRACE( "drawable %s\n", debugstr_opengl_drawable( base ) );
 
@@ -964,7 +971,7 @@ static void x11drv_surface_destroy( struct opengl_drawable *base )
     {
         destroy_glx_completion_objects( gl->completion );
         pthread_mutex_destroy( &gl->completion->lock );
-        client_surface_free_metadata( gl->completion, sizeof(*gl->completion) );
+        client_surface_free_scoped_metadata( &surface->memory, gl->completion, sizeof(*gl->completion) );
     }
     if (gl->drawable)
     {
@@ -976,6 +983,7 @@ static void x11drv_surface_destroy( struct opengl_drawable *base )
         pglXDestroyWindow( gdi_display, gl->drawable );
         XUnlockDisplay( gdi_display );
     }
+    if (gl->memory_registered) x11drv_client_surface_release_gl_memory( surface );
 }
 
 static BOOL set_swap_interval( struct gl_drawable *gl, int interval )
@@ -1036,13 +1044,18 @@ static BOOL x11drv_surface_create( struct client_surface *client, int format, st
     struct gl_drawable *gl;
 
     if (!(gl = opengl_drawable_create( sizeof(*gl), &x11drv_surface_funcs, format, client ))) return FALSE;
+    if (!(gl->memory_registered = x11drv_client_surface_acquire_gl_memory( surface )))
+    {
+        opengl_drawable_release( &gl->base );
+        return FALSE;
+    }
     if (pglXGetSyncValuesOML && pglXSwapBuffersMscOML)
     {
-        struct glx_completion_context *completion = client_surface_alloc_metadata( 1, sizeof(*completion) );
+        struct glx_completion_context *completion = client_surface_alloc_scoped_metadata( &surface->memory, 1, sizeof(*completion) );
 
         if (completion && pthread_mutex_init( &completion->lock, NULL ))
         {
-            client_surface_free_metadata( completion, sizeof(*completion) );
+            client_surface_free_scoped_metadata( &surface->memory, completion, sizeof(*completion) );
             completion = NULL;
         }
         /* No private query domain means using the shared completion monitor,
@@ -1756,9 +1769,11 @@ static struct client_surface_completion_result wait_glx_present_completion( void
 static void release_glx_present_completion( void *context )
 {
     struct glx_present_completion *completion = context;
+    struct opengl_drawable *drawable = completion->drawable;
 
-    opengl_drawable_release( completion->drawable );
-    client_surface_free_metadata( completion, sizeof(*completion) );
+    client_surface_free_scoped_metadata( &impl_from_client_surface( drawable->client )->memory,
+                                          completion, sizeof(*completion) );
+    opengl_drawable_release( drawable );
 }
 
 static BOOL snapshot_client_surface( struct opengl_drawable *base, struct client_surface_frame *present,
@@ -1795,14 +1810,14 @@ static BOOL snapshot_client_surface( struct opengl_drawable *base, struct client
     bytes = (SIZE_T)size.cx * size.cy * 4;
     if (surface->snapshot_pixels_size != bytes)
     {
-        if (!client_surface_reserve_memory( CLIENT_SURFACE_MEMORY_STAGING, bytes )) return FALSE;
+        if (!client_surface_reserve_scoped_memory( &surface->memory, CLIENT_SURFACE_MEMORY_STAGING, bytes )) return FALSE;
         if (!(pixels = malloc( bytes )))
         {
-            client_surface_release_memory( CLIENT_SURFACE_MEMORY_STAGING, bytes );
+            client_surface_release_scoped_memory( &surface->memory, CLIENT_SURFACE_MEMORY_STAGING, bytes );
             return FALSE;
         }
         free( surface->snapshot_pixels );
-        client_surface_release_memory( CLIENT_SURFACE_MEMORY_STAGING, surface->snapshot_pixels_size );
+        client_surface_release_scoped_memory( &surface->memory, CLIENT_SURFACE_MEMORY_STAGING, surface->snapshot_pixels_size );
         surface->snapshot_pixels = pixels;
         surface->snapshot_pixels_size = bytes;
     }
@@ -1874,6 +1889,7 @@ static BOOL blit_client_surface_output( struct opengl_drawable *base,
 static BOOL x11drv_surface_swap_blit( struct opengl_drawable *base, struct opengl_drawable *source,
                                       opengl_drawable_blit_func blit )
 {
+    struct x11drv_client_surface *surface = impl_from_client_surface( base->client );
     struct glx_present_completion *completion = NULL;
     GLXContext ctx = NtCurrentTeb()->glReserved2;
     struct gl_drawable *gl = impl_from_opengl_drawable( base );
@@ -1890,7 +1906,7 @@ static BOOL x11drv_surface_swap_blit( struct opengl_drawable *base, struct openg
                                          usexcomposite )) return FALSE;
     client_surface_begin_present( base->client );
     if (usexcomposite && present.completion.kind == CLIENT_SURFACE_COMPLETION_EXACT &&
-        !(completion = client_surface_alloc_metadata( 1, sizeof(*completion) )))
+        !(completion = client_surface_alloc_scoped_metadata( &surface->memory, 1, sizeof(*completion) )))
     {
         client_surface_submit_present( base->client, &present );
         complete_opengl_present( base->client, &present, FALSE, FALSE, expected_size, 0 );
@@ -1900,7 +1916,7 @@ static BOOL x11drv_surface_swap_blit( struct opengl_drawable *base, struct openg
     if (blit && !blit_client_surface_output( base, &present, source, blit,
                    !usexcomposite && present.completion.kind == CLIENT_SURFACE_COMPLETION_EXACT ))
     {
-        client_surface_free_metadata( completion, sizeof(*completion) );
+        client_surface_free_scoped_metadata( &surface->memory, completion, sizeof(*completion) );
         client_surface_submit_present( base->client, &present );
         complete_opengl_present( base->client, &present, FALSE, FALSE, expected_size, 0 );
         return FALSE;
@@ -1946,7 +1962,7 @@ static BOOL x11drv_surface_swap_blit( struct opengl_drawable *base, struct openg
         client_surface_submit_present( base->client, &present );
     }
 
-    client_surface_free_metadata( completion, sizeof(*completion) );
+    client_surface_free_scoped_metadata( &surface->memory, completion, sizeof(*completion) );
     if (!complete_opengl_present( base->client, &present, submitted, completed, expected_size,
                                           CLIENT_SURFACE_PRESENT_TIMEOUT ))
         WARN( "client-surface composition did not complete for %s\n",
@@ -1961,6 +1977,7 @@ static BOOL x11drv_surface_swap( struct opengl_drawable *base )
 
 struct egl_snapshot_completion
 {
+    struct client_surface_memory_scope memory;
     LONG refs;
     EGLSyncKHR sync;
     /* Only the queued completion owns the drawable and mapping references.
@@ -1973,6 +1990,7 @@ struct egl_snapshot_completion
 
 struct egl_snapshot_image
 {
+    struct client_surface_memory_scope memory;
     EGLImageKHR image;
     struct egl_snapshot_completion *pending;
 };
@@ -1981,7 +1999,7 @@ static void release_snapshot_sync( struct egl_snapshot_completion *completion )
 {
     if (!completion || InterlockedDecrement( &completion->refs )) return;
     snapshot_destroy_sync( egl->display, completion->sync );
-    client_surface_free_metadata( completion, sizeof(*completion) );
+    client_surface_free_owned_metadata( &completion->memory, completion, sizeof(*completion) );
 }
 
 static struct client_surface_completion_result wait_snapshot_completion( void *context, DWORD timeout )
@@ -2030,7 +2048,7 @@ static void release_snapshot_image( void *context )
 
     snapshot_destroy_image( egl->display, image->image );
     release_snapshot_sync( image->pending );
-    client_surface_free_metadata( image, sizeof(*image) );
+    client_surface_free_owned_metadata( &image->memory, image, sizeof(*image) );
 }
 
 static const struct x11drv_client_snapshot_image_ops snapshot_image_ops =
@@ -2042,16 +2060,28 @@ static const struct x11drv_client_snapshot_image_ops snapshot_image_ops =
 static struct egl_snapshot_completion *prepare_snapshot_completion( struct egl_snapshot_image *image )
 {
     struct egl_snapshot_completion *completion = image->pending;
+    struct client_surface_memory_scope memory = {0};
 
     /* Storage preparation proved sole image ownership and GPU completion.
      * Once its callback has also released its reference, the image's existing
      * metadata can carry another write without competing for process budget.
      * Neither a pending fence nor another callback's references are reused. */
     if (!completion || InterlockedCompareExchange( &completion->refs, 0, 0 ) != 1)
-        return client_surface_alloc_metadata( 1, sizeof(*completion) );
+    {
+        client_surface_memory_scope_copy( &memory, &image->memory, TRUE );
+        if (!(completion = client_surface_alloc_scoped_metadata( &memory, 1, sizeof(*completion) )))
+        {
+            client_surface_memory_scope_destroy( &memory );
+            return NULL;
+        }
+        completion->memory = memory;
+        return completion;
+    }
     image->pending = NULL;
     snapshot_destroy_sync( egl->display, completion->sync );
+    memory = completion->memory;
     memset( completion, 0, sizeof(*completion) );
+    completion->memory = memory;
     return completion;
 }
 
@@ -2085,13 +2115,21 @@ static int snapshot_client_surface_gpu( struct opengl_drawable *base,
     pixmap = x11drv_client_snapshot_pixmap( snapshot );
     if (!(image = x11drv_client_snapshot_get_image( snapshot )))
     {
-        if (!(image = client_surface_alloc_metadata( 1, sizeof(*image) ))) return -1;
+        struct client_surface_memory_scope memory = {0};
+
+        client_surface_memory_scope_copy( &memory, x11drv_client_snapshot_memory( snapshot ), TRUE );
+        if (!(image = client_surface_alloc_scoped_metadata( &memory, 1, sizeof(*image) )))
+        {
+            client_surface_memory_scope_destroy( &memory );
+            return -1;
+        }
+        image->memory = memory;
         image->image = snapshot_create_image( egl->display, EGL_NO_CONTEXT, EGL_NATIVE_PIXMAP_KHR,
                                                (EGLClientBuffer)pixmap, attribs );
         if (!image->image)
         {
             TRACE( "EGL source pixmap import unavailable, error %#x\n", funcs->p_eglGetError() );
-            client_surface_free_metadata( image, sizeof(*image) );
+            client_surface_free_owned_metadata( &image->memory, image, sizeof(*image) );
             release_opengl_capture( present );
             return 0;
         }
@@ -2176,7 +2214,7 @@ static int snapshot_client_surface_gpu( struct opengl_drawable *base,
         present->capture.size = (SIZE){source->width, source->height};
     }
 done:
-    client_surface_free_metadata( completion, sizeof(*completion) );
+    if (completion) client_surface_free_owned_metadata( &completion->memory, completion, sizeof(*completion) );
     if (scissor) funcs->p_glEnable( GL_SCISSOR_TEST );
     if (srgb) funcs->p_glEnable( GL_FRAMEBUFFER_SRGB );
     funcs->p_glBindRenderbuffer( GL_RENDERBUFFER, renderbuffer );
@@ -2200,7 +2238,10 @@ done:
 
 static void x11drv_egl_surface_destroy( struct opengl_drawable *base )
 {
+    struct gl_drawable *gl = impl_from_opengl_drawable( base );
+
     TRACE( "drawable %s\n", debugstr_opengl_drawable( base ) );
+    if (gl->memory_registered) x11drv_client_surface_release_gl_memory( impl_from_client_surface( base->client ) );
 }
 
 static void x11drv_egl_surface_flush( struct opengl_drawable *base, UINT flags )
@@ -2267,9 +2308,11 @@ static struct client_surface_completion_result wait_egl_present_completion( void
 static void release_egl_present_completion( void *context )
 {
     struct egl_present_completion *completion = context;
+    struct opengl_drawable *drawable = completion->drawable;
 
-    opengl_drawable_release( completion->drawable );
-    client_surface_free_metadata( completion, sizeof(*completion) );
+    client_surface_free_scoped_metadata( &impl_from_client_surface( drawable->client )->memory,
+                                          completion, sizeof(*completion) );
+    opengl_drawable_release( drawable );
 }
 
 static BOOL blit_client_surface_framebuffer( struct opengl_drawable *base,
@@ -2404,7 +2447,7 @@ static BOOL x11drv_egl_surface_present( struct opengl_drawable *base, GLuint fra
         frame_id = 0;
     }
     client_surface_begin_present( base->client );
-    if (frame_id && !(completion = client_surface_alloc_metadata( 1, sizeof(*completion) )))
+    if (frame_id && !(completion = client_surface_alloc_scoped_metadata( &surface->memory, 1, sizeof(*completion) )))
     {
         client_surface_submit_present( base->client, &present );
         complete_opengl_present( base->client, &present, FALSE, FALSE, expected_size, 0 );
@@ -2413,7 +2456,7 @@ static BOOL x11drv_egl_surface_present( struct opengl_drawable *base, GLuint fra
     }
     if ((blit || framebuffer) && !refresh_prepared_egl_surface( base, &present ))
     {
-        client_surface_free_metadata( completion, sizeof(*completion) );
+        client_surface_free_scoped_metadata( &surface->memory, completion, sizeof(*completion) );
         client_surface_submit_present( base->client, &present );
         complete_opengl_present( base->client, &present, FALSE, FALSE, expected_size, 0 );
         return FALSE;
@@ -2422,7 +2465,7 @@ static BOOL x11drv_egl_surface_present( struct opengl_drawable *base, GLuint fra
                    (!usexcomposite || surface->direct_snapshot) &&
                    present.completion.kind == CLIENT_SURFACE_COMPLETION_EXACT ))
     {
-        client_surface_free_metadata( completion, sizeof(*completion) );
+        client_surface_free_scoped_metadata( &surface->memory, completion, sizeof(*completion) );
         client_surface_submit_present( base->client, &present );
         complete_opengl_present( base->client, &present, FALSE, FALSE, expected_size, 0 );
         return FALSE;
@@ -2477,7 +2520,7 @@ static BOOL x11drv_egl_surface_present( struct opengl_drawable *base, GLuint fra
     client_surface_submit_present( base->client, &present );
     if (!ret)
     {
-        client_surface_free_metadata( completion, sizeof(*completion) );
+        client_surface_free_scoped_metadata( &surface->memory, completion, sizeof(*completion) );
         err = funcs->p_eglGetError();
         WARN( "Failed to swap EGL surface %s, error %#x\n", debugstr_opengl_drawable( base ), err );
         complete_opengl_present( base->client, &present, FALSE, FALSE, NULL, 0 );

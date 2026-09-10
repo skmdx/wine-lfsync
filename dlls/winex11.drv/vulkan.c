@@ -109,6 +109,7 @@ static VkResult X11DRV_vulkan_surface_get_source( struct client_surface *client,
 }
 
 static BOOL X11DRV_vulkan_surface_read_snapshot( struct vulkan_surface_snapshot **storage,
+                                                 const struct client_surface_memory_scope *memory,
                                                  const void *pixels, uint32_t width, uint32_t height,
                                                  VkFormat format )
 {
@@ -117,7 +118,7 @@ static BOOL X11DRV_vulkan_surface_read_snapshot( struct vulkan_surface_snapshot 
     BOOL ret;
 
     if (!layout) return FALSE;
-    ret = x11drv_client_snapshot_upload( &snapshot, pixels, width, height, TRUE, layout );
+    ret = x11drv_client_snapshot_upload( &snapshot, memory, pixels, width, height, TRUE, layout );
     *storage = (struct vulkan_surface_snapshot *)snapshot;
     return ret;
 }

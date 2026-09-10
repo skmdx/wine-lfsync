@@ -89,7 +89,7 @@ struct VkDevice_T
 #include "wine/list.h"
 
 /* Wine internal vulkan driver version, needs to be bumped upon vulkan_funcs changes. */
-#define WINE_VULKAN_DRIVER_VERSION 57
+#define WINE_VULKAN_DRIVER_VERSION 58
 
 struct vulkan_object
 {
@@ -359,6 +359,7 @@ struct vulkan_funcs
 /* interface between win32u and the user drivers */
 struct client_surface;
 struct client_surface_frame;
+struct client_surface_memory_scope;
 struct vulkan_surface_snapshot;
 
 enum vulkan_surface_source_type
@@ -387,7 +388,7 @@ struct vulkan_driver_funcs
      * Read may block in native code and receives no surface state. Apply
      * exchanges that image with the surface's retained completed image;
      * it transfers ownership without native calls or resource destruction. */
-    BOOL (*p_vulkan_surface_read_snapshot)(struct vulkan_surface_snapshot **, const void *,
+    BOOL (*p_vulkan_surface_read_snapshot)(struct vulkan_surface_snapshot **, const struct client_surface_memory_scope *, const void *,
                                           uint32_t, uint32_t, VkFormat);
     BOOL (*p_vulkan_surface_apply_snapshot)(struct client_surface *, struct client_surface_frame *,
                                            struct vulkan_surface_snapshot **);

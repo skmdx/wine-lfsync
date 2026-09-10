@@ -28,6 +28,7 @@ WINE_DEFAULT_DEBUG_CHANNEL(x11drv);
 struct snapshot_connection
 {
     struct list entry;
+    struct client_surface_memory_scope memory;
     struct x11drv_client_surface_retired_resource retirement;
     struct list retired_snapshots;
     pthread_cond_t cond;
@@ -47,6 +48,7 @@ static unsigned int snapshot_connection_count;
 struct x11drv_client_snapshot
 {
     struct list retirement_entry;
+    struct client_surface_memory_scope memory;
     LONG refs;
     struct snapshot_connection *connection;
     Pixmap pixmap;
@@ -77,8 +79,7 @@ static void free_snapshot_connection( struct x11drv_client_surface_retired_resou
     pthread_mutex_unlock( &snapshot_connections_lock );
     TRACE( "released snapshot connection %p domain %s worker %p\n",
            connection, wine_dbgstr_longlong( connection->domain ), resource->thread );
-    free( connection );
-    client_surface_release_metadata_memory( sizeof(*connection) );
+    client_surface_free_owned_metadata( &connection->memory, connection, sizeof(*connection) );
 }
 
 static void snapshot_retirement_thread( void *context )
@@ -141,39 +142,42 @@ static int snapshot_error( Display *display, XErrorEvent *event, void *arg )
     return TRUE;
 }
 
-static struct snapshot_connection *snapshot_connection_acquire( UINT64 domain )
+static struct snapshot_connection *snapshot_connection_acquire( UINT64 domain,
+                                                                const struct client_surface_memory_scope *owners )
 {
     struct snapshot_connection *connection;
+    struct client_surface_memory_scope memory = {0};
 
     pthread_mutex_lock( &snapshot_connections_lock );
     LIST_FOR_EACH_ENTRY( connection, &snapshot_connections, struct snapshot_connection, entry )
     {
-        if (connection->domain != domain) continue;
+        if (connection->domain != domain || connection->memory.domain != owners->domain) continue;
         ++connection->refs;
         pthread_mutex_unlock( &snapshot_connections_lock );
         return connection;
     }
     connection = NULL;
     if (snapshot_connection_count == SNAPSHOT_CONNECTION_LIMIT) goto done;
-    if (!client_surface_reserve_metadata_memory( sizeof(*connection) )) goto done;
-    if (!(connection = calloc( 1, sizeof(*connection) )))
+    /* An execution connection can serve several window owners. Its shared
+     * transport belongs to the native domain, never to the first window. */
+    client_surface_memory_scope_copy( &memory, owners, FALSE );
+    if (!(connection = client_surface_alloc_scoped_metadata( &memory, 1, sizeof(*connection) )))
     {
-        client_surface_release_metadata_memory( sizeof(*connection) );
+        client_surface_memory_scope_destroy( &memory );
         goto done;
     }
+    connection->memory = memory;
     if (pthread_mutex_init( &connection->lock, NULL ))
     {
-        free( connection );
+        client_surface_free_owned_metadata( &connection->memory, connection, sizeof(*connection) );
         connection = NULL;
-        client_surface_release_metadata_memory( sizeof(*connection) );
         goto done;
     }
     if (client_surface_cond_init( &connection->cond ))
     {
         pthread_mutex_destroy( &connection->lock );
-        free( connection );
+        client_surface_free_owned_metadata( &connection->memory, connection, sizeof(*connection) );
         connection = NULL;
-        client_surface_release_metadata_memory( sizeof(*connection) );
         goto done;
     }
     list_init( &connection->retired_snapshots );
@@ -256,6 +260,11 @@ SIZE x11drv_client_snapshot_size( const struct x11drv_client_snapshot *snapshot 
     return snapshot ? snapshot->size : (SIZE){0};
 }
 
+const struct client_surface_memory_scope *x11drv_client_snapshot_memory( const struct x11drv_client_snapshot *snapshot )
+{
+    return &snapshot->memory;
+}
+
 void x11drv_client_snapshot_release_staging( struct x11drv_client_snapshot *snapshot )
 {
     UINT64 bytes;
@@ -264,7 +273,7 @@ void x11drv_client_snapshot_release_staging( struct x11drv_client_snapshot *snap
     bytes = (UINT64)snapshot->image->bytes_per_line * snapshot->image->height;
     XDestroyImage( snapshot->image );
     snapshot->image = NULL;
-    client_surface_release_memory( CLIENT_SURFACE_MEMORY_STAGING, bytes );
+    client_surface_release_scoped_memory( &snapshot->memory, CLIENT_SURFACE_MEMORY_STAGING, bytes );
 }
 
 static void destroy_snapshot( struct x11drv_client_snapshot *snapshot )
@@ -299,10 +308,9 @@ static void destroy_snapshot( struct x11drv_client_snapshot *snapshot )
     if (snapshot->acquired)
         x11drv_client_surface_trace_image( "free", "producer_snapshot", display,
                                           snapshot->pixmap, snapshot->bytes );
-    client_surface_release_memory( CLIENT_SURFACE_MEMORY_SOURCE, snapshot->bytes );
+    client_surface_release_scoped_memory( &snapshot->memory, CLIENT_SURFACE_MEMORY_SOURCE, snapshot->bytes );
     snapshot_connection_release( connection );
-    free( snapshot );
-    client_surface_release_metadata_memory( sizeof(*snapshot) );
+    client_surface_free_owned_metadata( &snapshot->memory, snapshot, sizeof(*snapshot) );
 }
 
 struct x11drv_client_snapshot *x11drv_client_snapshot_share( struct x11drv_client_snapshot *snapshot )
@@ -348,14 +356,14 @@ static BOOL snapshot_create_image( struct x11drv_client_snapshot *snapshot )
         return FALSE;
     }
     bytes = (UINT64)height * image->bytes_per_line;
-    if (!client_surface_reserve_memory( CLIENT_SURFACE_MEMORY_STAGING, bytes ))
+    if (!client_surface_reserve_scoped_memory( &snapshot->memory, CLIENT_SURFACE_MEMORY_STAGING, bytes ))
     {
         XDestroyImage( image );
         return FALSE;
     }
     if (!(image->data = calloc( height, image->bytes_per_line )))
     {
-        client_surface_release_memory( CLIENT_SURFACE_MEMORY_STAGING, bytes );
+        client_surface_release_scoped_memory( &snapshot->memory, CLIENT_SURFACE_MEMORY_STAGING, bytes );
         XDestroyImage( image );
         return FALSE;
     }
@@ -363,21 +371,24 @@ static BOOL snapshot_create_image( struct x11drv_client_snapshot *snapshot )
     return TRUE;
 }
 
-static struct x11drv_client_snapshot *snapshot_alloc( unsigned int width, unsigned int height, unsigned int depth )
+static struct x11drv_client_snapshot *snapshot_alloc( const struct client_surface_memory_scope *owners,
+                                                      unsigned int width, unsigned int height, unsigned int depth )
 {
     struct x11drv_client_snapshot *snapshot;
+    struct client_surface_memory_scope memory = {0};
     UINT64 bytes = (UINT64)width * height * (depth > 16 ? 4 : depth > 8 ? 2 : 1);
 
-    if (!client_surface_reserve_metadata_memory( sizeof(*snapshot) )) return NULL;
-    if (!(snapshot = calloc( 1, sizeof(*snapshot) )))
+    client_surface_memory_scope_copy( &memory, owners, TRUE );
+    if (!(snapshot = client_surface_alloc_scoped_metadata( &memory, 1, sizeof(*snapshot) )))
     {
-        client_surface_release_metadata_memory( sizeof(*snapshot) );
+        client_surface_memory_scope_destroy( &memory );
         return NULL;
     }
+    snapshot->memory = memory;
     snapshot->size = (SIZE){width, height};
     snapshot->depth = depth;
     snapshot->refs = 1;
-    if (!client_surface_reserve_memory( CLIENT_SURFACE_MEMORY_SOURCE, bytes )) goto failed;
+    if (!client_surface_reserve_scoped_memory( &snapshot->memory, CLIENT_SURFACE_MEMORY_SOURCE, bytes )) goto failed;
     snapshot->bytes = bytes;
     return snapshot;
 
@@ -423,6 +434,7 @@ static BOOL snapshot_create_native_image( struct x11drv_client_snapshot *snapsho
 }
 
 BOOL x11drv_client_snapshot_prepare_storage( struct x11drv_client_snapshot **storage,
+                                             const struct client_surface_memory_scope *memory,
                                              unsigned int width, unsigned int height, unsigned int depth )
 {
     struct x11drv_client_snapshot *snapshot = *storage, *next;
@@ -432,12 +444,12 @@ BOOL x11drv_client_snapshot_prepare_storage( struct x11drv_client_snapshot **sto
     if (!width || !height || width > 0xffff || height > 0xffff) return FALSE;
     if (!client_surface_get_execution_domain( &domain )) return FALSE;
     if (snapshot && snapshot->size.cx == width && snapshot->size.cy == height && snapshot->depth == depth &&
-        snapshot->connection && snapshot->connection->domain == domain &&
+        snapshot->connection && snapshot->connection->domain == domain && snapshot->memory.domain == memory->domain &&
         InterlockedCompareExchange( &snapshot->refs, 0, 0 ) == 1)
         return !snapshot->native_image || snapshot->image_ops->ready( snapshot->native_image );
 
-    if (!(next = snapshot_alloc( width, height, depth ))) return FALSE;
-    if ((next->connection = snapshot_connection_acquire( domain )))
+    if (!(next = snapshot_alloc( memory, width, height, depth ))) return FALSE;
+    if ((next->connection = snapshot_connection_acquire( domain, memory )))
     {
         pthread_mutex_lock( &next->connection->lock );
         ret = snapshot_create_native_image( next );
@@ -467,16 +479,18 @@ void x11drv_client_snapshot_set_image( struct x11drv_client_snapshot *snapshot, 
     snapshot->image_ops = ops;
 }
 
-BOOL x11drv_client_snapshot_prepare_native( struct x11drv_client_snapshot **storage, Window window,
+BOOL x11drv_client_snapshot_prepare_native( struct x11drv_client_snapshot **storage,
+                                           const struct client_surface_memory_scope *memory, Window window,
                                            unsigned int width, unsigned int height, unsigned int depth, UINT64 epoch )
 {
     struct x11drv_client_snapshot *snapshot = *storage, *next;
 
     if (!width || !height || width > 0xffff || height > 0xffff) return FALSE;
     if (!snapshot || snapshot->size.cx != width || snapshot->size.cy != height || snapshot->depth != depth ||
+        snapshot->memory.domain != memory->domain ||
         InterlockedCompareExchange( &snapshot->refs, 0, 0 ) != 1)
     {
-        if (!(next = snapshot_alloc( width, height, depth ))) return FALSE;
+        if (!(next = snapshot_alloc( memory, width, height, depth ))) return FALSE;
         x11drv_client_snapshot_release( snapshot );
         *storage = snapshot = next;
     }
@@ -496,13 +510,13 @@ BOOL x11drv_client_snapshot_prepare_read( struct x11drv_client_snapshot **storag
     if (!client_surface_get_execution_domain( &domain )) return FALSE;
     if (snapshot->connection && snapshot->connection->domain != domain)
     {
-        if (!(next = snapshot_alloc( snapshot->size.cx, snapshot->size.cy, snapshot->depth ))) return FALSE;
+        if (!(next = snapshot_alloc( &snapshot->memory, snapshot->size.cx, snapshot->size.cy, snapshot->depth ))) return FALSE;
         next->window = snapshot->window;
         next->target_epoch = snapshot->target_epoch;
         x11drv_client_snapshot_release( snapshot );
         *storage = snapshot = next;
     }
-    if (!snapshot->connection) snapshot->connection = snapshot_connection_acquire( domain );
+    if (!snapshot->connection) snapshot->connection = snapshot_connection_acquire( domain, &snapshot->memory );
     return !!snapshot->connection;
 }
 
@@ -566,7 +580,8 @@ static unsigned long snapshot_component( unsigned int pixel, unsigned int source
 
 /* No surface or target state is borrowed by this operation. A sole owner may
  * reuse storage; another reference instead requires an independent image. */
-BOOL x11drv_client_snapshot_upload( struct x11drv_client_snapshot **storage, const BYTE *pixels,
+BOOL x11drv_client_snapshot_upload( struct x11drv_client_snapshot **storage,
+                                    const struct client_surface_memory_scope *memory, const BYTE *pixels,
                                     unsigned int width, unsigned int height, BOOL top_down,
                                     const struct x11drv_snapshot_format *format )
 {
@@ -582,11 +597,11 @@ BOOL x11drv_client_snapshot_upload( struct x11drv_client_snapshot **storage, con
     if (!width || !height || width > 0xffff || height > 0xffff) return FALSE;
     if (!client_surface_get_execution_domain( &domain )) return FALSE;
     if (!snapshot || snapshot->size.cx != width || snapshot->size.cy != height ||
-        !snapshot->connection || snapshot->connection->domain != domain ||
+        !snapshot->connection || snapshot->connection->domain != domain || snapshot->memory.domain != memory->domain ||
         InterlockedCompareExchange( &snapshot->refs, 0, 0 ) != 1)
     {
-        if (!(next = snapshot_alloc( width, height, default_visual.depth ))) return FALSE;
-        if ((next->connection = snapshot_connection_acquire( domain )))
+        if (!(next = snapshot_alloc( memory, width, height, default_visual.depth ))) return FALSE;
+        if ((next->connection = snapshot_connection_acquire( domain, memory )))
         {
             pthread_mutex_lock( &next->connection->lock );
             ret = snapshot_create_native_image( next ) && snapshot_create_image( next );

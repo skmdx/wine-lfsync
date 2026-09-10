@@ -352,14 +352,14 @@ BOOL client_surface_memory_scope_init( struct client_surface_memory_scope *scope
 }
 
 void client_surface_memory_scope_copy( struct client_surface_memory_scope *dst,
-                                      const struct client_surface_memory_scope *src )
+                                      const struct client_surface_memory_scope *src, BOOL include_owner )
 {
     unsigned int i;
 
     assert( !dst->owner && !dst->domain );
     for (i = 0; i < ARRAY_SIZE(dst->used); ++i) assert( !dst->used[i] );
     pthread_mutex_lock( &image_memory_lock );
-    if ((dst->owner = src->owner)) ++dst->owner->refs;
+    if (include_owner && (dst->owner = src->owner)) ++dst->owner->refs;
     if ((dst->domain = src->domain)) ++dst->domain->refs;
     pthread_mutex_unlock( &image_memory_lock );
 }

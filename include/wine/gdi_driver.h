@@ -220,7 +220,7 @@ struct gdi_dc_funcs
 };
 
 /* increment this when changing driver tables or shared driver-facing structures */
-#define WINE_GDI_DRIVER_VERSION 146
+#define WINE_GDI_DRIVER_VERSION 147
 
 #define GDI_PRIORITY_NULL_DRV        0  /* null driver */
 #define GDI_PRIORITY_FONT_DRV      100  /* any font driver */
@@ -343,7 +343,7 @@ struct client_surface_backend
                      HDC hdc, HRGN surface_region, BOOL flush, BOOL defer_visible );
     /* Prepare producer-private storage. This does not publish a frame. */
     BOOL (*handoff_prepare)( struct client_surface *surface,
-                             struct client_surface_source *source, unsigned int index );
+                             struct client_surface_source *source, const struct client_surface_frame *frame );
     /* Transfer a prepared source operation to this capture. Read owns its
      * storage without surface locks; apply and release only change references.
      * The core retains native submission order and revalidates before apply. */
@@ -393,7 +393,9 @@ struct client_surface_frame
     LONG64 serial;
     DWORD submission_time;
     UINT64 target_epoch;
+    UINT64 memory_domain; /* native allocation domain; resources retain their own account references */
     enum client_surface_frame_target target;
+    BOOL replay; /* publish retained completed storage without another native source read */
     UINT64 handoff_control;
     unsigned int handoff_index;
     /* Borrowed from the prepared reservation until its completion/capture is
@@ -432,7 +434,7 @@ struct client_surface_memory_scope
 
 W32KAPI BOOL client_surface_memory_scope_init( struct client_surface_memory_scope *scope, HWND hwnd, UINT64 domain );
 W32KAPI void client_surface_memory_scope_copy( struct client_surface_memory_scope *dst,
-                                              const struct client_surface_memory_scope *src );
+                                              const struct client_surface_memory_scope *src, BOOL include_owner );
 W32KAPI void client_surface_memory_scope_destroy( struct client_surface_memory_scope *scope );
 W32KAPI BOOL client_surface_reserve_scoped_memory( struct client_surface_memory_scope *scope,
                                                   enum client_surface_memory_class type, UINT64 bytes );
@@ -479,6 +481,19 @@ static inline void *client_surface_alloc_metadata( SIZE_T count, SIZE_T size )
 static inline void client_surface_free_metadata( void *data, SIZE_T size )
 {
     client_surface_free_scoped_metadata( NULL, data, size );
+}
+
+/* The object embeds its own scope. Its native resources have already been
+ * released; preserve only the final metadata charge across the actual free. */
+static inline void client_surface_free_owned_metadata( struct client_surface_memory_scope *scope,
+                                                        void *data, SIZE_T size )
+{
+    struct client_surface_memory_scope memory;
+
+    if (!data) return;
+    memory = *scope;
+    client_surface_free_scoped_metadata( &memory, data, size );
+    client_surface_memory_scope_destroy( &memory );
 }
 
 struct client_surface
@@ -582,7 +597,7 @@ W32KAPI void client_surface_lock_present( struct client_surface *surface );
 W32KAPI void client_surface_unlock_present( struct client_surface *surface );
 W32KAPI void client_surface_prepare_present_locked( struct client_surface *surface,
                                                     struct client_surface_frame *present,
-                                                    BOOL external_completion );
+                                                    BOOL external_completion, UINT64 memory_domain );
 W32KAPI BOOL client_surface_complete_present_locked( struct client_surface *surface,
                                                      struct client_surface_frame *present,
                                                      BOOL submitted, BOOL external_completed,

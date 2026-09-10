@@ -2470,7 +2470,7 @@ static BOOL read_vulkan_snapshot( void *context )
                                  .memory = snapshot->memory, .size = VK_WHOLE_SIZE};
 
     return !device->p_vkInvalidateMappedMemoryRanges( device->host.device, 1, &range ) &&
-           driver_funcs->p_vulkan_surface_read_snapshot( &snapshot->backend_snapshot, snapshot->pixels,
+           driver_funcs->p_vulkan_surface_read_snapshot( &snapshot->backend_snapshot, &swapchain->memory, snapshot->pixels,
                swapchain->host_extents.width, swapchain->host_extents.height, swapchain->format );
 }
 
@@ -3376,7 +3376,8 @@ reservation_failed:
         struct swapchain *swapchain = swapchain_from_handle( client_swapchains[i] );
 
         client_surface_prepare_present_locked( swapchain->surface->client, &presents[i],
-                                               (use_internal_present_wait && present_ids[i]) || swapchain_needs_snapshot( swapchain ) );
+                                               (use_internal_present_wait && present_ids[i]) || swapchain_needs_snapshot( swapchain ),
+                                               impl_from_vulkan_device( device )->completion_domain_base );
         have_snapshots |= swapchain_needs_snapshot( swapchain ) &&
                           presents[i].completion.kind == CLIENT_SURFACE_COMPLETION_EXACT;
         if (presents[i].completion.kind != CLIENT_SURFACE_COMPLETION_NONE &&

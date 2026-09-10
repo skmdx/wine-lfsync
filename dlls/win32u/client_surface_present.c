@@ -671,7 +671,8 @@ void client_surface_wait_present_locked( struct client_surface *surface, BOOL ex
 
 static void prepare_client_surface_present_locked( struct client_surface *surface,
                                                     struct client_surface_frame *present,
-                                                    BOOL external_completion, BOOL allow_direct_transition )
+                                                    BOOL external_completion, BOOL replay,
+                                                    UINT64 memory_domain )
 {
     struct client_surface_target target;
     unsigned int retry;
@@ -690,6 +691,8 @@ static void prepare_client_surface_present_locked( struct client_surface *surfac
     }
 
     memset( present, 0, sizeof(*present) );
+    present->memory_domain = memory_domain;
+    present->replay = replay;
 
     /* A server scene sequence is also the invalidation token for native
      * geometry.  Reapplying an unchanged scene on every GL/Vulkan frame made
@@ -713,7 +716,7 @@ static void prepare_client_surface_present_locked( struct client_surface *surfac
           surface->target.toplevel != present->scene.toplevel ||
           surface->target_scene_epoch != present->scene.epoch ||
           surface->target_scene_mode != present->scene.mode ||
-          (allow_direct_transition && present->scene.authoritative &&
+          (!replay && present->scene.authoritative &&
            present->scene.direct_candidate &&
            present->scene.mode != CLIENT_SURFACE_PRESENTATION_DIRECT)); ++retry)
     {
@@ -721,9 +724,9 @@ static void prepare_client_surface_present_locked( struct client_surface *surfac
          * actual producer must still ask the owner to select its strategy
          * before the native present; geometry application is not admission. */
         if (present->scene.valid)
-            client_surface_update_present_scene_locked( surface, &present->scene, allow_direct_transition );
+            client_surface_update_present_scene_locked( surface, &present->scene, !replay );
         else
-            client_surface_update_present_scene_locked( surface, NULL, allow_direct_transition );
+            client_surface_update_present_scene_locked( surface, NULL, !replay );
         client_surface_get_scene( surface, &present->scene );
     }
     /* PREPARING can consume one geometry resample before the owner admits
@@ -732,7 +735,7 @@ static void prepare_client_surface_present_locked( struct client_surface *surfac
      * completion path. Otherwise its first image is captured offscreen while
      * the owner waits for a native DIRECT completion that cannot arrive.
      * A concurrent scene change fails the existing exact-snapshot check. */
-    if (allow_direct_transition && present->scene.valid &&
+    if (!replay && present->scene.valid &&
         present->scene.mode == CLIENT_SURFACE_PRESENTATION_DIRECT &&
         (surface->target_scene_epoch != present->scene.epoch ||
          surface->target_scene_mode != present->scene.mode))
@@ -780,9 +783,9 @@ static void prepare_client_surface_present_locked( struct client_surface *surfac
 
 void client_surface_prepare_present_locked( struct client_surface *surface,
                                             struct client_surface_frame *present,
-                                            BOOL external_completion )
+                                            BOOL external_completion, UINT64 memory_domain )
 {
-    prepare_client_surface_present_locked( surface, present, external_completion, TRUE );
+    prepare_client_surface_present_locked( surface, present, external_completion, FALSE, memory_domain );
 }
 
 void client_surface_prepare_recompose_locked( struct client_surface *surface,
@@ -791,7 +794,7 @@ void client_surface_prepare_recompose_locked( struct client_surface *surface,
     /* A cached image can be replayed by a completion system thread. It has
      * neither a producer TEB nor a new native Present to replace the image
      * that attaching a DIRECT drawable may discard. */
-    prepare_client_surface_present_locked( surface, present, TRUE, FALSE );
+    prepare_client_surface_present_locked( surface, present, TRUE, TRUE, 0 );
 }
 
 BOOL client_surface_needs_completion_reservation( struct client_surface *surface )
@@ -843,7 +846,7 @@ prepare:
     client_surface_wait_present_locked( surface, external_completion );
     ready = start ? client_surface_perf_time() : 0;
     pending_after = start ? InterlockedCompareExchange( &surface->external_completion_count, 0, 0 ) : 0;
-    client_surface_prepare_present_locked( surface, present, external_completion );
+    client_surface_prepare_present_locked( surface, present, external_completion, 0 );
     if (asynchronous && present->completion.kind != CLIENT_SURFACE_COMPLETION_NONE && !job)
     {
         /* Preparation may attach an offscreen target after the initial

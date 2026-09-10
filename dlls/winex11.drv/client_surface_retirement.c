@@ -32,6 +32,7 @@ WINE_DECLARE_DEBUG_CHANNEL(csperf);
 struct x11drv_client_surface_retirement
 {
     struct list entry;
+    struct client_surface_memory_scope memory;
     void *view;
     struct client_surface_handoff_channel *channel;
     UINT64 identity, cookie;
@@ -93,8 +94,7 @@ static void release_source_retirement( struct x11drv_client_surface_retirement *
     pthread_mutex_lock( &retirement_lock );
     --retirement_count;
     pthread_mutex_unlock( &retirement_lock );
-    free( retirement );
-    client_surface_release_metadata_memory( sizeof(*retirement) );
+    client_surface_free_owned_metadata( &retirement->memory, retirement, sizeof(*retirement) );
 }
 
 static void wake_retiring_source_owner( struct x11drv_client_surface_retirement *retirement )
@@ -229,14 +229,21 @@ BOOL x11drv_client_surface_prepare_resource_retirement(void)
     return !status;
 }
 
-BOOL x11drv_client_surface_prepare_retirement( struct x11drv_client_surface *surface )
+BOOL x11drv_client_surface_prepare_retirement( struct x11drv_client_surface *surface,
+                                               const struct client_surface_memory_scope *owners )
 {
     struct x11drv_client_surface_retirement *retirement;
+    struct client_surface_memory_scope memory = {0};
 
     if (surface->handoff_retirement) return TRUE;
     if (!x11drv_client_surface_prepare_resource_retirement()) return FALSE;
-    if (!client_surface_reserve_metadata_memory( sizeof(*retirement) )) return FALSE;
-    if (!(retirement = calloc( 1, sizeof(*retirement) ))) goto failed;
+    client_surface_memory_scope_copy( &memory, owners, TRUE );
+    if (!(retirement = client_surface_alloc_scoped_metadata( &memory, 1, sizeof(*retirement) )))
+    {
+        client_surface_memory_scope_destroy( &memory );
+        return FALSE;
+    }
+    retirement->memory = memory;
     pthread_mutex_lock( &retirement_lock );
     if (retirement_count == MAX_SOURCE_RETIREMENTS) goto failed_locked;
     ++retirement_count;
@@ -246,9 +253,7 @@ BOOL x11drv_client_surface_prepare_retirement( struct x11drv_client_surface *sur
 
 failed_locked:
     pthread_mutex_unlock( &retirement_lock );
-    free( retirement );
-failed:
-    client_surface_release_metadata_memory( sizeof(*retirement) );
+    client_surface_free_owned_metadata( &retirement->memory, retirement, sizeof(*retirement) );
     return FALSE;
 }
 

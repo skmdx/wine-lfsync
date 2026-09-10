@@ -42,6 +42,8 @@ struct x11drv_client_source_frame
 struct x11drv_client_surface
 {
     struct client_surface client;
+    struct client_surface_memory_scope memory; /* GL allocation owners, held through detach */
+    unsigned int memory_refs; /* live GL drawables; cached images retain independent scopes */
     XWindowChanges changes;
     Colormap colormap;
     Window window;
@@ -72,7 +74,8 @@ extern const struct x11drv_snapshot_format x11drv_snapshot_rgba8;
 /* Upload replaces shared storage rather than modifying a published image.
  * Every native image has an admitted connection worker for its last release.
  * Only metadata without native storage can be destroyed by its caller. */
-extern BOOL x11drv_client_snapshot_upload( struct x11drv_client_snapshot **snapshot, const BYTE *pixels,
+extern BOOL x11drv_client_snapshot_upload( struct x11drv_client_snapshot **snapshot,
+                                          const struct client_surface_memory_scope *memory, const BYTE *pixels,
                                           unsigned int width, unsigned int height, BOOL top_down,
                                           const struct x11drv_snapshot_format *format );
 extern Pixmap x11drv_client_snapshot_pixmap( const struct x11drv_client_snapshot *snapshot );
@@ -86,13 +89,16 @@ struct x11drv_client_snapshot_image_ops
     void (*destroy)( void *image );
 };
 extern BOOL x11drv_client_snapshot_prepare_storage( struct x11drv_client_snapshot **storage,
+                                                   const struct client_surface_memory_scope *memory,
                                                    unsigned int width, unsigned int height, unsigned int depth );
+extern const struct client_surface_memory_scope *x11drv_client_snapshot_memory( const struct x11drv_client_snapshot *snapshot );
 extern void *x11drv_client_snapshot_get_image( struct x11drv_client_snapshot *snapshot );
 extern void x11drv_client_snapshot_set_image( struct x11drv_client_snapshot *snapshot, void *image,
                                               const struct x11drv_client_snapshot_image_ops *ops );
 /* Called after handoff retirement admission. Preparation reserves storage
  * charges without native I/O; read only uses the transferred private object. */
-extern BOOL x11drv_client_snapshot_prepare_native( struct x11drv_client_snapshot **storage, Window window,
+extern BOOL x11drv_client_snapshot_prepare_native( struct x11drv_client_snapshot **storage,
+                                                  const struct client_surface_memory_scope *memory, Window window,
                                                   unsigned int width, unsigned int height,
                                                   unsigned int depth, UINT64 epoch );
 extern BOOL x11drv_client_snapshot_read_native( void *context );
@@ -106,7 +112,10 @@ extern void x11drv_client_surface_trace_image( const char *event, const char *ki
                                               Display *display, Pixmap pixmap, UINT64 bytes );
 extern void x11drv_client_surface_set_gpu_snapshot( struct x11drv_client_surface *surface,
                                                    struct x11drv_client_snapshot *snapshot );
-extern BOOL x11drv_client_surface_prepare_retirement( struct x11drv_client_surface *surface );
+extern BOOL x11drv_client_surface_prepare_retirement( struct x11drv_client_surface *surface,
+                                                      const struct client_surface_memory_scope *memory );
+extern BOOL x11drv_client_surface_acquire_gl_memory( struct x11drv_client_surface *surface );
+extern void x11drv_client_surface_release_gl_memory( struct x11drv_client_surface *surface );
 extern void x11drv_client_surface_retire_handoff( struct client_surface *client,
                                                  const struct client_surface_handoff_lease *lease );
 extern void x11drv_client_surface_destroy_retirement( struct x11drv_client_surface *surface );
