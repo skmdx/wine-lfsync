@@ -1298,7 +1298,7 @@ static void x11drv_surface_flush( struct opengl_drawable *base, UINT flags )
     if (flags & GL_FLUSH_INTERVAL) set_swap_interval( gl, base->interval );
     if (!(flags & GL_FLUSH_PRESENT)) return;
 
-    client_surface_prepare_present( base->client, &present, TRUE );
+    if (!client_surface_prepare_present( base->client, &present, TRUE, FALSE )) return;
     client_surface_begin_present( base->client );
     /* Native completion remains required while PREPARING blocks publication. */
     if (present.completion.kind == CLIENT_SURFACE_COMPLETION_EXACT)
@@ -1857,6 +1857,7 @@ static BOOL blit_client_surface_output( struct opengl_drawable *base,
 static BOOL x11drv_surface_swap_blit( struct opengl_drawable *base, struct opengl_drawable *source,
                                       opengl_drawable_blit_func blit )
 {
+    struct glx_present_completion *completion = NULL;
     GLXContext ctx = NtCurrentTeb()->glReserved2;
     struct gl_drawable *gl = impl_from_opengl_drawable( base );
     struct client_surface_frame present;
@@ -1868,11 +1869,21 @@ static BOOL x11drv_surface_swap_blit( struct opengl_drawable *base, struct openg
     TRACE( "drawable %s\n", debugstr_opengl_drawable( base ) );
 
     use_oml = ctx && gl->completion;
-    client_surface_prepare_present( base->client, &present, use_oml || !usexcomposite );
+    if (!client_surface_prepare_present( base->client, &present, use_oml || !usexcomposite,
+                                         usexcomposite )) return FALSE;
     client_surface_begin_present( base->client );
+    if (usexcomposite && present.completion.kind == CLIENT_SURFACE_COMPLETION_EXACT &&
+        !(completion = malloc( sizeof(*completion) )))
+    {
+        client_surface_submit_present( base->client, &present );
+        client_surface_complete_present( base->client, &present, FALSE, FALSE, expected_size, 0 );
+        RtlSetLastWin32Error( ERROR_NOT_ENOUGH_MEMORY );
+        return FALSE;
+    }
     if (blit && !blit_client_surface_output( base, &present, source, blit,
                    !usexcomposite && present.completion.kind == CLIENT_SURFACE_COMPLETION_EXACT ))
     {
+        free( completion );
         client_surface_submit_present( base->client, &present );
         client_surface_complete_present( base->client, &present, FALSE, FALSE, expected_size, 0 );
         return FALSE;
@@ -1901,27 +1912,13 @@ static BOOL x11drv_surface_swap_blit( struct opengl_drawable *base, struct openg
         client_surface_submit_present( base->client, &present );
         if (submitted)
         {
-            struct glx_present_completion *completion;
-
-            if ((completion = malloc( sizeof(*completion) )))
-            {
-                completion->drawable = base;
-                completion->target_sbc = target_sbc;
-                opengl_drawable_add_ref( base );
-                client_surface_set_present_completion( &present, wait_glx_present_completion,
-                                                       release_glx_present_completion, completion );
-                client_surface_defer_present( base->client, &present, expected_size );
-                return TRUE;
-            }
-            {
-                struct glx_present_completion fallback = {base, target_sbc};
-
-                client_surface_set_present_completion( &present, wait_glx_present_completion,
-                                                       NULL, &fallback );
-                completed = client_surface_wait_present_completion( base->client, &present,
-                                                                     CLIENT_SURFACE_PRESENT_TIMEOUT ).status ==
-                            CLIENT_SURFACE_COMPLETION_SIGNALED;
-            }
+            completion->drawable = base;
+            completion->target_sbc = target_sbc;
+            opengl_drawable_add_ref( base );
+            client_surface_set_present_completion( &present, wait_glx_present_completion,
+                                                   release_glx_present_completion, completion );
+            client_surface_defer_present( base->client, &present, expected_size );
+            return TRUE;
         }
     }
     else
@@ -1932,6 +1929,7 @@ static BOOL x11drv_surface_swap_blit( struct opengl_drawable *base, struct openg
         client_surface_submit_present( base->client, &present );
     }
 
+    free( completion );
     if (!client_surface_complete_present( base->client, &present, submitted, completed, expected_size,
                                           CLIENT_SURFACE_PRESENT_TIMEOUT ))
         WARN( "client-surface composition did not complete for %s\n",
@@ -2190,7 +2188,7 @@ static void x11drv_egl_surface_flush( struct opengl_drawable *base, UINT flags )
     }
     if (!(flags & GL_FLUSH_PRESENT)) return;
 
-    client_surface_prepare_present( base->client, &present, TRUE );
+    if (!client_surface_prepare_present( base->client, &present, TRUE, FALSE )) return;
     client_surface_begin_present( base->client );
     /* Native completion remains required while PREPARING blocks publication. */
     if (present.completion.kind == CLIENT_SURFACE_COMPLETION_EXACT)
@@ -2339,6 +2337,7 @@ static BOOL refresh_prepared_egl_surface( struct opengl_drawable *base,
 static BOOL x11drv_egl_surface_present( struct opengl_drawable *base, GLuint framebuffer,
                                        struct opengl_drawable *source, opengl_drawable_blit_func blit )
 {
+    struct egl_present_completion *completion = NULL;
     struct gl_drawable *gl = impl_from_opengl_drawable( base );
     struct x11drv_client_surface *surface = impl_from_client_surface( base->client );
     struct client_surface_frame present;
@@ -2354,8 +2353,9 @@ static BOOL x11drv_egl_surface_present( struct opengl_drawable *base, GLuint fra
     timestamp_completion = !framebuffer && egl->has_EGL_ANDROID_get_frame_timestamps &&
         funcs->p_eglGetFrameTimestampSupportedANDROID( egl->display, gl->base.surface,
                                                        EGL_DISPLAY_PRESENT_TIME_ANDROID );
-    client_surface_prepare_present( base->client, &present,
-                                     timestamp_completion || !usexcomposite || surface->direct_snapshot );
+    if (!client_surface_prepare_present( base->client, &present,
+                                         timestamp_completion || !usexcomposite || surface->direct_snapshot,
+                                         TRUE )) return FALSE;
     if (usexcomposite && !surface->direct_snapshot && present.completion.kind == CLIENT_SURFACE_COMPLETION_EXACT &&
         !funcs->p_eglGetNextFrameIdANDROID( egl->display, gl->base.surface, &frame_id ))
     {
@@ -2364,8 +2364,16 @@ static BOOL x11drv_egl_surface_present( struct opengl_drawable *base, GLuint fra
         frame_id = 0;
     }
     client_surface_begin_present( base->client );
+    if (frame_id && !(completion = malloc( sizeof(*completion) )))
+    {
+        client_surface_submit_present( base->client, &present );
+        client_surface_complete_present( base->client, &present, FALSE, FALSE, expected_size, 0 );
+        RtlSetLastWin32Error( ERROR_NOT_ENOUGH_MEMORY );
+        return FALSE;
+    }
     if ((blit || framebuffer) && !refresh_prepared_egl_surface( base, &present ))
     {
+        free( completion );
         client_surface_submit_present( base->client, &present );
         client_surface_complete_present( base->client, &present, FALSE, FALSE, expected_size, 0 );
         return FALSE;
@@ -2374,6 +2382,7 @@ static BOOL x11drv_egl_surface_present( struct opengl_drawable *base, GLuint fra
                    (!usexcomposite || surface->direct_snapshot) &&
                    present.completion.kind == CLIENT_SURFACE_COMPLETION_EXACT ))
     {
+        free( completion );
         client_surface_submit_present( base->client, &present );
         client_surface_complete_present( base->client, &present, FALSE, FALSE, expected_size, 0 );
         return FALSE;
@@ -2428,6 +2437,7 @@ static BOOL x11drv_egl_surface_present( struct opengl_drawable *base, GLuint fra
     client_surface_submit_present( base->client, &present );
     if (!ret)
     {
+        free( completion );
         err = funcs->p_eglGetError();
         WARN( "Failed to swap EGL surface %s, error %#x\n", debugstr_opengl_drawable( base ), err );
         client_surface_complete_present( base->client, &present, FALSE, FALSE, NULL, 0 );
@@ -2436,31 +2446,17 @@ static BOOL x11drv_egl_surface_present( struct opengl_drawable *base, GLuint fra
 
     if (present.completion.kind == CLIENT_SURFACE_COMPLETION_EXACT && frame_id)
     {
-        struct egl_present_completion *completion;
-
-        if ((completion = malloc( sizeof(*completion) )))
-        {
-            completion->drawable = base;
-            completion->frame_id = frame_id;
-            opengl_drawable_add_ref( base );
-            client_surface_set_present_completion( &present, wait_egl_present_completion,
-                                                   release_egl_present_completion, completion );
-            client_surface_defer_present( base->client, &present, expected_size );
-            return TRUE;
-        }
-
-        {
-            struct egl_present_completion fallback = {base, frame_id};
-            client_surface_set_present_completion( &present, wait_egl_present_completion,
-                                                   NULL, &fallback );
-            timestamp_completion = client_surface_wait_present_completion(
-                base->client, &present, CLIENT_SURFACE_PRESENT_TIMEOUT ).status == CLIENT_SURFACE_COMPLETION_SIGNALED;
-        }
+        completion->drawable = base;
+        completion->frame_id = frame_id;
+        opengl_drawable_add_ref( base );
+        client_surface_set_present_completion( &present, wait_egl_present_completion,
+                                               release_egl_present_completion, completion );
+        client_surface_defer_present( base->client, &present, expected_size );
+        return TRUE;
     }
-    else timestamp_completion = FALSE;
 
     if (!client_surface_complete_present( base->client, &present, TRUE,
-                                          timestamp_completion, expected_size,
+                                          FALSE, expected_size,
                                           CLIENT_SURFACE_PRESENT_TIMEOUT ))
         WARN( "client-surface composition did not complete for %s\n",
               debugstr_opengl_drawable( base ) );

@@ -219,7 +219,7 @@ struct gdi_dc_funcs
 };
 
 /* increment this when changing driver tables or shared driver-facing structures */
-#define WINE_GDI_DRIVER_VERSION 140
+#define WINE_GDI_DRIVER_VERSION 141
 
 #define GDI_PRIORITY_NULL_DRV        0  /* null driver */
 #define GDI_PRIORITY_FONT_DRV      100  /* any font driver */
@@ -383,6 +383,8 @@ struct client_surface_frame
     UINT64 damage_base_sequence;
     struct client_surface_completion completion;
     struct client_surface_capture capture;
+    /* An unused admission belongs to this frame until defer or completion. */
+    struct client_surface_completion_job *completion_job;
     enum client_surface_frame_result result;
 };
 
@@ -472,9 +474,11 @@ W32KAPI BOOL client_surface_update( struct client_surface *surface );
 W32KAPI void client_surface_add_ref( struct client_surface *surface );
 W32KAPI void client_surface_release( struct client_surface *surface );
 W32KAPI void client_surface_present( struct client_surface *surface );
-W32KAPI void client_surface_prepare_present( struct client_surface *surface,
-                                             struct client_surface_frame *present,
-                                             BOOL external_completion );
+/* Success holds submission ordering until begin_present. Failure leaves no
+ * lock or reservation owned by the caller and has not submitted native work. */
+W32KAPI BOOL client_surface_prepare_present( struct client_surface *surface,
+                                              struct client_surface_frame *present,
+                                              BOOL external_completion, BOOL asynchronous );
 W32KAPI void client_surface_begin_present( struct client_surface *surface );
 W32KAPI void client_surface_submit_present( struct client_surface *surface,
                                              struct client_surface_frame *present );

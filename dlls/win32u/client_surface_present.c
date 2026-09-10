@@ -1349,16 +1349,24 @@ void client_surface_prepare_recompose_locked( struct client_surface *surface,
     prepare_client_surface_present_locked( surface, present, TRUE, FALSE );
 }
 
-void client_surface_prepare_present( struct client_surface *surface,
+BOOL client_surface_prepare_present( struct client_surface *surface,
                                      struct client_surface_frame *present,
-                                     BOOL external_completion )
+                                     BOOL external_completion, BOOL asynchronous )
 {
+    struct client_surface_completion_job *job = NULL;
+    struct client_surface_target target;
     unsigned long long start = TRACE_ON(csperf) ? client_surface_perf_time() : 0;
     unsigned long long scene, locked, ready;
     LONG pending_before, pending_after;
 
     client_surface_prepare_scene( surface );
     scene = start ? client_surface_perf_time() : 0;
+    if (asynchronous)
+    {
+        client_surface_get_target( surface, &target );
+        if (target.offscreen && !(job = client_surface_reserve_completion( surface ))) goto failed;
+    }
+prepare:
     client_surface_lock_present( surface );
     locked = start ? client_surface_perf_time() : 0;
     pending_before = start ? InterlockedCompareExchange( &surface->external_completion_count, 0, 0 ) : 0;
@@ -1366,10 +1374,30 @@ void client_surface_prepare_present( struct client_surface *surface,
     ready = start ? client_surface_perf_time() : 0;
     pending_after = start ? InterlockedCompareExchange( &surface->external_completion_count, 0, 0 ) : 0;
     client_surface_prepare_present_locked( surface, present, external_completion );
+    if (asynchronous && present->completion.kind != CLIENT_SURFACE_COMPLETION_NONE && !job)
+    {
+        /* Preparation may attach an offscreen target after the initial
+         * inspection. Cancel its unsubmitted token and acquire admission
+         * outside every surface lock before preparing that target again. */
+        pthread_mutex_lock( &surface->present_lock );
+        client_surface_abandon_handoff_locked( surface, present );
+        if (present->completion.kind == CLIENT_SURFACE_COMPLETION_SHARED &&
+            surface->backend->completion && surface->backend->completion->abandon)
+            surface->backend->completion->abandon( surface );
+        pthread_mutex_unlock( &surface->present_lock );
+        client_surface_unlock_present( surface );
+        if (!(job = client_surface_reserve_completion( surface ))) goto failed;
+        goto prepare;
+    }
+    present->completion_job = job;
     TRACE_(csperf)( "ticks=%llu event=prepare identity=%s begin=%llu scene=%llu locked=%llu ready=%llu "
                    "pending_before=%d pending_after=%d\n", client_surface_perf_time(),
                    wine_dbgstr_longlong( client_surface_get_identity( surface ) ), start, scene, locked, ready,
                    pending_before, pending_after );
+    return TRUE;
+failed:
+    RtlSetLastWin32Error( ERROR_NOT_ENOUGH_MEMORY );
+    return FALSE;
 }
 
 static void client_surface_begin_present_locked( struct client_surface *surface )
@@ -1604,6 +1632,7 @@ BOOL client_surface_complete_present( struct client_surface *surface,
                                       BOOL submitted, BOOL external_completed,
                                       const SIZE *expected_size, DWORD timeout )
 {
+    struct client_surface_completion_job *job;
     BOOL ret;
 
     /* An armed driver monitor has exclusive ownership through
@@ -1619,10 +1648,13 @@ BOOL client_surface_complete_present( struct client_surface *surface,
         return TRUE;
     }
 
+    job = present->completion_job;
+    present->completion_job = NULL;
     client_surface_lock_present( surface );
     ret = client_surface_complete_present_locked( surface, present, submitted,
                                                   external_completed, expected_size, timeout );
     client_surface_unlock_present( surface );
+    client_surface_cancel_completion( job );
     return ret;
 }
 
@@ -1633,7 +1665,7 @@ void client_surface_present( struct client_surface *surface )
     /* Compatibility path for drivers whose presentation callback already
      * supplies a host completion boundary.  It still participates in target
      * token validation and per-surface submission serialization. */
-    client_surface_prepare_present( surface, &present, TRUE );
+    if (!client_surface_prepare_present( surface, &present, TRUE, FALSE )) return;
     client_surface_begin_present( surface );
     client_surface_submit_present( surface, &present );
     client_surface_complete_present( surface, &present, TRUE, TRUE, NULL, 0 );

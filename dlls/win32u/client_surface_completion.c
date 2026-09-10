@@ -174,8 +174,7 @@ static BOOL client_surface_reserve_completion_slot(void)
         if (previous == count) return TRUE;
         count = previous;
     }
-    /* Rejected reservations never consume capacity, including while their
-     * callers wait in the FIFO with stack-owned synchronous jobs. */
+    /* Rejected reservations never consume capacity or reach native submit. */
     return FALSE;
 }
 
@@ -597,9 +596,9 @@ static void queue_completion_job_locked( struct client_surface *surface,
     pthread_cond_broadcast( &completion_executor_cond );
 }
 
-/* Allocation/admission/worker failure does not create a second ordering path.
- * A stack owner can help earlier jobs of its own surface, but cannot skip an
- * executing or PENDING head, nor wait for unrelated surfaces to free a worker.
+/* Explicit synchronous waits use the same FIFO. A stack owner can help earlier
+ * jobs of its own surface, but cannot skip an executing or PENDING head, nor
+ * wait for unrelated surfaces to free a worker.
  * Its stack storage and an extra surface reference live until terminal done. */
 static void complete_inline_job( struct client_surface *surface, struct client_surface_completion_job *own )
 {
@@ -763,6 +762,7 @@ void client_surface_defer_reserved_present( struct client_surface_completion_job
     struct client_surface *surface = job->surface;
 
     assert( job->reserved && present->serial );
+    assert( !present->completion_job );
     assert( present->completion.kind != CLIENT_SURFACE_COMPLETION_NONE );
     assert( present->completion.external_result && present->completion.wait && present->completion.release );
     assert( InterlockedCompareExchange( &surface->external_completion_count, 0, 0 ) > 0 );
@@ -790,54 +790,9 @@ void client_surface_defer_present( struct client_surface *surface,
                                    struct client_surface_frame *present,
                                    const SIZE *expected_size )
 {
-    struct client_surface_completion completion = present->completion;
-    struct client_surface_completion_job local = {0}, *job;
-    BOOL reserved = FALSE, asynchronous = FALSE;
+    struct client_surface_completion_job *job = present->completion_job;
 
-    assert( completion.kind != CLIENT_SURFACE_COMPLETION_NONE );
-    assert( completion.external_result );
-    assert( present->serial );
-    assert( InterlockedCompareExchange( &surface->external_completion_count, 0, 0 ) > 0 );
-    assert( completion.wait && completion.release );
-
-    if ((job = malloc( sizeof(*job) )))
-    {
-        reserved = client_surface_reserve_completion_slot();
-        if (reserved && InterlockedCompareExchange( &surface->external_completion_count, 0, 0 ) <
-                        CLIENT_SURFACE_MAX_DEFERRED_PRESENTS)
-            asynchronous = start_client_surface_completion_thread( surface );
-    }
-    /* Creation is outside the queue lock. Recheck the active workers while
-     * enqueueing: the last idle worker could have exited in the meantime. */
-    client_surface_add_ref( surface );
-    client_surface_add_ref( surface );
-    pthread_mutex_lock( &completion_executor_lock );
-    asynchronous = asynchronous && active_completion_workers_locked() && completion_queue_has_room_locked( surface );
-    if (asynchronous) memset( job, 0, sizeof(*job) );
-    else
-    {
-        free( job );
-        if (reserved) InterlockedDecrement( &client_surface_deferred_present_count );
-        job = &local;
-    }
-    job->present = *present;
-    job->allocated = asynchronous;
-    job->deferred = TRUE;
-    job->has_expected_size = !!expected_size;
-    if (expected_size) job->expected_size = *expected_size;
-    job->wait_started = present->submission_time;
-    job->wait_timeout = CLIENT_SURFACE_PRESENT_TIMEOUT;
-    job->poll_delay = 1;
-    queue_completion_job_locked( surface, job );
-    pthread_mutex_unlock( &completion_executor_lock );
-    if (asynchronous)
-    {
-        memset( present, 0, sizeof(*present) );
-        client_surface_release( surface );
-    }
-    else
-    {
-        complete_inline_job( surface, job );
-        *present = local.present;
-    }
+    assert( job && job->surface == surface );
+    present->completion_job = NULL;
+    client_surface_defer_reserved_present( job, present, expected_size );
 }
