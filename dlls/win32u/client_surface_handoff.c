@@ -691,7 +691,13 @@ void client_surface_handoff_retire_closed( struct client_surface *surface )
 /* The caller removed a completion token while holding present_lock. */
 void client_surface_handoff_completed( struct client_surface *surface )
 {
-    if (surface->handoff->release_pending &&
+    /* A failed newer frame can leave an independent completed image cached.
+     * Its validity does not keep a revoked transport alive: the last token
+     * must retire that channel even when no target update requested release.
+     * release_handoff still accounts for native submission and source waiters. */
+    if ((surface->handoff->release_pending ||
+         (surface->handoff->channel &&
+          __atomic_load_n( &surface->handoff->channel->closed, __ATOMIC_ACQUIRE ))) &&
         !InterlockedCompareExchange( &surface->external_completion_count, 0, 0 ))
         client_surface_release_handoff( surface );
     /* An abandoned image or the last completion can also satisfy the
