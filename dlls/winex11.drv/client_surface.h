@@ -31,16 +31,11 @@ struct x11drv_client_surface_completion
 
 struct x11drv_client_source_frame
 {
-    /* A snapshot reference owns pixmap when non-NULL; the mutable native
-     * allocation/import fields below are then empty. */
+    /* The snapshot owns native storage and its pending GPU write. The source
+     * slot owns a reference until its checked consumer read completes. */
     struct x11drv_client_snapshot *snapshot;
     Pixmap pixmap;
-    GC gc;
     unsigned int width, height, depth;
-    UINT64 bytes;
-    void *image;
-    void (*release_image)( void *image );
-    BOOL (*image_ready)( void *image );
     BOOL gpu_copy; /* this reservation uses the image's independently owned GPU fence */
 };
 
@@ -56,11 +51,9 @@ struct x11drv_client_surface
     VisualID source_visual;
     unsigned int source_depth;
     BOOL direct_snapshot;
-    Pixmap gpu_snapshot;
-    SIZE gpu_snapshot_size;
+    struct x11drv_client_snapshot *gpu_snapshot;
     struct x11drv_client_source_frame sources[CLIENT_SURFACE_SOURCE_FRAME_COUNT];
     struct x11drv_client_surface_retirement *handoff_retirement;
-    struct x11drv_client_surface_retirement *snapshot_retirement;
     struct x11drv_client_surface_completion completion;
     BOOL manual_redirect;   /* client drawable is manually XComposite redirected */
 
@@ -87,6 +80,16 @@ extern SIZE x11drv_client_snapshot_size( const struct x11drv_client_snapshot *sn
 extern void x11drv_client_snapshot_release_staging( struct x11drv_client_snapshot *snapshot );
 extern struct x11drv_client_snapshot *x11drv_client_snapshot_share( struct x11drv_client_snapshot *snapshot );
 extern void x11drv_client_snapshot_release( struct x11drv_client_snapshot *snapshot );
+struct x11drv_client_snapshot_image_ops
+{
+    BOOL (*ready)( void *image );
+    void (*destroy)( void *image );
+};
+extern BOOL x11drv_client_snapshot_prepare_storage( struct x11drv_client_snapshot **storage,
+                                                   unsigned int width, unsigned int height, unsigned int depth );
+extern void *x11drv_client_snapshot_get_image( struct x11drv_client_snapshot *snapshot );
+extern void x11drv_client_snapshot_set_image( struct x11drv_client_snapshot *snapshot, void *image,
+                                              const struct x11drv_client_snapshot_image_ops *ops );
 /* Called after handoff retirement admission. Preparation reserves storage
  * charges without native I/O; read only uses the transferred private object. */
 extern BOOL x11drv_client_snapshot_prepare_native( struct x11drv_client_snapshot **storage, Window window,
@@ -100,7 +103,8 @@ extern BOOL x11drv_client_surface_snapshot( struct client_surface *client, const
 extern void x11drv_client_surface_release_snapshot_staging( struct x11drv_client_surface *surface );
 extern void x11drv_client_surface_trace_image( const char *event, const char *kind,
                                               Display *display, Pixmap pixmap, UINT64 bytes );
-extern void x11drv_client_surface_set_gpu_snapshot( struct x11drv_client_surface *surface, Pixmap pixmap );
+extern void x11drv_client_surface_set_gpu_snapshot( struct x11drv_client_surface *surface,
+                                                   struct x11drv_client_snapshot *snapshot );
 extern BOOL x11drv_client_surface_prepare_retirement( struct x11drv_client_surface *surface );
 extern void x11drv_client_surface_retire_handoff( struct client_surface *client,
                                                  const struct client_surface_handoff_lease *lease );

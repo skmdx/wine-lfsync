@@ -131,20 +131,16 @@ void x11drv_client_surface_release_snapshot_staging( struct x11drv_client_surfac
 
 void x11drv_client_surface_release_source_frame( struct x11drv_client_source_frame *frame )
 {
-    if (frame->snapshot)
-    {
-        assert( !frame->gc && !frame->image && !frame->bytes );
-        x11drv_client_snapshot_release( frame->snapshot );
-    }
-    else
-    {
-        if (frame->image) frame->release_image( frame->image );
-        if (frame->gc) XFreeGC( gdi_display, frame->gc );
-        if (frame->pixmap) XFreePixmap( gdi_display, frame->pixmap );
-        x11drv_client_surface_trace_image( "free", "producer_slot", gdi_display, frame->pixmap, frame->bytes );
-        client_surface_release_memory( CLIENT_SURFACE_MEMORY_SOURCE, frame->bytes );
-    }
+    x11drv_client_snapshot_release( frame->snapshot );
     memset( frame, 0, sizeof(*frame) );
+}
+
+void x11drv_client_surface_set_gpu_snapshot( struct x11drv_client_surface *surface,
+                                            struct x11drv_client_snapshot *snapshot )
+{
+    if (surface->gpu_snapshot == snapshot) return;
+    x11drv_client_snapshot_release( surface->gpu_snapshot );
+    surface->gpu_snapshot = snapshot ? x11drv_client_snapshot_share( snapshot ) : NULL;
 }
 
 static void x11drv_client_surface_destroy( struct client_surface *client )
@@ -159,11 +155,7 @@ static void x11drv_client_surface_destroy( struct client_surface *client )
     x11drv_client_surface_destroy_retirement( surface );
     x11drv_client_surface_release_snapshot_staging( surface );
     for (i = 0; i < ARRAY_SIZE(surface->sources); ++i)
-    {
-        x11drv_client_surface_trace_image( "retire", "producer_slot", gdi_display,
-                                          surface->sources[i].pixmap, surface->sources[i].bytes );
         x11drv_client_surface_release_source_frame( surface->sources + i );
-    }
     x11drv_client_snapshot_release( surface->snapshot );
     if (surface->colormap != default_colormap) XFreeColormap( gdi_display, surface->colormap );
     if (surface->window) destroy_client_window( hwnd, surface->window );
@@ -307,74 +299,19 @@ static BOOL x11drv_client_surface_update( struct client_surface *client,
     return TRUE;
 }
 
-static int client_surface_clip_error( Display *display, XErrorEvent *event, void *arg )
-{
-    *(int *)arg = event->error_code;
-    return TRUE;
-}
-
-static void discard_client_surface_source( Pixmap *pixmap, GC *gc, UINT64 *bytes, const char *kind )
-{
-    int error = 0;
-
-    /* Xlib may return handles before the server reports BadAlloc. Consume
-     * cleanup errors locally and never cache a failed allocation for reuse. */
-    x11drv_client_surface_trace_image( "retire", kind, gdi_display, *pixmap, *bytes );
-    X11DRV_expect_error( gdi_display, client_surface_clip_error, &error );
-    if (*gc) XFreeGC( gdi_display, *gc );
-    if (*pixmap) XFreePixmap( gdi_display, *pixmap );
-    XSync( gdi_display, False );
-    X11DRV_check_error();
-    x11drv_client_surface_trace_image( "free", kind, gdi_display, *pixmap, *bytes );
-    *gc = NULL;
-    *pixmap = 0;
-    client_surface_release_memory( CLIENT_SURFACE_MEMORY_SOURCE, *bytes );
-    *bytes = 0;
-}
-
 struct x11drv_client_source_frame *x11drv_client_surface_get_source(
     struct client_surface *client, unsigned int index, unsigned int width,
     unsigned int height, unsigned int depth )
 {
     struct x11drv_client_surface *surface = impl_from_client_surface( client );
     struct x11drv_client_source_frame *frame = &surface->sources[index];
-    UINT64 bytes = (UINT64)width * height * (depth > 16 ? 4 : depth > 8 ? 2 : 1);
-    struct x11drv_client_source_frame next = {.width = width, .height = height, .depth = depth, .bytes = bytes};
-    BOOL preserve;
-    int error = 0;
 
     assert( index < ARRAY_SIZE(surface->sources) );
-    /* A mutable GPU import cannot borrow an immutable snapshot's Pixmap.
-     * Only the reserved source slot's reference is released here. */
-    if (frame->snapshot) x11drv_client_surface_release_source_frame( frame );
-    preserve = frame->pixmap && frame->pixmap == surface->gpu_snapshot &&
-               frame->width >= width && frame->height >= height && frame->depth == depth;
-    /* A timed-out completion returns the control token, but does not make
-     * storage that the GPU is still writing reusable. */
-    if (frame->image && frame->image_ready && !frame->image_ready( frame->image )) return NULL;
-    if (frame->pixmap && frame->width == width && frame->height == height && frame->depth == depth)
-        return frame;
-    if (!client_surface_reserve_memory( CLIENT_SURFACE_MEMORY_SOURCE, bytes )) return NULL;
-    X11DRV_expect_error( gdi_display, client_surface_clip_error, &error );
-    next.pixmap = XCreatePixmap( gdi_display, root_window, width, height, depth );
-    if (preserve && (next.gc = XCreateGC( gdi_display, next.pixmap, 0, NULL )))
-        XCopyArea( gdi_display, frame->pixmap, next.pixmap, next.gc, 0, 0, width, height, 0, 0 );
-    XSync( gdi_display, False );
-    X11DRV_check_error();
-    if (error || !next.pixmap || (preserve && !next.gc))
-    {
-        discard_client_surface_source( &next.pixmap, &next.gc, &next.bytes, NULL );
-        return NULL;
-    }
-    x11drv_client_surface_trace_image( "acquire", "producer_slot", gdi_display, next.pixmap, next.bytes );
-    if (frame->pixmap == surface->gpu_snapshot)
-    {
-        x11drv_client_surface_set_gpu_snapshot( surface, preserve ? next.pixmap : 0 );
-        surface->gpu_snapshot_size = (SIZE){width, height};
-    }
-    x11drv_client_surface_trace_image( "retire", "producer_slot", gdi_display, frame->pixmap, frame->bytes );
-    x11drv_client_surface_release_source_frame( frame );
-    *frame = next;
+    if (!x11drv_client_snapshot_prepare_storage( &frame->snapshot, width, height, depth )) return NULL;
+    frame->pixmap = x11drv_client_snapshot_pixmap( frame->snapshot );
+    frame->width = width;
+    frame->height = height;
+    frame->depth = depth;
     return frame;
 }
 
@@ -410,18 +347,20 @@ static BOOL x11drv_client_surface_handoff_prepare(
     {
         struct x11drv_client_source_frame *frame = surface->sources + index;
 
-        assert( !frame->gc && !frame->image && !frame->bytes );
         if (!x11drv_client_snapshot_prepare_native( &frame->snapshot, surface->window, width, height,
                                                      surface->source_depth, image->target_epoch )) return FALSE;
         frame->pixmap = x11drv_client_snapshot_pixmap( frame->snapshot );
     }
     /* Admission proved the previous publication's checked read has finished.
      * Return this reference before upload chooses writable storage, so an
-     * otherwise unreferenced working snapshot can be reused without a copy. */
-    else if (surface->sources[index].snapshot)
+     * otherwise unreferenced working snapshot can be reused without a copy.
+     * A GPU import instead keeps its source-slot storage; preparing that
+     * storage separately checks its pending write before allowing reuse. */
+    else if (surface->sources[index].snapshot &&
+             !x11drv_client_snapshot_get_image( surface->sources[index].snapshot ))
         x11drv_client_surface_release_source_frame( surface->sources + index );
     image->source = native ? surface->window : x11drv_client_snapshot_pixmap( surface->snapshot );
-    if (surface->gpu_snapshot) image->source = surface->gpu_snapshot;
+    if (surface->gpu_snapshot) image->source = x11drv_client_snapshot_pixmap( surface->gpu_snapshot );
     image->source_visual = native ? surface->source_visual : default_visual.visualid;
     image->flags = CLIENT_SURFACE_HANDOFF_NATIVE_X11 | CLIENT_SURFACE_HANDOFF_FULL_DAMAGE;
     image->width = width;
@@ -447,7 +386,7 @@ static BOOL apply_native_snapshot( void *context, struct client_surface *client,
     struct x11drv_client_surface *surface = impl_from_client_surface( client );
     struct x11drv_client_source_frame *frame = surface->sources + present->handoff_index;
 
-    assert( !frame->pixmap && !frame->snapshot && !frame->image );
+    assert( !frame->pixmap && !frame->snapshot );
     frame->snapshot = x11drv_client_snapshot_share( context );
     frame->pixmap = x11drv_client_snapshot_pixmap( context );
     frame->width = present->handoff_source->width;
@@ -470,7 +409,7 @@ static BOOL x11drv_client_surface_handoff_capture( struct client_surface *client
     if (!usexcomposite || surface->direct_snapshot) return TRUE;
     if (!frame->snapshot) return FALSE;
     if (!x11drv_client_snapshot_prepare_read( &frame->snapshot )) return FALSE;
-    assert( !frame->gc && !frame->image && !frame->bytes && !frame->gpu_copy );
+    assert( !frame->gpu_copy );
     capture->context = frame->snapshot;
     capture->read = x11drv_client_snapshot_read_native;
     capture->apply = apply_native_snapshot;
@@ -499,14 +438,13 @@ static BOOL x11drv_client_surface_handoff_complete( struct client_surface *clien
     struct x11drv_client_surface *surface = impl_from_client_surface( client );
     struct x11drv_client_source_frame *frame = &surface->sources[index];
     BOOL native = usexcomposite && !surface->direct_snapshot;
-    unsigned int depth = native ? surface->source_depth : default_visual.depth;
-    Pixmap source = x11drv_client_snapshot_pixmap( surface->snapshot );
-    int error = 0;
+    struct x11drv_client_snapshot *snapshot;
+    SIZE size;
 
     assert( index < ARRAY_SIZE(surface->sources) );
     if (native)
     {
-        SIZE size = x11drv_client_snapshot_size( frame->snapshot );
+        size = x11drv_client_snapshot_size( frame->snapshot );
 
         if (!frame->snapshot || size.cx != image->width || size.cy != image->height) return FALSE;
         image->source = frame->pixmap;
@@ -519,64 +457,30 @@ static BOOL x11drv_client_surface_handoff_complete( struct client_surface *clien
     if (frame->gpu_copy)
     {
         image->source = frame->pixmap;
-        x11drv_client_surface_set_gpu_snapshot( surface, frame->pixmap );
-        surface->gpu_snapshot_size = (SIZE){image->width, image->height};
+        x11drv_client_surface_set_gpu_snapshot( surface, frame->snapshot );
         image->source_visual = default_visual.visualid;
         image->flags |= CLIENT_SURFACE_HANDOFF_COPY_SOURCE;
         return TRUE;
     }
-    if (!native && !surface->gpu_snapshot && surface->snapshot && (!frame->pixmap || frame->snapshot))
+    snapshot = surface->gpu_snapshot ? surface->gpu_snapshot : surface->snapshot;
+    size = x11drv_client_snapshot_size( snapshot );
+    if (!snapshot || size.cx < image->width || size.cy < image->height) return FALSE;
+    if (!surface->gpu_snapshot && (size.cx != image->width || size.cy != image->height)) return FALSE;
+    if (frame->snapshot != snapshot)
     {
-        SIZE size = x11drv_client_snapshot_size( surface->snapshot );
-
-        if (size.cx != image->width || size.cy != image->height) return FALSE;
-        if (frame->snapshot != surface->snapshot)
-        {
-            x11drv_client_surface_release_source_frame( frame );
-            frame->snapshot = x11drv_client_snapshot_share( surface->snapshot );
-        }
-        frame->pixmap = source;
-        frame->width = image->width;
-        frame->height = image->height;
-        frame->depth = default_visual.depth;
-        image->source = source;
-        image->source_visual = default_visual.visualid;
-        image->flags |= CLIENT_SURFACE_HANDOFF_COPY_SOURCE;
-        /* Upload already completed its native synchronization. The slot now
-         * owns immutable pixels until consumer acknowledgement or retirement;
-         * neither target changes nor the next upload can invalidate them. */
-        trace_snapshot_freeze( client, image, index );
-        return TRUE;
+        x11drv_client_surface_release_source_frame( frame );
+        frame->snapshot = x11drv_client_snapshot_share( snapshot );
     }
-    if (!(frame = x11drv_client_surface_get_source( client, index, image->width, image->height, depth )))
-        return FALSE;
-    if (surface->gpu_snapshot && surface->gpu_snapshot_size.cx >= image->width &&
-        surface->gpu_snapshot_size.cy >= image->height)
-        source = surface->gpu_snapshot;
-    X11DRV_expect_error( gdi_display, client_surface_clip_error, &error );
-    if (!frame->gc) frame->gc = XCreateGC( gdi_display, frame->pixmap, 0, NULL );
-    if (source && frame->gc)
-        XCopyArea( gdi_display, source, frame->pixmap, frame->gc, 0, 0, image->width, image->height, 0, 0 );
-    /* This boundary proves the source image is immutable before READY, not
-     * merely that its copy request was queued. The other slot remains usable
-     * while the owner reads this independent pixmap. */
-    XSync( gdi_display, False );
-    X11DRV_check_error();
-    if (error || !source || !frame->gc)
-    {
-        if (frame->pixmap == surface->gpu_snapshot) x11drv_client_surface_set_gpu_snapshot( surface, 0 );
-        if (frame->image) frame->release_image( frame->image );
-        frame->image = NULL;
-        discard_client_surface_source( &frame->pixmap, &frame->gc, &frame->bytes, "producer_slot" );
-        return FALSE;
-    }
-    if (source == surface->gpu_snapshot)
-    {
-        x11drv_client_surface_set_gpu_snapshot( surface, frame->pixmap );
-        surface->gpu_snapshot_size = (SIZE){image->width, image->height};
-    }
+    frame->pixmap = x11drv_client_snapshot_pixmap( snapshot );
+    frame->width = image->width;
+    frame->height = image->height;
+    frame->depth = default_visual.depth;
     image->source = frame->pixmap;
+    image->source_visual = default_visual.visualid;
     image->flags |= CLIENT_SURFACE_HANDOFF_COPY_SOURCE;
+    /* Cached GPU and CPU images have identical read ownership. Replaying an
+     * already completed image needs a reference, not another native copy. */
+    trace_snapshot_freeze( client, image, index );
     return TRUE;
 }
 

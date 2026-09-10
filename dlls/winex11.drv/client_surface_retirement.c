@@ -32,7 +32,6 @@ WINE_DECLARE_DEBUG_CHANNEL(csperf);
 struct x11drv_client_surface_retirement
 {
     struct list entry;
-    LONG refs;
     void *view;
     struct client_surface_handoff_channel *channel;
     UINT64 identity, cookie;
@@ -75,22 +74,18 @@ static void init_retirement_cond(void)
 static void release_source_retirement( struct x11drv_client_surface_retirement *retirement )
 {
     unsigned int i;
-    BOOL flush = FALSE;
 
-    if (InterlockedDecrement( &retirement->refs )) return;
     assert( !retirement->view );
     for (i = 0; i < ARRAY_SIZE(retirement->sources); ++i)
     {
         struct x11drv_client_source_frame *frame = retirement->sources + i;
         Pixmap pixmap = frame->pixmap;
 
-        flush |= !frame->snapshot && (frame->pixmap || frame->gc);
         x11drv_client_surface_release_source_frame( frame );
         if (pixmap)
             TRACE( "released retired source reference %#lx identity %s cookie %s\n", pixmap,
                    wine_dbgstr_longlong( retirement->identity ), wine_dbgstr_longlong( retirement->cookie ) );
     }
-    if (flush) XFlush( gdi_display );
     /* These source references are released. A shared snapshot's last release
      * queues its independently charged storage until native destruction; this
      * mapping receipt does not assert native or physical image destruction. */
@@ -100,16 +95,6 @@ static void release_source_retirement( struct x11drv_client_surface_retirement *
     pthread_mutex_unlock( &retirement_lock );
     client_surface_release_memory( CLIENT_SURFACE_MEMORY_STAGING, sizeof(*retirement) );
     free( retirement );
-}
-
-void x11drv_client_surface_set_gpu_snapshot( struct x11drv_client_surface *surface, Pixmap pixmap )
-{
-    struct x11drv_client_surface_retirement *retirement = surface->snapshot_retirement;
-
-    if (surface->gpu_snapshot == pixmap) return;
-    surface->gpu_snapshot = pixmap;
-    surface->snapshot_retirement = NULL;
-    if (retirement) release_source_retirement( retirement );
 }
 
 static void wake_retiring_source_owner( struct x11drv_client_surface_retirement *retirement )
@@ -133,7 +118,7 @@ static BOOL retire_source_mapping( struct x11drv_client_surface_retirement *reti
 {
     struct client_surface_handoff_shared *shared = retirement->view;
     struct client_surface_handoff_channel *channel = retirement->channel;
-    unsigned int i, index = channel - shared->channels;
+    unsigned int index = channel - shared->channels;
     BOOL ready;
 
     /* Closing prevents new reads without pretending that a checked X11 copy
@@ -148,12 +133,6 @@ static BOOL retire_source_mapping( struct x11drv_client_surface_retirement *reti
               CLIENT_SURFACE_HANDOFF_ENDPOINT_CONSUMER) ||
             __atomic_load_n( &channel->consumer_sequence, __ATOMIC_ACQUIRE ) ==
             __atomic_load_n( &channel->producer_sequence, __ATOMIC_ACQUIRE );
-    for (i = 0; i < ARRAY_SIZE(retirement->sources); ++i)
-    {
-        struct x11drv_client_source_frame *frame = retirement->sources + i;
-
-        if (frame->image && frame->image_ready && !frame->image_ready( frame->image )) ready = FALSE;
-    }
     if (!ready) return FALSE;
 
     TRACE( "releasing source mapping identity %s cookie %s after readers completed, view %p fd %d\n",
@@ -262,7 +241,6 @@ BOOL x11drv_client_surface_prepare_retirement( struct x11drv_client_surface *sur
     if (retirement_count == MAX_SOURCE_RETIREMENTS) goto failed_locked;
     ++retirement_count;
     pthread_mutex_unlock( &retirement_lock );
-    retirement->refs = 1;
     surface->handoff_retirement = retirement;
     return TRUE;
 
@@ -302,22 +280,12 @@ void x11drv_client_surface_retire_handoff( struct client_surface *client,
     memcpy( retirement->sources, surface->sources, sizeof(surface->sources) );
     memset( surface->sources, 0, sizeof(surface->sources) );
     surface->handoff_retirement = NULL;
-    for (i = 0; i < ARRAY_SIZE(retirement->sources); ++i)
-        if (surface->gpu_snapshot && surface->gpu_snapshot == retirement->sources[i].pixmap)
-        {
-            assert( !surface->snapshot_retirement );
-            InterlockedIncrement( &retirement->refs );
-            surface->snapshot_retirement = retirement;
-            break;
-        }
     TRACE( "retiring source mapping identity %s cookie %s view %p fd %d\n",
            wine_dbgstr_longlong( retirement->identity ), wine_dbgstr_longlong( retirement->cookie ),
            retirement->view, retirement->ready_fd );
     trace_source_retirement( "source_retire_begin", client->hwnd, retirement );
     for (i = 0; i < ARRAY_SIZE(retirement->sources); ++i)
     {
-        x11drv_client_surface_trace_image( "retire", "producer_slot", gdi_display,
-                                          retirement->sources[i].pixmap, retirement->sources[i].bytes );
         if (retirement->sources[i].pixmap)
             TRACE( "retaining source pixmap %#lx identity %s cookie %s\n", retirement->sources[i].pixmap,
                    wine_dbgstr_longlong( retirement->identity ), wine_dbgstr_longlong( retirement->cookie ) );

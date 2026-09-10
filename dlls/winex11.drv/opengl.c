@@ -2016,6 +2016,12 @@ static void release_snapshot_image( void *context )
     free( image );
 }
 
+static const struct x11drv_client_snapshot_image_ops snapshot_image_ops =
+{
+    snapshot_image_ready,
+    release_snapshot_image,
+};
+
 /* Runs in the FBO wrapper's internal context, after its color/gamma blit.
  * Return zero for an unsupported import, negative for a failed GPU copy. */
 static int snapshot_client_surface_gpu( struct opengl_drawable *base,
@@ -2044,10 +2050,9 @@ static int snapshot_client_surface_gpu( struct opengl_drawable *base,
     pthread_mutex_lock( &base->client->present_lock );
     frame = x11drv_client_surface_get_source( base->client, present->handoff_index,
                                               source->width, source->height, default_visual.depth );
-    if (frame && surface->gpu_snapshot == frame->pixmap) x11drv_client_surface_set_gpu_snapshot( surface, 0 );
     pthread_mutex_unlock( &base->client->present_lock );
     if (!frame) return -1;
-    if (!(image = frame->image))
+    if (!(image = x11drv_client_snapshot_get_image( frame->snapshot )))
     {
         if (!(image = calloc( 1, sizeof(*image) ))) return -1;
         image->image = snapshot_create_image( egl->display, EGL_NO_CONTEXT, EGL_NATIVE_PIXMAP_KHR,
@@ -2058,9 +2063,7 @@ static int snapshot_client_surface_gpu( struct opengl_drawable *base,
             free( image );
             return 0;
         }
-        frame->image = image;
-        frame->release_image = release_snapshot_image;
-        frame->image_ready = snapshot_image_ready;
+        x11drv_client_snapshot_set_image( frame->snapshot, image, &snapshot_image_ops );
         TRACE( "imported EGL source pixmap %#lx size %ux%u from visual %#lx to %#lx\n",
                frame->pixmap, frame->width, frame->height, surface->source_visual, default_visual.visualid );
     }
