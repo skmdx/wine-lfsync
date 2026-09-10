@@ -366,9 +366,15 @@ BOOL x11drv_client_surface_snapshot( struct client_surface *client, struct clien
     BOOL ret;
 
     assert( !present->capture.context );
+    snapshot = NULL;
     pthread_mutex_lock( &client->present_lock );
-    snapshot = surface->snapshot;
-    surface->snapshot = NULL;
+    if (present->handoff_control)
+    {
+        struct x11drv_client_source_frame *frame = surface->sources + present->handoff_index;
+
+        snapshot = frame->snapshot;
+        memset( frame, 0, sizeof(*frame) );
+    }
     pthread_mutex_unlock( &client->present_lock );
     ret = x11drv_client_snapshot_upload( &snapshot, pixels, width, height, top_down, format );
     present->capture.context = snapshot;
@@ -402,12 +408,11 @@ static BOOL x11drv_client_surface_handoff_prepare(
                                                      surface->source_depth, image->target_epoch )) return FALSE;
         frame->pixmap = x11drv_client_snapshot_pixmap( frame->snapshot );
     }
-    /* Admission proved the previous publication's checked read has finished.
-     * Return this reference before upload chooses writable storage, so an
-     * otherwise unreferenced working snapshot can be reused without a copy.
-     * A GPU import instead keeps its source-slot storage; preparing that
-     * storage separately checks its pending write before allowing reuse. */
-    else if (surface->sources[index].snapshot &&
+    /* OpenGL (a nonzero pixel format) transfers this returned slot to its
+     * next CPU or GPU capture, keeping the completed cache independently.
+     * Vulkan instead owns working storage in its capture reservations; drop
+     * the consumed slot's reference before those choose writable storage. */
+    else if (!client->format && surface->sources[index].snapshot &&
              !x11drv_client_snapshot_get_image( surface->sources[index].snapshot ))
         x11drv_client_surface_release_source_frame( surface->sources + index );
     image->source = native ? surface->window : x11drv_client_snapshot_pixmap( surface->snapshot );
