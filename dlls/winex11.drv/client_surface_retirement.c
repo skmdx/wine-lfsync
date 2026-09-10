@@ -63,6 +63,7 @@ static pthread_cond_t retirement_cond;
 static pthread_once_t retirement_cond_once = PTHREAD_ONCE_INIT;
 static int retirement_cond_status;
 static struct list retirements = LIST_INIT( retirements );
+static struct list retired_resources = LIST_INIT( retired_resources );
 static unsigned int retirement_count;
 static BOOL retirement_started;
 
@@ -74,25 +75,25 @@ static void init_retirement_cond(void)
 static void release_source_retirement( struct x11drv_client_surface_retirement *retirement )
 {
     unsigned int i;
+    BOOL flush = FALSE;
 
     if (InterlockedDecrement( &retirement->refs )) return;
     assert( !retirement->view );
     for (i = 0; i < ARRAY_SIZE(retirement->sources); ++i)
     {
         struct x11drv_client_source_frame *frame = retirement->sources + i;
+        Pixmap pixmap = frame->pixmap;
 
-        if (frame->image) frame->release_image( frame->image );
-        if (frame->gc) XFreeGC( gdi_display, frame->gc );
-        if (frame->pixmap) XFreePixmap( gdi_display, frame->pixmap );
-        x11drv_client_surface_trace_image( "free", "producer_slot", gdi_display, frame->pixmap, frame->bytes );
-        if (frame->pixmap)
-            TRACE( "released retired source pixmap %#lx identity %s cookie %s\n", frame->pixmap,
+        flush |= !frame->snapshot && (frame->pixmap || frame->gc);
+        x11drv_client_surface_release_source_frame( frame );
+        if (pixmap)
+            TRACE( "released retired source reference %#lx identity %s cookie %s\n", pixmap,
                    wine_dbgstr_longlong( retirement->identity ), wine_dbgstr_longlong( retirement->cookie ) );
-        client_surface_release_memory( CLIENT_SURFACE_MEMORY_SOURCE, frame->bytes );
     }
-    XFlush( gdi_display );
-    /* The native image release callbacks and XFreePixmap calls returned;
-     * this does not assert that the X server or GPU freed physical memory. */
+    if (flush) XFlush( gdi_display );
+    /* These source references are released. A shared snapshot's last release
+     * queues its independently charged storage until native destruction; this
+     * mapping receipt does not assert native or physical image destruction. */
     trace_source_retirement( "source_retire_release", 0, retirement );
     pthread_mutex_lock( &retirement_lock );
     --retirement_count;
@@ -177,15 +178,24 @@ static BOOL retire_source_mapping( struct x11drv_client_surface_retirement *reti
 static void source_retirement_thread( void *context )
 {
     struct list pending = LIST_INIT( pending );
+    struct list resources = LIST_INIT( resources );
     struct x11drv_client_surface_retirement *retirement, *next;
+    struct x11drv_client_surface_retired_resource *resource, *next_resource;
 
     for (;;)
     {
         pthread_mutex_lock( &retirement_lock );
-        while (list_empty( &retirements )) pthread_cond_wait( &retirement_cond, &retirement_lock );
+        while (list_empty( &retirements ) && list_empty( &retired_resources ))
+            pthread_cond_wait( &retirement_cond, &retirement_lock );
         list_move_tail( &pending, &retirements );
+        list_move_tail( &resources, &retired_resources );
         pthread_mutex_unlock( &retirement_lock );
 
+        LIST_FOR_EACH_ENTRY_SAFE( resource, next_resource, &resources, struct x11drv_client_surface_retired_resource, entry )
+        {
+            list_remove( &resource->entry );
+            resource->release( resource );
+        }
         LIST_FOR_EACH_ENTRY_SAFE( retirement, next, &pending, struct x11drv_client_surface_retirement, entry )
         {
             if (!retire_source_mapping( retirement )) continue;
@@ -196,10 +206,23 @@ static void source_retirement_thread( void *context )
         if (!list_empty( &pending ))
         {
             list_move_tail( &retirements, &pending );
-            client_surface_cond_timedwait( &retirement_cond, &retirement_lock, 10 );
+            if (list_empty( &retired_resources ))
+                client_surface_cond_timedwait( &retirement_cond, &retirement_lock, 10 );
         }
         pthread_mutex_unlock( &retirement_lock );
     }
+}
+
+void x11drv_client_surface_retire_resource( struct x11drv_client_surface_retired_resource *resource )
+{
+    pthread_mutex_lock( &retirement_lock );
+    /* A shared image first acquired a frame reference after handoff_prepare
+     * admitted this worker. Its embedded queue entry needs no new capacity;
+     * the entire image remains charged until the callback actually returns. */
+    assert( retirement_started );
+    list_add_tail( &retired_resources, &resource->entry );
+    pthread_cond_signal( &retirement_cond );
+    pthread_mutex_unlock( &retirement_lock );
 }
 
 BOOL x11drv_client_surface_prepare_retirement( struct x11drv_client_surface *surface )

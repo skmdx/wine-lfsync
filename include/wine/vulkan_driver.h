@@ -382,7 +382,8 @@ struct vulkan_driver_funcs
     /* The source contract covers the surface lifetime, including a later
      * DIRECT -> COMPOSITED transition. Querying it never allocates an image. */
     VkResult (*p_vulkan_surface_get_source)(struct client_surface *, VkFormat, struct vulkan_surface_source *);
-    /* A readback reservation exclusively owns its reusable backend image.
+    /* A readback reservation owns a reference to reusable backend storage.
+     * Readers can retain a completed image; read must then replace storage.
      * Read may block in native code and receives no surface state. Apply
      * exchanges that image with the surface's retained completed image;
      * it transfers ownership without native calls or resource destruction. */

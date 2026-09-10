@@ -129,7 +129,7 @@ static BOOL X11DRV_vulkan_surface_apply_snapshot( struct client_surface *client,
     struct x11drv_client_surface *surface = impl_from_client_surface( client );
     struct x11drv_client_snapshot *snapshot = (struct x11drv_client_snapshot *)*storage;
 
-    /* Both sides exclusively own their image. The validated FIFO capture
+    /* Both sides own an image reference. The validated FIFO capture
      * exchanges them without native work or releasing resources under the
      * surface locks. The reservation can recycle the previous image only
      * after this completion's final release. Retained pixels remain valid
@@ -147,7 +147,7 @@ static BOOL X11DRV_vulkan_surface_apply_snapshot( struct client_surface *client,
 
 static void X11DRV_vulkan_surface_destroy_snapshot( struct vulkan_surface_snapshot *snapshot )
 {
-    x11drv_client_snapshot_destroy( (struct x11drv_client_snapshot *)snapshot );
+    x11drv_client_snapshot_release( (struct x11drv_client_snapshot *)snapshot );
 }
 
 static void X11DRV_map_instance_extensions( struct vulkan_instance_extensions *extensions )

@@ -31,6 +31,9 @@ struct x11drv_client_surface_completion
 
 struct x11drv_client_source_frame
 {
+    /* A snapshot reference owns pixmap when non-NULL; the mutable native
+     * allocation/import fields below are then empty. */
+    struct x11drv_client_snapshot *snapshot;
     Pixmap pixmap;
     GC gc;
     unsigned int width, height, depth;
@@ -75,15 +78,17 @@ struct x11drv_snapshot_format
     unsigned int red_mask, green_mask, blue_mask, alpha_mask;
 };
 extern const struct x11drv_snapshot_format x11drv_snapshot_rgba8;
-/* The caller exclusively owns this reusable image. Upload and destruction
- * may enter native I/O; inspecting or exchanging a completed image cannot. */
+/* Upload replaces shared storage rather than modifying a published image.
+ * Sharing requires an admitted handoff retirement; its last release only
+ * queues native destruction. Unpublished private storage can die inline. */
 extern BOOL x11drv_client_snapshot_upload( struct x11drv_client_snapshot **snapshot, const BYTE *pixels,
                                           unsigned int width, unsigned int height, BOOL top_down,
                                           const struct x11drv_snapshot_format *format );
 extern Pixmap x11drv_client_snapshot_pixmap( const struct x11drv_client_snapshot *snapshot );
 extern SIZE x11drv_client_snapshot_size( const struct x11drv_client_snapshot *snapshot );
 extern void x11drv_client_snapshot_release_staging( struct x11drv_client_snapshot *snapshot );
-extern void x11drv_client_snapshot_destroy( struct x11drv_client_snapshot *snapshot );
+extern struct x11drv_client_snapshot *x11drv_client_snapshot_share( struct x11drv_client_snapshot *snapshot );
+extern void x11drv_client_snapshot_release( struct x11drv_client_snapshot *snapshot );
 extern BOOL x11drv_client_surface_snapshot( struct client_surface *client, const BYTE *pixels,
                                             unsigned int width, unsigned int height,
                                             BOOL top_down, const struct x11drv_snapshot_format *format );
@@ -95,6 +100,17 @@ extern BOOL x11drv_client_surface_prepare_retirement( struct x11drv_client_surfa
 extern void x11drv_client_surface_retire_handoff( struct client_surface *client,
                                                  const struct client_surface_handoff_lease *lease );
 extern void x11drv_client_surface_destroy_retirement( struct x11drv_client_surface *surface );
+extern void x11drv_client_surface_release_source_frame( struct x11drv_client_source_frame *frame );
+
+/* Embedded in an already charged source resource. The admitted retirement
+ * worker owns it from enqueue until release returns; enqueue never allocates
+ * or performs native I/O, and does not return the resource's memory charge. */
+struct x11drv_client_surface_retired_resource
+{
+    struct list entry;
+    void (*release)( struct x11drv_client_surface_retired_resource *resource );
+};
+extern void x11drv_client_surface_retire_resource( struct x11drv_client_surface_retired_resource *resource );
 extern struct x11drv_client_source_frame *x11drv_client_surface_get_source(
     struct client_surface *client, unsigned int index, unsigned int width,
     unsigned int height, unsigned int depth );

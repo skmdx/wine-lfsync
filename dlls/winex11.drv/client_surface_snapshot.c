@@ -15,6 +15,7 @@
 
 #include "config.h"
 
+#include <assert.h>
 #include <fcntl.h>
 
 #include "client_surface.h"
@@ -23,6 +24,9 @@ WINE_DEFAULT_DEBUG_CHANNEL(x11drv);
 
 struct x11drv_client_snapshot
 {
+    struct x11drv_client_surface_retired_resource retirement;
+    LONG refs;
+    BOOL shared;
     struct x11drv_error_handler errors;
     Display *display;
     Pixmap pixmap;
@@ -61,7 +65,7 @@ void x11drv_client_snapshot_release_staging( struct x11drv_client_snapshot *snap
     snapshot->image = NULL;
 }
 
-void x11drv_client_snapshot_destroy( struct x11drv_client_snapshot *snapshot )
+static void destroy_snapshot( struct x11drv_client_snapshot *snapshot )
 {
     if (!snapshot) return;
     x11drv_client_snapshot_release_staging( snapshot );
@@ -83,6 +87,30 @@ void x11drv_client_snapshot_destroy( struct x11drv_client_snapshot *snapshot )
     client_surface_release_memory( CLIENT_SURFACE_MEMORY_SOURCE, snapshot->bytes );
     client_surface_release_memory( CLIENT_SURFACE_MEMORY_STAGING, sizeof(*snapshot) );
     free( snapshot );
+}
+
+static void release_retired_snapshot( struct x11drv_client_surface_retired_resource *resource )
+{
+    struct x11drv_client_snapshot *snapshot = CONTAINING_RECORD( resource, struct x11drv_client_snapshot, retirement );
+
+    assert( !snapshot->refs );
+    destroy_snapshot( snapshot );
+}
+
+struct x11drv_client_snapshot *x11drv_client_snapshot_share( struct x11drv_client_snapshot *snapshot )
+{
+    /* A frame holds this reference until its checked consumer read finishes.
+     * The retained surface image and a working reservation own separate refs. */
+    snapshot->shared = TRUE;
+    InterlockedIncrement( &snapshot->refs );
+    return snapshot;
+}
+
+void x11drv_client_snapshot_release( struct x11drv_client_snapshot *snapshot )
+{
+    if (!snapshot || InterlockedDecrement( &snapshot->refs )) return;
+    if (snapshot->shared) x11drv_client_surface_retire_resource( &snapshot->retirement );
+    else destroy_snapshot( snapshot );
 }
 
 static BOOL snapshot_create_image( struct x11drv_client_snapshot *snapshot )
@@ -127,6 +155,8 @@ static struct x11drv_client_snapshot *snapshot_create( unsigned int width, unsig
         return NULL;
     }
     snapshot->size = (SIZE){width, height};
+    snapshot->refs = 1;
+    snapshot->retirement.release = release_retired_snapshot;
     if (!client_surface_reserve_memory( CLIENT_SURFACE_MEMORY_SOURCE, bytes )) goto failed;
     snapshot->bytes = bytes;
     if (!(snapshot->display = XOpenDisplay( DisplayString( gdi_display ) ))) goto failed;
@@ -147,7 +177,7 @@ static struct x11drv_client_snapshot *snapshot_create( unsigned int width, unsig
     return snapshot;
 
 failed:
-    x11drv_client_snapshot_destroy( snapshot );
+    x11drv_client_snapshot_release( snapshot );
     return NULL;
 }
 
@@ -165,8 +195,8 @@ static unsigned long snapshot_component( unsigned int pixel, unsigned int source
             (source_mask >> source_shift)) << shift;
 }
 
-/* No surface or target state is borrowed by this operation. Its sole owner
- * may exchange a completed snapshot, but cannot upload into a borrowed one. */
+/* No surface or target state is borrowed by this operation. A sole owner may
+ * reuse storage; another reference instead requires an independent image. */
 BOOL x11drv_client_snapshot_upload( struct x11drv_client_snapshot **storage, const BYTE *pixels,
                                     unsigned int width, unsigned int height, BOOL top_down,
                                     const struct x11drv_snapshot_format *format )
@@ -178,10 +208,11 @@ BOOL x11drv_client_snapshot_upload( struct x11drv_client_snapshot **storage, con
                           ~(default_visual.red_mask | default_visual.green_mask | default_visual.blue_mask);
 
     if (!width || !height || width > 0xffff || height > 0xffff) return FALSE;
-    if (!snapshot || snapshot->size.cx != width || snapshot->size.cy != height)
+    if (!snapshot || snapshot->size.cx != width || snapshot->size.cy != height ||
+        InterlockedCompareExchange( &snapshot->refs, 0, 0 ) != 1)
     {
         if (!(next = snapshot_create( width, height ))) return FALSE;
-        x11drv_client_snapshot_destroy( snapshot );
+        x11drv_client_snapshot_release( snapshot );
         *storage = snapshot = next;
     }
     if (!snapshot_create_image( snapshot )) return FALSE;
@@ -233,7 +264,7 @@ BOOL x11drv_client_snapshot_upload( struct x11drv_client_snapshot **storage, con
     if (snapshot->error)
     {
         TRACE( "snapshot upload failed with X error %d\n", snapshot->error );
-        x11drv_client_snapshot_destroy( snapshot );
+        x11drv_client_snapshot_release( snapshot );
         *storage = NULL;
         return FALSE;
     }
