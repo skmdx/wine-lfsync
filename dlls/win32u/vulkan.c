@@ -165,6 +165,7 @@ struct device
     BOOL retirement_starting;
     BOOL retirement_shutdown;
     BOOL swapchain_maintenance1;
+    UINT64 completion_domain_base;
     struct vulkan_device obj;
 };
 
@@ -1089,6 +1090,11 @@ static VkResult win32u_vkCreateDevice( VkPhysicalDevice client_physical_device, 
     for (queue_count = 0, i = 0; i < create_info->queueCreateInfoCount; i++) queue_count += create_info->pQueueCreateInfos[i].queueCount;
 
     if (!(impl = calloc( 1, offsetof(struct device, obj.queues[queue_count]) ))) return VK_ERROR_OUT_OF_HOST_MEMORY;
+    if (queue_count && !(impl->completion_domain_base = client_surface_allocate_completion_domains( queue_count )))
+    {
+        free( impl );
+        return VK_ERROR_OUT_OF_HOST_MEMORY;
+    }
     if (pthread_mutex_init( &impl->retirement_lock, NULL ))
     {
         free( impl );
@@ -3227,7 +3233,8 @@ reserve_completions:
          * the submitting thread after its guest semaphore has been consumed. */
         res = VK_ERROR_OUT_OF_HOST_MEMORY;
         if (!reservations[index].job &&
-            !(reservations[index].job = client_surface_reserve_completion( swapchain->surface->client )))
+            !(reservations[index].job = client_surface_reserve_completion_domain( swapchain->surface->client,
+                impl_from_vulkan_device( device )->completion_domain_base + (queue - device->queues) )))
             goto reservation_failed;
         if (!start_swapchain_retirement_thread( impl_from_vulkan_device( device ) ))
             goto reservation_failed;
