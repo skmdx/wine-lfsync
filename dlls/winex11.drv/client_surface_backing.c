@@ -35,6 +35,7 @@
 #include "xpresent.h"
 #include "client_surface_xcb.h"
 #include "wine/server.h"
+#include "wine/rbtree.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(x11drv);
 WINE_DECLARE_DEBUG_CHANNEL(csperf);
@@ -276,9 +277,25 @@ struct client_surface_direct_completion
     UINT64 identity, scene_epoch, native_epoch;
 };
 
+/* The routing lifetime spans initial target preparation, replacement and the
+ * last resource release. Only refs/registry use compositor_mutex; the actor
+ * alone owns both FIFOs and the ready/parked list entry. */
+struct client_surface_compositor_queue
+{
+    struct rb_entry registry_entry;
+    struct client_surface_memory_scope memory;
+    struct client_surface_compositor_target *target;
+    struct list entry;
+    struct client_surface_compositor_job *head, **tail, *control_head, **control_tail;
+    HWND toplevel;
+    unsigned int refs, incoming;
+};
+
 struct client_surface_compositor_job
 {
     struct client_surface_compositor_job *next;
+    struct client_surface_compositor_queue *queue;
+    UINT64 sequence;
     struct client_surface_owner_notifications *notifications;
     enum client_surface_compositor_op op;
     HWND toplevel; /* Scalar routing key, never a borrowed window-data pointer. */
@@ -393,9 +410,20 @@ struct client_surface_compositor_job
 static struct client_surface_compositor_job *client_surface_compositor_head;
 static struct client_surface_compositor_job **client_surface_compositor_tail =
     &client_surface_compositor_head;
-/* Only the compositor thread touches pending jobs. Their submitting threads
- * retain ownership until completion, including while another target runs. */
-static struct client_surface_compositor_job *client_surface_compositor_pending;
+static int compare_client_surface_compositor_queue( const void *key, const struct rb_entry *entry )
+{
+    const struct client_surface_compositor_queue *queue =
+        CONTAINING_RECORD( entry, const struct client_surface_compositor_queue, registry_entry );
+    ULONG_PTR a = (ULONG_PTR)key, b = (ULONG_PTR)queue->toplevel;
+
+    return (a > b) - (a < b);
+}
+
+static struct rb_tree client_surface_compositor_queues = {compare_client_surface_compositor_queue};
+static struct list client_surface_compositor_ready = LIST_INIT( client_surface_compositor_ready );
+static struct list client_surface_compositor_parked = LIST_INIT( client_surface_compositor_parked );
+static UINT64 client_surface_compositor_sequence;
+static LONGLONG client_surface_compositor_domain;
 static UINT64 client_surface_native_update_serial;
 
 /* One object owns all notifications for a target lifetime. BEGIN and resumed
@@ -406,6 +434,7 @@ static UINT64 client_surface_native_update_serial;
 struct client_surface_owner_notifications
 {
     struct client_surface_owner_notifications *next;
+    struct client_surface_compositor_queue *queue;
     struct client_surface_memory_scope memory;
     HWND toplevel;
     UINT64 refs;
@@ -517,6 +546,13 @@ static BOOL publish_client_surface_handoff_generation( HWND toplevel, UINT64 gen
 static BOOL client_surface_present_on_compositor( struct client_surface_compositor_job *job );
 static BOOL process_client_surface_compositor_jobs(void);
 static void enqueue_client_surface_compositor_job( struct client_surface_compositor_job *job );
+
+static void wake_client_surface_compositor_queues(void)
+{
+    /* Native completion or a timer can make parked heads runnable. Move the
+     * list in constant time; dispatch still inspects at most 64 queue heads. */
+    list_move_tail( &client_surface_compositor_ready, &client_surface_compositor_parked );
+}
 static BOOL get_client_surface_window_extent( struct x11drv_win_data *data,
                                               unsigned int *width, unsigned int *height );
 #ifdef SONAME_LIBXPRESENT
@@ -599,20 +635,79 @@ static BOOL client_surface_copy_on_compositor( Drawable source, Drawable destina
         source, destination, source_x, source_y, destination_x, destination_y, width, height );
 }
 
-/* Only the compositor actor calls this allocator. Its native connection is
- * independent of producer GL/Vulkan domains. The allocation retains these
- * accounts after HWND detach and while a release job is still queued. */
+/* Routing storage is admitted before the actor starts. Its account uses the
+ * same stable native domain as the actor's images, never the GUI thread's
+ * execution domain. Each allocation retains it through actual retirement. */
 static void *alloc_client_surface_compositor_metadata( HWND toplevel, SIZE_T size,
                                                         struct client_surface_memory_scope *memory )
 {
     UINT64 domain;
     void *data;
 
-    if (!client_surface_get_execution_domain( &domain ) ||
-        !client_surface_memory_scope_init( memory, toplevel, domain )) return NULL;
+    pthread_mutex_lock( &client_surface_compositor_mutex );
+    if (!client_surface_compositor_domain)
+        client_surface_compositor_domain = client_surface_allocate_completion_domains( 1 );
+    domain = client_surface_compositor_domain;
+    pthread_mutex_unlock( &client_surface_compositor_mutex );
+    if (!domain || !client_surface_memory_scope_init( memory, toplevel, domain )) return NULL;
     if (!(data = client_surface_alloc_scoped_metadata( memory, 1, size )))
         client_surface_memory_scope_destroy( memory );
     return data;
+}
+
+static struct client_surface_compositor_queue *get_client_surface_compositor_queue( HWND toplevel )
+{
+    struct client_surface_compositor_queue *queue, *created = NULL;
+    struct client_surface_memory_scope memory = {0};
+    struct rb_entry *entry;
+
+    assert( toplevel );
+    pthread_mutex_lock( &client_surface_compositor_mutex );
+    for (;;)
+    {
+        if ((entry = rb_get( &client_surface_compositor_queues, toplevel )))
+        {
+            queue = CONTAINING_RECORD( entry, struct client_surface_compositor_queue, registry_entry );
+            ++queue->refs;
+            break;
+        }
+        if (created)
+        {
+            queue = created;
+            created = NULL;
+            rb_put( &client_surface_compositor_queues, toplevel, &queue->registry_entry );
+            break;
+        }
+        pthread_mutex_unlock( &client_surface_compositor_mutex );
+        if (!(created = alloc_client_surface_compositor_metadata( toplevel, sizeof(*created), &memory )))
+            return NULL;
+        created->memory = memory;
+        created->toplevel = toplevel;
+        created->refs = 1;
+        created->tail = &created->head;
+        created->control_tail = &created->control_head;
+        list_init( &created->entry );
+        pthread_mutex_lock( &client_surface_compositor_mutex );
+    }
+    pthread_mutex_unlock( &client_surface_compositor_mutex );
+    if (created) client_surface_free_owned_metadata( &created->memory, created, sizeof(*created) );
+    return queue;
+}
+
+static void release_client_surface_compositor_queue( struct client_surface_compositor_queue *queue )
+{
+    BOOL unused;
+
+    pthread_mutex_lock( &client_surface_compositor_mutex );
+    assert( queue->refs );
+    if ((unused = !--queue->refs))
+    {
+        assert( !queue->head && !queue->control_head && !queue->incoming &&
+                !queue->target && list_empty( &queue->entry ) );
+        rb_remove( &client_surface_compositor_queues, &queue->registry_entry );
+    }
+    pthread_mutex_unlock( &client_surface_compositor_mutex );
+    if (unused) client_surface_free_owned_metadata( &queue->memory, queue, sizeof(*queue) );
 }
 
 static struct client_surface_compositor_target *alloc_client_surface_compositor_target( HWND toplevel )
@@ -633,18 +728,23 @@ static struct client_surface_compositor_target *alloc_client_surface_compositor_
         return NULL;
     }
     notifications->memory = memory;
+    /* The creating job already owns this queue, so this lookup cannot need
+     * another allocation or depend on a second admission decision. */
+    notifications->queue = get_client_surface_compositor_queue( toplevel );
+    assert( notifications->queue );
     notifications->toplevel = toplevel;
     notifications->refs = 1;
     notifications->end = (struct client_surface_compositor_job){
         .op = CLIENT_SURFACE_COMPOSITOR_END_UPDATE, .toplevel = toplevel,
-        .notifications = notifications, .async = TRUE};
+        .notifications = notifications, .queue = notifications->queue, .async = TRUE};
     notifications->finish = (struct client_surface_compositor_job){
         .op = CLIENT_SURFACE_COMPOSITOR_FINISH_UPDATE, .toplevel = toplevel,
-        .notifications = notifications, .async = TRUE};
+        .notifications = notifications, .queue = notifications->queue, .async = TRUE};
     notifications->direct = (struct client_surface_compositor_job){
         .op = CLIENT_SURFACE_COMPOSITOR_DIRECT_COMPLETE, .toplevel = toplevel,
-        .notifications = notifications, .async = TRUE};
+        .notifications = notifications, .queue = notifications->queue, .async = TRUE};
     target->notifications = notifications;
+    notifications->queue->target = target;
     pthread_mutex_lock( &client_surface_compositor_mutex );
     notifications->next = client_surface_owner_notifications;
     client_surface_owner_notifications = notifications;
@@ -657,13 +757,19 @@ static void free_client_surface_compositor_target( struct client_surface_composi
     struct client_surface_owner_notifications **cursor, *notifications = target->notifications;
     BOOL unused;
 
+    assert( notifications->queue->target == target );
+    notifications->queue->target = NULL;
     pthread_mutex_lock( &client_surface_compositor_mutex );
     for (cursor = &client_surface_owner_notifications; *cursor != notifications; cursor = &(*cursor)->next)
         assert( *cursor );
     *cursor = notifications->next;
     unused = !--notifications->refs;
     pthread_mutex_unlock( &client_surface_compositor_mutex );
-    if (unused) client_surface_free_owned_metadata( &notifications->memory, notifications, sizeof(*notifications) );
+    if (unused)
+    {
+        release_client_surface_compositor_queue( notifications->queue );
+        client_surface_free_owned_metadata( &notifications->memory, notifications, sizeof(*notifications) );
+    }
     client_surface_free_owned_metadata( &target->memory, target, sizeof(*target) );
 }
 
@@ -693,9 +799,13 @@ static BOOL client_surface_alloc_on_compositor( struct client_surface_compositor
     assert( job->u.pool.copy_count && job->u.pool.copy_count <= ARRAY_SIZE(job->u.pool.pixmaps) );
     if (!(allocation = alloc_client_surface_compositor_metadata( job->toplevel, sizeof(*allocation), &memory ))) return FALSE;
     allocation->memory = memory;
+    allocation->release.queue = get_client_surface_compositor_queue( job->toplevel );
+    assert( allocation->release.queue );
+    allocation->release.toplevel = job->toplevel;
     allocation->bytes = 2 * client_surface_pixmap_bytes( job->u.pool.width, job->u.pool.height, job->u.pool.depth );
     if (!client_surface_reserve_scoped_memory( &allocation->memory, CLIENT_SURFACE_MEMORY_OUTPUT, allocation->bytes ))
     {
+        release_client_surface_compositor_queue( allocation->release.queue );
         client_surface_free_owned_metadata( &allocation->memory, allocation, sizeof(*allocation) );
         return FALSE;
     }
@@ -755,6 +865,7 @@ static BOOL client_surface_alloc_on_compositor( struct client_surface_compositor
     X11DRV_check_error();
     job->u.pool.pixmaps[0] = job->u.pool.pixmaps[1] = 0;
     client_surface_release_scoped_memory( &allocation->memory, CLIENT_SURFACE_MEMORY_OUTPUT, allocation->bytes );
+    release_client_surface_compositor_queue( allocation->release.queue );
     client_surface_free_owned_metadata( &allocation->memory, allocation, sizeof(*allocation) );
     return FALSE;
 }
@@ -784,7 +895,10 @@ static BOOL client_surface_free_on_compositor( const Pixmap pixmaps[2] )
         /* A rollback has no queued node. Otherwise the dispatcher still owns
          * release, including its result and queue link, until it retires it. */
         if (!allocation->release.async)
+        {
+            release_client_surface_compositor_queue( allocation->release.queue );
             client_surface_free_owned_metadata( &allocation->memory, allocation, sizeof(*allocation) );
+        }
     }
     if (error) WARN( "failed to release client-surface frame pool %#lx/%#lx, error %d\n",
                      pixmaps[0], pixmaps[1], error );
@@ -943,7 +1057,11 @@ static void process_client_surface_present_events(void)
             }
         }
         pXFreeEventData( display, &event );
-        if (target && frame) finish_client_surface_compositor_frame( target, frame );
+        if (target && frame)
+        {
+            finish_client_surface_compositor_frame( target, frame );
+            wake_client_surface_compositor_queues();
+        }
     }
 }
 
@@ -3528,10 +3646,12 @@ static void process_client_surface_compositor_mailboxes(void)
 static void wait_client_surface_compositor_work(void)
 {
     struct pollfd waiters[CLIENT_SURFACE_HANDOFF_MAX_POOLS_PER_CONSUMER + 2];
+    struct list *queues[] = {&client_surface_compositor_ready, &client_surface_compositor_parked};
     struct client_surface_compositor_pool *pool;
     struct client_surface_compositor_job *job;
+    struct client_surface_compositor_queue *queue;
     struct client_surface_compositor_target *target;
-    unsigned int count = 0;
+    unsigned int count = 0, i;
     int ret, timeout = -1;
 
     drain_client_surface_notification( client_surface_compositor_notify[0] );
@@ -3549,8 +3669,11 @@ static void wait_client_surface_compositor_work(void)
     if (client_surface_compositor_display && XPending( client_surface_compositor_display )) return;
     /* Xlib may have read a reply into XCB while looking for events. Poll the
      * library buffer after that read, before waiting on the kernel fd. */
-    if (process_client_surface_present_replies()) return;
-    if (process_client_surface_copy_replies()) return;
+    if (process_client_surface_present_replies() || process_client_surface_copy_replies())
+    {
+        wake_client_surface_compositor_queues();
+        return;
+    }
     if (process_client_surface_handoffs()) return;
     /* Complete/Idle above can release the last output credit after the
      * producer has stopped. Replay its retained cache before parking: no
@@ -3560,8 +3683,11 @@ static void wait_client_surface_compositor_work(void)
     /* A synchronous copy may have buffered events and replies while handling
      * the sources above. Recheck after those requests as well, before poll. */
     if (client_surface_compositor_display && XPending( client_surface_compositor_display )) return;
-    if (process_client_surface_present_replies()) return;
-    if (process_client_surface_copy_replies()) return;
+    if (process_client_surface_present_replies() || process_client_surface_copy_replies())
+    {
+        wake_client_surface_compositor_queues();
+        return;
+    }
     pthread_mutex_lock( &client_surface_compositor_mutex );
     if (client_surface_compositor_head)
     {
@@ -3577,17 +3703,24 @@ static void wait_client_surface_compositor_work(void)
         assert( count < ARRAY_SIZE(waiters) );
         waiters[count++] = (struct pollfd){pool->ready_fd, POLLIN, 0};
     }
-    for (job = client_surface_compositor_pending; job; job = job->next)
-    {
-        DWORD elapsed;
-        int remaining;
+    for (i = 0; i < ARRAY_SIZE(queues); ++i)
+        LIST_FOR_EACH_ENTRY( queue, queues[i], struct client_surface_compositor_queue, entry )
+        {
+            DWORD elapsed;
+            int remaining;
 
-        if (job->op != CLIENT_SURFACE_COMPOSITOR_PRESENT || !job->u.present.started) continue;
-        if (job->u.present.done) return;
-        elapsed = NtGetTickCount() - job->u.present.start;
-        remaining = elapsed >= 5000 ? 0 : 5000 - elapsed;
-        if (timeout < 0 || timeout > remaining) timeout = remaining;
-    }
+            /* Only a normal FIFO head can have an in-flight Present. */
+            if (!(job = queue->head) || job->op != CLIENT_SURFACE_COMPOSITOR_PRESENT ||
+                !job->u.present.started) continue;
+            if (job->u.present.done)
+            {
+                wake_client_surface_compositor_queues();
+                return;
+            }
+            elapsed = NtGetTickCount() - job->u.present.start;
+            remaining = elapsed >= 5000 ? 0 : 5000 - elapsed;
+            if (timeout < 0 || timeout > remaining) timeout = remaining;
+        }
     for (target = client_surface_compositor_targets; target; target = target->next)
     {
         DWORD elapsed;
@@ -3599,6 +3732,7 @@ static void wait_client_surface_compositor_work(void)
         if (timeout < 0 || timeout > remaining) timeout = remaining;
     }
     do ret = poll( waiters, count, timeout ); while (ret < 0 && errno == EINTR);
+    wake_client_surface_compositor_queues();
     if (ret < 0) WARN( "client-surface compositor poll failed, error %d\n", errno );
 }
 
@@ -3620,15 +3754,23 @@ static struct client_surface_compositor_target *client_surface_compositor_job_ta
 static BOOL client_surface_compositor_update_ready( struct client_surface_compositor_target *target,
                                                     const struct client_surface_compositor_job *until )
 {
-    const struct client_surface_compositor_job *job;
+    const struct client_surface_compositor_queue *queue = target->notifications->queue;
     unsigned int i;
 
     if (target->copy_frame || target->native_updates) return FALSE;
     for (i = 0; i < ARRAY_SIZE(target->frames); ++i)
         if (target->frames[i].serial) return FALSE;
-    for (job = client_surface_compositor_pending; job && job != until; job = job->next)
-        if (client_surface_compositor_job_target( job ) == target) return FALSE;
-    return TRUE;
+    if (!until)
+    {
+        BOOL incoming;
+
+        pthread_mutex_lock( &client_surface_compositor_mutex );
+        incoming = !!queue->incoming;
+        pthread_mutex_unlock( &client_surface_compositor_mutex );
+        if (incoming) return FALSE;
+    }
+    return (!queue->head || (until && queue->head->sequence >= until->sequence)) &&
+           (!queue->control_head || (until && queue->control_head->sequence >= until->sequence));
 }
 
 static BOOL execute_client_surface_compositor_job( struct client_surface_compositor_job *job )
@@ -3774,49 +3916,20 @@ static BOOL execute_client_surface_compositor_job( struct client_surface_composi
 static struct client_surface_compositor_target *client_surface_compositor_job_target(
     const struct client_surface_compositor_job *job )
 {
-    struct client_surface_compositor_target *target;
-    Drawable source = None, destination = None;
-    Pixmap first = None, second = None;
+    struct client_surface_compositor_target *target = job->queue->target;
     unsigned int i;
 
-    if (job->toplevel)
+    if (target && job->notifications && target->notifications != job->notifications) return NULL;
+    /* A detached old pool shares routing order with its HWND, but it need
+     * not wait for native reads of a replacement pool on the new target. */
+    if (target && job->op == CLIENT_SURFACE_COMPOSITOR_FREE_POOL)
     {
-        target = find_client_surface_compositor_target( job->toplevel );
-        if (target && job->notifications && target->notifications != job->notifications) return NULL;
-        return target;
-    }
-    /* Only these jobs route by borrowed/retired native IDs. Never interpret
-     * another operation's payload as drawables while checking queue order. */
-    switch (job->op)
-    {
-    case CLIENT_SURFACE_COMPOSITOR_COPY:
-        source = job->u.copy.source;
-        destination = job->u.copy.destination;
-        break;
-    case CLIENT_SURFACE_COMPOSITOR_PRESENT:
-        source = job->u.present.source;
-        destination = job->u.present.destination;
-        break;
-    case CLIENT_SURFACE_COMPOSITOR_FREE_POOL:
-        first = job->u.retired_pixmaps[0];
-        second = job->u.retired_pixmaps[1];
-        break;
-    default:
+        for (i = 0; i < ARRAY_SIZE(target->frames); ++i)
+            if (target->frames[i].pixmap && (target->frames[i].pixmap == job->u.retired_pixmaps[0] ||
+                                           target->frames[i].pixmap == job->u.retired_pixmaps[1])) return target;
         return NULL;
     }
-    for (target = client_surface_compositor_targets; target; target = target->next)
-    {
-        if (target->window && (target->window == destination || target->window == source))
-            return target;
-        for (i = 0; i < ARRAY_SIZE(target->frames); ++i)
-        {
-            Pixmap pixmap = target->frames[i].pixmap;
-
-            if (pixmap && (pixmap == source || pixmap == destination ||
-                           pixmap == first || pixmap == second)) return target;
-        }
-    }
-    return NULL;
+    return target;
 }
 
 static BOOL client_surface_compositor_job_ready( struct client_surface_compositor_job *job,
@@ -3972,15 +4085,70 @@ static void finish_client_surface_notification( struct client_surface_compositor
     }
     unused = !notifications->refs;
     pthread_mutex_unlock( &client_surface_compositor_mutex );
-    if (unused) client_surface_free_owned_metadata( &notifications->memory, notifications, sizeof(*notifications) );
+    if (unused)
+    {
+        release_client_surface_compositor_queue( notifications->queue );
+        client_surface_free_owned_metadata( &notifications->memory, notifications, sizeof(*notifications) );
+    }
+}
+
+static BOOL client_surface_compositor_control_job( const struct client_surface_compositor_job *job )
+{
+    return job->op == CLIENT_SURFACE_COMPOSITOR_TRY_BEGIN_UPDATE ||
+           job->op == CLIENT_SURFACE_COMPOSITOR_CHECK_UPDATE ||
+           job->op == CLIENT_SURFACE_COMPOSITOR_FINISH_UPDATE ||
+           job->op == CLIENT_SURFACE_COMPOSITOR_END_UPDATE ||
+           job->op == CLIENT_SURFACE_COMPOSITOR_CHECK_CACHE;
+}
+
+static void ready_client_surface_compositor_queue( struct client_surface_compositor_queue *queue )
+{
+    list_remove( &queue->entry );
+    list_add_tail( &client_surface_compositor_ready, &queue->entry );
+}
+
+/* Inspect only a FIFO head. A started Present keeps this exact job until its
+ * completion or caller deadline, independently of the output's native lease. */
+static BOOL step_client_surface_compositor_job( struct client_surface_compositor_job *job,
+                                               BOOL *progressed )
+{
+    struct client_surface_compositor_target *target = client_surface_compositor_job_target( job );
+    BOOL rejected;
+
+    if (job->op == CLIENT_SURFACE_COMPOSITOR_PRESENT && job->u.present.started)
+    {
+        if (!job->u.present.done && NtGetTickCount() - job->u.present.start >= 5000)
+        {
+            unsigned int i;
+
+            if (target)
+                for (i = 0; i < ARRAY_SIZE(target->frames); ++i)
+                    if (target->frames[i].waiter == job) target->frames[i].waiter = NULL;
+            job->u.present.done = TRUE;
+            job->result = FALSE;
+        }
+        return job->u.present.done;
+    }
+    if (!client_surface_compositor_job_ready( job, target, &rejected )) return FALSE;
+    prepare_client_surface_notification( job );
+    job->result = !rejected && execute_client_surface_compositor_job( job );
+    *progressed = TRUE;
+    if (job->op == CLIENT_SURFACE_COMPOSITOR_DIRECT_PLAN ||
+        job->op == CLIENT_SURFACE_COMPOSITOR_RETIRE_POOL)
+    {
+        target = client_surface_compositor_job_target( job );
+        if (target) target->quiescing = target->native_updates || target->deferred_update;
+    }
+    return job->op != CLIENT_SURFACE_COMPOSITOR_PRESENT || !job->u.present.started || job->u.present.done;
 }
 
 static BOOL process_client_surface_compositor_jobs(void)
 {
-    struct client_surface_compositor_job **cursor, *job, *earlier;
-    unsigned int budget = 64;
-    BOOL progressed = FALSE;
+    struct client_surface_compositor_queue *queue;
+    struct client_surface_compositor_job *incoming, **tail = &incoming, *job;
     struct client_surface_compositor_target *target;
+    unsigned int admitted = 0, scanned = 0, completed = 0, budget = 64;
+    BOOL progressed = FALSE, more;
 
     for (target = client_surface_compositor_targets; target; target = target->next)
     {
@@ -3991,120 +4159,114 @@ static BOOL process_client_surface_compositor_jobs(void)
                            WINE_UPDATE_CLIENT_SURFACE_HANDOFFS, 0 );
     }
 
-    for (cursor = &client_surface_compositor_pending; *cursor; cursor = &(*cursor)->next) ;
+    /* Bound ingestion as well as execution. The next iteration resumes from
+     * the same incoming head, without traversing any parked queue's jobs. */
     pthread_mutex_lock( &client_surface_compositor_mutex );
-    *cursor = client_surface_compositor_head;
-    client_surface_compositor_head = NULL;
-    client_surface_compositor_tail = &client_surface_compositor_head;
-    pthread_mutex_unlock( &client_surface_compositor_mutex );
-
-    /* FREE_POOL irrevocably transfers these exact images to the actor. Trace
-     * each new job once, before its native readers may have finished. UPDATE
-     * is not retirement: replacement allocation can still fail and roll back. */
-    if (TRACE_ON(csperf))
-        for (job = *cursor; job; job = job->next)
-        {
-            struct client_surface_output_allocation *allocation;
-
-            if (job->op != CLIENT_SURFACE_COMPOSITOR_FREE_POOL) continue;
-            for (allocation = client_surface_output_allocations; allocation; allocation = allocation->next)
-            {
-                if (!((allocation->pixmaps[0] == job->u.retired_pixmaps[0] && allocation->pixmaps[1] == job->u.retired_pixmaps[1]) ||
-                      (allocation->pixmaps[0] == job->u.retired_pixmaps[1] && allocation->pixmaps[1] == job->u.retired_pixmaps[0]))) continue;
-                x11drv_client_surface_trace_image( "retire", "output_pair", client_surface_compositor_display,
-                                                  job->u.retired_pixmaps[0], allocation->bytes / 2 );
-                x11drv_client_surface_trace_image( "retire", "output_pair", client_surface_compositor_display,
-                                                  job->u.retired_pixmaps[1], allocation->bytes / 2 );
-                break;
-            }
-        }
-
-    for (cursor = &client_surface_compositor_pending; (job = *cursor) && budget; )
+    while (admitted < 64 && (job = client_surface_compositor_head))
     {
-        struct client_surface_compositor_target *target = client_surface_compositor_job_target( job );
-
-        /* Preserve ordering within a target, including GUI publication ACKs,
-         * while allowing later jobs for independent targets to run. The
-         * read-only cache probe can pass older work: its hint grants no
-         * repair or publication rights. */
-        for (earlier = client_surface_compositor_pending; earlier != job; earlier = earlier->next)
-            if ((target && target == client_surface_compositor_job_target( earlier )) ||
-                (job->toplevel && job->toplevel == earlier->toplevel)) break;
-        if (earlier != job && job->op != CLIENT_SURFACE_COMPOSITOR_TRY_BEGIN_UPDATE &&
-            job->op != CLIENT_SURFACE_COMPOSITOR_CHECK_UPDATE &&
-            job->op != CLIENT_SURFACE_COMPOSITOR_FINISH_UPDATE &&
-            job->op != CLIENT_SURFACE_COMPOSITOR_END_UPDATE &&
-            job->op != CLIENT_SURFACE_COMPOSITOR_CHECK_CACHE)
+        client_surface_compositor_head = job->next;
+        *tail = job;
+        tail = &job->next;
+        --job->queue->incoming;
+        ++admitted;
+    }
+    if (!client_surface_compositor_head) client_surface_compositor_tail = &client_surface_compositor_head;
+    more = !!client_surface_compositor_head;
+    *tail = NULL;
+    pthread_mutex_unlock( &client_surface_compositor_mutex );
+    while ((job = incoming))
+    {
+        incoming = job->next;
+        job->next = NULL;
+        queue = job->queue;
+        if (client_surface_compositor_control_job( job ))
         {
-            cursor = &job->next;
-            continue;
-        }
-        if (job->op == CLIENT_SURFACE_COMPOSITOR_PRESENT && job->u.present.started)
-        {
-            if (!job->u.present.done && NtGetTickCount() - job->u.present.start >= 5000)
-            {
-                unsigned int i;
-
-                /* Retire the caller's wait, not the in-flight output. Its
-                 * serial remains owned until real Complete and Idle events. */
-                if (target)
-                    for (i = 0; i < ARRAY_SIZE(target->frames); ++i)
-                        if (target->frames[i].waiter == job) target->frames[i].waiter = NULL;
-                job->u.present.done = TRUE;
-                job->result = FALSE;
-            }
-            if (!job->u.present.done)
-            {
-                cursor = &job->next;
-                continue;
-            }
+            *queue->control_tail = job;
+            queue->control_tail = &job->next;
         }
         else
         {
-            BOOL rejected;
-
-            if (!client_surface_compositor_job_ready( job, target, &rejected ))
-            {
-                cursor = &job->next;
-                continue;
-            }
-            prepare_client_surface_notification( job );
-            job->result = !rejected && execute_client_surface_compositor_job( job );
-            if (job->op == CLIENT_SURFACE_COMPOSITOR_DIRECT_PLAN ||
-                job->op == CLIENT_SURFACE_COMPOSITOR_RETIRE_POOL)
-            {
-                target = client_surface_compositor_job_target( job );
-                if (target) target->quiescing = target->native_updates || target->deferred_update;
-            }
-            if (job->op == CLIENT_SURFACE_COMPOSITOR_PRESENT && job->u.present.started)
-            {
-                --budget;
-                progressed = TRUE;
-                cursor = &job->next;
-                continue;
-            }
+            *queue->tail = job;
+            queue->tail = &job->next;
         }
-        *cursor = job->next;
+        ready_client_surface_compositor_queue( queue );
+        if (TRACE_ON(csperf) && job->op == CLIENT_SURFACE_COMPOSITOR_FREE_POOL)
+        {
+            struct client_surface_output_allocation *allocation =
+                CONTAINING_RECORD( job, struct client_surface_output_allocation, release );
+
+            x11drv_client_surface_trace_image( "retire", "output_pair", client_surface_compositor_display,
+                                              job->u.retired_pixmaps[0], allocation->bytes / 2 );
+            x11drv_client_surface_trace_image( "retire", "output_pair", client_surface_compositor_display,
+                                              job->u.retired_pixmaps[1], allocation->bytes / 2 );
+        }
+    }
+
+    while (budget && !list_empty( &client_surface_compositor_ready ))
+    {
+        BOOL done, control;
+
+        queue = LIST_ENTRY( list_head( &client_surface_compositor_ready ), struct client_surface_compositor_queue, entry );
+        list_remove( &queue->entry );
+        list_init( &queue->entry );
+        control = queue->control_head && (!queue->head || queue->control_head->sequence < queue->head->sequence);
+        job = control ? queue->control_head : queue->head;
+        assert( job );
         --budget;
+        ++scanned;
+        done = step_client_surface_compositor_job( job, &progressed );
+        /* Preserve the old bypass contract: only these control operations
+         * may pass a blocked normal head. Their own FIFO remains ordered. */
+        if (!done && !control && queue->control_head)
+        {
+            if (!budget)
+            {
+                ready_client_surface_compositor_queue( queue );
+                break;
+            }
+            control = TRUE;
+            job = queue->control_head;
+            --budget;
+            ++scanned;
+            done = step_client_surface_compositor_job( job, &progressed );
+        }
+        if (!done)
+        {
+            list_add_tail( &client_surface_compositor_parked, &queue->entry );
+            continue;
+        }
+        if (control)
+        {
+            if (!(queue->control_head = job->next)) queue->control_tail = &queue->control_head;
+        }
+        else if (!(queue->head = job->next)) queue->tail = &queue->head;
+        if (queue->head || queue->control_head) ready_client_surface_compositor_queue( queue );
+        ++completed;
         progressed = TRUE;
         release_client_surface_compositor_job_resources( job );
         if (job->async)
         {
             if (job->notifications) finish_client_surface_notification( job );
-            else if (job->op == CLIENT_SURFACE_COMPOSITOR_FREE_POOL)
+            else
             {
                 struct client_surface_output_allocation *allocation =
                     CONTAINING_RECORD( job, struct client_surface_output_allocation, release );
 
+                assert( job->op == CLIENT_SURFACE_COMPOSITOR_FREE_POOL );
+                release_client_surface_compositor_queue( allocation->release.queue );
                 client_surface_free_owned_metadata( &allocation->memory, allocation, sizeof(*allocation) );
             }
-            else free( job );
-            continue;
         }
-        pthread_mutex_lock( &client_surface_compositor_mutex );
-        job->complete = TRUE;
-        pthread_cond_broadcast( &client_surface_compositor_cond );
-        pthread_mutex_unlock( &client_surface_compositor_mutex );
+        else
+        {
+            pthread_mutex_lock( &client_surface_compositor_mutex );
+            job->complete = TRUE;
+            pthread_cond_broadcast( &client_surface_compositor_cond );
+            pthread_mutex_unlock( &client_surface_compositor_mutex );
+        }
+        /* The enqueue reference also covers dispatcher bookkeeping after a
+         * synchronous caller returns or the final notification frees itself. */
+        release_client_surface_compositor_queue( queue );
     }
     for (target = client_surface_compositor_targets; target; target = target->next)
     {
@@ -4120,7 +4282,10 @@ static BOOL process_client_surface_compositor_jobs(void)
         if (!target->update_notified)
             WARN( "failed to notify deferred native update for %p\n", target->toplevel );
     }
-    return progressed;
+    TRACE_(csperf)( "ticks=%llu event=compositor_queue_scan ingested=%u inspected=%u completed=%u more=%u runnable=%u\n",
+                   client_surface_perf_time(), admitted, scanned, completed, more,
+                   !list_empty( &client_surface_compositor_ready ) );
+    return progressed || more || !list_empty( &client_surface_compositor_ready );
 }
 
 static void client_surface_compositor_thread( void *context )
@@ -4135,6 +4300,7 @@ static void client_surface_compositor_thread( void *context )
         progressed = process_client_surface_present_replies();
         progressed |= process_client_surface_copy_replies();
         progressed |= process_client_surface_compositor_restores();
+        if (progressed) wake_client_surface_compositor_queues();
         progressed |= process_client_surface_compositor_jobs();
         progressed |= process_client_surface_handoffs();
         progressed |= replay_client_surface_scene_sources();
@@ -4175,6 +4341,10 @@ static BOOL init_client_surface_compositor_notification(void)
 static void enqueue_client_surface_compositor_job( struct client_surface_compositor_job *job )
 {
     assert( client_surface_compositor_started );
+    assert( job->queue );
+    ++job->queue->refs;
+    ++job->queue->incoming;
+    job->sequence = ++client_surface_compositor_sequence;
     job->next = NULL;
     job->complete = FALSE;
     if (job->op == CLIENT_SURFACE_COMPOSITOR_PRESENT)
@@ -4218,6 +4388,11 @@ static BOOL submit_client_surface_compositor_job( struct client_surface_composit
     BOOL ret = FALSE;
 
     job->async = FALSE;
+    if (!(job->queue = get_client_surface_compositor_queue( job->toplevel )))
+    {
+        release_client_surface_compositor_job_resources( job );
+        return FALSE;
+    }
     pthread_mutex_lock( &client_surface_compositor_mutex );
     if (queue_client_surface_compositor_job( job ))
     {
@@ -4228,6 +4403,7 @@ static BOOL submit_client_surface_compositor_job( struct client_surface_composit
     }
     pthread_mutex_unlock( &client_surface_compositor_mutex );
     if (!job->complete) release_client_surface_compositor_job_resources( job );
+    release_client_surface_compositor_queue( job->queue );
     return ret;
 }
 
@@ -4247,7 +4423,9 @@ static void post_client_surface_compositor_job( struct client_surface_compositor
             if ((allocation->pixmaps[0] == job->u.retired_pixmaps[0] && allocation->pixmaps[1] == job->u.retired_pixmaps[1]) ||
                 (allocation->pixmaps[0] == job->u.retired_pixmaps[1] && allocation->pixmaps[1] == job->u.retired_pixmaps[0])) break;
         assert( allocation && !allocation->release.async );
-        allocation->release = *job;
+        allocation->release.op = job->op;
+        allocation->release.u.retired_pixmaps[0] = job->u.retired_pixmaps[0];
+        allocation->release.u.retired_pixmaps[1] = job->u.retired_pixmaps[1];
         allocation->release.async = TRUE;
         enqueue_client_surface_compositor_job( &allocation->release );
         pthread_mutex_unlock( &client_surface_compositor_mutex );
@@ -4346,7 +4524,7 @@ void X11DRV_client_surface_complete_direct( struct client_surface *surface,
     post_client_surface_compositor_job( &job );
 }
 
-static BOOL client_surface_backing_copy_area( Drawable source, Drawable destination,
+static BOOL client_surface_backing_copy_area( HWND toplevel, Drawable source, Drawable destination,
                                               int source_x, int source_y,
                                               int destination_x, int destination_y,
                                               unsigned int width, unsigned int height )
@@ -4354,6 +4532,7 @@ static BOOL client_surface_backing_copy_area( Drawable source, Drawable destinat
     struct client_surface_compositor_job job =
     {
         .op = CLIENT_SURFACE_COMPOSITOR_COPY,
+        .toplevel = toplevel,
         .u.copy =
         {
             .source = source,
@@ -4421,19 +4600,20 @@ static void client_surface_backing_free( Pixmap first, Pixmap second )
     post_client_surface_compositor_job( &job );
 }
 
-static BOOL client_surface_backing_copy( Drawable source, Drawable destination,
+static BOOL client_surface_backing_copy( HWND toplevel, Drawable source, Drawable destination,
                                          unsigned int width, unsigned int height )
 {
-    return client_surface_backing_copy_area( source, destination, 0, 0, 0, 0,
+    return client_surface_backing_copy_area( toplevel, source, destination, 0, 0, 0, 0,
                                              width, height );
 }
 
-static BOOL client_surface_backing_present( Window window, Pixmap pixmap,
+static BOOL client_surface_backing_present( HWND toplevel, Window window, Pixmap pixmap,
                                             unsigned int width, unsigned int height )
 {
     struct client_surface_compositor_job job =
     {
         .op = CLIENT_SURFACE_COMPOSITOR_PRESENT,
+        .toplevel = toplevel,
         .u.present =
         {
             .source = pixmap,
@@ -5006,7 +5186,7 @@ static BOOL copy_client_surface_backing_snapshot( struct x11drv_win_data *data, 
     /* The compositor uses another connection. Complete the owner's drawing
      * before copying the complete checkpoint, including its GDI pixels. */
     XSync( data->display, False );
-    return client_surface_backing_copy( data->whole_window, pixmap, window_width, window_height );
+    return client_surface_backing_copy( data->hwnd, data->whole_window, pixmap, window_width, window_height );
 }
 
 static BOOL snapshot_client_surface_backing( struct x11drv_win_data *data, BOOL invalidate, BOOL ensure_on_failure,
@@ -5189,12 +5369,12 @@ BOOL X11DRV_client_surface_backing_publish( struct x11drv_win_data *data )
     width = min( data->client_surface_backing_width, window_width );
     height = min( data->client_surface_backing_height, window_height );
     if (width != window_width || height != window_height) return FALSE;
-    if (!client_surface_backing_present( data->whole_window, data->client_surface_backing,
+    if (!client_surface_backing_present( data->hwnd, data->whole_window, data->client_surface_backing,
                                          width, height ))
     {
         TRACE( "falling back to XCopyArea publication for pixmap %#lx\n",
                data->client_surface_backing );
-        if (!client_surface_backing_copy( data->client_surface_backing,
+        if (!client_surface_backing_copy( data->hwnd, data->client_surface_backing,
                                           data->whole_window, width, height ))
             return FALSE;
     }
@@ -5244,7 +5424,7 @@ BOOL X11DRV_client_surface_backing_restore( struct x11drv_win_data *data,
         window_width > data->client_surface_backing_valid_width ||
         window_height > data->client_surface_backing_valid_height)
         return FALSE;
-    return client_surface_backing_copy_area( data->client_surface_backing,
+    return client_surface_backing_copy_area( data->hwnd, data->client_surface_backing,
                                              data->whole_window,
                                              rect->left, rect->top,
                                              rect->left, rect->top,

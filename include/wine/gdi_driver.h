@@ -592,6 +592,9 @@ W32KAPI struct client_surface_completion_job *client_surface_reserve_completion(
  * are process-local, never reused, and do not identify an image or its owner.
  * Synchronous callers have a distinct domain from asynchronous completion. */
 W32KAPI BOOL client_surface_get_execution_domain( UINT64 *domain );
+/* Reserve stable keys for a native executor whose lifetime is independent
+ * of the submitting thread. This reserves identity, not worker capacity. */
+W32KAPI UINT64 client_surface_allocate_completion_domains( unsigned int count );
 W32KAPI void client_surface_cancel_completion( struct client_surface_completion_job *job );
 W32KAPI void client_surface_defer_reserved_present( struct client_surface_completion_job *job,
                                                    struct client_surface_frame *present,
