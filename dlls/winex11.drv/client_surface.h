@@ -86,7 +86,8 @@ extern void x11drv_client_surface_trace_image( const char *event, const char *ki
                                               Display *display, Pixmap pixmap, UINT64 bytes );
 extern void x11drv_client_surface_set_gpu_snapshot( struct x11drv_client_surface *surface, Pixmap pixmap );
 extern BOOL x11drv_client_surface_prepare_retirement( struct x11drv_client_surface *surface );
-extern void x11drv_client_surface_retire_handoff( struct client_surface *client );
+extern void x11drv_client_surface_retire_handoff( struct client_surface *client,
+                                                 const struct client_surface_handoff_lease *lease );
 extern void x11drv_client_surface_destroy_retirement( struct x11drv_client_surface *surface );
 extern struct x11drv_client_source_frame *x11drv_client_surface_get_source(
     struct client_surface *client, unsigned int index, unsigned int width,

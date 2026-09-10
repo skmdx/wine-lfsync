@@ -26,6 +26,17 @@ extern int client_surface_cond_init( pthread_cond_t *cond );
 extern int client_surface_cond_timedwait( pthread_cond_t *cond, pthread_mutex_t *mutex, DWORD timeout );
 extern BOOL client_surface_completion_init( struct client_surface *surface );
 extern void client_surface_completion_destroy( struct client_surface *surface );
+extern struct client_surface *client_surface_alloc( UINT size );
+extern void client_surface_handoff_destroy( struct client_surface *surface );
+extern BOOL client_surface_handoff_has_source( const struct client_surface *surface );
+extern BOOL client_surface_handoff_write_available( const struct client_surface *surface );
+extern void client_surface_handoff_wait( struct client_surface *surface );
+extern void client_surface_handoff_retire_closed( struct client_surface *surface );
+extern void client_surface_handoff_completed( struct client_surface *surface );
+extern BOOL client_surface_handoff_valid( const struct client_surface *surface,
+                                        const struct client_surface_frame *present );
+extern BOOL client_surface_prepare_source_locked( struct client_surface *surface,
+                                                 struct client_surface_frame *present );
 
 extern HWND client_surface_set_server_state( HWND hwnd, const struct client_surface *surface,
                                              UINT flags, UINT64 generation,

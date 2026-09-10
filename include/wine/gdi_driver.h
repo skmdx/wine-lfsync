@@ -219,7 +219,7 @@ struct gdi_dc_funcs
 };
 
 /* increment this when changing driver tables or shared driver-facing structures */
-#define WINE_GDI_DRIVER_VERSION 142
+#define WINE_GDI_DRIVER_VERSION 143
 
 #define GDI_PRIORITY_NULL_DRV        0  /* null driver */
 #define GDI_PRIORITY_FONT_DRV      100  /* any font driver */
@@ -310,6 +310,16 @@ struct client_surface_completion_ops
     void (*abandon)( struct client_surface *surface );
 };
 
+/* Retirement takes this mapped endpoint and notification fd together. Native
+ * readers may outlive the producer surface; only retirement releases the lease. */
+struct client_surface_handoff_lease
+{
+    void *view;
+    struct client_surface_handoff_channel *channel;
+    UINT64 cookie;
+    int ready_fd;
+};
+
 struct client_surface_backend
 {
     unsigned int caps;
@@ -332,14 +342,14 @@ struct client_surface_backend
                      HDC hdc, HRGN surface_region, BOOL flush, BOOL defer_visible );
     /* Prepare producer-private storage. This does not publish a frame. */
     BOOL (*handoff_prepare)( struct client_surface *surface,
-                             struct client_surface_source *source );
+                             struct client_surface_source *source, unsigned int index );
     /* Freeze a completed native drawable into independent producer storage. */
     BOOL (*handoff_complete)( struct client_surface *surface,
-                              struct client_surface_source *source );
+                              struct client_surface_source *source, unsigned int index );
     BOOL (*handoff_serialize)( struct client_surface *surface );
     /* Take ownership of the mapped handoff, its notification fd and source
      * storage. Retire them after readers finish, without retaining surface. */
-    void (*handoff_retire)( struct client_surface *surface );
+    void (*handoff_retire)( struct client_surface *surface, const struct client_surface_handoff_lease *lease );
     const struct client_surface_completion_ops *completion;
 };
 
@@ -380,6 +390,10 @@ struct client_surface_frame
     enum client_surface_frame_target target;
     UINT64 handoff_control;
     unsigned int handoff_index;
+    /* Borrowed from the prepared reservation until its completion/capture is
+     * released. Native callbacks retain no access to the producer registry. */
+    struct client_surface_source *handoff_source;
+    struct client_surface_handoff_channel *handoff_channel;
     RECT damage;
     UINT64 damage_base_sequence;
     struct client_surface_completion completion;
@@ -448,18 +462,7 @@ struct client_surface
     LONG64                             clip_target_seq;
     HRGN                               clip_region;
     BOOL                               clip_region_valid;
-    void                              *handoff_view;
-    SIZE_T                             handoff_view_size;
-    struct client_surface_handoff_shared *handoff_shared;
-    struct client_surface_handoff_channel *handoff_channel;
-    struct client_surface_source        handoff_source[CLIENT_SURFACE_SOURCE_FRAME_COUNT];
-    unsigned int next_handoff;
-    UINT64                             handoff_serial;
-    UINT64                             handoff_mapping_id;
-    UINT64                             handoff_cookie;
-    BOOL                               handoff_release_pending;
-    unsigned int                       handoff_waiters; /* unlocked waits retaining the mapped view */
-    int                                handoff_ready_fd;
+    struct client_surface_handoff      *handoff;        /* private producer transport and source reservations */
     BOOL                               raw;            /* use the raw physical position and size for the host client surface */
 };
 

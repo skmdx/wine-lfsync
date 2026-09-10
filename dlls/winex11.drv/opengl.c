@@ -1811,7 +1811,7 @@ static BOOL snapshot_client_surface( struct opengl_drawable *base, struct client
     pthread_mutex_lock( &base->client->present_lock );
     ret = x11drv_client_surface_snapshot( base->client, pixels, size.cx, size.cy, FALSE, &x11drv_snapshot_rgba8 );
     if (ret && present->handoff_control)
-        base->client->handoff_source[present->handoff_index].source = surface->snapshot;
+        present->handoff_source->source = surface->snapshot;
     if (ret) present->capture.size = size;
     pthread_mutex_unlock( &base->client->present_lock );
     return ret;
@@ -2026,7 +2026,7 @@ static int snapshot_client_surface_gpu( struct opengl_drawable *base,
     struct egl_snapshot_completion *completion;
     struct egl_snapshot_image *image;
     struct x11drv_client_surface *surface = impl_from_client_surface( base->client );
-    struct client_surface_source *source = base->client->handoff_source + present->handoff_index;
+    struct client_surface_source *source = present->handoff_source;
     GLint read_fbo, draw_fbo, read_buffer, renderbuffer;
     GLuint fbo = 0, buffer = 0;
     GLboolean scissor, srgb;
@@ -2105,8 +2105,8 @@ static int snapshot_client_surface_gpu( struct opengl_drawable *base,
             funcs->p_glFlush();
             completion->refs = 2;
             completion->drawable = base;
-            completion->source = base->client->handoff_source + present->handoff_index;
-            completion->channel = base->client->handoff_channel;
+            completion->source = present->handoff_source;
+            completion->channel = present->handoff_channel;
             completion->control = present->handoff_control;
             opengl_drawable_add_ref( base );
             release_snapshot_sync( image->pending );

@@ -236,7 +236,8 @@ failed:
     return FALSE;
 }
 
-void x11drv_client_surface_retire_handoff( struct client_surface *client )
+void x11drv_client_surface_retire_handoff( struct client_surface *client,
+                                         const struct client_surface_handoff_lease *lease )
 {
     struct x11drv_client_surface *surface = impl_from_client_surface( client );
     struct x11drv_client_surface_retirement *retirement = surface->handoff_retirement;
@@ -247,19 +248,19 @@ void x11drv_client_surface_retire_handoff( struct client_surface *client )
         /* Preparation failed before any source could be submitted. */
         struct x11drv_client_surface_retirement empty =
         {
-            .view = client->handoff_view, .channel = client->handoff_channel,
-            .identity = client->handoff_channel->identity, .cookie = client->handoff_cookie,
-            .ready_fd = client->handoff_ready_fd,
+            .view = lease->view, .channel = lease->channel,
+            .identity = lease->channel->identity, .cookie = lease->cookie,
+            .ready_fd = lease->ready_fd,
         };
         BOOL ready = retire_source_mapping( &empty );
         assert( ready );
         return;
     }
-    retirement->view = client->handoff_view;
-    retirement->channel = client->handoff_channel;
-    retirement->identity = client->handoff_channel->identity;
-    retirement->cookie = client->handoff_cookie;
-    retirement->ready_fd = client->handoff_ready_fd;
+    retirement->view = lease->view;
+    retirement->channel = lease->channel;
+    retirement->identity = lease->channel->identity;
+    retirement->cookie = lease->cookie;
+    retirement->ready_fd = lease->ready_fd;
     memcpy( retirement->sources, surface->sources, sizeof(surface->sources) );
     memset( surface->sources, 0, sizeof(surface->sources) );
     surface->handoff_retirement = NULL;

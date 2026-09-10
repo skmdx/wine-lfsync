@@ -505,7 +505,7 @@ BOOL x11drv_client_surface_snapshot( struct client_surface *client, const BYTE *
 }
 
 static BOOL x11drv_client_surface_handoff_prepare(
-    struct client_surface *client, struct client_surface_source *image )
+    struct client_surface *client, struct client_surface_source *image, unsigned int index )
 {
     struct x11drv_client_surface *surface = impl_from_client_surface( client );
     BOOL native = usexcomposite && !surface->direct_snapshot;
@@ -527,7 +527,7 @@ static BOOL x11drv_client_surface_handoff_prepare(
     image->width = width;
     image->height = height;
     if (!native) image->flags |= CLIENT_SURFACE_HANDOFF_COPY_SOURCE;
-    surface->sources[image - client->handoff_source].gpu_copy = FALSE;
+    surface->sources[index].gpu_copy = FALSE;
     return TRUE;
 }
 
@@ -543,10 +543,9 @@ static BOOL x11drv_client_surface_handoff_serialize( struct client_surface *clie
 }
 
 static BOOL x11drv_client_surface_handoff_complete( struct client_surface *client,
-                                                   struct client_surface_source *image )
+                                                   struct client_surface_source *image, unsigned int index )
 {
     struct x11drv_client_surface *surface = impl_from_client_surface( client );
-    unsigned int index = image - client->handoff_source;
     struct x11drv_client_source_frame *frame = &surface->sources[index];
     BOOL native = usexcomposite && !surface->direct_snapshot;
     unsigned int depth = native ? surface->source_depth : default_visual.depth;
