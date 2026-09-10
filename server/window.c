@@ -22,18 +22,6 @@
 
 #include <assert.h>
 #include <stdarg.h>
-#include <errno.h>
-#include <fcntl.h>
-#include <unistd.h>
-#include <sys/socket.h>
-
-#ifdef __linux__
-#include <limits.h>
-#include <linux/futex.h>
-#include <sys/syscall.h>
-#include <sys/eventfd.h>
-#endif
-
 #include "ntstatus.h"
 #include "windef.h"
 #include "winbase.h"
@@ -48,6 +36,7 @@
 #include "user.h"
 #include "unicode.h"
 #include "wine/client_surface.h"
+#include "client_surface_handoff.h"
 
 static const struct ratio no_dpi;
 
@@ -73,23 +62,6 @@ struct client_surface_owner
     struct process *process;
 };
 
-struct client_surface_handoff_pool
-{
-    struct list entry;
-    struct process *producer; /* raw keys, removed on either process cleanup */
-    struct process *consumer;
-    struct object *mapping;
-    struct client_surface_handoff_shared *shared;
-    UINT64 id;
-    struct file *ready_read;
-    struct file *ready_write;
-    int ready_fd;
-    unsigned char used[CLIENT_SURFACE_HANDOFF_CHANNELS];
-};
-
-static struct list client_surface_handoff_pools = LIST_INIT( client_surface_handoff_pools );
-static UINT64 client_surface_handoff_serial;
-
 enum client_surface_destroy_state
 {
     CLIENT_SURFACE_DESTROY_NONE,
@@ -103,10 +75,7 @@ struct client_surface_ref
     struct client_surface_ref *index_next;
     struct client_surface_owner *owner;
     struct process *process; /* queue callback keeps this valid for a retired tombstone */
-    struct client_surface_handoff_pool *handoff_pool;
-    struct window *handoff_top; /* exact owner root for this mapping binding */
-    unsigned int handoff_index;
-    UINT64 handoff_cookie;
+    struct client_surface_handoff_binding *handoff;
     UINT64         id;
     unsigned long long generation;
     unsigned long long sequence;
@@ -115,9 +84,6 @@ struct client_surface_ref
     unsigned int    claimed : 1; /* an active surface which completed a host present */
     unsigned int    scene_publication : 1; /* renderer supports owner scene publication */
     unsigned int    direct_presentation : 1; /* renderer can attach its native source directly */
-    unsigned int    handoff_producer_mapped : 1;
-    unsigned int    handoff_consumer_mapped : 1;
-    unsigned int    handoff_retired : 1; /* owner root changed; wait for checked reads before invalidation */
     unsigned int    notification_pending : 1; /* an update for this identity is queued */
     /* pending counts all selected images, including warm ones. This separate
      * obligation selects producer retries after the inventory was consumed
@@ -193,7 +159,7 @@ static int post_client_surface_notification( struct client_surface_ref *surface,
 
 static void free_client_surface_ref_if_unused( struct client_surface_ref *surface )
 {
-    if (surface->owner || surface->handoff_pool || surface->notification_pending ||
+    if (surface->owner || surface->handoff || surface->notification_pending ||
         surface->destroy_state != CLIENT_SURFACE_DESTROY_NONE)
         return;
 
@@ -212,188 +178,25 @@ static void retire_client_surface_ref( struct client_surface_ref *surface )
     free_client_surface_ref_if_unused( surface );
 }
 
-#ifdef __linux__
-static void client_surface_handoff_futex_wake( LONG *address )
+static void client_surface_handoff_changed( void *context )
 {
-    syscall( SYS_futex, address, FUTEX_WAKE, INT_MAX, NULL, NULL, 0 );
-}
-#else
-static void client_surface_handoff_futex_wake( LONG *address )
-{
-    (void)address;
-}
-#endif
-
-static void wake_client_surface_handoff( struct client_surface_handoff_pool *pool, int ready )
-{
-    LONG *parked = ready ? &pool->shared->ready_parked : &pool->shared->release_parked;
-    LONG *sequence = ready ? &pool->shared->ready_sequence : &pool->shared->release_sequence;
-
-    /* As in lfsync, the waiter publishes parked before rechecking state. The
-     * waker which claims that publication owns the sequence increment. */
-    if (!__atomic_exchange_n( parked, 0, __ATOMIC_ACQ_REL )) return;
-    __atomic_add_fetch( sequence, 1, __ATOMIC_RELEASE );
-    if (ready)
-    {
-        UINT64 value = 1;
-        int ret;
-
-        do
-#ifdef __linux__
-            ret = write( pool->ready_fd, &value, sizeof(value) );
-#else
-            ret = send( pool->ready_fd, &value, sizeof(value), 0 );
-#endif
-        while (ret < 0 && errno == EINTR);
-    }
-    else client_surface_handoff_futex_wake( sequence );
-}
-
-static void signal_client_surface_handoff_ready( struct client_surface_handoff_pool *pool,
-                                                 unsigned int index )
-{
-    __atomic_fetch_or( &pool->shared->ready_bitmap[index / 64],
-                       (UINT64)1 << (index % 64), __ATOMIC_RELEASE );
-    wake_client_surface_handoff( pool, 1 );
-}
-
-static int is_client_surface_handoff_lost( const struct client_surface_ref *surface )
-{
-    return surface->handoff_pool && __atomic_load_n(
-        &surface->handoff_pool->shared->channels[surface->handoff_index].closed, __ATOMIC_ACQUIRE );
-}
-
-static void mark_client_surface_handoff_lost( struct client_surface_ref *surface )
-{
-    if (!surface->handoff_pool) return;
-    __atomic_store_n( &surface->handoff_pool->shared->channels[surface->handoff_index].closed,
-                      1, __ATOMIC_RELEASE );
-    invalidate_client_surface_owner_repair( surface );
-    signal_client_surface_handoff_ready( surface->handoff_pool, surface->handoff_index );
-    wake_client_surface_handoff( surface->handoff_pool, 0 );
+    invalidate_client_surface_owner_repair( context );
 }
 
 static void free_client_surface_handoff( struct client_surface_ref *surface )
 {
-    struct client_surface_handoff_pool *pool = surface->handoff_pool;
-    unsigned int index = surface->handoff_index;
-
-    if (!pool) return;
-    assert( !surface->handoff_producer_mapped && !surface->handoff_consumer_mapped );
-    mark_client_surface_handoff_lost( surface );
-    __atomic_fetch_and( &pool->shared->ready_bitmap[index / 64],
-                        ~((UINT64)1 << (index % 64)), __ATOMIC_ACQ_REL );
-    __atomic_store_n( &pool->shared->channels[index].endpoints, 0, __ATOMIC_RELEASE );
-    pool->used[index] = 0;
-    if (surface->handoff_top) release_object( surface->handoff_top );
-    surface->handoff_pool = NULL;
-    surface->handoff_top = NULL;
-    surface->handoff_index = 0;
-    surface->handoff_cookie = 0;
-    surface->handoff_retired = 0;
+    client_surface_handoff_free( surface->handoff );
+    surface->handoff = NULL;
 }
 
 static void retire_client_surface_handoff( struct client_surface_ref *surface )
 {
-    if (!surface->handoff_pool) return;
-    mark_client_surface_handoff_lost( surface );
-    if (!surface->handoff_producer_mapped && !surface->handoff_consumer_mapped)
-        free_client_surface_handoff( surface );
+    surface->handoff = client_surface_handoff_retire( surface->handoff );
 }
 
 static void retarget_client_surface_handoff( struct client_surface_ref *surface )
 {
-    if (!surface->handoff_pool) return;
-    surface->handoff_retired = 1;
-    invalidate_client_surface_owner_repair( surface );
-    /* The old owner may still be reading this storage. Keep its tokens until
-     * its endpoint release proves the checked copies have finished. */
-    if (!surface->handoff_consumer_mapped) retire_client_surface_handoff( surface );
-}
-
-static struct client_surface_handoff_pool *create_client_surface_handoff_pool(
-    struct process *producer, struct process *consumer )
-{
-    struct client_surface_handoff_pool *pool, *cursor;
-    unsigned int count = 0;
-    int fds[2];
-    void *ptr;
-
-    if (client_surface_handoff_serial == ~(UINT64)0)
-    {
-        set_error( STATUS_NO_MEMORY );
-        return NULL;
-    }
-    LIST_FOR_EACH_ENTRY( cursor, &client_surface_handoff_pools,
-                         struct client_surface_handoff_pool, entry )
-        if (cursor->consumer == consumer &&
-            ++count >= CLIENT_SURFACE_HANDOFF_MAX_POOLS_PER_CONSUMER)
-        {
-            set_error( STATUS_INSUFFICIENT_RESOURCES );
-            return NULL;
-        }
-    if (!(pool = mem_alloc( sizeof(*pool) ))) return NULL;
-#ifdef __linux__
-    fds[0] = eventfd( 0, EFD_CLOEXEC | EFD_NONBLOCK );
-    fds[1] = fds[0] < 0 ? -1 : fcntl( fds[0], F_DUPFD_CLOEXEC, 0 );
-#else
-    if (socketpair( AF_UNIX, SOCK_DGRAM, 0, fds )) fds[0] = fds[1] = -1;
-    if (fds[0] >= 0)
-    {
-        if (fcntl( fds[0], F_SETFD, FD_CLOEXEC ) < 0 ||
-            fcntl( fds[1], F_SETFD, FD_CLOEXEC ) < 0 ||
-            fcntl( fds[0], F_SETFL, O_NONBLOCK ) < 0 ||
-            fcntl( fds[1], F_SETFL, O_NONBLOCK ) < 0)
-        {
-            int saved_errno = errno;
-
-            close( fds[0] );
-            close( fds[1] );
-            fds[0] = fds[1] = -1;
-            errno = saved_errno;
-        }
-    }
-#endif
-    if (fds[0] < 0 || fds[1] < 0)
-    {
-        file_set_error();
-        if (fds[0] >= 0) close( fds[0] );
-        free( pool );
-        return NULL;
-    }
-    pool->ready_fd = fds[1];
-    if (!(pool->ready_read = create_file_for_fd( fds[0], FILE_GENERIC_READ, FILE_SHARE_READ )))
-    {
-        close( fds[1] );
-        free( pool );
-        return NULL;
-    }
-    if (!(pool->ready_write = create_file_for_fd( fds[1], FILE_GENERIC_WRITE, FILE_SHARE_WRITE )))
-    {
-        release_object( pool->ready_read );
-        free( pool );
-        return NULL;
-    }
-    if (!(pool->mapping = create_shared_data_mapping(
-              sizeof(struct client_surface_handoff_shared), &ptr )))
-    {
-        release_object( pool->ready_write );
-        release_object( pool->ready_read );
-        free( pool );
-        return NULL;
-    }
-    pool->shared = ptr;
-    pool->producer = producer;
-    pool->consumer = consumer;
-    pool->id = ++client_surface_handoff_serial;
-    memset( pool->used, 0, sizeof(pool->used) );
-    memset( pool->shared, 0, sizeof(*pool->shared) );
-    pool->shared->mapping_id = pool->id;
-    pool->shared->version = CLIENT_SURFACE_HANDOFF_VERSION;
-    pool->shared->channel_count = CLIENT_SURFACE_HANDOFF_CHANNELS;
-    __atomic_store_n( &pool->shared->magic, CLIENT_SURFACE_HANDOFF_MAGIC, __ATOMIC_RELEASE );
-    list_add_tail( &client_surface_handoff_pools, &pool->entry );
-    return pool;
+    surface->handoff = client_surface_handoff_retarget( surface->handoff );
 }
 
 static int alloc_client_surface_handoff( struct client_surface_ref *surface,
@@ -490,48 +293,16 @@ C_ASSERT( sizeof(window_shm_t) == offsetof(window_shm_t, extra[0]) );
 static int alloc_client_surface_handoff( struct client_surface_ref *surface,
                                          struct window *win, struct window *top )
 {
-    struct client_surface_handoff_pool *pool;
-    struct client_surface_handoff_channel *channel;
     struct process *consumer;
-    unsigned int i;
 
     if (!top->thread || !(consumer = top->thread->process))
     {
         set_error( STATUS_INVALID_PARAMETER );
         return 0;
     }
-    if (client_surface_handoff_serial >= ~(UINT64)0 - 1)
-    {
-        set_error( STATUS_NO_MEMORY );
-        return 0;
-    }
-    LIST_FOR_EACH_ENTRY( pool, &client_surface_handoff_pools,
-                         struct client_surface_handoff_pool, entry )
-    {
-        if (pool->producer != surface->process || pool->consumer != consumer) continue;
-        for (i = 0; i < CLIENT_SURFACE_HANDOFF_CHANNELS; ++i)
-            if (!pool->used[i]) goto found;
-    }
-    if (!(pool = create_client_surface_handoff_pool( surface->process, consumer ))) return 0;
-    i = 0;
-found:
-    surface->handoff_pool = pool;
-    surface->handoff_top = (struct window *)grab_object( top );
-    surface->handoff_index = i;
-    surface->handoff_cookie = ++client_surface_handoff_serial;
-    surface->handoff_producer_mapped = 0;
-    surface->handoff_consumer_mapped = 0;
-    pool->used[i] = 1;
-    __atomic_fetch_and( &pool->shared->ready_bitmap[i / 64],
-                        ~((UINT64)1 << (i % 64)), __ATOMIC_ACQ_REL );
-    channel = &pool->shared->channels[i];
-    memset( channel, 0, sizeof(*channel) );
-    channel->cookie = surface->handoff_cookie;
-    channel->identity = surface->id;
-    channel->producer_process = surface->process->id;
-    channel->window = win->handle;
-    channel->toplevel = top->handle;
-    return 1;
+    surface->handoff = client_surface_handoff_create( surface->process, consumer, &top->obj,
+        win->handle, top->handle, surface->id, client_surface_handoff_changed, surface );
+    return !!surface->handoff;
 }
 
 static int client_surface_is_preparing( const struct window *top )
@@ -962,7 +733,7 @@ static void retarget_client_surface_subtree_handoffs( struct window *win, struct
     if (!win->client_surface_subtree_count) return;
     LIST_FOR_EACH_ENTRY( owner, &win->client_surface_owners, struct client_surface_owner, entry )
         LIST_FOR_EACH_ENTRY( surface, &owner->surfaces, struct client_surface_ref, entry )
-            if (surface->handoff_pool && surface->handoff_top != top)
+            if (surface->handoff && client_surface_handoff_get_state( surface->handoff ).owner != &top->obj)
                 retarget_client_surface_handoff( surface );
     LIST_FOR_EACH_ENTRY( child, &win->children, struct window, entry )
         retarget_client_surface_subtree_handoffs( child, top );
@@ -1666,7 +1437,7 @@ static struct client_surface_ref *get_client_surface_ref( struct client_surface_
     /* Only a server-issued, unbound reservation may start registration.
      * Retired records remain indexed only while a channel or notification
      * owns them; they can never be rebound to another window lifetime. */
-    if (!surface || surface->owner || surface->handoff_pool || surface->notification_pending ||
+    if (!surface || surface->owner || surface->handoff || surface->notification_pending ||
         surface->destroy_state != CLIENT_SURFACE_DESTROY_NONE)
     {
         set_error( STATUS_INVALID_PARAMETER );
@@ -2191,7 +1962,6 @@ static int discard_client_surface_owners( struct window *win, struct window *top
 void cleanup_process_client_surfaces( struct process *process )
 {
     struct client_surface_ref *surface, *next;
-    struct client_surface_handoff_pool *handoff_pool, *handoff_next;
     user_handle_t handle = 0;
     struct client_surface_owner *owner;
     struct window *win, *top;
@@ -2222,15 +1992,9 @@ void cleanup_process_client_surfaces( struct process *process )
         for (surface = client_surface_ref_index[bucket]; surface; surface = next)
         {
             next = surface->index_next;
-            if (!surface->handoff_pool ||
-                (surface->handoff_pool->producer != process &&
-                 surface->handoff_pool->consumer != process))
-                continue;
-            mark_client_surface_handoff_lost( surface );
-            surface->handoff_producer_mapped = 0;
-            surface->handoff_consumer_mapped = 0;
-            free_client_surface_handoff( surface );
-            free_client_surface_ref_if_unused( surface );
+            if (!surface->handoff) continue;
+            surface->handoff = client_surface_handoff_cleanup_binding( surface->handoff, process );
+            if (!surface->handoff) free_client_surface_ref_if_unused( surface );
         }
     }
 
@@ -2256,16 +2020,7 @@ void cleanup_process_client_surfaces( struct process *process )
         }
     }
     assert( !process->client_surface_destroy_count );
-    LIST_FOR_EACH_ENTRY_SAFE( handoff_pool, handoff_next, &client_surface_handoff_pools,
-                              struct client_surface_handoff_pool, entry )
-    {
-        if (handoff_pool->producer != process && handoff_pool->consumer != process) continue;
-        list_remove( &handoff_pool->entry );
-        release_shared_data_mapping( handoff_pool->mapping, handoff_pool->shared );
-        release_object( handoff_pool->ready_write );
-        release_object( handoff_pool->ready_read );
-        free( handoff_pool );
-    }
+    client_surface_handoff_cleanup_pools( process );
 }
 
 static struct client_surface_ref *get_client_surface_handoff_ref( struct window *win,
@@ -2312,7 +2067,8 @@ static struct client_surface_ref *get_client_surface_handoff_ref( struct window 
 DECL_HANDLER(get_client_surface_handoff)
 {
     struct client_surface_ref *surface;
-    struct client_surface_handoff_channel *channel;
+    struct client_surface_handoff_state state;
+    struct client_surface_handoff_mapping mapping;
     struct window *top, *win;
     int producer_view = !req->owner;
 
@@ -2323,78 +2079,74 @@ DECL_HANDLER(get_client_surface_handoff)
     top = get_toplevel_window( win );
     if (!(surface = get_client_surface_handoff_ref( win, req->producer, req->surface,
                                                     req->owner ))) return;
+    state = client_surface_handoff_get_state( surface->handoff );
     /* A hidden producer hint may become stale before its owner registers.
      * Do not turn that transport-only request into channel allocation or
      * resurrect a closed lifetime. Ordinary visible provisioning is unchanged. */
-    if (req->require_producer && (!req->owner || !surface->handoff_pool ||
-        !surface->handoff_producer_mapped || surface->handoff_top != top ||
-        surface->handoff_retired || is_client_surface_handoff_lost( surface )))
+    if (req->require_producer && (!req->owner || !surface->handoff ||
+        !(state.mapped & CLIENT_SURFACE_HANDOFF_ENDPOINT_PRODUCER) || state.owner != &top->obj ||
+        state.retired || state.lost))
     {
         set_error( STATUS_INVALID_HANDLE );
         return;
     }
-    if (surface->handoff_pool &&
-        (surface->handoff_top != top || surface->handoff_retired || is_client_surface_handoff_lost( surface )))
+    if (surface->handoff &&
+        (state.owner != &top->obj || state.retired || state.lost))
     {
         /* Do not reacquire an endpoint of a failed binding while its peer
          * is retiring it. Otherwise both sides can repeatedly remap the
          * same closed channel cookie and prevent its final release forever. */
-        if (surface->handoff_top != top || surface->handoff_retired)
+        if (state.owner != &top->obj || state.retired)
             retarget_client_surface_handoff( surface );
         else retire_client_surface_handoff( surface );
-        if (surface->handoff_producer_mapped || surface->handoff_consumer_mapped)
+        if (client_surface_handoff_get_state( surface->handoff ).mapped)
         {
             set_error( STATUS_DEVICE_BUSY );
             return;
         }
         free_client_surface_handoff( surface );
     }
-    if (!surface->handoff_pool && !alloc_client_surface_handoff( surface, win, top )) return;
-    if (!(reply->mapping = alloc_handle( current->process, surface->handoff_pool->mapping,
-                                         SECTION_MAP_READ | SECTION_MAP_WRITE, 0 ))) return;
-    if (producer_view) surface->handoff_producer_mapped = 1;
-    else surface->handoff_consumer_mapped = 1;
-    channel = &surface->handoff_pool->shared->channels[surface->handoff_index];
-    __atomic_fetch_or( &channel->endpoints,
-                       producer_view ? CLIENT_SURFACE_HANDOFF_ENDPOINT_PRODUCER :
-                                       CLIENT_SURFACE_HANDOFF_ENDPOINT_CONSUMER, __ATOMIC_RELEASE );
-    reply->mapping_id = surface->handoff_pool->id;
-    reply->size = sizeof(*surface->handoff_pool->shared);
-    reply->offset = (char *)channel - (char *)surface->handoff_pool->shared;
-    reply->cookie = surface->handoff_cookie;
+    if (!surface->handoff && !alloc_client_surface_handoff( surface, win, top )) return;
+    if (!(reply->mapping = client_surface_handoff_map( surface->handoff, current->process,
+                                                       producer_view, &mapping ))) return;
+    reply->mapping_id = mapping.id;
+    reply->size = mapping.size;
+    reply->offset = mapping.offset;
+    reply->cookie = mapping.cookie;
 }
 
 DECL_HANDLER(get_client_surface_handoff_event)
 {
     struct client_surface_ref *surface;
+    struct client_surface_handoff_state state;
     struct window *win;
 
     if (!(win = get_window( req->handle ))) return;
     if (!(surface = get_client_surface_handoff_ref( win, req->producer, req->surface,
                                                     req->owner ))) return;
-    if (!surface->handoff_pool || surface->handoff_cookie != req->cookie ||
-        surface->handoff_top != get_toplevel_window( win ))
+    state = client_surface_handoff_get_state( surface->handoff );
+    if (!surface->handoff || state.cookie != req->cookie ||
+        state.owner != &get_toplevel_window( win )->obj)
     {
         set_error( STATUS_INVALID_HANDLE );
         return;
     }
-    reply->event = alloc_handle( current->process,
-        req->owner ? surface->handoff_pool->ready_read : surface->handoff_pool->ready_write,
-        req->owner ? FILE_GENERIC_READ : FILE_GENERIC_WRITE, 0 );
+    reply->event = client_surface_handoff_get_event( surface->handoff, current->process, !req->owner );
 }
 
 DECL_HANDLER(get_client_surface_handoff_visibility)
 {
     struct client_surface_owner *owner;
     struct client_surface_ref *surface;
+    struct client_surface_handoff_state state;
     struct window *win;
 
     if (!(win = get_window( req->handle ))) return;
     if (!(surface = get_client_surface_handoff_ref( win, 0, req->surface, 0 ))) return;
-    if (!surface->handoff_pool || !surface->handoff_producer_mapped ||
-        surface->handoff_cookie != req->cookie || surface->handoff_retired ||
-        surface->handoff_top != get_toplevel_window( win ) ||
-        is_client_surface_handoff_lost( surface ))
+    state = client_surface_handoff_get_state( surface->handoff );
+    if (!surface->handoff || !(state.mapped & CLIENT_SURFACE_HANDOFF_ENDPOINT_PRODUCER) ||
+        state.cookie != req->cookie || state.retired ||
+        state.owner != &get_toplevel_window( win )->obj || state.lost)
     {
         set_error( STATUS_INVALID_HANDLE );
         return;
@@ -2412,7 +2164,7 @@ DECL_HANDLER(get_client_surface_handoff_visibility)
 DECL_HANDLER(release_client_surface_handoff)
 {
     struct client_surface_ref *surface;
-    struct client_surface_handoff_channel *channel;
+    struct client_surface_handoff_state state;
     user_handle_t refresh = 0, current_refresh = 0;
     int producer_view = !req->owner;
 
@@ -2435,52 +2187,37 @@ DECL_HANDLER(release_client_surface_handoff)
 
             for (cursor = client_surface_ref_index[bucket]; cursor; cursor = cursor->index_next)
                 if (cursor->process->id == req->producer && cursor->id == req->surface &&
-                    cursor->handoff_pool && cursor->handoff_pool->consumer == current->process)
+                    cursor->handoff && client_surface_handoff_get_state( cursor->handoff ).consumer == current->process)
                 {
                     surface = cursor;
                     break;
                 }
         }
     }
-    if (!surface || !surface->handoff_pool || !req->cookie ||
-        req->cookie != surface->handoff_cookie ||
-        (req->handle && surface->handoff_top->handle != req->handle))
+    state = client_surface_handoff_get_state( surface ? surface->handoff : NULL );
+    if (!surface || !surface->handoff || !req->cookie ||
+        req->cookie != state.cookie ||
+        (req->handle && ((struct window *)state.owner)->handle != req->handle))
     {
         set_error( STATUS_INVALID_PARAMETER );
         return;
     }
-    channel = &surface->handoff_pool->shared->channels[surface->handoff_index];
-    if (producer_view) surface->handoff_producer_mapped = 0;
-    else
+    client_surface_handoff_release_endpoint( surface->handoff, producer_view );
+    state = client_surface_handoff_get_state( surface->handoff );
+    if (!state.mapped && ((!surface->active && !surface->cached) || state.lost))
     {
-        surface->handoff_consumer_mapped = 0;
-        invalidate_client_surface_owner_repair( surface );
-    }
-    /* A retired owner root cannot consume any remaining frame. A normal
-     * hide/show can reacquire the same binding and must keep its only image.
-     * Invalidate and wake for reparent or failure, before clearing the endpoint.
-     * The consumer keeps its endpoint until all checked reads have finished. */
-    if (!producer_view && (surface->handoff_retired || is_client_surface_handoff_lost( surface )))
-        mark_client_surface_handoff_lost( surface );
-    __atomic_fetch_and( &channel->endpoints,
-                        ~(LONG)(producer_view ? CLIENT_SURFACE_HANDOFF_ENDPOINT_PRODUCER :
-                                                CLIENT_SURFACE_HANDOFF_ENDPOINT_CONSUMER), __ATOMIC_RELEASE );
-    if (!surface->handoff_producer_mapped && !surface->handoff_consumer_mapped &&
-        ((!surface->active && !surface->cached) ||
-         is_client_surface_handoff_lost( surface )))
-    {
-        if ((surface->active || surface->cached) && surface->handoff_top)
+        if ((surface->active || surface->cached) && state.owner)
         {
             struct client_surface_owner *owner;
             struct window *win;
 
-            refresh = surface->handoff_top->handle;
+            refresh = ((struct window *)state.owner)->handle;
             /* A new owner may already have tried to bind while the old
              * mapping was still pinned. Wake it when that last endpoint
              * releases, as well as the old root which needs cleanup. The
              * shared window handle is only a lookup hint: authenticate its
              * current registration and selection before routing the wake. */
-            if ((win = get_user_object( channel->window, NTUSER_OBJ_WINDOW )) &&
+            if ((win = get_user_object( state.window, NTUSER_OBJ_WINDOW )) &&
                 get_client_surface_owner( win, surface->process, 0 ) == surface->owner &&
                 select_client_surface_producer( win, &owner ) == surface)
                 current_refresh = get_toplevel_window( win )->handle;
@@ -2505,6 +2242,7 @@ static int validate_client_surface_handoff_generation( struct window *win, struc
 {
     struct client_surface_owner *owner;
     struct client_surface_ref *surface;
+    struct client_surface_handoff_state state;
     struct window *child;
 
     if (!win->client_surface_subtree_count || !is_visible( win )) return 1;
@@ -2525,18 +2263,19 @@ static int validate_client_surface_handoff_generation( struct window *win, struc
             if (partial) goto children;
             return 0;
         }
-        if ((!owner_repair && surface->generation != generation) || !surface->handoff_pool ||
-            surface->handoff_top != top || surface->handoff_pool->consumer != current->process)
+        state = client_surface_handoff_get_state( surface->handoff );
+        if ((!owner_repair && surface->generation != generation) || !surface->handoff ||
+            state.owner != &top->obj || state.consumer != current->process)
             return 0;
         /* A completed publication may outlive source endpoint retirement, but
          * a new repair must not authorize a binding already being replaced.
          * Once recovery was requested, a remapped endpoint is not fresh proof. */
-        if (owner_repair && (!surface->handoff_consumer_mapped || surface->handoff_retired ||
-                            is_client_surface_handoff_lost( surface ) ||
+        if (owner_repair && (!(state.mapped & CLIENT_SURFACE_HANDOFF_ENDPOINT_CONSUMER) || state.retired ||
+                            state.lost ||
                             (partial && surface->source_required))) return 0;
         receipt = &receipts[low];
         if (receipt->handle != win->handle || receipt->process != owner->process->id ||
-            receipt->surface != surface->id || receipt->cookie != surface->handoff_cookie ||
+            receipt->surface != surface->id || receipt->cookie != state.cookie ||
             !receipt->source_generation || receipt->buffer_index >= CLIENT_SURFACE_HANDOFF_RING_SIZE)
             return 0;
         (*count)++;
@@ -2720,6 +2459,8 @@ static void get_client_surface_handoff_desc( struct window *win, struct window *
                                               struct client_surface_ref *surface,
                                               struct client_surface_handoff_desc *desc )
 {
+    struct client_surface_handoff_state state = client_surface_handoff_get_state( surface->handoff );
+
     desc->handle = win->handle;
     desc->process = owner->process->id;
     desc->surface = surface->id;
@@ -2727,14 +2468,13 @@ static void get_client_surface_handoff_desc( struct window *win, struct window *
     /* Provisioning is transport work, independent of scene visibility and
      * whether the first completion has published READY yet. Use the server
      * endpoint lifetime, never the writable shared endpoint hints. */
-    desc->producer_mapped = surface->handoff_pool && surface->handoff_top == top &&
-                            surface->handoff_producer_mapped && !surface->handoff_retired &&
-                            !is_client_surface_handoff_lost( surface );
+    desc->producer_mapped = state.owner == &top->obj &&
+                            (state.mapped & CLIENT_SURFACE_HANDOFF_ENDPOINT_PRODUCER) &&
+                            !state.retired && !state.lost;
     /* Shared endpoints alone cannot authorize reuse: A -> B -> A
      * leaves the old owner mapped until its checked reads finish. */
-    desc->cookie = surface->handoff_pool && surface->handoff_top == top &&
-                   surface->handoff_consumer_mapped && !surface->handoff_retired &&
-                   !is_client_surface_handoff_lost( surface ) ? surface->handoff_cookie : 0;
+    desc->cookie = state.owner == &top->obj && (state.mapped & CLIENT_SURFACE_HANDOFF_ENDPOINT_CONSUMER) &&
+                   !state.retired && !state.lost ? state.cookie : 0;
 }
 
 static unsigned int prepare_client_surface_generation( struct window *win, unsigned long long generation,
@@ -2895,7 +2635,7 @@ DECL_HANDLER(resolve_client_surface_scene_sources)
 
 static void invalidate_client_surface_owner_repair( struct client_surface_ref *surface )
 {
-    struct window *top = surface->handoff_top;
+    struct window *top = (struct window *)client_surface_handoff_get_state( surface->handoff ).owner;
     unsigned int error = get_error();
 
     if (!top || (!top->client_surface_transaction.owner_repair &&
@@ -2927,12 +2667,16 @@ static int client_surface_owner_repair_channels_live( struct window *win, struct
 {
     struct client_surface_owner *owner;
     struct client_surface_ref *surface;
+    struct client_surface_handoff_state state;
     struct window *child;
 
     if (!win->client_surface_subtree_count || !is_visible( win )) return 1;
-    if ((surface = select_client_surface_producer( win, &owner )) &&
-        (!surface->handoff_pool || surface->handoff_top != top || !surface->handoff_consumer_mapped ||
-         surface->handoff_retired || is_client_surface_handoff_lost( surface ))) return 0;
+    if ((surface = select_client_surface_producer( win, &owner )))
+    {
+        state = client_surface_handoff_get_state( surface->handoff );
+        if (state.owner != &top->obj || !(state.mapped & CLIENT_SURFACE_HANDOFF_ENDPOINT_CONSUMER) ||
+            state.retired || state.lost) return 0;
+    }
     LIST_FOR_EACH_ENTRY( child, &win->children, struct window, entry )
         if (!client_surface_owner_repair_channels_live( child, top )) return 0;
     return 1;
