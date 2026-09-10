@@ -78,7 +78,7 @@ static void free_snapshot_connection( struct x11drv_client_surface_retired_resou
     TRACE( "released snapshot connection %p domain %s worker %p\n",
            connection, wine_dbgstr_longlong( connection->domain ), resource->thread );
     free( connection );
-    client_surface_release_memory( CLIENT_SURFACE_MEMORY_STAGING, sizeof(*connection) );
+    client_surface_release_metadata_memory( sizeof(*connection) );
 }
 
 static void snapshot_retirement_thread( void *context )
@@ -155,17 +155,17 @@ static struct snapshot_connection *snapshot_connection_acquire( UINT64 domain )
     }
     connection = NULL;
     if (snapshot_connection_count == SNAPSHOT_CONNECTION_LIMIT) goto done;
-    if (!client_surface_reserve_memory( CLIENT_SURFACE_MEMORY_STAGING, sizeof(*connection) )) goto done;
+    if (!client_surface_reserve_metadata_memory( sizeof(*connection) )) goto done;
     if (!(connection = calloc( 1, sizeof(*connection) )))
     {
-        client_surface_release_memory( CLIENT_SURFACE_MEMORY_STAGING, sizeof(*connection) );
+        client_surface_release_metadata_memory( sizeof(*connection) );
         goto done;
     }
     if (pthread_mutex_init( &connection->lock, NULL ))
     {
         free( connection );
         connection = NULL;
-        client_surface_release_memory( CLIENT_SURFACE_MEMORY_STAGING, sizeof(*connection) );
+        client_surface_release_metadata_memory( sizeof(*connection) );
         goto done;
     }
     if (client_surface_cond_init( &connection->cond ))
@@ -173,7 +173,7 @@ static struct snapshot_connection *snapshot_connection_acquire( UINT64 domain )
         pthread_mutex_destroy( &connection->lock );
         free( connection );
         connection = NULL;
-        client_surface_release_memory( CLIENT_SURFACE_MEMORY_STAGING, sizeof(*connection) );
+        client_surface_release_metadata_memory( sizeof(*connection) );
         goto done;
     }
     list_init( &connection->retired_snapshots );
@@ -302,7 +302,7 @@ static void destroy_snapshot( struct x11drv_client_snapshot *snapshot )
     client_surface_release_memory( CLIENT_SURFACE_MEMORY_SOURCE, snapshot->bytes );
     snapshot_connection_release( connection );
     free( snapshot );
-    client_surface_release_memory( CLIENT_SURFACE_MEMORY_STAGING, sizeof(*snapshot) );
+    client_surface_release_metadata_memory( sizeof(*snapshot) );
 }
 
 struct x11drv_client_snapshot *x11drv_client_snapshot_share( struct x11drv_client_snapshot *snapshot )
@@ -368,10 +368,10 @@ static struct x11drv_client_snapshot *snapshot_alloc( unsigned int width, unsign
     struct x11drv_client_snapshot *snapshot;
     UINT64 bytes = (UINT64)width * height * (depth > 16 ? 4 : depth > 8 ? 2 : 1);
 
-    if (!client_surface_reserve_memory( CLIENT_SURFACE_MEMORY_STAGING, sizeof(*snapshot) )) return NULL;
+    if (!client_surface_reserve_metadata_memory( sizeof(*snapshot) )) return NULL;
     if (!(snapshot = calloc( 1, sizeof(*snapshot) )))
     {
-        client_surface_release_memory( CLIENT_SURFACE_MEMORY_STAGING, sizeof(*snapshot) );
+        client_surface_release_metadata_memory( sizeof(*snapshot) );
         return NULL;
     }
     snapshot->size = (SIZE){width, height};

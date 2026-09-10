@@ -424,18 +424,21 @@ W32KAPI void client_surface_fail_scene( HWND hwnd );
 
 W32KAPI BOOL client_surface_reserve_memory( enum client_surface_memory_class type, UINT64 bytes );
 W32KAPI void client_surface_release_memory( enum client_surface_memory_class type, UINT64 bytes );
+W32KAPI BOOL client_surface_reserve_metadata_memory( UINT64 bytes );
+W32KAPI void client_surface_release_metadata_memory( UINT64 bytes );
 
-/* Explicit transfer metadata shares the image budget. Callers retain the
- * allocated byte count when a native enumeration later changes its count. */
+/* Transfer and retirement metadata has protected admission within the image
+ * budget. Callers retain the allocated byte count when a native enumeration
+ * later changes its count. Native use must finish before the actual free. */
 static inline void *client_surface_alloc_metadata( SIZE_T count, SIZE_T size )
 {
     void *data;
 
     if (size && count > ~(SIZE_T)0 / size) return NULL;
     size *= count;
-    if (!client_surface_reserve_memory( CLIENT_SURFACE_MEMORY_STAGING, size )) return NULL;
+    if (!client_surface_reserve_metadata_memory( size )) return NULL;
     if (!(data = calloc( 1, size )))
-        client_surface_release_memory( CLIENT_SURFACE_MEMORY_STAGING, size );
+        client_surface_release_metadata_memory( size );
     return data;
 }
 
@@ -443,7 +446,7 @@ static inline void client_surface_free_metadata( void *data, SIZE_T size )
 {
     if (!data) return;
     free( data );
-    client_surface_release_memory( CLIENT_SURFACE_MEMORY_STAGING, size );
+    client_surface_release_metadata_memory( size );
 }
 
 struct client_surface

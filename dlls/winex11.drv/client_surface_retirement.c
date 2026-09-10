@@ -94,7 +94,7 @@ static void release_source_retirement( struct x11drv_client_surface_retirement *
     --retirement_count;
     pthread_mutex_unlock( &retirement_lock );
     free( retirement );
-    client_surface_release_memory( CLIENT_SURFACE_MEMORY_STAGING, sizeof(*retirement) );
+    client_surface_release_metadata_memory( sizeof(*retirement) );
 }
 
 static void wake_retiring_source_owner( struct x11drv_client_surface_retirement *retirement )
@@ -235,7 +235,7 @@ BOOL x11drv_client_surface_prepare_retirement( struct x11drv_client_surface *sur
 
     if (surface->handoff_retirement) return TRUE;
     if (!x11drv_client_surface_prepare_resource_retirement()) return FALSE;
-    if (!client_surface_reserve_memory( CLIENT_SURFACE_MEMORY_STAGING, sizeof(*retirement) )) return FALSE;
+    if (!client_surface_reserve_metadata_memory( sizeof(*retirement) )) return FALSE;
     if (!(retirement = calloc( 1, sizeof(*retirement) ))) goto failed;
     pthread_mutex_lock( &retirement_lock );
     if (retirement_count == MAX_SOURCE_RETIREMENTS) goto failed_locked;
@@ -248,7 +248,7 @@ failed_locked:
     pthread_mutex_unlock( &retirement_lock );
     free( retirement );
 failed:
-    client_surface_release_memory( CLIENT_SURFACE_MEMORY_STAGING, sizeof(*retirement) );
+    client_surface_release_metadata_memory( sizeof(*retirement) );
     return FALSE;
 }
 
