@@ -219,7 +219,7 @@ struct gdi_dc_funcs
 };
 
 /* increment this when changing driver tables or shared driver-facing structures */
-#define WINE_GDI_DRIVER_VERSION 141
+#define WINE_GDI_DRIVER_VERSION 142
 
 #define GDI_PRIORITY_NULL_DRV        0  /* null driver */
 #define GDI_PRIORITY_FONT_DRV      100  /* any font driver */
@@ -302,9 +302,10 @@ enum client_surface_backend_caps
 struct client_surface_completion_ops
 {
     /* Arm and poll a host presentation boundary. PENDING preserves the same
-     * monitor; only terminal failure or cancellation may abandon it. */
+     * monitor. Cancel is only valid before entering native submission. */
     BOOL (*prepare)( struct client_surface *surface );
     struct client_surface_completion_result (*wait)( struct client_surface *surface, DWORD timeout );
+    void (*cancel)( struct client_surface *surface );
     /* retire an armed boundary when host submission may have partially failed */
     void (*abandon)( struct client_surface *surface );
 };

@@ -1363,6 +1363,21 @@ BOOL client_surface_needs_completion_reservation( struct client_surface *surface
            !scene.authoritative || !scene.direct_candidate;
 }
 
+/* The caller holds completion_lock and has not entered native submission.
+ * Admission can require dropping that lock and preparing a newer scene. This
+ * cancels only our unsubmitted tokens, not an uncertain native operation. */
+void client_surface_cancel_prepare_locked( struct client_surface *surface,
+                                           struct client_surface_frame *present )
+{
+    assert( !present->serial );
+    pthread_mutex_lock( &surface->present_lock );
+    client_surface_abandon_handoff_locked( surface, present );
+    if (present->completion.kind == CLIENT_SURFACE_COMPLETION_SHARED &&
+        surface->backend->completion && surface->backend->completion->cancel)
+        surface->backend->completion->cancel( surface );
+    pthread_mutex_unlock( &surface->present_lock );
+}
+
 BOOL client_surface_prepare_present( struct client_surface *surface,
                                      struct client_surface_frame *present,
                                      BOOL external_completion, BOOL asynchronous )
@@ -1389,12 +1404,7 @@ prepare:
         /* Preparation may attach an offscreen target after the initial
          * inspection. Cancel its unsubmitted token and acquire admission
          * outside every surface lock before preparing that target again. */
-        pthread_mutex_lock( &surface->present_lock );
-        client_surface_abandon_handoff_locked( surface, present );
-        if (present->completion.kind == CLIENT_SURFACE_COMPLETION_SHARED &&
-            surface->backend->completion && surface->backend->completion->abandon)
-            surface->backend->completion->abandon( surface );
-        pthread_mutex_unlock( &surface->present_lock );
+        client_surface_cancel_prepare_locked( surface, present );
         client_surface_unlock_present( surface );
         if (!(job = client_surface_reserve_completion( surface ))) goto failed;
         goto prepare;

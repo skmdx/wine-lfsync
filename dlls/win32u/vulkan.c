@@ -3291,12 +3291,7 @@ reservation_failed:
         {
             struct client_surface *surface = swapchain_from_handle( client_swapchains[i] )->surface->client;
 
-            pthread_mutex_lock( &surface->present_lock );
-            client_surface_abandon_handoff_locked( surface, &presents[i] );
-            if (presents[i].completion.kind == CLIENT_SURFACE_COMPLETION_SHARED &&
-                surface->backend->completion && surface->backend->completion->abandon)
-                surface->backend->completion->abandon( surface );
-            pthread_mutex_unlock( &surface->present_lock );
+            client_surface_cancel_prepare_locked( surface, &presents[i] );
         }
         while (surface_locked_count)
             client_surface_unlock_present( present_surfaces[--surface_locked_count] );

@@ -77,6 +77,8 @@ extern BOOL client_surface_publish_handoff_locked( struct client_surface *surfac
                                                     const struct client_surface_completed_frame *frame );
 extern void client_surface_abandon_handoff_locked( struct client_surface *surface,
                                                    struct client_surface_frame *present );
+extern void client_surface_cancel_prepare_locked( struct client_surface *surface,
+                                                  struct client_surface_frame *present );
 extern void client_surface_release_handoff( struct client_surface *surface );
 
 #endif /* __WINE_WIN32U_CLIENT_SURFACE_H */

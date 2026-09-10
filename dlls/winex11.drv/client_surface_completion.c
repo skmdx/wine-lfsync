@@ -240,6 +240,24 @@ static BOOL x11drv_client_surface_prepare_completion( struct client_surface *cli
 #endif
 }
 
+static void x11drv_client_surface_cancel_completion( struct client_surface *client )
+{
+#if defined(HAVE_X11_EXTENSIONS_XDAMAGE_H) && defined(SONAME_LIBXDAMAGE)
+    struct x11drv_client_surface *surface = impl_from_client_surface( client );
+
+    /* No WSI operation has entered native code for this preparation. Keep
+     * the monitor reusable: the next prepare drains older damage before its
+     * own submission. A native error or abandoned submitted operation still
+     * permanently breaks the monitor through abandon(), never this path. */
+    pthread_mutex_lock( &xdamage_lock );
+    assert( list_empty( &surface->completion.wait_entry ) );
+    surface->completion.ready = FALSE;
+    TRACE( "event=xdamage_cancel_prepare surface=%p damage=%lx broken=%u\n",
+           client, surface->completion.damage, surface->completion.broken );
+    pthread_mutex_unlock( &xdamage_lock );
+#endif
+}
+
 static void x11drv_client_surface_abandon_completion( struct client_surface *client )
 {
 #if defined(HAVE_X11_EXTENSIONS_XDAMAGE_H) && defined(SONAME_LIBXDAMAGE)
@@ -381,6 +399,7 @@ const struct client_surface_completion_ops x11drv_client_surface_completion_ops 
 {
     .prepare = x11drv_client_surface_prepare_completion,
     .wait = x11drv_client_surface_wait_completion,
+    .cancel = x11drv_client_surface_cancel_completion,
     .abandon = x11drv_client_surface_abandon_completion,
 };
 
