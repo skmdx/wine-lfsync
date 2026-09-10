@@ -34,6 +34,7 @@
 #include "xcomposite.h"
 #include "xpresent.h"
 #include "client_surface_xcb.h"
+#include "client_surface_query.h"
 #include "wine/server.h"
 #include "wine/rbtree.h"
 
@@ -89,6 +90,8 @@ struct client_surface_compositor_reply
 
 struct client_surface_cache_copy
 {
+    struct client_surface_geometry_query query;
+    BOOL query_pending;
     struct client_surface_compositor_reply reply;
     struct client_surface_xcb_request request;
     struct client_surface_handoff_slot frame;
@@ -120,6 +123,11 @@ struct client_surface_compositor_binding
     struct client_surface_cache_copy cache_copy;
     BOOL retired;
 };
+
+static BOOL client_surface_cache_read_pending( const struct client_surface_compositor_binding *binding )
+{
+    return binding->cache_copy.query_pending || binding->cache_copy.reply.requests;
+}
 
 static void trace_client_surface_source( const char *event,
     const struct client_surface_compositor_binding *binding, UINT64 control, UINT64 sequence,
@@ -1741,7 +1749,7 @@ static void free_client_surface_cached_image( struct client_surface_cached_image
 
 static void free_client_surface_compositor_binding( struct client_surface_compositor_binding *binding )
 {
-    assert( binding->retired && !binding->cache_copy.reply.requests );
+    assert( binding->retired && !client_surface_cache_read_pending( binding ) );
     /* Releasing the consumer endpoint also permits the producer to retire
      * unacknowledged slots. Keep it, the mapping and both cache images until
      * our last native read and checked reply have completed. */
@@ -1772,15 +1780,16 @@ static void remove_client_surface_compositor_binding(
      * it cannot resume at the old consumer sequence without those images. */
     __atomic_store_n( &binding->channel->closed, 1, __ATOMIC_RELEASE );
     binding->retired = TRUE;
-    TRACE_(csperf)( "ticks=%llu event=cache_detach identity=%s cookie=%s pending=%u token=%s barrier=%u "
+    TRACE_(csperf)( "ticks=%llu event=cache_detach identity=%s cookie=%s pending=%u query_pending=%u token=%s barrier=%u "
                    "consumed=%s produced=%s endpoints=%u\n", client_surface_perf_time(),
                    wine_dbgstr_longlong( binding->identity ), wine_dbgstr_longlong( binding->cookie ),
-                   !!binding->cache_copy.reply.requests, wine_dbgstr_longlong( binding->cache_copy.control ),
+                   !!binding->cache_copy.reply.requests, binding->cache_copy.query_pending,
+                   wine_dbgstr_longlong( binding->cache_copy.control ),
                    binding->cache_copy.request.barrier,
                    wine_dbgstr_longlong( __atomic_load_n( &binding->channel->consumer_sequence, __ATOMIC_ACQUIRE ) ),
                    wine_dbgstr_longlong( __atomic_load_n( &binding->channel->producer_sequence, __ATOMIC_ACQUIRE ) ),
                    __atomic_load_n( &binding->channel->endpoints, __ATOMIC_ACQUIRE ) );
-    if (!binding->cache_copy.reply.requests) free_client_surface_compositor_binding( binding );
+    if (!client_surface_cache_read_pending( binding )) free_client_surface_compositor_binding( binding );
 }
 
 static struct client_surface_compositor_pool *acquire_client_surface_compositor_pool(
@@ -2684,28 +2693,6 @@ static BOOL restore_client_surface_compositor_target(
     return restore_client_surface_compositor_pixels( target );
 }
 
-static BOOL validate_client_surface_pixmap( Pixmap pixmap, unsigned int min_width,
-                                            unsigned int min_height,
-                                            unsigned int *source_depth )
-{
-    Window root;
-    unsigned int width, height, border, pixmap_depth;
-    int x, y, error = 0;
-    BOOL ret;
-
-    X11DRV_expect_error( client_surface_compositor_display,
-                         client_surface_compositor_error, &error );
-    ret = XGetGeometry( client_surface_compositor_display, pixmap, &root, &x, &y,
-                        &width, &height, &border, &pixmap_depth );
-    XSync( client_surface_compositor_display, False );
-    X11DRV_check_error();
-    TRACE_(csperf)( "ticks=%llu event=source_geometry pixmap=%lx result=%u error=%d geometry_calls=1 sync_calls=1\n",
-                   client_surface_perf_time(), pixmap, ret, error );
-    if (!ret || error || width < min_width || height < min_height) return FALSE;
-    *source_depth = pixmap_depth;
-    return TRUE;
-}
-
 static BOOL client_surface_source_cache_matches( const struct client_surface_source_cache *cache,
                                                  const struct client_surface_handoff_slot *slot )
 {
@@ -2714,7 +2701,7 @@ static BOOL client_surface_source_cache_matches( const struct client_surface_sou
 }
 
 static BOOL get_client_surface_compositor_source(
-    struct client_surface_compositor_binding *binding, unsigned int index,
+    struct client_surface_compositor_binding *binding,
     const struct client_surface_handoff_slot *slot, Pixmap *source,
     unsigned int *source_depth )
 {
@@ -2731,17 +2718,8 @@ static BOOL get_client_surface_compositor_source(
      * tuple within this binding; the ring index only selects a miss victim. */
     for (i = 0; i < ARRAY_SIZE(binding->sources); ++i)
         if (client_surface_source_cache_matches( &binding->sources[i], slot )) break;
-    if (i < ARRAY_SIZE(binding->sources)) cache = &binding->sources[i];
-    else
-    {
-        cache = &binding->sources[index];
-        if (!validate_client_surface_pixmap( slot->source, slot->width, slot->height, source_depth ))
-            return FALSE;
-        *cache = (struct client_surface_source_cache){slot->source, slot->target_epoch,
-            slot->source_visual, slot->width, slot->height, *source_depth};
-        TRACE( "validated source pixmap %#lx visual %#lx depth %u size %ux%u slot %u\n",
-               cache->pixmap, cache->visual, cache->depth, cache->width, cache->height, index );
-    }
+    if (i == ARRAY_SIZE(binding->sources)) return FALSE;
+    cache = &binding->sources[i];
     *source = cache->pixmap;
     *source_depth = cache->depth;
     return TRUE;
@@ -2836,40 +2814,21 @@ static void complete_client_surface_cache_reply( struct client_surface_composito
         replay_client_surface_scene_sources( target, &budget );
 }
 
-static void cache_client_surface_handoff( struct client_surface_compositor_binding *binding,
-                                          unsigned int index, UINT64 control )
+static void start_client_surface_cache_copy( struct client_surface_compositor_binding *binding,
+                                             unsigned int depth )
 {
-    struct client_surface_handoff_channel *channel = binding->channel;
-    struct client_surface_handoff_slot frame = channel->slots[index];
     struct client_surface_cached_image *image = &binding->spare_image;
     struct client_surface_cache_copy *copy = &binding->cache_copy;
+    struct client_surface_handoff_slot frame = copy->frame;
     Display *display = client_surface_compositor_display;
-    unsigned int depth;
-    Pixmap source;
-    BOOL success = FALSE, created = FALSE;
+    Pixmap source = frame.source;
+    UINT64 control = copy->control;
+    BOOL created = FALSE;
     int error = 0;
 
-    assert( !binding->retired && !copy->reply.requests );
-    copy->frame = frame;
-    copy->index = index;
-    copy->control = control;
-    copy->started = client_surface_perf_time();
+    assert( !binding->retired && !client_surface_cache_read_pending( binding ) );
     TRACE( "reading handoff hwnd %p identity %s sequence %s into owner cache\n", binding->window,
-           wine_dbgstr_longlong( binding->identity ),
-           wine_dbgstr_longlong( control ) );
-    trace_client_surface_source( "claim", binding, control, frame.source_sequence, 0, frame.source, TRUE );
-    if (frame.cookie != binding->cookie || frame.identity != binding->identity ||
-        frame.producer_process != binding->process ||
-        frame.window != wine_server_user_handle( binding->window ) ||
-        frame.toplevel != wine_server_user_handle( binding->toplevel ) ||
-        !(frame.flags & CLIENT_SURFACE_HANDOFF_NATIVE_X11) || !frame.width || !frame.height ||
-        !frame.source_visual) goto done;
-    if (binding->latest_image.pixmap && frame.source_sequence < binding->latest_frame.source_sequence)
-    {
-        success = TRUE;
-        goto done;
-    }
-    if (!get_client_surface_compositor_source( binding, index, &frame, &source, &depth )) goto done;
+           wine_dbgstr_longlong( binding->identity ), wine_dbgstr_longlong( control ) );
     if (image->width != frame.width || image->height != frame.height || image->depth != depth)
     {
         UINT64 bytes = client_surface_pixmap_bytes( frame.width, frame.height, depth );
@@ -2951,7 +2910,82 @@ static void cache_client_surface_handoff( struct client_surface_compositor_bindi
     finish_client_surface_cache_copy( binding, TRUE );
     return;
 done:
+    release_client_surface_cached_source( binding, FALSE );
+}
+
+static void complete_client_surface_source_query( struct client_surface_geometry_query *query )
+{
+    struct client_surface_compositor_binding *binding =
+        CONTAINING_RECORD( query, struct client_surface_compositor_binding, cache_copy.query );
+    struct client_surface_cache_copy *copy = &binding->cache_copy;
+    const struct client_surface_handoff_slot *frame = &copy->frame;
+
+    assert( copy->query_pending );
+    copy->query_pending = FALSE;
+    TRACE_(csperf)( "ticks=%llu event=cache_query_complete identity=%s cookie=%s token=%s query=%p "
+                   "success=%u retired=%u\n", client_surface_perf_time(),
+                   wine_dbgstr_longlong( binding->identity ), wine_dbgstr_longlong( binding->cookie ),
+                   wine_dbgstr_longlong( copy->control ), query, query->success, binding->retired );
+    if (binding->retired || !query->success)
+    {
+        release_client_surface_cached_source( binding, FALSE );
+        return;
+    }
+    binding->sources[copy->index] = (struct client_surface_source_cache){frame->source,
+        frame->target_epoch, frame->source_visual, frame->width, frame->height, query->depth};
+    start_client_surface_cache_copy( binding, query->depth );
+}
+
+static BOOL cache_client_surface_handoff( struct client_surface_compositor_binding *binding,
+                                          unsigned int index, UINT64 control )
+{
+    struct client_surface_handoff_slot frame = binding->channel->slots[index];
+    struct client_surface_cache_copy *copy = &binding->cache_copy;
+    enum client_surface_query_status status;
+    unsigned int depth;
+    Pixmap source;
+    BOOL success = FALSE;
+
+    assert( !binding->retired && !client_surface_cache_read_pending( binding ) );
+    copy->frame = frame;
+    copy->index = index;
+    copy->control = control;
+    copy->started = client_surface_perf_time();
+    if (frame.cookie != binding->cookie || frame.identity != binding->identity ||
+        frame.producer_process != binding->process ||
+        frame.window != wine_server_user_handle( binding->window ) ||
+        frame.toplevel != wine_server_user_handle( binding->toplevel ) ||
+        !(frame.flags & CLIENT_SURFACE_HANDOFF_NATIVE_X11) ||
+        !(frame.flags & CLIENT_SURFACE_HANDOFF_COPY_SOURCE) || !frame.width || !frame.height ||
+        !frame.source_visual) goto rejected;
+    if (binding->latest_image.pixmap && frame.source_sequence < binding->latest_frame.source_sequence)
+    {
+        success = TRUE;
+        goto rejected;
+    }
+    if (get_client_surface_compositor_source( binding, &frame, &source, &depth ))
+    {
+        trace_client_surface_source( "claim", binding, control, frame.source_sequence, 0, frame.source, TRUE );
+        start_client_surface_cache_copy( binding, depth );
+        return TRUE;
+    }
+    copy->query = (struct client_surface_geometry_query){.pixmap = frame.source,
+        .min_width = frame.width, .min_height = frame.height, .complete = complete_client_surface_source_query};
+    status = client_surface_query_geometry( &copy->query, wake_client_surface_compositor );
+    if (status == CLIENT_SURFACE_QUERY_FULL) return FALSE;
+    if (status == CLIENT_SURFACE_QUERY_FAILED) goto rejected;
+    copy->query_pending = TRUE;
+    trace_client_surface_source( "claim", binding, control, frame.source_sequence, 0, frame.source, TRUE );
+    TRACE_(csperf)( "ticks=%llu event=cache_query_pending identity=%s cookie=%s token=%s sequence=%s "
+                   "query=%p source=%lx\n", client_surface_perf_time(),
+                   wine_dbgstr_longlong( binding->identity ), wine_dbgstr_longlong( binding->cookie ),
+                   wine_dbgstr_longlong( control ), wine_dbgstr_longlong( frame.source_sequence ),
+                   &copy->query, (Pixmap)frame.source );
+    return TRUE;
+rejected:
+    trace_client_surface_source( "claim", binding, control, frame.source_sequence, 0, frame.source, TRUE );
     release_client_surface_cached_source( binding, success );
+    return TRUE;
 }
 
 static BOOL get_client_surface_compositor_catchup(
@@ -3919,7 +3953,7 @@ static BOOL coalesce_client_surface_handoffs( struct client_surface_compositor_b
     struct client_surface_scene scene;
     UINT64 previous = *consumed;
 
-    assert( !binding->cache_copy.reply.requests && produced != *consumed );
+    assert( !client_surface_cache_read_pending( binding ) && produced != *consumed );
     if (!target || target->quiescing || target->assembly_pending || !target->scene.valid ||
         binding->scene_index >= target->scene.count || target->scene.members[binding->scene_index] != binding ||
         !client_surface_cached_frame_matches_layout( binding, &target->scene.layouts[binding->scene_index] ) ||
@@ -4005,7 +4039,7 @@ static BOOL process_client_surface_handoffs(void)
                 /* Clear the hint before acquiring the sequence. A concurrent
                  * publisher either appears in that load or leaves its bit set. */
                 __atomic_fetch_and( &pool->shared->ready_bitmap[word], ~((UINT64)1 << bit), __ATOMIC_ACQ_REL );
-                while (!binding->cache_copy.reply.requests &&
+                while (!client_surface_cache_read_pending( binding ) &&
                        !__atomic_load_n( &channel->closed, __ATOMIC_ACQUIRE ))
                 {
                     consumed = __atomic_load_n( &channel->consumer_sequence, __ATOMIC_RELAXED );
@@ -4033,9 +4067,15 @@ static BOOL process_client_surface_handoffs(void)
                     }
                     budget -= consumed - previous;
                     frames += consumed - previous;
-                    cache_client_surface_handoff( binding, consumed & (CLIENT_SURFACE_HANDOFF_RING_SIZE - 1),
-                                                   consumed + 1 );
+                    /* A full native queue still consumes an admission attempt. */
                     --budget;
+                    if (!cache_client_surface_handoff( binding, consumed & (CLIENT_SURFACE_HANDOFF_RING_SIZE - 1),
+                                                        consumed + 1 ))
+                    {
+                        progressed |= consumed != previous;
+                        __atomic_fetch_or( &pool->shared->ready_bitmap[word], (UINT64)1 << bit, __ATOMIC_RELEASE );
+                        break;
+                    }
                     progressed = TRUE;
                 }
                 if (!__atomic_load_n( &channel->closed, __ATOMIC_ACQUIRE )) continue;
@@ -4816,7 +4856,8 @@ static void client_surface_compositor_thread( void *context )
             BOOL progressed;
 
             process_client_surface_present_events();
-            progressed = process_client_surface_compositor_replies();
+            progressed = client_surface_complete_queries( CLIENT_SURFACE_COPY_BATCH_SIZE );
+            progressed |= process_client_surface_compositor_replies();
             if (progressed) wake_client_surface_compositor_queues();
             progressed |= process_client_surface_compositor_jobs();
             progressed |= process_client_surface_handoffs();

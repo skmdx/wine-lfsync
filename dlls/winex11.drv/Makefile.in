@@ -12,6 +12,7 @@ SOURCES = \
 	client_surface.c \
 	client_surface_backing.c \
 	client_surface_completion.c \
+	client_surface_query.c \
 	client_surface_retirement.c \
 	client_surface_snapshot.c \
 	client_surface_xcb.c \
