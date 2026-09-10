@@ -198,6 +198,7 @@ struct swapchain_snapshot
     VkCommandBuffer command;
     uint32_t queue_family;
     struct vulkan_snapshot_fence *pending;
+    struct vulkan_snapshot_capture *capture;
     BOOL busy;
 };
 
@@ -253,6 +254,7 @@ struct vulkan_present_reservation
     struct client_surface_completion_job *job;
     struct vulkan_present_completion *completion;
     BOOL required;
+    BOOL new_capture;
 };
 
 static struct client_surface_completion_result wait_vulkan_present_completion( void *context, DWORD timeout )
@@ -2420,8 +2422,6 @@ static VkResult acquire_snapshot_reservation( struct vulkan_device *device, stru
              * alive, including on timeout, rather than recycling GPU work. */
             return res == VK_TIMEOUT ? VK_ERROR_OUT_OF_DEVICE_MEMORY : res;
         }
-        release_snapshot_fence( snapshot->pending );
-        snapshot->pending = NULL;
     }
     *ret = snapshot;
     return VK_SUCCESS;
@@ -2472,7 +2472,6 @@ static void release_vulkan_snapshot_capture( void *context )
     struct vulkan_snapshot_capture *capture = context;
 
     release_snapshot_reservation( capture->swapchain, capture->snapshot );
-    client_surface_free_metadata( capture, sizeof(*capture) );
 }
 
 static void destroy_swapchain_snapshot( struct vulkan_device *device, struct swapchain_snapshot *snapshot )
@@ -2489,6 +2488,7 @@ static void destroy_swapchain_snapshot( struct vulkan_device *device, struct swa
     if (snapshot->memory) device->p_vkFreeMemory( device->host.device, snapshot->memory, NULL );
     client_surface_release_memory( CLIENT_SURFACE_MEMORY_STAGING, snapshot->memory_bytes );
     client_surface_free_metadata( snapshot->images, snapshot->images_bytes );
+    client_surface_free_metadata( snapshot->capture, sizeof(*snapshot->capture) );
     memset( snapshot, 0, sizeof(*snapshot) );
 }
 
@@ -2582,7 +2582,13 @@ failed:
      * reached its source fence before admission and keeps its allocations. */
     if (fresh)
     {
+        struct vulkan_snapshot_capture *capture = snapshot->capture;
+
+        /* The unsubmitted reservation still owns its capture until the
+         * batch cancels it, even when native storage preparation fails. */
+        snapshot->capture = NULL;
         destroy_swapchain_snapshot( device, snapshot );
+        snapshot->capture = capture;
         snapshot->busy = TRUE;
     }
     else if (snapshot->pool)
@@ -2592,6 +2598,40 @@ failed:
         snapshot->command = 0;
     }
     return res;
+}
+
+static struct vulkan_snapshot_fence *take_snapshot_fence( struct client_surface_frame *presents,
+                                                          struct vulkan_present_reservation *reservations,
+                                                          unsigned int count )
+{
+    struct vulkan_snapshot_fence *pending = NULL;
+    unsigned int i;
+
+    for (i = 0; i < count; ++i)
+    {
+        struct swapchain_snapshot *snapshot = reservations[i].snapshot;
+        struct vulkan_snapshot_fence *previous;
+
+        if (!presents[i].capture.apply || !(previous = snapshot->pending)) continue;
+        /* Admission observed this fence and owns the image reservation.
+         * Drop all selected images' old references before deciding whether
+         * any callback or unselected swapchain still owns the candidate. */
+        snapshot->pending = NULL;
+        if (!pending) pending = previous;
+        else if (previous != pending && InterlockedCompareExchange( &previous->refs, 0, 0 ) == 1 &&
+                 InterlockedCompareExchange( &pending->refs, 0, 0 ) != 1)
+        {
+            release_snapshot_fence( pending );
+            pending = previous;
+        }
+        else release_snapshot_fence( previous );
+    }
+    if (pending && InterlockedCompareExchange( &pending->refs, 0, 0 ) != 1)
+    {
+        release_snapshot_fence( pending );
+        pending = NULL;
+    }
+    return pending;
 }
 
 static VkResult snapshot_vulkan_present( struct vulkan_queue *queue, VkPresentInfoKHR *present_info,
@@ -2613,39 +2653,54 @@ static VkResult snapshot_vulkan_present( struct vulkan_queue *queue, VkPresentIn
     if (present_info->swapchainCount > ARRAY_SIZE(commands_buffer) &&
         !(commands = client_surface_alloc_metadata( present_info->swapchainCount, sizeof(*commands) )))
         return VK_ERROR_OUT_OF_HOST_MEMORY;
-    if (!(pending = client_surface_alloc_metadata( 1, sizeof(*pending) )))
-    {
-        res = VK_ERROR_OUT_OF_HOST_MEMORY;
-        goto done;
-    }
-    pending->device = device;
-    pending->refs = 1;
     /* Admit every capture owner before allocating native snapshot storage.
      * Host metadata failure must not consume guest synchronization or leave
      * a freshly allocated image without its capture owner. */
     for (i = 0; i < present_info->swapchainCount; ++i)
     {
         struct swapchain *swapchain = swapchain_from_handle( client_swapchains[i] );
+        struct swapchain_snapshot *snapshot = reservations[i].snapshot;
         struct vulkan_snapshot_capture *capture;
 
         if (!swapchain_needs_snapshot( swapchain ) || presents[i].completion.kind != CLIENT_SURFACE_COMPLETION_EXACT) continue;
-        assert( reservations[i].snapshot && reservations[i].snapshot->busy );
-        if (!(capture = client_surface_alloc_metadata( 1, sizeof(*capture) )))
+        assert( snapshot && snapshot->busy );
+        if (!(capture = snapshot->capture))
         {
-            res = VK_ERROR_OUT_OF_HOST_MEMORY;
-            goto done;
+            if (!(capture = client_surface_alloc_metadata( 1, sizeof(*capture) )))
+            {
+                res = VK_ERROR_OUT_OF_HOST_MEMORY;
+                goto done;
+            }
+            capture->device = device;
+            capture->swapchain = swapchain;
+            capture->snapshot = snapshot;
+            snapshot->capture = capture;
+            reservations[i].new_capture = TRUE;
         }
-        capture->device = device;
-        capture->swapchain = swapchain;
-        capture->snapshot = reservations[i].snapshot;
         presents[i].capture.read = read_vulkan_snapshot;
         presents[i].capture.apply = apply_vulkan_snapshot;
         presents[i].capture.release = release_vulkan_snapshot_capture;
         presents[i].capture.context = capture;
     }
-    if ((res = device->p_vkCreateFence( device->host.device, &fence_info, NULL, &fence )))
-        goto done;
-    pending->fence = fence;
+    if (!(pending = take_snapshot_fence( presents, reservations, present_info->swapchainCount )))
+    {
+        if (!(pending = client_surface_alloc_metadata( 1, sizeof(*pending) )))
+        {
+            res = VK_ERROR_OUT_OF_HOST_MEMORY;
+            goto done;
+        }
+        pending->device = device;
+        pending->refs = 1;
+    }
+    if (pending->fence)
+    {
+        if ((res = device->p_vkResetFences( device->host.device, 1, &pending->fence ))) goto done;
+    }
+    else
+    {
+        if ((res = device->p_vkCreateFence( device->host.device, &fence_info, NULL, &fence ))) goto done;
+        pending->fence = fence;
+    }
     for (i = 0; i < present_info->swapchainCount; ++i)
     {
         struct swapchain *swapchain = swapchain_from_handle( client_swapchains[i] );
@@ -2723,7 +2778,12 @@ done:
 
             /* No submitted fence was installed. The caller still owns and
              * releases all reservations after dropping the submission locks. */
-            client_surface_free_metadata( capture->context, sizeof(struct vulkan_snapshot_capture) );
+            if (reservations[i].new_capture)
+            {
+                client_surface_free_metadata( reservations[i].snapshot->capture,
+                                               sizeof(struct vulkan_snapshot_capture) );
+                reservations[i].snapshot->capture = NULL;
+            }
             memset( capture, 0, sizeof(*capture) );
         }
     if (!submitted && res && present_info->pResults)
