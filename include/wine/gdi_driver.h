@@ -420,6 +420,27 @@ enum client_surface_memory_class
     CLIENT_SURFACE_MEMORY_CLASS_COUNT,
 };
 
+struct client_surface_memory_account;
+
+/* A resource keeps its original allocation owners through retirement. A copy
+ * acquires new account references, but never copies another resource's charge. */
+struct client_surface_memory_scope
+{
+    struct client_surface_memory_account *owner, *domain;
+    UINT64 used[CLIENT_SURFACE_MEMORY_CLASS_COUNT + 1];
+};
+
+W32KAPI BOOL client_surface_memory_scope_init( struct client_surface_memory_scope *scope, HWND hwnd, UINT64 domain );
+W32KAPI void client_surface_memory_scope_copy( struct client_surface_memory_scope *dst,
+                                              const struct client_surface_memory_scope *src );
+W32KAPI void client_surface_memory_scope_destroy( struct client_surface_memory_scope *scope );
+W32KAPI BOOL client_surface_reserve_scoped_memory( struct client_surface_memory_scope *scope,
+                                                  enum client_surface_memory_class type, UINT64 bytes );
+W32KAPI void client_surface_release_scoped_memory( struct client_surface_memory_scope *scope,
+                                                  enum client_surface_memory_class type, UINT64 bytes );
+W32KAPI BOOL client_surface_reserve_scoped_metadata( struct client_surface_memory_scope *scope, UINT64 bytes );
+W32KAPI void client_surface_release_scoped_metadata( struct client_surface_memory_scope *scope, UINT64 bytes );
+
 W32KAPI void client_surface_fail_scene( HWND hwnd );
 
 W32KAPI BOOL client_surface_reserve_memory( enum client_surface_memory_class type, UINT64 bytes );
@@ -430,23 +451,34 @@ W32KAPI void client_surface_release_metadata_memory( UINT64 bytes );
 /* Transfer and retirement metadata has protected admission within the image
  * budget. Callers retain the allocated byte count when a native enumeration
  * later changes its count. Native use must finish before the actual free. */
-static inline void *client_surface_alloc_metadata( SIZE_T count, SIZE_T size )
+static inline void *client_surface_alloc_scoped_metadata( struct client_surface_memory_scope *scope,
+                                                          SIZE_T count, SIZE_T size )
 {
     void *data;
 
     if (size && count > ~(SIZE_T)0 / size) return NULL;
     size *= count;
-    if (!client_surface_reserve_metadata_memory( size )) return NULL;
-    if (!(data = calloc( 1, size )))
-        client_surface_release_metadata_memory( size );
+    if (!client_surface_reserve_scoped_metadata( scope, size )) return NULL;
+    if (!(data = calloc( 1, size ))) client_surface_release_scoped_metadata( scope, size );
     return data;
+}
+
+static inline void client_surface_free_scoped_metadata( struct client_surface_memory_scope *scope,
+                                                         void *data, SIZE_T size )
+{
+    if (!data) return;
+    free( data );
+    client_surface_release_scoped_metadata( scope, size );
+}
+
+static inline void *client_surface_alloc_metadata( SIZE_T count, SIZE_T size )
+{
+    return client_surface_alloc_scoped_metadata( NULL, count, size );
 }
 
 static inline void client_surface_free_metadata( void *data, SIZE_T size )
 {
-    if (!data) return;
-    free( data );
-    client_surface_release_metadata_memory( size );
+    client_surface_free_scoped_metadata( NULL, data, size );
 }
 
 struct client_surface

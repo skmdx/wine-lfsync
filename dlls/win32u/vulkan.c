@@ -166,6 +166,7 @@ struct device
     BOOL retirement_shutdown;
     BOOL swapchain_maintenance1;
     UINT64 completion_domain_base;
+    struct client_surface_memory_scope memory;
     struct vulkan_device obj;
 };
 
@@ -212,6 +213,7 @@ struct swapchain
     VkFormat format;
     struct vulkan_surface_source source;
     struct swapchain_snapshot snapshots[2];
+    struct client_surface_memory_scope memory;
     unsigned int next_snapshot;
     pthread_mutex_t present_lock;
     pthread_cond_t completion_cond;
@@ -227,6 +229,17 @@ static struct swapchain *swapchain_from_handle( VkSwapchainKHR handle )
 {
     struct vulkan_swapchain *obj = vulkan_swapchain_from_handle( handle );
     return CONTAINING_RECORD( obj, struct swapchain, obj );
+}
+
+static BOOL ensure_device_memory( struct vulkan_device *device )
+{
+    struct device *impl = impl_from_vulkan_device( device );
+    BOOL ret;
+
+    pthread_mutex_lock( &impl->retirement_lock );
+    ret = impl->memory.domain || client_surface_memory_scope_init( &impl->memory, NULL, impl->completion_domain_base );
+    pthread_mutex_unlock( &impl->retirement_lock );
+    return ret;
 }
 
 static BOOL swapchain_needs_snapshot( const struct swapchain *swapchain )
@@ -305,9 +318,10 @@ static void release_swapchain_completion( struct swapchain *swapchain )
 static void release_vulkan_present_completion( void *context )
 {
     struct vulkan_present_completion *completion = context;
+    struct swapchain *swapchain = completion->swapchain;
 
-    release_swapchain_completion( completion->swapchain );
-    client_surface_free_metadata( completion, sizeof(*completion) );
+    client_surface_free_scoped_metadata( &swapchain->memory, completion, sizeof(*completion) );
+    release_swapchain_completion( swapchain );
 }
 
 static void retain_swapchain_completion( struct swapchain *swapchain )
@@ -1175,6 +1189,7 @@ static void win32u_vkDestroyDevice( VkDevice client_device, const VkAllocationCa
     assert( list_empty( &impl->retired_swapchains ) );
 
     device->p_vkDestroyDevice( device->host.device, NULL /* pAllocator */ );
+    client_surface_memory_scope_destroy( &impl->memory );
     for (i = 0; i < device->queue_count; i++)
         instance->p_remove_object( instance, &device->queues[i].obj );
     instance->p_remove_object( instance, &device->obj );
@@ -2353,7 +2368,7 @@ static void release_snapshot_fence( struct vulkan_snapshot_fence *pending )
 {
     if (!pending || InterlockedDecrement( &pending->refs )) return;
     pending->device->p_vkDestroyFence( pending->device->host.device, pending->fence, NULL );
-    client_surface_free_metadata( pending, sizeof(*pending) );
+    client_surface_free_scoped_metadata( &impl_from_vulkan_device( pending->device )->memory, pending, sizeof(*pending) );
 }
 
 static void release_snapshot_reservation( struct swapchain *swapchain, struct swapchain_snapshot *snapshot )
@@ -2474,7 +2489,8 @@ static void release_vulkan_snapshot_capture( void *context )
     release_snapshot_reservation( capture->swapchain, capture->snapshot );
 }
 
-static void destroy_swapchain_snapshot( struct vulkan_device *device, struct swapchain_snapshot *snapshot )
+static void destroy_swapchain_snapshot( struct vulkan_device *device, struct swapchain *swapchain,
+                                        struct swapchain_snapshot *snapshot )
 {
     /* The retiring swapchain has checked completion of its source reads.
      * Partial initialization has not submitted any work. */
@@ -2486,9 +2502,9 @@ static void destroy_swapchain_snapshot( struct vulkan_device *device, struct swa
     if (snapshot->pixels) device->p_vkUnmapMemory( device->host.device, snapshot->memory );
     if (snapshot->buffer) device->p_vkDestroyBuffer( device->host.device, snapshot->buffer, NULL );
     if (snapshot->memory) device->p_vkFreeMemory( device->host.device, snapshot->memory, NULL );
-    client_surface_release_memory( CLIENT_SURFACE_MEMORY_STAGING, snapshot->memory_bytes );
-    client_surface_free_metadata( snapshot->images, snapshot->images_bytes );
-    client_surface_free_metadata( snapshot->capture, sizeof(*snapshot->capture) );
+    client_surface_release_scoped_memory( &swapchain->memory, CLIENT_SURFACE_MEMORY_STAGING, snapshot->memory_bytes );
+    client_surface_free_scoped_metadata( &swapchain->memory, snapshot->images, snapshot->images_bytes );
+    client_surface_free_scoped_metadata( &swapchain->memory, snapshot->capture, sizeof(*snapshot->capture) );
     memset( snapshot, 0, sizeof(*snapshot) );
 }
 
@@ -2520,7 +2536,7 @@ static VkResult prepare_swapchain_snapshot( struct vulkan_queue *queue, struct s
         if ((res = device->p_vkGetSwapchainImagesKHR( device->host.device, swapchain->obj.host.swapchain,
                                                      &image_count, NULL ))) goto failed;
         snapshot->image_count = image_count;
-        if (!(snapshot->images = client_surface_alloc_metadata( image_count, sizeof(*snapshot->images) )))
+        if (!(snapshot->images = client_surface_alloc_scoped_metadata( &swapchain->memory, image_count, sizeof(*snapshot->images) )))
         {
             res = VK_ERROR_OUT_OF_HOST_MEMORY;
             goto failed;
@@ -2546,7 +2562,7 @@ static VkResult prepare_swapchain_snapshot( struct vulkan_queue *queue, struct s
         }
         memory_info.allocationSize = requirements.size;
         memory_info.memoryTypeIndex = i;
-        if (!client_surface_reserve_memory( CLIENT_SURFACE_MEMORY_STAGING, requirements.size ))
+        if (!client_surface_reserve_scoped_memory( &swapchain->memory, CLIENT_SURFACE_MEMORY_STAGING, requirements.size ))
         {
             res = VK_ERROR_OUT_OF_DEVICE_MEMORY;
             goto failed;
@@ -2587,7 +2603,7 @@ failed:
         /* The unsubmitted reservation still owns its capture until the
          * batch cancels it, even when native storage preparation fails. */
         snapshot->capture = NULL;
-        destroy_swapchain_snapshot( device, snapshot );
+        destroy_swapchain_snapshot( device, swapchain, snapshot );
         snapshot->capture = capture;
         snapshot->busy = TRUE;
     }
@@ -2640,6 +2656,7 @@ static VkResult snapshot_vulkan_present( struct vulkan_queue *queue, VkPresentIn
                                          struct vulkan_present_reservation *reservations )
 {
     struct vulkan_device *device = queue->device;
+    struct client_surface_memory_scope *memory = &impl_from_vulkan_device( device )->memory;
     VkCommandBuffer commands_buffer[16], *commands = commands_buffer;
     VkBool32 submitted = VK_FALSE;
     struct wine_vk_present_source_info source = {WINE_VK_PRESENT_SOURCE_INFO, present_info->pNext,
@@ -2650,8 +2667,9 @@ static VkResult snapshot_vulkan_present( struct vulkan_queue *queue, VkPresentIn
     unsigned int i, count = 0;
     VkResult res = VK_SUCCESS;
 
+    if (!ensure_device_memory( device )) return VK_ERROR_OUT_OF_HOST_MEMORY;
     if (present_info->swapchainCount > ARRAY_SIZE(commands_buffer) &&
-        !(commands = client_surface_alloc_metadata( present_info->swapchainCount, sizeof(*commands) )))
+        !(commands = client_surface_alloc_scoped_metadata( memory, present_info->swapchainCount, sizeof(*commands) )))
         return VK_ERROR_OUT_OF_HOST_MEMORY;
     /* Admit every capture owner before allocating native snapshot storage.
      * Host metadata failure must not consume guest synchronization or leave
@@ -2666,7 +2684,7 @@ static VkResult snapshot_vulkan_present( struct vulkan_queue *queue, VkPresentIn
         assert( snapshot && snapshot->busy );
         if (!(capture = snapshot->capture))
         {
-            if (!(capture = client_surface_alloc_metadata( 1, sizeof(*capture) )))
+            if (!(capture = client_surface_alloc_scoped_metadata( &swapchain->memory, 1, sizeof(*capture) )))
             {
                 res = VK_ERROR_OUT_OF_HOST_MEMORY;
                 goto done;
@@ -2684,7 +2702,7 @@ static VkResult snapshot_vulkan_present( struct vulkan_queue *queue, VkPresentIn
     }
     if (!(pending = take_snapshot_fence( presents, reservations, present_info->swapchainCount )))
     {
-        if (!(pending = client_surface_alloc_metadata( 1, sizeof(*pending) )))
+        if (!(pending = client_surface_alloc_scoped_metadata( memory, 1, sizeof(*pending) )))
         {
             res = VK_ERROR_OUT_OF_HOST_MEMORY;
             goto done;
@@ -2780,8 +2798,10 @@ done:
              * releases all reservations after dropping the submission locks. */
             if (reservations[i].new_capture)
             {
-                client_surface_free_metadata( reservations[i].snapshot->capture,
-                                               sizeof(struct vulkan_snapshot_capture) );
+                struct swapchain *swapchain = swapchain_from_handle( client_swapchains[i] );
+
+                client_surface_free_scoped_metadata( &swapchain->memory, reservations[i].snapshot->capture,
+                                                      sizeof(struct vulkan_snapshot_capture) );
                 reservations[i].snapshot->capture = NULL;
             }
             memset( capture, 0, sizeof(*capture) );
@@ -2790,7 +2810,7 @@ done:
         for (i = 0; i < present_info->swapchainCount; ++i) present_info->pResults[i] = res;
     release_snapshot_fence( pending );
     if (commands != commands_buffer)
-        client_surface_free_metadata( commands, present_info->swapchainCount * sizeof(*commands) );
+        client_surface_free_scoped_metadata( memory, commands, present_info->swapchainCount * sizeof(*commands) );
     return res;
 }
 
@@ -2881,6 +2901,16 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
         return VK_ERROR_OUT_OF_HOST_MEMORY;
     }
 
+    /* Pin the allocation owners while this HWND is alive. A first Present
+     * may follow window destruction, and must retain native WSI semantics
+     * without resolving a destroyed or reused HWND to a different account. */
+    if (!client_surface_memory_scope_init( &swapchain->memory, surface->hwnd,
+                                           impl_from_vulkan_device( device )->completion_domain_base ))
+    {
+        res = VK_ERROR_OUT_OF_HOST_MEMORY;
+        goto failed;
+    }
+
     /* No USER, client-surface, or device lock spans this drain. A wait which
      * already entered may finish, while later waits observe closed admission.
      * Native retirement is irreversible even when creating its replacement
@@ -2895,13 +2925,7 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
     }
     TRACE( "Native swapchain create replacing %p returned %d\n", old_swapchain, res );
     if (old_swapchain) release_swapchain_completion( old_swapchain );
-    if (res)
-    {
-        pthread_cond_destroy( &swapchain->completion_cond );
-        pthread_mutex_destroy( &swapchain->present_lock );
-        free( swapchain );
-        return res;
-    }
+    if (res) goto failed;
     vulkan_object_init( &swapchain->obj.obj, host_swapchain );
     swapchain->surface = surface;
     InterlockedIncrement( &surface->refs );
@@ -2917,6 +2941,13 @@ static VkResult win32u_vkCreateSwapchainKHR( VkDevice client_device, const VkSwa
 
     *ret = swapchain->obj.client.swapchain;
     return VK_SUCCESS;
+
+failed:
+    client_surface_memory_scope_destroy( &swapchain->memory );
+    pthread_cond_destroy( &swapchain->completion_cond );
+    pthread_mutex_destroy( &swapchain->present_lock );
+    free( swapchain );
+    return res;
 }
 
 static BOOL destroy_swapchain( struct vulkan_device *device, struct swapchain *swapchain )
@@ -2949,9 +2980,10 @@ static BOOL destroy_swapchain( struct vulkan_device *device, struct swapchain *s
 
     TRACE( "destroying retired swapchain %p after its source copies\n", swapchain );
     for (i = 0; i < ARRAY_SIZE(swapchain->snapshots); ++i)
-        destroy_swapchain_snapshot( device, &swapchain->snapshots[i] );
+        destroy_swapchain_snapshot( device, swapchain, &swapchain->snapshots[i] );
     device->p_vkDestroySwapchainKHR( device->host.device, swapchain->obj.host.swapchain, NULL );
     release_surface( swapchain->surface );
+    client_surface_memory_scope_destroy( &swapchain->memory );
 
     pthread_cond_destroy( &swapchain->completion_cond );
     pthread_mutex_destroy( &swapchain->present_lock );
@@ -3181,6 +3213,7 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
     uint64_t present_ids_buffer[16], *present_ids = present_ids_buffer;
     VkPresentIdKHR present_id_info = {VK_STRUCTURE_TYPE_PRESENT_ID_KHR};
     struct vulkan_device *device = queue->device;
+    struct client_surface_memory_scope *memory = &impl_from_vulkan_device( device )->memory;
     const VkSwapchainKHR *client_swapchains = present_info->pSwapchains;
     const VkPresentRegionsKHR *regions = find_next_struct( present_info->pNext,
                                                           VK_STRUCTURE_TYPE_PRESENT_REGIONS_KHR );
@@ -3196,23 +3229,25 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
     use_internal_present_wait = device->internal_present_wait &&
         !find_next_struct( present_info->pNext, VK_STRUCTURE_TYPE_PRESENT_ID_KHR );
 
+    if (present_info->swapchainCount > ARRAY_SIZE(swapchains_buffer) && !ensure_device_memory( device ))
+        goto allocation_failed;
     if (present_info->swapchainCount > ARRAY_SIZE(swapchains_buffer) &&
-        !(swapchains = client_surface_alloc_metadata( present_info->swapchainCount, sizeof(*swapchains) )))
+        !(swapchains = client_surface_alloc_scoped_metadata( memory, present_info->swapchainCount, sizeof(*swapchains) )))
         goto allocation_failed;
     if (present_info->swapchainCount > ARRAY_SIZE(presents_buffer) &&
-        !(presents = client_surface_alloc_metadata( present_info->swapchainCount, sizeof(*presents) )))
+        !(presents = client_surface_alloc_scoped_metadata( memory, present_info->swapchainCount, sizeof(*presents) )))
         goto allocation_failed;
     if (present_info->swapchainCount > ARRAY_SIZE(present_surfaces_buffer) &&
-        !(present_surfaces = client_surface_alloc_metadata( present_info->swapchainCount, sizeof(*present_surfaces) )))
+        !(present_surfaces = client_surface_alloc_scoped_metadata( memory, present_info->swapchainCount, sizeof(*present_surfaces) )))
         goto allocation_failed;
     if (use_internal_present_wait && present_info->swapchainCount > ARRAY_SIZE(present_ids_buffer) &&
-        !(present_ids = client_surface_alloc_metadata( present_info->swapchainCount, sizeof(*present_ids) )))
+        !(present_ids = client_surface_alloc_scoped_metadata( memory, present_info->swapchainCount, sizeof(*present_ids) )))
         goto allocation_failed;
     if (present_info->swapchainCount > ARRAY_SIZE(present_swapchains_buffer) &&
-        !(present_swapchains = client_surface_alloc_metadata( present_info->swapchainCount, sizeof(*present_swapchains) )))
+        !(present_swapchains = client_surface_alloc_scoped_metadata( memory, present_info->swapchainCount, sizeof(*present_swapchains) )))
         goto allocation_failed;
     if (present_info->swapchainCount > ARRAY_SIZE(reservations_buffer) &&
-        !(reservations = client_surface_alloc_metadata( present_info->swapchainCount, sizeof(*reservations) )))
+        !(reservations = client_surface_alloc_scoped_metadata( memory, present_info->swapchainCount, sizeof(*reservations) )))
         goto allocation_failed;
     reservation_count = present_info->swapchainCount;
 
@@ -3222,7 +3257,7 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
     if (!present_info->pResults)
     {
         if (present_info->swapchainCount > ARRAY_SIZE(results_buffer) &&
-            !(results = client_surface_alloc_metadata( present_info->swapchainCount, sizeof(*results) )))
+            !(results = client_surface_alloc_scoped_metadata( memory, present_info->swapchainCount, sizeof(*results) )))
             goto allocation_failed;
         present_info->pResults = results;
     }
@@ -3289,7 +3324,8 @@ reserve_completions:
             goto reservation_failed;
         if (!swapchain_needs_snapshot( swapchain ) && use_internal_present_wait && present_ids[index] &&
             !reservations[index].completion &&
-            !(reservations[index].completion = client_surface_alloc_metadata( 1, sizeof(*reservations[index].completion) )))
+            !(reservations[index].completion = client_surface_alloc_scoped_metadata( &swapchain->memory, 1,
+                                                 sizeof(*reservations[index].completion) )))
             goto reservation_failed;
         if (!swapchain_needs_snapshot( swapchain ) || reservations[index].snapshot ||
             !(res = acquire_snapshot_reservation( device, swapchain, &reservations[index].snapshot ))) continue;
@@ -3550,24 +3586,26 @@ done:
     for (uint32_t i = 0; i < reservation_count; ++i)
     {
         client_surface_cancel_completion( reservations[i].job );
-        client_surface_free_metadata( reservations[i].completion, sizeof(*reservations[i].completion) );
+        if (reservations[i].completion)
+            client_surface_free_scoped_metadata( &swapchain_from_handle( client_swapchains[i] )->memory,
+                                                  reservations[i].completion, sizeof(*reservations[i].completion) );
         if (reservations[i].snapshot)
             release_snapshot_reservation( swapchain_from_handle( client_swapchains[i] ), reservations[i].snapshot );
     }
     if (reservations != reservations_buffer)
-        client_surface_free_metadata( reservations, present_info->swapchainCount * sizeof(*reservations) );
+        client_surface_free_scoped_metadata( memory, reservations, present_info->swapchainCount * sizeof(*reservations) );
     if (results != results_buffer)
-        client_surface_free_metadata( results, present_info->swapchainCount * sizeof(*results) );
+        client_surface_free_scoped_metadata( memory, results, present_info->swapchainCount * sizeof(*results) );
     if (present_swapchains != present_swapchains_buffer)
-        client_surface_free_metadata( present_swapchains, present_info->swapchainCount * sizeof(*present_swapchains) );
+        client_surface_free_scoped_metadata( memory, present_swapchains, present_info->swapchainCount * sizeof(*present_swapchains) );
     if (present_ids != present_ids_buffer)
-        client_surface_free_metadata( present_ids, present_info->swapchainCount * sizeof(*present_ids) );
+        client_surface_free_scoped_metadata( memory, present_ids, present_info->swapchainCount * sizeof(*present_ids) );
     if (present_surfaces != present_surfaces_buffer)
-        client_surface_free_metadata( present_surfaces, present_info->swapchainCount * sizeof(*present_surfaces) );
+        client_surface_free_scoped_metadata( memory, present_surfaces, present_info->swapchainCount * sizeof(*present_surfaces) );
     if (presents != presents_buffer)
-        client_surface_free_metadata( presents, present_info->swapchainCount * sizeof(*presents) );
+        client_surface_free_scoped_metadata( memory, presents, present_info->swapchainCount * sizeof(*presents) );
     if (swapchains != swapchains_buffer)
-        client_surface_free_metadata( swapchains, present_info->swapchainCount * sizeof(*swapchains) );
+        client_surface_free_scoped_metadata( memory, swapchains, present_info->swapchainCount * sizeof(*swapchains) );
 
     if (TRACE_ON( fps ))
     {

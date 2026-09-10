@@ -421,6 +421,7 @@ struct framebuffer_surface
     struct opengl_drawable *target;         /* driver drawable to present to */
     SIZE                   storage_size;
     UINT64                 storage_bytes;
+    struct client_surface_memory_scope memory;
     BOOL                   storage_valid;
 };
 
@@ -466,7 +467,8 @@ static UINT64 framebuffer_surface_storage_size( struct framebuffer_surface *surf
 static BOOL reserve_framebuffer_surface_storage( struct framebuffer_surface *surface, UINT64 bytes )
 {
     if (bytes <= surface->storage_bytes) return TRUE;
-    if (!client_surface_reserve_memory( CLIENT_SURFACE_MEMORY_SOURCE, bytes - surface->storage_bytes ))
+    if (!client_surface_reserve_scoped_memory( &surface->memory, CLIENT_SURFACE_MEMORY_SOURCE,
+                                               bytes - surface->storage_bytes ))
         return FALSE;
     surface->storage_bytes = bytes;
     return TRUE;
@@ -796,7 +798,8 @@ static void framebuffer_surface_destroy( struct opengl_drawable *drawable )
 
     TRACE( "%s\n", debugstr_opengl_drawable( drawable ) );
     assert( !drawable->read_fbo && !drawable->draw_fbo );
-    client_surface_release_memory( CLIENT_SURFACE_MEMORY_SOURCE, surface->storage_bytes );
+    client_surface_release_scoped_memory( &surface->memory, CLIENT_SURFACE_MEMORY_SOURCE, surface->storage_bytes );
+    client_surface_memory_scope_destroy( &surface->memory );
     if (surface->target) opengl_drawable_release( surface->target );
 }
 
@@ -915,7 +918,8 @@ static void framebuffer_surface_flush( struct opengl_drawable *drawable, UINT fl
                                          surface->storage_valid;
             if (surface->storage_valid)
             {
-                client_surface_release_memory( CLIENT_SURFACE_MEMORY_SOURCE, surface->storage_bytes - bytes );
+                client_surface_release_scoped_memory( &surface->memory, CLIENT_SURFACE_MEMORY_SOURCE,
+                                                       surface->storage_bytes - bytes );
                 surface->storage_bytes = bytes;
                 surface->storage_size = size;
             }
@@ -1011,7 +1015,8 @@ static struct opengl_drawable *framebuffer_surface_create( int format, struct cl
 
     if (!(surface = opengl_drawable_create( sizeof(*surface), &framebuffer_surface_funcs, format, client ))) return NULL;
     if ((surface->target = target)) opengl_drawable_add_ref( surface->target );
-    if (!reserve_framebuffer_surface_storage( surface,
+    if (!client_surface_memory_scope_init( &surface->memory, client ? client->hwnd : NULL, 0 ) ||
+        !reserve_framebuffer_surface_storage( surface,
                                               framebuffer_surface_storage_size( surface, surface->base.virtual_size ) ))
     {
         opengl_drawable_release( &surface->base );

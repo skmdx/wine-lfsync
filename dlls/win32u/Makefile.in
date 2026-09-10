@@ -17,6 +17,7 @@ SOURCES = \
 	client_surface.c \
 	client_surface_completion.c \
 	client_surface_handoff.c \
+	client_surface_memory.c \
 	client_surface_present.c \
 	clipping.c \
 	cursoricon.c \
