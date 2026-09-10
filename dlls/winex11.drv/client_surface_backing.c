@@ -162,6 +162,9 @@ struct client_surface_compositor_frame
 {
     struct client_surface_compositor_job *waiter;
     Pixmap pixmap;
+#ifdef SONAME_LIBXPRESENT
+    struct rb_entry pixmap_entry;
+#endif
     GC gc;
     UINT64 revision;
     uint32_t serial;
@@ -185,6 +188,9 @@ struct client_surface_compositor_frame
     BOOL copy_replay;
     RECT copy_damage;
     struct client_surface_xcb_request copy_request;
+    struct list reply_entry;
+    struct client_surface_compositor_target *reply_target;
+    struct client_surface_copy_batch *reply_batch;
 };
 
 struct client_surface_compositor_target
@@ -238,6 +244,35 @@ struct client_surface_compositor_target
     VisualID visual;
 };
 
+#ifdef SONAME_LIBXPRESENT
+static int compare_client_surface_compositor_pixmap( const void *key, const struct rb_entry *entry )
+{
+    const struct client_surface_compositor_frame *frame =
+        CONTAINING_RECORD( entry, const struct client_surface_compositor_frame, pixmap_entry );
+    Pixmap a = *(const Pixmap *)key, b = frame->pixmap;
+
+    return (a > b) - (a < b);
+}
+
+static struct rb_tree client_surface_compositor_pixmaps = {compare_client_surface_compositor_pixmap};
+#endif
+
+static void set_client_surface_compositor_pixmap( struct client_surface_compositor_frame *frame, Pixmap pixmap )
+{
+#ifdef SONAME_LIBXPRESENT
+    assert( !frame->reply_target && !frame->serial );
+    if (frame->pixmap) rb_remove( &client_surface_compositor_pixmaps, &frame->pixmap_entry );
+#endif
+    frame->pixmap = pixmap;
+#ifdef SONAME_LIBXPRESENT
+    if (pixmap)
+    {
+        assert( !rb_get( &client_surface_compositor_pixmaps, &pixmap ) );
+        rb_put( &client_surface_compositor_pixmaps, &pixmap, &frame->pixmap_entry );
+    }
+#endif
+}
+
 static pthread_mutex_t client_surface_compositor_mutex = PTHREAD_MUTEX_INITIALIZER;
 static Display *client_surface_compositor_display;
 static BOOL client_surface_compositor_started;
@@ -245,7 +280,19 @@ static int client_surface_compositor_notify[2] = {-1, -1};
 static struct client_surface_compositor_pool *client_surface_compositor_pools;
 static struct client_surface_compositor_binding *client_surface_compositor_bindings;
 static struct client_surface_compositor_target *client_surface_compositor_targets;
+static struct client_surface_compositor_target *client_surface_compositor_next_target;
+static unsigned int client_surface_compositor_target_count;
+static UINT64 client_surface_compositor_target_generation;
 static UINT64 client_surface_compositor_mark;
+
+struct client_surface_compositor_scan
+{
+    UINT64 generation, wake_serial;
+    unsigned int remaining;
+    DWORD timeout_start;
+    int timeout;
+    BOOL progressed;
+};
 
 static int compare_client_surface_compositor_target( const void *key, const struct rb_entry *entry )
 {
@@ -269,6 +316,9 @@ static void register_client_surface_compositor_target( struct client_surface_com
     target->prev = &client_surface_compositor_targets;
     if (target->next) target->next->prev = &target->next;
     client_surface_compositor_targets = target;
+    if (!client_surface_compositor_next_target) client_surface_compositor_next_target = target;
+    ++client_surface_compositor_target_count;
+    ++client_surface_compositor_target_generation;
 }
 
 enum client_surface_compositor_op
@@ -479,6 +529,7 @@ static int compare_client_surface_compositor_queue( const void *key, const struc
 static struct rb_tree client_surface_compositor_queues = {compare_client_surface_compositor_queue};
 static struct list client_surface_compositor_ready = LIST_INIT( client_surface_compositor_ready );
 static struct list client_surface_compositor_parked = LIST_INIT( client_surface_compositor_parked );
+static UINT64 client_surface_compositor_wake_serial;
 static UINT64 client_surface_compositor_sequence;
 static LONGLONG client_surface_compositor_domain;
 static UINT64 client_surface_native_update_serial;
@@ -543,6 +594,21 @@ struct client_surface_copy_batch
 static struct client_surface_copy_batch client_surface_copy_batch;
 static struct client_surface_copy_batch client_surface_pending_batches[64];
 static unsigned int client_surface_pending_batch_count;
+static struct list client_surface_compositor_replies = LIST_INIT( client_surface_compositor_replies );
+
+/* Every checked group ends in a GetInputFocus barrier on this actor's sole
+ * connection. Keep that submission order so a later poll cannot buffer an
+ * earlier reply behind an already inspected target before the actor sleeps.
+ * The frame's existing native-use lifetime owns this intrusive notification. */
+static void queue_client_surface_compositor_reply( struct client_surface_compositor_target *target,
+                                                   struct client_surface_compositor_frame *frame,
+                                                   struct client_surface_copy_batch *batch )
+{
+    assert( !frame->reply_target );
+    frame->reply_target = target;
+    frame->reply_batch = batch;
+    list_add_tail( &client_surface_compositor_replies, &frame->reply_entry );
+}
 
 static void flush_client_surface_copy_batch(void);
 
@@ -606,6 +672,7 @@ static void enqueue_client_surface_compositor_job( struct client_surface_composi
 
 static void wake_client_surface_compositor_queues(void)
 {
+    ++client_surface_compositor_wake_serial;
     /* Native completion or a timer can make parked heads runnable. Move the
      * list in constant time; dispatch still inspects at most 64 queue heads. */
     list_move_tail( &client_surface_compositor_ready, &client_surface_compositor_parked );
@@ -1138,39 +1205,25 @@ static void complete_client_surface_compositor_frame(
     }
 }
 
-static BOOL process_client_surface_present_replies(void)
+static void complete_client_surface_present_request( struct client_surface_compositor_target *target,
+                                                     struct client_surface_compositor_frame *frame, BOOL success )
 {
-    struct client_surface_compositor_target *target;
-    unsigned int i;
-    BOOL progressed = FALSE, success;
-
-    for (target = client_surface_compositor_targets; target; target = target->next)
-        for (i = 0; i < ARRAY_SIZE(target->frames); ++i)
-        {
-            struct client_surface_compositor_frame *frame = &target->frames[i];
-
-            if (!frame->request_pending ||
-                !client_surface_xcb_poll( client_surface_compositor_display, &frame->request,
-                                          &success )) continue;
-            progressed = TRUE;
-            frame->request_pending = FALSE;
-            TRACE( "validated X Present request %u serial %u success %u\n",
-                   frame->request.cookies[0], frame->serial, success );
-            if (!success)
-            {
-                TRACE_(csperf)( "ticks=%llu event=present_error window=%lx pixmap=%lx serial=%u\n",
-                               client_surface_perf_time(), target->window, frame->pixmap, frame->serial );
-                /* A rejected Present cannot generate Complete/Idle. Preserve
-                 * the previous synchronous path's checked XCopy fallback. */
-                frame->last_complete_success = client_surface_copy_on_compositor(
-                    frame->pixmap, target->window, 0, 0, 0, 0, target->width, target->height );
-                frame->last_complete_serial = frame->serial;
-                frame->complete = frame->idle = TRUE;
-            }
-            complete_client_surface_compositor_frame( target, frame );
-            finish_client_surface_compositor_frame( target, frame );
-        }
-    return progressed;
+    frame->request_pending = FALSE;
+    TRACE( "validated X Present request %u serial %u success %u\n",
+           frame->request.cookies[0], frame->serial, success );
+    if (!success)
+    {
+        TRACE_(csperf)( "ticks=%llu event=present_error window=%lx pixmap=%lx serial=%u\n",
+                       client_surface_perf_time(), target->window, frame->pixmap, frame->serial );
+        /* A rejected Present cannot generate Complete/Idle. Preserve
+         * the previous synchronous path's checked XCopy fallback. */
+        frame->last_complete_success = client_surface_copy_on_compositor(
+            frame->pixmap, target->window, 0, 0, 0, 0, target->width, target->height );
+        frame->last_complete_serial = frame->serial;
+        frame->complete = frame->idle = TRUE;
+    }
+    complete_client_surface_compositor_frame( target, frame );
+    finish_client_surface_compositor_frame( target, frame );
 }
 
 static void process_client_surface_present_events(void)
@@ -1259,14 +1312,12 @@ static unsigned int count_client_surface_compositor_frames(
 
 static BOOL wait_client_surface_compositor_pixmap_idle( Pixmap pixmap )
 {
-    struct client_surface_compositor_target *target;
-    unsigned int i;
+    struct client_surface_compositor_frame *frame;
+    struct rb_entry *entry;
 
-    for (target = client_surface_compositor_targets; target; target = target->next)
-        for (i = 0; i < ARRAY_SIZE(target->frames); ++i)
-            if (target->frames[i].pixmap == pixmap)
-                return !!acquire_client_surface_compositor_frame( target, pixmap );
-    return TRUE;
+    if (!(entry = rb_get( &client_surface_compositor_pixmaps, &pixmap ))) return TRUE;
+    frame = CONTAINING_RECORD( entry, struct client_surface_compositor_frame, pixmap_entry );
+    return !frame->serial;
 }
 
 static BOOL submit_client_surface_present( struct client_surface_compositor_target *target,
@@ -1290,6 +1341,7 @@ static BOOL submit_client_surface_present( struct client_surface_compositor_targ
     frame->publish_pending = !!publish_generation;
     frame->request_pending = client_surface_xcb_present( display, target->window, frame->pixmap,
                                                         serial, &frame->request );
+    if (frame->request_pending) queue_client_surface_compositor_reply( target, frame, NULL );
     if (!frame->request_pending)
     {
         X11DRV_expect_error( display, client_surface_compositor_error, &error );
@@ -1355,11 +1407,6 @@ static void flush_client_surface_compositor_mailbox(
 
 #else
 
-static BOOL process_client_surface_present_replies(void)
-{
-    return FALSE;
-}
-
 static void process_client_surface_present_events(void)
 {
     Display *display = client_surface_compositor_display;
@@ -1404,7 +1451,7 @@ static struct client_surface_compositor_frame *alloc_client_surface_compositor_m
         client_surface_release_scoped_memory( &target->memory, CLIENT_SURFACE_MEMORY_OUTPUT, bytes );
         return NULL;
     }
-    frame->pixmap = pixmap;
+    set_client_surface_compositor_pixmap( frame, pixmap );
     target->mailbox_bytes = bytes;
     target->next_frame = 0;
     x11drv_client_surface_trace_image( "acquire", "output_mailbox", display, pixmap, bytes );
@@ -1427,7 +1474,7 @@ static void free_client_surface_compositor_mailbox( struct client_surface_compos
     x11drv_client_surface_trace_image( "free", "output_mailbox", display, frame->pixmap, target->mailbox_bytes );
     client_surface_release_scoped_memory( &target->memory, CLIENT_SURFACE_MEMORY_OUTPUT, target->mailbox_bytes );
     if (error) WARN( "failed to release client-surface mailbox %#lx, error %d\n", frame->pixmap, error );
-    frame->pixmap = 0;
+    set_client_surface_compositor_pixmap( frame, 0 );
     target->mailbox_bytes = 0;
 }
 
@@ -2175,10 +2222,11 @@ static BOOL update_client_surface_compositor_target( struct client_surface_compo
         {
             client_surface_xcb_free_gc( client_surface_compositor_display, &target->frames[i].xcb_gc );
             if (target->frames[i].gc) XFreeGC( client_surface_compositor_display, target->frames[i].gc );
+            if (i < 2) set_client_surface_compositor_pixmap( &target->frames[i], 0 );
         }
         memset( target->frames, 0, sizeof(target->frames) );
-        target->frames[0].pixmap = job->u.pool.pixmaps[0];
-        target->frames[1].pixmap = job->u.pool.pixmaps[1];
+        set_client_surface_compositor_pixmap( &target->frames[0], job->u.pool.pixmaps[0] );
+        set_client_surface_compositor_pixmap( &target->frames[1], job->u.pool.pixmaps[1] );
         target->mailbox_bytes = 0;
         target->published = job->u.pool.pixmaps[0];
         target->published_width = job->u.pool.valid_width;
@@ -2263,11 +2311,16 @@ static BOOL remove_client_surface_compositor_target( HWND toplevel )
     {
         client_surface_xcb_free_gc( client_surface_compositor_display, &target->frames[i].xcb_gc );
         if (target->frames[i].gc) XFreeGC( client_surface_compositor_display, target->frames[i].gc );
+        if (i < 2) set_client_surface_compositor_pixmap( &target->frames[i], 0 );
     }
     free_client_surface_compositor_mailbox( target );
     rb_remove( &client_surface_compositor_target_registry, &target->registry_entry );
     *target->prev = target->next;
     if (target->next) target->next->prev = target->prev;
+    if (client_surface_compositor_next_target == target)
+        client_surface_compositor_next_target = target->next ? target->next : client_surface_compositor_targets;
+    --client_surface_compositor_target_count;
+    ++client_surface_compositor_target_generation;
     free_client_surface_scene_plan( target );
     free_client_surface_compositor_target( target );
     return TRUE;
@@ -2295,6 +2348,7 @@ static BOOL retire_client_surface_compositor_pool( HWND toplevel )
     {
         client_surface_xcb_free_gc( client_surface_compositor_display, &target->frames[i].xcb_gc );
         if (target->frames[i].gc) XFreeGC( client_surface_compositor_display, target->frames[i].gc );
+        if (i < 2) set_client_surface_compositor_pixmap( &target->frames[i], 0 );
     }
     free_client_surface_compositor_mailbox( target );
     memset( target->frames, 0, sizeof(target->frames) );
@@ -2535,20 +2589,13 @@ static BOOL restore_client_surface_compositor_pixels( struct client_surface_comp
                                               rect.right - rect.left, rect.bottom - rect.top );
 }
 
-static BOOL process_client_surface_compositor_restores(void)
+static BOOL process_client_surface_compositor_restore( struct client_surface_compositor_target *target )
 {
-    struct client_surface_compositor_target *target;
-    BOOL progressed = FALSE;
-
-    for (target = client_surface_compositor_targets; target; target = target->next)
-    {
-        if (IsRectEmpty( &target->restore_rect ) || !client_surface_compositor_restore_ready( target )) continue;
-        progressed = TRUE;
-        if (!restore_client_surface_compositor_pixels( target ))
-            NtUserPostMessage( target->toplevel, WM_WINE_UPDATEWINDOWSTATE,
-                               WINE_UPDATE_CLIENT_SURFACE_HANDOFFS, 0 );
-    }
-    return progressed;
+    if (IsRectEmpty( &target->restore_rect ) || !client_surface_compositor_restore_ready( target )) return FALSE;
+    if (!restore_client_surface_compositor_pixels( target ))
+        NtUserPostMessage( target->toplevel, WM_WINE_UPDATEWINDOWSTATE,
+                           WINE_UPDATE_CLIENT_SURFACE_HANDOFFS, 0 );
+    return TRUE;
 }
 
 static BOOL restore_client_surface_compositor_target(
@@ -2966,6 +3013,7 @@ static BOOL copy_client_surface_handoff_to_frame(
                                  &plan->source_damage, &plan->destination, clips, clip_count, clipped,
                                  &frame->copy_request, TRUE ))
     {
+        queue_client_surface_compositor_reply( target, frame, NULL );
         *pending = TRUE;
         return TRUE;
     }
@@ -3231,6 +3279,8 @@ static void flush_client_surface_copy_batch(void)
         client_surface_pending_batches[i] = client_surface_copy_batch;
         ++client_surface_pending_batch_count;
         client_surface_copy_batch.target->copy_frame = client_surface_copy_batch.frame;
+        queue_client_surface_compositor_reply( client_surface_copy_batch.target,
+            client_surface_copy_batch.frame, &client_surface_pending_batches[i] );
         client_surface_copy_batch.count = 0;
         return;
     }
@@ -3276,35 +3326,52 @@ static BOOL publish_client_surface_handoff_frame(
     return composed;
 }
 
-static BOOL process_client_surface_copy_replies(void)
+static BOOL process_client_surface_compositor_replies(void)
 {
     struct client_surface_compositor_target *target;
-    unsigned int i;
-    BOOL progressed = FALSE, success;
+    struct client_surface_compositor_frame *frame;
+    struct client_surface_copy_batch *batch;
+    struct client_surface_xcb_request *requests;
+    unsigned int count, inspected = 0, completed = 0;
+    BOOL success;
 
-    for (i = 0; client_surface_pending_batch_count && i < ARRAY_SIZE(client_surface_pending_batches); ++i)
+    while (inspected < 64 && !list_empty( &client_surface_compositor_replies ))
     {
-        struct client_surface_copy_batch *batch = &client_surface_pending_batches[i];
-
-        if (!batch->count || !client_surface_xcb_poll_batch( client_surface_compositor_display,
-                                                            batch->requests, batch->count, &success )) continue;
-        progressed = TRUE;
-        batch->target->copy_frame = NULL;
-        --client_surface_pending_batch_count;
-        complete_client_surface_copy_batch( batch, success && !batch->error );
-    }
-    for (target = client_surface_compositor_targets; target; target = target->next)
-    {
-        struct client_surface_compositor_frame *frame = target->copy_frame;
         struct client_surface_compositor_binding *binding;
         UINT64 control;
 
-        if (!frame || !frame->copy_binding || !client_surface_xcb_poll( client_surface_compositor_display,
-                                               &frame->copy_request, &success )) continue;
-        progressed = TRUE;
-        binding = frame->copy_binding;
-        control = frame->copy_control;
+        frame = LIST_ENTRY( list_head( &client_surface_compositor_replies ),
+                            struct client_surface_compositor_frame, reply_entry );
+        target = frame->reply_target;
+        batch = frame->reply_batch;
+        requests = batch ? batch->requests : frame->request_pending ? &frame->request : &frame->copy_request;
+        count = batch ? batch->count : 1;
+        ++inspected;
+        if (!client_surface_xcb_poll_batch( client_surface_compositor_display, requests, count, &success )) break;
+        ++completed;
+        /* A completion can immediately submit this frame again. Return its
+         * list entry before publishing or flushing the next mailbox. */
+        list_remove( &frame->reply_entry );
+        frame->reply_target = NULL;
+        frame->reply_batch = NULL;
+        if (frame->request_pending)
+        {
+#ifdef SONAME_LIBXPRESENT
+            complete_client_surface_present_request( target, frame, success );
+#endif
+            continue;
+        }
+        assert( target->copy_frame == frame );
         target->copy_frame = NULL;
+        if (batch)
+        {
+            --client_surface_pending_batch_count;
+            complete_client_surface_copy_batch( batch, success && !batch->error );
+            continue;
+        }
+        binding = frame->copy_binding;
+        assert( binding );
+        control = frame->copy_control;
         frame->copy_binding = NULL;
         TRACE( "validated owner copy request %u pixmap %#lx success %u\n",
                frame->copy_request.cookies[0], frame->pixmap, success );
@@ -3325,7 +3392,9 @@ static BOOL process_client_surface_copy_replies(void)
             publish_client_surface_handoff_frame( target, frame, NULL );
         }
     }
-    return progressed;
+    TRACE_(csperf)( "ticks=%llu event=compositor_reply_scan inspected=%u completed=%u pending=%u\n",
+                   client_surface_perf_time(), inspected, completed, !list_empty( &client_surface_compositor_replies ) );
+    return !!completed;
 }
 
 /* Use the same immutable source predicate for composition and native owner
@@ -3751,46 +3820,34 @@ static BOOL process_client_surface_handoffs(void)
     return progressed;
 }
 
-static BOOL replay_client_surface_scene_sources(void)
+static BOOL replay_client_surface_scene_sources( struct client_surface_compositor_target *target,
+                                                 unsigned int *budget )
 {
-    static HWND next_toplevel;
-    struct client_surface_compositor_target *target, *next, *first = client_surface_compositor_targets;
-    unsigned int targets = 0, budget = CLIENT_SURFACE_COPY_BATCH_SIZE;
     BOOL progressed = FALSE;
 
     /* Scene replay reads owner-local images. It never claims a returned
      * producer slot or depends on the producer retaining its previous XID. */
-    for (target = client_surface_compositor_targets; target; target = target->next)
+    if (!target->scene.valid || target->quiescing || target->copy_frame) return FALSE;
+    while (target->replay_member < target->scene.count && *budget)
     {
-        if (target->toplevel == next_toplevel) first = target;
-        ++targets;
-    }
-    for (target = first; targets-- && budget; target = next)
-    {
-        next = target->next ? target->next : client_surface_compositor_targets;
-        next_toplevel = next->toplevel;
-        if (!target->scene.valid || target->quiescing || target->copy_frame) continue;
-        while (target->replay_member < target->scene.count && budget)
+        struct client_surface_compositor_binding *binding = target->scene.members[target->replay_member];
+
+        --*budget;
+        if (binding->latest_image.pixmap && binding->replay_epoch != target->scene.epoch)
         {
-            struct client_surface_compositor_binding *binding = target->scene.members[target->replay_member];
+            BOOL queued = compose_client_surface_cached_frame( binding );
 
-            if (binding->latest_image.pixmap && binding->replay_epoch != target->scene.epoch)
-            {
-                BOOL queued = compose_client_surface_cached_frame( binding );
-
-                /* Accepted asynchronous copies advance this bounded scan,
-                 * but commit their source checkpoint only with their real
-                 * reply. A newer source resets the scan above. */
-                if (!queued && binding->latest_image.pixmap &&
-                    binding->replay_epoch != target->scene.epoch) break;
-            }
-            ++target->replay_member;
-            --budget;
-            progressed = TRUE;
-            if (target->copy_frame) break;
+            /* Accepted asynchronous copies advance this bounded scan,
+             * but commit their source checkpoint only with their real
+             * reply. A newer source resets the scan above. */
+            if (!queued && binding->latest_image.pixmap &&
+                binding->replay_epoch != target->scene.epoch) break;
         }
-        flush_client_surface_copy_batch();
+        ++target->replay_member;
+        progressed = TRUE;
+        if (target->copy_frame) break;
     }
+    flush_client_surface_copy_batch();
     return progressed;
 }
 
@@ -3802,26 +3859,9 @@ static void drain_client_surface_notification( int fd )
     do ret = read( fd, &value, sizeof(value) ); while (ret > 0 || (ret < 0 && errno == EINTR));
 }
 
-static void process_client_surface_compositor_mailboxes(void)
+static void arm_client_surface_compositor_work(void)
 {
-#ifdef SONAME_LIBXPRESENT
-    struct client_surface_compositor_target *target;
-
-    for (target = client_surface_compositor_targets; target; target = target->next)
-        flush_client_surface_compositor_mailbox( target );
-#endif
-}
-
-static void wait_client_surface_compositor_work(void)
-{
-    struct pollfd waiters[CLIENT_SURFACE_HANDOFF_MAX_POOLS_PER_CONSUMER + 2];
-    struct list *queues[] = {&client_surface_compositor_ready, &client_surface_compositor_parked};
     struct client_surface_compositor_pool *pool;
-    struct client_surface_compositor_job *job;
-    struct client_surface_compositor_queue *queue;
-    struct client_surface_compositor_target *target;
-    unsigned int count = 0, i;
-    int ret, timeout = -1;
 
     drain_client_surface_notification( client_surface_compositor_notify[0] );
     for (pool = client_surface_compositor_pools; pool; pool = pool->next)
@@ -3829,30 +3869,23 @@ static void wait_client_surface_compositor_work(void)
         drain_client_surface_notification( pool->ready_fd );
         __atomic_store_n( &pool->shared->ready_parked, 1, __ATOMIC_RELEASE );
     }
+}
 
-    /* Drain before parking, then recheck authoritative work. A publisher
-     * racing this scan leaves an unread notification; an earlier publisher
-     * is found by the ready bitmap. Do not drain again before poll(). */
-    process_client_surface_present_events();
-    if (process_client_surface_compositor_jobs()) return;
+static void wait_client_surface_compositor_work( const struct client_surface_compositor_scan *scan )
+{
+    struct pollfd waiters[CLIENT_SURFACE_HANDOFF_MAX_POOLS_PER_CONSUMER + 2];
+    struct client_surface_compositor_pool *pool;
+    unsigned int count = 0;
+    DWORD elapsed;
+    int ret, timeout = scan->timeout;
+
+    /* A complete quiet traversal follows arming. A later publisher leaves
+     * its notification unread. Xlib may also have buffered replies while
+     * handling sources or events: check the oldest barrier after its final
+     * read, without scanning every target or draining any notification. */
+    assert( !scan->remaining && scan->generation == client_surface_compositor_target_generation );
     if (client_surface_compositor_display && XPending( client_surface_compositor_display )) return;
-    /* Xlib may have read a reply into XCB while looking for events. Poll the
-     * library buffer after that read, before waiting on the kernel fd. */
-    if (process_client_surface_present_replies() || process_client_surface_copy_replies())
-    {
-        wake_client_surface_compositor_queues();
-        return;
-    }
-    if (process_client_surface_handoffs()) return;
-    /* Complete/Idle above can release the last output credit after the
-     * producer has stopped. Replay its retained cache before parking: no
-     * further source notification is required to publish that final image. */
-    if (replay_client_surface_scene_sources()) return;
-    process_client_surface_compositor_mailboxes();
-    /* A synchronous copy may have buffered events and replies while handling
-     * the sources above. Recheck after those requests as well, before poll. */
-    if (client_surface_compositor_display && XPending( client_surface_compositor_display )) return;
-    if (process_client_surface_present_replies() || process_client_surface_copy_replies())
+    if (process_client_surface_compositor_replies())
     {
         wake_client_surface_compositor_queues();
         return;
@@ -3872,35 +3905,20 @@ static void wait_client_surface_compositor_work(void)
         assert( count < ARRAY_SIZE(waiters) );
         waiters[count++] = (struct pollfd){pool->ready_fd, POLLIN, 0};
     }
-    for (i = 0; i < ARRAY_SIZE(queues); ++i)
-        LIST_FOR_EACH_ENTRY( queue, queues[i], struct client_surface_compositor_queue, entry )
-        {
-            DWORD elapsed;
-            int remaining;
-
-            /* Only a normal FIFO head can have an in-flight Present. */
-            if (!(job = queue->head) || job->op != CLIENT_SURFACE_COMPOSITOR_PRESENT ||
-                !job->u.present.started) continue;
-            if (job->u.present.done)
-            {
-                wake_client_surface_compositor_queues();
-                return;
-            }
-            elapsed = NtGetTickCount() - job->u.present.start;
-            remaining = elapsed >= 5000 ? 0 : 5000 - elapsed;
-            if (timeout < 0 || timeout > remaining) timeout = remaining;
-        }
-    for (target = client_surface_compositor_targets; target; target = target->next)
+    /* The earliest deadline was collected during the traversal. Time spent
+     * in later slices must not extend it, including across tick wraparound. */
+    do
     {
-        DWORD elapsed;
-        int remaining;
-
-        if (!target->shrink_start || target->native_updates || target->assembly_pending) continue;
-        elapsed = NtGetTickCount() - target->shrink_start;
-        remaining = elapsed >= 2000 ? 0 : 2000 - elapsed;
-        if (timeout < 0 || timeout > remaining) timeout = remaining;
-    }
-    do ret = poll( waiters, count, timeout ); while (ret < 0 && errno == EINTR);
+        if ((timeout = scan->timeout) >= 0)
+        {
+            elapsed = NtGetTickCount() - scan->timeout_start;
+            timeout = elapsed >= timeout ? 0 : timeout - elapsed;
+        }
+        TRACE_(csperf)( "ticks=%llu event=compositor_wait targets=%u remaining=%u timeout=%d generation=%s\n",
+                       client_surface_perf_time(), client_surface_compositor_target_count, scan->remaining, timeout,
+                       wine_dbgstr_longlong( scan->generation ) );
+        ret = poll( waiters, count, timeout );
+    } while (ret < 0 && errno == EINTR);
     wake_client_surface_compositor_queues();
     if (ret < 0) WARN( "client-surface compositor poll failed, error %d\n", errno );
 }
@@ -4315,18 +4333,8 @@ static BOOL process_client_surface_compositor_jobs(void)
 {
     struct client_surface_compositor_queue *queue;
     struct client_surface_compositor_job *incoming, **tail = &incoming, *job;
-    struct client_surface_compositor_target *target;
     unsigned int admitted = 0, scanned = 0, completed = 0, budget = 64;
     BOOL progressed = FALSE, more;
-
-    for (target = client_surface_compositor_targets; target; target = target->next)
-    {
-        if (!target->shrink_start || target->native_updates || target->assembly_pending ||
-            NtGetTickCount() - target->shrink_start < 2000) continue;
-        target->shrink_start = 0;
-        NtUserPostMessage( target->toplevel, WM_WINE_UPDATEWINDOWSTATE,
-                           WINE_UPDATE_CLIENT_SURFACE_HANDOFFS, 0 );
-    }
 
     /* Bound ingestion as well as execution. The next iteration resumes from
      * the same incoming head, without traversing any parked queue's jobs. */
@@ -4440,44 +4448,147 @@ static BOOL process_client_surface_compositor_jobs(void)
          * synchronous caller returns or the final notification frees itself. */
         release_client_surface_compositor_queue( queue );
     }
-    for (target = client_surface_compositor_targets; target; target = target->next)
-    {
-        if (!target->deferred_update || target->update_notified) continue;
-        quiesce_client_surface_compositor_target( target );
-        if (!client_surface_compositor_update_ready( target, NULL )) continue;
-        /* Keep this target quiescent until the GUI applies the latest server
-         * state. A token prevents a delayed notification from resuming a new
-         * target or a state update already consumed by another native change. */
-        target->update_notified = NtUserPostMessage( target->toplevel, WM_X11DRV_CLIENT_SURFACE_UPDATE,
-                                                    (UINT)target->deferred_update,
-                                                    (UINT)(target->deferred_update >> 32) );
-        if (!target->update_notified)
-            WARN( "failed to notify deferred native update for %p\n", target->toplevel );
-    }
     TRACE_(csperf)( "ticks=%llu event=compositor_queue_scan ingested=%u inspected=%u completed=%u more=%u runnable=%u\n",
                    client_surface_perf_time(), admitted, scanned, completed, more,
                    !list_empty( &client_surface_compositor_ready ) );
     return progressed || more || !list_empty( &client_surface_compositor_ready );
 }
 
+static void update_client_surface_compositor_timeout( struct client_surface_compositor_scan *scan,
+                                                      DWORD now, unsigned int remaining )
+{
+    DWORD elapsed = now - scan->timeout_start;
+
+    if (scan->timeout >= 0)
+        scan->timeout = elapsed >= scan->timeout ? 0 : scan->timeout - elapsed;
+    scan->timeout_start = now;
+    if (scan->timeout < 0 || scan->timeout > remaining) scan->timeout = remaining;
+}
+
+static BOOL process_client_surface_compositor_targets( struct client_surface_compositor_scan *scan )
+{
+    struct client_surface_compositor_target *target;
+    unsigned int inspected = 0, budget = CLIENT_SURFACE_COPY_BATCH_SIZE;
+    BOOL progressed = FALSE;
+
+    /* Insertion/removal changes the set to recheck, but never resets fair
+     * traversal to the list head. Removal repairs the retained cursor before
+     * freeing a target. A complete stable round is required before poll(). */
+    if (scan->generation != client_surface_compositor_target_generation)
+    {
+        scan->generation = client_surface_compositor_target_generation;
+        scan->remaining = client_surface_compositor_target_count;
+        scan->timeout = -1;
+    }
+    while (scan->remaining && inspected < 64 && budget)
+    {
+        struct client_surface_compositor_job *job;
+        DWORD now, elapsed;
+
+        target = client_surface_compositor_next_target;
+        assert( target );
+        client_surface_compositor_next_target = target->next ? target->next : client_surface_compositor_targets;
+        --scan->remaining;
+        ++inspected;
+        if (target->deferred_update && !target->update_notified)
+        {
+            quiesce_client_surface_compositor_target( target );
+            if (client_surface_compositor_update_ready( target, NULL ))
+            {
+                /* Keep this exact target quiescent until the GUI consumes
+                 * the token; a delayed notification cannot resume another. */
+                target->update_notified = NtUserPostMessage( target->toplevel, WM_X11DRV_CLIENT_SURFACE_UPDATE,
+                                                            (UINT)target->deferred_update,
+                                                            (UINT)(target->deferred_update >> 32) );
+                if (!target->update_notified)
+                    WARN( "failed to notify deferred native update for %p\n", target->toplevel );
+                progressed |= target->update_notified;
+            }
+        }
+        progressed |= process_client_surface_compositor_restore( target );
+        progressed |= replay_client_surface_scene_sources( target, &budget );
+#ifdef SONAME_LIBXPRESENT
+        flush_client_surface_compositor_mailbox( target );
+#endif
+        now = NtGetTickCount();
+        if (target->shrink_start && !target->native_updates && !target->assembly_pending)
+        {
+            elapsed = now - target->shrink_start;
+            if (elapsed >= 2000)
+            {
+                target->shrink_start = 0;
+                NtUserPostMessage( target->toplevel, WM_WINE_UPDATEWINDOWSTATE,
+                                   WINE_UPDATE_CLIENT_SURFACE_HANDOFFS, 0 );
+                progressed = TRUE;
+            }
+            else update_client_surface_compositor_timeout( scan, now, 2000 - elapsed );
+        }
+        /* An in-flight Present owns its target until its FIFO head retires.
+         * Collect its deadline here instead of traversing all parked queues. */
+        job = target->notifications->queue->head;
+        if (job && job->op == CLIENT_SURFACE_COMPOSITOR_PRESENT && job->u.present.started)
+        {
+            elapsed = now - job->u.present.start;
+            if (job->u.present.done || elapsed >= 5000)
+            {
+                ready_client_surface_compositor_queue( target->notifications->queue );
+                progressed = TRUE;
+            }
+            else update_client_surface_compositor_timeout( scan, now, 5000 - elapsed );
+        }
+    }
+    TRACE_(csperf)( "ticks=%llu event=compositor_target_scan targets=%u inspected=%u replayed=%u remaining=%u progressed=%u generation=%s\n",
+                   client_surface_perf_time(), client_surface_compositor_target_count, inspected,
+                   CLIENT_SURFACE_COPY_BATCH_SIZE - budget, scan->remaining, progressed,
+                   wine_dbgstr_longlong( scan->generation ) );
+    return progressed;
+}
+
 static void client_surface_compositor_thread( void *context )
 {
-    (void)context;
+    BOOL armed = FALSE;
 
+    (void)context;
     for (;;)
     {
-        BOOL progressed;
+        struct client_surface_compositor_scan scan =
+        {
+            .generation = client_surface_compositor_target_generation,
+            .wake_serial = client_surface_compositor_wake_serial,
+            .remaining = client_surface_compositor_target_count,
+            .timeout = -1,
+        };
 
-        process_client_surface_present_events();
-        progressed = process_client_surface_present_replies();
-        progressed |= process_client_surface_copy_replies();
-        progressed |= process_client_surface_compositor_restores();
-        if (progressed) wake_client_surface_compositor_queues();
-        progressed |= process_client_surface_compositor_jobs();
-        progressed |= process_client_surface_handoffs();
-        progressed |= replay_client_surface_scene_sources();
-        process_client_surface_compositor_mailboxes();
-        if (!progressed) wait_client_surface_compositor_work();
+        TRACE_(csperf)( "ticks=%llu event=compositor_scan_begin targets=%u armed=%u generation=%s\n",
+                       client_surface_perf_time(), client_surface_compositor_target_count, armed,
+                       wine_dbgstr_longlong( scan.generation ) );
+        do
+        {
+            BOOL progressed;
+
+            process_client_surface_present_events();
+            progressed = process_client_surface_compositor_replies();
+            if (progressed) wake_client_surface_compositor_queues();
+            progressed |= process_client_surface_compositor_jobs();
+            progressed |= process_client_surface_handoffs();
+            progressed |= process_client_surface_compositor_targets( &scan );
+            scan.progressed |= progressed;
+        } while (scan.remaining);
+        /* Helpers acquiring output credit can consume events too. Count
+         * those wakes even when their caller could not submit any work. */
+        if (scan.progressed || scan.wake_serial != client_surface_compositor_wake_serial)
+        {
+            armed = FALSE;
+            continue;
+        }
+        if (!armed)
+        {
+            arm_client_surface_compositor_work();
+            armed = TRUE;
+            continue;
+        }
+        wait_client_surface_compositor_work( &scan );
+        armed = FALSE;
     }
 }
 
