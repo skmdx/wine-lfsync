@@ -74,8 +74,26 @@ struct client_surface_cached_image
     struct client_surface_memory_scope memory;
     Pixmap pixmap;
     GC gc;
+    unsigned int xcb_gc;
     UINT64 bytes;
     unsigned int width, height, depth;
+};
+
+struct client_surface_compositor_reply
+{
+    struct list entry;
+    struct client_surface_xcb_request *requests;
+    unsigned int count;
+    void (*complete)( struct client_surface_compositor_reply *reply, BOOL success );
+};
+
+struct client_surface_cache_copy
+{
+    struct client_surface_compositor_reply reply;
+    struct client_surface_xcb_request request;
+    struct client_surface_handoff_slot frame;
+    UINT64 control, started;
+    unsigned int index;
 };
 
 struct client_surface_compositor_binding
@@ -99,6 +117,8 @@ struct client_surface_compositor_binding
     UINT64 latest_control;
     UINT64 replay_epoch;
     unsigned int latest_index;
+    struct client_surface_cache_copy cache_copy;
+    BOOL retired;
 };
 
 static void trace_client_surface_source( const char *event,
@@ -188,7 +208,7 @@ struct client_surface_compositor_frame
     BOOL copy_replay;
     RECT copy_damage;
     struct client_surface_xcb_request copy_request;
-    struct list reply_entry;
+    struct client_surface_compositor_reply reply;
     struct client_surface_compositor_target *reply_target;
     struct client_surface_copy_batch *reply_batch;
 };
@@ -596,6 +616,19 @@ static struct client_surface_copy_batch client_surface_pending_batches[64];
 static unsigned int client_surface_pending_batch_count;
 static struct list client_surface_compositor_replies = LIST_INIT( client_surface_compositor_replies );
 
+static void complete_client_surface_output_reply( struct client_surface_compositor_reply *reply, BOOL success );
+
+static void queue_client_surface_reply( struct client_surface_compositor_reply *reply,
+                                        struct client_surface_xcb_request *requests, unsigned int count,
+                                        void (*complete)( struct client_surface_compositor_reply *, BOOL ) )
+{
+    assert( !reply->requests && count );
+    reply->requests = requests;
+    reply->count = count;
+    reply->complete = complete;
+    list_add_tail( &client_surface_compositor_replies, &reply->entry );
+}
+
 /* Every checked group ends in a GetInputFocus barrier on this actor's sole
  * connection. Keep that submission order so a later poll cannot buffer an
  * earlier reply behind an already inspected target before the actor sleeps.
@@ -607,7 +640,9 @@ static void queue_client_surface_compositor_reply( struct client_surface_composi
     assert( !frame->reply_target );
     frame->reply_target = target;
     frame->reply_batch = batch;
-    list_add_tail( &client_surface_compositor_replies, &frame->reply_entry );
+    queue_client_surface_reply( &frame->reply,
+        batch ? batch->requests : frame->request_pending ? &frame->request : &frame->copy_request,
+        batch ? batch->count : 1, complete_client_surface_output_reply );
 }
 
 static void flush_client_surface_copy_batch(void);
@@ -1682,6 +1717,7 @@ static void free_client_surface_cached_image( struct client_surface_cached_image
     if (acquired)
         x11drv_client_surface_trace_image( "retire", "owner_cache", client_surface_compositor_display,
                                           image->pixmap, image->bytes );
+    client_surface_xcb_free_gc( client_surface_compositor_display, &image->xcb_gc );
     if (image->pixmap || image->gc)
         X11DRV_expect_error( client_surface_compositor_display, client_surface_compositor_error, &error );
     if (image->gc) XFreeGC( client_surface_compositor_display, image->gc );
@@ -1699,6 +1735,19 @@ static void free_client_surface_cached_image( struct client_surface_cached_image
     client_surface_release_scoped_memory( &image->memory, CLIENT_SURFACE_MEMORY_SOURCE, image->bytes );
     client_surface_memory_scope_destroy( &image->memory );
     memset( image, 0, sizeof(*image) );
+}
+
+static void free_client_surface_compositor_binding( struct client_surface_compositor_binding *binding )
+{
+    assert( binding->retired && !binding->cache_copy.reply.requests );
+    /* Releasing the consumer endpoint also permits the producer to retire
+     * unacknowledged slots. Keep it, the mapping and both cache images until
+     * our last native read and checked reply have completed. */
+    release_client_surface_compositor_binding_server( binding );
+    release_client_surface_compositor_pool( binding->pool );
+    free_client_surface_cached_image( &binding->latest_image, TRUE );
+    free_client_surface_cached_image( &binding->spare_image, TRUE );
+    client_surface_free_owned_metadata( &binding->memory, binding, sizeof(*binding) );
 }
 
 static void remove_client_surface_compositor_binding(
@@ -1720,11 +1769,16 @@ static void remove_client_surface_compositor_binding(
      * the cache is discarded, a new consumer needs a new channel and frame;
      * it cannot resume at the old consumer sequence without those images. */
     __atomic_store_n( &binding->channel->closed, 1, __ATOMIC_RELEASE );
-    release_client_surface_compositor_binding_server( binding );
-    release_client_surface_compositor_pool( binding->pool );
-    free_client_surface_cached_image( &binding->latest_image, TRUE );
-    free_client_surface_cached_image( &binding->spare_image, TRUE );
-    client_surface_free_owned_metadata( &binding->memory, binding, sizeof(*binding) );
+    binding->retired = TRUE;
+    TRACE_(csperf)( "ticks=%llu event=cache_detach identity=%s cookie=%s pending=%u token=%s barrier=%u "
+                   "consumed=%s produced=%s endpoints=%u\n", client_surface_perf_time(),
+                   wine_dbgstr_longlong( binding->identity ), wine_dbgstr_longlong( binding->cookie ),
+                   !!binding->cache_copy.reply.requests, wine_dbgstr_longlong( binding->cache_copy.control ),
+                   binding->cache_copy.request.barrier,
+                   wine_dbgstr_longlong( __atomic_load_n( &binding->channel->consumer_sequence, __ATOMIC_ACQUIRE ) ),
+                   wine_dbgstr_longlong( __atomic_load_n( &binding->channel->producer_sequence, __ATOMIC_ACQUIRE ) ),
+                   __atomic_load_n( &binding->channel->endpoints, __ATOMIC_ACQUIRE ) );
+    if (!binding->cache_copy.reply.requests) free_client_surface_compositor_binding( binding );
 }
 
 static struct client_surface_compositor_pool *acquire_client_surface_compositor_pool(
@@ -2691,18 +2745,104 @@ static BOOL get_client_surface_compositor_source(
     return TRUE;
 }
 
-static BOOL cache_client_surface_handoff( struct client_surface_compositor_binding *binding,
+static void release_client_surface_cached_source( struct client_surface_compositor_binding *binding,
+                                                  BOOL success )
+{
+    const struct client_surface_cache_copy *copy = &binding->cache_copy;
+    struct client_surface_handoff_channel *channel = binding->channel;
+    unsigned int index = channel - binding->pool->shared->channels;
+
+    trace_client_surface_source( "cache_copy", binding, copy->control, copy->frame.source_sequence,
+                                 0, binding->latest_image.pixmap, success );
+    /* Descriptor publication pins the independent producer image. Sending a
+     * request is not permission to return it; this runs after the checked
+     * read, or after rejecting a descriptor without submitting any read. */
+    __atomic_store_n( &channel->consumer_sequence, copy->control, __ATOMIC_RELEASE );
+    if (!success && !binding->latest_image.pixmap)
+        __atomic_store_n( &channel->closed, 1, __ATOMIC_RELEASE );
+    trace_client_surface_source( "cache_release", binding, copy->control, copy->frame.source_sequence,
+                                 0, binding->latest_image.pixmap, success );
+    TRACE( "%s handoff hwnd %p identity %s sequence %s after owner cache copy\n",
+           success || binding->latest_image.pixmap ? "released" : "lost", binding->window,
+           wine_dbgstr_longlong( binding->identity ), wine_dbgstr_longlong( copy->control ) );
+    client_surface_handoff_wake_release( binding->pool->shared );
+    if (binding->retired)
+    {
+        free_client_surface_compositor_binding( binding );
+        return;
+    }
+    if (success)
+    {
+        struct client_surface_compositor_target *target = find_client_surface_compositor_target( binding->toplevel );
+
+        binding->replay_epoch = 0;
+        /* A new completed source also retries preceding dirty scene members.
+         * No target pointer is borrowed across this native copy. */
+        if (target) target->replay_member = 0;
+    }
+    /* A producer may have filled the ring while the read was pending. Its
+     * hint was consumed then; recheck the authoritative sequence after the
+     * completion without requiring another producer notification. */
+    __atomic_fetch_or( &binding->pool->shared->ready_bitmap[index / 64],
+                       (UINT64)1 << (index % 64), __ATOMIC_RELEASE );
+}
+
+static void finish_client_surface_cache_copy( struct client_surface_compositor_binding *binding, BOOL success )
+{
+    struct client_surface_cache_copy *copy = &binding->cache_copy;
+
+    if (success && !binding->retired)
+    {
+        struct client_surface_cached_image previous = binding->latest_image;
+
+        binding->latest_image = binding->spare_image;
+        binding->spare_image = previous;
+        binding->latest_frame = copy->frame;
+        binding->latest_frame.source = binding->latest_image.pixmap;
+        binding->latest_control = copy->control;
+        binding->latest_index = copy->index;
+    }
+    release_client_surface_cached_source( binding, success && !binding->retired );
+}
+
+static void complete_client_surface_cache_reply( struct client_surface_compositor_reply *reply, BOOL success )
+{
+    struct client_surface_compositor_binding *binding =
+        CONTAINING_RECORD( reply, struct client_surface_compositor_binding, cache_copy.reply );
+    struct client_surface_cache_copy *copy = &binding->cache_copy;
+    struct client_surface_cached_image *image = &binding->spare_image;
+
+    TRACE_(csperf)( "ticks=%llu event=cache_native_copy identity=%s cookie=%s token=%s sequence=%s "
+                   "source=%lx destination=%lx width=%u height=%u depth=%u pixel_bits=%u copied=1 error=%u "
+                   "sync_calls=0 async=1 elapsed=%s retired=%u\n",
+                   client_surface_perf_time(), wine_dbgstr_longlong( binding->identity ),
+                   wine_dbgstr_longlong( binding->cookie ), wine_dbgstr_longlong( copy->control ),
+                   wine_dbgstr_longlong( copy->frame.source_sequence ), (Pixmap)copy->frame.source, image->pixmap,
+                   image->width, image->height, image->depth,
+                   pixmap_formats[image->depth] ? pixmap_formats[image->depth]->bits_per_pixel : 0, !success,
+                   wine_dbgstr_longlong( client_surface_perf_time() - copy->started ), binding->retired );
+    if (!success) free_client_surface_cached_image( image, TRUE );
+    finish_client_surface_cache_copy( binding, success );
+}
+
+static void cache_client_surface_handoff( struct client_surface_compositor_binding *binding,
                                           unsigned int index, UINT64 control )
 {
     struct client_surface_handoff_channel *channel = binding->channel;
     struct client_surface_handoff_slot frame = channel->slots[index];
-    struct client_surface_cached_image *image = &binding->spare_image, previous;
+    struct client_surface_cached_image *image = &binding->spare_image;
+    struct client_surface_cache_copy *copy = &binding->cache_copy;
     Display *display = client_surface_compositor_display;
     unsigned int depth;
     Pixmap source;
     BOOL success = FALSE, created = FALSE;
     int error = 0;
 
+    assert( !binding->retired && !copy->reply.requests );
+    copy->frame = frame;
+    copy->index = index;
+    copy->control = control;
+    copy->started = client_surface_perf_time();
     TRACE( "reading handoff hwnd %p identity %s sequence %s into owner cache\n", binding->window,
            wine_dbgstr_longlong( binding->identity ),
            wine_dbgstr_longlong( control ) );
@@ -2737,6 +2877,41 @@ static BOOL cache_client_surface_handoff( struct client_surface_compositor_bindi
     }
     /* Keep the last complete cache intact until the new full image and its
      * error check succeed. Neither buffer borrows a producer XID. */
+    if (client_surface_xcb_available( display ))
+    {
+        RECT rect = {0, 0, frame.width, frame.height};
+        XRectangle clip = {0, 0, frame.width, frame.height};
+
+        /* Native storage creation remains a checked cold operation. Steady
+         * copies into this private spare do not perform an XSync round trip. */
+        if (!image->pixmap)
+        {
+            X11DRV_expect_error( display, client_surface_compositor_error, &error );
+            image->pixmap = XCreatePixmap( display, root_window, image->width, image->height, image->depth );
+            XSync( display, False );
+            X11DRV_check_error();
+            TRACE_(csperf)( "ticks=%llu event=cache_native_alloc pixmap=%lx error=%u sync_calls=1\n",
+                           client_surface_perf_time(), image->pixmap, error );
+            if (!image->pixmap || error)
+            {
+                free_client_surface_cached_image( image, FALSE );
+                goto done;
+            }
+            x11drv_client_surface_trace_image( "acquire", "owner_cache", display, image->pixmap, image->bytes );
+        }
+        if (client_surface_xcb_copy( display, source, image->pixmap, &image->xcb_gc,
+                                    0, NULL, &rect, &rect, &clip, 1, FALSE, &copy->request, TRUE ))
+        {
+            queue_client_surface_reply( &copy->reply, &copy->request, 1, complete_client_surface_cache_reply );
+            TRACE_(csperf)( "ticks=%llu event=cache_pending identity=%s cookie=%s token=%s sequence=%s "
+                           "window=0 pixmap=%lx success=1 source=%lx display=%p request=%u barrier=%u\n",
+                           client_surface_perf_time(), wine_dbgstr_longlong( binding->identity ),
+                           wine_dbgstr_longlong( binding->cookie ), wine_dbgstr_longlong( control ),
+                           wine_dbgstr_longlong( frame.source_sequence ), image->pixmap, source, display,
+                           copy->request.cookies[copy->request.count - 1], copy->request.barrier );
+            return;
+        }
+    }
     X11DRV_expect_error( display, client_surface_compositor_error, &error );
     if (!image->pixmap)
     {
@@ -2762,31 +2937,10 @@ static BOOL cache_client_surface_handoff( struct client_surface_compositor_bindi
     }
     if (created)
         x11drv_client_surface_trace_image( "acquire", "owner_cache", display, image->pixmap, image->bytes );
-    previous = binding->latest_image;
-    binding->latest_image = *image;
-    *image = previous;
-    frame.source = binding->latest_image.pixmap;
-    binding->latest_frame = frame;
-    binding->latest_control = control;
-    binding->latest_index = index;
-    success = TRUE;
+    finish_client_surface_cache_copy( binding, TRUE );
+    return;
 done:
-    trace_client_surface_source( "cache_copy", binding, control, frame.source_sequence,
-                                 0, binding->latest_image.pixmap, success );
-    /* The acquire load of producer_sequence made this descriptor immutable.
-     * Return it only after every source read and its X error check completed.
-     * A failed replacement preserves the previous owner-local image. */
-    __atomic_store_n( &channel->consumer_sequence, control, __ATOMIC_RELEASE );
-    if (!success && !binding->latest_image.pixmap)
-        __atomic_store_n( &channel->closed, 1, __ATOMIC_RELEASE );
-    trace_client_surface_source( "cache_release", binding, control, frame.source_sequence,
-                                 0, binding->latest_image.pixmap, success );
-    TRACE( "%s handoff hwnd %p identity %s sequence %s after owner cache copy\n",
-           success || binding->latest_image.pixmap ? "released" : "lost", binding->window,
-           wine_dbgstr_longlong( binding->identity ),
-           wine_dbgstr_longlong( control ) );
-    client_surface_handoff_wake_release( binding->pool->shared );
-    return success;
+    release_client_surface_cached_source( binding, success );
 }
 
 static BOOL get_client_surface_compositor_catchup(
@@ -3326,71 +3480,74 @@ static BOOL publish_client_surface_handoff_frame(
     return composed;
 }
 
+static void complete_client_surface_output_reply( struct client_surface_compositor_reply *reply, BOOL success )
+{
+    struct client_surface_compositor_frame *frame =
+        CONTAINING_RECORD( reply, struct client_surface_compositor_frame, reply );
+    struct client_surface_compositor_target *target = frame->reply_target;
+    struct client_surface_copy_batch *batch = frame->reply_batch;
+    struct client_surface_compositor_binding *binding;
+    UINT64 control;
+
+    frame->reply_target = NULL;
+    frame->reply_batch = NULL;
+    if (frame->request_pending)
+    {
+#ifdef SONAME_LIBXPRESENT
+        complete_client_surface_present_request( target, frame, success );
+#endif
+        return;
+    }
+    assert( target->copy_frame == frame );
+    target->copy_frame = NULL;
+    if (batch)
+    {
+        --client_surface_pending_batch_count;
+        complete_client_surface_copy_batch( batch, success && !batch->error );
+        return;
+    }
+    binding = frame->copy_binding;
+    assert( binding );
+    control = frame->copy_control;
+    frame->copy_binding = NULL;
+    TRACE( "validated owner copy request %u pixmap %#lx success %u\n",
+           frame->copy_request.cookies[0], frame->pixmap, success );
+    trace_client_surface_source( frame->copy_replay ? "replay_copy_async" : "copy_async",
+                                 binding, control, frame->copy_sequence,
+                                 target->window, frame->pixmap, success );
+    if (!success)
+    {
+        binding->source_epoch = binding->source_sequence = 0;
+        binding->replay_epoch = 0;
+        frame->revision = 0;
+        discard_client_surface_compositor_gc( frame );
+    }
+    if (success)
+    {
+        note_client_surface_source_copy( binding, frame->copy_epoch, frame->copy_sequence );
+        note_client_surface_compositor_damage( target, frame, &frame->copy_damage );
+        publish_client_surface_handoff_frame( target, frame, NULL );
+    }
+}
+
 static BOOL process_client_surface_compositor_replies(void)
 {
-    struct client_surface_compositor_target *target;
-    struct client_surface_compositor_frame *frame;
-    struct client_surface_copy_batch *batch;
-    struct client_surface_xcb_request *requests;
-    unsigned int count, inspected = 0, completed = 0;
+    struct client_surface_compositor_reply *reply;
+    unsigned int inspected = 0, completed = 0;
     BOOL success;
 
     while (inspected < 64 && !list_empty( &client_surface_compositor_replies ))
     {
-        struct client_surface_compositor_binding *binding;
-        UINT64 control;
-
-        frame = LIST_ENTRY( list_head( &client_surface_compositor_replies ),
-                            struct client_surface_compositor_frame, reply_entry );
-        target = frame->reply_target;
-        batch = frame->reply_batch;
-        requests = batch ? batch->requests : frame->request_pending ? &frame->request : &frame->copy_request;
-        count = batch ? batch->count : 1;
+        reply = LIST_ENTRY( list_head( &client_surface_compositor_replies ),
+                            struct client_surface_compositor_reply, entry );
         ++inspected;
-        if (!client_surface_xcb_poll_batch( client_surface_compositor_display, requests, count, &success )) break;
+        if (!client_surface_xcb_poll_batch( client_surface_compositor_display, reply->requests,
+                                            reply->count, &success )) break;
         ++completed;
-        /* A completion can immediately submit this frame again. Return its
-         * list entry before publishing or flushing the next mailbox. */
-        list_remove( &frame->reply_entry );
-        frame->reply_target = NULL;
-        frame->reply_batch = NULL;
-        if (frame->request_pending)
-        {
-#ifdef SONAME_LIBXPRESENT
-            complete_client_surface_present_request( target, frame, success );
-#endif
-            continue;
-        }
-        assert( target->copy_frame == frame );
-        target->copy_frame = NULL;
-        if (batch)
-        {
-            --client_surface_pending_batch_count;
-            complete_client_surface_copy_batch( batch, success && !batch->error );
-            continue;
-        }
-        binding = frame->copy_binding;
-        assert( binding );
-        control = frame->copy_control;
-        frame->copy_binding = NULL;
-        TRACE( "validated owner copy request %u pixmap %#lx success %u\n",
-               frame->copy_request.cookies[0], frame->pixmap, success );
-        trace_client_surface_source( frame->copy_replay ? "replay_copy_async" : "copy_async",
-                                     binding, control, frame->copy_sequence,
-                                     target->window, frame->pixmap, success );
-        if (!success)
-        {
-            binding->source_epoch = binding->source_sequence = 0;
-            binding->replay_epoch = 0;
-            frame->revision = 0;
-            discard_client_surface_compositor_gc( frame );
-        }
-        if (success)
-        {
-            note_client_surface_source_copy( binding, frame->copy_epoch, frame->copy_sequence );
-            note_client_surface_compositor_damage( target, frame, &frame->copy_damage );
-            publish_client_surface_handoff_frame( target, frame, NULL );
-        }
+        /* Completion may requeue the same node or release its owning object. */
+        list_remove( &reply->entry );
+        reply->requests = NULL;
+        reply->complete( reply, success );
     }
     TRACE_(csperf)( "ticks=%llu event=compositor_reply_scan inspected=%u completed=%u pending=%u\n",
                    client_surface_perf_time(), inspected, completed, !list_empty( &client_surface_compositor_replies ) );
@@ -3757,10 +3914,9 @@ static BOOL process_client_surface_handoffs(void)
                 /* Clear the hint before acquiring the sequence. A concurrent
                  * publisher either appears in that load or leaves its bit set. */
                 __atomic_fetch_and( &pool->shared->ready_bitmap[word], ~((UINT64)1 << bit), __ATOMIC_ACQ_REL );
-                while (!__atomic_load_n( &channel->closed, __ATOMIC_ACQUIRE ))
+                while (!binding->cache_copy.reply.requests &&
+                       !__atomic_load_n( &channel->closed, __ATOMIC_ACQUIRE ))
                 {
-                    struct client_surface_compositor_target *target;
-
                     consumed = __atomic_load_n( &channel->consumer_sequence, __ATOMIC_RELAXED );
                     produced = __atomic_load_n( &channel->producer_sequence, __ATOMIC_ACQUIRE );
                     if (produced == consumed) break;
@@ -3774,18 +3930,9 @@ static BOOL process_client_surface_handoffs(void)
                         __atomic_fetch_or( &pool->shared->ready_bitmap[word], (UINT64)1 << bit, __ATOMIC_RELEASE );
                         break;
                     }
-                    target = find_client_surface_compositor_target( binding->toplevel );
                     flush_client_surface_copy_batch();
-                    if (cache_client_surface_handoff( binding, consumed & (CLIENT_SURFACE_HANDOFF_RING_SIZE - 1),
-                                                      consumed + 1 ))
-                    {
-                        binding->replay_epoch = 0;
-                        /* A preceding member may still have a valid cache
-                         * whose earlier private copy failed. An actual new
-                         * source notification retries those dirty members
-                         * too; a failed reply alone does not restart them. */
-                        if (target) target->replay_member = 0;
-                    }
+                    cache_client_surface_handoff( binding, consumed & (CLIENT_SURFACE_HANDOFF_RING_SIZE - 1),
+                                                   consumed + 1 );
                     --budget;
                     progressed = TRUE;
                 }
