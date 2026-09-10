@@ -3723,7 +3723,7 @@ static BOOL compose_client_surface_cached_frame( struct client_surface_composito
      * its replacement is being checked. Scene obligations still use their
      * complete owner images independently of this steady-frame preference. */
     if (!current.generation && !current.source_pending && !current.publication_pending &&
-        binding->cache_copy.reply.requests) return FALSE;
+        client_surface_cache_read_pending( binding )) return FALSE;
     /* Inventory resolution precedes the first copy, so the full assembly
      * cannot race its own pending decision or publish a stale cache proof. */
     if (current.source_pending &&
