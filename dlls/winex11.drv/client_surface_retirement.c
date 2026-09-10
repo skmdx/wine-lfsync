@@ -17,7 +17,6 @@
 
 #include <assert.h>
 #include <errno.h>
-#include <time.h>
 #include <unistd.h>
 #include <sys/socket.h>
 #ifdef __linux__
@@ -60,10 +59,17 @@ static void trace_source_retirement( const char *event, HWND hwnd,
 
 #define MAX_SOURCE_RETIREMENTS 1024
 static pthread_mutex_t retirement_lock = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t retirement_cond = PTHREAD_COND_INITIALIZER;
+static pthread_cond_t retirement_cond;
+static pthread_once_t retirement_cond_once = PTHREAD_ONCE_INIT;
+static int retirement_cond_status;
 static struct list retirements = LIST_INIT( retirements );
 static unsigned int retirement_count;
 static BOOL retirement_started;
+
+static void init_retirement_cond(void)
+{
+    retirement_cond_status = client_surface_cond_init( &retirement_cond );
+}
 
 static void release_source_retirement( struct x11drv_client_surface_retirement *retirement )
 {
@@ -189,14 +195,8 @@ static void source_retirement_thread( void *context )
         pthread_mutex_lock( &retirement_lock );
         if (!list_empty( &pending ))
         {
-            struct timespec deadline;
-
             list_move_tail( &retirements, &pending );
-            clock_gettime( CLOCK_REALTIME, &deadline );
-            deadline.tv_nsec += 10000000;
-            deadline.tv_sec += deadline.tv_nsec / 1000000000;
-            deadline.tv_nsec %= 1000000000;
-            pthread_cond_timedwait( &retirement_cond, &retirement_lock, &deadline );
+            client_surface_cond_timedwait( &retirement_cond, &retirement_lock, 10 );
         }
         pthread_mutex_unlock( &retirement_lock );
     }
@@ -209,6 +209,8 @@ BOOL x11drv_client_surface_prepare_retirement( struct x11drv_client_surface *sur
     NTSTATUS status;
 
     if (surface->handoff_retirement) return TRUE;
+    pthread_once( &retirement_cond_once, init_retirement_cond );
+    if (retirement_cond_status) return FALSE;
     if (!client_surface_reserve_memory( CLIENT_SURFACE_MEMORY_STAGING, sizeof(*retirement) )) return FALSE;
     if (!(retirement = calloc( 1, sizeof(*retirement) ))) goto failed;
     pthread_mutex_lock( &retirement_lock );

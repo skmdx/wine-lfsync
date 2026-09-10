@@ -19,7 +19,6 @@
 #include <dlfcn.h>
 #include <errno.h>
 #include <poll.h>
-#include <time.h>
 
 #include "client_surface.h"
 #if defined(HAVE_X11_EXTENSIONS_XDAMAGE_H) && defined(SONAME_LIBXDAMAGE)
@@ -367,19 +366,9 @@ static struct client_surface_completion_result x11drv_client_surface_wait_comple
         }
         else
         {
-            struct timespec abstime;
-
-            if (clock_gettime( CLOCK_REALTIME, &abstime ))
-            {
-                pthread_mutex_unlock( &xdamage_lock );
-                return client_surface_completion_result( CLIENT_SURFACE_COMPLETION_FAILED );
-            }
-            abstime.tv_nsec += (long)(remaining % 1000) * 1000000;
-            abstime.tv_sec += remaining / 1000 + abstime.tv_nsec / 1000000000;
-            abstime.tv_nsec %= 1000000000;
             assert( list_empty( &surface->completion.wait_entry ) );
             list_add_tail( &xdamage_waiters, &surface->completion.wait_entry );
-            ret = pthread_cond_timedwait( &surface->completion.cond, &xdamage_lock, &abstime );
+            ret = client_surface_cond_timedwait( &surface->completion.cond, &xdamage_lock, remaining );
             if (!list_empty( &surface->completion.wait_entry ))
             {
                 list_remove( &surface->completion.wait_entry );
@@ -406,7 +395,7 @@ const struct client_surface_completion_ops x11drv_client_surface_completion_ops 
 BOOL x11drv_client_surface_completion_init( struct x11drv_client_surface *surface )
 {
     list_init( &surface->completion.wait_entry );
-    if (pthread_cond_init( &surface->completion.cond, NULL )) return FALSE;
+    if (client_surface_cond_init( &surface->completion.cond )) return FALSE;
     surface->completion.cond_initialized = TRUE;
     return TRUE;
 }

@@ -219,7 +219,7 @@ struct gdi_dc_funcs
 };
 
 /* increment this when changing driver tables or shared driver-facing structures */
-#define WINE_GDI_DRIVER_VERSION 143
+#define WINE_GDI_DRIVER_VERSION 144
 
 #define GDI_PRIORITY_NULL_DRV        0  /* null driver */
 #define GDI_PRIORITY_FONT_DRV      100  /* any font driver */
@@ -477,6 +477,9 @@ W32KAPI void *client_surface_create( UINT size, const struct client_surface_back
 W32KAPI BOOL client_surface_update( struct client_surface *surface );
 W32KAPI void client_surface_add_ref( struct client_surface *surface );
 W32KAPI void client_surface_release( struct client_surface *surface );
+/* Timed conditions pair this initializer with the monotonic/relative wait. */
+W32KAPI int client_surface_cond_init( pthread_cond_t *cond );
+W32KAPI int client_surface_cond_timedwait( pthread_cond_t *cond, pthread_mutex_t *mutex, DWORD timeout );
 W32KAPI void client_surface_present( struct client_surface *surface );
 /* Success holds submission ordering until begin_present. Failure leaves no
  * lock or reservation owned by the caller and has not submitted native work. */

@@ -21,9 +21,6 @@ struct client_surface_geometry
     RECT monitor_rect;
 };
 
-/* Timed conditions pair this initializer with the monotonic/relative wait. */
-extern int client_surface_cond_init( pthread_cond_t *cond );
-extern int client_surface_cond_timedwait( pthread_cond_t *cond, pthread_mutex_t *mutex, DWORD timeout );
 extern BOOL client_surface_completion_init( struct client_surface *surface );
 extern void client_surface_completion_destroy( struct client_surface *surface );
 extern struct client_surface *client_surface_alloc( UINT size );

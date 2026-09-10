@@ -14,6 +14,7 @@
 #endif
 
 #include <assert.h>
+#include <errno.h>
 #include <time.h>
 #ifdef __linux__
 #include <unistd.h>
@@ -125,7 +126,7 @@ int client_surface_cond_timedwait( pthread_cond_t *cond, pthread_mutex_t *mutex,
     time.tv_nsec = (timeout % 1000) * 1000000;
     return pthread_cond_timedwait_relative_np( cond, mutex, &time );
 #else
-    clock_gettime( CLOCK_MONOTONIC, &time );
+    if (clock_gettime( CLOCK_MONOTONIC, &time )) return errno;
     time.tv_sec += timeout / 1000;
     time.tv_nsec += (timeout % 1000) * 1000000;
     time.tv_sec += time.tv_nsec / 1000000000;
