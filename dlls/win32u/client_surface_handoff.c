@@ -387,13 +387,10 @@ static BOOL prepare_client_surface_handoff_locked( struct client_surface *surfac
         return FALSE;
     }
     if (!map_client_surface_handoff( surface )) return FALSE;
-    if (!independent && (__atomic_load_n( &surface->handoff->channel->endpoints, __ATOMIC_ACQUIRE ) &
-         CLIENT_SURFACE_HANDOFF_ENDPOINT_CONSUMER) == 0)
-    {
-        TRACE( "handoff identity %s has no compositor endpoint\n",
-               wine_dbgstr_longlong( client_surface_get_identity( surface ) ) );
-        return FALSE;
-    }
+    /* A visible source may publish before the asynchronous owner binds.
+     * Cached replay needs the same retained READY path as a new capture:
+     * endpoint registration alone will not request another replay. Hidden
+     * sources are kept private by the publication visibility check. */
     if (!acquire_client_surface_handoff( surface, independent ? NULL : &present->scene,
                                         &token, &present->handoff_index ))
     {
