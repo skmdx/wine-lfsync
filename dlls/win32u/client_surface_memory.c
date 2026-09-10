@@ -373,3 +373,41 @@ void client_surface_memory_scope_destroy( struct client_surface_memory_scope *sc
     release_memory_account( scope->domain );
     scope->owner = scope->domain = NULL;
 }
+
+/* Capacity and accounting belong to the allocation, independently of the
+ * current array consumer and its logical element count. */
+struct client_surface_memory_array
+{
+    struct client_surface_memory_scope memory;
+    SIZE_T capacity, bytes;
+};
+
+void *client_surface_alloc_owned_array( const struct client_surface_memory_scope *owner,
+                                       SIZE_T count, SIZE_T size )
+{
+    struct client_surface_memory_scope memory = {0};
+    struct client_surface_memory_array *array;
+    SIZE_T bytes;
+
+    if (!count || !size || count > (~(SIZE_T)0 - sizeof(*array)) / size) return NULL;
+    bytes = sizeof(*array) + count * size;
+    client_surface_memory_scope_copy( &memory, owner, TRUE );
+    if (!(array = client_surface_alloc_scoped_metadata( &memory, 1, bytes )))
+    {
+        client_surface_memory_scope_destroy( &memory );
+        return NULL;
+    }
+    array->memory = memory;
+    array->capacity = count;
+    array->bytes = bytes;
+    return array + 1;
+}
+
+void client_surface_free_owned_array( void *data )
+{
+    struct client_surface_memory_array *array;
+
+    if (!data) return;
+    array = (struct client_surface_memory_array *)data - 1;
+    client_surface_free_owned_metadata( &array->memory, array, array->bytes );
+}

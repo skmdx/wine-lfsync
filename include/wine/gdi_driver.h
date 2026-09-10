@@ -500,41 +500,9 @@ static inline void client_surface_free_owned_metadata( struct client_surface_mem
 
 /* Variable metadata keeps its allocation capacity and account with the
  * storage. Sorting, filtering and ownership transfer do not resize it. */
-struct client_surface_memory_array
-{
-    struct client_surface_memory_scope memory;
-    SIZE_T capacity, bytes;
-};
-
-static inline void *client_surface_alloc_owned_array( const struct client_surface_memory_scope *owner,
-                                                      SIZE_T count, SIZE_T size )
-{
-    struct client_surface_memory_scope memory = {0};
-    struct client_surface_memory_array *array;
-    SIZE_T bytes;
-
-    if (!count || !size || count > (~(SIZE_T)0 - sizeof(*array)) / size) return NULL;
-    bytes = sizeof(*array) + count * size;
-    client_surface_memory_scope_copy( &memory, owner, TRUE );
-    if (!(array = client_surface_alloc_scoped_metadata( &memory, 1, bytes )))
-    {
-        client_surface_memory_scope_destroy( &memory );
-        return NULL;
-    }
-    array->memory = memory;
-    array->capacity = count;
-    array->bytes = bytes;
-    return array + 1;
-}
-
-static inline void client_surface_free_owned_array( void *data )
-{
-    struct client_surface_memory_array *array;
-
-    if (!data) return;
-    array = (struct client_surface_memory_array *)data - 1;
-    client_surface_free_owned_metadata( &array->memory, array, array->bytes );
-}
+W32KAPI void *client_surface_alloc_owned_array( const struct client_surface_memory_scope *owner,
+                                              SIZE_T count, SIZE_T size );
+W32KAPI void client_surface_free_owned_array( void *data );
 
 struct client_surface
 {
