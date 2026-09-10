@@ -324,7 +324,10 @@ static BOOL start_client_surface_completion_thread( struct client_surface *prosp
     /* One clean owner suffices for unsubmitted tickets. Grow the pool when
      * independent FIFO heads become runnable, not for each reserved frame. */
     if (!demand && completion_reservation_count) demand = 1;
-    if (active + starting_completion_workers_locked() <
+    /* A concurrent creation cannot own this caller's ticket until it succeeds.
+     * With no running owner, use a free slot instead of refusing admission just
+     * because another caller is still creating the first worker. */
+    if ((!active && demand) || active + starting_completion_workers_locked() <
         min( demand, (unsigned int)ARRAY_SIZE(completion_workers) ))
         for (i = 0; i < ARRAY_SIZE(completion_workers); ++i)
             if (completion_workers[i].state == COMPLETION_WORKER_FREE)
