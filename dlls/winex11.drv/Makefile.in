@@ -13,6 +13,7 @@ SOURCES = \
 	client_surface_backing.c \
 	client_surface_completion.c \
 	client_surface_retirement.c \
+	client_surface_snapshot.c \
 	client_surface_xcb.c \
 	client_surface_xfixes.c \
 	desktop.c \

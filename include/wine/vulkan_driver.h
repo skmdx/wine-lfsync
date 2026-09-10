@@ -89,7 +89,7 @@ struct VkDevice_T
 #include "wine/list.h"
 
 /* Wine internal vulkan driver version, needs to be bumped upon vulkan_funcs changes. */
-#define WINE_VULKAN_DRIVER_VERSION 56
+#define WINE_VULKAN_DRIVER_VERSION 57
 
 struct vulkan_object
 {
@@ -359,6 +359,7 @@ struct vulkan_funcs
 /* interface between win32u and the user drivers */
 struct client_surface;
 struct client_surface_frame;
+struct vulkan_surface_snapshot;
 
 enum vulkan_surface_source_type
 {
@@ -381,8 +382,15 @@ struct vulkan_driver_funcs
     /* The source contract covers the surface lifetime, including a later
      * DIRECT -> COMPOSITED transition. Querying it never allocates an image. */
     VkResult (*p_vulkan_surface_get_source)(struct client_surface *, VkFormat, struct vulkan_surface_source *);
-    BOOL (*p_vulkan_surface_snapshot)(struct client_surface *, struct client_surface_frame *,
-                                     const void *, uint32_t, uint32_t, VkFormat);
+    /* A readback reservation exclusively owns its reusable backend image.
+     * Read may block in native code and receives no surface state. Apply
+     * exchanges that image with the surface's retained completed image;
+     * it transfers ownership without native calls or resource destruction. */
+    BOOL (*p_vulkan_surface_read_snapshot)(struct vulkan_surface_snapshot **, const void *,
+                                          uint32_t, uint32_t, VkFormat);
+    BOOL (*p_vulkan_surface_apply_snapshot)(struct client_surface *, struct client_surface_frame *,
+                                           struct vulkan_surface_snapshot **);
+    void (*p_vulkan_surface_destroy_snapshot)(struct vulkan_surface_snapshot *);
     VkBool32 (*p_get_physical_device_presentation_support)(struct vulkan_physical_device *, uint32_t);
     void (*p_map_instance_extensions)( struct vulkan_instance_extensions *extensions );
     void (*p_map_device_extensions)( struct vulkan_device_extensions *extensions );

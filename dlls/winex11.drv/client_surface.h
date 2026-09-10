@@ -16,6 +16,7 @@
 
 struct x11drv_client_surface;
 struct x11drv_client_surface_retirement;
+struct x11drv_client_snapshot;
 
 struct x11drv_client_surface_completion
 {
@@ -46,11 +47,7 @@ struct x11drv_client_surface
     XWindowChanges changes;
     Colormap colormap;
     Window window;
-    Pixmap snapshot;
-    SIZE snapshot_size;
-    XImage *snapshot_image;
-    GC snapshot_gc;
-    UINT64 snapshot_bytes;
+    struct x11drv_client_snapshot *snapshot;
     BYTE *snapshot_pixels;
     SIZE_T snapshot_pixels_size;
     VisualID source_visual;
@@ -78,6 +75,15 @@ struct x11drv_snapshot_format
     unsigned int red_mask, green_mask, blue_mask, alpha_mask;
 };
 extern const struct x11drv_snapshot_format x11drv_snapshot_rgba8;
+/* The caller exclusively owns this reusable image. Upload and destruction
+ * may enter native I/O; inspecting or exchanging a completed image cannot. */
+extern BOOL x11drv_client_snapshot_upload( struct x11drv_client_snapshot **snapshot, const BYTE *pixels,
+                                          unsigned int width, unsigned int height, BOOL top_down,
+                                          const struct x11drv_snapshot_format *format );
+extern Pixmap x11drv_client_snapshot_pixmap( const struct x11drv_client_snapshot *snapshot );
+extern SIZE x11drv_client_snapshot_size( const struct x11drv_client_snapshot *snapshot );
+extern void x11drv_client_snapshot_release_staging( struct x11drv_client_snapshot *snapshot );
+extern void x11drv_client_snapshot_destroy( struct x11drv_client_snapshot *snapshot );
 extern BOOL x11drv_client_surface_snapshot( struct client_surface *client, const BYTE *pixels,
                                             unsigned int width, unsigned int height,
                                             BOOL top_down, const struct x11drv_snapshot_format *format );

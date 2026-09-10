@@ -828,6 +828,18 @@ extern BOOL X11DRV_ProcessEvents( DWORD mask );
 
 typedef int (*x11drv_error_callback)( Display *display, XErrorEvent *event, void *arg );
 
+/* A private connection may own its error sink for its entire lifetime. The
+ * callback must not call Xlib or change the registration. Unregister only
+ * after the last native operation (including XCloseDisplay) has returned. */
+struct x11drv_error_handler
+{
+    struct list entry;
+    Display *display;
+    x11drv_error_callback callback;
+    void *arg;
+};
+extern void X11DRV_register_error_handler( struct x11drv_error_handler *handler );
+extern void X11DRV_unregister_error_handler( struct x11drv_error_handler *handler );
 extern void X11DRV_expect_error( Display *display, x11drv_error_callback callback, void *arg );
 extern int X11DRV_check_error(void);
 extern POINT virtual_screen_to_root( INT x, INT y );

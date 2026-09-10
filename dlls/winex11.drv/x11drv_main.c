@@ -97,6 +97,8 @@ static BOOL use_xim = TRUE;
 static WCHAR input_style[20];
 
 static pthread_mutex_t error_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t error_handlers_mutex = PTHREAD_MUTEX_INITIALIZER;
+static struct list error_handlers = LIST_INIT(error_handlers);
 
 #define IS_OPTION_TRUE(ch) \
     ((ch) == 'y' || (ch) == 'Y' || (ch) == 't' || (ch) == 'T' || (ch) == '1')
@@ -287,11 +289,42 @@ int X11DRV_check_error(void)
 }
 
 
+void X11DRV_register_error_handler( struct x11drv_error_handler *handler )
+{
+    pthread_mutex_lock( &error_handlers_mutex );
+    /* XCloseDisplay may have just released the address of a connection whose
+     * owner has not yet removed its sink. A newly opened connection wins. */
+    list_add_head( &error_handlers, &handler->entry );
+    pthread_mutex_unlock( &error_handlers_mutex );
+}
+
+void X11DRV_unregister_error_handler( struct x11drv_error_handler *handler )
+{
+    pthread_mutex_lock( &error_handlers_mutex );
+    list_remove( &handler->entry );
+    pthread_mutex_unlock( &error_handlers_mutex );
+}
+
 /***********************************************************************
  *		error_handler
  */
 static int error_handler( Display *display, XErrorEvent *error_evt )
 {
+    struct x11drv_error_handler *handler;
+    int handled = 0;
+
+    /* This lock protects registration and the short error callback only.
+     * A stopped request on a private connection cannot hold it across I/O. */
+    pthread_mutex_lock( &error_handlers_mutex );
+    LIST_FOR_EACH_ENTRY( handler, &error_handlers, struct x11drv_error_handler, entry )
+        if (handler->display == display)
+        {
+            handled = handler->callback( display, error_evt, handler->arg );
+            break;
+        }
+    pthread_mutex_unlock( &error_handlers_mutex );
+    if (handled) return 0;
+
     if (err_callback && display == err_callback_display &&
         (!error_evt->serial || error_evt->serial >= err_serial))
     {

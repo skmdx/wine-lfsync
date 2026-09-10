@@ -108,22 +108,46 @@ static VkResult X11DRV_vulkan_surface_get_source( struct client_surface *client,
     return VK_SUCCESS;
 }
 
-static BOOL X11DRV_vulkan_surface_snapshot( struct client_surface *client,
-                                           struct client_surface_frame *present,
-                                           const void *pixels, uint32_t width, uint32_t height,
-                                           VkFormat format )
+static BOOL X11DRV_vulkan_surface_read_snapshot( struct vulkan_surface_snapshot **storage,
+                                                 const void *pixels, uint32_t width, uint32_t height,
+                                                 VkFormat format )
+{
+    struct x11drv_client_snapshot *snapshot = (struct x11drv_client_snapshot *)*storage;
+    const struct x11drv_snapshot_format *layout = get_snapshot_format( format );
+    BOOL ret;
+
+    if (!layout) return FALSE;
+    ret = x11drv_client_snapshot_upload( &snapshot, pixels, width, height, TRUE, layout );
+    *storage = (struct vulkan_surface_snapshot *)snapshot;
+    return ret;
+}
+
+static BOOL X11DRV_vulkan_surface_apply_snapshot( struct client_surface *client,
+                                                  struct client_surface_frame *present,
+                                                  struct vulkan_surface_snapshot **storage )
 {
     struct x11drv_client_surface *surface = impl_from_client_surface( client );
-    const struct x11drv_snapshot_format *snapshot = get_snapshot_format( format );
+    struct x11drv_client_snapshot *snapshot = (struct x11drv_client_snapshot *)*storage;
 
-    if (!snapshot || !x11drv_client_surface_snapshot( client, pixels, width, height, TRUE, snapshot )) return FALSE;
-    if (present->handoff_control) present->handoff_source->source = surface->snapshot;
-    /* Retain the completed image even while the owner prepares a new scene.
-     * The common completion path freezes it before publishing its source. */
-    present->capture.size = (SIZE){width, height};
-    TRACE( "captured Vulkan snapshot %#lx size %ux%u format %u for %s\n",
-           surface->snapshot, width, height, format, debugstr_client_surface( client ) );
+    /* Both sides exclusively own their image. The validated FIFO capture
+     * exchanges them without native work or releasing resources under the
+     * surface locks. The reservation can recycle the previous image only
+     * after this completion's final release. Retained pixels remain valid
+     * even if the swapchain and its two working reservations are destroyed. */
+    *storage = (struct vulkan_surface_snapshot *)surface->snapshot;
+    surface->snapshot = snapshot;
+    if (present->handoff_control)
+        present->handoff_source->source = x11drv_client_snapshot_pixmap( snapshot );
+    present->capture.size = x11drv_client_snapshot_size( snapshot );
+    TRACE( "captured Vulkan snapshot %#lx size %dx%d for %s\n",
+           x11drv_client_snapshot_pixmap( snapshot ), (int)present->capture.size.cx,
+           (int)present->capture.size.cy, debugstr_client_surface( client ) );
     return TRUE;
+}
+
+static void X11DRV_vulkan_surface_destroy_snapshot( struct vulkan_surface_snapshot *snapshot )
+{
+    x11drv_client_snapshot_destroy( (struct x11drv_client_snapshot *)snapshot );
 }
 
 static void X11DRV_map_instance_extensions( struct vulkan_instance_extensions *extensions )
@@ -146,7 +170,9 @@ static const struct vulkan_driver_funcs x11drv_vulkan_driver_funcs =
 {
     .p_vulkan_surface_create = X11DRV_vulkan_surface_create,
     .p_vulkan_surface_get_source = X11DRV_vulkan_surface_get_source,
-    .p_vulkan_surface_snapshot = X11DRV_vulkan_surface_snapshot,
+    .p_vulkan_surface_read_snapshot = X11DRV_vulkan_surface_read_snapshot,
+    .p_vulkan_surface_apply_snapshot = X11DRV_vulkan_surface_apply_snapshot,
+    .p_vulkan_surface_destroy_snapshot = X11DRV_vulkan_surface_destroy_snapshot,
     .p_get_physical_device_presentation_support = X11DRV_get_physical_device_presentation_support,
     .p_map_instance_extensions = X11DRV_map_instance_extensions,
     .p_map_device_extensions = X11DRV_map_device_extensions,

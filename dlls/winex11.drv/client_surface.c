@@ -123,12 +123,7 @@ void x11drv_client_surface_release_snapshot_staging( struct x11drv_client_surfac
     free( surface->snapshot_pixels );
     surface->snapshot_pixels = NULL;
     surface->snapshot_pixels_size = 0;
-    if (surface->snapshot_image)
-    {
-        bytes += (UINT64)surface->snapshot_image->bytes_per_line * surface->snapshot_image->height;
-        XDestroyImage( surface->snapshot_image );
-        surface->snapshot_image = NULL;
-    }
+    x11drv_client_snapshot_release_staging( surface->snapshot );
     client_surface_release_memory( CLIENT_SURFACE_MEMORY_STAGING, bytes );
     if (bytes) TRACE( "released CPU snapshot staging for %s, bytes %s\n",
                       debugstr_client_surface( &surface->client ), wine_dbgstr_longlong( bytes ) );
@@ -157,9 +152,7 @@ static void x11drv_client_surface_destroy( struct client_surface *client )
                                           surface->sources[i].pixmap, surface->sources[i].bytes );
         client_surface_release_memory( CLIENT_SURFACE_MEMORY_SOURCE, surface->sources[i].bytes );
     }
-    if (surface->snapshot_gc) XFreeGC( gdi_display, surface->snapshot_gc );
-    if (surface->snapshot) XFreePixmap( gdi_display, surface->snapshot );
-    client_surface_release_memory( CLIENT_SURFACE_MEMORY_SOURCE, surface->snapshot_bytes );
+    x11drv_client_snapshot_destroy( surface->snapshot );
     if (surface->colormap != default_colormap) XFreeColormap( gdi_display, surface->colormap );
     if (surface->window) destroy_client_window( hwnd, surface->window );
 }
@@ -373,133 +366,14 @@ struct x11drv_client_source_frame *x11drv_client_surface_get_source(
     return frame;
 }
 
-const struct x11drv_snapshot_format x11drv_snapshot_rgba8 = {4, 0xff, 0xff00, 0xff0000, 0xff000000};
-
-static unsigned long snapshot_component( unsigned int pixel, unsigned int source_mask, unsigned long mask )
-{
-    unsigned int shift = 0, source_shift = 0;
-
-    if (!mask) return 0;
-    if (!source_mask) return mask; /* formats without alpha are opaque */
-    while (!(mask & (1ul << shift))) ++shift;
-    while (!(source_mask & (1u << source_shift))) ++source_shift;
-    return ((UINT64)((pixel & source_mask) >> source_shift) * (mask >> shift) /
-            (source_mask >> source_shift)) << shift;
-}
-
 BOOL x11drv_client_surface_snapshot( struct client_surface *client, const BYTE *pixels,
                                      unsigned int width, unsigned int height,
                                      BOOL top_down, const struct x11drv_snapshot_format *format )
 {
     struct x11drv_client_surface *surface = impl_from_client_surface( client );
-    XImage *image;
-    GC gc;
-    unsigned int x, y;
-    unsigned long alpha = ((1ull << default_visual.depth) - 1) &
-                          ~(default_visual.red_mask | default_visual.green_mask | default_visual.blue_mask);
-    int error = 0;
 
-    image = surface->snapshot_image;
-    if (!image || image->width != width || image->height != height)
-    {
-        if (!(image = XCreateImage( gdi_display, default_visual.visual, default_visual.depth,
-                                ZPixmap, 0, NULL, width, height, 32, 0 )))
-            return FALSE;
-        if (image->bytes_per_line <= 0 || height > ~(SIZE_T)0 / image->bytes_per_line ||
-            !client_surface_reserve_memory( CLIENT_SURFACE_MEMORY_STAGING, (UINT64)height * image->bytes_per_line ))
-        {
-            XDestroyImage( image );
-            return FALSE;
-        }
-        if (!(image->data = calloc( height, image->bytes_per_line )))
-        {
-            client_surface_release_memory( CLIENT_SURFACE_MEMORY_STAGING, (UINT64)height * image->bytes_per_line );
-            XDestroyImage( image );
-            return FALSE;
-        }
-        if (surface->snapshot_image)
-        {
-            client_surface_release_memory( CLIENT_SURFACE_MEMORY_STAGING,
-                (UINT64)surface->snapshot_image->bytes_per_line * surface->snapshot_image->height );
-            XDestroyImage( surface->snapshot_image );
-        }
-        surface->snapshot_image = image;
-    }
-    if (format->texel_size == 4 && format->green_mask == 0xff00 &&
-        (format->red_mask == 0xff || format->red_mask == 0xff0000) &&
-        image->bits_per_pixel == 32 && image->byte_order == LSBFirst &&
-        default_visual.red_mask == 0xff0000 && default_visual.green_mask == 0xff00 &&
-        default_visual.blue_mask == 0xff)
-    {
-        for (y = 0; y < height; ++y)
-        {
-            BYTE *row = (BYTE *)image->data +
-                        (SIZE_T)(top_down ? y : height - y - 1) * image->bytes_per_line;
-
-            if (format->red_mask == 0xff0000)
-            {
-                memcpy( row, pixels, (SIZE_T)width * 4 );
-                pixels += (SIZE_T)width * 4;
-                continue;
-            }
-
-            for (x = 0; x < width; ++x, pixels += 4, row += 4)
-            {
-                row[0] = pixels[2];
-                row[1] = pixels[1];
-                row[2] = pixels[0];
-                row[3] = pixels[3];
-            }
-        }
-    }
-    else
-        for (y = 0; y < height; ++y)
-            for (x = 0; x < width; ++x, pixels += format->texel_size)
-            {
-                unsigned int pixel = 0;
-
-                memcpy( &pixel, pixels, format->texel_size );
-                XPutPixel( image, x, top_down ? y : height - y - 1,
-                           snapshot_component( pixel, format->red_mask, default_visual.red_mask ) |
-                           snapshot_component( pixel, format->green_mask, default_visual.green_mask ) |
-                           snapshot_component( pixel, format->blue_mask, default_visual.blue_mask ) |
-                           snapshot_component( pixel, format->alpha_mask, alpha ) );
-            }
-
-    X11DRV_expect_error( gdi_display, client_surface_clip_error, &error );
-    if (!surface->snapshot || surface->snapshot_size.cx != width || surface->snapshot_size.cy != height)
-    {
-        UINT64 bytes = (UINT64)width * height * (default_visual.depth > 16 ? 4 : default_visual.depth > 8 ? 2 : 1);
-
-        if (!client_surface_reserve_memory( CLIENT_SURFACE_MEMORY_SOURCE, bytes ))
-        {
-            X11DRV_check_error();
-            return FALSE;
-        }
-        if (surface->snapshot_gc) XFreeGC( gdi_display, surface->snapshot_gc );
-        surface->snapshot_gc = NULL;
-        if (surface->snapshot) XFreePixmap( gdi_display, surface->snapshot );
-        client_surface_release_memory( CLIENT_SURFACE_MEMORY_SOURCE, surface->snapshot_bytes );
-        surface->snapshot_bytes = bytes;
-        surface->snapshot = XCreatePixmap( gdi_display, root_window, width, height, default_visual.depth );
-        surface->snapshot_size = (SIZE){width, height};
-    }
-    if (!(gc = surface->snapshot_gc))
-        gc = surface->snapshot_gc = XCreateGC( gdi_display, surface->snapshot, 0, NULL );
-    if (gc)
-    {
-        XPutImage( gdi_display, surface->snapshot, gc, image, 0, 0, 0, 0, width, height );
-    }
-    XSync( gdi_display, False );
-    X11DRV_check_error();
-    if (!gc || error)
-    {
-        discard_client_surface_source( &surface->snapshot, &surface->snapshot_gc,
-                                        &surface->snapshot_bytes, NULL );
+    if (!x11drv_client_snapshot_upload( &surface->snapshot, pixels, width, height, top_down, format ))
         return FALSE;
-    }
-    TRACE( "uploaded producer snapshot %#lx from visual %#lx to %#lx\n",
-           surface->snapshot, surface->source_visual, default_visual.visualid );
     x11drv_client_surface_set_gpu_snapshot( surface, 0 );
     return TRUE;
 }
@@ -520,7 +394,7 @@ static BOOL x11drv_client_surface_handoff_prepare(
     if (source.right <= source.left || source.bottom <= source.top) return FALSE;
     width = source.right - source.left;
     height = source.bottom - source.top;
-    image->source = native ? surface->window : surface->snapshot;
+    image->source = native ? surface->window : x11drv_client_snapshot_pixmap( surface->snapshot );
     if (surface->gpu_snapshot) image->source = surface->gpu_snapshot;
     image->source_visual = native ? surface->source_visual : default_visual.visualid;
     image->flags = CLIENT_SURFACE_HANDOFF_NATIVE_X11 | CLIENT_SURFACE_HANDOFF_FULL_DAMAGE;
@@ -549,7 +423,7 @@ static BOOL x11drv_client_surface_handoff_complete( struct client_surface *clien
     struct x11drv_client_source_frame *frame = &surface->sources[index];
     BOOL native = usexcomposite && !surface->direct_snapshot;
     unsigned int depth = native ? surface->source_depth : default_visual.depth;
-    Pixmap source = surface->snapshot;
+    Pixmap source = x11drv_client_snapshot_pixmap( surface->snapshot );
     int error = 0;
 
     assert( index < ARRAY_SIZE(surface->sources) );

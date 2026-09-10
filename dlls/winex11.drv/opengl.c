@@ -1811,7 +1811,7 @@ static BOOL snapshot_client_surface( struct opengl_drawable *base, struct client
     pthread_mutex_lock( &base->client->present_lock );
     ret = x11drv_client_surface_snapshot( base->client, pixels, size.cx, size.cy, FALSE, &x11drv_snapshot_rgba8 );
     if (ret && present->handoff_control)
-        present->handoff_source->source = surface->snapshot;
+        present->handoff_source->source = x11drv_client_snapshot_pixmap( surface->snapshot );
     if (ret) present->capture.size = size;
     pthread_mutex_unlock( &base->client->present_lock );
     return ret;
@@ -2130,7 +2130,7 @@ static int snapshot_client_surface_gpu( struct opengl_drawable *base,
          * Keep the pixmap for replay, but stop retaining CPU storage once
          * independent GPU capture works. A later fallback reallocates it. */
         pthread_mutex_lock( &base->client->present_lock );
-        if (surface->snapshot_pixels || surface->snapshot_image)
+        if (surface->snapshot_pixels || surface->snapshot)
             x11drv_client_surface_release_snapshot_staging( surface );
         pthread_mutex_unlock( &base->client->present_lock );
         frame->gpu_copy = TRUE;

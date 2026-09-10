@@ -191,6 +191,7 @@ struct swapchain_snapshot
     VkDeviceMemory memory;
     UINT64 memory_bytes;
     void *pixels;
+    struct vulkan_surface_snapshot *backend_snapshot;
     VkCommandPool pool;
     VkCommandBuffer command;
     uint32_t queue_family;
@@ -2442,20 +2443,21 @@ static BOOL read_vulkan_snapshot( void *context )
     struct vulkan_snapshot_capture *capture = context;
     struct vulkan_device *device = capture->device;
     struct swapchain_snapshot *snapshot = capture->snapshot;
+    struct swapchain *swapchain = capture->swapchain;
     VkMappedMemoryRange range = {.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
                                  .memory = snapshot->memory, .size = VK_WHOLE_SIZE};
 
-    return !device->p_vkInvalidateMappedMemoryRanges( device->host.device, 1, &range );
+    return !device->p_vkInvalidateMappedMemoryRanges( device->host.device, 1, &range ) &&
+           driver_funcs->p_vulkan_surface_read_snapshot( &snapshot->backend_snapshot, snapshot->pixels,
+               swapchain->host_extents.width, swapchain->host_extents.height, swapchain->format );
 }
 
 static BOOL apply_vulkan_snapshot( void *context, struct client_surface *surface,
                                    struct client_surface_frame *present )
 {
     struct vulkan_snapshot_capture *capture = context;
-    struct swapchain *swapchain = capture->swapchain;
 
-    return driver_funcs->p_vulkan_surface_snapshot( surface, present, capture->snapshot->pixels,
-               swapchain->host_extents.width, swapchain->host_extents.height, swapchain->format );
+    return driver_funcs->p_vulkan_surface_apply_snapshot( surface, present, &capture->snapshot->backend_snapshot );
 }
 
 static void release_vulkan_snapshot_capture( void *context )
@@ -2470,6 +2472,8 @@ static void destroy_swapchain_snapshot( struct vulkan_device *device, struct swa
 {
     /* The retiring swapchain has checked completion of its source reads.
      * Partial initialization has not submitted any work. */
+    if (snapshot->backend_snapshot)
+        driver_funcs->p_vulkan_surface_destroy_snapshot( snapshot->backend_snapshot );
     if (snapshot->pending)
         release_snapshot_fence( snapshot->pending );
     if (snapshot->pool) device->p_vkDestroyCommandPool( device->host.device, snapshot->pool, NULL );
