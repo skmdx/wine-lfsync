@@ -433,24 +433,54 @@ void client_surface_abandon_handoff_locked( struct client_surface *surface,
     present->handoff_control = 0;
 }
 
+static BOOL source_capture_current( struct client_surface *surface, struct client_surface_frame *present )
+{
+    struct client_surface_source *source = surface->handoff->sources + present->handoff_index;
+
+    return surface->handoff->channel &&
+           !__atomic_load_n( &surface->handoff->channel->closed, __ATOMIC_ACQUIRE ) &&
+           present->handoff_control && present->result == CLIENT_SURFACE_FRAME_PENDING &&
+           surface->hwnd && surface->target.valid && present->target_epoch == surface->target.epoch &&
+           (surface->active || surface->server_cached) &&
+           __atomic_load_n( &source->reservation, __ATOMIC_ACQUIRE ) == present->handoff_control &&
+           (present->serial > surface->composed_serial ||
+            (present->serial == surface->composed_serial && surface->content_valid));
+}
+
 BOOL client_surface_freeze_frame_locked( struct client_surface *surface,
                                          struct client_surface_frame *present,
                                          struct client_surface_completed_frame *frame )
 {
     struct client_surface_source *source = surface->handoff->sources + present->handoff_index;
-    BOOL valid;
+    struct client_surface_capture capture = {0};
+    BOOL valid, pinned = FALSE;
 
     memset( frame, 0, sizeof(*frame) );
     pthread_mutex_lock( &surface->present_lock );
-    valid = surface->handoff->channel &&
-            !__atomic_load_n( &surface->handoff->channel->closed, __ATOMIC_ACQUIRE ) && present->handoff_control && present->result == CLIENT_SURFACE_FRAME_PENDING &&
-            surface->hwnd && surface->target.valid && present->target_epoch == surface->target.epoch &&
-            (surface->active || surface->server_cached) &&
-            __atomic_load_n( &source->reservation, __ATOMIC_ACQUIRE ) == present->handoff_control &&
-            (present->serial > surface->composed_serial ||
-             (present->serial == surface->composed_serial && surface->content_valid));
+    valid = source_capture_current( surface, present );
     if (valid && present->capture.size.cx)
         valid = source->width == present->capture.size.cx && source->height == present->capture.size.cy;
+    if (valid && surface->backend->handoff_capture)
+        valid = surface->backend->handoff_capture( surface, present, &capture );
+    if (valid && capture.read)
+    {
+        /* Cached replay has no host completion token of its own. Retain the
+         * mapping and native-source submission order for every private read,
+         * while allowing target writers to invalidate its eventual publication. */
+        InterlockedIncrement( &surface->external_completion_count );
+        pinned = TRUE;
+        pthread_mutex_unlock( &surface->present_lock );
+        pthread_mutex_unlock( &surface->completion_lock );
+        valid = capture.read( capture.context );
+        pthread_mutex_lock( &surface->completion_lock );
+        pthread_mutex_lock( &surface->present_lock );
+        if (!source_capture_current( surface, present ))
+        {
+            present->result = CLIENT_SURFACE_FRAME_SUPERSEDED;
+            valid = FALSE;
+        }
+        if (valid && capture.apply) valid = capture.apply( capture.context, surface, present );
+    }
     if (valid && surface->backend->handoff_complete)
         valid = surface->backend->handoff_complete( surface, source, present->handoff_index );
     if (valid)
@@ -474,6 +504,15 @@ BOOL client_surface_freeze_frame_locked( struct client_surface *surface,
         }
         surface->composed_serial = present->serial;
         InterlockedExchange( &surface->content_valid, TRUE );
+    }
+    /* Source captures release references only. Their admitted backend
+     * retirement owns any native destruction after the last reference. */
+    if (capture.release) capture.release( capture.context );
+    if (pinned)
+    {
+        if (!InterlockedDecrement( &surface->external_completion_count ))
+            pthread_cond_broadcast( &surface->completion_cond );
+        client_surface_handoff_completed( surface );
     }
     pthread_mutex_unlock( &surface->present_lock );
     return valid;

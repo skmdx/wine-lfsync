@@ -219,7 +219,7 @@ struct gdi_dc_funcs
 };
 
 /* increment this when changing driver tables or shared driver-facing structures */
-#define WINE_GDI_DRIVER_VERSION 145
+#define WINE_GDI_DRIVER_VERSION 146
 
 #define GDI_PRIORITY_NULL_DRV        0  /* null driver */
 #define GDI_PRIORITY_FONT_DRV      100  /* any font driver */
@@ -343,6 +343,11 @@ struct client_surface_backend
     /* Prepare producer-private storage. This does not publish a frame. */
     BOOL (*handoff_prepare)( struct client_surface *surface,
                              struct client_surface_source *source, unsigned int index );
+    /* Transfer a prepared source operation to this capture. Read owns its
+     * storage without surface locks; apply and release only change references.
+     * The core retains native submission order and revalidates before apply. */
+    BOOL (*handoff_capture)( struct client_surface *surface, struct client_surface_frame *frame,
+                             struct client_surface_capture *capture );
     /* Freeze a completed native drawable into independent producer storage. */
     BOOL (*handoff_complete)( struct client_surface *surface,
                               struct client_surface_source *source, unsigned int index );

@@ -55,8 +55,6 @@ struct x11drv_client_surface
     SIZE_T snapshot_pixels_size;
     VisualID source_visual;
     unsigned int source_depth;
-    Pixmap snapshot_import;
-    UINT64 snapshot_import_epoch;
     BOOL direct_snapshot;
     Pixmap gpu_snapshot;
     SIZE gpu_snapshot_size;
@@ -79,8 +77,8 @@ struct x11drv_snapshot_format
 };
 extern const struct x11drv_snapshot_format x11drv_snapshot_rgba8;
 /* Upload replaces shared storage rather than modifying a published image.
- * Sharing requires an admitted handoff retirement; its last release only
- * queues native destruction. Unpublished private storage can die inline. */
+ * Sharing and native capture require admitted handoff retirement; their last
+ * release only queues native destruction. Private CPU storage can die inline. */
 extern BOOL x11drv_client_snapshot_upload( struct x11drv_client_snapshot **snapshot, const BYTE *pixels,
                                           unsigned int width, unsigned int height, BOOL top_down,
                                           const struct x11drv_snapshot_format *format );
@@ -89,6 +87,12 @@ extern SIZE x11drv_client_snapshot_size( const struct x11drv_client_snapshot *sn
 extern void x11drv_client_snapshot_release_staging( struct x11drv_client_snapshot *snapshot );
 extern struct x11drv_client_snapshot *x11drv_client_snapshot_share( struct x11drv_client_snapshot *snapshot );
 extern void x11drv_client_snapshot_release( struct x11drv_client_snapshot *snapshot );
+/* Called after handoff retirement admission. Preparation reserves storage
+ * charges without native I/O; read only uses the transferred private object. */
+extern BOOL x11drv_client_snapshot_prepare_native( struct x11drv_client_snapshot **storage, Window window,
+                                                  unsigned int width, unsigned int height,
+                                                  unsigned int depth, UINT64 epoch );
+extern BOOL x11drv_client_snapshot_read_native( void *context );
 extern BOOL x11drv_client_surface_snapshot( struct client_surface *client, const BYTE *pixels,
                                             unsigned int width, unsigned int height,
                                             BOOL top_down, const struct x11drv_snapshot_format *format );

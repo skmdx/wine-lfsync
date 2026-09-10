@@ -19,6 +19,7 @@
 #include <fcntl.h>
 
 #include "client_surface.h"
+#include "xcomposite.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(x11drv);
 
@@ -26,13 +27,17 @@ struct x11drv_client_snapshot
 {
     struct x11drv_client_surface_retired_resource retirement;
     LONG refs;
-    BOOL shared;
+    BOOL deferred;
     struct x11drv_error_handler errors;
     Display *display;
     Pixmap pixmap;
     GC gc;
     XImage *image;
     SIZE size;
+    unsigned int depth;
+    Window window;
+    Pixmap import;
+    UINT64 target_epoch, import_epoch;
     UINT64 bytes;
     int error;
     BOOL acquired;
@@ -101,7 +106,7 @@ struct x11drv_client_snapshot *x11drv_client_snapshot_share( struct x11drv_clien
 {
     /* A frame holds this reference until its checked consumer read finishes.
      * The retained surface image and a working reservation own separate refs. */
-    snapshot->shared = TRUE;
+    snapshot->deferred = TRUE;
     InterlockedIncrement( &snapshot->refs );
     return snapshot;
 }
@@ -109,7 +114,7 @@ struct x11drv_client_snapshot *x11drv_client_snapshot_share( struct x11drv_clien
 void x11drv_client_snapshot_release( struct x11drv_client_snapshot *snapshot )
 {
     if (!snapshot || InterlockedDecrement( &snapshot->refs )) return;
-    if (snapshot->shared) x11drv_client_surface_retire_resource( &snapshot->retirement );
+    if (snapshot->deferred) x11drv_client_surface_retire_resource( &snapshot->retirement );
     else destroy_snapshot( snapshot );
 }
 
@@ -143,10 +148,10 @@ static BOOL snapshot_create_image( struct x11drv_client_snapshot *snapshot )
     return TRUE;
 }
 
-static struct x11drv_client_snapshot *snapshot_create( unsigned int width, unsigned int height )
+static struct x11drv_client_snapshot *snapshot_alloc( unsigned int width, unsigned int height, unsigned int depth )
 {
     struct x11drv_client_snapshot *snapshot;
-    UINT64 bytes = (UINT64)width * height * (default_visual.depth > 16 ? 4 : default_visual.depth > 8 ? 2 : 1);
+    UINT64 bytes = (UINT64)width * height * (depth > 16 ? 4 : depth > 8 ? 2 : 1);
 
     if (!client_surface_reserve_memory( CLIENT_SURFACE_MEMORY_STAGING, sizeof(*snapshot) )) return NULL;
     if (!(snapshot = calloc( 1, sizeof(*snapshot) )))
@@ -155,30 +160,97 @@ static struct x11drv_client_snapshot *snapshot_create( unsigned int width, unsig
         return NULL;
     }
     snapshot->size = (SIZE){width, height};
+    snapshot->depth = depth;
     snapshot->refs = 1;
     snapshot->retirement.release = release_retired_snapshot;
     if (!client_surface_reserve_memory( CLIENT_SURFACE_MEMORY_SOURCE, bytes )) goto failed;
     snapshot->bytes = bytes;
+    return snapshot;
+
+failed:
+    x11drv_client_snapshot_release( snapshot );
+    return NULL;
+}
+
+static BOOL snapshot_create_native_image( struct x11drv_client_snapshot *snapshot )
+{
+    if (snapshot->display) return snapshot->acquired;
     if (!(snapshot->display = XOpenDisplay( DisplayString( gdi_display ) ))) goto failed;
     snapshot->errors.display = snapshot->display;
     snapshot->errors.callback = snapshot_error;
     snapshot->errors.arg = snapshot;
     X11DRV_register_error_handler( &snapshot->errors );
     if (fcntl( ConnectionNumber( snapshot->display ), F_SETFD, FD_CLOEXEC ) == -1) goto failed;
-    if (!snapshot_create_image( snapshot )) goto failed;
     snapshot->pixmap = XCreatePixmap( snapshot->display, DefaultRootWindow( snapshot->display ),
-                                      width, height, default_visual.depth );
+                                      snapshot->size.cx, snapshot->size.cy, snapshot->depth );
     snapshot->gc = XCreateGC( snapshot->display, snapshot->pixmap, 0, NULL );
     XSync( snapshot->display, False );
     if (!snapshot->pixmap || !snapshot->gc || snapshot->error) goto failed;
     snapshot->acquired = TRUE;
     x11drv_client_surface_trace_image( "acquire", "producer_snapshot", snapshot->display,
                                       snapshot->pixmap, snapshot->bytes );
-    return snapshot;
+    return TRUE;
 
 failed:
-    x11drv_client_snapshot_release( snapshot );
-    return NULL;
+    return FALSE;
+}
+
+BOOL x11drv_client_snapshot_prepare_native( struct x11drv_client_snapshot **storage, Window window,
+                                           unsigned int width, unsigned int height, unsigned int depth, UINT64 epoch )
+{
+    struct x11drv_client_snapshot *snapshot = *storage, *next;
+
+    if (!width || !height || width > 0xffff || height > 0xffff) return FALSE;
+    if (!snapshot || snapshot->size.cx != width || snapshot->size.cy != height || snapshot->depth != depth ||
+        InterlockedCompareExchange( &snapshot->refs, 0, 0 ) != 1)
+    {
+        if (!(next = snapshot_alloc( width, height, depth ))) return FALSE;
+        x11drv_client_snapshot_release( snapshot );
+        *storage = snapshot = next;
+    }
+    /* The prepared handoff already admitted retirement. Even an unpublished
+     * failed copy can therefore release its last reference without native I/O. */
+    snapshot->deferred = TRUE;
+    assert( !snapshot->window || snapshot->window == window );
+    snapshot->window = window;
+    snapshot->target_epoch = epoch;
+    return TRUE;
+}
+
+BOOL x11drv_client_snapshot_read_native( void *context )
+{
+    struct x11drv_client_snapshot *snapshot = context;
+
+    assert( snapshot->refs == 1 && snapshot->window );
+    if (!snapshot_create_native_image( snapshot )) return FALSE;
+    snapshot->error = 0;
+#ifdef SONAME_LIBXCOMPOSITE
+    if (!snapshot->import || snapshot->import_epoch != snapshot->target_epoch)
+    {
+        if (snapshot->import) XFreePixmap( snapshot->display, snapshot->import );
+        snapshot->import = pXCompositeNameWindowPixmap( snapshot->display, snapshot->window );
+        XSync( snapshot->display, False );
+        if (snapshot->error)
+        {
+            /* An unsuccessful NameWindowPixmap XID must not be freed. */
+            snapshot->import = 0;
+            return FALSE;
+        }
+        snapshot->import_epoch = snapshot->target_epoch;
+    }
+#endif
+    if (!snapshot->import) return FALSE;
+    XCopyArea( snapshot->display, snapshot->import, snapshot->pixmap, snapshot->gc,
+               0, 0, snapshot->size.cx, snapshot->size.cy, 0, 0 );
+    XSync( snapshot->display, False );
+    if (snapshot->error)
+    {
+        TRACE( "native source copy failed with X error %d\n", snapshot->error );
+        return FALSE;
+    }
+    TRACE( "copied native window %#lx into private snapshot %#lx display %p epoch %s\n",
+           snapshot->window, snapshot->pixmap, snapshot->display, wine_dbgstr_longlong( snapshot->target_epoch ) );
+    return TRUE;
 }
 
 const struct x11drv_snapshot_format x11drv_snapshot_rgba8 = {4, 0xff, 0xff00, 0xff0000, 0xff000000};
@@ -211,7 +283,12 @@ BOOL x11drv_client_snapshot_upload( struct x11drv_client_snapshot **storage, con
     if (!snapshot || snapshot->size.cx != width || snapshot->size.cy != height ||
         InterlockedCompareExchange( &snapshot->refs, 0, 0 ) != 1)
     {
-        if (!(next = snapshot_create( width, height ))) return FALSE;
+        if (!(next = snapshot_alloc( width, height, default_visual.depth ))) return FALSE;
+        if (!snapshot_create_native_image( next ) || !snapshot_create_image( next ))
+        {
+            x11drv_client_snapshot_release( next );
+            return FALSE;
+        }
         x11drv_client_snapshot_release( snapshot );
         *storage = snapshot = next;
     }

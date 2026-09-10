@@ -158,7 +158,6 @@ static void x11drv_client_surface_destroy( struct client_surface *client )
     x11drv_client_surface_completion_destroy( surface );
     x11drv_client_surface_destroy_retirement( surface );
     x11drv_client_surface_release_snapshot_staging( surface );
-    if (surface->snapshot_import) XFreePixmap( gdi_display, surface->snapshot_import );
     for (i = 0; i < ARRAY_SIZE(surface->sources); ++i)
     {
         x11drv_client_surface_trace_image( "retire", "producer_slot", gdi_display,
@@ -407,10 +406,19 @@ static BOOL x11drv_client_surface_handoff_prepare(
     if (source.right <= source.left || source.bottom <= source.top) return FALSE;
     width = source.right - source.left;
     height = source.bottom - source.top;
+    if (native)
+    {
+        struct x11drv_client_source_frame *frame = surface->sources + index;
+
+        assert( !frame->gc && !frame->image && !frame->bytes );
+        if (!x11drv_client_snapshot_prepare_native( &frame->snapshot, surface->window, width, height,
+                                                     surface->source_depth, image->target_epoch )) return FALSE;
+        frame->pixmap = x11drv_client_snapshot_pixmap( frame->snapshot );
+    }
     /* Admission proved the previous publication's checked read has finished.
      * Return this reference before upload chooses writable storage, so an
      * otherwise unreferenced working snapshot can be reused without a copy. */
-    if (surface->sources[index].snapshot)
+    else if (surface->sources[index].snapshot)
         x11drv_client_surface_release_source_frame( surface->sources + index );
     image->source = native ? surface->window : x11drv_client_snapshot_pixmap( surface->snapshot );
     if (surface->gpu_snapshot) image->source = surface->gpu_snapshot;
@@ -434,6 +442,56 @@ static BOOL x11drv_client_surface_handoff_serialize( struct client_surface *clie
     return usexcomposite && !surface->direct_snapshot && client->target.offscreen;
 }
 
+static BOOL apply_native_snapshot( void *context, struct client_surface *client, struct client_surface_frame *present )
+{
+    struct x11drv_client_surface *surface = impl_from_client_surface( client );
+    struct x11drv_client_source_frame *frame = surface->sources + present->handoff_index;
+
+    assert( !frame->pixmap && !frame->snapshot && !frame->image );
+    frame->snapshot = x11drv_client_snapshot_share( context );
+    frame->pixmap = x11drv_client_snapshot_pixmap( context );
+    frame->width = present->handoff_source->width;
+    frame->height = present->handoff_source->height;
+    frame->depth = surface->source_depth;
+    return TRUE;
+}
+
+static void release_native_snapshot( void *context )
+{
+    x11drv_client_snapshot_release( context );
+}
+
+static BOOL x11drv_client_surface_handoff_capture( struct client_surface *client, struct client_surface_frame *present,
+                                                  struct client_surface_capture *capture )
+{
+    struct x11drv_client_surface *surface = impl_from_client_surface( client );
+    struct x11drv_client_source_frame *frame = surface->sources + present->handoff_index;
+
+    if (!usexcomposite || surface->direct_snapshot) return TRUE;
+    if (!frame->snapshot) return FALSE;
+    assert( !frame->gc && !frame->image && !frame->bytes && !frame->gpu_copy );
+    capture->context = frame->snapshot;
+    capture->read = x11drv_client_snapshot_read_native;
+    capture->apply = apply_native_snapshot;
+    capture->release = release_native_snapshot;
+    memset( frame, 0, sizeof(*frame) );
+    return TRUE;
+}
+
+static void trace_snapshot_freeze( struct client_surface *client, const struct client_surface_source *image, unsigned int index )
+{
+    if (TRACE_ON(csperf))
+    {
+        LARGE_INTEGER ticks;
+
+        NtQueryPerformanceCounter( &ticks, NULL );
+        TRACE_(csperf)( "ticks=%llu event=snapshot_freeze identity=%s reservation=%s index=%u pixmap=%lx\n",
+                       (unsigned long long)ticks.QuadPart,
+                       wine_dbgstr_longlong( __atomic_load_n( &client->identity, __ATOMIC_ACQUIRE ) ),
+                       wine_dbgstr_longlong( image->reservation ), index, (Pixmap)image->source );
+    }
+}
+
 static BOOL x11drv_client_surface_handoff_complete( struct client_surface *client,
                                                    struct client_surface_source *image, unsigned int index )
 {
@@ -445,6 +503,16 @@ static BOOL x11drv_client_surface_handoff_complete( struct client_surface *clien
     int error = 0;
 
     assert( index < ARRAY_SIZE(surface->sources) );
+    if (native)
+    {
+        SIZE size = x11drv_client_snapshot_size( frame->snapshot );
+
+        if (!frame->snapshot || size.cx != image->width || size.cy != image->height) return FALSE;
+        image->source = frame->pixmap;
+        image->flags |= CLIENT_SURFACE_HANDOFF_COPY_SOURCE;
+        trace_snapshot_freeze( client, image, index );
+        return TRUE;
+    }
     /* The core validated this reservation and consumed its native completion.
      * gpu_copy selects storage; it is not itself proof of GPU completion. */
     if (frame->gpu_copy)
@@ -476,16 +544,7 @@ static BOOL x11drv_client_surface_handoff_complete( struct client_surface *clien
         /* Upload already completed its native synchronization. The slot now
          * owns immutable pixels until consumer acknowledgement or retirement;
          * neither target changes nor the next upload can invalidate them. */
-        if (TRACE_ON(csperf))
-        {
-            LARGE_INTEGER ticks;
-
-            NtQueryPerformanceCounter( &ticks, NULL );
-            TRACE_(csperf)( "ticks=%llu event=snapshot_freeze identity=%s reservation=%s index=%u pixmap=%lx\n",
-                           (unsigned long long)ticks.QuadPart,
-                           wine_dbgstr_longlong( __atomic_load_n( &client->identity, __ATOMIC_ACQUIRE ) ),
-                           wine_dbgstr_longlong( image->reservation ), index, source );
-        }
+        trace_snapshot_freeze( client, image, index );
         return TRUE;
     }
     if (!(frame = x11drv_client_surface_get_source( client, index, image->width, image->height, depth )))
@@ -494,28 +553,6 @@ static BOOL x11drv_client_surface_handoff_complete( struct client_surface *clien
         surface->gpu_snapshot_size.cy >= image->height)
         source = surface->gpu_snapshot;
     X11DRV_expect_error( gdi_display, client_surface_clip_error, &error );
-#ifdef SONAME_LIBXCOMPOSITE
-    if (native)
-    {
-        if (!surface->snapshot_import || surface->snapshot_import_epoch != image->target_epoch)
-        {
-            if (surface->snapshot_import) XFreePixmap( gdi_display, surface->snapshot_import );
-            surface->snapshot_import = pXCompositeNameWindowPixmap( gdi_display, surface->window );
-            surface->snapshot_import_epoch = image->target_epoch;
-            XSync( gdi_display, False );
-            X11DRV_check_error();
-            if (error)
-            {
-                /* NameWindowPixmap allocates an XID before the server checks
-                 * the source. An unsuccessful name must never be freed. */
-                surface->snapshot_import = 0;
-                return FALSE;
-            }
-            X11DRV_expect_error( gdi_display, client_surface_clip_error, &error );
-        }
-        source = surface->snapshot_import;
-    }
-#endif
     if (!frame->gc) frame->gc = XCreateGC( gdi_display, frame->pixmap, 0, NULL );
     if (source && frame->gc)
         XCopyArea( gdi_display, source, frame->pixmap, frame->gc, 0, 0, image->width, image->height, 0, 0 );
@@ -557,6 +594,7 @@ static const struct client_surface_backend x11drv_client_surface_backend =
     .complete_direct = X11DRV_client_surface_complete_direct,
     .update = x11drv_client_surface_update,
     .handoff_prepare = x11drv_client_surface_handoff_prepare,
+    .handoff_capture = x11drv_client_surface_handoff_capture,
     .handoff_complete = x11drv_client_surface_handoff_complete,
     .handoff_serialize = x11drv_client_surface_handoff_serialize,
     .handoff_retire = x11drv_client_surface_retire_handoff,
