@@ -2056,6 +2056,22 @@ static const struct x11drv_client_snapshot_image_ops snapshot_image_ops =
     release_snapshot_image,
 };
 
+static struct egl_snapshot_completion *prepare_snapshot_completion( struct egl_snapshot_image *image )
+{
+    struct egl_snapshot_completion *completion = image->pending;
+
+    /* Storage preparation proved sole image ownership and GPU completion.
+     * Once its callback has also released its reference, the image's existing
+     * metadata can carry another write without competing for process budget.
+     * Neither a pending fence nor another callback's references are reused. */
+    if (!completion || InterlockedCompareExchange( &completion->refs, 0, 0 ) != 1)
+        return alloc_client_surface_metadata( sizeof(*completion) );
+    image->pending = NULL;
+    snapshot_destroy_sync( egl->display, completion->sync );
+    memset( completion, 0, sizeof(*completion) );
+    return completion;
+}
+
 /* Runs in the FBO wrapper's internal context, after its color/gamma blit.
  * Return zero for an unsupported import, negative for a failed GPU copy. */
 static int snapshot_client_surface_gpu( struct opengl_drawable *base,
@@ -2106,7 +2122,7 @@ static int snapshot_client_surface_gpu( struct opengl_drawable *base,
      * Metadata pressure must not turn an otherwise asynchronous capture
      * into a caller-side glFinish after the copy has already been submitted. */
     if (snapshot_create_sync && snapshot_destroy_sync && snapshot_wait_sync &&
-        !(completion = alloc_client_surface_metadata( sizeof(*completion) ))) return -1;
+        !(completion = prepare_snapshot_completion( image ))) return -1;
     funcs->p_glGetIntegerv( GL_READ_FRAMEBUFFER_BINDING, &read_fbo );
     funcs->p_glGetIntegerv( GL_DRAW_FRAMEBUFFER_BINDING, &draw_fbo );
     funcs->p_glGetIntegerv( GL_RENDERBUFFER_BINDING, &renderbuffer );
