@@ -190,6 +190,7 @@ struct client_surface_compositor_target
 {
     struct client_surface_compositor_target *next;
     struct client_surface_memory_scope memory;
+    struct client_surface_owner_notifications *notifications;
     HWND toplevel;
     Window window;
     struct client_surface_compositor_frame frames[CLIENT_SURFACE_COMPOSITOR_FRAME_COUNT];
@@ -219,6 +220,7 @@ struct client_surface_compositor_target
     unsigned int native_updates;
     UINT64 deferred_update;
     BOOL update_notified;
+    BOOL update_resumed;
     UINT deferred_update_types;
     UINT64 mailbox_bytes;
     DWORD shrink_start;
@@ -268,9 +270,16 @@ enum client_surface_compositor_op
     CLIENT_SURFACE_COMPOSITOR_RENEW_DIRECT,
 };
 
+struct client_surface_direct_completion
+{
+    Drawable source;
+    UINT64 identity, scene_epoch, native_epoch;
+};
+
 struct client_surface_compositor_job
 {
     struct client_surface_compositor_job *next;
+    struct client_surface_owner_notifications *notifications;
     enum client_surface_compositor_op op;
     HWND toplevel; /* Scalar routing key, never a borrowed window-data pointer. */
     BOOL result;
@@ -359,11 +368,7 @@ struct client_surface_compositor_job
             unsigned int width, height, window_width, window_height;
         } direct_renew;
         /* DIRECT_COMPLETE carries scalar attestations, no native lease. */
-        struct
-        {
-            Drawable source;
-            UINT64 identity, scene_epoch, native_epoch;
-        } direct_complete;
+        struct client_surface_direct_completion direct_complete;
         /* RESTORE_TARGET borrows the destination; deferred restoration is
          * stored on the target, without retaining this stack job. */
         struct
@@ -376,7 +381,9 @@ struct client_surface_compositor_job
         /* Native-update operations carry scalar barriers and return values. */
         struct
         {
+            struct client_surface_owner_notifications *notifications;
             UINT64 mark;
+            unsigned int count;
             BOOL invalidate_scene, deferred;
             UINT types;
         } update;
@@ -390,6 +397,26 @@ static struct client_surface_compositor_job **client_surface_compositor_tail =
  * retain ownership until completion, including while another target runs. */
 static struct client_surface_compositor_job *client_surface_compositor_pending;
 static UINT64 client_surface_native_update_serial;
+
+/* One object owns all notifications for a target lifetime. BEGIN and resumed
+ * GUI notifications retain references until END/FINISH dispatch, even after
+ * the target is removed. DIRECT receipts hold a queue reference and coalesce
+ * only within the authenticated plan. All fields here use compositor_mutex;
+ * execution consumes a private job payload, never a concurrently written one. */
+struct client_surface_owner_notifications
+{
+    struct client_surface_owner_notifications *next;
+    struct client_surface_memory_scope memory;
+    HWND toplevel;
+    UINT64 refs;
+    struct client_surface_compositor_job end, finish, direct;
+    unsigned int pending_ends;
+    BOOL end_queued, finish_queued, direct_queued, direct_pending;
+    UINT64 finish_serial;
+    struct client_surface_direct_completion direct_plan, direct_proof;
+};
+
+static struct client_surface_owner_notifications *client_surface_owner_notifications;
 
 /* The release node is part of the admitted output storage. The GUI can pass
  * ownership back without allocating or waiting for the actor. The registry
@@ -489,6 +516,7 @@ static BOOL publish_client_surface_handoff_generation( HWND toplevel, UINT64 gen
                                                        UINT64 scene_generation, BOOL success );
 static BOOL client_surface_present_on_compositor( struct client_surface_compositor_job *job );
 static BOOL process_client_surface_compositor_jobs(void);
+static void enqueue_client_surface_compositor_job( struct client_surface_compositor_job *job );
 static BOOL get_client_surface_window_extent( struct x11drv_win_data *data,
                                               unsigned int *width, unsigned int *height );
 #ifdef SONAME_LIBXPRESENT
@@ -591,11 +619,65 @@ static struct client_surface_compositor_target *alloc_client_surface_compositor_
 {
     struct client_surface_memory_scope memory = {0};
     struct client_surface_compositor_target *target;
+    struct client_surface_owner_notifications *notifications;
 
     if (!(target = alloc_client_surface_compositor_metadata( toplevel, sizeof(*target), &memory ))) return NULL;
     target->memory = memory;
     target->toplevel = toplevel;
+    memset( &memory, 0, sizeof(memory) );
+    client_surface_memory_scope_copy( &memory, &target->memory, TRUE );
+    if (!(notifications = client_surface_alloc_scoped_metadata( &memory, 1, sizeof(*notifications) )))
+    {
+        client_surface_memory_scope_destroy( &memory );
+        client_surface_free_owned_metadata( &target->memory, target, sizeof(*target) );
+        return NULL;
+    }
+    notifications->memory = memory;
+    notifications->toplevel = toplevel;
+    notifications->refs = 1;
+    notifications->end = (struct client_surface_compositor_job){
+        .op = CLIENT_SURFACE_COMPOSITOR_END_UPDATE, .toplevel = toplevel,
+        .notifications = notifications, .async = TRUE};
+    notifications->finish = (struct client_surface_compositor_job){
+        .op = CLIENT_SURFACE_COMPOSITOR_FINISH_UPDATE, .toplevel = toplevel,
+        .notifications = notifications, .async = TRUE};
+    notifications->direct = (struct client_surface_compositor_job){
+        .op = CLIENT_SURFACE_COMPOSITOR_DIRECT_COMPLETE, .toplevel = toplevel,
+        .notifications = notifications, .async = TRUE};
+    target->notifications = notifications;
+    pthread_mutex_lock( &client_surface_compositor_mutex );
+    notifications->next = client_surface_owner_notifications;
+    client_surface_owner_notifications = notifications;
+    pthread_mutex_unlock( &client_surface_compositor_mutex );
     return target;
+}
+
+static void free_client_surface_compositor_target( struct client_surface_compositor_target *target )
+{
+    struct client_surface_owner_notifications **cursor, *notifications = target->notifications;
+    BOOL unused;
+
+    pthread_mutex_lock( &client_surface_compositor_mutex );
+    for (cursor = &client_surface_owner_notifications; *cursor != notifications; cursor = &(*cursor)->next)
+        assert( *cursor );
+    *cursor = notifications->next;
+    unused = !--notifications->refs;
+    pthread_mutex_unlock( &client_surface_compositor_mutex );
+    if (unused) client_surface_free_owned_metadata( &notifications->memory, notifications, sizeof(*notifications) );
+    client_surface_free_owned_metadata( &target->memory, target, sizeof(*target) );
+}
+
+static void update_client_surface_notification_plan( struct client_surface_compositor_target *target )
+{
+    struct client_surface_owner_notifications *notifications = target->notifications;
+
+    pthread_mutex_lock( &client_surface_compositor_mutex );
+    notifications->direct_plan = (struct client_surface_direct_completion){0};
+    if (target->scene.valid && target->scene.strategy == DIRECT_ATTACH)
+        notifications->direct_plan = (struct client_surface_direct_completion){
+            .identity = target->scene.direct_identity, .scene_epoch = target->scene.epoch,
+            .source = target->scene.direct_drawable};
+    pthread_mutex_unlock( &client_surface_compositor_mutex );
 }
 
 static BOOL client_surface_alloc_on_compositor( struct client_surface_compositor_job *job )
@@ -1650,6 +1732,7 @@ static BOOL install_client_surface_scene_plan( struct client_surface_compositor_
     job->u.scene_install.count = 0;
     target->scene.count = count;
     target->scene.valid = TRUE;
+    update_client_surface_notification_plan( target );
     target->quiescing = target->native_updates || target->deferred_update;
     target->receipts = receipts;
     target->replay_member = 0;
@@ -1845,7 +1928,7 @@ static BOOL update_client_surface_compositor_target( struct client_surface_compo
     return TRUE;
 
 failed:
-    if (created) client_surface_free_owned_metadata( &target->memory, target, sizeof(*target) );
+    if (created) free_client_surface_compositor_target( target );
     else target->quiescing = target->native_updates || target->deferred_update;
     return FALSE;
 }
@@ -1890,7 +1973,7 @@ static BOOL remove_client_surface_compositor_target( HWND toplevel )
         free( target->scene.members );
         free_client_surface_scene_layouts( target->scene.layouts, target->scene.count );
         free( target->receipts );
-        client_surface_free_owned_metadata( &target->memory, target, sizeof(*target) );
+        free_client_surface_compositor_target( target );
         return TRUE;
     }
     return TRUE;
@@ -2034,11 +2117,12 @@ static BOOL install_client_surface_direct_plan( const struct client_surface_comp
         .strategy = DIRECT_ATTACH, .direct_identity = job->u.direct_plan.identity,
         .direct_drawable = job->u.direct_plan.source, .epoch = scene_id, .valid = TRUE,
     };
+    update_client_surface_notification_plan( target );
     SetRectEmpty( &target->restore_rect );
     TRACE( "owner DIRECT_ATTACH hwnd %p scene %s identity %s drawable %#lx\n",
            target->toplevel, wine_dbgstr_longlong( scene_id ), wine_dbgstr_longlong( job->u.direct_plan.identity ), job->u.direct_plan.source );
 done:
-    if (allocated && !accepted) client_surface_free_owned_metadata( &target->memory, target, sizeof(*target) );
+    if (allocated && !accepted) free_client_surface_compositor_target( target );
     return accepted;
 }
 
@@ -2102,6 +2186,7 @@ static BOOL renew_client_surface_direct_plan( const struct client_surface_compos
     SERVER_END_REQ;
     if (!scene_id) return FALSE;
     target->scene.epoch = scene_id;
+    update_client_surface_notification_plan( target );
     target->window_width = job->u.direct_renew.window_width;
     target->window_height = job->u.direct_renew.window_height;
     SetRectEmpty( &target->restore_rect );
@@ -2117,7 +2202,7 @@ static BOOL complete_client_surface_direct_plan( const struct client_surface_com
     struct client_surface_compositor_target *target = find_client_surface_compositor_target( job->toplevel );
     BOOL accepted = FALSE;
 
-    if (!target || !target->scene.valid || target->scene.strategy != DIRECT_ATTACH ||
+    if (!target || target->notifications != job->notifications || !target->scene.valid || target->scene.strategy != DIRECT_ATTACH ||
         target->scene.epoch != job->u.direct_complete.scene_epoch || target->scene.direct_identity != job->u.direct_complete.identity ||
         target->scene.direct_drawable != job->u.direct_complete.source) return FALSE;
     /* No native pointer is retained or dereferenced by this queued proof.
@@ -3557,20 +3642,30 @@ static BOOL execute_client_surface_compositor_job( struct client_surface_composi
         struct client_surface_compositor_target *target =
             find_client_surface_compositor_target( job->toplevel );
 
-        if (!target) return FALSE;
+        if (!target || (job->notifications && target->notifications != job->notifications)) return FALSE;
         if (job->op == CLIENT_SURFACE_COMPOSITOR_CHECK_UPDATE ||
             job->op == CLIENT_SURFACE_COMPOSITOR_FINISH_UPDATE)
         {
             if (target->deferred_update != job->u.update.mark || !target->update_notified) return FALSE;
             if (job->op == CLIENT_SURFACE_COMPOSITOR_CHECK_UPDATE)
             {
+                if (target->update_resumed) return FALSE;
+                target->update_resumed = TRUE;
                 job->u.update.types = target->deferred_update_types | X11DRV_CLIENT_SURFACE_UPDATE_STATE;
                 target->deferred_update_types = 0;
+                job->u.update.notifications = target->notifications;
+                pthread_mutex_lock( &client_surface_compositor_mutex );
+                assert( !target->notifications->finish_serial && !target->notifications->finish_queued );
+                ++target->notifications->refs;
+                target->notifications->finish_serial = job->u.update.mark;
+                target->notifications->finish.u.update.mark = job->u.update.mark;
+                pthread_mutex_unlock( &client_surface_compositor_mutex );
             }
             else
             {
                 if (!target->deferred_update_types) target->deferred_update = 0;
                 target->update_notified = FALSE;
+                target->update_resumed = FALSE;
                 target->quiescing = target->native_updates || target->deferred_update;
             }
             return TRUE;
@@ -3596,12 +3691,17 @@ static BOOL execute_client_surface_compositor_job( struct client_surface_composi
         {
             target->deferred_update_types &= ~job->u.update.types;
             ++target->native_updates;
+            job->u.update.notifications = target->notifications;
+            pthread_mutex_lock( &client_surface_compositor_mutex );
+            ++target->notifications->refs;
+            pthread_mutex_unlock( &client_surface_compositor_mutex );
             target->quiescing = TRUE;
             if (job->u.update.invalidate_scene) target->scene.valid = FALSE;
         }
         else
         {
-            if (target->native_updates) --target->native_updates;
+            assert( job->u.update.count && target->native_updates >= job->u.update.count );
+            target->native_updates -= job->u.update.count;
             target->quiescing = target->native_updates || target->deferred_update;
         }
         return TRUE;
@@ -3679,7 +3779,12 @@ static struct client_surface_compositor_target *client_surface_compositor_job_ta
     Pixmap first = None, second = None;
     unsigned int i;
 
-    if (job->toplevel) return find_client_surface_compositor_target( job->toplevel );
+    if (job->toplevel)
+    {
+        target = find_client_surface_compositor_target( job->toplevel );
+        if (target && job->notifications && target->notifications != job->notifications) return NULL;
+        return target;
+    }
     /* Only these jobs route by borrowed/retired native IDs. Never interpret
      * another operation's payload as drawables while checking queue order. */
     switch (job->op)
@@ -3749,7 +3854,8 @@ static BOOL client_surface_compositor_job_ready( struct client_surface_composito
      * must answer while that target's older Present work is still pending. */
     if (job->op == CLIENT_SURFACE_COMPOSITOR_TRY_BEGIN_UPDATE ||
         job->op == CLIENT_SURFACE_COMPOSITOR_CHECK_UPDATE ||
-        job->op == CLIENT_SURFACE_COMPOSITOR_FINISH_UPDATE) return TRUE;
+        job->op == CLIENT_SURFACE_COMPOSITOR_FINISH_UPDATE ||
+        job->op == CLIENT_SURFACE_COMPOSITOR_END_UPDATE) return TRUE;
     /* The copy uses immutable scene/binding references. Inspecting those
      * references, or resolving source availability from completed owner
      * caches, neither mutates nor releases its output. A queued resolve can
@@ -3811,6 +3917,64 @@ static void release_client_surface_compositor_job_resources( struct client_surfa
     }
 }
 
+static void prepare_client_surface_notification( struct client_surface_compositor_job *job )
+{
+    struct client_surface_owner_notifications *notifications = job->notifications;
+
+    if (!notifications) return;
+    pthread_mutex_lock( &client_surface_compositor_mutex );
+    if (job->op == CLIENT_SURFACE_COMPOSITOR_END_UPDATE)
+    {
+        job->u.update.count = notifications->pending_ends;
+        notifications->pending_ends = 0;
+        assert( job->u.update.count );
+    }
+    else if (job->op == CLIENT_SURFACE_COMPOSITOR_DIRECT_COMPLETE)
+    {
+        assert( notifications->direct_pending );
+        job->u.direct_complete = notifications->direct_proof;
+        notifications->direct_pending = FALSE;
+    }
+    pthread_mutex_unlock( &client_surface_compositor_mutex );
+}
+
+/* The dispatcher has unlinked the node. Producers only change the pending
+ * fields while it executes, so a concurrent notification can now requeue it
+ * without overwriting the live job or losing its retained reference. */
+static void finish_client_surface_notification( struct client_surface_compositor_job *job )
+{
+    struct client_surface_owner_notifications *notifications = job->notifications;
+    BOOL unused;
+
+    pthread_mutex_lock( &client_surface_compositor_mutex );
+    if (job->op == CLIENT_SURFACE_COMPOSITOR_END_UPDATE)
+    {
+        assert( notifications->refs >= job->u.update.count );
+        notifications->refs -= job->u.update.count;
+        if (notifications->pending_ends) enqueue_client_surface_compositor_job( job );
+        else notifications->end_queued = FALSE;
+    }
+    else if (job->op == CLIENT_SURFACE_COMPOSITOR_FINISH_UPDATE)
+    {
+        notifications->finish_queued = FALSE;
+        notifications->finish_serial = 0;
+        --notifications->refs;
+    }
+    else
+    {
+        assert( job->op == CLIENT_SURFACE_COMPOSITOR_DIRECT_COMPLETE );
+        if (notifications->direct_pending) enqueue_client_surface_compositor_job( job );
+        else
+        {
+            notifications->direct_queued = FALSE;
+            --notifications->refs;
+        }
+    }
+    unused = !notifications->refs;
+    pthread_mutex_unlock( &client_surface_compositor_mutex );
+    if (unused) client_surface_free_owned_metadata( &notifications->memory, notifications, sizeof(*notifications) );
+}
+
 static BOOL process_client_surface_compositor_jobs(void)
 {
     struct client_surface_compositor_job **cursor, *job, *earlier;
@@ -3869,6 +4033,7 @@ static BOOL process_client_surface_compositor_jobs(void)
         if (earlier != job && job->op != CLIENT_SURFACE_COMPOSITOR_TRY_BEGIN_UPDATE &&
             job->op != CLIENT_SURFACE_COMPOSITOR_CHECK_UPDATE &&
             job->op != CLIENT_SURFACE_COMPOSITOR_FINISH_UPDATE &&
+            job->op != CLIENT_SURFACE_COMPOSITOR_END_UPDATE &&
             job->op != CLIENT_SURFACE_COMPOSITOR_CHECK_CACHE)
         {
             cursor = &job->next;
@@ -3903,6 +4068,7 @@ static BOOL process_client_surface_compositor_jobs(void)
                 cursor = &job->next;
                 continue;
             }
+            prepare_client_surface_notification( job );
             job->result = !rejected && execute_client_surface_compositor_job( job );
             if (job->op == CLIENT_SURFACE_COMPOSITOR_DIRECT_PLAN ||
                 job->op == CLIENT_SURFACE_COMPOSITOR_RETIRE_POOL)
@@ -3924,7 +4090,8 @@ static BOOL process_client_surface_compositor_jobs(void)
         release_client_surface_compositor_job_resources( job );
         if (job->async)
         {
-            if (job->op == CLIENT_SURFACE_COMPOSITOR_FREE_POOL)
+            if (job->notifications) finish_client_surface_notification( job );
+            else if (job->op == CLIENT_SURFACE_COMPOSITOR_FREE_POOL)
             {
                 struct client_surface_output_allocation *allocation =
                     CONTAINING_RECORD( job, struct client_surface_output_allocation, release );
@@ -4064,11 +4231,11 @@ static BOOL submit_client_surface_compositor_job( struct client_surface_composit
     return ret;
 }
 
-/* Release jobs carry only values; the caller does not consume their result.
- * Keep the synchronous path if ownership cannot pass to the actor. */
+/* Every notification already owns storage: an output allocation or a target
+ * notification object. This boundary never allocates or waits for dispatch. */
 static void post_client_surface_compositor_job( struct client_surface_compositor_job *job )
 {
-    struct client_surface_compositor_job *pending;
+    struct client_surface_owner_notifications *notifications = job->notifications;
 
     if (job->op == CLIENT_SURFACE_COMPOSITOR_FREE_POOL)
     {
@@ -4089,24 +4256,44 @@ static void post_client_surface_compositor_job( struct client_surface_compositor
     assert( job->op == CLIENT_SURFACE_COMPOSITOR_FINISH_UPDATE ||
             job->op == CLIENT_SURFACE_COMPOSITOR_END_UPDATE ||
             job->op == CLIENT_SURFACE_COMPOSITOR_DIRECT_COMPLETE );
-    if ((pending = malloc( sizeof(*pending) )))
+    pthread_mutex_lock( &client_surface_compositor_mutex );
+    if (job->op == CLIENT_SURFACE_COMPOSITOR_END_UPDATE)
     {
-        BOOL queued;
-
-        *pending = *job;
-        pending->async = TRUE;
-        pthread_mutex_lock( &client_surface_compositor_mutex );
-        queued = queue_client_surface_compositor_job( pending );
-        pthread_mutex_unlock( &client_surface_compositor_mutex );
-        if (queued) return;
-        free( pending );
+        assert( notifications && notifications->refs && notifications->pending_ends < ~0u );
+        ++notifications->pending_ends;
+        if (!notifications->end_queued)
+        {
+            notifications->end_queued = TRUE;
+            enqueue_client_surface_compositor_job( &notifications->end );
+        }
     }
-    /* Dropping a release would leave a target quiescent or leak its retired
-     * pixmaps. Only a successful enqueue transfers the release obligation. */
-    if (!submit_client_surface_compositor_job( job ) && !job->complete &&
-        job->op == CLIENT_SURFACE_COMPOSITOR_DIRECT_COMPLETE)
-        WARN( "failed to queue client-surface release/publication op %u hwnd %p\n",
-              job->op, job->toplevel );
+    else if (job->op == CLIENT_SURFACE_COMPOSITOR_FINISH_UPDATE)
+    {
+        if (notifications && notifications->finish_serial == job->u.update.mark && !notifications->finish_queued)
+        {
+            notifications->finish_queued = TRUE;
+            enqueue_client_surface_compositor_job( &notifications->finish );
+        }
+    }
+    else
+    {
+        for (notifications = client_surface_owner_notifications; notifications; notifications = notifications->next)
+            if (notifications->toplevel == job->toplevel) break;
+        if (notifications && notifications->direct_plan.identity == job->u.direct_complete.identity &&
+            notifications->direct_plan.scene_epoch == job->u.direct_complete.scene_epoch &&
+            notifications->direct_plan.source == job->u.direct_complete.source)
+        {
+            notifications->direct_proof = job->u.direct_complete;
+            notifications->direct_pending = TRUE;
+            if (!notifications->direct_queued)
+            {
+                notifications->direct_queued = TRUE;
+                ++notifications->refs;
+                enqueue_client_surface_compositor_job( &notifications->direct );
+            }
+        }
+    }
+    pthread_mutex_unlock( &client_surface_compositor_mutex );
 }
 
 BOOL X11DRV_client_surface_prepare_direct( struct client_surface *surface,
@@ -4307,8 +4494,8 @@ static void remove_client_surface_backing_target( HWND toplevel )
     if (started) submit_client_surface_compositor_job( &job );
 }
 
-BOOL X11DRV_client_surface_backing_begin_update( HWND hwnd, const struct window_rects *rects,
-                                                UINT swp_flags, BOOL *deferred )
+struct client_surface_owner_notifications *X11DRV_client_surface_backing_begin_update(
+    HWND hwnd, const struct window_rects *rects, UINT swp_flags, BOOL *deferred )
 {
     const UINT no_geometry = SWP_NOSIZE | SWP_NOMOVE | SWP_NOCLIENTSIZE | SWP_NOCLIENTMOVE | SWP_NOZORDER;
     struct x11drv_win_data *data;
@@ -4327,7 +4514,7 @@ BOOL X11DRV_client_surface_backing_begin_update( HWND hwnd, const struct window_
     };
 
     if (deferred) *deferred = FALSE;
-    if (!(data = get_win_data( hwnd ))) return FALSE;
+    if (!(data = get_win_data( hwnd ))) return NULL;
     backing = !!data->client_surface_backing;
     activation = (swp_flags & WINE_SWP_CLIENT_SURFACE_BACKING_ENABLE) &&
                  !data->client_surface_backing_enabled;
@@ -4340,7 +4527,7 @@ BOOL X11DRV_client_surface_backing_begin_update( HWND hwnd, const struct window_
         data->is_fullscreen || (swp_flags & WINE_SWP_FULLSCREEN) ||
         memcmp( &data->rects, rects, sizeof(*rects) );
     release_win_data( data );
-    if (!backing) return FALSE;
+    if (!backing) return NULL;
 
     /* Plain state notifications can be coalesced and reapplied from current
      * server state, including backing and preparation. A deferred prepare
@@ -4356,17 +4543,18 @@ BOOL X11DRV_client_surface_backing_begin_update( HWND hwnd, const struct window_
         job.op = CLIENT_SURFACE_COMPOSITOR_TRY_BEGIN_UPDATE;
         ret = submit_client_surface_compositor_job( &job );
         *deferred = job.u.update.deferred;
-        return ret;
+        return ret ? job.u.update.notifications : NULL;
     }
 
     /* A missing Present event can leave this target quiescing indefinitely.
      * Do not hold the process-wide window-data lock while it drains. Keep
      * only the handle across the wait; the caller must look up its data again.
      * Destroying the window also removes its compositor target. */
-    return submit_client_surface_compositor_job( &job );
+    return submit_client_surface_compositor_job( &job ) ? job.u.update.notifications : NULL;
 }
 
-UINT X11DRV_client_surface_backing_resume_update( HWND hwnd, UINT64 serial )
+UINT X11DRV_client_surface_backing_resume_update( HWND hwnd, UINT64 serial,
+                                                 struct client_surface_owner_notifications **notifications )
 {
     struct client_surface_compositor_job job =
     {
@@ -4378,15 +4566,19 @@ UINT X11DRV_client_surface_backing_resume_update( HWND hwnd, UINT64 serial )
         },
     };
 
+    *notifications = NULL;
     if (!submit_client_surface_compositor_job( &job )) return 0;
+    *notifications = job.u.update.notifications;
     return job.u.update.types;
 }
 
-void X11DRV_client_surface_backing_finish_deferred_update( HWND hwnd, UINT64 serial )
+void X11DRV_client_surface_backing_finish_deferred_update( HWND hwnd, UINT64 serial,
+                                                          struct client_surface_owner_notifications *notifications )
 {
     struct client_surface_compositor_job job =
     {
         .op = CLIENT_SURFACE_COMPOSITOR_FINISH_UPDATE,
+        .notifications = notifications,
         .toplevel = hwnd,
         .u.update =
         {
@@ -4400,21 +4592,26 @@ void X11DRV_client_surface_backing_finish_deferred_update( HWND hwnd, UINT64 ser
     post_client_surface_compositor_job( &job );
 }
 
-void X11DRV_client_surface_backing_end_update( struct x11drv_win_data *data )
+void X11DRV_client_surface_backing_end_update( struct x11drv_win_data *data,
+                                               struct client_surface_owner_notifications *notifications )
 {
     struct client_surface_compositor_job job =
     {
         .op = CLIENT_SURFACE_COMPOSITOR_END_UPDATE,
-        .toplevel = data->hwnd,
+        .notifications = notifications,
+        .toplevel = notifications->toplevel,
     };
 
     /* The GUI connection owns native geometry, shape and staging. Its changes
      * finish while this target is quiescent, before the owner activates the
      * installed plan. No unrelated target participates in this barrier. */
-    X11DRV_sync_window_changes( data->display );
-    if (data->client_surface_backing) X11DRV_client_surface_backing_ensure( data );
-    /* Later native update and destruction jobs for this target remain behind
-     * its release in the actor queue. The GUI has no result to wait for. */
+    if (data)
+    {
+        X11DRV_sync_window_changes( data->display );
+        if (data->client_surface_backing) X11DRV_client_surface_backing_ensure( data );
+    }
+    /* Return this exact target lifetime even if window data disappeared. An
+     * obsolete release cannot resume a replacement target on the same HWND. */
     post_client_surface_compositor_job( &job );
 }
 

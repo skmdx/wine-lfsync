@@ -759,14 +759,18 @@ extern void X11DRV_client_surface_complete_direct( struct client_surface *surfac
 extern BOOL X11DRV_client_surface_prepare_owner( struct x11drv_win_data *data );
 extern BOOL X11DRV_client_surface_backing_ensure( struct x11drv_win_data *data );
 extern BOOL X11DRV_client_surface_bind_producers( HWND toplevel );
-extern BOOL X11DRV_client_surface_backing_begin_update( HWND hwnd, const struct window_rects *rects,
-                                                        UINT swp_flags, BOOL *deferred );
-extern UINT X11DRV_client_surface_backing_resume_update( HWND hwnd, UINT64 serial );
-extern void X11DRV_client_surface_backing_finish_deferred_update( HWND hwnd, UINT64 serial );
+struct client_surface_owner_notifications;
+extern struct client_surface_owner_notifications *X11DRV_client_surface_backing_begin_update(
+    HWND hwnd, const struct window_rects *rects, UINT swp_flags, BOOL *deferred );
+extern UINT X11DRV_client_surface_backing_resume_update( HWND hwnd, UINT64 serial,
+                                                         struct client_surface_owner_notifications **notifications );
+extern void X11DRV_client_surface_backing_finish_deferred_update( HWND hwnd, UINT64 serial,
+                                                                  struct client_surface_owner_notifications *notifications );
 #define X11DRV_CLIENT_SURFACE_UPDATE_STATE   1
 #define X11DRV_CLIENT_SURFACE_UPDATE_BACKING 2
 #define X11DRV_CLIENT_SURFACE_UPDATE_PREPARE 4
-extern void X11DRV_client_surface_backing_end_update( struct x11drv_win_data *data );
+extern void X11DRV_client_surface_backing_end_update( struct x11drv_win_data *data,
+                                                       struct client_surface_owner_notifications *notifications );
 extern BOOL X11DRV_client_surface_backing_snapshot( struct x11drv_win_data *data, BOOL invalidate );
 extern BOOL X11DRV_client_surface_backing_publish( struct x11drv_win_data *data );
 extern BOOL X11DRV_client_surface_backing_restore( struct x11drv_win_data *data,

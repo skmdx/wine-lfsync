@@ -3632,7 +3632,8 @@ BOOL X11DRV_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_hint, UIN
     BOOL prepare_client_surface = !!(swp_flags & WINE_SWP_CLIENT_SURFACE_PREPARE);
     BOOL enable_client_surface_backing = !!(swp_flags & WINE_SWP_CLIENT_SURFACE_BACKING_ENABLE);
     BOOL disable_client_surface_backing = !!(swp_flags & WINE_SWP_CLIENT_SURFACE_BACKING_DISABLE);
-    BOOL owner_update, deferred, ret = TRUE;
+    struct client_surface_owner_notifications *owner_update;
+    BOOL deferred, ret = TRUE;
 
     if ((is_managed = is_window_managed( hwnd, swp_flags, fullscreen ))) make_owner_managed( hwnd );
 
@@ -3661,7 +3662,11 @@ BOOL X11DRV_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_hint, UIN
     }
     owner_update = X11DRV_client_surface_backing_begin_update( hwnd, new_rects, swp_flags, &deferred );
     if (deferred) return FALSE;
-    if (!(data = get_win_data( hwnd ))) return TRUE;
+    if (!(data = get_win_data( hwnd )))
+    {
+        if (owner_update) X11DRV_client_surface_backing_end_update( NULL, owner_update );
+        return TRUE;
+    }
     if (is_managed) window_set_managed( data, TRUE );
 
     old_rects = data->rects;
@@ -3712,7 +3717,7 @@ BOOL X11DRV_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_hint, UIN
     {
         if (client_surface_pending || prepare_client_surface || publish_client_surface)
             client_surface_bypass_staging( hwnd );
-        if (owner_update) X11DRV_client_surface_backing_end_update( data );
+        if (owner_update) X11DRV_client_surface_backing_end_update( data, owner_update );
         release_win_data( data );
         return TRUE;
     }
@@ -3824,7 +3829,7 @@ BOOL X11DRV_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_hint, UIN
     /* if window was fullscreen and is being hidden, release cursor clipping */
     was_fullscreen &= data->desired_state.wm_state != NormalState;
 
-    if (owner_update) X11DRV_client_surface_backing_end_update( data );
+    if (owner_update) X11DRV_client_surface_backing_end_update( data, owner_update );
     XFlush( data->display );  /* make sure changes are done before we start painting again */
     release_win_data( data );
 
@@ -3921,17 +3926,19 @@ void X11DRV_SetWindowIcons( HWND hwnd, HICON icon, const ICONINFO *ii, HICON ico
 void X11DRV_SetWindowRgn( HWND hwnd, HRGN hrgn, BOOL redraw )
 {
     struct x11drv_win_data *data;
-    BOOL owner_update = X11DRV_client_surface_backing_begin_update( hwnd, NULL, 0, NULL );
+    struct client_surface_owner_notifications *owner_update =
+        X11DRV_client_surface_backing_begin_update( hwnd, NULL, 0, NULL );
 
     if ((data = get_win_data( hwnd )))
     {
         sync_window_region( data, hrgn );
-        if (owner_update) X11DRV_client_surface_backing_end_update( data );
+        if (owner_update) X11DRV_client_surface_backing_end_update( data, owner_update );
         release_win_data( data );
     }
-    else if (X11DRV_get_whole_window( hwnd ))
+    else
     {
-        send_message( hwnd, WM_X11DRV_SET_WIN_REGION, 0, 0 );
+        if (owner_update) X11DRV_client_surface_backing_end_update( NULL, owner_update );
+        if (X11DRV_get_whole_window( hwnd )) send_message( hwnd, WM_X11DRV_SET_WIN_REGION, 0, 0 );
     }
 }
 
@@ -4038,8 +4045,9 @@ LRESULT X11DRV_WindowMessage( HWND hwnd, UINT msg, WPARAM wp, LPARAM lp )
     {
     case WM_X11DRV_CLIENT_SURFACE_UPDATE:
     {
+        struct client_surface_owner_notifications *notifications;
         UINT64 serial = (UINT64)(UINT)wp | ((UINT64)(UINT)lp << 32);
-        UINT types = X11DRV_client_surface_backing_resume_update( hwnd, serial );
+        UINT types = X11DRV_client_surface_backing_resume_update( hwnd, serial, &notifications );
 
         if (types)
         {
@@ -4048,7 +4056,7 @@ LRESULT X11DRV_WindowMessage( HWND hwnd, UINT msg, WPARAM wp, LPARAM lp )
             if (types & X11DRV_CLIENT_SURFACE_UPDATE_PREPARE)
                 send_message( hwnd, WM_WINE_UPDATEWINDOWSTATE, WINE_PREPARE_CLIENT_SURFACES, 0 );
             send_message( hwnd, WM_WINE_UPDATEWINDOWSTATE, WINE_UPDATE_CLIENT_SURFACE_HANDOFFS, 0 );
-            X11DRV_client_surface_backing_finish_deferred_update( hwnd, serial );
+            X11DRV_client_surface_backing_finish_deferred_update( hwnd, serial, notifications );
         }
         return 0;
     }
