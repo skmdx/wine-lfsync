@@ -3204,14 +3204,13 @@ reserve_completions:
     for (uint32_t i = 0; i < present_info->swapchainCount; ++i)
     {
         struct swapchain *swapchain = present_swapchains[i];
-        struct client_surface_target target;
         unsigned int index;
 
         for (index = 0; index < present_info->swapchainCount; ++index)
             if (swapchain_from_handle( client_swapchains[index] ) == swapchain) break;
         assert( index < present_info->swapchainCount );
-        client_surface_get_target( swapchain->surface->client, &target );
-        if (!reservations[index].required && !target.offscreen) continue;
+        if (!reservations[index].required &&
+            !client_surface_needs_completion_reservation( swapchain->surface->client )) continue;
         /* Reserve every batch member's completion owner before any native
          * acceptance. Admission and allocation cannot fall back to a wait on
          * the submitting thread after its guest semaphore has been consumed. */

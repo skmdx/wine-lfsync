@@ -36,6 +36,7 @@ extern void client_surface_get_target( const struct client_surface *surface,
                                        struct client_surface_target *target );
 extern BOOL get_client_surface_rects( HWND toplevel, HWND hwnd,
                                       struct client_surface_target *target );
+extern BOOL client_surface_needs_completion_reservation( struct client_surface *surface );
 extern BOOL client_surface_get_scene( struct client_surface *surface,
                                       struct client_surface_scene *scene );
 extern BOOL client_surface_scene_current( const struct client_surface_scene *scene );

@@ -1349,23 +1349,33 @@ void client_surface_prepare_recompose_locked( struct client_surface *surface,
     prepare_client_surface_present_locked( surface, present, TRUE, FALSE );
 }
 
+BOOL client_surface_needs_completion_reservation( struct client_surface *surface )
+{
+    struct client_surface_scene scene;
+    struct client_surface_target target;
+
+    client_surface_get_target( surface, &target );
+    if (!target.offscreen) return FALSE;
+    /* Preparation selects and attaches an eligible DIRECT scene. Its old
+     * offscreen target must not require capacity before that selection. If
+     * the owner keeps composition, the prepared frame requests admission. */
+    return !client_surface_get_scene( surface, &scene ) ||
+           !scene.authoritative || !scene.direct_candidate;
+}
+
 BOOL client_surface_prepare_present( struct client_surface *surface,
                                      struct client_surface_frame *present,
                                      BOOL external_completion, BOOL asynchronous )
 {
     struct client_surface_completion_job *job = NULL;
-    struct client_surface_target target;
     unsigned long long start = TRACE_ON(csperf) ? client_surface_perf_time() : 0;
     unsigned long long scene, locked, ready;
     LONG pending_before, pending_after;
 
     client_surface_prepare_scene( surface );
     scene = start ? client_surface_perf_time() : 0;
-    if (asynchronous)
-    {
-        client_surface_get_target( surface, &target );
-        if (target.offscreen && !(job = client_surface_reserve_completion( surface ))) goto failed;
-    }
+    if (asynchronous && client_surface_needs_completion_reservation( surface ) &&
+        !(job = client_surface_reserve_completion( surface ))) goto failed;
 prepare:
     client_surface_lock_present( surface );
     locked = start ? client_surface_perf_time() : 0;
