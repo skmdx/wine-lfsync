@@ -93,8 +93,8 @@ static void release_source_retirement( struct x11drv_client_surface_retirement *
     pthread_mutex_lock( &retirement_lock );
     --retirement_count;
     pthread_mutex_unlock( &retirement_lock );
-    client_surface_release_memory( CLIENT_SURFACE_MEMORY_STAGING, sizeof(*retirement) );
     free( retirement );
+    client_surface_release_memory( CLIENT_SURFACE_MEMORY_STAGING, sizeof(*retirement) );
 }
 
 static void wake_retiring_source_owner( struct x11drv_client_surface_retirement *retirement )

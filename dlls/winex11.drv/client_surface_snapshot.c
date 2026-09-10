@@ -77,8 +77,8 @@ static void free_snapshot_connection( struct x11drv_client_surface_retired_resou
     pthread_mutex_unlock( &snapshot_connections_lock );
     TRACE( "released snapshot connection %p domain %s worker %p\n",
            connection, wine_dbgstr_longlong( connection->domain ), resource->thread );
-    client_surface_release_memory( CLIENT_SURFACE_MEMORY_STAGING, sizeof(*connection) );
     free( connection );
+    client_surface_release_memory( CLIENT_SURFACE_MEMORY_STAGING, sizeof(*connection) );
 }
 
 static void snapshot_retirement_thread( void *context )
@@ -258,11 +258,13 @@ SIZE x11drv_client_snapshot_size( const struct x11drv_client_snapshot *snapshot 
 
 void x11drv_client_snapshot_release_staging( struct x11drv_client_snapshot *snapshot )
 {
+    UINT64 bytes;
+
     if (!snapshot || !snapshot->image) return;
-    client_surface_release_memory( CLIENT_SURFACE_MEMORY_STAGING,
-        (UINT64)snapshot->image->bytes_per_line * snapshot->image->height );
+    bytes = (UINT64)snapshot->image->bytes_per_line * snapshot->image->height;
     XDestroyImage( snapshot->image );
     snapshot->image = NULL;
+    client_surface_release_memory( CLIENT_SURFACE_MEMORY_STAGING, bytes );
 }
 
 static void destroy_snapshot( struct x11drv_client_snapshot *snapshot )
@@ -299,8 +301,8 @@ static void destroy_snapshot( struct x11drv_client_snapshot *snapshot )
                                           snapshot->pixmap, snapshot->bytes );
     client_surface_release_memory( CLIENT_SURFACE_MEMORY_SOURCE, snapshot->bytes );
     snapshot_connection_release( connection );
-    client_surface_release_memory( CLIENT_SURFACE_MEMORY_STAGING, sizeof(*snapshot) );
     free( snapshot );
+    client_surface_release_memory( CLIENT_SURFACE_MEMORY_STAGING, sizeof(*snapshot) );
 }
 
 struct x11drv_client_snapshot *x11drv_client_snapshot_share( struct x11drv_client_snapshot *snapshot )
