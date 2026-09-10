@@ -50,6 +50,7 @@ static unsigned long long client_surface_perf_time(void)
 struct client_surface_compositor_pool
 {
     struct client_surface_compositor_pool *next;
+    struct client_surface_memory_scope memory;
     struct client_surface_handoff_shared *shared;
     UINT64 id;
     SIZE_T size;
@@ -69,6 +70,7 @@ struct client_surface_source_cache
 
 struct client_surface_cached_image
 {
+    struct client_surface_memory_scope memory;
     Pixmap pixmap;
     GC gc;
     UINT64 bytes;
@@ -78,6 +80,7 @@ struct client_surface_cached_image
 struct client_surface_compositor_binding
 {
     struct client_surface_compositor_binding *next;
+    struct client_surface_memory_scope memory;
     struct client_surface_compositor_pool *pool;
     struct client_surface_handoff_channel *channel;
     struct client_surface_source_cache sources[CLIENT_SURFACE_HANDOFF_RING_SIZE];
@@ -146,6 +149,7 @@ struct client_surface_scene_plan
 struct client_surface_output_allocation
 {
     struct client_surface_output_allocation *next;
+    struct client_surface_memory_scope memory;
     Pixmap pixmaps[2];
     UINT64 bytes;
 };
@@ -195,6 +199,7 @@ struct client_surface_compositor_frame
 struct client_surface_compositor_target
 {
     struct client_surface_compositor_target *next;
+    struct client_surface_memory_scope memory;
     HWND toplevel;
     Window window;
     struct client_surface_compositor_frame frames[CLIENT_SURFACE_COMPOSITOR_FRAME_COUNT];
@@ -561,9 +566,37 @@ static BOOL client_surface_copy_on_compositor( Drawable source, Drawable destina
         source, destination, source_x, source_y, destination_x, destination_y, width, height );
 }
 
+/* Only the compositor actor calls this allocator. Its native connection is
+ * independent of producer GL/Vulkan domains. The allocation retains these
+ * accounts after HWND detach and while a release job is still queued. */
+static void *alloc_client_surface_compositor_metadata( HWND toplevel, SIZE_T size,
+                                                        struct client_surface_memory_scope *memory )
+{
+    UINT64 domain;
+    void *data;
+
+    if (!client_surface_get_execution_domain( &domain ) ||
+        !client_surface_memory_scope_init( memory, toplevel, domain )) return NULL;
+    if (!(data = client_surface_alloc_scoped_metadata( memory, 1, size )))
+        client_surface_memory_scope_destroy( memory );
+    return data;
+}
+
+static struct client_surface_compositor_target *alloc_client_surface_compositor_target( HWND toplevel )
+{
+    struct client_surface_memory_scope memory = {0};
+    struct client_surface_compositor_target *target;
+
+    if (!(target = alloc_client_surface_compositor_metadata( toplevel, sizeof(*target), &memory ))) return NULL;
+    target->memory = memory;
+    target->toplevel = toplevel;
+    return target;
+}
+
 static BOOL client_surface_alloc_on_compositor( struct client_surface_compositor_job *job )
 {
     Display *display = client_surface_compositor_display;
+    struct client_surface_memory_scope memory = {0};
     struct client_surface_output_allocation *allocation;
     unsigned int i, copy_width = min( job->u.pool.window_width, job->u.pool.width );
     unsigned int copy_height = min( job->u.pool.window_height, job->u.pool.height );
@@ -571,11 +604,12 @@ static BOOL client_surface_alloc_on_compositor( struct client_surface_compositor
     int error = 0;
 
     assert( job->u.pool.copy_count && job->u.pool.copy_count <= ARRAY_SIZE(job->u.pool.pixmaps) );
-    if (!(allocation = malloc( sizeof(*allocation) ))) return FALSE;
+    if (!(allocation = alloc_client_surface_compositor_metadata( job->toplevel, sizeof(*allocation), &memory ))) return FALSE;
+    allocation->memory = memory;
     allocation->bytes = 2 * client_surface_pixmap_bytes( job->u.pool.width, job->u.pool.height, job->u.pool.depth );
-    if (!client_surface_reserve_memory( CLIENT_SURFACE_MEMORY_OUTPUT, allocation->bytes ))
+    if (!client_surface_reserve_scoped_memory( &allocation->memory, CLIENT_SURFACE_MEMORY_OUTPUT, allocation->bytes ))
     {
-        free( allocation );
+        client_surface_free_owned_metadata( &allocation->memory, allocation, sizeof(*allocation) );
         return FALSE;
     }
     X11DRV_expect_error( display, client_surface_compositor_error, &error );
@@ -631,8 +665,8 @@ static BOOL client_surface_alloc_on_compositor( struct client_surface_compositor
     XSync( display, False );
     X11DRV_check_error();
     job->u.pool.pixmaps[0] = job->u.pool.pixmaps[1] = 0;
-    client_surface_release_memory( CLIENT_SURFACE_MEMORY_OUTPUT, allocation->bytes );
-    free( allocation );
+    client_surface_release_scoped_memory( &allocation->memory, CLIENT_SURFACE_MEMORY_OUTPUT, allocation->bytes );
+    client_surface_free_owned_metadata( &allocation->memory, allocation, sizeof(*allocation) );
     return FALSE;
 }
 
@@ -655,8 +689,8 @@ static BOOL client_surface_free_on_compositor( const Pixmap pixmaps[2] )
         *cursor = allocation->next;
         x11drv_client_surface_trace_image( "free", "output_pair", display, pixmaps[0], allocation->bytes / 2 );
         x11drv_client_surface_trace_image( "free", "output_pair", display, pixmaps[1], allocation->bytes / 2 );
-        client_surface_release_memory( CLIENT_SURFACE_MEMORY_OUTPUT, allocation->bytes );
-        free( allocation );
+        client_surface_release_scoped_memory( &allocation->memory, CLIENT_SURFACE_MEMORY_OUTPUT, allocation->bytes );
+        client_surface_free_owned_metadata( &allocation->memory, allocation, sizeof(*allocation) );
     }
     if (error) WARN( "failed to release client-surface frame pool %#lx/%#lx, error %d\n",
                      pixmaps[0], pixmaps[1], error );
@@ -971,7 +1005,7 @@ static struct client_surface_compositor_frame *alloc_client_surface_compositor_m
      * reuse either existing image without overwriting a completed checkpoint. */
     if (frame->pixmap || !target->frames[0].pixmap || !target->frames[1].pixmap) return NULL;
     bytes = client_surface_pixmap_bytes( target->width, target->height, target->depth );
-    if (!client_surface_reserve_memory( CLIENT_SURFACE_MEMORY_OUTPUT, bytes )) return NULL;
+    if (!client_surface_reserve_scoped_memory( &target->memory, CLIENT_SURFACE_MEMORY_OUTPUT, bytes )) return NULL;
     X11DRV_expect_error( display, client_surface_compositor_error, &error );
     pixmap = XCreatePixmap( display, target->window, target->width, target->height, target->depth );
     XSync( display, False );
@@ -986,7 +1020,7 @@ static struct client_surface_compositor_frame *alloc_client_surface_compositor_m
         XFreePixmap( display, pixmap );
         XSync( display, False );
         X11DRV_check_error();
-        client_surface_release_memory( CLIENT_SURFACE_MEMORY_OUTPUT, bytes );
+        client_surface_release_scoped_memory( &target->memory, CLIENT_SURFACE_MEMORY_OUTPUT, bytes );
         return NULL;
     }
     frame->pixmap = pixmap;
@@ -994,6 +1028,26 @@ static struct client_surface_compositor_frame *alloc_client_surface_compositor_m
     target->next_frame = 0;
     x11drv_client_surface_trace_image( "acquire", "output_mailbox", display, pixmap, bytes );
     return frame;
+}
+
+static void free_client_surface_compositor_mailbox( struct client_surface_compositor_target *target )
+{
+    Display *display = client_surface_compositor_display;
+    struct client_surface_compositor_frame *frame = &target->frames[2];
+    int error = 0;
+
+    if (!frame->pixmap) return;
+    assert( !frame->serial && !frame->copy_binding );
+    x11drv_client_surface_trace_image( "retire", "output_mailbox", display, frame->pixmap, target->mailbox_bytes );
+    X11DRV_expect_error( display, client_surface_compositor_error, &error );
+    XFreePixmap( display, frame->pixmap );
+    XSync( display, False );
+    X11DRV_check_error();
+    x11drv_client_surface_trace_image( "free", "output_mailbox", display, frame->pixmap, target->mailbox_bytes );
+    client_surface_release_scoped_memory( &target->memory, CLIENT_SURFACE_MEMORY_OUTPUT, target->mailbox_bytes );
+    if (error) WARN( "failed to release client-surface mailbox %#lx, error %d\n", frame->pixmap, error );
+    frame->pixmap = 0;
+    target->mailbox_bytes = 0;
 }
 
 static struct client_surface_compositor_frame *get_client_surface_compositor_frame(
@@ -1188,7 +1242,7 @@ static void release_client_surface_compositor_pool( struct client_surface_compos
         *cursor = pool->next;
         NtUnmapViewOfSection( NtCurrentProcess(), pool->shared );
         close( pool->ready_fd );
-        free( pool );
+        client_surface_free_owned_metadata( &pool->memory, pool, sizeof(*pool) );
         return;
     }
     assert( 0 );
@@ -1215,7 +1269,8 @@ static void free_client_surface_cached_image( struct client_surface_cached_image
     if (acquired)
         x11drv_client_surface_trace_image( "free", "owner_cache", client_surface_compositor_display,
                                           image->pixmap, image->bytes );
-    client_surface_release_memory( CLIENT_SURFACE_MEMORY_SOURCE, image->bytes );
+    client_surface_release_scoped_memory( &image->memory, CLIENT_SURFACE_MEMORY_SOURCE, image->bytes );
+    client_surface_memory_scope_destroy( &image->memory );
     memset( image, 0, sizeof(*image) );
 }
 
@@ -1242,7 +1297,7 @@ static void remove_client_surface_compositor_binding(
     release_client_surface_compositor_pool( binding->pool );
     free_client_surface_cached_image( &binding->latest_image, TRUE );
     free_client_surface_cached_image( &binding->spare_image, TRUE );
-    free( binding );
+    client_surface_free_owned_metadata( &binding->memory, binding, sizeof(*binding) );
 }
 
 static struct client_surface_compositor_pool *acquire_client_surface_compositor_pool(
@@ -1250,6 +1305,7 @@ static struct client_surface_compositor_pool *acquire_client_surface_compositor_
 {
     struct client_surface_handoff_shared *shared;
     struct client_surface_compositor_pool *pool;
+    struct client_surface_memory_scope memory = {0};
     SIZE_T size = job->u.registration.view_size;
     void *view = NULL;
 
@@ -1279,7 +1335,9 @@ static struct client_surface_compositor_pool *acquire_client_surface_compositor_
         ++pool->refs;
         return pool;
     }
-    if (!(pool = calloc( 1, sizeof(*pool) ))) goto failed;
+    /* A shared mapping can serve several owners on this connection. */
+    if (!(pool = alloc_client_surface_compositor_metadata( NULL, sizeof(*pool), &memory ))) goto failed;
+    pool->memory = memory;
     pool->next = client_surface_compositor_pools;
     pool->shared = shared;
     pool->id = job->u.registration.mapping_id;
@@ -1306,6 +1364,7 @@ static BOOL register_client_surface_compositor_handoff(
     struct client_surface_compositor_job *job )
 {
     struct client_surface_compositor_binding **cursor, *binding;
+    struct client_surface_memory_scope memory = {0};
     struct client_surface_compositor_pool *pool;
     struct client_surface_handoff_channel *channel;
     BOOL ret = FALSE;
@@ -1338,7 +1397,8 @@ static BOOL register_client_surface_compositor_handoff(
         break;
     }
 
-    if (!(binding = calloc( 1, sizeof(*binding) ))) goto done;
+    if (!(binding = alloc_client_surface_compositor_metadata( job->toplevel, sizeof(*binding), &memory ))) goto done;
+    binding->memory = memory;
     binding->next = client_surface_compositor_bindings;
     binding->pool = pool;
     binding->channel = channel;
@@ -1672,8 +1732,7 @@ static BOOL update_client_surface_compositor_target( struct client_surface_compo
 
     if (!(target = find_client_surface_compositor_target( job->toplevel )))
     {
-        if (!(target = calloc( 1, sizeof(*target) ))) return FALSE;
-        target->toplevel = job->toplevel;
+        if (!(target = alloc_client_surface_compositor_target( job->toplevel ))) return FALSE;
         created = TRUE;
     }
     same_pool = target->frames[0].pixmap && target->frames[1].pixmap &&
@@ -1723,15 +1782,7 @@ static BOOL update_client_surface_compositor_target( struct client_surface_compo
     {
         unsigned int i;
 
-        if (target->frames[2].pixmap)
-        {
-            x11drv_client_surface_trace_image( "retire", "output_mailbox", client_surface_compositor_display,
-                                              target->frames[2].pixmap, target->mailbox_bytes );
-            XFreePixmap( client_surface_compositor_display, target->frames[2].pixmap );
-            x11drv_client_surface_trace_image( "free", "output_mailbox", client_surface_compositor_display,
-                                              target->frames[2].pixmap, target->mailbox_bytes );
-            client_surface_release_memory( CLIENT_SURFACE_MEMORY_OUTPUT, target->mailbox_bytes );
-        }
+        free_client_surface_compositor_mailbox( target );
         for (i = 0; i < ARRAY_SIZE(target->frames); ++i)
         {
             client_surface_xcb_free_gc( client_surface_compositor_display, &target->frames[i].xcb_gc );
@@ -1782,7 +1833,7 @@ static BOOL update_client_surface_compositor_target( struct client_surface_compo
     return TRUE;
 
 failed:
-    if (created) free( target );
+    if (created) client_surface_free_owned_metadata( &target->memory, target, sizeof(*target) );
     else target->quiescing = target->native_updates || target->deferred_update;
     return FALSE;
 }
@@ -1822,21 +1873,12 @@ static BOOL remove_client_surface_compositor_target( HWND toplevel )
             client_surface_xcb_free_gc( client_surface_compositor_display, &target->frames[i].xcb_gc );
             if (target->frames[i].gc) XFreeGC( client_surface_compositor_display, target->frames[i].gc );
         }
-        if (target->frames[2].pixmap)
-        {
-            x11drv_client_surface_trace_image( "retire", "output_mailbox", client_surface_compositor_display,
-                                              target->frames[2].pixmap, target->mailbox_bytes );
-            XFreePixmap( client_surface_compositor_display, target->frames[2].pixmap );
-            XSync( client_surface_compositor_display, False );
-            x11drv_client_surface_trace_image( "free", "output_mailbox", client_surface_compositor_display,
-                                              target->frames[2].pixmap, target->mailbox_bytes );
-            client_surface_release_memory( CLIENT_SURFACE_MEMORY_OUTPUT, target->mailbox_bytes );
-        }
+        free_client_surface_compositor_mailbox( target );
         *cursor = target->next;
         free( target->scene.members );
         free_client_surface_scene_layouts( target->scene.layouts, target->scene.count );
         free( target->receipts );
-        free( target );
+        client_surface_free_owned_metadata( &target->memory, target, sizeof(*target) );
         return TRUE;
     }
     return TRUE;
@@ -1865,16 +1907,7 @@ static BOOL retire_client_surface_compositor_pool( HWND toplevel )
         client_surface_xcb_free_gc( client_surface_compositor_display, &target->frames[i].xcb_gc );
         if (target->frames[i].gc) XFreeGC( client_surface_compositor_display, target->frames[i].gc );
     }
-    if (target->frames[2].pixmap)
-    {
-        x11drv_client_surface_trace_image( "retire", "output_mailbox", client_surface_compositor_display,
-                                          target->frames[2].pixmap, target->mailbox_bytes );
-        XFreePixmap( client_surface_compositor_display, target->frames[2].pixmap );
-        XSync( client_surface_compositor_display, False );
-        x11drv_client_surface_trace_image( "free", "output_mailbox", client_surface_compositor_display,
-                                          target->frames[2].pixmap, target->mailbox_bytes );
-        client_surface_release_memory( CLIENT_SURFACE_MEMORY_OUTPUT, target->mailbox_bytes );
-    }
+    free_client_surface_compositor_mailbox( target );
     memset( target->frames, 0, sizeof(target->frames) );
     target->mailbox_bytes = 0;
     target->backing = target->latest = target->published = None;
@@ -1955,8 +1988,7 @@ static BOOL install_client_surface_direct_plan( const struct client_surface_comp
     }
     if (!target)
     {
-        if (!(target = calloc( 1, sizeof(*target) ))) goto done;
-        target->toplevel = job->toplevel;
+        if (!(target = alloc_client_surface_compositor_target( job->toplevel ))) goto done;
         target->window = job->u.direct_plan.destination;
         allocated = TRUE;
     }
@@ -1994,7 +2026,7 @@ static BOOL install_client_surface_direct_plan( const struct client_surface_comp
     TRACE( "owner DIRECT_ATTACH hwnd %p scene %s identity %s drawable %#lx\n",
            target->toplevel, wine_dbgstr_longlong( scene_id ), wine_dbgstr_longlong( job->u.direct_plan.identity ), job->u.direct_plan.source );
 done:
-    if (allocated && !accepted) free( target );
+    if (allocated && !accepted) client_surface_free_owned_metadata( &target->memory, target, sizeof(*target) );
     return accepted;
 }
 
@@ -2261,7 +2293,12 @@ static BOOL cache_client_surface_handoff( struct client_surface_compositor_bindi
         UINT64 bytes = client_surface_pixmap_bytes( frame.width, frame.height, depth );
 
         free_client_surface_cached_image( image, TRUE );
-        if (!client_surface_reserve_memory( CLIENT_SURFACE_MEMORY_SOURCE, bytes )) goto done;
+        client_surface_memory_scope_copy( &image->memory, &binding->memory, TRUE );
+        if (!client_surface_reserve_scoped_memory( &image->memory, CLIENT_SURFACE_MEMORY_SOURCE, bytes ))
+        {
+            client_surface_memory_scope_destroy( &image->memory );
+            goto done;
+        }
         image->bytes = bytes;
         image->width = frame.width;
         image->height = frame.height;
@@ -2379,7 +2416,8 @@ static unsigned long convert_client_surface_component( unsigned long pixel,
     return ((value * destination_max + source_max / 2) / source_max) << destination_shift;
 }
 
-static BOOL copy_client_surface_image( Display *display, Pixmap source, Pixmap destination,
+static BOOL copy_client_surface_image( Display *display, struct client_surface_memory_scope *memory,
+                                       Pixmap source, Pixmap destination,
                                        GC gc, VisualID source_id, VisualID destination_id,
                                        unsigned int source_width, unsigned int source_height,
                                        const RECT *rect )
@@ -2419,7 +2457,7 @@ static BOOL copy_client_surface_image( Display *display, Pixmap source, Pixmap d
     input_bytes *= source_height;
     output_bytes = (UINT64)output->bytes_per_line * height;
     if (input_bytes > ~(UINT64)0 - output_bytes ||
-        !client_surface_reserve_memory( CLIENT_SURFACE_MEMORY_STAGING, input_bytes + output_bytes ))
+        !client_surface_reserve_scoped_memory( memory, CLIENT_SURFACE_MEMORY_STAGING, input_bytes + output_bytes ))
         goto done;
     reserved = input_bytes + output_bytes;
     if (!(input = XGetImage( display, source, 0, 0, source_width, source_height,
@@ -2453,7 +2491,7 @@ static BOOL copy_client_surface_image( Display *display, Pixmap source, Pixmap d
 done:
     if (output) XDestroyImage( output );
     if (input) XDestroyImage( input );
-    client_surface_release_memory( CLIENT_SURFACE_MEMORY_STAGING, reserved );
+    client_surface_release_scoped_memory( memory, CLIENT_SURFACE_MEMORY_STAGING, reserved );
     if (destination_visual) XFree( destination_visual );
     if (source_visual) XFree( source_visual );
     return ret;
@@ -2592,7 +2630,7 @@ static BOOL copy_client_surface_handoff_to_frame(
                     clipped ? clips : NULL, clipped ? clip_count : 0, 0, 0 );
                 if (!overlay_copied)
                     overlay_copied = copy_client_surface_image(
-                        display, source, frame->pixmap, gc, slot->source_visual, target->visual,
+                        display, &target->memory, source, frame->pixmap, gc, slot->source_visual, target->visual,
                         slot->width, slot->height, &plan->destination );
             }
         }
