@@ -280,6 +280,8 @@ extern DWORD get_pixmap_image( Pixmap pixmap, int width, int height, const XVisu
                                BITMAPINFO *info, struct gdi_image_bits *bits );
 
 extern RGNDATA *X11DRV_GetRegionData( HRGN hrgn, HDC hdc_lptodp );
+extern DWORD X11DRV_GetRegionDataSize( HRGN hrgn );
+extern BOOL X11DRV_FillRegionData( HRGN hrgn, HDC hdc_lptodp, RGNDATA *data, DWORD size );
 extern BOOL add_extra_clipping_region( X11DRV_PDEVICE *dev, HRGN rgn );
 extern void restore_clipping_region( X11DRV_PDEVICE *dev );
 extern void add_device_bounds( X11DRV_PDEVICE *dev, const RECT *rect );

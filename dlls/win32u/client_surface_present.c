@@ -146,6 +146,7 @@ static void release_client_surface_clip_snapshot( struct client_surface_clip_sna
 
 static BOOL get_client_surface_region( const RECT *monitor_rect,
                                        const struct client_surface_clip_snapshot *snapshot,
+                                       const struct client_surface_memory_scope *memory,
                                        HRGN *region )
 {
     RGNDATA *data;
@@ -156,7 +157,7 @@ static BOOL get_client_surface_region( const RECT *monitor_rect,
     if (!snapshot->count) return TRUE;
     if (snapshot->count > (MAXDWORD - FIELD_OFFSET( RGNDATA, Buffer )) / sizeof(RECT)) return FALSE;
     size = FIELD_OFFSET( RGNDATA, Buffer ) + snapshot->count * sizeof(RECT);
-    if (!(data = malloc( size ))) return FALSE;
+    if (!(data = memory ? client_surface_alloc_owned_array( memory, size, 1 ) : malloc( size ))) return FALSE;
 
     data->rdh.dwSize = sizeof(data->rdh);
     data->rdh.iType = RDH_RECTANGLES;
@@ -167,7 +168,8 @@ static BOOL get_client_surface_region( const RECT *monitor_rect,
         ((RECT *)data->Buffer)[i] = wine_server_get_rect( snapshot->windows[i].rect );
 
     clips = NtGdiExtCreateRegion( NULL, size, data );
-    free( data );
+    if (memory) client_surface_free_owned_array( data );
+    else free( data );
     if (!clips) return FALSE;
     if (!(*region = NtGdiCreateRectRgn( monitor_rect->left, monitor_rect->top,
                                        monitor_rect->right, monitor_rect->bottom )) ||
@@ -186,7 +188,8 @@ static BOOL get_client_surface_region( const RECT *monitor_rect,
 }
 
 static HRGN create_client_surface_visible_region( const RECT *rects, UINT count,
-                                                  struct ratio from, struct ratio to )
+                                                  struct ratio from, struct ratio to,
+                                                  const struct client_surface_memory_scope *memory )
 {
     RGNDATA *data;
     HRGN region, mapped;
@@ -194,7 +197,7 @@ static HRGN create_client_surface_visible_region( const RECT *rects, UINT count,
 
     if (count > (MAXDWORD - FIELD_OFFSET( RGNDATA, Buffer )) / sizeof(*rects)) return 0;
     size = FIELD_OFFSET( RGNDATA, Buffer ) + (SIZE_T)count * sizeof(*rects);
-    if (!(data = malloc( size ))) return 0;
+    if (!(data = client_surface_alloc_owned_array( memory, size, 1 ))) return 0;
     memset( &data->rdh, 0, sizeof(data->rdh) );
     data->rdh.dwSize = sizeof(data->rdh);
     data->rdh.iType = RDH_RECTANGLES;
@@ -202,7 +205,7 @@ static HRGN create_client_surface_visible_region( const RECT *rects, UINT count,
     data->rdh.nRgnSize = count * sizeof(*rects);
     if (count) memcpy( data->Buffer, rects, count * sizeof(*rects) );
     region = NtGdiExtCreateRegion( NULL, size, data );
-    free( data );
+    client_surface_free_owned_array( data );
     if (!region) return 0;
     mapped = map_dpi_region( region, from, to );
     NtGdiDeleteObjectApp( region );
@@ -215,10 +218,11 @@ void client_surface_free_scene_snapshot( UINT count, struct client_surface_scene
 
     for (i = 0; i < count; ++i)
         if (members[i].region) NtGdiDeleteObjectApp( members[i].region );
-    free( members );
+    client_surface_free_owned_array( members );
 }
 
-BOOL client_surface_get_scene_snapshot( HWND toplevel, UINT64 *scene_id, UINT *count,
+BOOL client_surface_get_scene_snapshot( HWND toplevel, const struct client_surface_memory_scope *memory,
+                                        UINT64 *scene_id, UINT *count,
                                         struct client_surface_scene_member **members )
 {
     struct client_surface_scene_member *result = NULL;
@@ -240,7 +244,8 @@ BOOL client_surface_get_scene_snapshot( HWND toplevel, UINT64 *scene_id, UINT *c
         UINT required;
         UINT64 current;
 
-        if (!(next = realloc( data, size ))) goto done;
+        if (!(next = client_surface_alloc_owned_array( memory, size, 1 ))) goto done;
+        client_surface_free_owned_array( data );
         data = next;
         SERVER_START_REQ( get_client_surface_scene_snapshot )
         {
@@ -266,10 +271,10 @@ BOOL client_surface_get_scene_snapshot( HWND toplevel, UINT64 *scene_id, UINT *c
         id = current;
         break;
     }
-    if (total && (!(result = calloc( total, sizeof(*result) )) ||
-                  !(layers = calloc( total, sizeof(*layers) )) ||
-                  !(monitor_rects = calloc( total, sizeof(*monitor_rects) )) ||
-                  !(dpis = calloc( total, sizeof(*dpis) )))) goto done;
+    if (total && (!(result = client_surface_alloc_owned_array( memory, total, sizeof(*result) )) ||
+                  !(layers = client_surface_alloc_owned_array( memory, total, sizeof(*layers) )) ||
+                  !(monitor_rects = client_surface_alloc_owned_array( memory, total, sizeof(*monitor_rects) )) ||
+                  !(dpis = client_surface_alloc_owned_array( memory, total, sizeof(*dpis) )))) goto done;
     cursor = data;
     remaining = reply_size;
     for (i = 0; i < total; ++i)
@@ -334,14 +339,14 @@ BOOL client_surface_get_scene_snapshot( HWND toplevel, UINT64 *scene_id, UINT *c
         snapshot.count = layer->clip_count;
         cursor += layer->clip_count * sizeof(*snapshot.windows);
         if (!result[i].visible) continue;
-        if (!get_client_surface_region( &target->monitor_rect, &snapshot, &result[i].region )) goto done;
+        if (!get_client_surface_region( &target->monitor_rect, &snapshot, memory, &result[i].region )) goto done;
         if (!result[i].region && !(result[i].region = NtGdiCreateRectRgn( 0, 0,
             target->monitor_rect.right - target->monitor_rect.left,
             target->monitor_rect.bottom - target->monitor_rect.top ))) goto done;
         if (!(layer->flags & CLIENT_SURFACE_SCENE_PRESENT_RECT))
         {
             visible = create_client_surface_visible_region( visible_rects, layer->visible_count,
-                                                             layer->window_dpi, layer->raw_dpi );
+                                                             layer->window_dpi, layer->raw_dpi, memory );
             if (!visible) goto done;
             combined = NtGdiCombineRgn( result[i].region, result[i].region, visible, RGN_AND ) != ERROR;
             NtGdiDeleteObjectApp( visible );
@@ -354,10 +359,10 @@ BOOL client_surface_get_scene_snapshot( HWND toplevel, UINT64 *scene_id, UINT *c
     ret = TRUE;
 done:
     if (!ret && result) client_surface_free_scene_snapshot( total, result );
-    free( monitor_rects );
-    free( dpis );
-    free( layers );
-    free( data );
+    client_surface_free_owned_array( monitor_rects );
+    client_surface_free_owned_array( dpis );
+    client_surface_free_owned_array( layers );
+    client_surface_free_owned_array( data );
     return ret;
 }
 
@@ -385,7 +390,7 @@ static BOOL get_cached_client_surface_region( struct client_surface *surface, HW
     }
 
     valid = get_client_surface_clip_snapshot( hwnd, &raw_dpi, monitor_rect, present, &snapshot );
-    if (valid) valid = get_client_surface_region( monitor_rect, &snapshot, &new_region );
+    if (valid) valid = get_client_surface_region( monitor_rect, &snapshot, NULL, &new_region );
     release_client_surface_clip_snapshot( &snapshot );
     if (!valid)
     {

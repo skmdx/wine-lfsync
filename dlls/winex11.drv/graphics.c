@@ -146,34 +146,30 @@ static void add_pen_device_bounds( X11DRV_PDEVICE *dev, const POINT *points, int
     add_device_bounds( dev, &bounds );
 }
 
-/***********************************************************************
- *           X11DRV_GetRegionData
- *
- * Calls GetRegionData on the given region and converts the rectangle
- * array to XRectangle format. The returned buffer must be freed by caller.
- * If hdc_lptodp is not 0, the rectangles are converted through LPtoDP.
- */
-RGNDATA *X11DRV_GetRegionData( HRGN hrgn, HDC hdc_lptodp )
+/* Include space for the native rectangle array before allocating storage. */
+DWORD X11DRV_GetRegionDataSize( HRGN hrgn )
 {
-    RGNDATA *data;
     DWORD size;
-    unsigned int i;
-    RECT *rect, tmp;
-    XRectangle *xrect;
 
-    if (!(size = NtGdiGetRegionData( hrgn, 0, NULL ))) return NULL;
+    if (!(size = NtGdiGetRegionData( hrgn, 0, NULL ))) return 0;
     if (sizeof(XRectangle) > sizeof(RECT))
     {
         /* add extra size for XRectangle array */
         int count = (size - sizeof(RGNDATAHEADER)) / sizeof(RECT);
         size += count * (sizeof(XRectangle) - sizeof(RECT));
     }
-    if (!(data = malloc( size ))) return NULL;
-    if (!NtGdiGetRegionData( hrgn, size, data ))
-    {
-        free( data );
-        return NULL;
-    }
+    return size;
+}
+
+/* Fill caller-owned storage, preserving its original allocation size when
+ * conversion below compacts or filters the native rectangle list. */
+BOOL X11DRV_FillRegionData( HRGN hrgn, HDC hdc_lptodp, RGNDATA *data, DWORD size )
+{
+    unsigned int i;
+    RECT *rect, tmp;
+    XRectangle *xrect;
+
+    if (!NtGdiGetRegionData( hrgn, size, data )) return FALSE;
 
     rect = (RECT *)data->Buffer;
     xrect = (XRectangle *)data->Buffer;
@@ -238,7 +234,25 @@ RGNDATA *X11DRV_GetRegionData( HRGN hrgn, HDC hdc_lptodp )
         }
         data->rdh.nCount = xrect - (XRectangle *)data->Buffer;
     }
-    return data;
+    return TRUE;
+}
+
+/***********************************************************************
+ *           X11DRV_GetRegionData
+ *
+ * Calls GetRegionData on the given region and converts the rectangle
+ * array to XRectangle format. The returned buffer must be freed by caller.
+ * If hdc_lptodp is not 0, the rectangles are converted through LPtoDP.
+ */
+RGNDATA *X11DRV_GetRegionData( HRGN hrgn, HDC hdc_lptodp )
+{
+    RGNDATA *data;
+    DWORD size;
+
+    if (!(size = X11DRV_GetRegionDataSize( hrgn )) || !(data = malloc( size ))) return NULL;
+    if (X11DRV_FillRegionData( hrgn, hdc_lptodp, data, size )) return data;
+    free( data );
+    return NULL;
 }
 
 

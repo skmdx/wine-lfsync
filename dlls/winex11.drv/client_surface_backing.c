@@ -1817,7 +1817,7 @@ static BOOL reuse_client_surface_compositor_handoffs( const struct client_surfac
     for (binding = client_surface_compositor_bindings; binding; binding = binding->next)
         if (binding->toplevel == job->toplevel) ++count;
     if (!count) return TRUE;
-    if (!(members = calloc( count, sizeof(*members) ))) return FALSE;
+    if (!(members = client_surface_alloc_owned_array( &job->queue->memory, count, sizeof(*members) ))) return FALSE;
     i = 0;
     for (binding = client_surface_compositor_bindings; binding; binding = binding->next)
         if (binding->toplevel == job->toplevel) members[i++] = binding;
@@ -1848,7 +1848,7 @@ static BOOL reuse_client_surface_compositor_handoffs( const struct client_surfac
             break;
         }
     }
-    free( members );
+    client_surface_free_owned_array( members );
     return TRUE;
 }
 
@@ -1857,8 +1857,20 @@ static void free_client_surface_scene_layouts( struct client_surface_scene_layou
 {
     unsigned int i;
 
-    for (i = 0; i < count; ++i) free( layouts[i].clip );
-    free( layouts );
+    for (i = 0; i < count; ++i) client_surface_free_owned_array( layouts[i].clip );
+    client_surface_free_owned_array( layouts );
+}
+
+static void free_client_surface_scene_plan( struct client_surface_compositor_target *target )
+{
+    client_surface_free_owned_array( target->receipts );
+    client_surface_free_owned_array( target->scene.members );
+    free_client_surface_scene_layouts( target->scene.layouts, target->scene.count );
+    target->receipts = NULL;
+    target->scene.members = NULL;
+    target->scene.layouts = NULL;
+    target->scene.count = 0;
+    target->scene.valid = FALSE;
 }
 
 static BOOL check_client_surface_compositor_scene( const struct client_surface_compositor_job *job )
@@ -1918,10 +1930,10 @@ static BOOL install_client_surface_scene_plan( struct client_surface_compositor_
     if (count > available) return FALSE;
     if (count)
     {
-        if (!(members = malloc( available * sizeof(*members) ))) return FALSE;
-        if (!(receipts = calloc( count, sizeof(*receipts) )))
+        if (!(members = client_surface_alloc_owned_array( &target->memory, available, sizeof(*members) ))) return FALSE;
+        if (!(receipts = client_surface_alloc_owned_array( &target->memory, count, sizeof(*receipts) )))
         {
-            free( members );
+            client_surface_free_owned_array( members );
             return FALSE;
         }
         for (binding = client_surface_compositor_bindings; binding; binding = binding->next)
@@ -1939,8 +1951,8 @@ static BOOL install_client_surface_scene_plan( struct client_surface_compositor_
                 members[next]->process != job->u.scene_install.layouts[i].process ||
                 members[next]->identity != job->u.scene_install.layouts[i].identity)
             {
-                free( members );
-                free( receipts );
+                client_surface_free_owned_array( members );
+                client_surface_free_owned_array( receipts );
                 return FALSE;
             }
             members[i] = members[next++];
@@ -1949,15 +1961,13 @@ static BOOL install_client_surface_scene_plan( struct client_surface_compositor_
     if (target->scene.valid && target->scene.epoch == job->u.scene_install.epoch && target->scene.count == count &&
         (!count || !memcmp( members, target->scene.members, count * sizeof(*members) )))
     {
-        free( receipts );
-        free( members );
+        client_surface_free_owned_array( receipts );
+        client_surface_free_owned_array( members );
         return TRUE;
     }
     finish_client_surface_compositor_assembly( target, TRUE );
     update_client_surface_compositor_scene( target, job->u.scene_install.epoch );
-    free( target->receipts );
-    free( target->scene.members );
-    free_client_surface_scene_layouts( target->scene.layouts, target->scene.count );
+    free_client_surface_scene_plan( target );
     target->scene.members = members;
     target->scene.strategy = OWNER_COMPOSITE;
     target->scene.direct_identity = 0;
@@ -2205,9 +2215,7 @@ static BOOL remove_client_surface_compositor_target( HWND toplevel )
         }
         free_client_surface_compositor_mailbox( target );
         *cursor = target->next;
-        free( target->scene.members );
-        free_client_surface_scene_layouts( target->scene.layouts, target->scene.count );
-        free( target->receipts );
+        free_client_surface_scene_plan( target );
         free_client_surface_compositor_target( target );
         return TRUE;
     }
@@ -2344,10 +2352,7 @@ static BOOL install_client_surface_direct_plan( const struct client_surface_comp
     quiesce_client_surface_compositor_target( target );
     sweep_client_surface_compositor_handoffs( target->toplevel, 0, NULL );
     update_client_surface_compositor_scene( target, scene_id );
-    free( target->scene.members );
-    free_client_surface_scene_layouts( target->scene.layouts, target->scene.count );
-    free( target->receipts );
-    target->receipts = NULL;
+    free_client_surface_scene_plan( target );
     target->scene = (struct client_surface_scene_plan){
         .strategy = DIRECT_ATTACH, .direct_identity = job->u.direct_plan.identity,
         .direct_drawable = job->u.direct_plan.source, .epoch = scene_id, .valid = TRUE,
@@ -3310,7 +3315,7 @@ static BOOL repair_client_surface_compositor_owner( HWND toplevel, BOOL resolve 
         return TRUE;
     if (!target || !target->scene.valid || !target->scene.count ||
         !client_surface_scene_snapshot_current( toplevel, target->scene.epoch )) return FALSE;
-    if (!(receipts = calloc( target->scene.count, sizeof(*receipts) ))) return FALSE;
+    if (!(receipts = client_surface_alloc_owned_array( &target->memory, target->scene.count, sizeof(*receipts) ))) return FALSE;
     for (i = 0; i < target->scene.count; ++i)
     {
         struct client_surface_compositor_binding *binding = target->scene.members[i];
@@ -3361,7 +3366,7 @@ static BOOL repair_client_surface_compositor_owner( HWND toplevel, BOOL resolve 
         for (i = 0; i < target->scene.count; ++i) target->scene.members[i]->replay_epoch = 0;
     }
 done:
-    free( receipts );
+    client_surface_free_owned_array( receipts );
     return accepted;
 }
 
@@ -5064,7 +5069,8 @@ release:
     return FALSE;
 }
 
-static BOOL bind_client_surface_handoffs( HWND toplevel, struct client_surface_handoff_desc *descs,
+static BOOL bind_client_surface_handoffs( HWND toplevel, const struct client_surface_memory_scope *memory,
+                                          struct client_surface_handoff_desc *descs,
                                           UINT count, UINT64 mark )
 {
     struct client_surface_compositor_job job =
@@ -5082,7 +5088,7 @@ static BOOL bind_client_surface_handoffs( HWND toplevel, struct client_surface_h
     UINT i;
 
     if (!count) return TRUE;
-    if (!(reused = calloc( count, sizeof(*reused) ))) return FALSE;
+    if (!(reused = client_surface_alloc_owned_array( memory, count, sizeof(*reused) ))) return FALSE;
     job.u.reuse.reused = reused;
     if (!submit_client_surface_compositor_job( &job )) goto done;
     for (i = 0; i < count; ++i)
@@ -5093,12 +5099,13 @@ static BOOL bind_client_surface_handoffs( HWND toplevel, struct client_surface_h
             !register_client_surface_handoff( toplevel, &descs[i], mark )) goto done;
     ret = TRUE;
 done:
-    free( reused );
+    client_surface_free_owned_array( reused );
     return ret;
 }
 
 BOOL X11DRV_client_surface_bind_producers( HWND toplevel )
 {
+    struct client_surface_compositor_queue *queue;
     struct client_surface_scene_member *members = NULL;
     struct client_surface_handoff_desc *descs = NULL;
     UINT count = 0, live = 0, i;
@@ -5106,8 +5113,9 @@ BOOL X11DRV_client_surface_bind_producers( HWND toplevel )
     BOOL ret = FALSE;
 
     if (!mark) mark = InterlockedIncrement64( (LONG64 *)&client_surface_compositor_mark );
-    if (!client_surface_get_scene_snapshot( toplevel, &scene, &count, &members )) goto done;
-    if (count && !(descs = calloc( count, sizeof(*descs) ))) goto done;
+    if (!(queue = get_client_surface_compositor_queue( toplevel ))) return FALSE;
+    if (!client_surface_get_scene_snapshot( toplevel, &queue->memory, &scene, &count, &members )) goto done;
+    if (count && !(descs = client_surface_alloc_owned_array( &queue->memory, count, sizeof(*descs) ))) goto done;
     for (i = 0; i < count; ++i)
     {
         if (!members[i].producer_mapped) continue;
@@ -5126,15 +5134,17 @@ BOOL X11DRV_client_surface_bind_producers( HWND toplevel )
      * authenticates the current selected producer and channel lifetime; the
      * actor scans READY even without a visible layout or backing target. */
     if (live) qsort( descs, live, sizeof(*descs), compare_client_surface_handoff_descs );
-    ret = bind_client_surface_handoffs( toplevel, descs, live, mark );
+    ret = bind_client_surface_handoffs( toplevel, &queue->memory, descs, live, mark );
 done:
-    free( descs );
+    client_surface_free_owned_array( descs );
     client_surface_free_scene_snapshot( count, members );
+    release_client_surface_compositor_queue( queue );
     return ret;
 }
 
 static BOOL refresh_client_surface_handoffs( HWND toplevel )
 {
+    struct client_surface_compositor_queue *queue;
     struct client_surface_handoff_desc *descs = NULL;
     struct client_surface_scene_member *members = NULL;
     struct client_surface_scene_layout *layouts = NULL;
@@ -5154,7 +5164,8 @@ static BOOL refresh_client_surface_handoffs( HWND toplevel )
 
     mark = InterlockedIncrement64( (LONG64 *)&client_surface_compositor_mark );
     if (!mark) mark = InterlockedIncrement64( (LONG64 *)&client_surface_compositor_mark );
-    if (!client_surface_get_scene_snapshot( toplevel, &scene_generation, &count, &members )) goto failed;
+    if (!(queue = get_client_surface_compositor_queue( toplevel ))) return FALSE;
+    if (!client_surface_get_scene_snapshot( toplevel, &queue->memory, &scene_generation, &count, &members )) goto failed;
     if (count == 1 && members[0].direct_candidate &&
         client_surface_get_toplevel_scene( toplevel, &scene ) &&
         scene.epoch == scene_generation && scene.mode == CLIENT_SURFACE_PRESENTATION_DIRECT)
@@ -5163,9 +5174,10 @@ static BOOL refresh_client_surface_handoffs( HWND toplevel )
          * A candidate still needs channels and an owner plan if the native
          * producer presents before preparation or admission can finish. */
         client_surface_free_scene_snapshot( count, members );
+        release_client_surface_compositor_queue( queue );
         return client_surface_scene_snapshot_current( toplevel, scene_generation );
     }
-    if (count && !(descs = calloc( count, sizeof(*descs) ))) goto failed;
+    if (count && !(descs = client_surface_alloc_owned_array( &queue->memory, count, sizeof(*descs) ))) goto failed;
     for (i = 0; i < count; ++i)
     {
         descs[i].handle = wine_server_user_handle( members[i].hwnd );
@@ -5196,13 +5208,14 @@ static BOOL refresh_client_surface_handoffs( HWND toplevel )
         if (submit_client_surface_compositor_job( &job ))
         {
             if (!client_surface_scene_snapshot_current( toplevel, scene_generation )) goto failed;
-            free( descs );
+            client_surface_free_owned_array( descs );
             client_surface_free_scene_snapshot( count, members );
+            release_client_surface_compositor_queue( queue );
             return TRUE;
         }
     }
     for (i = 0; i < count; ++i) layout_count += !!descs[i].visible;
-    if (layout_count && !(layouts = calloc( layout_count, sizeof(*layouts) )))
+    if (layout_count && !(layouts = client_surface_alloc_owned_array( &queue->memory, layout_count, sizeof(*layouts) )))
     {
         layout_count = 0;
         goto failed;
@@ -5211,15 +5224,19 @@ static BOOL refresh_client_surface_handoffs( HWND toplevel )
      * The binding cache remains independent and includes hidden producers. */
     for (i = 0, index = 0; i < count; ++i)
     {
+        DWORD size;
+
         if (!members[i].visible) continue;
         layouts[index].window = members[i].hwnd;
         layouts[index].process = members[i].process;
         layouts[index].identity = members[i].identity;
         layouts[index].geometry = members[i].target;
-        if (!(layouts[index].clip = X11DRV_GetRegionData( members[i].region, 0 ))) goto failed;
+        if (!(size = X11DRV_GetRegionDataSize( members[i].region )) ||
+            !(layouts[index].clip = client_surface_alloc_owned_array( &queue->memory, size, 1 )) ||
+            !X11DRV_FillRegionData( members[i].region, 0, layouts[index].clip, size )) goto failed;
         ++index;
     }
-    if (!bind_client_surface_handoffs( toplevel, descs, count, mark )) goto failed;
+    if (!bind_client_surface_handoffs( toplevel, &queue->memory, descs, count, mark )) goto failed;
 
     if (!client_surface_scene_snapshot_current( toplevel, scene_generation )) goto failed;
     {
@@ -5243,14 +5260,16 @@ static BOOL refresh_client_surface_handoffs( HWND toplevel )
         if (!installed) goto failed;
     }
     free_client_surface_scene_layouts( layouts, layout_count );
-    free( descs );
+    client_surface_free_owned_array( descs );
     client_surface_free_scene_snapshot( count, members );
+    release_client_surface_compositor_queue( queue );
     return TRUE;
 
 failed:
     free_client_surface_scene_layouts( layouts, layout_count );
-    free( descs );
+    client_surface_free_owned_array( descs );
     client_surface_free_scene_snapshot( count, members );
+    release_client_surface_compositor_queue( queue );
     return FALSE;
 }
 
