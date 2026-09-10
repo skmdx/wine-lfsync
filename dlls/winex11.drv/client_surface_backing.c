@@ -277,52 +277,115 @@ struct client_surface_compositor_job
 {
     struct client_surface_compositor_job *next;
     enum client_surface_compositor_op op;
-    Drawable source;
-    Drawable destination;
-    int source_x;
-    int source_y;
-    int destination_x;
-    int destination_y;
-    unsigned int width;
-    unsigned int height;
-    unsigned int window_width;
-    unsigned int window_height;
-    unsigned int copy_count;
-    unsigned int preserve_width;
-    unsigned int preserve_height;
-    unsigned int valid_width;
-    unsigned int valid_height;
-    unsigned int depth;
-    Pixmap pixmaps[2];
-    HANDLE mapping;
-    SIZE_T view_size;
-    SIZE_T offset;
-    UINT64 mapping_id;
-    UINT64 cookie;
-    UINT64 identity;
-    UINT64 mark;
-    UINT64 scene_epoch;
-    UINT64 native_epoch;
-    int ready_fd;
-    process_id_t process;
-    HWND handoff_window;
-    HWND handoff_toplevel;
-    VisualID visual;
+    HWND toplevel; /* Scalar routing key, never a borrowed window-data pointer. */
     BOOL result;
     BOOL complete;
     BOOL async;
-    BOOL present_started;
-    BOOL present_done;
-    DWORD present_start;
-    struct client_surface_scene_layout *layouts;
-    unsigned int layout_count;
-    const struct client_surface_handoff_desc *handoffs;
-    unsigned int handoff_count;
-    BOOL *handoff_reused;
-    BOOL invalidate_scene;
-    BOOL update_deferred;
-    UINT update_types;
-    DWORD shrink_start;
+    union
+    {
+        /* COPY borrows the XIDs until synchronous completion. */
+        struct
+        {
+            Drawable source, destination;
+            int source_x, source_y, destination_x, destination_y;
+            unsigned int width, height;
+        } copy;
+        /* REPLACE_POOL borrows source and returns new pixmaps only on success.
+         * UPDATE_TARGET borrows the registered pair and uses the same
+         * installation payload as the replacement transaction. */
+        struct
+        {
+            Drawable source, destination;
+            unsigned int width, height, window_width, window_height;
+            unsigned int copy_count, preserve_width, preserve_height;
+            unsigned int valid_width, valid_height, depth;
+            Pixmap pixmaps[2];
+            VisualID visual;
+            DWORD shrink_start;
+        } pool;
+        /* FREE_POOL transfers its detached pair and accounting on enqueue. */
+        Pixmap retired_pixmaps[2];
+        /* PRESENT borrows registered output XIDs. The target keeps the native
+         * serial after a caller timeout; only its waiter pointer is detached. */
+        struct
+        {
+            Drawable source, destination;
+            unsigned int width, height;
+            BOOL started, done;
+            DWORD start;
+        } present;
+        /* REGISTER_HANDOFF borrows mapping until synchronous return. ready_fd
+         * is consumed by a new pool or closed at job completion/cancellation. */
+        struct
+        {
+            HANDLE mapping;
+            SIZE_T view_size, offset;
+            UINT64 mapping_id, cookie, identity, mark;
+            int ready_fd;
+            process_id_t process;
+            HWND window;
+        } registration;
+        /* REUSE_HANDOFFS borrows both input and output arrays until return. */
+        struct
+        {
+            const struct client_surface_handoff_desc *handoffs;
+            unsigned int count;
+            BOOL *reused;
+            UINT64 mark;
+        } reuse;
+        /* CHECK_SCENE only borrows the roster; it cannot adopt layouts. */
+        struct
+        {
+            const struct client_surface_handoff_desc *handoffs;
+            unsigned int count;
+            UINT64 epoch;
+        } scene_check;
+        /* SWEEP_HANDOFFS adopts layouts only when installing the plan, then
+         * clears this pointer/count. Failure, stale and unchanged plans leave
+         * them with the synchronous caller, including all clip allocations. */
+        struct
+        {
+            struct client_surface_scene_layout *layouts;
+            unsigned int count;
+            UINT64 epoch, mark;
+        } scene_install;
+        /* DIRECT_PLAN borrows drawable IDs for synchronous native checks. */
+        struct
+        {
+            Drawable source, destination;
+            UINT64 identity, scene_epoch;
+        } direct_plan;
+        /* RENEW_DIRECT borrows only the owner's destination and geometry. */
+        struct
+        {
+            Drawable destination;
+            UINT64 scene_epoch;
+            int source_x, source_y;
+            unsigned int width, height, window_width, window_height;
+        } direct_renew;
+        /* DIRECT_COMPLETE carries scalar attestations, no native lease. */
+        struct
+        {
+            Drawable source;
+            UINT64 identity, scene_epoch, native_epoch;
+        } direct_complete;
+        /* RESTORE_TARGET borrows the destination; deferred restoration is
+         * stored on the target, without retaining this stack job. */
+        struct
+        {
+            Drawable destination;
+            int destination_x, destination_y;
+            unsigned int width, height, window_width, window_height;
+            unsigned int valid_width, valid_height;
+        } restore;
+        /* Native-update operations carry scalar barriers and return values. */
+        struct
+        {
+            UINT64 mark;
+            BOOL invalidate_scene, deferred;
+            UINT types;
+        } update;
+    } u;
 };
 
 static struct client_surface_compositor_job *client_surface_compositor_head;
@@ -502,45 +565,45 @@ static BOOL client_surface_alloc_on_compositor( struct client_surface_compositor
 {
     Display *display = client_surface_compositor_display;
     struct client_surface_output_allocation *allocation;
-    unsigned int i, copy_width = min( job->window_width, job->width );
-    unsigned int copy_height = min( job->window_height, job->height );
+    unsigned int i, copy_width = min( job->u.pool.window_width, job->u.pool.width );
+    unsigned int copy_height = min( job->u.pool.window_height, job->u.pool.height );
     GC gc;
     int error = 0;
 
-    assert( job->copy_count && job->copy_count <= ARRAY_SIZE(job->pixmaps) );
+    assert( job->u.pool.copy_count && job->u.pool.copy_count <= ARRAY_SIZE(job->u.pool.pixmaps) );
     if (!(allocation = malloc( sizeof(*allocation) ))) return FALSE;
-    allocation->bytes = 2 * client_surface_pixmap_bytes( job->width, job->height, job->depth );
+    allocation->bytes = 2 * client_surface_pixmap_bytes( job->u.pool.width, job->u.pool.height, job->u.pool.depth );
     if (!client_surface_reserve_memory( CLIENT_SURFACE_MEMORY_OUTPUT, allocation->bytes ))
     {
         free( allocation );
         return FALSE;
     }
     X11DRV_expect_error( display, client_surface_compositor_error, &error );
-    job->pixmaps[0] = XCreatePixmap( display, job->destination, job->width, job->height, job->depth );
-    job->pixmaps[1] = XCreatePixmap( display, job->destination, job->width, job->height, job->depth );
+    job->u.pool.pixmaps[0] = XCreatePixmap( display, job->u.pool.destination, job->u.pool.width, job->u.pool.height, job->u.pool.depth );
+    job->u.pool.pixmaps[1] = XCreatePixmap( display, job->u.pool.destination, job->u.pool.width, job->u.pool.height, job->u.pool.depth );
     /* The owner completed its drawing before this job. All destinations are
      * private new images, so allocation and checkpoint errors can share one
      * reply boundary. Do not register or install any of them before it. */
-    gc = XCreateGC( display, job->pixmaps[0], 0, NULL );
+    gc = XCreateGC( display, job->u.pool.pixmaps[0], 0, NULL );
     if (gc)
     {
-        for (i = 0; i < job->copy_count; ++i)
+        for (i = 0; i < job->u.pool.copy_count; ++i)
         {
-            XCopyArea( display, job->destination, job->pixmaps[i], gc, 0, 0,
+            XCopyArea( display, job->u.pool.destination, job->u.pool.pixmaps[i], gc, 0, 0,
                        copy_width, copy_height, 0, 0 );
             TRACE_(csperf)( "ticks=%llu event=xlib_copy_request source=%lx destination=%lx width=%u height=%u clipped=0 route=restore\n",
-                           client_surface_perf_time(), job->destination, job->pixmaps[i],
+                           client_surface_perf_time(), job->u.pool.destination, job->u.pool.pixmaps[i],
                            copy_width, copy_height );
             /* The replacement job drained the old target before entering.
              * Preserve its completed intersection over the GUI seed without
              * exposing either new image before the common error boundary. */
-            if (job->source && job->preserve_width && job->preserve_height)
+            if (job->u.pool.source && job->u.pool.preserve_width && job->u.pool.preserve_height)
             {
-                XCopyArea( display, job->source, job->pixmaps[i], gc, 0, 0,
-                           job->preserve_width, job->preserve_height, 0, 0 );
+                XCopyArea( display, job->u.pool.source, job->u.pool.pixmaps[i], gc, 0, 0,
+                           job->u.pool.preserve_width, job->u.pool.preserve_height, 0, 0 );
                 TRACE_(csperf)( "ticks=%llu event=xlib_copy_request source=%lx destination=%lx width=%u height=%u clipped=0 route=restore\n",
-                               client_surface_perf_time(), job->source, job->pixmaps[i],
-                               job->preserve_width, job->preserve_height );
+                               client_surface_perf_time(), job->u.pool.source, job->u.pool.pixmaps[i],
+                               job->u.pool.preserve_width, job->u.pool.preserve_height );
             }
         }
         XFreeGC( display, gc );
@@ -549,25 +612,25 @@ static BOOL client_surface_alloc_on_compositor( struct client_surface_compositor
     X11DRV_check_error();
     TRACE_(csperf)( "ticks=%llu event=output_pool_alloc first=%lx second=%lx "
                    "width=%u height=%u depth=%u checkpoint_copies=%u copy_width=%u copy_height=%u sync_calls=1 error=%d success=%u\n",
-                   client_surface_perf_time(), job->pixmaps[0], job->pixmaps[1],
-                   job->width, job->height, job->depth, gc ? job->copy_count : 0,
+                   client_surface_perf_time(), job->u.pool.pixmaps[0], job->u.pool.pixmaps[1],
+                   job->u.pool.width, job->u.pool.height, job->u.pool.depth, gc ? job->u.pool.copy_count : 0,
                    copy_width, copy_height, error, !!gc && !error );
     if (gc && !error)
     {
-        memcpy( allocation->pixmaps, job->pixmaps, sizeof(allocation->pixmaps) );
+        memcpy( allocation->pixmaps, job->u.pool.pixmaps, sizeof(allocation->pixmaps) );
         allocation->next = client_surface_output_allocations;
         client_surface_output_allocations = allocation;
-        x11drv_client_surface_trace_image( "acquire", "output_pair", display, job->pixmaps[0], allocation->bytes / 2 );
-        x11drv_client_surface_trace_image( "acquire", "output_pair", display, job->pixmaps[1], allocation->bytes / 2 );
+        x11drv_client_surface_trace_image( "acquire", "output_pair", display, job->u.pool.pixmaps[0], allocation->bytes / 2 );
+        x11drv_client_surface_trace_image( "acquire", "output_pair", display, job->u.pool.pixmaps[1], allocation->bytes / 2 );
         return TRUE;
     }
 
     X11DRV_expect_error( display, client_surface_compositor_error, &error );
-    XFreePixmap( display, job->pixmaps[0] );
-    XFreePixmap( display, job->pixmaps[1] );
+    XFreePixmap( display, job->u.pool.pixmaps[0] );
+    XFreePixmap( display, job->u.pool.pixmaps[1] );
     XSync( display, False );
     X11DRV_check_error();
-    job->pixmaps[0] = job->pixmaps[1] = 0;
+    job->u.pool.pixmaps[0] = job->u.pool.pixmaps[1] = 0;
     client_surface_release_memory( CLIENT_SURFACE_MEMORY_OUTPUT, allocation->bytes );
     free( allocation );
     return FALSE;
@@ -645,7 +708,8 @@ static void complete_client_surface_compositor_frame(
     if (frame->request_pending || !frame->complete) return;
     if (frame->waiter)
     {
-        frame->waiter->present_done = TRUE;
+        assert( frame->waiter->op == CLIENT_SURFACE_COMPOSITOR_PRESENT );
+        frame->waiter->u.present.done = TRUE;
         frame->waiter->result = success;
         frame->waiter = NULL;
     }
@@ -1074,23 +1138,23 @@ static BOOL client_surface_present_on_compositor( struct client_surface_composit
 {
 #ifdef SONAME_LIBXPRESENT
     struct client_surface_compositor_target *target =
-        find_client_surface_compositor_window( job->destination );
+        find_client_surface_compositor_window( job->u.present.destination );
     struct client_surface_compositor_frame *frame;
 
     if (!usexpresent || !target ||
-        !(frame = acquire_client_surface_compositor_frame( target, job->source )))
+        !(frame = acquire_client_surface_compositor_frame( target, job->u.present.source )))
         return FALSE;
-    frame->width = job->width;
-    frame->height = job->height;
+    frame->width = job->u.present.width;
+    frame->height = job->u.present.height;
     /* This owner scene snapshot includes GDI pixels written outside the
      * compositor connection.  Record a complete checkpoint for later partial
      * handoffs into other pool entries. */
-    note_client_surface_compositor_snapshot( target, job->source );
+    note_client_surface_compositor_snapshot( target, job->u.present.source );
     if (!submit_client_surface_present( target, frame, 0, 0, NULL ))
         return FALSE;
     frame->waiter = job;
-    job->present_started = TRUE;
-    job->present_start = NtGetTickCount();
+    job->u.present.started = TRUE;
+    job->u.present.start = NtGetTickCount();
     return TRUE;
 #else
     return FALSE;
@@ -1186,10 +1250,10 @@ static struct client_surface_compositor_pool *acquire_client_surface_compositor_
 {
     struct client_surface_handoff_shared *shared;
     struct client_surface_compositor_pool *pool;
-    SIZE_T size = job->view_size;
+    SIZE_T size = job->u.registration.view_size;
     void *view = NULL;
 
-    if ((pool = find_client_surface_compositor_pool( job->mapping_id )))
+    if ((pool = find_client_surface_compositor_pool( job->u.registration.mapping_id )))
     {
         size = pool->size;
         view = pool->shared;
@@ -1199,7 +1263,7 @@ static struct client_surface_compositor_pool *acquire_client_surface_compositor_
         /* The job's caller keeps its section handle until this synchronous job
          * returns. Only the first binding maps a pool; later registrations use
          * this connection's retained view, including across scene changes. */
-        if (NtMapViewOfSection( job->mapping, NtCurrentProcess(), &view, 0, 0, NULL,
+        if (NtMapViewOfSection( job->u.registration.mapping, NtCurrentProcess(), &view, 0, 0, NULL,
                                &size, ViewShare, 0, PAGE_READWRITE )) return NULL;
     }
     shared = view;
@@ -1208,7 +1272,7 @@ static struct client_surface_compositor_pool *acquire_client_surface_compositor_
         __atomic_load_n( &shared->magic, __ATOMIC_ACQUIRE ) != CLIENT_SURFACE_HANDOFF_MAGIC ||
         shared->version != CLIENT_SURFACE_HANDOFF_VERSION ||
         shared->channel_count != CLIENT_SURFACE_HANDOFF_CHANNELS ||
-        shared->mapping_id != job->mapping_id)
+        shared->mapping_id != job->u.registration.mapping_id)
         goto failed;
     if (pool)
     {
@@ -1218,11 +1282,11 @@ static struct client_surface_compositor_pool *acquire_client_surface_compositor_
     if (!(pool = calloc( 1, sizeof(*pool) ))) goto failed;
     pool->next = client_surface_compositor_pools;
     pool->shared = shared;
-    pool->id = job->mapping_id;
+    pool->id = job->u.registration.mapping_id;
     pool->size = size;
     pool->refs = 1;
-    pool->ready_fd = job->ready_fd;
-    job->ready_fd = -1;
+    pool->ready_fd = job->u.registration.ready_fd;
+    job->u.registration.ready_fd = -1;
     client_surface_compositor_pools = pool;
     return pool;
 
@@ -1247,25 +1311,25 @@ static BOOL register_client_surface_compositor_handoff(
     BOOL ret = FALSE;
 
     if (!(pool = acquire_client_surface_compositor_pool( job ))) goto done;
-    if (job->offset < offsetof(struct client_surface_handoff_shared, channels) ||
-        job->offset > sizeof(*pool->shared) - sizeof(*channel) ||
-        (job->offset - offsetof(struct client_surface_handoff_shared, channels)) % sizeof(*channel)) goto done;
-    channel = (struct client_surface_handoff_channel *)((char *)pool->shared + job->offset);
-    if (channel->cookie != job->cookie || channel->identity != job->identity ||
-        channel->producer_process != job->process ||
-        channel->window != wine_server_user_handle( job->handoff_window ) ||
-        channel->toplevel != wine_server_user_handle( job->handoff_toplevel ) ||
+    if (job->u.registration.offset < offsetof(struct client_surface_handoff_shared, channels) ||
+        job->u.registration.offset > sizeof(*pool->shared) - sizeof(*channel) ||
+        (job->u.registration.offset - offsetof(struct client_surface_handoff_shared, channels)) % sizeof(*channel)) goto done;
+    channel = (struct client_surface_handoff_channel *)((char *)pool->shared + job->u.registration.offset);
+    if (channel->cookie != job->u.registration.cookie || channel->identity != job->u.registration.identity ||
+        channel->producer_process != job->u.registration.process ||
+        channel->window != wine_server_user_handle( job->u.registration.window ) ||
+        channel->toplevel != wine_server_user_handle( job->toplevel ) ||
         __atomic_load_n( &channel->closed, __ATOMIC_ACQUIRE )) goto done;
 
     for (cursor = &client_surface_compositor_bindings; *cursor; cursor = &(*cursor)->next)
     {
         binding = *cursor;
-        if (binding->toplevel != job->handoff_toplevel ||
-            binding->process != job->process || binding->identity != job->identity)
+        if (binding->toplevel != job->toplevel ||
+            binding->process != job->u.registration.process || binding->identity != job->u.registration.identity)
             continue;
-        if (binding->cookie == job->cookie)
+        if (binding->cookie == job->u.registration.cookie)
         {
-            binding->mark = job->mark;
+            binding->mark = job->u.registration.mark;
             ret = TRUE;
             goto done;
         }
@@ -1279,12 +1343,12 @@ static BOOL register_client_surface_compositor_handoff(
     binding->pool = pool;
     binding->channel = channel;
     pool->bindings[channel - pool->shared->channels] = binding;
-    binding->toplevel = job->handoff_toplevel;
-    binding->window = job->handoff_window;
-    binding->process = job->process;
-    binding->identity = job->identity;
-    binding->cookie = job->cookie;
-    binding->mark = job->mark;
+    binding->toplevel = job->toplevel;
+    binding->window = job->u.registration.window;
+    binding->process = job->u.registration.process;
+    binding->identity = job->u.registration.identity;
+    binding->cookie = job->u.registration.cookie;
+    binding->mark = job->u.registration.mark;
     pool->refs++;
     client_surface_compositor_bindings = binding;
     TRACE( "registered handoff hwnd %p identity %s producer %04x pool %s cookie %s\n",
@@ -1294,8 +1358,6 @@ static BOOL register_client_surface_compositor_handoff(
 
 done:
     if (pool) release_client_surface_compositor_pool( pool );
-    if (job->ready_fd >= 0) close( job->ready_fd );
-    job->ready_fd = -1;
     return ret;
 }
 
@@ -1362,19 +1424,19 @@ static BOOL reuse_client_surface_compositor_handoffs( const struct client_surfac
     struct client_surface_compositor_binding *binding, **members;
     unsigned int count = 0, i = 0;
 
-    for (i = 0; i < job->handoff_count; ++i) job->handoff_reused[i] = FALSE;
+    for (i = 0; i < job->u.reuse.count; ++i) job->u.reuse.reused[i] = FALSE;
     for (binding = client_surface_compositor_bindings; binding; binding = binding->next)
-        if (binding->toplevel == job->handoff_toplevel) ++count;
+        if (binding->toplevel == job->toplevel) ++count;
     if (!count) return TRUE;
     if (!(members = calloc( count, sizeof(*members) ))) return FALSE;
     i = 0;
     for (binding = client_surface_compositor_bindings; binding; binding = binding->next)
-        if (binding->toplevel == job->handoff_toplevel) members[i++] = binding;
+        if (binding->toplevel == job->toplevel) members[i++] = binding;
     qsort( members, count, sizeof(*members), compare_client_surface_scene_members );
 
-    for (i = 0; i < job->handoff_count; ++i)
+    for (i = 0; i < job->u.reuse.count; ++i)
     {
-        const struct client_surface_handoff_desc *desc = &job->handoffs[i];
+        const struct client_surface_handoff_desc *desc = &job->u.reuse.handoffs[i];
         unsigned int low = 0, high = count;
 
         /* A nonzero roster cookie includes server-side retirement checks;
@@ -1392,8 +1454,8 @@ static BOOL reuse_client_surface_compositor_handoffs( const struct client_surfac
             if (wine_server_user_handle( binding->window ) != desc->handle) break;
             if (binding->process != desc->process || binding->identity != desc->surface ||
                 binding->cookie != desc->cookie) continue;
-            if ((job->handoff_reused[i] = client_surface_compositor_binding_is_live( binding )))
-                binding->mark = job->mark;
+            if ((job->u.reuse.reused[i] = client_surface_compositor_binding_is_live( binding )))
+                binding->mark = job->u.reuse.mark;
             break;
         }
     }
@@ -1413,24 +1475,24 @@ static void free_client_surface_scene_layouts( struct client_surface_scene_layou
 static BOOL check_client_surface_compositor_scene( const struct client_surface_compositor_job *job )
 {
     struct client_surface_compositor_target *target =
-        find_client_surface_compositor_target( job->handoff_toplevel );
+        find_client_surface_compositor_target( job->toplevel );
     struct client_surface_compositor_binding *binding;
     unsigned int i, count = 0, found = 0, needed = 0, bound = 0;
 
-    for (i = 0; i < job->handoff_count; ++i)
+    for (i = 0; i < job->u.scene_check.count; ++i)
     {
-        count += !!job->handoffs[i].visible;
-        needed += !!(job->handoffs[i].visible || job->handoffs[i].producer_mapped);
+        count += !!job->u.scene_check.handoffs[i].visible;
+        needed += !!(job->u.scene_check.handoffs[i].visible || job->u.scene_check.handoffs[i].producer_mapped);
     }
     if (!target || !target->scene.valid || target->scene.strategy != OWNER_COMPOSITE ||
-        target->scene.epoch != job->scene_epoch ||
+        target->scene.epoch != job->u.scene_check.epoch ||
         target->scene.count != count) return FALSE;
     for (binding = client_surface_compositor_bindings; binding; binding = binding->next)
     {
         const struct client_surface_handoff_desc *desc;
-        unsigned int low = 0, high = job->handoff_count;
+        unsigned int low = 0, high = job->u.scene_check.count;
 
-        if (binding->toplevel != job->handoff_toplevel) continue;
+        if (binding->toplevel != job->toplevel) continue;
         /* The caller sorted this authoritative roster. Validate retained
          * hidden bindings too; a changed producer or retired cookie must not
          * survive merely because the visible scene is unchanged. */
@@ -1438,11 +1500,11 @@ static BOOL check_client_surface_compositor_scene( const struct client_surface_c
         {
             unsigned int mid = low + (high - low) / 2;
 
-            if (job->handoffs[mid].handle < wine_server_user_handle( binding->window )) low = mid + 1;
+            if (job->u.scene_check.handoffs[mid].handle < wine_server_user_handle( binding->window )) low = mid + 1;
             else high = mid;
         }
-        if (low == job->handoff_count) return FALSE;
-        desc = &job->handoffs[low];
+        if (low == job->u.scene_check.count) return FALSE;
+        desc = &job->u.scene_check.handoffs[low];
         if (wine_server_user_handle( binding->window ) != desc->handle ||
             binding->process != desc->process || binding->identity != desc->surface ||
             binding->cookie != desc->cookie || !client_surface_compositor_binding_is_live( binding )) return FALSE;
@@ -1460,7 +1522,7 @@ static BOOL install_client_surface_scene_plan( struct client_surface_compositor_
 {
     struct client_surface_compositor_binding *binding, **members = NULL;
     struct client_surface_handoff_receipt *receipts = NULL;
-    unsigned int count = job->layout_count, available = 0, i = 0, next = 0;
+    unsigned int count = job->u.scene_install.count, available = 0, i = 0, next = 0;
 
     for (binding = client_surface_compositor_bindings; binding; binding = binding->next)
         if (binding->toplevel == target->toplevel) ++available;
@@ -1476,17 +1538,17 @@ static BOOL install_client_surface_scene_plan( struct client_surface_compositor_
         for (binding = client_surface_compositor_bindings; binding; binding = binding->next)
             if (binding->toplevel == target->toplevel) members[i++] = binding;
         qsort( members, available, sizeof(*members), compare_client_surface_scene_members );
-        qsort( job->layouts, count, sizeof(*job->layouts), compare_client_surface_scene_layouts );
+        qsort( job->u.scene_install.layouts, count, sizeof(*job->u.scene_install.layouts), compare_client_surface_scene_layouts );
         for (i = 0; i < count; ++i)
         {
             /* The binding cache includes hidden producers. Select only the
              * visible scene's layers from this sorted list; visibility does
              * not discard their last completed images. */
             while (next < available && wine_server_user_handle( members[next]->window ) <
-                                       wine_server_user_handle( job->layouts[i].window )) ++next;
-            if (next == available || members[next]->window != job->layouts[i].window ||
-                members[next]->process != job->layouts[i].process ||
-                members[next]->identity != job->layouts[i].identity)
+                                       wine_server_user_handle( job->u.scene_install.layouts[i].window )) ++next;
+            if (next == available || members[next]->window != job->u.scene_install.layouts[i].window ||
+                members[next]->process != job->u.scene_install.layouts[i].process ||
+                members[next]->identity != job->u.scene_install.layouts[i].identity)
             {
                 free( members );
                 free( receipts );
@@ -1495,7 +1557,7 @@ static BOOL install_client_surface_scene_plan( struct client_surface_compositor_
             members[i] = members[next++];
         }
     }
-    if (target->scene.valid && target->scene.epoch == job->scene_epoch && target->scene.count == count &&
+    if (target->scene.valid && target->scene.epoch == job->u.scene_install.epoch && target->scene.count == count &&
         (!count || !memcmp( members, target->scene.members, count * sizeof(*members) )))
     {
         free( receipts );
@@ -1503,7 +1565,7 @@ static BOOL install_client_surface_scene_plan( struct client_surface_compositor_
         return TRUE;
     }
     finish_client_surface_compositor_assembly( target, TRUE );
-    update_client_surface_compositor_scene( target, job->scene_epoch );
+    update_client_surface_compositor_scene( target, job->u.scene_install.epoch );
     free( target->receipts );
     free( target->scene.members );
     free_client_surface_scene_layouts( target->scene.layouts, target->scene.count );
@@ -1511,9 +1573,9 @@ static BOOL install_client_surface_scene_plan( struct client_surface_compositor_
     target->scene.strategy = OWNER_COMPOSITE;
     target->scene.direct_identity = 0;
     target->scene.direct_drawable = None;
-    target->scene.layouts = job->layouts;
-    job->layouts = NULL;
-    job->layout_count = 0;
+    target->scene.layouts = job->u.scene_install.layouts;
+    job->u.scene_install.layouts = NULL;
+    job->u.scene_install.count = 0;
     target->scene.count = count;
     target->scene.valid = TRUE;
     target->quiescing = target->native_updates || target->deferred_update;
@@ -1608,25 +1670,25 @@ static BOOL update_client_surface_compositor_target( struct client_surface_compo
     struct client_surface_output_allocation *allocation = NULL;
     BOOL same_pool, checkpoint, created = FALSE;
 
-    if (!(target = find_client_surface_compositor_target( job->handoff_toplevel )))
+    if (!(target = find_client_surface_compositor_target( job->toplevel )))
     {
         if (!(target = calloc( 1, sizeof(*target) ))) return FALSE;
-        target->toplevel = job->handoff_toplevel;
+        target->toplevel = job->toplevel;
         created = TRUE;
     }
     same_pool = target->frames[0].pixmap && target->frames[1].pixmap &&
-                ((target->frames[0].pixmap == job->pixmaps[0] &&
-                 target->frames[1].pixmap == job->pixmaps[1]) ||
-                 (target->frames[0].pixmap == job->pixmaps[1] &&
-                 target->frames[1].pixmap == job->pixmaps[0]));
+                ((target->frames[0].pixmap == job->u.pool.pixmaps[0] &&
+                 target->frames[1].pixmap == job->u.pool.pixmaps[1]) ||
+                 (target->frames[0].pixmap == job->u.pool.pixmaps[1] &&
+                 target->frames[1].pixmap == job->u.pool.pixmaps[0]));
     if (!same_pool)
     {
         /* Only a checked checkpoint pair can replace the old pool. A failed
          * checkpoint or target allocation leaves it available for cleanup;
          * composition owns any third image separately after installation. */
         for (allocation = client_surface_output_allocations; allocation; allocation = allocation->next)
-            if ((allocation->pixmaps[0] == job->pixmaps[0] && allocation->pixmaps[1] == job->pixmaps[1]) ||
-                (allocation->pixmaps[0] == job->pixmaps[1] && allocation->pixmaps[1] == job->pixmaps[0])) break;
+            if ((allocation->pixmaps[0] == job->u.pool.pixmaps[0] && allocation->pixmaps[1] == job->u.pool.pixmaps[1]) ||
+                (allocation->pixmaps[0] == job->u.pool.pixmaps[1] && allocation->pixmaps[1] == job->u.pool.pixmaps[0])) break;
         if (!allocation) goto failed;
     }
     if (created)
@@ -1634,29 +1696,29 @@ static BOOL update_client_surface_compositor_target( struct client_surface_compo
         target->next = client_surface_compositor_targets;
         client_surface_compositor_targets = target;
     }
-    if (target->window != job->destination || target->window_width != job->window_width ||
-        target->window_height != job->window_height || !same_pool)
+    if (target->window != job->u.pool.destination || target->window_width != job->u.pool.window_width ||
+        target->window_height != job->u.pool.window_height || !same_pool)
         quiesce_client_surface_compositor_target( target );
-    checkpoint = !same_pool || target->backing != job->pixmaps[0];
-    if (target->window != job->destination || target->window_width != job->window_width ||
-        target->window_height != job->window_height || target->depth != job->depth || target->visual != job->visual)
+    checkpoint = !same_pool || target->backing != job->u.pool.pixmaps[0];
+    if (target->window != job->u.pool.destination || target->window_width != job->u.pool.window_width ||
+        target->window_height != job->u.pool.window_height || target->depth != job->u.pool.depth || target->visual != job->u.pool.visual)
     {
         target->scene.valid = FALSE;
         SetRectEmpty( &target->restore_rect );
     }
     if (target->assembly_pending &&
-        (target->window != job->destination || target->backing != job->pixmaps[0] ||
-         target->window_width != job->window_width || target->window_height != job->window_height ||
-         target->depth != job->depth || target->visual != job->visual))
+        (target->window != job->u.pool.destination || target->backing != job->u.pool.pixmaps[0] ||
+         target->window_width != job->u.pool.window_width || target->window_height != job->u.pool.window_height ||
+         target->depth != job->u.pool.depth || target->visual != job->u.pool.visual))
         finish_client_surface_compositor_assembly( target, TRUE );
-    if ((target->window && target->window != job->destination) ||
+    if ((target->window && target->window != job->u.pool.destination) ||
         (target->frames[0].pixmap && !same_pool))
         drain_client_surface_compositor_target( target );
     /* Selection belongs to the native window, not its replaceable images.
      * Keep it across pool replacement and an acknowledged DIRECT plan. */
-    if (target->window && target->window != job->destination)
+    if (target->window && target->window != job->u.pool.destination)
         free_client_surface_compositor_present_input( target );
-    target->window = job->destination;
+    target->window = job->u.pool.destination;
     if (!same_pool)
     {
         unsigned int i;
@@ -1676,23 +1738,23 @@ static BOOL update_client_surface_compositor_target( struct client_surface_compo
             if (target->frames[i].gc) XFreeGC( client_surface_compositor_display, target->frames[i].gc );
         }
         memset( target->frames, 0, sizeof(target->frames) );
-        target->frames[0].pixmap = job->pixmaps[0];
-        target->frames[1].pixmap = job->pixmaps[1];
+        target->frames[0].pixmap = job->u.pool.pixmaps[0];
+        target->frames[1].pixmap = job->u.pool.pixmaps[1];
         target->mailbox_bytes = 0;
-        target->published = job->pixmaps[0];
-        target->published_width = job->valid_width;
-        target->published_height = job->valid_height;
+        target->published = job->u.pool.pixmaps[0];
+        target->published_width = job->u.pool.valid_width;
+        target->published_height = job->u.pool.valid_height;
         target->next_frame = 0;
         target->mailbox_pending = FALSE;
     }
-    target->backing = job->pixmaps[0];
-    target->shrink_start = job->shrink_start;
-    target->width = job->width;
-    target->height = job->height;
-    target->window_width = job->window_width;
-    target->window_height = job->window_height;
-    target->depth = job->depth;
-    target->visual = job->visual;
+    target->backing = job->u.pool.pixmaps[0];
+    target->shrink_start = job->u.pool.shrink_start;
+    target->width = job->u.pool.width;
+    target->height = job->u.pool.height;
+    target->window_width = job->u.pool.window_width;
+    target->window_height = job->u.pool.window_height;
+    target->depth = job->u.pool.depth;
+    target->visual = job->u.pool.visual;
     target->quiescing = target->native_updates || target->deferred_update;
     TRACE( "updated compositor target hwnd %p window %#lx size %ux%u depth %u visual %#lx\n",
            target->toplevel, target->window, target->window_width, target->window_height,
@@ -1734,10 +1796,10 @@ static BOOL replace_client_surface_compositor_pool( struct client_surface_compos
      * target failure leaves that pair and its pending publication intact. */
     if (!client_surface_compositor_open() || !client_surface_alloc_on_compositor( job )) goto failed;
     if (update_client_surface_compositor_target( job )) return TRUE;
-    client_surface_free_on_compositor( job->pixmaps );
-    job->pixmaps[0] = job->pixmaps[1] = 0;
+    client_surface_free_on_compositor( job->u.pool.pixmaps );
+    job->u.pool.pixmaps[0] = job->u.pool.pixmaps[1] = 0;
 failed:
-    if ((target = find_client_surface_compositor_target( job->handoff_toplevel )))
+    if ((target = find_client_surface_compositor_target( job->toplevel )))
         target->quiescing = target->native_updates || target->deferred_update;
     return FALSE;
 }
@@ -1832,16 +1894,16 @@ static BOOL client_surface_direct_plan_current( const struct client_surface_comp
 {
     struct client_surface_scene current;
 
-    return job->source && job->destination && (!target || target->window == job->destination) &&
-           get_client_surface_direct_scene( job->handoff_toplevel, job->scene_epoch, &current );
+    return job->u.direct_plan.source && job->u.direct_plan.destination && (!target || target->window == job->u.direct_plan.destination) &&
+           get_client_surface_direct_scene( job->toplevel, job->u.direct_plan.scene_epoch, &current );
 }
 
 static BOOL install_client_surface_direct_plan( const struct client_surface_compositor_job *job )
 {
-    struct client_surface_compositor_target *target = find_client_surface_compositor_target( job->handoff_toplevel );
+    struct client_surface_compositor_target *target = find_client_surface_compositor_target( job->toplevel );
     struct client_surface_scene current;
     XWindowAttributes attributes;
-    UINT64 scene_id = job->scene_epoch;
+    UINT64 scene_id = job->u.direct_plan.scene_epoch;
     BOOL accepted = FALSE, allocated = FALSE;
     Status queried;
     int error = 0;
@@ -1850,17 +1912,17 @@ static BOOL install_client_surface_direct_plan( const struct client_surface_comp
      * select requests authenticate the sole selected identity, owner process
      * and exact scene before changing the plan. No geometry or clip from a
      * roster snapshot is consumed by native attachment. */
-    if (!job->source || !job->destination ||
-        !get_client_surface_direct_scene( job->handoff_toplevel, scene_id, &current ))
+    if (!job->u.direct_plan.source || !job->u.direct_plan.destination ||
+        !get_client_surface_direct_scene( job->toplevel, scene_id, &current ))
         goto done;
     /* A managed top-level may still be waiting for the WM to map it. A
      * DIRECT image presented into that unmapped hierarchy can be discarded
      * by the later map. Keep the first frame in the owner cache instead. */
     X11DRV_expect_error( client_surface_compositor_display, client_surface_compositor_error, &error );
-    queried = XGetWindowAttributes( client_surface_compositor_display, job->destination, &attributes );
+    queried = XGetWindowAttributes( client_surface_compositor_display, job->u.direct_plan.destination, &attributes );
     X11DRV_check_error();
     TRACE( "DIRECT native admission hwnd %p window %#lx queried %u map state %d error %d\n",
-           job->handoff_toplevel, job->destination, queried, queried ? attributes.map_state : -1, error );
+           job->toplevel, job->u.direct_plan.destination, queried, queried ? attributes.map_state : -1, error );
     if (!queried || error || attributes.map_state != IsViewable) goto done;
     if (!current.generation)
     {
@@ -1870,40 +1932,40 @@ static BOOL install_client_surface_direct_plan( const struct client_surface_comp
          * successful ACK checkpoint can authorize skipping geometry prepare.
          * The submitting producer keeps this exact drawable alive throughout. */
         if (!target || !target->scene.valid || target->scene.strategy != OWNER_COMPOSITE ||
-            target->scene.epoch != scene_id || target->window != job->destination) goto done;
+            target->scene.epoch != scene_id || target->window != job->u.direct_plan.destination) goto done;
         SERVER_START_REQ( prepare_client_surface_direct_plan )
         {
-            req->handle = wine_server_user_handle( job->handoff_toplevel );
+            req->handle = wine_server_user_handle( job->toplevel );
             req->scene_id = scene_id;
-            req->surface = job->identity;
+            req->surface = job->u.direct_plan.identity;
             req->previous_scene = 0;
             if (!wine_server_call( req )) next_scene = reply->scene_id;
         }
         SERVER_END_REQ;
         if (!next_scene) goto done;
         TRACE( "owner DIRECT strategy scene hwnd %p old %s new %s identity %s\n",
-               job->handoff_toplevel, wine_dbgstr_longlong( scene_id ), wine_dbgstr_longlong( next_scene ),
-               wine_dbgstr_longlong( job->identity ) );
+               job->toplevel, wine_dbgstr_longlong( scene_id ), wine_dbgstr_longlong( next_scene ),
+               wine_dbgstr_longlong( job->u.direct_plan.identity ) );
         /* Read the new immutable scene rather than retagging the old one.
          * Failed admission leaves the channels and old plan intact; the
          * restart's ordinary owner wake can compose the new scene. */
         scene_id = next_scene;
-        if (!get_client_surface_direct_scene( job->handoff_toplevel, scene_id, &current ) ||
+        if (!get_client_surface_direct_scene( job->toplevel, scene_id, &current ) ||
             current.generation != scene_id) goto done;
     }
     if (!target)
     {
         if (!(target = calloc( 1, sizeof(*target) ))) goto done;
-        target->toplevel = job->handoff_toplevel;
-        target->window = job->destination;
+        target->toplevel = job->toplevel;
+        target->window = job->u.direct_plan.destination;
         allocated = TRUE;
     }
-    if (target->window != job->destination) goto done;
+    if (target->window != job->u.direct_plan.destination) goto done;
     SERVER_START_REQ( select_client_surface_direct_plan )
     {
-        req->handle = wine_server_user_handle( job->handoff_toplevel );
+        req->handle = wine_server_user_handle( job->toplevel );
         req->scene_id = scene_id;
-        req->surface = job->identity;
+        req->surface = job->u.direct_plan.identity;
         if (!wine_server_call( req )) accepted = reply->accepted;
     }
     SERVER_END_REQ;
@@ -1925,12 +1987,12 @@ static BOOL install_client_surface_direct_plan( const struct client_surface_comp
     free( target->receipts );
     target->receipts = NULL;
     target->scene = (struct client_surface_scene_plan){
-        .strategy = DIRECT_ATTACH, .direct_identity = job->identity,
-        .direct_drawable = job->source, .epoch = scene_id, .valid = TRUE,
+        .strategy = DIRECT_ATTACH, .direct_identity = job->u.direct_plan.identity,
+        .direct_drawable = job->u.direct_plan.source, .epoch = scene_id, .valid = TRUE,
     };
     SetRectEmpty( &target->restore_rect );
     TRACE( "owner DIRECT_ATTACH hwnd %p scene %s identity %s drawable %#lx\n",
-           target->toplevel, wine_dbgstr_longlong( scene_id ), wine_dbgstr_longlong( job->identity ), job->source );
+           target->toplevel, wine_dbgstr_longlong( scene_id ), wine_dbgstr_longlong( job->u.direct_plan.identity ), job->u.direct_plan.source );
 done:
     if (allocated && !accepted) free( target );
     return accepted;
@@ -1938,7 +2000,7 @@ done:
 
 static BOOL renew_client_surface_direct_plan( const struct client_surface_compositor_job *job )
 {
-    struct client_surface_compositor_target *target = find_client_surface_compositor_target( job->handoff_toplevel );
+    struct client_surface_compositor_target *target = find_client_surface_compositor_target( job->toplevel );
     struct client_surface_scene current;
     XWindowAttributes window, drawable;
     Window root, parent, *children = NULL;
@@ -1950,45 +2012,45 @@ static BOOL renew_client_surface_direct_plan( const struct client_surface_compos
     /* Only a previously admitted attachment with its output pool already
      * retired can renew without preserving a composition checkpoint. */
     if (!target || !target->scene.valid || target->scene.strategy != DIRECT_ATTACH ||
-        !target->scene.direct_drawable || target->window != job->destination ||
+        !target->scene.direct_drawable || target->window != job->u.direct_renew.destination ||
         target->copy_frame || target->native_updates || target->deferred_update) return FALSE;
     for (i = 0; i < ARRAY_SIZE(target->frames); ++i)
         if (target->frames[i].pixmap) return FALSE;
-    client_surface_get_toplevel_scene( job->handoff_toplevel, &current );
+    client_surface_get_toplevel_scene( job->toplevel, &current );
     if (current.valid || !current.direct_candidate || current.generation ||
-        current.epoch != job->scene_epoch || (current.epoch & 1)) return FALSE;
+        current.epoch != job->u.direct_renew.scene_epoch || (current.epoch & 1)) return FALSE;
 
     /* The GUI has completed its native changes. Check the retained child
      * itself, including its parent and exact client extent, rather than
      * treating the old scene's geometry or a DIRECT candidate as that proof. */
     if (client_surface_xcb_available( client_surface_compositor_display ))
     {
-        RECT rect = {job->source_x, job->source_y, job->source_x + job->width, job->source_y + job->height};
+        RECT rect = {job->u.direct_renew.source_x, job->u.direct_renew.source_y, job->u.direct_renew.source_x + job->u.direct_renew.width, job->u.direct_renew.source_y + job->u.direct_renew.height};
 
-        if (!client_surface_xcb_check_direct( client_surface_compositor_display, job->destination,
-                                              target->scene.direct_drawable, job->window_width,
-                                              job->window_height, &rect )) return FALSE;
+        if (!client_surface_xcb_check_direct( client_surface_compositor_display, job->u.direct_renew.destination,
+                                              target->scene.direct_drawable, job->u.direct_renew.window_width,
+                                              job->u.direct_renew.window_height, &rect )) return FALSE;
     }
     else
     {
         X11DRV_expect_error( client_surface_compositor_display, client_surface_compositor_error, &error );
-        native = XGetWindowAttributes( client_surface_compositor_display, job->destination, &window ) &&
+        native = XGetWindowAttributes( client_surface_compositor_display, job->u.direct_renew.destination, &window ) &&
                  XGetWindowAttributes( client_surface_compositor_display, target->scene.direct_drawable, &drawable ) &&
                  XQueryTree( client_surface_compositor_display, target->scene.direct_drawable,
                              &root, &parent, &children, &count );
         if (children) XFree( children );
         X11DRV_check_error();
         if (!native || error || window.map_state != IsViewable || drawable.map_state != IsViewable ||
-            parent != job->destination || drawable.border_width ||
-            window.width != job->window_width || window.height != job->window_height ||
-            drawable.x != job->source_x || drawable.y != job->source_y ||
-            drawable.width != job->width || drawable.height != job->height) return FALSE;
+            parent != job->u.direct_renew.destination || drawable.border_width ||
+            window.width != job->u.direct_renew.window_width || window.height != job->u.direct_renew.window_height ||
+            drawable.x != job->u.direct_renew.source_x || drawable.y != job->u.direct_renew.source_y ||
+            drawable.width != job->u.direct_renew.width || drawable.height != job->u.direct_renew.height) return FALSE;
     }
 
     SERVER_START_REQ( prepare_client_surface_direct_plan )
     {
-        req->handle = wine_server_user_handle( job->handoff_toplevel );
-        req->scene_id = job->scene_epoch;
+        req->handle = wine_server_user_handle( job->toplevel );
+        req->scene_id = job->u.direct_renew.scene_epoch;
         req->surface = target->scene.direct_identity;
         req->previous_scene = target->scene.epoch;
         if (!wine_server_call( req )) scene_id = reply->scene_id;
@@ -1996,8 +2058,8 @@ static BOOL renew_client_surface_direct_plan( const struct client_surface_compos
     SERVER_END_REQ;
     if (!scene_id) return FALSE;
     target->scene.epoch = scene_id;
-    target->window_width = job->window_width;
-    target->window_height = job->window_height;
+    target->window_width = job->u.direct_renew.window_width;
+    target->window_height = job->u.direct_renew.window_height;
     SetRectEmpty( &target->restore_rect );
     TRACE( "owner DIRECT_ATTACH hwnd %p scene %s identity %s drawable %#lx renewed=1 size=%ux%u\n",
            target->toplevel, wine_dbgstr_longlong( scene_id ),
@@ -2008,28 +2070,28 @@ static BOOL renew_client_surface_direct_plan( const struct client_surface_compos
 
 static BOOL complete_client_surface_direct_plan( const struct client_surface_compositor_job *job )
 {
-    struct client_surface_compositor_target *target = find_client_surface_compositor_target( job->handoff_toplevel );
+    struct client_surface_compositor_target *target = find_client_surface_compositor_target( job->toplevel );
     BOOL accepted = FALSE;
 
     if (!target || !target->scene.valid || target->scene.strategy != DIRECT_ATTACH ||
-        target->scene.epoch != job->scene_epoch || target->scene.direct_identity != job->identity ||
-        target->scene.direct_drawable != job->source) return FALSE;
+        target->scene.epoch != job->u.direct_complete.scene_epoch || target->scene.direct_identity != job->u.direct_complete.identity ||
+        target->scene.direct_drawable != job->u.direct_complete.source) return FALSE;
     /* No native pointer is retained or dereferenced by this queued proof.
      * The producer validated its native epoch before enqueue; destruction or
      * a new scene invalidates server admission for that unique surface ID. */
     SERVER_START_REQ( complete_client_surface_direct_plan )
     {
-        req->handle = wine_server_user_handle( job->handoff_toplevel );
-        req->scene_id = job->scene_epoch;
-        req->surface = job->identity;
+        req->handle = wine_server_user_handle( job->toplevel );
+        req->scene_id = job->u.direct_complete.scene_epoch;
+        req->surface = job->u.direct_complete.identity;
         if (!wine_server_call( req )) accepted = reply->accepted;
     }
     SERVER_END_REQ;
     TRACE( "owner DIRECT_ATTACH host complete hwnd %p scene %s identity %s target %s accepted %u\n",
-           job->handoff_toplevel, wine_dbgstr_longlong( job->scene_epoch ), wine_dbgstr_longlong( job->identity ),
-           wine_dbgstr_longlong( job->native_epoch ), accepted );
-    return accepted && publish_client_surface_handoff_generation( job->handoff_toplevel,
-                                                                 job->scene_epoch, job->scene_epoch, TRUE );
+           job->toplevel, wine_dbgstr_longlong( job->u.direct_complete.scene_epoch ), wine_dbgstr_longlong( job->u.direct_complete.identity ),
+           wine_dbgstr_longlong( job->u.direct_complete.native_epoch ), accepted );
+    return accepted && publish_client_surface_handoff_generation( job->toplevel,
+                                                                 job->u.direct_complete.scene_epoch, job->u.direct_complete.scene_epoch, TRUE );
 }
 
 static BOOL client_surface_compositor_restore_ready( const struct client_surface_compositor_target *target )
@@ -2077,18 +2139,18 @@ static BOOL restore_client_surface_compositor_target(
     struct client_surface_compositor_job *job )
 {
     struct client_surface_compositor_target *target =
-        find_client_surface_compositor_target( job->handoff_toplevel );
-    RECT rect = {job->destination_x, job->destination_y,
-                 job->destination_x + job->width, job->destination_y + job->height};
+        find_client_surface_compositor_target( job->toplevel );
+    RECT rect = {job->u.restore.destination_x, job->u.restore.destination_y,
+                 job->u.restore.destination_x + job->u.restore.width, job->u.restore.destination_y + job->u.restore.height};
 
     process_client_surface_present_events();
     if (!target || !target->window || target->scene.strategy == DIRECT_ATTACH ||
-        target->window != job->destination ||
-        target->window_width != job->window_width ||
-        target->window_height != job->window_height)
+        target->window != job->u.restore.destination ||
+        target->window_width != job->u.restore.window_width ||
+        target->window_height != job->u.restore.window_height)
         return FALSE;
-    job->valid_width = target->published_width;
-    job->valid_height = target->published_height;
+    job->u.restore.valid_width = target->published_width;
+    job->u.restore.valid_height = target->published_height;
     if (IsRectEmpty( &target->restore_rect )) target->restore_rect = rect;
     else add_bounds_rect( &target->restore_rect, &rect );
     /* A newer Present may have reached the window before its Complete event
@@ -3385,9 +3447,9 @@ static void wait_client_surface_compositor_work(void)
         DWORD elapsed;
         int remaining;
 
-        if (!job->present_started) continue;
-        if (job->present_done) return;
-        elapsed = NtGetTickCount() - job->present_start;
+        if (job->op != CLIENT_SURFACE_COMPOSITOR_PRESENT || !job->u.present.started) continue;
+        if (job->u.present.done) return;
+        elapsed = NtGetTickCount() - job->u.present.start;
         remaining = elapsed >= 5000 ? 0 : 5000 - elapsed;
         if (timeout < 0 || timeout > remaining) timeout = remaining;
     }
@@ -3443,16 +3505,16 @@ static BOOL execute_client_surface_compositor_job( struct client_surface_composi
         job->op == CLIENT_SURFACE_COMPOSITOR_END_UPDATE)
     {
         struct client_surface_compositor_target *target =
-            find_client_surface_compositor_target( job->handoff_toplevel );
+            find_client_surface_compositor_target( job->toplevel );
 
         if (!target) return FALSE;
         if (job->op == CLIENT_SURFACE_COMPOSITOR_CHECK_UPDATE ||
             job->op == CLIENT_SURFACE_COMPOSITOR_FINISH_UPDATE)
         {
-            if (target->deferred_update != job->mark || !target->update_notified) return FALSE;
+            if (target->deferred_update != job->u.update.mark || !target->update_notified) return FALSE;
             if (job->op == CLIENT_SURFACE_COMPOSITOR_CHECK_UPDATE)
             {
-                job->update_types = target->deferred_update_types | X11DRV_CLIENT_SURFACE_UPDATE_STATE;
+                job->u.update.types = target->deferred_update_types | X11DRV_CLIENT_SURFACE_UPDATE_STATE;
                 target->deferred_update_types = 0;
             }
             else
@@ -3473,8 +3535,8 @@ static BOOL execute_client_surface_compositor_job( struct client_surface_composi
                     if (!(++client_surface_native_update_serial)) ++client_surface_native_update_serial;
                     target->deferred_update = client_surface_native_update_serial;
                 }
-                target->deferred_update_types |= job->update_types;
-                job->update_deferred = TRUE;
+                target->deferred_update_types |= job->u.update.types;
+                job->u.update.deferred = TRUE;
                 TRACE( "deferring native state update %s for %p\n",
                        wine_dbgstr_longlong( target->deferred_update ), target->toplevel );
                 return FALSE;
@@ -3482,10 +3544,10 @@ static BOOL execute_client_surface_compositor_job( struct client_surface_composi
         }
         if (job->op != CLIENT_SURFACE_COMPOSITOR_END_UPDATE)
         {
-            target->deferred_update_types &= ~job->update_types;
+            target->deferred_update_types &= ~job->u.update.types;
             ++target->native_updates;
             target->quiescing = TRUE;
-            if (job->invalidate_scene) target->scene.valid = FALSE;
+            if (job->u.update.invalidate_scene) target->scene.valid = FALSE;
         }
         else
         {
@@ -3510,29 +3572,29 @@ static BOOL execute_client_surface_compositor_job( struct client_surface_composi
          * and native output ownership. A positive hint still needs the
          * complete scene, binding and image checks in the actual repair. */
         for (binding = client_surface_compositor_bindings; binding; binding = binding->next)
-            if (binding->toplevel == job->handoff_toplevel && binding->latest_image.pixmap)
+            if (binding->toplevel == job->toplevel && binding->latest_image.pixmap)
             {
                 cached = TRUE;
                 break;
             }
-        TRACE( "owner cache probe hwnd %p cached %u\n", job->handoff_toplevel, cached );
+        TRACE( "owner cache probe hwnd %p cached %u\n", job->toplevel, cached );
         return cached;
     }
     if (job->op == CLIENT_SURFACE_COMPOSITOR_REPAIR_OWNER)
-        return repair_client_surface_compositor_owner( job->handoff_toplevel, FALSE );
+        return repair_client_surface_compositor_owner( job->toplevel, FALSE );
     if (job->op == CLIENT_SURFACE_COMPOSITOR_RESOLVE_SOURCES)
-        return repair_client_surface_compositor_owner( job->handoff_toplevel, TRUE );
+        return repair_client_surface_compositor_owner( job->toplevel, TRUE );
     if (job->op == CLIENT_SURFACE_COMPOSITOR_SWEEP_HANDOFFS)
-        return sweep_client_surface_compositor_handoffs( job->handoff_toplevel, job->mark,
+        return sweep_client_surface_compositor_handoffs( job->toplevel, job->u.scene_install.mark,
                                                           job );
     if (job->op == CLIENT_SURFACE_COMPOSITOR_UPDATE_TARGET)
         return update_client_surface_compositor_target( job );
     if (job->op == CLIENT_SURFACE_COMPOSITOR_REPLACE_POOL)
         return replace_client_surface_compositor_pool( job );
     if (job->op == CLIENT_SURFACE_COMPOSITOR_REMOVE_TARGET)
-        return remove_client_surface_compositor_target( job->handoff_toplevel );
+        return remove_client_surface_compositor_target( job->toplevel );
     if (job->op == CLIENT_SURFACE_COMPOSITOR_RETIRE_POOL)
-        return retire_client_surface_compositor_pool( job->handoff_toplevel );
+        return retire_client_surface_compositor_pool( job->toplevel );
     if (job->op == CLIENT_SURFACE_COMPOSITOR_DIRECT_PLAN)
         return install_client_surface_direct_plan( job );
     if (job->op == CLIENT_SURFACE_COMPOSITOR_RENEW_DIRECT)
@@ -3545,7 +3607,7 @@ static BOOL execute_client_surface_compositor_job( struct client_surface_composi
     switch (job->op)
     {
     case CLIENT_SURFACE_COMPOSITOR_FREE_POOL:
-        return client_surface_free_on_compositor( job->pixmaps );
+        return client_surface_free_on_compositor( job->u.retired_pixmaps );
     case CLIENT_SURFACE_COMPOSITOR_PRESENT:
         return client_surface_present_on_compositor( job );
     case CLIENT_SURFACE_COMPOSITOR_COPY:
@@ -3553,29 +3615,50 @@ static BOOL execute_client_surface_compositor_job( struct client_surface_composi
     default:
         return FALSE;
     }
-    return client_surface_copy_on_compositor( job->source, job->destination,
-                                              job->source_x, job->source_y,
-                                              job->destination_x, job->destination_y,
-                                              job->width, job->height );
+    return client_surface_copy_on_compositor( job->u.copy.source, job->u.copy.destination,
+                                              job->u.copy.source_x, job->u.copy.source_y,
+                                              job->u.copy.destination_x, job->u.copy.destination_y,
+                                              job->u.copy.width, job->u.copy.height );
 }
 
 static struct client_surface_compositor_target *client_surface_compositor_job_target(
     const struct client_surface_compositor_job *job )
 {
     struct client_surface_compositor_target *target;
+    Drawable source = None, destination = None;
+    Pixmap first = None, second = None;
     unsigned int i;
 
-    if (job->handoff_toplevel) return find_client_surface_compositor_target( job->handoff_toplevel );
+    if (job->toplevel) return find_client_surface_compositor_target( job->toplevel );
+    /* Only these jobs route by borrowed/retired native IDs. Never interpret
+     * another operation's payload as drawables while checking queue order. */
+    switch (job->op)
+    {
+    case CLIENT_SURFACE_COMPOSITOR_COPY:
+        source = job->u.copy.source;
+        destination = job->u.copy.destination;
+        break;
+    case CLIENT_SURFACE_COMPOSITOR_PRESENT:
+        source = job->u.present.source;
+        destination = job->u.present.destination;
+        break;
+    case CLIENT_SURFACE_COMPOSITOR_FREE_POOL:
+        first = job->u.retired_pixmaps[0];
+        second = job->u.retired_pixmaps[1];
+        break;
+    default:
+        return NULL;
+    }
     for (target = client_surface_compositor_targets; target; target = target->next)
     {
-        if (target->window && (target->window == job->destination || target->window == job->source))
+        if (target->window && (target->window == destination || target->window == source))
             return target;
         for (i = 0; i < ARRAY_SIZE(target->frames); ++i)
         {
             Pixmap pixmap = target->frames[i].pixmap;
 
-            if (pixmap && (pixmap == job->source || pixmap == job->destination ||
-                           pixmap == job->pixmaps[0] || pixmap == job->pixmaps[1])) return target;
+            if (pixmap && (pixmap == source || pixmap == destination ||
+                           pixmap == first || pixmap == second)) return target;
         }
     }
     return NULL;
@@ -3636,10 +3719,10 @@ static BOOL client_surface_compositor_job_ready( struct client_surface_composito
         job->op == CLIENT_SURFACE_COMPOSITOR_BEGIN_UPDATE ||
         job->op == CLIENT_SURFACE_COMPOSITOR_REPLACE_POOL) drain = TRUE;
     if (job->op == CLIENT_SURFACE_COMPOSITOR_UPDATE_TARGET)
-        drain = target->window != job->destination ||
-                target->window_width != job->window_width || target->window_height != job->window_height ||
-                !((target->frames[0].pixmap == job->pixmaps[0] && target->frames[1].pixmap == job->pixmaps[1]) ||
-                  (target->frames[1].pixmap == job->pixmaps[0] && target->frames[0].pixmap == job->pixmaps[1]));
+        drain = target->window != job->u.pool.destination ||
+                target->window_width != job->u.pool.window_width || target->window_height != job->u.pool.window_height ||
+                !((target->frames[0].pixmap == job->u.pool.pixmaps[0] && target->frames[1].pixmap == job->u.pool.pixmaps[1]) ||
+                  (target->frames[1].pixmap == job->u.pool.pixmaps[0] && target->frames[0].pixmap == job->u.pool.pixmaps[1]));
     if (drain)
     {
         /* Stop producing work for this target while its previous native
@@ -3658,12 +3741,24 @@ static BOOL client_surface_compositor_job_ready( struct client_surface_composito
 
         if (!frame->serial) continue;
         if (drain ||
-            (job->op == CLIENT_SURFACE_COMPOSITOR_COPY && frame->pixmap == job->destination) ||
-            (job->op == CLIENT_SURFACE_COMPOSITOR_PRESENT && frame->pixmap == job->source) ||
+            (job->op == CLIENT_SURFACE_COMPOSITOR_COPY && frame->pixmap == job->u.copy.destination) ||
+            (job->op == CLIENT_SURFACE_COMPOSITOR_PRESENT && frame->pixmap == job->u.present.source) ||
             (job->op == CLIENT_SURFACE_COMPOSITOR_FREE_POOL &&
-             (frame->pixmap == job->pixmaps[0] || frame->pixmap == job->pixmaps[1]))) return FALSE;
+             (frame->pixmap == job->u.retired_pixmaps[0] || frame->pixmap == job->u.retired_pixmaps[1]))) return FALSE;
     }
     return TRUE;
+}
+
+static void release_client_surface_compositor_job_resources( struct client_surface_compositor_job *job )
+{
+    /* Registration may fail validation, be cancelled before execution, or
+     * reuse an existing pool. Only a newly created pool adopts the fd. The
+     * section handle remains borrowed from the synchronous caller. */
+    if (job->op == CLIENT_SURFACE_COMPOSITOR_REGISTER_HANDOFF && job->u.registration.ready_fd >= 0)
+    {
+        close( job->u.registration.ready_fd );
+        job->u.registration.ready_fd = -1;
+    }
 }
 
 static BOOL process_client_surface_compositor_jobs(void)
@@ -3700,12 +3795,12 @@ static BOOL process_client_surface_compositor_jobs(void)
             if (job->op != CLIENT_SURFACE_COMPOSITOR_FREE_POOL) continue;
             for (allocation = client_surface_output_allocations; allocation; allocation = allocation->next)
             {
-                if (!((allocation->pixmaps[0] == job->pixmaps[0] && allocation->pixmaps[1] == job->pixmaps[1]) ||
-                      (allocation->pixmaps[0] == job->pixmaps[1] && allocation->pixmaps[1] == job->pixmaps[0]))) continue;
+                if (!((allocation->pixmaps[0] == job->u.retired_pixmaps[0] && allocation->pixmaps[1] == job->u.retired_pixmaps[1]) ||
+                      (allocation->pixmaps[0] == job->u.retired_pixmaps[1] && allocation->pixmaps[1] == job->u.retired_pixmaps[0]))) continue;
                 x11drv_client_surface_trace_image( "retire", "output_pair", client_surface_compositor_display,
-                                                  job->pixmaps[0], allocation->bytes / 2 );
+                                                  job->u.retired_pixmaps[0], allocation->bytes / 2 );
                 x11drv_client_surface_trace_image( "retire", "output_pair", client_surface_compositor_display,
-                                                  job->pixmaps[1], allocation->bytes / 2 );
+                                                  job->u.retired_pixmaps[1], allocation->bytes / 2 );
                 break;
             }
         }
@@ -3720,7 +3815,7 @@ static BOOL process_client_surface_compositor_jobs(void)
          * repair or publication rights. */
         for (earlier = client_surface_compositor_pending; earlier != job; earlier = earlier->next)
             if ((target && target == client_surface_compositor_job_target( earlier )) ||
-                (job->handoff_toplevel && job->handoff_toplevel == earlier->handoff_toplevel)) break;
+                (job->toplevel && job->toplevel == earlier->toplevel)) break;
         if (earlier != job && job->op != CLIENT_SURFACE_COMPOSITOR_TRY_BEGIN_UPDATE &&
             job->op != CLIENT_SURFACE_COMPOSITOR_CHECK_UPDATE &&
             job->op != CLIENT_SURFACE_COMPOSITOR_FINISH_UPDATE &&
@@ -3729,9 +3824,9 @@ static BOOL process_client_surface_compositor_jobs(void)
             cursor = &job->next;
             continue;
         }
-        if (job->present_started)
+        if (job->op == CLIENT_SURFACE_COMPOSITOR_PRESENT && job->u.present.started)
         {
-            if (!job->present_done && NtGetTickCount() - job->present_start >= 5000)
+            if (!job->u.present.done && NtGetTickCount() - job->u.present.start >= 5000)
             {
                 unsigned int i;
 
@@ -3740,10 +3835,10 @@ static BOOL process_client_surface_compositor_jobs(void)
                 if (target)
                     for (i = 0; i < ARRAY_SIZE(target->frames); ++i)
                         if (target->frames[i].waiter == job) target->frames[i].waiter = NULL;
-                job->present_done = TRUE;
+                job->u.present.done = TRUE;
                 job->result = FALSE;
             }
-            if (!job->present_done)
+            if (!job->u.present.done)
             {
                 cursor = &job->next;
                 continue;
@@ -3765,7 +3860,7 @@ static BOOL process_client_surface_compositor_jobs(void)
                 target = client_surface_compositor_job_target( job );
                 if (target) target->quiescing = target->native_updates || target->deferred_update;
             }
-            if (job->present_started)
+            if (job->op == CLIENT_SURFACE_COMPOSITOR_PRESENT && job->u.present.started)
             {
                 --budget;
                 progressed = TRUE;
@@ -3776,6 +3871,7 @@ static BOOL process_client_surface_compositor_jobs(void)
         *cursor = job->next;
         --budget;
         progressed = TRUE;
+        release_client_surface_compositor_job_resources( job );
         if (job->async)
         {
             free( job );
@@ -3859,8 +3955,10 @@ static BOOL queue_client_surface_compositor_job( struct client_surface_composito
 
     job->next = NULL;
     job->complete = FALSE;
-    job->present_started = job->present_done = FALSE;
-    job->update_deferred = FALSE;
+    if (job->op == CLIENT_SURFACE_COMPOSITOR_PRESENT)
+        job->u.present.started = job->u.present.done = FALSE;
+    if (job->op == CLIENT_SURFACE_COMPOSITOR_TRY_BEGIN_UPDATE)
+        job->u.update.deferred = FALSE;
     if (!client_surface_compositor_started)
     {
         if (!init_client_surface_compositor_notification()) return FALSE;
@@ -3896,6 +3994,7 @@ static BOOL submit_client_surface_compositor_job( struct client_surface_composit
         ret = job->result;
     }
     pthread_mutex_unlock( &client_surface_compositor_mutex );
+    if (!job->complete) release_client_surface_compositor_job_resources( job );
     return ret;
 }
 
@@ -3926,7 +4025,7 @@ static void post_client_surface_compositor_job( struct client_surface_compositor
     if (!submit_client_surface_compositor_job( job ) && !job->complete &&
         (job->op == CLIENT_SURFACE_COMPOSITOR_FREE_POOL || job->op == CLIENT_SURFACE_COMPOSITOR_DIRECT_COMPLETE))
         WARN( "failed to queue client-surface release/publication op %u hwnd %p\n",
-              job->op, job->handoff_toplevel );
+              job->op, job->toplevel );
 }
 
 BOOL X11DRV_client_surface_prepare_direct( struct client_surface *surface,
@@ -3937,21 +4036,24 @@ BOOL X11DRV_client_surface_prepare_direct( struct client_surface *surface,
     struct client_surface_compositor_job job =
     {
         .op = CLIENT_SURFACE_COMPOSITOR_DIRECT_PLAN,
-        .handoff_toplevel = scene->toplevel,
-        .scene_epoch = scene->epoch,
-        .identity = ReadAcquire64( (LONG64 *)&surface->identity ),
-        .source = impl_from_client_surface( surface )->window,
+        .toplevel = scene->toplevel,
+        .u.direct_plan =
+        {
+            .scene_epoch = scene->epoch,
+            .identity = ReadAcquire64( (LONG64 *)&surface->identity ),
+            .source = impl_from_client_surface( surface )->window,
+        },
     };
 
     if ((scene->generation && scene->generation != scene->epoch) ||
         !(data = get_win_data( scene->toplevel ))) return FALSE;
-    job.destination = data->whole_window;
+    job.u.direct_plan.destination = data->whole_window;
     release_win_data( data );
     /* The producer retains its drawable while this scalar plan is admitted.
      * Native attach follows on this thread inside the existing target update. */
     accepted = submit_client_surface_compositor_job( &job );
     TRACE( "DIRECT plan request hwnd %p scene %s identity %s accepted %u\n",
-           scene->toplevel, wine_dbgstr_longlong( scene->epoch ), wine_dbgstr_longlong( job.identity ), accepted );
+           scene->toplevel, wine_dbgstr_longlong( scene->epoch ), wine_dbgstr_longlong( job.u.direct_plan.identity ), accepted );
     return accepted;
 }
 
@@ -3961,11 +4063,14 @@ void X11DRV_client_surface_complete_direct( struct client_surface *surface,
     struct client_surface_compositor_job job =
     {
         .op = CLIENT_SURFACE_COMPOSITOR_DIRECT_COMPLETE,
-        .handoff_toplevel = frame->scene.toplevel,
-        .scene_epoch = frame->scene.epoch,
-        .native_epoch = frame->target_epoch,
-        .identity = ReadAcquire64( (LONG64 *)&surface->identity ),
-        .source = impl_from_client_surface( surface )->window,
+        .toplevel = frame->scene.toplevel,
+        .u.direct_complete =
+        {
+            .scene_epoch = frame->scene.epoch,
+            .native_epoch = frame->target_epoch,
+            .identity = ReadAcquire64( (LONG64 *)&surface->identity ),
+            .source = impl_from_client_surface( surface )->window,
+        },
     };
 
     /* A delayed scene ACK is not a native Present failure. There is no caller
@@ -3981,14 +4086,17 @@ static BOOL client_surface_backing_copy_area( Drawable source, Drawable destinat
     struct client_surface_compositor_job job =
     {
         .op = CLIENT_SURFACE_COMPOSITOR_COPY,
-        .source = source,
-        .destination = destination,
-        .source_x = source_x,
-        .source_y = source_y,
-        .destination_x = destination_x,
-        .destination_y = destination_y,
-        .width = width,
-        .height = height,
+        .u.copy =
+        {
+            .source = source,
+            .destination = destination,
+            .source_x = source_x,
+            .source_y = source_y,
+            .destination_x = destination_x,
+            .destination_y = destination_y,
+            .width = width,
+            .height = height,
+        },
     };
 
     return submit_client_surface_compositor_job( &job );
@@ -4003,28 +4111,31 @@ static BOOL replace_client_surface_backing( struct x11drv_win_data *data, unsign
     struct client_surface_compositor_job job =
     {
         .op = CLIENT_SURFACE_COMPOSITOR_REPLACE_POOL,
-        .handoff_toplevel = data->hwnd,
-        .source = snapshot ? 0 : data->client_surface_backing,
-        .destination = data->whole_window,
-        .width = width,
-        .height = height,
-        .depth = data->vis.depth,
-        .window_width = window_width,
-        .window_height = window_height,
-        .copy_count = snapshot ? 1 : 2,
-        .preserve_width = preserve_width,
-        .preserve_height = preserve_height,
-        .valid_width = preserve_width >= window_width && preserve_height >= window_height ? window_width : 0,
-        .valid_height = preserve_width >= window_width && preserve_height >= window_height ? window_height : 0,
-        .visual = data->vis.visualid,
+        .toplevel = data->hwnd,
+        .u.pool =
+        {
+            .source = snapshot ? 0 : data->client_surface_backing,
+            .destination = data->whole_window,
+            .width = width,
+            .height = height,
+            .depth = data->vis.depth,
+            .window_width = window_width,
+            .window_height = window_height,
+            .copy_count = snapshot ? 1 : 2,
+            .preserve_width = preserve_width,
+            .preserve_height = preserve_height,
+            .valid_width = preserve_width >= window_width && preserve_height >= window_height ? window_width : 0,
+            .valid_height = preserve_width >= window_width && preserve_height >= window_height ? window_height : 0,
+            .visual = data->vis.visualid,
+        },
     };
 
     if (snapshot && (width < window_width || height < window_height)) return FALSE;
     /* Complete the GUI connection's drawing before the actor reads it. */
     XSync( data->display, False );
     if (!submit_client_surface_compositor_job( &job )) return FALSE;
-    *first = job.pixmaps[0];
-    *second = job.pixmaps[1];
+    *first = job.u.pool.pixmaps[0];
+    *second = job.u.pool.pixmaps[1];
     return TRUE;
 }
 
@@ -4033,7 +4144,7 @@ static void client_surface_backing_free( Pixmap first, Pixmap second )
     struct client_surface_compositor_job job =
     {
         .op = CLIENT_SURFACE_COMPOSITOR_FREE_POOL,
-        .pixmaps = {first, second},
+        .u.retired_pixmaps = {first, second},
     };
 
     /* These are either unregistered allocations, or the prior synchronous
@@ -4055,10 +4166,13 @@ static BOOL client_surface_backing_present( Window window, Pixmap pixmap,
     struct client_surface_compositor_job job =
     {
         .op = CLIENT_SURFACE_COMPOSITOR_PRESENT,
-        .source = pixmap,
-        .destination = window,
-        .width = width,
-        .height = height,
+        .u.present =
+        {
+            .source = pixmap,
+            .destination = window,
+            .width = width,
+            .height = height,
+        },
     };
 
     return submit_client_surface_compositor_job( &job );
@@ -4073,20 +4187,23 @@ static BOOL update_client_surface_backing_target( struct x11drv_win_data *data )
     job = (struct client_surface_compositor_job)
     {
         .op = CLIENT_SURFACE_COMPOSITOR_UPDATE_TARGET,
-        .pixmaps = {data->client_surface_backing, data->client_surface_backing_spare},
-        .destination = data->whole_window,
-        .width = data->client_surface_backing_width,
-        .height = data->client_surface_backing_height,
-        .window_width = window_width,
-        .window_height = window_height,
-        .valid_width = data->client_surface_backing_valid ?
-                       data->client_surface_backing_valid_width : 0,
-        .valid_height = data->client_surface_backing_valid ?
-                        data->client_surface_backing_valid_height : 0,
-        .depth = data->vis.depth,
-        .handoff_toplevel = data->hwnd,
-        .visual = data->vis.visualid,
-        .shrink_start = data->client_surface_backing_shrink_start,
+        .toplevel = data->hwnd,
+        .u.pool =
+        {
+            .pixmaps = {data->client_surface_backing, data->client_surface_backing_spare},
+            .destination = data->whole_window,
+            .width = data->client_surface_backing_width,
+            .height = data->client_surface_backing_height,
+            .window_width = window_width,
+            .window_height = window_height,
+            .valid_width = data->client_surface_backing_valid ?
+                           data->client_surface_backing_valid_width : 0,
+            .valid_height = data->client_surface_backing_valid ?
+                            data->client_surface_backing_valid_height : 0,
+            .depth = data->vis.depth,
+            .visual = data->vis.visualid,
+            .shrink_start = data->client_surface_backing_shrink_start,
+        },
     };
 
     return submit_client_surface_compositor_job( &job );
@@ -4098,7 +4215,7 @@ static void remove_client_surface_backing_target( HWND toplevel )
     struct client_surface_compositor_job job =
     {
         .op = CLIENT_SURFACE_COMPOSITOR_REMOVE_TARGET,
-        .handoff_toplevel = toplevel,
+        .toplevel = toplevel,
     };
 
     /* A plan can exist without output pixmaps, but an ordinary window's
@@ -4118,11 +4235,14 @@ BOOL X11DRV_client_surface_backing_begin_update( HWND hwnd, const struct window_
     struct client_surface_compositor_job job =
     {
         .op = CLIENT_SURFACE_COMPOSITOR_BEGIN_UPDATE,
-        .handoff_toplevel = hwnd,
-        .update_types = X11DRV_CLIENT_SURFACE_UPDATE_STATE |
-            ((swp_flags & (WINE_SWP_CLIENT_SURFACE_BACKING_ENABLE | WINE_SWP_CLIENT_SURFACE_BACKING_DISABLE))
-             ? X11DRV_CLIENT_SURFACE_UPDATE_BACKING : 0) |
-            ((swp_flags & WINE_SWP_CLIENT_SURFACE_PREPARE) ? X11DRV_CLIENT_SURFACE_UPDATE_PREPARE : 0),
+        .toplevel = hwnd,
+        .u.update =
+        {
+            .types = X11DRV_CLIENT_SURFACE_UPDATE_STATE |
+                ((swp_flags & (WINE_SWP_CLIENT_SURFACE_BACKING_ENABLE | WINE_SWP_CLIENT_SURFACE_BACKING_DISABLE))
+                 ? X11DRV_CLIENT_SURFACE_UPDATE_BACKING : 0) |
+                ((swp_flags & WINE_SWP_CLIENT_SURFACE_PREPARE) ? X11DRV_CLIENT_SURFACE_UPDATE_PREPARE : 0),
+        },
     };
 
     if (deferred) *deferred = FALSE;
@@ -4134,7 +4254,7 @@ BOOL X11DRV_client_surface_backing_begin_update( HWND hwnd, const struct window_
      * The server roster/epoch check continues
      * to invalidate topology and producer changes. Be conservative for
      * fullscreen mappings, shape, frame and actual native geometry changes. */
-    job.invalidate_scene = !rects || (swp_flags & no_geometry) != no_geometry ||
+    job.u.update.invalidate_scene = !rects || (swp_flags & no_geometry) != no_geometry ||
         (swp_flags & (SWP_SHOWWINDOW | SWP_HIDEWINDOW | SWP_FRAMECHANGED | SWP_STATECHANGED)) ||
         data->is_fullscreen || (swp_flags & WINE_SWP_FULLSCREEN) ||
         memcmp( &data->rects, rects, sizeof(*rects) );
@@ -4147,14 +4267,14 @@ BOOL X11DRV_client_surface_backing_begin_update( HWND hwnd, const struct window_
      * A new backing activation retains its synchronous native publication
      * boundary. Repeated enables can coalesce with a pending disable while
      * the native backing is still enabled. */
-    if (deferred && !job.invalidate_scene && !activation &&
+    if (deferred && !job.u.update.invalidate_scene && !activation &&
         !(swp_flags & WINE_SWP_CLIENT_SURFACE_PUBLISH))
     {
         BOOL ret;
 
         job.op = CLIENT_SURFACE_COMPOSITOR_TRY_BEGIN_UPDATE;
         ret = submit_client_surface_compositor_job( &job );
-        *deferred = job.update_deferred;
+        *deferred = job.u.update.deferred;
         return ret;
     }
 
@@ -4170,12 +4290,15 @@ UINT X11DRV_client_surface_backing_resume_update( HWND hwnd, UINT64 serial )
     struct client_surface_compositor_job job =
     {
         .op = CLIENT_SURFACE_COMPOSITOR_CHECK_UPDATE,
-        .handoff_toplevel = hwnd,
-        .mark = serial,
+        .toplevel = hwnd,
+        .u.update =
+        {
+            .mark = serial,
+        },
     };
 
     if (!submit_client_surface_compositor_job( &job )) return 0;
-    return job.update_types;
+    return job.u.update.types;
 }
 
 void X11DRV_client_surface_backing_finish_deferred_update( HWND hwnd, UINT64 serial )
@@ -4183,8 +4306,11 @@ void X11DRV_client_surface_backing_finish_deferred_update( HWND hwnd, UINT64 ser
     struct client_surface_compositor_job job =
     {
         .op = CLIENT_SURFACE_COMPOSITOR_FINISH_UPDATE,
-        .handoff_toplevel = hwnd,
-        .mark = serial,
+        .toplevel = hwnd,
+        .u.update =
+        {
+            .mark = serial,
+        },
     };
 
     /* Even if the server no longer needs a prepare or backing transition,
@@ -4198,7 +4324,7 @@ void X11DRV_client_surface_backing_end_update( struct x11drv_win_data *data )
     struct client_surface_compositor_job job =
     {
         .op = CLIENT_SURFACE_COMPOSITOR_END_UPDATE,
-        .handoff_toplevel = data->hwnd,
+        .toplevel = data->hwnd,
     };
 
     /* The GUI connection owns native geometry, shape and staging. Its changes
@@ -4218,13 +4344,16 @@ static BOOL register_client_surface_handoff( HWND toplevel,
     struct client_surface_compositor_job job =
     {
         .op = CLIENT_SURFACE_COMPOSITOR_REGISTER_HANDOFF,
-        .process = desc->process,
-        .identity = desc->surface,
-        .cookie = desc->cookie,
-        .mark = mark,
-        .handoff_window = wine_server_ptr_handle( desc->handle ),
-        .handoff_toplevel = toplevel,
-        .ready_fd = -1,
+        .toplevel = toplevel,
+        .u.registration =
+        {
+            .process = desc->process,
+            .identity = desc->surface,
+            .cookie = desc->cookie,
+            .mark = mark,
+            .window = wine_server_ptr_handle( desc->handle ),
+            .ready_fd = -1,
+        },
     };
     HANDLE event = NULL;
     BOOL ret = FALSE;
@@ -4240,11 +4369,11 @@ static BOOL register_client_surface_handoff( HWND toplevel,
         status = wine_server_call( req );
         if (!status)
         {
-            job.mapping = wine_server_ptr_handle( reply->mapping );
-            job.view_size = reply->size;
-            job.offset = reply->offset;
-            job.mapping_id = reply->mapping_id;
-            job.cookie = reply->cookie;
+            job.u.registration.mapping = wine_server_ptr_handle( reply->mapping );
+            job.u.registration.view_size = reply->size;
+            job.u.registration.offset = reply->offset;
+            job.u.registration.mapping_id = reply->mapping_id;
+            job.u.registration.cookie = reply->cookie;
         }
     }
     SERVER_END_REQ;
@@ -4254,7 +4383,7 @@ static BOOL register_client_surface_handoff( HWND toplevel,
         req->handle = desc->handle;
         req->producer = desc->process;
         req->surface = desc->surface;
-        req->cookie = job.cookie;
+        req->cookie = job.u.registration.cookie;
         req->owner = 1;
         status = wine_server_call( req );
         if (!status) event = wine_server_ptr_handle( reply->event );
@@ -4262,22 +4391,21 @@ static BOOL register_client_surface_handoff( HWND toplevel,
     SERVER_END_REQ;
     if (!status)
     {
-        status = wine_server_handle_to_fd( event, FILE_READ_DATA, &job.ready_fd, NULL );
+        status = wine_server_handle_to_fd( event, FILE_READ_DATA, &job.u.registration.ready_fd, NULL );
         NtClose( event );
     }
     if (status) goto release;
     ret = submit_client_surface_compositor_job( &job );
-    if (!job.complete && job.ready_fd >= 0) close( job.ready_fd );
 
 release:
-    NtClose( job.mapping );
+    NtClose( job.u.registration.mapping );
     if (ret) return TRUE;
     SERVER_START_REQ( release_client_surface_handoff )
     {
         req->handle = wine_server_user_handle( toplevel );
         req->producer = desc->process;
         req->surface = desc->surface;
-        req->cookie = job.cookie;
+        req->cookie = job.u.registration.cookie;
         req->owner = 1;
         wine_server_call( req );
     }
@@ -4291,17 +4419,20 @@ static BOOL bind_client_surface_handoffs( HWND toplevel, struct client_surface_h
     struct client_surface_compositor_job job =
     {
         .op = CLIENT_SURFACE_COMPOSITOR_REUSE_HANDOFFS,
-        .handoff_toplevel = toplevel,
-        .handoffs = descs,
-        .handoff_count = count,
-        .mark = mark,
+        .toplevel = toplevel,
+        .u.reuse =
+        {
+            .handoffs = descs,
+            .count = count,
+            .mark = mark,
+        },
     };
     BOOL *reused, ret = FALSE;
     UINT i;
 
     if (!count) return TRUE;
     if (!(reused = calloc( count, sizeof(*reused) ))) return FALSE;
-    job.handoff_reused = reused;
+    job.u.reuse.reused = reused;
     if (!submit_client_surface_compositor_job( &job )) goto done;
     for (i = 0; i < count; ++i)
         /* A live producer can have unread frames or a capture already
@@ -4398,10 +4529,13 @@ static BOOL refresh_client_surface_handoffs( HWND toplevel )
         struct client_surface_compositor_job job =
         {
             .op = CLIENT_SURFACE_COMPOSITOR_CHECK_SCENE,
-            .handoff_toplevel = toplevel,
-            .scene_epoch = scene_generation,
-            .handoffs = descs,
-            .handoff_count = count,
+            .toplevel = toplevel,
+            .u.scene_check =
+            {
+                .epoch = scene_generation,
+                .handoffs = descs,
+                .count = count,
+            },
         };
 
         /* Backing ensure, snapshot and end-update can refresh the same plan
@@ -4441,17 +4575,20 @@ static BOOL refresh_client_surface_handoffs( HWND toplevel )
         struct client_surface_compositor_job job =
         {
             .op = CLIENT_SURFACE_COMPOSITOR_SWEEP_HANDOFFS,
-            .handoff_toplevel = toplevel,
-            .mark = mark,
-            .scene_epoch = scene_generation,
-            .layouts = layouts,
-            .layout_count = layout_count,
+            .toplevel = toplevel,
+            .u.scene_install =
+            {
+                .mark = mark,
+                .epoch = scene_generation,
+                .layouts = layouts,
+                .count = layout_count,
+            },
         };
         BOOL installed;
 
         installed = submit_client_surface_compositor_job( &job );
-        layouts = job.layouts;
-        layout_count = job.layout_count;
+        layouts = job.u.scene_install.layouts;
+        layout_count = job.u.scene_install.count;
         if (!installed) goto failed;
     }
     free_client_surface_scene_layouts( layouts, layout_count );
@@ -4478,7 +4615,7 @@ BOOL X11DRV_RepairClientSurfaceOwner( HWND hwnd, BOOL resolve )
     struct client_surface_compositor_job job =
     {
         .op = resolve ? CLIENT_SURFACE_COMPOSITOR_RESOLVE_SOURCES : CLIENT_SURFACE_COMPOSITOR_REPAIR_OWNER,
-        .handoff_toplevel = hwnd,
+        .toplevel = hwnd,
     };
 
     if (!resolve)
@@ -4531,7 +4668,7 @@ BOOL X11DRV_client_surface_backing_retire( struct x11drv_win_data *data )
     struct client_surface_compositor_job job =
     {
         .op = CLIENT_SURFACE_COMPOSITOR_RETIRE_POOL,
-        .handoff_toplevel = data->hwnd,
+        .toplevel = data->hwnd,
     };
 
     if (!submit_client_surface_compositor_job( &job )) return FALSE;
@@ -4561,15 +4698,18 @@ BOOL X11DRV_client_surface_prepare_owner( struct x11drv_win_data *data )
         struct client_surface_compositor_job job =
         {
             .op = CLIENT_SURFACE_COMPOSITOR_RENEW_DIRECT,
-            .handoff_toplevel = data->hwnd,
-            .scene_epoch = scene.epoch,
-            .destination = data->whole_window,
-            .source_x = data->rects.client.left - data->rects.visible.left,
-            .source_y = data->rects.client.top - data->rects.visible.top,
-            .width = data->rects.client.right - data->rects.client.left,
-            .height = data->rects.client.bottom - data->rects.client.top,
-            .window_width = data->rects.visible.right - data->rects.visible.left,
-            .window_height = data->rects.visible.bottom - data->rects.visible.top,
+            .toplevel = data->hwnd,
+            .u.direct_renew =
+            {
+                .scene_epoch = scene.epoch,
+                .destination = data->whole_window,
+                .source_x = data->rects.client.left - data->rects.visible.left,
+                .source_y = data->rects.client.top - data->rects.visible.top,
+                .width = data->rects.client.right - data->rects.client.left,
+                .height = data->rects.client.bottom - data->rects.client.top,
+                .window_width = data->rects.visible.right - data->rects.visible.left,
+                .window_height = data->rects.visible.bottom - data->rects.visible.top,
+            },
         };
 
         X11DRV_sync_window_changes( data->display );
@@ -4803,16 +4943,17 @@ BOOL X11DRV_client_surface_backing_restore( struct x11drv_win_data *data,
     job = (struct client_surface_compositor_job)
     {
         .op = CLIENT_SURFACE_COMPOSITOR_RESTORE_TARGET,
-        .destination = window,
-        .source_x = rect->left,
-        .source_y = rect->top,
-        .destination_x = rect->left,
-        .destination_y = rect->top,
-        .width = rect->right - rect->left,
-        .height = rect->bottom - rect->top,
-        .window_width = window_width,
-        .window_height = window_height,
-        .handoff_toplevel = data->hwnd,
+        .toplevel = data->hwnd,
+        .u.restore =
+        {
+            .destination = window,
+            .destination_x = rect->left,
+            .destination_y = rect->top,
+            .width = rect->right - rect->left,
+            .height = rect->bottom - rect->top,
+            .window_width = window_width,
+            .window_height = window_height,
+        },
     };
     if (submit_client_surface_compositor_job( &job ))
     {
