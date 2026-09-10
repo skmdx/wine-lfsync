@@ -189,7 +189,11 @@ struct client_surface_compositor_frame
 
 struct client_surface_compositor_target
 {
-    struct client_surface_compositor_target *next;
+    struct client_surface_compositor_target *next, **prev;
+    struct rb_entry registry_entry;
+#ifdef SONAME_LIBXPRESENT
+    struct rb_entry present_entry;
+#endif
     struct client_surface_memory_scope memory;
     struct client_surface_owner_notifications *notifications;
     HWND toplevel;
@@ -242,6 +246,30 @@ static struct client_surface_compositor_pool *client_surface_compositor_pools;
 static struct client_surface_compositor_binding *client_surface_compositor_bindings;
 static struct client_surface_compositor_target *client_surface_compositor_targets;
 static UINT64 client_surface_compositor_mark;
+
+static int compare_client_surface_compositor_target( const void *key, const struct rb_entry *entry )
+{
+    const struct client_surface_compositor_target *target =
+        CONTAINING_RECORD( entry, const struct client_surface_compositor_target, registry_entry );
+    ULONG_PTR a = (ULONG_PTR)key, b = (ULONG_PTR)target->toplevel;
+
+    return (a > b) - (a < b);
+}
+
+/* The actor alone publishes and removes targets. Keep lookup independent of
+ * maintenance traversal, without adding an allocation or a metadata lock to
+ * each source/event. Both intrusive indices share the target's accounting. */
+static struct rb_tree client_surface_compositor_target_registry = {compare_client_surface_compositor_target};
+
+static void register_client_surface_compositor_target( struct client_surface_compositor_target *target )
+{
+    assert( !rb_get( &client_surface_compositor_target_registry, target->toplevel ) );
+    rb_put( &client_surface_compositor_target_registry, target->toplevel, &target->registry_entry );
+    target->next = client_surface_compositor_targets;
+    target->prev = &client_surface_compositor_targets;
+    if (target->next) target->next->prev = &target->next;
+    client_surface_compositor_targets = target;
+}
 
 enum client_surface_compositor_op
 {
@@ -1036,13 +1064,25 @@ static BOOL client_surface_free_on_compositor( const Pixmap pixmaps[2] )
 
 #ifdef SONAME_LIBXPRESENT
 
-static struct client_surface_compositor_target *find_client_surface_compositor_window( Window window )
+static int compare_client_surface_compositor_present( const void *key, const struct rb_entry *entry )
+{
+    const struct client_surface_compositor_target *target =
+        CONTAINING_RECORD( entry, const struct client_surface_compositor_target, present_entry );
+    XID a = *(const XID *)key, b = target->present_event;
+
+    return (a > b) - (a < b);
+}
+
+static struct rb_tree client_surface_compositor_present_registry = {compare_client_surface_compositor_present};
+
+static struct client_surface_compositor_target *find_client_surface_compositor_present( XID event, Window window )
 {
     struct client_surface_compositor_target *target;
+    struct rb_entry *entry;
 
-    for (target = client_surface_compositor_targets; target; target = target->next)
-        if (target->window == window) return target;
-    return NULL;
+    if (!(entry = rb_get( &client_surface_compositor_present_registry, &event ))) return NULL;
+    target = CONTAINING_RECORD( entry, struct client_surface_compositor_target, present_entry );
+    return target->window == window ? target : NULL;
 }
 
 static struct client_surface_compositor_frame *find_client_surface_compositor_frame(
@@ -1156,16 +1196,16 @@ static void process_client_surface_present_events(void)
             XPresentCompleteNotifyEvent *notify = event.xcookie.data;
 
             if (notify->kind == PresentCompleteKindPixmap &&
-                (target = find_client_surface_compositor_window( notify->window )) &&
+                (target = find_client_surface_compositor_present( notify->eid, notify->window )) &&
                 (frame = find_client_surface_compositor_frame( target,
                                                                notify->serial_number, 0 )))
             {
                 BOOL success = notify->mode != PresentCompleteModeSkip;
 
                 TRACE_(csperf)( "ticks=%llu event=complete window=%lx pixmap=%lx serial=%u "
-                               "mode=%u ust=%s msc=%s\n", client_surface_perf_time(), target->window,
+                               "mode=%u ust=%s msc=%s event_id=%lx\n", client_surface_perf_time(), target->window,
                                frame->pixmap, frame->serial, notify->mode,
-                               wine_dbgstr_longlong( notify->ust ), wine_dbgstr_longlong( notify->msc ) );
+                               wine_dbgstr_longlong( notify->ust ), wine_dbgstr_longlong( notify->msc ), target->present_event );
                 frame->complete = TRUE;
                 frame->last_complete_serial = frame->serial;
                 frame->last_complete_success = success;
@@ -1176,12 +1216,12 @@ static void process_client_surface_present_events(void)
         {
             XPresentIdleNotifyEvent *notify = event.xcookie.data;
 
-            if ((target = find_client_surface_compositor_window( notify->window )) &&
+            if ((target = find_client_surface_compositor_present( notify->eid, notify->window )) &&
                 (frame = find_client_surface_compositor_frame( target,
                     notify->serial_number, notify->pixmap )))
             {
-                TRACE_(csperf)( "ticks=%llu event=idle window=%lx pixmap=%lx serial=%u\n",
-                               client_surface_perf_time(), target->window, frame->pixmap, frame->serial );
+                TRACE_(csperf)( "ticks=%llu event=idle window=%lx pixmap=%lx serial=%u event_id=%lx\n",
+                               client_surface_perf_time(), target->window, frame->pixmap, frame->serial, target->present_event );
                 frame->idle = TRUE;
             }
         }
@@ -1522,21 +1562,20 @@ static struct client_surface_compositor_pool *find_client_surface_compositor_poo
 
 static struct client_surface_compositor_target *find_client_surface_compositor_target( HWND toplevel )
 {
-    struct client_surface_compositor_target *target;
+    struct rb_entry *entry;
 
-    for (target = client_surface_compositor_targets; target; target = target->next)
-        if (target->toplevel == toplevel) return target;
-    return NULL;
+    if (!(entry = rb_get( &client_surface_compositor_target_registry, toplevel ))) return NULL;
+    return CONTAINING_RECORD( entry, struct client_surface_compositor_target, registry_entry );
 }
 
 static BOOL client_surface_present_on_compositor( struct client_surface_compositor_job *job )
 {
 #ifdef SONAME_LIBXPRESENT
     struct client_surface_compositor_target *target =
-        find_client_surface_compositor_window( job->u.present.destination );
+        find_client_surface_compositor_target( job->toplevel );
     struct client_surface_compositor_frame *frame;
 
-    if (!usexpresent || !target ||
+    if (!usexpresent || !target || target->window != job->u.present.destination ||
         !(frame = acquire_client_surface_compositor_frame( target, job->u.present.source )))
         return FALSE;
     frame->width = job->u.present.width;
@@ -2055,6 +2094,7 @@ static void free_client_surface_compositor_present_input( struct client_surface_
     {
         int error = 0;
 
+        rb_remove( &client_surface_compositor_present_registry, &target->present_entry );
         /* The GUI can destroy the native window before its asynchronous
          * target removal reaches the actor. The server already discarded
          * that window's event selection; check the late unregistration too. */
@@ -2102,11 +2142,7 @@ static BOOL update_client_surface_compositor_target( struct client_surface_compo
                 (allocation->pixmaps[0] == job->u.pool.pixmaps[1] && allocation->pixmaps[1] == job->u.pool.pixmaps[0])) break;
         if (!allocation) goto failed;
     }
-    if (created)
-    {
-        target->next = client_surface_compositor_targets;
-        client_surface_compositor_targets = target;
-    }
+    if (created) register_client_surface_compositor_target( target );
     if (target->window != job->u.pool.destination || target->window_width != job->u.pool.window_width ||
         target->window_height != job->u.pool.window_height || !same_pool)
         quiesce_client_surface_compositor_target( target );
@@ -2180,6 +2216,13 @@ static BOOL update_client_surface_compositor_target( struct client_surface_compo
         XSync( client_surface_compositor_display, False );
         X11DRV_check_error();
         if (error) target->present_event = 0;
+        if (target->present_event)
+        {
+            assert( !rb_get( &client_surface_compositor_present_registry, &target->present_event ) );
+            rb_put( &client_surface_compositor_present_registry, &target->present_event, &target->present_entry );
+            TRACE_(csperf)( "ticks=%llu event=present_input_register window=%lx event_id=%lx\n",
+                           client_surface_perf_time(), target->window, target->present_event );
+        }
     }
 #endif
     return TRUE;
@@ -2209,28 +2252,24 @@ failed:
 
 static BOOL remove_client_surface_compositor_target( HWND toplevel )
 {
-    struct client_surface_compositor_target **cursor;
+    struct client_surface_compositor_target *target;
+    unsigned int i;
 
     sweep_client_surface_compositor_handoffs( toplevel, 0, 0 );
-    for (cursor = &client_surface_compositor_targets; *cursor; cursor = &(*cursor)->next)
+    if (!(target = find_client_surface_compositor_target( toplevel ))) return TRUE;
+    drain_client_surface_compositor_target( target );
+    free_client_surface_compositor_present_input( target );
+    for (i = 0; i < ARRAY_SIZE(target->frames); ++i)
     {
-        struct client_surface_compositor_target *target = *cursor;
-        unsigned int i;
-
-        if (target->toplevel != toplevel) continue;
-        drain_client_surface_compositor_target( target );
-        free_client_surface_compositor_present_input( target );
-        for (i = 0; i < ARRAY_SIZE(target->frames); ++i)
-        {
-            client_surface_xcb_free_gc( client_surface_compositor_display, &target->frames[i].xcb_gc );
-            if (target->frames[i].gc) XFreeGC( client_surface_compositor_display, target->frames[i].gc );
-        }
-        free_client_surface_compositor_mailbox( target );
-        *cursor = target->next;
-        free_client_surface_scene_plan( target );
-        free_client_surface_compositor_target( target );
-        return TRUE;
+        client_surface_xcb_free_gc( client_surface_compositor_display, &target->frames[i].xcb_gc );
+        if (target->frames[i].gc) XFreeGC( client_surface_compositor_display, target->frames[i].gc );
     }
+    free_client_surface_compositor_mailbox( target );
+    rb_remove( &client_surface_compositor_target_registry, &target->registry_entry );
+    *target->prev = target->next;
+    if (target->next) target->next->prev = target->prev;
+    free_client_surface_scene_plan( target );
+    free_client_surface_compositor_target( target );
     return TRUE;
 }
 
@@ -2352,11 +2391,7 @@ static BOOL install_client_surface_direct_plan( const struct client_surface_comp
     }
     SERVER_END_REQ;
     if (!accepted) goto done;
-    if (allocated)
-    {
-        target->next = client_surface_compositor_targets;
-        client_surface_compositor_targets = target;
-    }
+    if (allocated) register_client_surface_compositor_target( target );
     /* Only authenticated admission may cancel the previous assembly. While
      * native reads and Present requests drained, the scheduler paused new
      * work without discarding a newer scene's assembly or mailbox. Keep its
