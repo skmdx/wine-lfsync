@@ -3577,7 +3577,9 @@ static void dump_set_client_surface_native_barrier_reply( const struct set_clien
 static void dump_set_client_surface_state_request( const struct set_client_surface_state_request *req )
 {
     fprintf( stderr, " handle=%08x", req->handle );
+    fprintf( stderr, ", scene_toplevel=%08x", req->scene_toplevel );
     dump_uint64( ", surface=", &req->surface );
+    dump_uint64( ", producer_sequence=", &req->producer_sequence );
     fprintf( stderr, ", flags=%08x", req->flags );
     dump_uint64( ", generation=", &req->generation );
     dump_uint64( ", scene_generation=", &req->scene_generation );

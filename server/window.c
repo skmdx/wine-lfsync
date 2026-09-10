@@ -79,6 +79,7 @@ struct client_surface_ref
     UINT64         id;
     unsigned long long generation;
     unsigned long long sequence;
+    unsigned long long candidate_serial; /* uncompleted native preparation, zero when absent */
     unsigned int    active : 1;
     unsigned int    cached : 1;
     unsigned int    claimed : 1; /* an active surface which completed a host present */
@@ -100,6 +101,8 @@ static UINT64 client_surface_id = (UINT64)1 << 32;
 static void retire_client_surface_handoff( struct client_surface_ref *surface );
 static void invalidate_client_surface_owner_repair( struct client_surface_ref *surface );
 static int client_surface_direct_candidate( struct window *top );
+static struct client_surface_ref *get_client_surface_native_candidate( struct window *top,
+                                                                      struct client_surface_owner **owner );
 static int client_surface_direct_registration_candidate( struct window *top );
 static int client_surface_direct_eligible( struct window *top );
 static enum client_surface_presentation_mode client_surface_presentation_mode( struct window *top );
@@ -173,7 +176,7 @@ static void retire_client_surface_ref( struct client_surface_ref *surface )
 {
     retire_client_surface_handoff( surface );
     list_remove( &surface->entry );
-    surface->active = surface->cached = surface->claimed = 0;
+    surface->active = surface->cached = surface->claimed = surface->candidate_serial = 0;
     surface->owner = NULL;
     free_client_surface_ref_if_unused( surface );
 }
@@ -332,6 +335,8 @@ static unsigned long long client_surface_transaction_generation( const struct wi
 
 static void update_client_surface_publication( struct window *top )
 {
+    struct client_surface_owner *owner;
+    struct client_surface_ref *candidate = get_client_surface_native_candidate( top, &owner );
     enum client_surface_presentation_mode mode = client_surface_presentation_mode( top );
     int direct = mode == CLIENT_SURFACE_PRESENTATION_DIRECT;
     int backing_required = top->client_surface_subtree_count &&
@@ -348,6 +353,8 @@ static void update_client_surface_publication( struct window *top )
     {
         shared->client_surface_generation = client_surface_transaction_generation( top );
         shared->client_surface_scene_generation = top->client_surface_scene_generation;
+        shared->client_surface_native_candidate = !top->client_surface_transaction.staged &&
+            !top->client_surface_native_barrier && candidate ? candidate->id : 0;
         shared->client_surface_flags =
             (top->client_surface_transaction.staged ? WINDOW_SHM_CLIENT_SURFACE_STAGED : 0) |
             (client_surface_is_composing( top ) ? WINDOW_SHM_CLIENT_SURFACE_COMPOSING : 0) |
@@ -1126,6 +1133,8 @@ static struct window *create_window( struct window *parent, struct window *owner
         shared->client_surface_flags = 0;
         shared->client_surface_process = 0;
         shared->client_surface_id = 0;
+        shared->client_surface_producer_sequence = 0;
+        shared->client_surface_native_candidate = 0;
         memset( (void *)&shared->info, 0, sizeof(shared->info) );
         memset( (void *)shared->extra, 0, extra_size );
         shared->info.wndproc    = get_class_wndproc( win->class, &ansi );
@@ -1503,28 +1512,58 @@ static int client_surface_has_visible_descendant_producer( struct window *win )
  * this candidate to COMPOSITED.  Restrict the initial direct path to the
  * owner process: foreign HWNDs have no local win_data with which to attach the
  * producer's native child window. */
+static struct client_surface_ref *get_client_surface_native_candidate( struct window *top,
+                                                                      struct client_surface_owner **owner )
+{
+    struct client_surface_ref *selected;
+    struct client_surface_owner *entry;
+    struct window *child;
+
+    *owner = NULL;
+    if (!is_visible( top ) || top->client_surface_subtree_count != 1 ||
+        top->client_surface_count != 1 || !top->thread)
+        return NULL;
+    selected = select_client_surface_producer( top, owner );
+    if (!selected)
+        LIST_FOR_EACH_ENTRY( entry, &top->client_surface_owners, struct client_surface_owner, entry )
+        {
+            struct client_surface_ref *surface;
+            LIST_FOR_EACH_ENTRY( surface, &entry->surfaces, struct client_surface_ref, entry )
+                if (surface->active && surface->candidate_serial)
+                {
+                    selected = surface;
+                    *owner = entry;
+                }
+        }
+    if (!selected || !selected->active || !selected->direct_presentation ||
+        (*owner)->process != top->thread->process)
+        return NULL;
+    LIST_FOR_EACH_ENTRY( child, &top->children, struct window, entry )
+        if (client_surface_has_visible_descendant_producer( child ))
+            return NULL;
+    return selected;
+}
+
 static int client_surface_direct_candidate( struct window *top )
 {
     struct client_surface_owner *owner;
-    struct client_surface_ref *selected;
-    struct window *child;
+    return !!get_client_surface_native_candidate( top, &owner );
+}
 
-    if (!is_visible( top ) || top->client_surface_subtree_count != 1 ||
-        top->client_surface_count != 1)
-        return 0;
-    if (!(selected = select_client_surface_producer( top, &owner )) ||
-        !selected->active || !selected->claimed || !selected->direct_presentation || !top->thread ||
-        owner->process != top->thread->process)
-        return 0;
-    LIST_FOR_EACH_ENTRY( child, &top->children, struct window, entry )
-        if (client_surface_has_visible_descendant_producer( child ))
-            return 0;
-    return 1;
+/* A scene can prepare the sole native candidate without advertising it as
+ * a completed producer. Existing completed images always take precedence. */
+static struct client_surface_ref *select_client_surface_scene_producer( struct window *win,
+                                                                        struct client_surface_owner **owner )
+{
+    struct client_surface_ref *surface = select_client_surface_producer( win, owner );
+    if (!surface && get_toplevel_window( win ) == win)
+        surface = get_client_surface_native_candidate( win, owner );
+    return surface;
 }
 
 /* Registration precedes the first producer claim.  Avoid provisioning a
  * backing in that gap when the sole possible producer is a same-process
- * DIRECT backend; prepare_present() claims it before the first native swap.
+ * DIRECT backend; prepare_present() requests native admission before swapping.
  * Any second identity, descendant or foreign/non-DIRECT producer removes
  * this exemption immediately on the topology slow path. */
 static int client_surface_direct_registration_candidate( struct window *top )
@@ -1574,7 +1613,7 @@ static int client_surface_scene_published_recursive( struct window *win,
     struct window *child;
 
     if (!win->client_surface_subtree_count) return 1;
-    selected = select_client_surface_producer( win, &owner );
+    selected = select_client_surface_scene_producer( win, &owner );
     if (selected && is_visible( win ))
     {
         (*selected_count)++;
@@ -1601,6 +1640,7 @@ static void update_client_surface_producer( struct window *win )
     {
         shared->client_surface_process = surface ? owner->process->id : 0;
         shared->client_surface_id = surface ? surface->id : 0;
+        shared->client_surface_producer_sequence = surface ? surface->sequence : 0;
     }
     SHARED_WRITE_END;
 }
@@ -2056,7 +2096,10 @@ static struct client_surface_ref *get_client_surface_handoff_ref( struct window 
         set_error( STATUS_INVALID_PARAMETER );
         return NULL;
     }
-    if (owner_view && select_client_surface_producer( win, &selected_owner ) != surface)
+    /* A sole native candidate may need an offscreen first image if DIRECT
+     * admission fails. Provision its transport without granting publication
+     * authority; an existing completed producer always wins scene selection. */
+    if (owner_view && select_client_surface_scene_producer( win, &selected_owner ) != surface)
     {
         set_error( STATUS_INVALID_PARAMETER );
         return NULL;
@@ -2487,7 +2530,7 @@ static unsigned int prepare_client_surface_generation( struct window *win, unsig
     unsigned int count = 0;
 
     if (!win->client_surface_subtree_count) return 0;
-    selected = select_client_surface_producer( win, &selected_owner );
+    selected = select_client_surface_scene_producer( win, &selected_owner );
     LIST_FOR_EACH_ENTRY( owner, &win->client_surface_owners, struct client_surface_owner, entry )
     {
         LIST_FOR_EACH_ENTRY( surface, &owner->surfaces, struct client_surface_ref, entry )
@@ -2570,7 +2613,7 @@ static void mark_client_surface_source_recovery( struct window *win, struct wind
     unsigned int low = 0, high = receipt_count;
 
     if (!win->client_surface_subtree_count || !is_visible( win )) return;
-    if ((surface = select_client_surface_producer( win, &owner )) &&
+    if ((surface = select_client_surface_scene_producer( win, &owner )) &&
         surface->generation == client_surface_transaction_generation( top ))
     {
         while (low < high)
@@ -5152,7 +5195,7 @@ static int collect_client_surface_scene_snapshot( struct window *win, struct win
     struct window *child;
 
     if (!win->client_surface_subtree_count) return 1;
-    if ((surface = select_client_surface_producer( win, &owner )))
+    if ((surface = select_client_surface_scene_producer( win, &owner )))
     {
         struct client_surface_scene_layer layer = {0};
         struct client_surface_clip_window *clips = NULL;
@@ -5268,7 +5311,7 @@ DECL_HANDLER(prepare_client_surface_direct_plan)
         top->client_surface_transaction.restart_pending || top->client_surface_native_barrier ||
         top->client_surface_scene_change_depth || client_surface_direct_eligible( top ) ||
         !client_surface_direct_candidate( top ) ||
-        !(surface = select_client_surface_producer( top, &owner )) || surface->id != req->surface ||
+        !(surface = get_client_surface_native_candidate( top, &owner )) || surface->id != req->surface ||
         owner->process != current->process || !surface->scene_publication || surface->generation)
         return;
 
@@ -5295,7 +5338,7 @@ DECL_HANDLER(prepare_client_surface_direct_plan)
         top->client_surface_scene_generation != req->scene_id &&
         top->client_surface_transaction.epoch == top->client_surface_scene_generation &&
         top->client_surface_transaction.pending == 1 && client_surface_direct_candidate( top ) &&
-        (surface = select_client_surface_producer( top, &owner )) && surface->id == req->surface &&
+        (surface = get_client_surface_native_candidate( top, &owner )) && surface->id == req->surface &&
         surface->generation == top->client_surface_scene_generation)
     {
         if (req->previous_scene)
@@ -5332,7 +5375,7 @@ DECL_HANDLER(select_client_surface_direct_plan)
         req->scene_id != top->client_surface_transaction.epoch ||
         top->client_surface_transaction.staged || top->client_surface_native_barrier ||
         !client_surface_direct_candidate( top ) ||
-        !(surface = select_client_surface_producer( top, &owner )) || surface->id != req->surface ||
+        !(surface = get_client_surface_native_candidate( top, &owner )) || surface->id != req->surface ||
         !surface->scene_publication || surface->generation != req->scene_id ||
         top->client_surface_transaction.pending != 1)
         return;
@@ -5473,8 +5516,9 @@ DECL_HANDLER(set_client_surface_native_barrier)
 DECL_HANDLER(set_client_surface_state)
 {
     struct client_surface_owner *owner, *selected_owner;
-    struct client_surface_ref *surface, *selected_before, *selected_after;
+    struct client_surface_ref *surface, *selected_before, *selected_after, *producer_before;
     struct window *win, *top;
+    unsigned long long producer_sequence_before;
     unsigned int selected_caps_before;
     int scene_change, was_pending, direct_before;
 
@@ -5520,7 +5564,9 @@ DECL_HANDLER(set_client_surface_state)
         return;
     }
 
-    selected_before = select_client_surface_producer( win, &selected_owner );
+    producer_before = select_client_surface_producer( win, &selected_owner );
+    producer_sequence_before = producer_before ? producer_before->sequence : 0;
+    selected_before = select_client_surface_scene_producer( win, &selected_owner );
     selected_caps_before = selected_before ? get_client_surface_backend_caps( selected_before ) : 0;
     direct_before = client_surface_direct_candidate( top );
 
@@ -5556,18 +5602,32 @@ DECL_HANDLER(set_client_surface_state)
     if ((req->flags & CLIENT_SURFACE_STATE_UNREGISTER) && surface && surface->active)
     {
         surface->active = 0;
+        surface->candidate_serial = 0;
         assert( win->client_surface_count );
         win->client_surface_count--;
         adjust_client_surface_subtree_count( win, -1 );
     }
+    if ((req->flags & CLIENT_SURFACE_STATE_NATIVE_CANDIDATE) && surface && surface->active && !surface->claimed &&
+        req->generation > surface->candidate_serial)
+        surface->candidate_serial = req->generation;
+    /* Cancellation identifies its own preparation. It neither rolls back a
+     * completed producer nor erases a later preparation on the same surface,
+     * including after an owner scene restart or reparent. */
+    if ((req->flags & CLIENT_SURFACE_STATE_CANCEL_CANDIDATE) && surface && !surface->claimed &&
+        req->generation == surface->candidate_serial)
+        surface->candidate_serial = 0;
     if ((req->flags & CLIENT_SURFACE_STATE_CLAIM) && surface && surface->active &&
+        req->scene_toplevel == top->handle && !(req->scene_generation & 1) &&
+        req->producer_sequence == (producer_before ? producer_before->sequence : 0) &&
+        req->scene_generation <= top->client_surface_scene_generation &&
         (!surface->claimed || select_client_surface_producer( win, &selected_owner ) != surface))
     {
         surface->claimed = 1;
+        surface->candidate_serial = 0;
         if (!++client_surface_ref_sequence) ++client_surface_ref_sequence;
         surface->sequence = client_surface_ref_sequence;
     }
-    selected_after = select_client_surface_producer( win, &selected_owner );
+    selected_after = select_client_surface_scene_producer( win, &selected_owner );
     scene_change = selected_before != selected_after ||
                    (selected_after && selected_caps_before !=
                     get_client_surface_backend_caps( selected_after )) ||
@@ -5579,6 +5639,14 @@ DECL_HANDLER(set_client_surface_state)
          * no replay unless they change the sole DIRECT candidate's eligibility:
          * the owner must choose that strategy from a new immutable scene. */
         begin_client_surface_scene_change( top );
+        update_client_surface_producer( win );
+    }
+    else if (producer_before != select_client_surface_producer( win, &selected_owner ) ||
+             (producer_before && producer_sequence_before != producer_before->sequence))
+    {
+        /* Completing the already admitted sole DIRECT candidate changes
+         * producer authority, not the scene's chosen identity or native
+         * target. Preserve that exact plan for its completion receipt. */
         update_client_surface_producer( win );
     }
     if (surface && !surface->active && !surface->cached)

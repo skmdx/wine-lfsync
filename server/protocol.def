@@ -1151,6 +1151,8 @@ typedef volatile struct
     unsigned int         client_surface_flags;      /* WINDOW_SHM_CLIENT_SURFACE_* */
     process_id_t         client_surface_process;    /* authoritative producer process */
     unsigned __int64     client_surface_id;         /* authoritative server-issued surface lifetime */
+    unsigned __int64     client_surface_producer_sequence; /* completed selection on this HWND */
+    unsigned __int64     client_surface_native_candidate; /* sole DIRECT candidate, not a completed producer */
     char                 extra[];          /* extra bytes storage */
 } window_shm_t;
 
@@ -4440,9 +4442,11 @@ enum inproc_sync_type
 /* Track whether a client-rendered window has changed while its hierarchy was hidden. */
 @REQ(set_client_surface_state)
     user_handle_t  handle;        /* client surface window */
+    user_handle_t  scene_toplevel; /* top-level of the completed source scene */
     unsigned __int64 surface;     /* server-issued client surface lifetime */
+    unsigned __int64 producer_sequence; /* completed selection observed before submission */
     unsigned int   flags;         /* CLIENT_SURFACE_STATE_* */
-    unsigned __int64 generation;  /* composition generation being committed */
+    unsigned __int64 generation;  /* composition generation or native preparation serial */
     unsigned __int64 scene_generation; /* scene snapshot being committed */
 @REPLY
     user_handle_t  toplevel;      /* current top-level ancestor */
@@ -4476,6 +4480,8 @@ enum inproc_sync_type
 #define CLIENT_SURFACE_STATE_DIRECT_PRESENTATION 0x200000
 #define CLIENT_SURFACE_STATE_UPDATE_CAPS         0x400000
 #define CLIENT_SURFACE_STATE_FAILED              0x800000
+#define CLIENT_SURFACE_STATE_NATIVE_CANDIDATE    0x1000000
+#define CLIENT_SURFACE_STATE_CANCEL_CANDIDATE    0x2000000
 
 #define CLIENT_SURFACE_PUBLISH_COPY   1  /* GUI must publish its completed backing */
 #define CLIENT_SURFACE_PUBLISH_EXPOSE 2  /* native image is complete; release staging only */

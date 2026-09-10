@@ -1135,6 +1135,8 @@ typedef volatile struct
     unsigned int         client_surface_flags;
     process_id_t         client_surface_process;
     unsigned __int64     client_surface_id;
+    unsigned __int64     client_surface_producer_sequence;
+    unsigned __int64     client_surface_native_candidate;
     char                 extra[];
 } window_shm_t;
 
@@ -6370,9 +6372,12 @@ struct set_client_surface_state_request
 {
     struct request_header __header;
     user_handle_t  handle;
+    user_handle_t  scene_toplevel;
+    char __pad_20[4];
     unsigned __int64 surface;
+    unsigned __int64 producer_sequence;
     unsigned int   flags;
-    char __pad_28[4];
+    char __pad_44[4];
     unsigned __int64 generation;
     unsigned __int64 scene_generation;
 };
@@ -6410,6 +6415,8 @@ struct set_client_surface_state_reply
 #define CLIENT_SURFACE_STATE_DIRECT_PRESENTATION 0x200000
 #define CLIENT_SURFACE_STATE_UPDATE_CAPS         0x400000
 #define CLIENT_SURFACE_STATE_FAILED              0x800000
+#define CLIENT_SURFACE_STATE_NATIVE_CANDIDATE    0x1000000
+#define CLIENT_SURFACE_STATE_CANCEL_CANDIDATE    0x2000000
 
 #define CLIENT_SURFACE_PUBLISH_COPY   1
 #define CLIENT_SURFACE_PUBLISH_EXPOSE 2
@@ -7671,6 +7678,6 @@ union generic_reply
     struct set_window_present_rect_reply set_window_present_rect_reply;
 };
 
-#define SERVER_PROTOCOL_VERSION 1019
+#define SERVER_PROTOCOL_VERSION 1022
 
 #endif /* __WINE_WINE_SERVER_PROTOCOL_H */

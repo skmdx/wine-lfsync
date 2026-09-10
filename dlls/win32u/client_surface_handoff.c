@@ -501,6 +501,7 @@ BOOL client_surface_freeze_frame_locked( struct client_surface *surface,
             frame->damage_base_frame = present->damage_base_sequence;
         }
         surface->composed_serial = present->serial;
+        surface->completed_image_serial = present->serial;
         InterlockedExchange( &surface->content_valid, TRUE );
     }
     /* Source captures release references only. Their admitted backend

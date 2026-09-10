@@ -280,7 +280,8 @@ HWND client_surface_set_server_state( HWND hwnd, const struct client_surface *su
         req->handle = wine_server_user_handle( hwnd );
         req->surface = surface ? client_surface_get_identity( surface ) : 0;
         req->flags = flags;
-        req->generation = generation;
+        req->generation = (flags & CLIENT_SURFACE_STATE_NATIVE_CANDIDATE) && surface ?
+                          surface->present_serial + 1 : generation;
         req->scene_generation = scene_generation;
         if (!wine_server_call( req ))
         {
@@ -333,6 +334,15 @@ void client_surface_invalidate_source_locked( struct client_surface *surface,
     pthread_mutex_lock( &surface->present_lock );
     if (present->serial > surface->composed_serial)
     {
+        /* A later failed write cannot modify an independently owned completed
+         * handoff image. Keep its serial and replay rights until a new image
+         * is actually accepted; mutable native sources still invalidate. */
+        if (surface->content_valid && surface->completed_image_serial &&
+            surface->completed_image_serial == surface->composed_serial)
+        {
+            pthread_mutex_unlock( &surface->present_lock );
+            return;
+        }
         /* A failed or stale presentation may still have changed the native
          * source.  Its previous completed contents are no longer reusable,
          * even if a move or resize has since changed the target sequence.
@@ -400,8 +410,8 @@ void client_surface_prepare_scene( struct client_surface *surface )
         return;
     }
 
-    /* A first submission can select a new producer and require an owner
-     * snapshot. Do that before acquiring a multi-surface submission's locks:
+    /* A first submission can prepare the sole native candidate and require
+     * an owner snapshot. Do that before acquiring a multi-surface submission's locks:
      * preparing the owner may update every surface belonging to it. */
     client_surface_lock_target( surface );
     pthread_mutex_lock( &surface->present_lock );
@@ -410,7 +420,7 @@ void client_surface_prepare_scene( struct client_surface *surface )
     {
         if (!scene.authoritative)
             toplevel = client_surface_set_server_state( surface->hwnd, surface,
-                CLIENT_SURFACE_STATE_CLAIM, 0, 0, &wake );
+                CLIENT_SURFACE_STATE_NATIVE_CANDIDATE, 0, 0, &wake );
         else if (!scene.valid)
             toplevel = scene.toplevel;
     }
@@ -674,6 +684,8 @@ static BOOL read_client_surface_scene( HWND toplevel, struct client_surface_scen
         scene->generation = (window_shm->client_surface_flags & WINDOW_SHM_CLIENT_SURFACE_COMPOSING) ?
                             window_shm->client_surface_generation : 0;
         scene->epoch = window_shm->client_surface_scene_generation;
+        scene->native_candidate = window_shm->client_surface_native_candidate;
+        scene->producer_sequence = window_shm->client_surface_producer_sequence;
         scene->mode = (window_shm->client_surface_flags & WINDOW_SHM_CLIENT_SURFACE_DIRECT) ?
                       CLIENT_SURFACE_PRESENTATION_DIRECT :
                       (window_shm->client_surface_flags & WINDOW_SHM_CLIENT_SURFACE_STAGED) ?
@@ -740,6 +752,7 @@ static BOOL read_client_surface_placement( struct client_surface *surface, struc
     {
         producer_process = producer_shm->client_surface_process;
         producer_id = producer_shm->client_surface_id;
+        scene->producer_sequence = producer_shm->client_surface_producer_sequence;
     }
     if (status)
     {
@@ -810,7 +823,8 @@ static BOOL client_surface_update_present_scene_internal_locked(
     }
     else
         scene_valid = client_surface_get_scene( surface, &scene );
-    if (allow_direct_transition && scene_valid && scene.authoritative && scene.direct_candidate &&
+    if (allow_direct_transition && scene_valid &&
+        scene.native_candidate == client_surface_get_identity( surface ) && scene.direct_candidate &&
         scene.mode != CLIENT_SURFACE_PRESENTATION_DIRECT && surface->backend->prepare_direct)
     {
         /* The owner selects from the final COMPOSING snapshot. Its admission
@@ -823,10 +837,12 @@ static BOOL client_surface_update_present_scene_internal_locked(
      * image through the private completion/handoff path. Candidate excludes
      * native barriers; the even exact scene and identity remain mandatory.
      * This applies only native geometry, never a valid scene or generation. */
-    preparing_candidate = allow_direct_transition && !scene_valid && scene.authoritative &&
+    preparing_candidate = allow_direct_transition && !scene_valid &&
+        scene.native_candidate == client_surface_get_identity( surface ) &&
         scene.direct_candidate && !scene.generation && scene.epoch && !(scene.epoch & 1) &&
         scene.toplevel == next.toplevel && client_surface_scene_snapshot_current( next.toplevel, scene.epoch );
-    next.mode = !scene_valid && !preparing_candidate ? current.mode : scene.authoritative ? scene.mode :
+    next.mode = !scene_valid && !preparing_candidate ? current.mode :
+                (scene.authoritative || scene.native_candidate == client_surface_get_identity( surface )) ? scene.mode :
                 CLIENT_SURFACE_PRESENTATION_COMPOSITED;
     /* Reparenting an already presented offscreen drawable may discard its
      * front buffer.  Keep the last STAGED/COMPOSITED image visible until an
@@ -835,7 +851,7 @@ static BOOL client_surface_update_present_scene_internal_locked(
     defer_direct = !allow_direct_transition &&
                    ((next.mode == CLIENT_SURFACE_PRESENTATION_DIRECT &&
                      current.mode != CLIENT_SURFACE_PRESENTATION_DIRECT) ||
-                    (scene_valid && scene.authoritative && scene.direct_candidate &&
+                    (scene_valid && scene.native_candidate == client_surface_get_identity( surface ) && scene.direct_candidate &&
                      scene.mode != CLIENT_SURFACE_PRESENTATION_DIRECT));
     if (defer_direct) next.mode = current.mode;
     old_source_rect = surface->raw ? current.monitor_rect : current.virtual_rect;

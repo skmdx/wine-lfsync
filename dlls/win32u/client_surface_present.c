@@ -699,12 +699,12 @@ static void prepare_client_surface_present_locked( struct client_surface *surfac
      * resize queries and X11 target setup part of the steady-state hot path. */
     pthread_mutex_lock( &surface->present_lock );
     client_surface_get_scene( surface, &present->scene );
-    if (surface->hwnd && InterlockedCompareExchange( &surface->active, 0, 0 ) &&
+    if (!replay && surface->hwnd && InterlockedCompareExchange( &surface->active, 0, 0 ) &&
         !present->scene.authoritative)
     {
         BOOL wake = FALSE;
         HWND toplevel = client_surface_set_server_state( surface->hwnd, surface,
-                                                         CLIENT_SURFACE_STATE_CLAIM,
+                                                         CLIENT_SURFACE_STATE_NATIVE_CANDIDATE,
                                                          0, 0, &wake );
 
         if (wake && toplevel)
@@ -716,7 +716,7 @@ static void prepare_client_surface_present_locked( struct client_surface *surfac
           surface->target.toplevel != present->scene.toplevel ||
           surface->target_scene_epoch != present->scene.epoch ||
           surface->target_scene_mode != present->scene.mode ||
-          (!replay && present->scene.authoritative &&
+          (!replay && present->scene.native_candidate == client_surface_get_identity( surface ) &&
            present->scene.direct_candidate &&
            present->scene.mode != CLIENT_SURFACE_PRESENTATION_DIRECT)); ++retry)
     {
@@ -811,6 +811,20 @@ BOOL client_surface_needs_completion_reservation( struct client_surface *surface
            !scene.authoritative || !scene.direct_candidate;
 }
 
+static void cancel_client_surface_candidate_locked( struct client_surface *surface,
+                                                     const struct client_surface_frame *present )
+{
+    HWND toplevel;
+    BOOL wake;
+
+    if (present->replay || present->scene.authoritative || !surface->hwnd) return;
+    toplevel = client_surface_set_server_state( surface->hwnd, surface,
+                                                CLIENT_SURFACE_STATE_CANCEL_CANDIDATE,
+                                                present->serial ? present->serial : surface->present_serial + 1,
+                                                present->scene.epoch, &wake );
+    if (wake && toplevel) NtUserPostMessage( toplevel, WM_WINE_UPDATEWINDOWSTATE, 0, 0 );
+}
+
 /* The caller holds completion_lock and has not entered native submission.
  * Admission can require dropping that lock and preparing a newer scene. This
  * cancels only our unsubmitted tokens, not an uncertain native operation. */
@@ -819,6 +833,7 @@ void client_surface_cancel_prepare_locked( struct client_surface *surface,
 {
     assert( !present->serial );
     pthread_mutex_lock( &surface->present_lock );
+    cancel_client_surface_candidate_locked( surface, present );
     client_surface_abandon_handoff_locked( surface, present );
     if (present->completion.kind == CLIENT_SURFACE_COMPLETION_SHARED &&
         surface->backend->completion && surface->backend->completion->cancel)
@@ -1033,7 +1048,7 @@ BOOL client_surface_complete_present_locked( struct client_surface *surface,
     {
         BOOL wake = FALSE;
         HWND hwnd;
-        HWND toplevel;
+        HWND toplevel = 0;
 
         /* Registration only advertises lifetime. A surface becomes the
          * producer after a host presentation or independent source snapshot
@@ -1045,13 +1060,37 @@ BOOL client_surface_complete_present_locked( struct client_surface *surface,
         pthread_mutex_lock( &surface->present_lock );
         hwnd = surface->hwnd;
         if (!InterlockedCompareExchange( &surface->active, 0, 0 )) hwnd = NULL;
-        if (hwnd)
+        /* PREPARING can prevent scene publication while an independent
+         * snapshot of the unchanged native target completes successfully.
+         * Its image proof can select the producer; it cannot acknowledge the
+         * scene. The server checks the original top-level and the selected
+         * producer's sequence on this HWND. Completion on a sibling or owner
+         * preparation must not reject an independently completed image. */
+        if (hwnd && (source_valid || present->target != CLIENT_SURFACE_FRAME_TARGET_INVALID) &&
+            surface->target.valid && present->target_epoch == surface->target.epoch &&
+            present->scene.toplevel == surface->target.toplevel &&
+            client_surface_validate_size_locked( surface, expected_size ))
         {
-            toplevel = client_surface_set_server_state( hwnd, surface,
-                                                        CLIENT_SURFACE_STATE_CLAIM,
-                                                        0, 0, &wake );
+            SERVER_START_REQ( set_client_surface_state )
+            {
+                req->handle = wine_server_user_handle( hwnd );
+                req->surface = client_surface_get_identity( surface );
+                req->flags = CLIENT_SURFACE_STATE_CLAIM;
+                req->scene_toplevel = wine_server_user_handle( present->scene.toplevel );
+                req->scene_generation = present->scene.epoch;
+                req->producer_sequence = present->scene.producer_sequence;
+                if (!wine_server_call( req ))
+                {
+                    toplevel = wine_server_ptr_handle( reply->toplevel );
+                    wake = reply->wake;
+                }
+            }
+            SERVER_END_REQ;
             if (wake && toplevel)
                 NtUserPostMessage( toplevel, WM_WINE_UPDATEWINDOWSTATE, 0, 0 );
+            TRACE( "claiming completed source %s scene %s source %u native epoch %s\n",
+                   debugstr_client_surface( surface ), wine_dbgstr_longlong( present->scene.epoch ),
+                   source_valid, wine_dbgstr_longlong( present->target_epoch ) );
             client_surface_get_scene( surface, &present->scene );
         }
         pthread_mutex_unlock( &surface->present_lock );
@@ -1069,9 +1108,14 @@ BOOL client_surface_complete_present_locked( struct client_surface *surface,
         completed = client_surface_end_present_internal( surface, expected_size, TRUE, present );
     }
     if (!completed) client_surface_abandon_handoff_locked( surface, present );
-    /* A composition failure may still have accepted a completed source; its
-     * serial then protects it from invalidation.  Otherwise retire both the
-     * failed frame and any older cached contents before releasing its token. */
+    if (!completed && !source_valid)
+    {
+        pthread_mutex_lock( &surface->present_lock );
+        cancel_client_surface_candidate_locked( surface, present );
+        pthread_mutex_unlock( &surface->present_lock );
+    }
+    /* A failed attempt cannot invalidate an independently completed image.
+     * Mutable native sources still retire their unproven previous contents. */
     if (!completed) client_surface_invalidate_source_locked( surface, present );
     if (source_valid && !handed_off && present->scene.toplevel)
     {

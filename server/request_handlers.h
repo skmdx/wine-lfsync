@@ -2453,11 +2453,13 @@ C_ASSERT( offsetof(struct set_client_surface_native_barrier_reply, generation) =
 C_ASSERT( offsetof(struct set_client_surface_native_barrier_reply, scene_generation) == 16 );
 C_ASSERT( sizeof(struct set_client_surface_native_barrier_reply) == 24 );
 C_ASSERT( offsetof(struct set_client_surface_state_request, handle) == 12 );
-C_ASSERT( offsetof(struct set_client_surface_state_request, surface) == 16 );
-C_ASSERT( offsetof(struct set_client_surface_state_request, flags) == 24 );
-C_ASSERT( offsetof(struct set_client_surface_state_request, generation) == 32 );
-C_ASSERT( offsetof(struct set_client_surface_state_request, scene_generation) == 40 );
-C_ASSERT( sizeof(struct set_client_surface_state_request) == 48 );
+C_ASSERT( offsetof(struct set_client_surface_state_request, scene_toplevel) == 16 );
+C_ASSERT( offsetof(struct set_client_surface_state_request, surface) == 24 );
+C_ASSERT( offsetof(struct set_client_surface_state_request, producer_sequence) == 32 );
+C_ASSERT( offsetof(struct set_client_surface_state_request, flags) == 40 );
+C_ASSERT( offsetof(struct set_client_surface_state_request, generation) == 48 );
+C_ASSERT( offsetof(struct set_client_surface_state_request, scene_generation) == 56 );
+C_ASSERT( sizeof(struct set_client_surface_state_request) == 64 );
 C_ASSERT( offsetof(struct set_client_surface_state_reply, toplevel) == 8 );
 C_ASSERT( offsetof(struct set_client_surface_state_reply, wake) == 12 );
 C_ASSERT( offsetof(struct set_client_surface_state_reply, generation) == 16 );

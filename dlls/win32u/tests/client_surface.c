@@ -50,6 +50,12 @@ struct native_barrier_state
     UINT64 scene_generation;
 };
 
+struct shared_surface_state
+{
+    UINT64 scene, surface, candidate, producer_sequence;
+    UINT flags;
+};
+
 struct clip_state
 {
     HWND toplevel;
@@ -66,6 +72,7 @@ struct scene_notification_counts
 
 static unsigned int (CDECL *p_wine_server_call)(void *);
 static void pump_messages( DWORD timeout );
+static BOOL read_shared_surface_state( HWND hwnd, struct shared_surface_state *state );
 static UINT set_scene_placement( HWND hwnd, int offset, int grow, int frame, UINT flags );
 static UINT drain_scene_notification_counts( UINT *owner_updates, UINT *prepares, UINT64 expected_surface,
                                              struct scene_notification_counts *counts );
@@ -93,21 +100,38 @@ static unsigned int release_surface( UINT64 surface )
     return p_wine_server_call( &info );
 }
 
-static unsigned int set_surface_state_scene( HWND hwnd, UINT64 surface, UINT flags,
-                                             UINT64 generation, UINT64 scene_generation,
-                                             struct surface_state *state )
+static unsigned int set_surface_state_source( HWND hwnd, UINT64 surface, UINT flags,
+                                              UINT64 generation, UINT64 scene_generation,
+                                              HWND source_top, UINT64 producer_sequence,
+                                              struct surface_state *state )
 {
     struct __server_request_info info;
     struct set_client_surface_state_request *req = &info.u.req.set_client_surface_state_request;
     const struct set_client_surface_state_reply *reply = &info.u.reply.set_client_surface_state_reply;
+    struct shared_surface_state current;
+    struct surface_state initial;
     unsigned int status;
 
+    if ((flags & CLIENT_SURFACE_STATE_CLAIM) && !source_top && !scene_generation &&
+        !set_surface_state_source( hwnd, 0, 0, 0, 0, 0, 0, &initial ) &&
+        read_shared_surface_state( hwnd, &current ))
+    {
+        /* Some cases reparent through the raw server API. The process-local
+         * GetAncestor cache intentionally has not observed that mutation. */
+        source_top = initial.toplevel;
+        scene_generation = initial.scene_generation;
+        producer_sequence = current.producer_sequence;
+    }
     memset( &info, 0, sizeof(info) );
     req->__header.req = REQ_set_client_surface_state;
     req->handle = wine_server_user_handle( hwnd );
     req->surface = surface;
     req->flags = flags;
+    req->scene_toplevel = wine_server_user_handle( source_top );
+    req->producer_sequence = producer_sequence;
     req->generation = generation;
+    if (!generation && (flags & (CLIENT_SURFACE_STATE_NATIVE_CANDIDATE | CLIENT_SURFACE_STATE_CANCEL_CANDIDATE)))
+        req->generation = 1;
     req->scene_generation = scene_generation;
     status = p_wine_server_call( &info );
     if (!status && state)
@@ -126,6 +150,15 @@ static unsigned int set_surface_state_scene( HWND hwnd, UINT64 surface, UINT fla
         state->wake = reply->wake;
     }
     return status;
+}
+
+static unsigned int set_surface_state_scene( HWND hwnd, UINT64 surface, UINT flags,
+                                             UINT64 generation, UINT64 scene_generation,
+                                             struct surface_state *state )
+{
+    HWND source_top = scene_generation && (flags & (CLIENT_SURFACE_STATE_CLAIM | CLIENT_SURFACE_STATE_CANCEL_CANDIDATE)) ?
+                      GetAncestor( hwnd, GA_ROOT ) : 0;
+    return set_surface_state_source( hwnd, surface, flags, generation, scene_generation, source_top, 0, state );
 }
 
 static unsigned int set_surface_state( HWND hwnd, UINT64 surface, UINT flags,
@@ -484,8 +517,7 @@ static void check_direct_candidate( HWND hwnd, UINT64 surface, UINT64 scene, BOO
 static void check_direct_snapshot_sealed( HWND hwnd, UINT64 scene );
 static void check_direct_snapshot_stale( HWND hwnd, UINT64 scene );
 
-static void check_direct_shared_state( HWND hwnd, UINT64 surface, UINT64 scene,
-                                       BOOL candidate, BOOL direct, BOOL backing )
+static BOOL read_shared_surface_state( HWND hwnd, struct shared_surface_state *state )
 {
     static const WCHAR section_name[] = L"\\KernelObjects\\__wine_session";
     UNICODE_STRING name = RTL_CONSTANT_STRING( section_name );
@@ -495,20 +527,22 @@ static void check_direct_shared_state( HWND hwnd, UINT64 surface, UINT64 scene,
     MEMORY_BASIC_INFORMATION memory;
     OBJECT_ATTRIBUTES attr;
     struct user_entry entry;
-    UINT64 seq, shared_scene, shared_surface;
-    UINT index = (LOWORD(hwnd) - FIRST_USER_HANDLE) >> 1, flags;
+    UINT64 seq;
+    UINT index = (LOWORD(hwnd) - FIRST_USER_HANDLE) >> 1;
     HANDLE section;
     UINT status;
+    BOOL valid = FALSE;
 
+    memset( state, 0, sizeof(*state) );
     open_section = (void *)GetProcAddress( GetModuleHandleA( "ntdll.dll" ), "NtOpenSection" );
     InitializeObjectAttributes( &attr, &name, 0, NULL, NULL );
     status = open_section( &section, SECTION_MAP_READ, &attr );
     ok( !status, "shared session open status %#x\n", status );
-    if (status) return;
+    if (status) return 0;
     session = MapViewOfFile( section, FILE_MAP_READ, 0, 0, 0 );
     CloseHandle( section );
     ok( !!session, "shared session map error %lu\n", GetLastError() );
-    if (!session) return;
+    if (!session) return 0;
     ok( index < MAX_USER_HANDLES, "invalid window table index %u\n", index );
     if (index >= MAX_USER_HANDLES) goto done;
     entry = session->user_entries[index];
@@ -525,22 +559,38 @@ static void check_direct_shared_state( HWND hwnd, UINT64 surface, UINT64 scene,
     {
         while ((seq = ReadNoFence64( &object->seq )) & 1) YieldProcessor();
         MemoryBarrier();
-        shared_scene = object->shm.window.client_surface_scene_generation;
-        shared_surface = object->shm.window.client_surface_id;
-        flags = object->shm.window.client_surface_flags;
+        state->scene = object->shm.window.client_surface_scene_generation;
+        state->surface = object->shm.window.client_surface_id;
+        state->candidate = object->shm.window.client_surface_native_candidate;
+        state->producer_sequence = object->shm.window.client_surface_producer_sequence;
+        state->flags = object->shm.window.client_surface_flags;
         MemoryBarrier();
     } while (ReadNoFence64( &object->seq ) != seq);
     ok( object->id == entry.id, "window shared object lifetime changed\n" );
-    ok( shared_scene == scene && shared_surface == surface,
-        "shared scene/lifetime %s/%s expected %s/%s\n", wine_dbgstr_longlong( shared_scene ),
-        wine_dbgstr_longlong( shared_surface ), wine_dbgstr_longlong( scene ), wine_dbgstr_longlong( surface ) );
-    ok( !!(flags & WINDOW_SHM_CLIENT_SURFACE_DIRECT_CANDIDATE) == candidate &&
-        !!(flags & WINDOW_SHM_CLIENT_SURFACE_DIRECT) == direct,
-        "shared DIRECT flags %#x expected candidate %u authorized %u\n", flags, candidate, direct );
-    ok( !!(flags & WINDOW_SHM_CLIENT_SURFACE_BACKING) == backing,
-        "shared backing flag %#x expected %u\n", flags, backing );
+    valid = object->id == entry.id;
 done:
     UnmapViewOfFile( (const void *)session );
+    return valid;
+}
+
+static UINT64 check_direct_shared_state( HWND hwnd, UINT64 surface, UINT64 scene,
+                                        BOOL candidate, BOOL direct, BOOL backing )
+{
+    struct shared_surface_state state;
+
+    if (!read_shared_surface_state( hwnd, &state )) return 0;
+    ok( !!state.candidate == candidate && (!candidate || !surface || state.candidate == surface),
+        "native candidate %s, completed surface %s, expected candidate %u\n",
+        wine_dbgstr_longlong( state.candidate ), wine_dbgstr_longlong( surface ), candidate );
+    ok( state.scene == scene && state.surface == surface,
+        "shared scene/lifetime %s/%s expected %s/%s\n", wine_dbgstr_longlong( state.scene ),
+        wine_dbgstr_longlong( state.surface ), wine_dbgstr_longlong( scene ), wine_dbgstr_longlong( surface ) );
+    ok( !!(state.flags & WINDOW_SHM_CLIENT_SURFACE_DIRECT_CANDIDATE) == candidate &&
+        !!(state.flags & WINDOW_SHM_CLIENT_SURFACE_DIRECT) == direct,
+        "shared DIRECT flags %#x expected candidate %u authorized %u\n", state.flags, candidate, direct );
+    ok( !!(state.flags & WINDOW_SHM_CLIENT_SURFACE_BACKING) == backing,
+        "shared backing flag %#x expected %u\n", state.flags, backing );
+    return state.producer_sequence;
 }
 
 static void check_direct_owner_auth( HWND hwnd, UINT64 surface, UINT64 scene )
@@ -862,6 +912,105 @@ static void test_direct_renewal_scene(void)
 done:
     release_surface( unused );
     if (!hwnd) release_surface( surface );
+}
+
+static void test_candidate_selection(void)
+{
+    const UINT flags = CLIENT_SURFACE_STATE_REGISTER | CLIENT_SURFACE_STATE_SCENE_PUBLICATION |
+                       CLIENT_SURFACE_STATE_DIRECT_PRESENTATION;
+    UINT64 first = allocate_surface(), second = allocate_surface(), third = allocate_surface();
+    UINT64 source_scene, first_sequence, third_sequence, second_sequence;
+    struct surface_state state, candidate, latest;
+    HWND hwnd = create_test_window( TRUE );
+    UINT status;
+    BOOL accepted;
+
+    ok( !!hwnd, "failed to create candidate window\n" );
+    if (!hwnd) goto done;
+    pump_messages( 100 );
+    status = set_surface_state( hwnd, first, flags, 0, &state );
+    ok( !status, "first registration status %#x\n", status );
+    status = set_surface_state( hwnd, first, CLIENT_SURFACE_STATE_NATIVE_CANDIDATE, 0, &state );
+    ok( !status, "native candidate status %#x\n", status );
+    check_direct_shared_state( hwnd, 0, state.scene_generation, TRUE, FALSE, FALSE );
+    check_direct_candidate( hwnd, first, state.scene_generation, TRUE );
+    status = set_surface_state( hwnd, first, CLIENT_SURFACE_STATE_NATIVE_CANDIDATE, 2, &state );
+    ok( !status, "second native preparation status %#x\n", status );
+    candidate = state;
+    status = set_surface_state_scene( hwnd, first, CLIENT_SURFACE_STATE_CANCEL_CANDIDATE, 1,
+                                      candidate.scene_generation, &state );
+    ok( !status && state.scene_generation == candidate.scene_generation, "old cancellation erased new preparation\n" );
+    check_direct_shared_state( hwnd, 0, state.scene_generation, TRUE, FALSE, FALSE );
+    source_scene = state.scene_generation;
+    status = prepare_surface_state( hwnd, &state );
+    ok( !status && state.generation && state.pending == 1, "candidate prepare status %#x pending %u\n",
+        status, state.pending );
+    candidate = state;
+    status = direct_plan_request( hwnd, first, state.scene_generation, FALSE, &accepted );
+    ok( !status && accepted, "uncompleted candidate native admission status %#x accepted %u\n", status, accepted );
+    check_direct_shared_state( hwnd, 0, state.scene_generation, TRUE, TRUE, FALSE );
+    status = direct_plan_request( hwnd, first, state.scene_generation, TRUE, &accepted );
+    ok( !status && !accepted, "uncompleted candidate published: status %#x accepted %u\n", status, accepted );
+    status = set_surface_state_scene( hwnd, first, CLIENT_SURFACE_STATE_CLAIM, 0,
+                                      source_scene, &state );
+    ok( !status && state.scene_generation == candidate.scene_generation &&
+        state.generation == candidate.generation && state.mode == CLIENT_SURFACE_PRESENTATION_DIRECT,
+        "candidate promotion changed its admitted plan: status %#x scene %s generation %s mode %u\n",
+        status, wine_dbgstr_longlong( state.scene_generation ), wine_dbgstr_longlong( state.generation ), state.mode );
+    check_direct_shared_state( hwnd, first, state.scene_generation, TRUE, TRUE, FALSE );
+    status = direct_plan_request( hwnd, first, state.scene_generation, TRUE, &accepted );
+    ok( !status && accepted, "completed candidate was rejected: status %#x accepted %u\n", status, accepted );
+    status = direct_plan_ack( hwnd, state.scene_generation, TRUE, &accepted );
+    ok( !status && accepted, "candidate ACK status %#x accepted %u\n", status, accepted );
+
+    status = set_surface_state( hwnd, second, flags, 0, &state );
+    ok( !status, "second registration status %#x\n", status );
+    complete_single_surface_generation( hwnd, first, &state );
+    candidate = state;
+    status = set_surface_state( hwnd, second, CLIENT_SURFACE_STATE_NATIVE_CANDIDATE, 0, &state );
+    ok( !status && state.scene_generation == candidate.scene_generation,
+        "second preparation changed completed selection: status %#x\n", status );
+    check_direct_shared_state( hwnd, first, state.scene_generation, FALSE, FALSE, TRUE );
+    status = set_surface_state_scene( hwnd, second, CLIENT_SURFACE_STATE_CANCEL_CANDIDATE, 0,
+                                      candidate.scene_generation, &state );
+    ok( !status && state.scene_generation == candidate.scene_generation,
+        "failed candidate changed completed selection: status %#x\n", status );
+    check_direct_shared_state( hwnd, first, state.scene_generation, FALSE, FALSE, TRUE );
+
+    first_sequence = check_direct_shared_state( hwnd, first, state.scene_generation, FALSE, FALSE, TRUE );
+    status = set_surface_state_source( hwnd, second, CLIENT_SURFACE_STATE_CLAIM, 0,
+                                       candidate.scene_generation, GetDesktopWindow(), first_sequence, &state );
+    ok( !status && state.scene_generation == candidate.scene_generation,
+        "completion for another top-level replaced the producer: status %#x\n", status );
+    check_direct_shared_state( hwnd, first, state.scene_generation, FALSE, FALSE, TRUE );
+
+    status = set_surface_state( hwnd, third, flags | CLIENT_SURFACE_STATE_CLAIM, 0, &latest );
+    ok( !status && latest.scene_generation != candidate.scene_generation,
+        "third completion did not advance selection: status %#x\n", status );
+    third_sequence = check_direct_shared_state( hwnd, third, latest.scene_generation, FALSE, FALSE, TRUE );
+    status = set_surface_state_source( hwnd, second, CLIENT_SURFACE_STATE_CLAIM, 0,
+                                       candidate.scene_generation, hwnd, first_sequence, &state );
+    ok( !status && state.scene_generation == latest.scene_generation,
+        "stale second completion replaced third: status %#x\n", status );
+    check_direct_shared_state( hwnd, third, state.scene_generation, FALSE, FALSE, TRUE );
+    status = set_surface_state_scene( hwnd, second, CLIENT_SURFACE_STATE_CANCEL_CANDIDATE, 0,
+                                      candidate.scene_generation, &state );
+    ok( !status && state.scene_generation == latest.scene_generation,
+        "stale cancellation changed third selection: status %#x\n", status );
+    check_direct_shared_state( hwnd, third, state.scene_generation, FALSE, FALSE, TRUE );
+    status = set_surface_state_source( hwnd, second, CLIENT_SURFACE_STATE_CLAIM, 0,
+                                       state.scene_generation, hwnd, third_sequence, &state );
+    second_sequence = check_direct_shared_state( hwnd, second, state.scene_generation, FALSE, FALSE, TRUE );
+    ok( !status && second_sequence > third_sequence,
+        "new completion did not replace the third producer: status %#x\n", status );
+    set_surface_state( hwnd, second, CLIENT_SURFACE_STATE_UNREGISTER, 0, NULL );
+    set_surface_state( hwnd, third, CLIENT_SURFACE_STATE_UNREGISTER, 0, NULL );
+    set_surface_state( hwnd, first, CLIENT_SURFACE_STATE_UNREGISTER, 0, NULL );
+    DestroyWindow( hwnd );
+done:
+    release_surface( third );
+    release_surface( second );
+    release_surface( first );
 }
 
 static void test_presentation_modes(void)
@@ -6523,6 +6672,7 @@ static BOOL run_focused_test_case( const char *name, char **argv )
         {"completion-provenance", "client surface completion result provenance",
          test_completion_result_provenance},
         {"presentation-modes", "client surface presentation modes", test_presentation_modes},
+        {"candidate-selection", "native candidates and completed producer selection", test_candidate_selection},
         {"generation-membership", "client surface generation membership",
          test_generation_membership},
         {"clip-scene-snapshot", "client surface clip scene snapshots",
@@ -6819,4 +6969,6 @@ START_TEST(client_surface)
     test_handoff_bitmap_boundary();
     trace( "testing 64x64 grow presentation completion\n" );
     test_grow64_present_completion();
+    trace( "testing native candidates and completed producer selection\n" );
+    test_candidate_selection();
 }

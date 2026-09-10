@@ -220,7 +220,7 @@ struct gdi_dc_funcs
 };
 
 /* increment this when changing driver tables or shared driver-facing structures */
-#define WINE_GDI_DRIVER_VERSION 147
+#define WINE_GDI_DRIVER_VERSION 148
 
 #define GDI_PRIORITY_NULL_DRV        0  /* null driver */
 #define GDI_PRIORITY_FONT_DRV      100  /* any font driver */
@@ -363,6 +363,8 @@ struct client_surface_scene
 {
     UINT64 generation;
     UINT64 epoch;
+    UINT64 native_candidate; /* may prepare DIRECT, but owns no completed image */
+    UINT64 producer_sequence; /* completed selection on the producer's HWND */
     HWND toplevel;
     enum client_surface_presentation_mode mode;
     BOOL valid;
@@ -526,6 +528,7 @@ struct client_surface
     enum client_surface_presentation_mode target_scene_mode; /* last server mode applied to native target */
     LONG64                             present_serial; /* producer submission order */
     LONG64                             composed_serial; /* newest source accepted or invalidated */
+    LONG64                             completed_image_serial; /* independently frozen image, not mutable DIRECT content */
     LONG                               external_completion_count; /* causal tokens currently in flight */
     LONG                               driver_completion_count; /* shared native monitor tokens in flight */
     LONG                               driver_completion_waiters; /* pending shared-monitor mode transitions */
