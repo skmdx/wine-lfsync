@@ -5648,6 +5648,16 @@ DECL_HANDLER(set_client_surface_state)
          * producer authority, not the scene's chosen identity or native
          * target. Preserve that exact plan for its completion receipt. */
         update_client_surface_producer( win );
+        /* The same candidate may instead complete after owner preparation
+         * failed. Its first usable image is new work for that unpublished
+         * scene, even though the selected identity did not change. Resume
+         * owner admission from this completion, without restarting an active
+         * DIRECT plan or requiring the producer to draw another frame. */
+        if ((req->flags & CLIENT_SURFACE_STATE_CLAIM) &&
+            top->client_surface_transaction.phase == CLIENT_SURFACE_PHASE_IDLE &&
+            top->client_surface_ack_scene != top->client_surface_scene_generation &&
+            client_surface_scene_published( top ))
+            restart_client_surface_generation( top );
     }
     if (surface && !surface->active && !surface->cached)
     {
