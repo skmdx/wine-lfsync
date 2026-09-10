@@ -912,21 +912,44 @@ void client_surface_submit_present( struct client_surface *surface,
     client_surface_unlock_present( surface );
 }
 
+static BOOL client_surface_capture_current_locked( struct client_surface *surface,
+                                                   struct client_surface_frame *present )
+{
+    return surface->hwnd && surface->target.valid && present->target_epoch == surface->target.epoch &&
+           present->serial > surface->composed_serial && client_surface_handoff_valid( surface, present );
+}
+
 static BOOL client_surface_capture_frame( struct client_surface *surface, struct client_surface_frame *present,
                                           const SIZE *expected_size, struct client_surface_completed_frame *frame )
 {
-    BOOL captured = FALSE;
+    BOOL readable = TRUE, captured = FALSE;
+
+    if (present->capture.read)
+    {
+        pthread_mutex_lock( &surface->present_lock );
+        readable = client_surface_capture_current_locked( surface, present ) &&
+                   (surface->active || surface->server_cached);
+        pthread_mutex_unlock( &surface->present_lock );
+        if (readable)
+        {
+            /* The FIFO execution lease owns capture.context and its storage.
+             * The completion token also pins the handoff through any target
+             * update while the native read runs. Neither needs a surface lock.
+             * Revalidate below: a newer reservation may supersede this frame. */
+            pthread_mutex_unlock( &surface->completion_lock );
+            readable = present->capture.read( present->capture.context );
+            pthread_mutex_lock( &surface->completion_lock );
+        }
+    }
 
     /* Completion waits run without submission serialization. A newer frame
      * can replace their handoff while they sleep; it alone owns the mutable
      * native source when the wait returns. Capture never consumes the fence. */
     pthread_mutex_lock( &surface->present_lock );
-    if (!surface->hwnd || !surface->target.valid || present->target_epoch != surface->target.epoch ||
-        present->serial <= surface->composed_serial ||
-        !client_surface_handoff_valid( surface, present ))
+    if (!client_surface_capture_current_locked( surface, present ))
         present->result = CLIENT_SURFACE_FRAME_SUPERSEDED;
-    else if ((surface->active || surface->server_cached) &&
-             (!present->capture.capture || present->capture.capture( present->capture.context, surface, present )) &&
+    else if (readable && (surface->active || surface->server_cached) &&
+             (!present->capture.apply || present->capture.apply( present->capture.context, surface, present )) &&
              client_surface_validate_size_locked( surface, present->capture.size.cx ?
                                                   &present->capture.size : expected_size ))
     {

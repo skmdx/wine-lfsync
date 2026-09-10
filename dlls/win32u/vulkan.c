@@ -2437,18 +2437,24 @@ static void release_vulkan_snapshot_completion( void *context )
     release_snapshot_fence( context );
 }
 
-static BOOL capture_vulkan_snapshot( void *context, struct client_surface *surface,
-                                      struct client_surface_frame *present )
+static BOOL read_vulkan_snapshot( void *context )
 {
     struct vulkan_snapshot_capture *capture = context;
     struct vulkan_device *device = capture->device;
-    struct swapchain *swapchain = capture->swapchain;
     struct swapchain_snapshot *snapshot = capture->snapshot;
     VkMappedMemoryRange range = {.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE,
                                  .memory = snapshot->memory, .size = VK_WHOLE_SIZE};
 
-    return !device->p_vkInvalidateMappedMemoryRanges( device->host.device, 1, &range ) &&
-           driver_funcs->p_vulkan_surface_snapshot( surface, present, snapshot->pixels,
+    return !device->p_vkInvalidateMappedMemoryRanges( device->host.device, 1, &range );
+}
+
+static BOOL apply_vulkan_snapshot( void *context, struct client_surface *surface,
+                                   struct client_surface_frame *present )
+{
+    struct vulkan_snapshot_capture *capture = context;
+    struct swapchain *swapchain = capture->swapchain;
+
+    return driver_funcs->p_vulkan_surface_snapshot( surface, present, capture->snapshot->pixels,
                swapchain->host_extents.width, swapchain->host_extents.height, swapchain->format );
 }
 
@@ -2642,7 +2648,8 @@ static VkResult snapshot_vulkan_present( struct vulkan_queue *queue, VkPresentIn
         capture->device = device;
         capture->swapchain = swapchain;
         capture->snapshot = snapshot;
-        presents[i].capture.capture = capture_vulkan_snapshot;
+        presents[i].capture.read = read_vulkan_snapshot;
+        presents[i].capture.apply = apply_vulkan_snapshot;
         presents[i].capture.release = release_vulkan_snapshot_capture;
         presents[i].capture.context = capture;
         image.image = snapshot->images[present_info->pImageIndices[i]];
@@ -2675,7 +2682,7 @@ static VkResult snapshot_vulkan_present( struct vulkan_queue *queue, VkPresentIn
     {
         struct swapchain_snapshot *snapshot = reservations[i].snapshot;
 
-        if (!presents[i].capture.capture) continue;
+        if (!presents[i].capture.apply) continue;
         assert( !snapshot->pending );
         snapshot->pending = pending;
         InterlockedIncrement( &pending->refs );
@@ -3363,7 +3370,7 @@ reservation_failed:
     {
         struct swapchain *swapchain = swapchain_from_handle( client_swapchains[i] );
 
-        if (reservations[i].snapshot && !presents[i].capture.capture)
+        if (reservations[i].snapshot && !presents[i].capture.apply)
             release_snapshot_reservation( swapchain, reservations[i].snapshot );
         /* A submitted snapshot is now owned by its capture context. */
         reservations[i].snapshot = NULL;
@@ -3376,7 +3383,7 @@ reservation_failed:
         struct surface *surface = swapchain->surface;
         SIZE expected_size = {swapchain->extents.width, swapchain->extents.height};
         BOOL compose = swapchain_res >= VK_SUCCESS;
-        BOOL snapshot_submitted = !!presents[i].capture.capture;
+        BOOL snapshot_submitted = !!presents[i].capture.apply;
         struct client_surface_completion completion = presents[i].completion;
         struct client_surface_capture capture = presents[i].capture;
         RECT client_rect;

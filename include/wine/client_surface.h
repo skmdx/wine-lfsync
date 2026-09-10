@@ -171,10 +171,14 @@ struct client_surface_capture
     /* Extent of prepared private storage. Neither its existence nor its size
      * proves completion; the core must consume the host result and freeze it. */
     SIZE size;
-    /* Consume completed private storage under the surface submission lock.
-     * This must not wait for GPU work. The core validates the frame's target
-     * and source ownership before allowing capture to modify the native image. */
-    BOOL (*capture)( void *context, struct client_surface *surface, struct client_surface_frame *frame );
+    /* Make completed private storage readable without any surface lock. The
+     * context owns that storage until release, including during target changes.
+     * This native operation may stall; it has no access to mutable surface state. */
+    BOOL (*read)( void *context );
+    /* Apply readable storage under the surface submission lock. This must not
+     * wait for GPU work. The core revalidates target and source ownership after
+     * read returns, before allowing apply to modify the backend image. */
+    BOOL (*apply)( void *context, struct client_surface *surface, struct client_surface_frame *frame );
     /* Own the storage independently of the completion fence, including when
      * a failed or stale completion prevents capture from being called. */
     void (*release)( void *context );
