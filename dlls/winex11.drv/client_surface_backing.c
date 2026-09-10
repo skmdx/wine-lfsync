@@ -235,7 +235,6 @@ struct client_surface_compositor_target
 };
 
 static pthread_mutex_t client_surface_compositor_mutex = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t client_surface_compositor_cond = PTHREAD_COND_INITIALIZER;
 static Display *client_surface_compositor_display;
 static BOOL client_surface_compositor_started;
 static int client_surface_compositor_notify[2] = {-1, -1};
@@ -397,6 +396,7 @@ struct client_surface_compositor_request
 {
     struct client_surface_compositor_job job;
     struct client_surface_memory_scope memory;
+    pthread_cond_t completed;
 };
 
 /* The routing lifetime spans initial target preparation, replacement and the
@@ -415,6 +415,7 @@ struct client_surface_compositor_queue
      * Serialize their storage within the admitted queue, independently of
      * ordinary request pressure. Release notifications never use this slot. */
     struct client_surface_compositor_request barrier;
+    pthread_cond_t barrier_available;
     BOOL barrier_in_use;
 };
 
@@ -745,6 +746,14 @@ static void *alloc_client_surface_compositor_metadata( HWND toplevel, SIZE_T siz
     return data;
 }
 
+static void free_client_surface_compositor_queue( struct client_surface_compositor_queue *queue )
+{
+    pthread_cond_destroy( &queue->barrier_available );
+    pthread_cond_destroy( &queue->barrier.completed );
+    client_surface_free_owned_metadata( &queue->memory, queue, sizeof(*queue) );
+    release_client_surface_compositor_capacity( CLIENT_SURFACE_COMPOSITOR_QUEUE_CAPACITY, 1, sizeof(*queue), NULL );
+}
+
 static struct client_surface_compositor_queue *get_client_surface_compositor_queue( HWND toplevel )
 {
     struct client_surface_compositor_queue *queue, *created = NULL;
@@ -780,6 +789,12 @@ static struct client_surface_compositor_queue *get_client_surface_compositor_que
             return NULL;
         }
         created->memory = memory;
+        if (pthread_cond_init( &created->barrier.completed, NULL )) goto failed;
+        if (pthread_cond_init( &created->barrier_available, NULL ))
+        {
+            pthread_cond_destroy( &created->barrier.completed );
+            goto failed;
+        }
         created->toplevel = toplevel;
         created->refs = 1;
         created->tail = &created->head;
@@ -788,12 +803,13 @@ static struct client_surface_compositor_queue *get_client_surface_compositor_que
         pthread_mutex_lock( &client_surface_compositor_mutex );
     }
     pthread_mutex_unlock( &client_surface_compositor_mutex );
-    if (created)
-    {
-        client_surface_free_owned_metadata( &created->memory, created, sizeof(*created) );
-        release_client_surface_compositor_capacity( CLIENT_SURFACE_COMPOSITOR_QUEUE_CAPACITY, 1, sizeof(*created), NULL );
-    }
+    if (created) free_client_surface_compositor_queue( created );
     return queue;
+
+failed:
+    client_surface_free_owned_metadata( &created->memory, created, sizeof(*created) );
+    release_client_surface_compositor_capacity( CLIENT_SURFACE_COMPOSITOR_QUEUE_CAPACITY, 1, sizeof(*created), NULL );
+    return NULL;
 }
 
 static void release_client_surface_compositor_queue( struct client_surface_compositor_queue *queue )
@@ -809,11 +825,7 @@ static void release_client_surface_compositor_queue( struct client_surface_compo
         rb_remove( &client_surface_compositor_queues, &queue->registry_entry );
     }
     pthread_mutex_unlock( &client_surface_compositor_mutex );
-    if (unused)
-    {
-        client_surface_free_owned_metadata( &queue->memory, queue, sizeof(*queue) );
-        release_client_surface_compositor_capacity( CLIENT_SURFACE_COMPOSITOR_QUEUE_CAPACITY, 1, sizeof(*queue), NULL );
-    }
+    if (unused) free_client_surface_compositor_queue( queue );
 }
 
 static struct client_surface_compositor_target *alloc_client_surface_compositor_target( HWND toplevel )
@@ -4381,9 +4393,12 @@ static BOOL process_client_surface_compositor_jobs(void)
         }
         else
         {
+            struct client_surface_compositor_request *request =
+                CONTAINING_RECORD( job, struct client_surface_compositor_request, job );
+
             pthread_mutex_lock( &client_surface_compositor_mutex );
             job->complete = TRUE;
-            pthread_cond_broadcast( &client_surface_compositor_cond );
+            pthread_cond_signal( &request->completed );
             pthread_mutex_unlock( &client_surface_compositor_mutex );
         }
         /* The enqueue reference also covers dispatcher bookkeeping after a
@@ -4476,7 +4491,6 @@ static void enqueue_client_surface_compositor_job( struct client_surface_composi
     *client_surface_compositor_tail = job;
     client_surface_compositor_tail = &job->next;
     wake_client_surface_compositor();
-    pthread_cond_broadcast( &client_surface_compositor_cond );
 }
 
 /* The caller holds client_surface_compositor_mutex. Ownership of asynchronous
@@ -4524,7 +4538,7 @@ static struct client_surface_compositor_request *alloc_client_surface_compositor
          * concurrent barriers serialize here instead of allocating jobs.
          * No release notification waits for this slot or uses its storage. */
         while (queue->barrier_in_use)
-            pthread_cond_wait( &client_surface_compositor_cond, &client_surface_compositor_mutex );
+            pthread_cond_wait( &queue->barrier_available, &client_surface_compositor_mutex );
         queue->barrier_in_use = TRUE;
         request = &queue->barrier;
         pthread_mutex_unlock( &client_surface_compositor_mutex );
@@ -4545,6 +4559,13 @@ static struct client_surface_compositor_request *alloc_client_surface_compositor
             return NULL;
         }
         request->memory = memory;
+        if (pthread_cond_init( &request->completed, NULL ))
+        {
+            client_surface_free_owned_metadata( &request->memory, request, sizeof(*request) );
+            release_client_surface_compositor_capacity( CLIENT_SURFACE_COMPOSITOR_REQUEST_CAPACITY,
+                                                        1, sizeof(*request), queue );
+            return NULL;
+        }
     }
     request->job = *job;
     request->job.queue = queue;
@@ -4560,11 +4581,12 @@ static void free_client_surface_compositor_request( struct client_surface_compos
         pthread_mutex_lock( &client_surface_compositor_mutex );
         assert( queue->barrier_in_use );
         queue->barrier_in_use = FALSE;
-        pthread_cond_broadcast( &client_surface_compositor_cond );
+        pthread_cond_signal( &queue->barrier_available );
         pthread_mutex_unlock( &client_surface_compositor_mutex );
     }
     else
     {
+        pthread_cond_destroy( &request->completed );
         client_surface_free_owned_metadata( &request->memory, request, sizeof(*request) );
         release_client_surface_compositor_capacity( CLIENT_SURFACE_COMPOSITOR_REQUEST_CAPACITY,
                                                     1, sizeof(*request), queue );
@@ -4587,7 +4609,7 @@ static BOOL submit_client_surface_compositor_job( struct client_surface_composit
     if (queue_client_surface_compositor_job( &request->job ))
     {
         while (!request->job.complete)
-            pthread_cond_wait( &client_surface_compositor_cond,
+            pthread_cond_wait( &request->completed,
                                &client_surface_compositor_mutex );
         ret = request->job.result;
     }
