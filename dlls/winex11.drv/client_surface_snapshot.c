@@ -23,13 +23,30 @@
 
 WINE_DEFAULT_DEBUG_CHANNEL(x11drv);
 
+/* Source images own references, not connections. Serial native work in one
+ * execution domain can share transport without sharing an image lifetime. */
+struct snapshot_connection
+{
+    struct list entry;
+    UINT64 domain;
+    unsigned int refs;
+    pthread_mutex_t lock;
+    struct x11drv_error_handler errors;
+    Display *display;
+    int error;
+};
+
+static pthread_mutex_t snapshot_connections_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct list snapshot_connections = LIST_INIT( snapshot_connections );
+static unsigned int snapshot_connection_count;
+#define SNAPSHOT_CONNECTION_LIMIT 64
+
 struct x11drv_client_snapshot
 {
     struct x11drv_client_surface_retired_resource retirement;
     LONG refs;
     BOOL deferred;
-    struct x11drv_error_handler errors;
-    Display *display;
+    struct snapshot_connection *connection;
     Pixmap pixmap;
     GC gc;
     XImage *image;
@@ -39,15 +56,101 @@ struct x11drv_client_snapshot
     Pixmap import;
     UINT64 target_epoch, import_epoch;
     UINT64 bytes;
-    int error;
     BOOL acquired;
 };
 
 static int snapshot_error( Display *display, XErrorEvent *event, void *arg )
 {
-    struct x11drv_client_snapshot *snapshot = arg;
+    struct snapshot_connection *connection = arg;
 
-    snapshot->error = event->error_code;
+    connection->error = event->error_code;
+    return TRUE;
+}
+
+static struct snapshot_connection *snapshot_connection_acquire( UINT64 domain )
+{
+    struct snapshot_connection *connection;
+
+    pthread_mutex_lock( &snapshot_connections_lock );
+    LIST_FOR_EACH_ENTRY( connection, &snapshot_connections, struct snapshot_connection, entry )
+    {
+        if (connection->domain != domain) continue;
+        ++connection->refs;
+        pthread_mutex_unlock( &snapshot_connections_lock );
+        return connection;
+    }
+    connection = NULL;
+    if (snapshot_connection_count == SNAPSHOT_CONNECTION_LIMIT) goto done;
+    if (!client_surface_reserve_memory( CLIENT_SURFACE_MEMORY_STAGING, sizeof(*connection) )) goto done;
+    if (!(connection = calloc( 1, sizeof(*connection) )))
+    {
+        client_surface_release_memory( CLIENT_SURFACE_MEMORY_STAGING, sizeof(*connection) );
+        goto done;
+    }
+    if (pthread_mutex_init( &connection->lock, NULL ))
+    {
+        free( connection );
+        connection = NULL;
+        client_surface_release_memory( CLIENT_SURFACE_MEMORY_STAGING, sizeof(*connection) );
+        goto done;
+    }
+    connection->domain = domain;
+    connection->refs = 1;
+    list_add_tail( &snapshot_connections, &connection->entry );
+    ++snapshot_connection_count;
+done:
+    pthread_mutex_unlock( &snapshot_connections_lock );
+    return connection;
+}
+
+static void snapshot_connection_release( struct snapshot_connection *connection )
+{
+    if (!connection) return;
+    pthread_mutex_lock( &snapshot_connections_lock );
+    if (--connection->refs)
+    {
+        pthread_mutex_unlock( &snapshot_connections_lock );
+        return;
+    }
+    list_remove( &connection->entry );
+    pthread_mutex_unlock( &snapshot_connections_lock );
+
+    /* No image can use this connection now. Keep both its admission and error
+     * sink until actual native destruction returns, outside metadata locks. */
+    if (connection->display)
+    {
+        XCloseDisplay( connection->display );
+        X11DRV_unregister_error_handler( &connection->errors );
+        TRACE( "closed snapshot connection %p domain %s\n", connection->display,
+               wine_dbgstr_longlong( connection->domain ) );
+    }
+    pthread_mutex_destroy( &connection->lock );
+    pthread_mutex_lock( &snapshot_connections_lock );
+    --snapshot_connection_count;
+    pthread_mutex_unlock( &snapshot_connections_lock );
+    client_surface_release_memory( CLIENT_SURFACE_MEMORY_STAGING, sizeof(*connection) );
+    free( connection );
+}
+
+/* The caller holds this domain's native lock. Error attribution belongs to
+ * the connection and every request window is drained before the lock returns. */
+static BOOL snapshot_connection_open( struct snapshot_connection *connection )
+{
+    if (connection->display) return TRUE;
+    if (!(connection->display = XOpenDisplay( DisplayString( gdi_display ) ))) return FALSE;
+    connection->errors.display = connection->display;
+    connection->errors.callback = snapshot_error;
+    connection->errors.arg = connection;
+    X11DRV_register_error_handler( &connection->errors );
+    if (fcntl( ConnectionNumber( connection->display ), F_SETFD, FD_CLOEXEC ) == -1)
+    {
+        XCloseDisplay( connection->display );
+        X11DRV_unregister_error_handler( &connection->errors );
+        connection->display = NULL;
+        return FALSE;
+    }
+    TRACE( "opened snapshot connection %p domain %s\n", connection->display,
+           wine_dbgstr_longlong( connection->domain ) );
     return TRUE;
 }
 
@@ -72,24 +175,36 @@ void x11drv_client_snapshot_release_staging( struct x11drv_client_snapshot *snap
 
 static void destroy_snapshot( struct x11drv_client_snapshot *snapshot )
 {
+    struct snapshot_connection *connection;
+    Display *display;
+
     if (!snapshot) return;
+    connection = snapshot->connection;
+    display = NULL;
     x11drv_client_snapshot_release_staging( snapshot );
-    if (snapshot->acquired)
-        x11drv_client_surface_trace_image( "retire", "producer_snapshot", snapshot->display,
-                                          snapshot->pixmap, snapshot->bytes );
-    if (snapshot->display)
+    if (connection)
     {
-        /* Closing this private connection releases all its server resources,
-         * including XIDs whose allocation failed. Keep the error sink alive
-         * through the close; an unsuccessful XID is never freed separately. */
-        if (snapshot->gc) XFreeGC( snapshot->display, snapshot->gc );
-        XCloseDisplay( snapshot->display );
-        X11DRV_unregister_error_handler( &snapshot->errors );
+        pthread_mutex_lock( &connection->lock );
+        display = connection->display;
+        if (snapshot->acquired)
+            x11drv_client_surface_trace_image( "retire", "producer_snapshot", display,
+                                              snapshot->pixmap, snapshot->bytes );
+        if (connection->display && (snapshot->gc || snapshot->import || snapshot->pixmap))
+        {
+            connection->error = 0;
+            if (snapshot->gc) XFreeGC( connection->display, snapshot->gc );
+            if (snapshot->import) XFreePixmap( connection->display, snapshot->import );
+            if (snapshot->pixmap) XFreePixmap( connection->display, snapshot->pixmap );
+            XSync( connection->display, False );
+            if (connection->error) WARN( "snapshot destruction returned X error %d\n", connection->error );
+        }
+        pthread_mutex_unlock( &connection->lock );
     }
     if (snapshot->acquired)
-        x11drv_client_surface_trace_image( "free", "producer_snapshot", snapshot->display,
+        x11drv_client_surface_trace_image( "free", "producer_snapshot", display,
                                           snapshot->pixmap, snapshot->bytes );
     client_surface_release_memory( CLIENT_SURFACE_MEMORY_SOURCE, snapshot->bytes );
+    snapshot_connection_release( connection );
     client_surface_release_memory( CLIENT_SURFACE_MEMORY_STAGING, sizeof(*snapshot) );
     free( snapshot );
 }
@@ -125,7 +240,7 @@ static BOOL snapshot_create_image( struct x11drv_client_snapshot *snapshot )
     UINT64 bytes;
 
     if (snapshot->image) return TRUE;
-    if (!(image = XCreateImage( snapshot->display, default_visual.visual, default_visual.depth,
+    if (!(image = XCreateImage( snapshot->connection->display, default_visual.visual, default_visual.depth,
                                ZPixmap, 0, NULL, width, height, 32, 0 ))) return FALSE;
     if (image->bytes_per_line <= 0 || height > ~(SIZE_T)0 / image->bytes_per_line)
     {
@@ -174,25 +289,38 @@ failed:
 
 static BOOL snapshot_create_native_image( struct x11drv_client_snapshot *snapshot )
 {
-    if (snapshot->display) return snapshot->acquired;
-    if (!(snapshot->display = XOpenDisplay( DisplayString( gdi_display ) ))) goto failed;
-    snapshot->errors.display = snapshot->display;
-    snapshot->errors.callback = snapshot_error;
-    snapshot->errors.arg = snapshot;
-    X11DRV_register_error_handler( &snapshot->errors );
-    if (fcntl( ConnectionNumber( snapshot->display ), F_SETFD, FD_CLOEXEC ) == -1) goto failed;
-    snapshot->pixmap = XCreatePixmap( snapshot->display, DefaultRootWindow( snapshot->display ),
+    struct snapshot_connection *connection = snapshot->connection;
+    XGCValues values = {.graphics_exposures = False};
+    Display *display;
+
+    if (snapshot->acquired) return TRUE;
+    if (!snapshot_connection_open( connection )) return FALSE;
+    display = connection->display;
+    connection->error = 0;
+    snapshot->pixmap = XCreatePixmap( display, DefaultRootWindow( display ),
                                       snapshot->size.cx, snapshot->size.cy, snapshot->depth );
-    snapshot->gc = XCreateGC( snapshot->display, snapshot->pixmap, 0, NULL );
-    XSync( snapshot->display, False );
-    if (!snapshot->pixmap || !snapshot->gc || snapshot->error) goto failed;
+    XSync( display, False );
+    if (connection->error || !snapshot->pixmap)
+    {
+        snapshot->pixmap = 0; /* A rejected allocation is not a resource to free. */
+        return FALSE;
+    }
+    snapshot->gc = XCreateGC( display, snapshot->pixmap, GCGraphicsExposures, &values );
+    XSync( display, False );
+    if (!snapshot->gc || connection->error)
+    {
+        /* Xlib may retain a client GC even if the server rejected its XID. */
+        if (snapshot->gc) XFreeGC( display, snapshot->gc );
+        XFreePixmap( display, snapshot->pixmap );
+        XSync( display, False );
+        snapshot->gc = NULL;
+        snapshot->pixmap = 0;
+        return FALSE;
+    }
     snapshot->acquired = TRUE;
-    x11drv_client_surface_trace_image( "acquire", "producer_snapshot", snapshot->display,
+    x11drv_client_surface_trace_image( "acquire", "producer_snapshot", display,
                                       snapshot->pixmap, snapshot->bytes );
     return TRUE;
-
-failed:
-    return FALSE;
 }
 
 BOOL x11drv_client_snapshot_prepare_native( struct x11drv_client_snapshot **storage, Window window,
@@ -217,40 +345,68 @@ BOOL x11drv_client_snapshot_prepare_native( struct x11drv_client_snapshot **stor
     return TRUE;
 }
 
+BOOL x11drv_client_snapshot_prepare_read( struct x11drv_client_snapshot **storage )
+{
+    struct x11drv_client_snapshot *snapshot = *storage, *next;
+    UINT64 domain;
+
+    assert( snapshot && snapshot->refs == 1 && snapshot->deferred );
+    if (!client_surface_get_execution_domain( &domain )) return FALSE;
+    if (snapshot->connection && snapshot->connection->domain != domain)
+    {
+        if (!(next = snapshot_alloc( snapshot->size.cx, snapshot->size.cy, snapshot->depth ))) return FALSE;
+        next->deferred = TRUE;
+        next->window = snapshot->window;
+        next->target_epoch = snapshot->target_epoch;
+        x11drv_client_snapshot_release( snapshot );
+        *storage = snapshot = next;
+    }
+    if (!snapshot->connection) snapshot->connection = snapshot_connection_acquire( domain );
+    return !!snapshot->connection;
+}
+
 BOOL x11drv_client_snapshot_read_native( void *context )
 {
     struct x11drv_client_snapshot *snapshot = context;
+    struct snapshot_connection *connection = snapshot->connection;
+    Display *display;
+    BOOL ret = FALSE;
 
-    assert( snapshot->refs == 1 && snapshot->window );
-    if (!snapshot_create_native_image( snapshot )) return FALSE;
-    snapshot->error = 0;
+    assert( snapshot->refs == 1 && snapshot->window && connection );
+    pthread_mutex_lock( &connection->lock );
+    if (!snapshot_create_native_image( snapshot )) goto done;
+    display = connection->display;
+    connection->error = 0;
 #ifdef SONAME_LIBXCOMPOSITE
     if (!snapshot->import || snapshot->import_epoch != snapshot->target_epoch)
     {
-        if (snapshot->import) XFreePixmap( snapshot->display, snapshot->import );
-        snapshot->import = pXCompositeNameWindowPixmap( snapshot->display, snapshot->window );
-        XSync( snapshot->display, False );
-        if (snapshot->error)
+        if (snapshot->import) XFreePixmap( display, snapshot->import );
+        snapshot->import = pXCompositeNameWindowPixmap( display, snapshot->window );
+        XSync( display, False );
+        if (connection->error)
         {
             /* An unsuccessful NameWindowPixmap XID must not be freed. */
             snapshot->import = 0;
-            return FALSE;
+            goto done;
         }
         snapshot->import_epoch = snapshot->target_epoch;
     }
 #endif
-    if (!snapshot->import) return FALSE;
-    XCopyArea( snapshot->display, snapshot->import, snapshot->pixmap, snapshot->gc,
+    if (!snapshot->import) goto done;
+    XCopyArea( display, snapshot->import, snapshot->pixmap, snapshot->gc,
                0, 0, snapshot->size.cx, snapshot->size.cy, 0, 0 );
-    XSync( snapshot->display, False );
-    if (snapshot->error)
+    XSync( display, False );
+    if (connection->error)
     {
-        TRACE( "native source copy failed with X error %d\n", snapshot->error );
-        return FALSE;
+        TRACE( "native source copy failed with X error %d\n", connection->error );
+        goto done;
     }
     TRACE( "copied native window %#lx into private snapshot %#lx display %p epoch %s\n",
-           snapshot->window, snapshot->pixmap, snapshot->display, wine_dbgstr_longlong( snapshot->target_epoch ) );
-    return TRUE;
+           snapshot->window, snapshot->pixmap, display, wine_dbgstr_longlong( snapshot->target_epoch ) );
+    ret = TRUE;
+done:
+    pthread_mutex_unlock( &connection->lock );
+    return ret;
 }
 
 const struct x11drv_snapshot_format x11drv_snapshot_rgba8 = {4, 0xff, 0xff00, 0xff0000, 0xff000000};
@@ -274,17 +430,29 @@ BOOL x11drv_client_snapshot_upload( struct x11drv_client_snapshot **storage, con
                                     const struct x11drv_snapshot_format *format )
 {
     struct x11drv_client_snapshot *snapshot = *storage, *next;
+    struct snapshot_connection *connection;
     XImage *image;
     unsigned int x, y;
+    UINT64 domain;
+    BOOL ret;
     unsigned long alpha = ((1ull << default_visual.depth) - 1) &
                           ~(default_visual.red_mask | default_visual.green_mask | default_visual.blue_mask);
 
     if (!width || !height || width > 0xffff || height > 0xffff) return FALSE;
+    if (!client_surface_get_execution_domain( &domain )) return FALSE;
     if (!snapshot || snapshot->size.cx != width || snapshot->size.cy != height ||
+        !snapshot->connection || snapshot->connection->domain != domain ||
         InterlockedCompareExchange( &snapshot->refs, 0, 0 ) != 1)
     {
         if (!(next = snapshot_alloc( width, height, default_visual.depth ))) return FALSE;
-        if (!snapshot_create_native_image( next ) || !snapshot_create_image( next ))
+        if ((next->connection = snapshot_connection_acquire( domain )))
+        {
+            pthread_mutex_lock( &next->connection->lock );
+            ret = snapshot_create_native_image( next ) && snapshot_create_image( next );
+            pthread_mutex_unlock( &next->connection->lock );
+        }
+        else ret = FALSE;
+        if (!ret)
         {
             x11drv_client_snapshot_release( next );
             return FALSE;
@@ -292,7 +460,11 @@ BOOL x11drv_client_snapshot_upload( struct x11drv_client_snapshot **storage, con
         x11drv_client_snapshot_release( snapshot );
         *storage = snapshot = next;
     }
-    if (!snapshot_create_image( snapshot )) return FALSE;
+    connection = snapshot->connection;
+    pthread_mutex_lock( &connection->lock );
+    ret = snapshot_create_image( snapshot );
+    pthread_mutex_unlock( &connection->lock );
+    if (!ret) return FALSE;
     image = snapshot->image;
     if (format->texel_size == 4 && format->green_mask == 0xff00 &&
         (format->red_mask == 0xff || format->red_mask == 0xff0000) &&
@@ -335,17 +507,20 @@ BOOL x11drv_client_snapshot_upload( struct x11drv_client_snapshot **storage, con
                            snapshot_component( pixel, format->alpha_mask, alpha ) );
             }
 
-    snapshot->error = 0;
-    XPutImage( snapshot->display, snapshot->pixmap, snapshot->gc, image, 0, 0, 0, 0, width, height );
-    XSync( snapshot->display, False );
-    if (snapshot->error)
+    pthread_mutex_lock( &connection->lock );
+    connection->error = 0;
+    XPutImage( connection->display, snapshot->pixmap, snapshot->gc, image, 0, 0, 0, 0, width, height );
+    XSync( connection->display, False );
+    ret = !connection->error;
+    if (!ret) TRACE( "snapshot upload failed with X error %d\n", connection->error );
+    pthread_mutex_unlock( &connection->lock );
+    if (!ret)
     {
-        TRACE( "snapshot upload failed with X error %d\n", snapshot->error );
         x11drv_client_snapshot_release( snapshot );
         *storage = NULL;
         return FALSE;
     }
     TRACE( "uploaded producer snapshot %#lx on private display %p size %ux%u\n",
-           snapshot->pixmap, snapshot->display, width, height );
+           snapshot->pixmap, connection->display, width, height );
     return TRUE;
 }

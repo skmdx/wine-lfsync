@@ -131,6 +131,8 @@ struct user_thread_info
     struct session_thread_data   *session_data;           /* shared session thread data */
     struct mouse_tracking_info   *mouse_tracking_info;    /* NtUserTrackMouseEvent handling */
     struct opengl_thread_data    *opengl_data;            /* OpenGL private thread data */
+    struct client_surface_completion_worker *completion_worker; /* current native completion domain */
+    UINT64                        client_surface_domain; /* synchronous native execution identity */
     struct list                   known_pointers;         /* list of known pointers */
 };
 

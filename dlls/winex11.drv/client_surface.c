@@ -469,6 +469,7 @@ static BOOL x11drv_client_surface_handoff_capture( struct client_surface *client
 
     if (!usexcomposite || surface->direct_snapshot) return TRUE;
     if (!frame->snapshot) return FALSE;
+    if (!x11drv_client_snapshot_prepare_read( &frame->snapshot )) return FALSE;
     assert( !frame->gc && !frame->image && !frame->bytes && !frame->gpu_copy );
     capture->context = frame->snapshot;
     capture->read = x11drv_client_snapshot_read_native;

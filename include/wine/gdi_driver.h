@@ -513,6 +513,10 @@ W32KAPI void client_surface_defer_present( struct client_surface *surface,
 /* Reserve before any native submission and outside every surface/native lock.
  * Cancellation returns an unused reservation; defer transfers frame ownership. */
 W32KAPI struct client_surface_completion_job *client_surface_reserve_completion( struct client_surface *surface );
+/* Native source I/O may share transport within this execution domain. Keys
+ * are process-local, never reused, and do not identify an image or its owner.
+ * Synchronous callers have a distinct domain from asynchronous completion. */
+W32KAPI BOOL client_surface_get_execution_domain( UINT64 *domain );
 W32KAPI void client_surface_cancel_completion( struct client_surface_completion_job *job );
 W32KAPI void client_surface_defer_reserved_present( struct client_surface_completion_job *job,
                                                    struct client_surface_frame *present,

@@ -23,6 +23,7 @@
 
 #include "ntstatus.h"
 #include "client_surface.h"
+#include "ntuser_private.h"
 #include "wine/debug.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(win);
@@ -282,6 +283,21 @@ UINT64 client_surface_allocate_completion_domains( unsigned int count )
     }
 }
 
+BOOL client_surface_get_execution_domain( UINT64 *domain )
+{
+    struct user_thread_info *info = get_user_thread_info();
+
+    if (info->completion_worker)
+    {
+        *domain = info->completion_worker->domain;
+        return TRUE;
+    }
+    if (!info->client_surface_domain &&
+        !(info->client_surface_domain = client_surface_allocate_completion_domains( 1 ))) return FALSE;
+    *domain = info->client_surface_domain;
+    return TRUE;
+}
+
 static struct client_surface_completion_worker *find_completion_worker_locked( UINT64 domain )
 {
     struct client_surface_completion_worker *idle = NULL;
@@ -479,8 +495,11 @@ static enum client_surface_completion_worker_disposition execute_completion_job(
 {
     struct client_surface_completion_result result = client_surface_completion_result( CLIENT_SURFACE_COMPLETION_FAILED );
     struct client_surface_completion_worker *worker = job->worker;
+    struct user_thread_info *info = get_user_thread_info();
+    struct client_surface_completion_worker *previous_worker = info->completion_worker;
     BOOL allocated = job->allocated;
 
+    info->completion_worker = worker;
     if (poll) result = poll_completion_job( surface, job );
     else TRACE( "cancelling completion without polling %s serial %s\n",
                 debugstr_client_surface( surface ), wine_dbgstr_longlong( job->present.serial ) );
@@ -508,6 +527,7 @@ static enum client_surface_completion_worker_disposition execute_completion_job(
         if (allocated) free( job );
         client_surface_release( surface );
     }
+    info->completion_worker = previous_worker;
     /* Native destruction in the last surface release is part of the lease,
      * too. Only now can another FIFO head or a newly admitted domain use this
      * slot. The worker array outlives both the job and the surface. */

@@ -93,6 +93,7 @@ extern BOOL x11drv_client_snapshot_prepare_native( struct x11drv_client_snapshot
                                                   unsigned int width, unsigned int height,
                                                   unsigned int depth, UINT64 epoch );
 extern BOOL x11drv_client_snapshot_read_native( void *context );
+extern BOOL x11drv_client_snapshot_prepare_read( struct x11drv_client_snapshot **storage );
 extern BOOL x11drv_client_surface_snapshot( struct client_surface *client, const BYTE *pixels,
                                             unsigned int width, unsigned int height,
                                             BOOL top_down, const struct x11drv_snapshot_format *format );
