@@ -146,16 +146,6 @@ struct client_surface_scene_plan
 #define CLIENT_SURFACE_COMPOSITOR_MAX_INFLIGHT 2
 #define CLIENT_SURFACE_COMPOSITOR_DAMAGE_HISTORY 64
 
-struct client_surface_output_allocation
-{
-    struct client_surface_output_allocation *next;
-    struct client_surface_memory_scope memory;
-    Pixmap pixmaps[2];
-    UINT64 bytes;
-};
-
-static struct client_surface_output_allocation *client_surface_output_allocations;
-
 static UINT64 client_surface_pixmap_bytes( unsigned int width, unsigned int height, unsigned int depth )
 {
     return (UINT64)width * height * (depth > 16 ? 4 : depth > 8 ? 2 : 1);
@@ -400,6 +390,21 @@ static struct client_surface_compositor_job **client_surface_compositor_tail =
  * retain ownership until completion, including while another target runs. */
 static struct client_surface_compositor_job *client_surface_compositor_pending;
 static UINT64 client_surface_native_update_serial;
+
+/* The release node is part of the admitted output storage. The GUI can pass
+ * ownership back without allocating or waiting for the actor. The registry
+ * links are protected by compositor_mutex; only the actor changes the native
+ * objects and their accounting. Keep this node until job dispatch finishes. */
+struct client_surface_output_allocation
+{
+    struct client_surface_compositor_job release;
+    struct client_surface_output_allocation *next;
+    struct client_surface_memory_scope memory;
+    Pixmap pixmaps[2];
+    UINT64 bytes;
+};
+
+static struct client_surface_output_allocation *client_surface_output_allocations;
 
 #define CLIENT_SURFACE_COPY_BATCH_SIZE 64
 struct client_surface_owner_copy
@@ -652,8 +657,10 @@ static BOOL client_surface_alloc_on_compositor( struct client_surface_compositor
     if (gc && !error)
     {
         memcpy( allocation->pixmaps, job->u.pool.pixmaps, sizeof(allocation->pixmaps) );
+        pthread_mutex_lock( &client_surface_compositor_mutex );
         allocation->next = client_surface_output_allocations;
         client_surface_output_allocations = allocation;
+        pthread_mutex_unlock( &client_surface_compositor_mutex );
         x11drv_client_surface_trace_image( "acquire", "output_pair", display, job->u.pool.pixmaps[0], allocation->bytes / 2 );
         x11drv_client_surface_trace_image( "acquire", "output_pair", display, job->u.pool.pixmaps[1], allocation->bytes / 2 );
         return TRUE;
@@ -676,9 +683,12 @@ static BOOL client_surface_free_on_compositor( const Pixmap pixmaps[2] )
     struct client_surface_output_allocation **cursor, *allocation;
     int error = 0;
 
+    pthread_mutex_lock( &client_surface_compositor_mutex );
     for (cursor = &client_surface_output_allocations; (allocation = *cursor); cursor = &allocation->next)
         if ((allocation->pixmaps[0] == pixmaps[0] && allocation->pixmaps[1] == pixmaps[1]) ||
             (allocation->pixmaps[0] == pixmaps[1] && allocation->pixmaps[1] == pixmaps[0])) break;
+    if (allocation) *cursor = allocation->next;
+    pthread_mutex_unlock( &client_surface_compositor_mutex );
     X11DRV_expect_error( display, client_surface_compositor_error, &error );
     if (pixmaps[0]) XFreePixmap( display, pixmaps[0] );
     if (pixmaps[1]) XFreePixmap( display, pixmaps[1] );
@@ -686,11 +696,13 @@ static BOOL client_surface_free_on_compositor( const Pixmap pixmaps[2] )
     X11DRV_check_error();
     if (allocation)
     {
-        *cursor = allocation->next;
         x11drv_client_surface_trace_image( "free", "output_pair", display, pixmaps[0], allocation->bytes / 2 );
         x11drv_client_surface_trace_image( "free", "output_pair", display, pixmaps[1], allocation->bytes / 2 );
         client_surface_release_scoped_memory( &allocation->memory, CLIENT_SURFACE_MEMORY_OUTPUT, allocation->bytes );
-        client_surface_free_owned_metadata( &allocation->memory, allocation, sizeof(*allocation) );
+        /* A rollback has no queued node. Otherwise the dispatcher still owns
+         * release, including its result and queue link, until it retires it. */
+        if (!allocation->release.async)
+            client_surface_free_owned_metadata( &allocation->memory, allocation, sizeof(*allocation) );
     }
     if (error) WARN( "failed to release client-surface frame pool %#lx/%#lx, error %d\n",
                      pixmaps[0], pixmaps[1], error );
@@ -3912,7 +3924,14 @@ static BOOL process_client_surface_compositor_jobs(void)
         release_client_surface_compositor_job_resources( job );
         if (job->async)
         {
-            free( job );
+            if (job->op == CLIENT_SURFACE_COMPOSITOR_FREE_POOL)
+            {
+                struct client_surface_output_allocation *allocation =
+                    CONTAINING_RECORD( job, struct client_surface_output_allocation, release );
+
+                client_surface_free_owned_metadata( &allocation->memory, allocation, sizeof(*allocation) );
+            }
+            else free( job );
             continue;
         }
         pthread_mutex_lock( &client_surface_compositor_mutex );
@@ -3984,6 +4003,23 @@ static BOOL init_client_surface_compositor_notification(void)
     return TRUE;
 }
 
+/* An admitted resource's release is infallible. This only links its existing
+ * node under the metadata mutex; no native operation runs while it is held. */
+static void enqueue_client_surface_compositor_job( struct client_surface_compositor_job *job )
+{
+    assert( client_surface_compositor_started );
+    job->next = NULL;
+    job->complete = FALSE;
+    if (job->op == CLIENT_SURFACE_COMPOSITOR_PRESENT)
+        job->u.present.started = job->u.present.done = FALSE;
+    if (job->op == CLIENT_SURFACE_COMPOSITOR_TRY_BEGIN_UPDATE)
+        job->u.update.deferred = FALSE;
+    *client_surface_compositor_tail = job;
+    client_surface_compositor_tail = &job->next;
+    wake_client_surface_compositor();
+    pthread_cond_broadcast( &client_surface_compositor_cond );
+}
+
 /* The caller holds client_surface_compositor_mutex. Ownership of asynchronous
  * jobs passes to the actor only when they have been queued successfully. */
 static BOOL queue_client_surface_compositor_job( struct client_surface_compositor_job *job )
@@ -3991,12 +4027,7 @@ static BOOL queue_client_surface_compositor_job( struct client_surface_composito
     HANDLE thread;
     NTSTATUS status;
 
-    job->next = NULL;
     job->complete = FALSE;
-    if (job->op == CLIENT_SURFACE_COMPOSITOR_PRESENT)
-        job->u.present.started = job->u.present.done = FALSE;
-    if (job->op == CLIENT_SURFACE_COMPOSITOR_TRY_BEGIN_UPDATE)
-        job->u.update.deferred = FALSE;
     if (!client_surface_compositor_started)
     {
         if (!init_client_surface_compositor_notification()) return FALSE;
@@ -4011,10 +4042,7 @@ static BOOL queue_client_surface_compositor_job( struct client_surface_composito
         NtClose( thread );
         client_surface_compositor_started = TRUE;
     }
-    *client_surface_compositor_tail = job;
-    client_surface_compositor_tail = &job->next;
-    wake_client_surface_compositor();
-    pthread_cond_broadcast( &client_surface_compositor_cond );
+    enqueue_client_surface_compositor_job( job );
     return TRUE;
 }
 
@@ -4042,9 +4070,24 @@ static void post_client_surface_compositor_job( struct client_surface_compositor
 {
     struct client_surface_compositor_job *pending;
 
+    if (job->op == CLIENT_SURFACE_COMPOSITOR_FREE_POOL)
+    {
+        struct client_surface_output_allocation *allocation;
+
+        if (!job->u.retired_pixmaps[0] && !job->u.retired_pixmaps[1]) return;
+        pthread_mutex_lock( &client_surface_compositor_mutex );
+        for (allocation = client_surface_output_allocations; allocation; allocation = allocation->next)
+            if ((allocation->pixmaps[0] == job->u.retired_pixmaps[0] && allocation->pixmaps[1] == job->u.retired_pixmaps[1]) ||
+                (allocation->pixmaps[0] == job->u.retired_pixmaps[1] && allocation->pixmaps[1] == job->u.retired_pixmaps[0])) break;
+        assert( allocation && !allocation->release.async );
+        allocation->release = *job;
+        allocation->release.async = TRUE;
+        enqueue_client_surface_compositor_job( &allocation->release );
+        pthread_mutex_unlock( &client_surface_compositor_mutex );
+        return;
+    }
     assert( job->op == CLIENT_SURFACE_COMPOSITOR_FINISH_UPDATE ||
             job->op == CLIENT_SURFACE_COMPOSITOR_END_UPDATE ||
-            job->op == CLIENT_SURFACE_COMPOSITOR_FREE_POOL ||
             job->op == CLIENT_SURFACE_COMPOSITOR_DIRECT_COMPLETE );
     if ((pending = malloc( sizeof(*pending) )))
     {
@@ -4061,7 +4104,7 @@ static void post_client_surface_compositor_job( struct client_surface_compositor
     /* Dropping a release would leave a target quiescent or leak its retired
      * pixmaps. Only a successful enqueue transfers the release obligation. */
     if (!submit_client_surface_compositor_job( job ) && !job->complete &&
-        (job->op == CLIENT_SURFACE_COMPOSITOR_FREE_POOL || job->op == CLIENT_SURFACE_COMPOSITOR_DIRECT_COMPLETE))
+        job->op == CLIENT_SURFACE_COMPOSITOR_DIRECT_COMPLETE)
         WARN( "failed to queue client-surface release/publication op %u hwnd %p\n",
               job->op, job->toplevel );
 }
