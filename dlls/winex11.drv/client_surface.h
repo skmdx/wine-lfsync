@@ -77,8 +77,8 @@ struct x11drv_snapshot_format
 };
 extern const struct x11drv_snapshot_format x11drv_snapshot_rgba8;
 /* Upload replaces shared storage rather than modifying a published image.
- * Sharing and native capture require admitted handoff retirement; their last
- * release only queues native destruction. Private CPU storage can die inline. */
+ * Every native image has an admitted connection worker for its last release.
+ * Only metadata without native storage can be destroyed by its caller. */
 extern BOOL x11drv_client_snapshot_upload( struct x11drv_client_snapshot **snapshot, const BYTE *pixels,
                                           unsigned int width, unsigned int height, BOOL top_down,
                                           const struct x11drv_snapshot_format *format );
@@ -107,14 +107,16 @@ extern void x11drv_client_surface_retire_handoff( struct client_surface *client,
 extern void x11drv_client_surface_destroy_retirement( struct x11drv_client_surface *surface );
 extern void x11drv_client_surface_release_source_frame( struct x11drv_client_source_frame *frame );
 
-/* Embedded in an already charged source resource. The admitted retirement
- * worker owns it from enqueue until release returns; enqueue never allocates
- * or performs native I/O, and does not return the resource's memory charge. */
+/* Embedded in an already charged resource. Reclamation waits for the owned
+ * thread to exit before closing its handle and invoking metadata-only release.
+ * Enqueue neither allocates nor returns the resource's memory charge. */
 struct x11drv_client_surface_retired_resource
 {
     struct list entry;
+    HANDLE thread;
     void (*release)( struct x11drv_client_surface_retired_resource *resource );
 };
+extern BOOL x11drv_client_surface_prepare_resource_retirement(void);
 extern void x11drv_client_surface_retire_resource( struct x11drv_client_surface_retired_resource *resource );
 extern struct x11drv_client_source_frame *x11drv_client_surface_get_source(
     struct client_surface *client, unsigned int index, unsigned int width,

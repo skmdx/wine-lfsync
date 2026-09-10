@@ -177,6 +177,7 @@ static BOOL retire_source_mapping( struct x11drv_client_surface_retirement *reti
 
 static void source_retirement_thread( void *context )
 {
+    LARGE_INTEGER timeout = {0};
     struct list pending = LIST_INIT( pending );
     struct list resources = LIST_INIT( resources );
     struct x11drv_client_surface_retirement *retirement, *next;
@@ -193,6 +194,10 @@ static void source_retirement_thread( void *context )
 
         LIST_FOR_EACH_ENTRY_SAFE( resource, next_resource, &resources, struct x11drv_client_surface_retired_resource, entry )
         {
+            /* Native image destruction belongs to its connection's admitted
+             * worker. Its handle, capacity and metadata outlive actual exit. */
+            if (NtWaitForSingleObject( resource->thread, FALSE, &timeout )) continue;
+            NtClose( resource->thread );
             list_remove( &resource->entry );
             resource->release( resource );
         }
@@ -203,11 +208,13 @@ static void source_retirement_thread( void *context )
             release_source_retirement( retirement );
         }
         pthread_mutex_lock( &retirement_lock );
-        if (!list_empty( &pending ))
+        if (!list_empty( &pending ) || !list_empty( &resources ))
         {
+            BOOL wait = list_empty( &retirements ) && list_empty( &retired_resources );
+
             list_move_tail( &retirements, &pending );
-            if (list_empty( &retired_resources ))
-                client_surface_cond_timedwait( &retirement_cond, &retirement_lock, 10 );
+            list_move_tail( &retired_resources, &resources );
+            if (wait) client_surface_cond_timedwait( &retirement_cond, &retirement_lock, 10 );
         }
         pthread_mutex_unlock( &retirement_lock );
     }
@@ -216,37 +223,43 @@ static void source_retirement_thread( void *context )
 void x11drv_client_surface_retire_resource( struct x11drv_client_surface_retired_resource *resource )
 {
     pthread_mutex_lock( &retirement_lock );
-    /* A shared image first acquired a frame reference after handoff_prepare
-     * admitted this worker. Its embedded queue entry needs no new capacity;
-     * the entire image remains charged until the callback actually returns. */
-    assert( retirement_started );
+    assert( retirement_started && resource->thread );
     list_add_tail( &retired_resources, &resource->entry );
     pthread_cond_signal( &retirement_cond );
     pthread_mutex_unlock( &retirement_lock );
 }
 
+BOOL x11drv_client_surface_prepare_resource_retirement(void)
+{
+    HANDLE thread;
+    NTSTATUS status = 0;
+
+    pthread_once( &retirement_cond_once, init_retirement_cond );
+    if (retirement_cond_status) return FALSE;
+    pthread_mutex_lock( &retirement_lock );
+    if (!retirement_started)
+    {
+        status = PsCreateSystemThread( &thread, THREAD_ALL_ACCESS, NULL, 0, NULL, source_retirement_thread, NULL );
+        if (!status)
+        {
+            NtClose( thread );
+            retirement_started = TRUE;
+        }
+    }
+    pthread_mutex_unlock( &retirement_lock );
+    return !status;
+}
+
 BOOL x11drv_client_surface_prepare_retirement( struct x11drv_client_surface *surface )
 {
     struct x11drv_client_surface_retirement *retirement;
-    HANDLE thread;
-    NTSTATUS status;
 
     if (surface->handoff_retirement) return TRUE;
-    pthread_once( &retirement_cond_once, init_retirement_cond );
-    if (retirement_cond_status) return FALSE;
+    if (!x11drv_client_surface_prepare_resource_retirement()) return FALSE;
     if (!client_surface_reserve_memory( CLIENT_SURFACE_MEMORY_STAGING, sizeof(*retirement) )) return FALSE;
     if (!(retirement = calloc( 1, sizeof(*retirement) ))) goto failed;
     pthread_mutex_lock( &retirement_lock );
     if (retirement_count == MAX_SOURCE_RETIREMENTS) goto failed_locked;
-    /* Reserve the record and sole process worker before publishing any source.
-     * Detach then needs no allocation and never frees a live reader on OOM. */
-    if (!retirement_started)
-    {
-        status = PsCreateSystemThread( &thread, THREAD_ALL_ACCESS, NULL, 0, NULL, source_retirement_thread, NULL );
-        if (status) goto failed_locked;
-        NtClose( thread );
-        retirement_started = TRUE;
-    }
     ++retirement_count;
     pthread_mutex_unlock( &retirement_lock );
     retirement->refs = 1;

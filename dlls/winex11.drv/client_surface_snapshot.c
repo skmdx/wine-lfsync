@@ -28,6 +28,9 @@ WINE_DEFAULT_DEBUG_CHANNEL(x11drv);
 struct snapshot_connection
 {
     struct list entry;
+    struct x11drv_client_surface_retired_resource retirement;
+    struct list retired_snapshots;
+    pthread_cond_t cond;
     UINT64 domain;
     unsigned int refs;
     pthread_mutex_t lock;
@@ -43,9 +46,8 @@ static unsigned int snapshot_connection_count;
 
 struct x11drv_client_snapshot
 {
-    struct x11drv_client_surface_retired_resource retirement;
+    struct list retirement_entry;
     LONG refs;
-    BOOL deferred;
     struct snapshot_connection *connection;
     Pixmap pixmap;
     GC gc;
@@ -58,6 +60,60 @@ struct x11drv_client_snapshot
     UINT64 bytes;
     BOOL acquired;
 };
+
+static void destroy_snapshot( struct x11drv_client_snapshot *snapshot );
+
+static void free_snapshot_connection( struct x11drv_client_surface_retired_resource *resource )
+{
+    struct snapshot_connection *connection = CONTAINING_RECORD( resource, struct snapshot_connection, retirement );
+
+    assert( !connection->refs && list_empty( &connection->retired_snapshots ) );
+    pthread_cond_destroy( &connection->cond );
+    pthread_mutex_destroy( &connection->lock );
+    pthread_mutex_lock( &snapshot_connections_lock );
+    --snapshot_connection_count;
+    pthread_mutex_unlock( &snapshot_connections_lock );
+    TRACE( "released snapshot connection %p domain %s worker %p\n",
+           connection, wine_dbgstr_longlong( connection->domain ), resource->thread );
+    client_surface_release_memory( CLIENT_SURFACE_MEMORY_STAGING, sizeof(*connection) );
+    free( connection );
+}
+
+static void snapshot_retirement_thread( void *context )
+{
+    struct snapshot_connection *connection = context;
+    struct x11drv_client_snapshot *snapshot;
+
+    TRACE( "started snapshot retirement worker for connection %p domain %s\n",
+           connection, wine_dbgstr_longlong( connection->domain ) );
+    for (;;)
+    {
+        pthread_mutex_lock( &snapshot_connections_lock );
+        while (list_empty( &connection->retired_snapshots ) && connection->refs)
+            pthread_cond_wait( &connection->cond, &snapshot_connections_lock );
+        if (!connection->refs)
+        {
+            assert( list_empty( &connection->retired_snapshots ) );
+            pthread_mutex_unlock( &snapshot_connections_lock );
+            break;
+        }
+        snapshot = LIST_ENTRY( list_head( &connection->retired_snapshots ), struct x11drv_client_snapshot, retirement_entry );
+        list_remove( &snapshot->retirement_entry );
+        pthread_mutex_unlock( &snapshot_connections_lock );
+        destroy_snapshot( snapshot );
+    }
+    /* The native connection and its admitted worker have the same fault
+     * domain. Neither a stopped copy nor destruction stalls another domain's
+     * retirement or the shared mapping/handle observer. */
+    if (connection->display)
+    {
+        XCloseDisplay( connection->display );
+        X11DRV_unregister_error_handler( &connection->errors );
+        TRACE( "closed snapshot connection %p domain %s\n", connection->display,
+               wine_dbgstr_longlong( connection->domain ) );
+    }
+    x11drv_client_surface_retire_resource( &connection->retirement );
+}
 
 static int snapshot_error( Display *display, XErrorEvent *event, void *arg )
 {
@@ -94,6 +150,16 @@ static struct snapshot_connection *snapshot_connection_acquire( UINT64 domain )
         client_surface_release_memory( CLIENT_SURFACE_MEMORY_STAGING, sizeof(*connection) );
         goto done;
     }
+    if (client_surface_cond_init( &connection->cond ))
+    {
+        pthread_mutex_destroy( &connection->lock );
+        free( connection );
+        connection = NULL;
+        client_surface_release_memory( CLIENT_SURFACE_MEMORY_STAGING, sizeof(*connection) );
+        goto done;
+    }
+    list_init( &connection->retired_snapshots );
+    connection->retirement.release = free_snapshot_connection;
     connection->domain = domain;
     connection->refs = 1;
     list_add_tail( &snapshot_connections, &connection->entry );
@@ -113,30 +179,38 @@ static void snapshot_connection_release( struct snapshot_connection *connection 
         return;
     }
     list_remove( &connection->entry );
-    pthread_mutex_unlock( &snapshot_connections_lock );
-
-    /* No image can use this connection now. Keep both its admission and error
-     * sink until actual native destruction returns, outside metadata locks. */
-    if (connection->display)
+    if (connection->retirement.thread)
     {
-        XCloseDisplay( connection->display );
-        X11DRV_unregister_error_handler( &connection->errors );
-        TRACE( "closed snapshot connection %p domain %s\n", connection->display,
-               wine_dbgstr_longlong( connection->domain ) );
+        pthread_cond_signal( &connection->cond );
+        pthread_mutex_unlock( &snapshot_connections_lock );
+        return;
     }
-    pthread_mutex_destroy( &connection->lock );
-    pthread_mutex_lock( &snapshot_connections_lock );
-    --snapshot_connection_count;
     pthread_mutex_unlock( &snapshot_connections_lock );
-    client_surface_release_memory( CLIENT_SURFACE_MEMORY_STAGING, sizeof(*connection) );
-    free( connection );
+    assert( !connection->display );
+    free_snapshot_connection( &connection->retirement );
 }
 
 /* The caller holds this domain's native lock. Error attribution belongs to
  * the connection and every request window is drained before the lock returns. */
 static BOOL snapshot_connection_open( struct snapshot_connection *connection )
 {
+    HANDLE thread;
+    NTSTATUS status;
+
     if (connection->display) return TRUE;
+    if (!connection->retirement.thread)
+    {
+        /* Admit native destruction before allocating anything on this Display.
+         * Connection initialization is serialized by its native lock. Metadata
+         * capacity remains charged until the thread has actually exited. */
+        if (!x11drv_client_surface_prepare_resource_retirement()) return FALSE;
+        status = PsCreateSystemThread( &thread, THREAD_ALL_ACCESS, NULL, 0, NULL,
+                                       snapshot_retirement_thread, connection );
+        if (status) return FALSE;
+        pthread_mutex_lock( &snapshot_connections_lock );
+        connection->retirement.thread = thread;
+        pthread_mutex_unlock( &snapshot_connections_lock );
+    }
     if (!(connection->display = XOpenDisplay( DisplayString( gdi_display ) ))) return FALSE;
     connection->errors.display = connection->display;
     connection->errors.callback = snapshot_error;
@@ -179,10 +253,11 @@ static void destroy_snapshot( struct x11drv_client_snapshot *snapshot )
     Display *display;
 
     if (!snapshot) return;
+    assert( !snapshot->refs );
     connection = snapshot->connection;
     display = NULL;
     x11drv_client_snapshot_release_staging( snapshot );
-    if (connection)
+    if (connection && (snapshot->gc || snapshot->import || snapshot->pixmap))
     {
         pthread_mutex_lock( &connection->lock );
         display = connection->display;
@@ -209,28 +284,32 @@ static void destroy_snapshot( struct x11drv_client_snapshot *snapshot )
     free( snapshot );
 }
 
-static void release_retired_snapshot( struct x11drv_client_surface_retired_resource *resource )
-{
-    struct x11drv_client_snapshot *snapshot = CONTAINING_RECORD( resource, struct x11drv_client_snapshot, retirement );
-
-    assert( !snapshot->refs );
-    destroy_snapshot( snapshot );
-}
-
 struct x11drv_client_snapshot *x11drv_client_snapshot_share( struct x11drv_client_snapshot *snapshot )
 {
     /* A frame holds this reference until its checked consumer read finishes.
      * The retained surface image and a working reservation own separate refs. */
-    snapshot->deferred = TRUE;
     InterlockedIncrement( &snapshot->refs );
     return snapshot;
 }
 
 void x11drv_client_snapshot_release( struct x11drv_client_snapshot *snapshot )
 {
+    struct snapshot_connection *connection;
+
     if (!snapshot || InterlockedDecrement( &snapshot->refs )) return;
-    if (snapshot->deferred) x11drv_client_surface_retire_resource( &snapshot->retirement );
-    else destroy_snapshot( snapshot );
+    connection = snapshot->connection;
+    pthread_mutex_lock( &snapshot_connections_lock );
+    if (connection && connection->retirement.thread)
+    {
+        list_add_tail( &connection->retired_snapshots, &snapshot->retirement_entry );
+        pthread_cond_signal( &connection->cond );
+        pthread_mutex_unlock( &snapshot_connections_lock );
+        return;
+    }
+    pthread_mutex_unlock( &snapshot_connections_lock );
+    /* No native allocation can precede the connection worker's admission. */
+    assert( !snapshot->pixmap && !snapshot->gc && !snapshot->import );
+    destroy_snapshot( snapshot );
 }
 
 static BOOL snapshot_create_image( struct x11drv_client_snapshot *snapshot )
@@ -277,7 +356,6 @@ static struct x11drv_client_snapshot *snapshot_alloc( unsigned int width, unsign
     snapshot->size = (SIZE){width, height};
     snapshot->depth = depth;
     snapshot->refs = 1;
-    snapshot->retirement.release = release_retired_snapshot;
     if (!client_surface_reserve_memory( CLIENT_SURFACE_MEMORY_SOURCE, bytes )) goto failed;
     snapshot->bytes = bytes;
     return snapshot;
@@ -336,9 +414,7 @@ BOOL x11drv_client_snapshot_prepare_native( struct x11drv_client_snapshot **stor
         x11drv_client_snapshot_release( snapshot );
         *storage = snapshot = next;
     }
-    /* The prepared handoff already admitted retirement. Even an unpublished
-     * failed copy can therefore release its last reference without native I/O. */
-    snapshot->deferred = TRUE;
+    /* Native storage is allocated only after admitting its connection worker. */
     assert( !snapshot->window || snapshot->window == window );
     snapshot->window = window;
     snapshot->target_epoch = epoch;
@@ -350,12 +426,11 @@ BOOL x11drv_client_snapshot_prepare_read( struct x11drv_client_snapshot **storag
     struct x11drv_client_snapshot *snapshot = *storage, *next;
     UINT64 domain;
 
-    assert( snapshot && snapshot->refs == 1 && snapshot->deferred );
+    assert( snapshot && snapshot->refs == 1 );
     if (!client_surface_get_execution_domain( &domain )) return FALSE;
     if (snapshot->connection && snapshot->connection->domain != domain)
     {
         if (!(next = snapshot_alloc( snapshot->size.cx, snapshot->size.cy, snapshot->depth ))) return FALSE;
-        next->deferred = TRUE;
         next->window = snapshot->window;
         next->target_epoch = snapshot->target_epoch;
         x11drv_client_snapshot_release( snapshot );
