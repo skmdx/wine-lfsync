@@ -277,20 +277,6 @@ struct client_surface_direct_completion
     UINT64 identity, scene_epoch, native_epoch;
 };
 
-/* The routing lifetime spans initial target preparation, replacement and the
- * last resource release. Only refs/registry use compositor_mutex; the actor
- * alone owns both FIFOs and the ready/parked list entry. */
-struct client_surface_compositor_queue
-{
-    struct rb_entry registry_entry;
-    struct client_surface_memory_scope memory;
-    struct client_surface_compositor_target *target;
-    struct list entry;
-    struct client_surface_compositor_job *head, **tail, *control_head, **control_tail;
-    HWND toplevel;
-    unsigned int refs, incoming;
-};
-
 struct client_surface_compositor_job
 {
     struct client_surface_compositor_job *next;
@@ -406,6 +392,48 @@ struct client_surface_compositor_job
         } update;
     } u;
 };
+
+struct client_surface_compositor_request
+{
+    struct client_surface_compositor_job job;
+    struct client_surface_memory_scope memory;
+};
+
+/* The routing lifetime spans initial target preparation, replacement and the
+ * last resource release. Only refs/registry/admission use compositor_mutex;
+ * the actor alone owns both FIFOs and the ready/parked list entry. */
+struct client_surface_compositor_queue
+{
+    struct rb_entry registry_entry;
+    struct client_surface_memory_scope memory;
+    struct client_surface_compositor_target *target;
+    struct list entry;
+    struct client_surface_compositor_job *head, **tail, *control_head, **control_tail;
+    HWND toplevel;
+    unsigned int refs, incoming, requests;
+    /* Native update barriers and removal already have synchronous callers.
+     * Serialize their storage within the admitted queue, independently of
+     * ordinary request pressure. Release notifications never use this slot. */
+    struct client_surface_compositor_request barrier;
+    BOOL barrier_in_use;
+};
+
+enum client_surface_compositor_capacity_kind
+{
+    CLIENT_SURFACE_COMPOSITOR_REQUEST_CAPACITY,
+    CLIENT_SURFACE_COMPOSITOR_QUEUE_CAPACITY,
+    CLIENT_SURFACE_COMPOSITOR_RELEASE_CAPACITY,
+    CLIENT_SURFACE_COMPOSITOR_CAPACITY_COUNT,
+};
+
+static const struct { unsigned int count; SIZE_T bytes; } client_surface_compositor_limits[] =
+{
+    [CLIENT_SURFACE_COMPOSITOR_REQUEST_CAPACITY] = {1024, 256 * 1024},
+    [CLIENT_SURFACE_COMPOSITOR_QUEUE_CAPACITY] = {2048, 1024 * 1024},
+    [CLIENT_SURFACE_COMPOSITOR_RELEASE_CAPACITY] = {4096, 1024 * 1024},
+};
+#define CLIENT_SURFACE_COMPOSITOR_REQUESTS_PER_TARGET 64
+static struct { unsigned int count; SIZE_T bytes; } client_surface_compositor_capacity[CLIENT_SURFACE_COMPOSITOR_CAPACITY_COUNT];
 
 static struct client_surface_compositor_job *client_surface_compositor_head;
 static struct client_surface_compositor_job **client_surface_compositor_tail =
@@ -635,6 +663,68 @@ static BOOL client_surface_copy_on_compositor( Drawable source, Drawable destina
         source, destination, source_x, source_y, destination_x, destination_y, width, height );
 }
 
+/* Capacity is reserved before allocation and returned after the real free.
+ * Reserved release nodes compete only when their resources are constructed,
+ * never when those resources need to retire. Caller holds compositor_mutex. */
+static BOOL reserve_client_surface_compositor_capacity( enum client_surface_compositor_capacity_kind kind,
+                                                        unsigned int count, SIZE_T bytes,
+                                                        struct client_surface_compositor_queue *queue )
+{
+    BOOL accepted = count <= client_surface_compositor_limits[kind].count - client_surface_compositor_capacity[kind].count &&
+                    bytes <= client_surface_compositor_limits[kind].bytes - client_surface_compositor_capacity[kind].bytes;
+
+    if (queue) accepted = accepted && queue->requests < CLIENT_SURFACE_COMPOSITOR_REQUESTS_PER_TARGET;
+    if (accepted)
+    {
+        client_surface_compositor_capacity[kind].count += count;
+        client_surface_compositor_capacity[kind].bytes += bytes;
+        if (queue) ++queue->requests;
+    }
+    TRACE_(csperf)( "ticks=%llu event=compositor_admission kind=%u count=%u bytes=%zu accepted=%u "
+                   "used=%u used_bytes=%zu hwnd=%p target_requests=%u\n", client_surface_perf_time(), kind,
+                   count, (size_t)bytes, accepted, client_surface_compositor_capacity[kind].count,
+                   (size_t)client_surface_compositor_capacity[kind].bytes, queue ? queue->toplevel : NULL,
+                   queue ? queue->requests : 0 );
+    return accepted;
+}
+
+static void release_client_surface_compositor_capacity( enum client_surface_compositor_capacity_kind kind,
+                                                        unsigned int count, SIZE_T bytes,
+                                                        struct client_surface_compositor_queue *queue )
+{
+    pthread_mutex_lock( &client_surface_compositor_mutex );
+    assert( client_surface_compositor_capacity[kind].count >= count && client_surface_compositor_capacity[kind].bytes >= bytes );
+    client_surface_compositor_capacity[kind].count -= count;
+    client_surface_compositor_capacity[kind].bytes -= bytes;
+    if (queue)
+    {
+        assert( queue->requests );
+        --queue->requests;
+    }
+    TRACE_(csperf)( "ticks=%llu event=compositor_capacity_return kind=%u count=%u bytes=%zu used=%u used_bytes=%zu "
+                   "hwnd=%p target_requests=%u\n", client_surface_perf_time(), kind, count, (size_t)bytes,
+                   client_surface_compositor_capacity[kind].count, (size_t)client_surface_compositor_capacity[kind].bytes,
+                   queue ? queue->toplevel : NULL, queue ? queue->requests : 0 );
+    pthread_mutex_unlock( &client_surface_compositor_mutex );
+}
+
+static BOOL reserve_client_surface_compositor_release( unsigned int count, SIZE_T bytes )
+{
+    BOOL ret;
+
+    pthread_mutex_lock( &client_surface_compositor_mutex );
+    ret = reserve_client_surface_compositor_capacity( CLIENT_SURFACE_COMPOSITOR_RELEASE_CAPACITY, count, bytes, NULL );
+    pthread_mutex_unlock( &client_surface_compositor_mutex );
+    return ret;
+}
+
+static void free_client_surface_compositor_release( struct client_surface_memory_scope *memory, void *data,
+                                                    unsigned int count, SIZE_T bytes )
+{
+    client_surface_free_owned_metadata( memory, data, bytes );
+    release_client_surface_compositor_capacity( CLIENT_SURFACE_COMPOSITOR_RELEASE_CAPACITY, count, bytes, NULL );
+}
+
 /* Routing storage is admitted before the actor starts. Its account uses the
  * same stable native domain as the actor's images, never the GUI thread's
  * execution domain. Each allocation retains it through actual retirement. */
@@ -678,9 +768,17 @@ static struct client_surface_compositor_queue *get_client_surface_compositor_que
             rb_put( &client_surface_compositor_queues, toplevel, &queue->registry_entry );
             break;
         }
+        if (!reserve_client_surface_compositor_capacity( CLIENT_SURFACE_COMPOSITOR_QUEUE_CAPACITY, 1, sizeof(*created), NULL ))
+        {
+            pthread_mutex_unlock( &client_surface_compositor_mutex );
+            return NULL;
+        }
         pthread_mutex_unlock( &client_surface_compositor_mutex );
         if (!(created = alloc_client_surface_compositor_metadata( toplevel, sizeof(*created), &memory )))
+        {
+            release_client_surface_compositor_capacity( CLIENT_SURFACE_COMPOSITOR_QUEUE_CAPACITY, 1, sizeof(*created), NULL );
             return NULL;
+        }
         created->memory = memory;
         created->toplevel = toplevel;
         created->refs = 1;
@@ -690,7 +788,11 @@ static struct client_surface_compositor_queue *get_client_surface_compositor_que
         pthread_mutex_lock( &client_surface_compositor_mutex );
     }
     pthread_mutex_unlock( &client_surface_compositor_mutex );
-    if (created) client_surface_free_owned_metadata( &created->memory, created, sizeof(*created) );
+    if (created)
+    {
+        client_surface_free_owned_metadata( &created->memory, created, sizeof(*created) );
+        release_client_surface_compositor_capacity( CLIENT_SURFACE_COMPOSITOR_QUEUE_CAPACITY, 1, sizeof(*created), NULL );
+    }
     return queue;
 }
 
@@ -702,12 +804,16 @@ static void release_client_surface_compositor_queue( struct client_surface_compo
     assert( queue->refs );
     if ((unused = !--queue->refs))
     {
-        assert( !queue->head && !queue->control_head && !queue->incoming &&
+        assert( !queue->head && !queue->control_head && !queue->incoming && !queue->requests && !queue->barrier_in_use &&
                 !queue->target && list_empty( &queue->entry ) );
         rb_remove( &client_surface_compositor_queues, &queue->registry_entry );
     }
     pthread_mutex_unlock( &client_surface_compositor_mutex );
-    if (unused) client_surface_free_owned_metadata( &queue->memory, queue, sizeof(*queue) );
+    if (unused)
+    {
+        client_surface_free_owned_metadata( &queue->memory, queue, sizeof(*queue) );
+        release_client_surface_compositor_capacity( CLIENT_SURFACE_COMPOSITOR_QUEUE_CAPACITY, 1, sizeof(*queue), NULL );
+    }
 }
 
 static struct client_surface_compositor_target *alloc_client_surface_compositor_target( HWND toplevel )
@@ -719,12 +825,18 @@ static struct client_surface_compositor_target *alloc_client_surface_compositor_
     if (!(target = alloc_client_surface_compositor_metadata( toplevel, sizeof(*target), &memory ))) return NULL;
     target->memory = memory;
     target->toplevel = toplevel;
+    if (!reserve_client_surface_compositor_release( 3, sizeof(*notifications) ))
+    {
+        client_surface_free_owned_metadata( &target->memory, target, sizeof(*target) );
+        return NULL;
+    }
     memset( &memory, 0, sizeof(memory) );
     client_surface_memory_scope_copy( &memory, &target->memory, TRUE );
     if (!(notifications = client_surface_alloc_scoped_metadata( &memory, 1, sizeof(*notifications) )))
     {
         client_surface_memory_scope_destroy( &memory );
         client_surface_free_owned_metadata( &target->memory, target, sizeof(*target) );
+        release_client_surface_compositor_capacity( CLIENT_SURFACE_COMPOSITOR_RELEASE_CAPACITY, 3, sizeof(*notifications), NULL );
         return NULL;
     }
     notifications->memory = memory;
@@ -768,7 +880,7 @@ static void free_client_surface_compositor_target( struct client_surface_composi
     if (unused)
     {
         release_client_surface_compositor_queue( notifications->queue );
-        client_surface_free_owned_metadata( &notifications->memory, notifications, sizeof(*notifications) );
+        free_client_surface_compositor_release( &notifications->memory, notifications, 3, sizeof(*notifications) );
     }
     client_surface_free_owned_metadata( &target->memory, target, sizeof(*target) );
 }
@@ -797,7 +909,12 @@ static BOOL client_surface_alloc_on_compositor( struct client_surface_compositor
     int error = 0;
 
     assert( job->u.pool.copy_count && job->u.pool.copy_count <= ARRAY_SIZE(job->u.pool.pixmaps) );
-    if (!(allocation = alloc_client_surface_compositor_metadata( job->toplevel, sizeof(*allocation), &memory ))) return FALSE;
+    if (!reserve_client_surface_compositor_release( 1, sizeof(*allocation) )) return FALSE;
+    if (!(allocation = alloc_client_surface_compositor_metadata( job->toplevel, sizeof(*allocation), &memory )))
+    {
+        release_client_surface_compositor_capacity( CLIENT_SURFACE_COMPOSITOR_RELEASE_CAPACITY, 1, sizeof(*allocation), NULL );
+        return FALSE;
+    }
     allocation->memory = memory;
     allocation->release.queue = get_client_surface_compositor_queue( job->toplevel );
     assert( allocation->release.queue );
@@ -806,7 +923,7 @@ static BOOL client_surface_alloc_on_compositor( struct client_surface_compositor
     if (!client_surface_reserve_scoped_memory( &allocation->memory, CLIENT_SURFACE_MEMORY_OUTPUT, allocation->bytes ))
     {
         release_client_surface_compositor_queue( allocation->release.queue );
-        client_surface_free_owned_metadata( &allocation->memory, allocation, sizeof(*allocation) );
+        free_client_surface_compositor_release( &allocation->memory, allocation, 1, sizeof(*allocation) );
         return FALSE;
     }
     X11DRV_expect_error( display, client_surface_compositor_error, &error );
@@ -866,7 +983,7 @@ static BOOL client_surface_alloc_on_compositor( struct client_surface_compositor
     job->u.pool.pixmaps[0] = job->u.pool.pixmaps[1] = 0;
     client_surface_release_scoped_memory( &allocation->memory, CLIENT_SURFACE_MEMORY_OUTPUT, allocation->bytes );
     release_client_surface_compositor_queue( allocation->release.queue );
-    client_surface_free_owned_metadata( &allocation->memory, allocation, sizeof(*allocation) );
+    free_client_surface_compositor_release( &allocation->memory, allocation, 1, sizeof(*allocation) );
     return FALSE;
 }
 
@@ -897,7 +1014,7 @@ static BOOL client_surface_free_on_compositor( const Pixmap pixmaps[2] )
         if (!allocation->release.async)
         {
             release_client_surface_compositor_queue( allocation->release.queue );
-            client_surface_free_owned_metadata( &allocation->memory, allocation, sizeof(*allocation) );
+            free_client_surface_compositor_release( &allocation->memory, allocation, 1, sizeof(*allocation) );
         }
     }
     if (error) WARN( "failed to release client-surface frame pool %#lx/%#lx, error %d\n",
@@ -4088,7 +4205,7 @@ static void finish_client_surface_notification( struct client_surface_compositor
     if (unused)
     {
         release_client_surface_compositor_queue( notifications->queue );
-        client_surface_free_owned_metadata( &notifications->memory, notifications, sizeof(*notifications) );
+        free_client_surface_compositor_release( &notifications->memory, notifications, 3, sizeof(*notifications) );
     }
 }
 
@@ -4254,7 +4371,7 @@ static BOOL process_client_surface_compositor_jobs(void)
 
                 assert( job->op == CLIENT_SURFACE_COMPOSITOR_FREE_POOL );
                 release_client_surface_compositor_queue( allocation->release.queue );
-                client_surface_free_owned_metadata( &allocation->memory, allocation, sizeof(*allocation) );
+                free_client_surface_compositor_release( &allocation->memory, allocation, 1, sizeof(*allocation) );
             }
         }
         else
@@ -4383,28 +4500,104 @@ static BOOL queue_client_surface_compositor_job( struct client_surface_composito
     return TRUE;
 }
 
+static struct client_surface_compositor_request *alloc_client_surface_compositor_request(
+    const struct client_surface_compositor_job *job, struct client_surface_compositor_queue *queue )
+{
+    struct client_surface_compositor_request *request;
+    struct client_surface_memory_scope memory = {0};
+    BOOL barrier = job->op == CLIENT_SURFACE_COMPOSITOR_BEGIN_UPDATE ||
+                   job->op == CLIENT_SURFACE_COMPOSITOR_TRY_BEGIN_UPDATE ||
+                   job->op == CLIENT_SURFACE_COMPOSITOR_CHECK_UPDATE ||
+                   job->op == CLIENT_SURFACE_COMPOSITOR_REMOVE_TARGET;
+
+    pthread_mutex_lock( &client_surface_compositor_mutex );
+    if (barrier)
+    {
+        /* These callers already synchronously protect native geometry or
+         * drain a target. They cannot interpret capacity refusal as "there
+         * was no target to protect". Their admitted queue owns one slot;
+         * concurrent barriers serialize here instead of allocating jobs.
+         * No release notification waits for this slot or uses its storage. */
+        while (queue->barrier_in_use)
+            pthread_cond_wait( &client_surface_compositor_cond, &client_surface_compositor_mutex );
+        queue->barrier_in_use = TRUE;
+        request = &queue->barrier;
+        pthread_mutex_unlock( &client_surface_compositor_mutex );
+    }
+    else
+    {
+        BOOL accepted = reserve_client_surface_compositor_capacity( CLIENT_SURFACE_COMPOSITOR_REQUEST_CAPACITY,
+                                                                     1, sizeof(*request), queue );
+
+        pthread_mutex_unlock( &client_surface_compositor_mutex );
+        if (!accepted) return NULL;
+        client_surface_memory_scope_copy( &memory, &queue->memory, TRUE );
+        if (!(request = client_surface_alloc_scoped_metadata( &memory, 1, sizeof(*request) )))
+        {
+            client_surface_memory_scope_destroy( &memory );
+            release_client_surface_compositor_capacity( CLIENT_SURFACE_COMPOSITOR_REQUEST_CAPACITY,
+                                                        1, sizeof(*request), queue );
+            return NULL;
+        }
+        request->memory = memory;
+    }
+    request->job = *job;
+    request->job.queue = queue;
+    request->job.async = FALSE;
+    return request;
+}
+
+static void free_client_surface_compositor_request( struct client_surface_compositor_request *request,
+                                                    struct client_surface_compositor_queue *queue )
+{
+    if (request == &queue->barrier)
+    {
+        pthread_mutex_lock( &client_surface_compositor_mutex );
+        assert( queue->barrier_in_use );
+        queue->barrier_in_use = FALSE;
+        pthread_cond_broadcast( &client_surface_compositor_cond );
+        pthread_mutex_unlock( &client_surface_compositor_mutex );
+    }
+    else
+    {
+        client_surface_free_owned_metadata( &request->memory, request, sizeof(*request) );
+        release_client_surface_compositor_capacity( CLIENT_SURFACE_COMPOSITOR_REQUEST_CAPACITY,
+                                                    1, sizeof(*request), queue );
+    }
+}
+
 static BOOL submit_client_surface_compositor_job( struct client_surface_compositor_job *job )
 {
+    struct client_surface_compositor_queue *queue;
+    struct client_surface_compositor_request *request;
     BOOL ret = FALSE;
 
-    job->async = FALSE;
-    if (!(job->queue = get_client_surface_compositor_queue( job->toplevel )))
+    if (!(queue = get_client_surface_compositor_queue( job->toplevel ))) goto failed;
+    if (!(request = alloc_client_surface_compositor_request( job, queue )))
     {
-        release_client_surface_compositor_job_resources( job );
-        return FALSE;
+        release_client_surface_compositor_queue( queue );
+        goto failed;
     }
     pthread_mutex_lock( &client_surface_compositor_mutex );
-    if (queue_client_surface_compositor_job( job ))
+    if (queue_client_surface_compositor_job( &request->job ))
     {
-        while (!job->complete)
+        while (!request->job.complete)
             pthread_cond_wait( &client_surface_compositor_cond,
                                &client_surface_compositor_mutex );
-        ret = job->result;
+        ret = request->job.result;
     }
     pthread_mutex_unlock( &client_surface_compositor_mutex );
-    if (!job->complete) release_client_surface_compositor_job_resources( job );
-    release_client_surface_compositor_queue( job->queue );
+    if (!request->job.complete) release_client_surface_compositor_job_resources( &request->job );
+    job->u = request->job.u;
+    job->result = request->job.result;
+    job->complete = request->job.complete;
+    free_client_surface_compositor_request( request, queue );
+    release_client_surface_compositor_queue( queue );
     return ret;
+
+failed:
+    release_client_surface_compositor_job_resources( job );
+    return FALSE;
 }
 
 /* Every notification already owns storage: an output allocation or a target
