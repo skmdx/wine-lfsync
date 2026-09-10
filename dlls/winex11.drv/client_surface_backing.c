@@ -617,6 +617,8 @@ static unsigned int client_surface_pending_batch_count;
 static struct list client_surface_compositor_replies = LIST_INIT( client_surface_compositor_replies );
 
 static void complete_client_surface_output_reply( struct client_surface_compositor_reply *reply, BOOL success );
+static BOOL replay_client_surface_scene_sources( struct client_surface_compositor_target *target,
+                                                 unsigned int *budget );
 
 static void queue_client_surface_reply( struct client_surface_compositor_reply *reply,
                                         struct client_surface_xcb_request *requests, unsigned int count,
@@ -2811,6 +2813,9 @@ static void complete_client_surface_cache_reply( struct client_surface_composito
         CONTAINING_RECORD( reply, struct client_surface_compositor_binding, cache_copy.reply );
     struct client_surface_cache_copy *copy = &binding->cache_copy;
     struct client_surface_cached_image *image = &binding->spare_image;
+    struct client_surface_compositor_target *target;
+    BOOL retired = binding->retired;
+    unsigned int budget = 1;
 
     TRACE_(csperf)( "ticks=%llu event=cache_native_copy identity=%s cookie=%s token=%s sequence=%s "
                    "source=%lx destination=%lx width=%u height=%u depth=%u pixel_bits=%u copied=1 error=%u "
@@ -2823,6 +2828,12 @@ static void complete_client_surface_cache_reply( struct client_surface_composito
                    wine_dbgstr_longlong( client_surface_perf_time() - copy->started ), binding->retired );
     if (!success) free_client_surface_cached_image( image, TRUE );
     finish_client_surface_cache_copy( binding, success );
+    /* Give an accepted cache one bounded output opportunity before another
+     * READY can start replacing it. Waiting for a newer read below must not
+     * starve output under a continuous producer. Use the scene's replay order,
+     * including its assembly obligations, rather than composing out of order. */
+    if (success && !retired && (target = find_client_surface_compositor_target( binding->toplevel )))
+        replay_client_surface_scene_sources( target, &budget );
 }
 
 static void cache_client_surface_handoff( struct client_surface_compositor_binding *binding,
@@ -3673,6 +3684,12 @@ static BOOL compose_client_surface_cached_frame( struct client_surface_composito
     if (!client_surface_get_toplevel_scene( binding->toplevel, &current ) ||
         current.epoch != target->scene.epoch ||
         current.mode == CLIENT_SURFACE_PRESENTATION_DIRECT) return FALSE;
+    /* A returned output credit also starts reading the newest retained
+     * producer image. Do not spend that credit on an older dirty cache while
+     * its replacement is being checked. Scene obligations still use their
+     * complete owner images independently of this steady-frame preference. */
+    if (!current.generation && !current.source_pending && !current.publication_pending &&
+        binding->cache_copy.reply.requests) return FALSE;
     /* Inventory resolution precedes the first copy, so the full assembly
      * cannot race its own pending decision or publish a stale cache proof. */
     if (current.source_pending &&
@@ -3876,6 +3893,80 @@ release:
     return composed;
 }
 
+static BOOL client_surface_handoff_matches_cache( const struct client_surface_compositor_binding *binding,
+                                                 const struct client_surface_handoff_slot *slot )
+{
+    const struct client_surface_handoff_slot *cached = &binding->latest_frame;
+
+    return slot->cookie == cached->cookie && slot->identity == cached->identity &&
+           slot->producer_process == cached->producer_process && slot->window == cached->window &&
+           slot->toplevel == cached->toplevel && slot->target_epoch == cached->target_epoch &&
+           slot->source && slot->source_visual == cached->source_visual &&
+           slot->width == cached->width && slot->height == cached->height &&
+           (slot->flags & (CLIENT_SURFACE_HANDOFF_NATIVE_X11 | CLIENT_SURFACE_HANDOFF_COPY_SOURCE)) ==
+                         (CLIENT_SURFACE_HANDOFF_NATIVE_X11 | CLIENT_SURFACE_HANDOFF_COPY_SOURCE);
+}
+
+/* Only unread steady images can be superseded. Keep the last complete owner
+ * image and the newest published producer image; a scene transaction or a
+ * native read must never depend on a slot returned by this path. */
+static BOOL coalesce_client_surface_handoffs( struct client_surface_compositor_binding *binding,
+                                             UINT64 *consumed, UINT64 produced, unsigned int limit )
+{
+    struct client_surface_compositor_target *target = find_client_surface_compositor_target( binding->toplevel );
+    struct client_surface_handoff_channel *channel = binding->channel;
+    const struct client_surface_handoff_slot *newest;
+    struct client_surface_scene scene;
+    UINT64 previous = *consumed;
+
+    assert( !binding->cache_copy.reply.requests && produced != *consumed );
+    if (!target || target->quiescing || target->assembly_pending || !target->scene.valid ||
+        binding->scene_index >= target->scene.count || target->scene.members[binding->scene_index] != binding ||
+        !client_surface_cached_frame_matches_layout( binding, &target->scene.layouts[binding->scene_index] ) ||
+        !client_surface_get_toplevel_scene( binding->toplevel, &scene ) || scene.epoch != target->scene.epoch ||
+        scene.mode != CLIENT_SURFACE_PRESENTATION_COMPOSITED || scene.generation ||
+        scene.source_pending || scene.publication_pending) return FALSE;
+    newest = &channel->slots[(produced - 1) & (CLIENT_SURFACE_HANDOFF_RING_SIZE - 1)];
+    if (!client_surface_handoff_matches_cache( binding, newest ) ||
+        newest->source_sequence < binding->latest_frame.source_sequence) return FALSE;
+    while (produced - *consumed > 1 && limit--)
+    {
+        const struct client_surface_handoff_slot slot =
+            channel->slots[*consumed & (CLIENT_SURFACE_HANDOFF_RING_SIZE - 1)];
+
+        if (!client_surface_handoff_matches_cache( binding, &slot ) ||
+            slot.source_sequence >= newest->source_sequence) break;
+        ++*consumed;
+        /* No native request has read this slot. The producer can now reuse
+         * it, but cannot replace newest before its separate read receipt. */
+        __atomic_store_n( &channel->consumer_sequence, *consumed, __ATOMIC_RELEASE );
+        TRACE_(csperf)( "ticks=%llu event=cache_skip identity=%s cookie=%s token=%s sequence=%s "
+                       "pixmap=%s retained_token=%s retained_sequence=%s cached_sequence=%s scene=%s\n",
+                       client_surface_perf_time(), wine_dbgstr_longlong( binding->identity ),
+                       wine_dbgstr_longlong( binding->cookie ), wine_dbgstr_longlong( *consumed ),
+                       wine_dbgstr_longlong( slot.source_sequence ), wine_dbgstr_longlong( slot.source ),
+                       wine_dbgstr_longlong( produced ), wine_dbgstr_longlong( newest->source_sequence ),
+                       wine_dbgstr_longlong( binding->latest_frame.source_sequence ), wine_dbgstr_longlong( scene.epoch ) );
+    }
+    if (*consumed != previous) client_surface_handoff_wake_release( binding->pool->shared );
+    if (produced - *consumed != 1) return FALSE;
+#ifdef SONAME_LIBXPRESENT
+    /* Native Complete/Idle or a new READY wakes the actor. Preserve the hint
+     * across its armed rescan without reporting a parked image as progress.
+     * A newer READY may replace this one; the final image waits for credit. */
+    if (usexpresent && target->present_event &&
+        count_client_surface_compositor_frames( target ) >= CLIENT_SURFACE_COMPOSITOR_MAX_INFLIGHT)
+    {
+        TRACE_(csperf)( "ticks=%llu event=cache_defer identity=%s cookie=%s token=%s sequence=%s scene=%s\n",
+                       client_surface_perf_time(), wine_dbgstr_longlong( binding->identity ),
+                       wine_dbgstr_longlong( binding->cookie ), wine_dbgstr_longlong( produced ),
+                       wine_dbgstr_longlong( newest->source_sequence ), wine_dbgstr_longlong( scene.epoch ) );
+        return TRUE;
+    }
+#endif
+    return FALSE;
+}
+
 static BOOL process_client_surface_handoffs(void)
 {
     static UINT64 next_pool_id;
@@ -3906,7 +3997,7 @@ static BOOL process_client_surface_handoffs(void)
                 unsigned int bit = __builtin_ctzll( bits ), index = word * 64 + bit;
                 struct client_surface_compositor_binding *binding = pool->bindings[index], **cursor;
                 struct client_surface_handoff_channel *channel = &pool->shared->channels[index];
-                UINT64 consumed, produced;
+                UINT64 consumed, produced, previous;
                 unsigned int frames = 0;
 
                 bits &= bits - 1;
@@ -3931,6 +4022,17 @@ static BOOL process_client_surface_handoffs(void)
                         break;
                     }
                     flush_client_surface_copy_batch();
+                    previous = consumed;
+                    if (coalesce_client_surface_handoffs( binding, &consumed, produced,
+                                                         CLIENT_SURFACE_HANDOFF_RING_SIZE - frames ))
+                    {
+                        progressed |= consumed != previous;
+                        budget -= consumed - previous;
+                        __atomic_fetch_or( &pool->shared->ready_bitmap[word], (UINT64)1 << bit, __ATOMIC_RELEASE );
+                        break;
+                    }
+                    budget -= consumed - previous;
+                    frames += consumed - previous;
                     cache_client_surface_handoff( binding, consumed & (CLIENT_SURFACE_HANDOFF_RING_SIZE - 1),
                                                    consumed + 1 );
                     --budget;

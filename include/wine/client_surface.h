@@ -37,14 +37,15 @@ enum client_surface_presentation_mode
 #define CLIENT_SURFACE_HANDOFF_CLIPPED 0x0004
 #define CLIENT_SURFACE_HANDOFF_XFIXES_CLIP 0x0008
 #define CLIENT_SURFACE_HANDOFF_PIXMAP_CLIP 0x0010
-/* Producer-owned snapshot: copy before acknowledging, without retaining its XID. */
+/* Producer-owned snapshot: finish any read before ACK, without retaining its XID. */
 #define CLIENT_SURFACE_HANDOFF_COPY_SOURCE 0x0020
 #define CLIENT_SURFACE_HANDOFF_ENDPOINT_PRODUCER 0x0001
 #define CLIENT_SURFACE_HANDOFF_ENDPOINT_CONSUMER 0x0002
 
 /* Only completed immutable image metadata enters the ring. The producer owns
  * a slot until producer_sequence publishes it; consumer_sequence returns it
- * after the owner's checked cache copy. Placement and publication context
+ * after the owner's checked cache copy, or without a read when the owner
+ * supersedes an unused image. Placement and publication context
  * belong to the owner's scene, never to the completed image descriptor. */
 struct DECLSPEC_ALIGN(64) client_surface_handoff_slot
 {
