@@ -299,32 +299,83 @@ static BOOL x11drv_client_surface_update( struct client_surface *client,
     return TRUE;
 }
 
-struct x11drv_client_source_frame *x11drv_client_surface_get_source(
-    struct client_surface *client, unsigned int index, unsigned int width,
-    unsigned int height, unsigned int depth )
+static void release_native_snapshot( void *context )
 {
-    struct x11drv_client_surface *surface = impl_from_client_surface( client );
-    struct x11drv_client_source_frame *frame = &surface->sources[index];
-
-    assert( index < ARRAY_SIZE(surface->sources) );
-    if (!x11drv_client_snapshot_prepare_storage( &frame->snapshot, width, height, depth )) return NULL;
-    frame->pixmap = x11drv_client_snapshot_pixmap( frame->snapshot );
-    frame->width = width;
-    frame->height = height;
-    frame->depth = depth;
-    return frame;
+    x11drv_client_snapshot_release( context );
 }
 
-BOOL x11drv_client_surface_snapshot( struct client_surface *client, const BYTE *pixels,
+static BOOL apply_gpu_snapshot( void *context, struct client_surface *client, struct client_surface_frame *present )
+{
+    struct x11drv_client_surface *surface = impl_from_client_surface( client );
+    struct x11drv_client_source_frame *frame = surface->sources + present->handoff_index;
+
+    assert( !frame->snapshot );
+    frame->snapshot = x11drv_client_snapshot_share( context );
+    frame->pixmap = x11drv_client_snapshot_pixmap( context );
+    frame->width = present->capture.size.cx;
+    frame->height = present->capture.size.cy;
+    frame->depth = default_visual.depth;
+    frame->gpu_copy = TRUE;
+    present->handoff_source->source = frame->pixmap;
+    return TRUE;
+}
+
+struct x11drv_client_snapshot *x11drv_client_surface_prepare_gpu_snapshot(
+    struct client_surface *client, struct client_surface_frame *present )
+{
+    struct x11drv_client_surface *surface = impl_from_client_surface( client );
+    struct x11drv_client_source_frame *frame = surface->sources + present->handoff_index;
+    struct x11drv_client_snapshot *snapshot;
+    BOOL ret;
+
+    assert( present->handoff_index < ARRAY_SIZE(surface->sources) && !present->capture.context );
+    /* Transfer the slot's reference to this capture before any native work.
+     * Completion applies it only after validating the original reservation;
+     * cancellation releases it through the same capture owner. */
+    pthread_mutex_lock( &client->present_lock );
+    snapshot = frame->snapshot;
+    memset( frame, 0, sizeof(*frame) );
+    pthread_mutex_unlock( &client->present_lock );
+    ret = x11drv_client_snapshot_prepare_storage( &snapshot, present->handoff_source->width,
+                                                  present->handoff_source->height, default_visual.depth );
+    present->capture.context = snapshot;
+    present->capture.apply = apply_gpu_snapshot;
+    present->capture.release = release_native_snapshot;
+    return ret ? snapshot : NULL;
+}
+
+static BOOL apply_cpu_snapshot( void *context, struct client_surface *client, struct client_surface_frame *present )
+{
+    struct x11drv_client_surface *surface = impl_from_client_surface( client );
+
+    x11drv_client_snapshot_release( surface->snapshot );
+    surface->snapshot = x11drv_client_snapshot_share( context );
+    x11drv_client_surface_set_gpu_snapshot( surface, NULL );
+    if (present->handoff_control)
+        present->handoff_source->source = x11drv_client_snapshot_pixmap( context );
+    return TRUE;
+}
+
+BOOL x11drv_client_surface_snapshot( struct client_surface *client, struct client_surface_frame *present,
+                                     const BYTE *pixels,
                                      unsigned int width, unsigned int height,
                                      BOOL top_down, const struct x11drv_snapshot_format *format )
 {
     struct x11drv_client_surface *surface = impl_from_client_surface( client );
+    struct x11drv_client_snapshot *snapshot;
+    BOOL ret;
 
-    if (!x11drv_client_snapshot_upload( &surface->snapshot, pixels, width, height, top_down, format ))
-        return FALSE;
-    x11drv_client_surface_set_gpu_snapshot( surface, 0 );
-    return TRUE;
+    assert( !present->capture.context );
+    pthread_mutex_lock( &client->present_lock );
+    snapshot = surface->snapshot;
+    surface->snapshot = NULL;
+    pthread_mutex_unlock( &client->present_lock );
+    ret = x11drv_client_snapshot_upload( &snapshot, pixels, width, height, top_down, format );
+    present->capture.context = snapshot;
+    present->capture.apply = apply_cpu_snapshot;
+    present->capture.release = release_native_snapshot;
+    if (ret) present->capture.size = (SIZE){width, height};
+    return ret;
 }
 
 static BOOL x11drv_client_surface_handoff_prepare(
@@ -393,11 +444,6 @@ static BOOL apply_native_snapshot( void *context, struct client_surface *client,
     frame->height = present->handoff_source->height;
     frame->depth = surface->source_depth;
     return TRUE;
-}
-
-static void release_native_snapshot( void *context )
-{
-    x11drv_client_snapshot_release( context );
 }
 
 static BOOL x11drv_client_surface_handoff_capture( struct client_surface *client, struct client_surface_frame *present,

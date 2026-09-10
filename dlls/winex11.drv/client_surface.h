@@ -97,7 +97,8 @@ extern BOOL x11drv_client_snapshot_prepare_native( struct x11drv_client_snapshot
                                                   unsigned int depth, UINT64 epoch );
 extern BOOL x11drv_client_snapshot_read_native( void *context );
 extern BOOL x11drv_client_snapshot_prepare_read( struct x11drv_client_snapshot **storage );
-extern BOOL x11drv_client_surface_snapshot( struct client_surface *client, const BYTE *pixels,
+extern BOOL x11drv_client_surface_snapshot( struct client_surface *client, struct client_surface_frame *present,
+                                            const BYTE *pixels,
                                             unsigned int width, unsigned int height,
                                             BOOL top_down, const struct x11drv_snapshot_format *format );
 extern void x11drv_client_surface_release_snapshot_staging( struct x11drv_client_surface *surface );
@@ -122,8 +123,9 @@ struct x11drv_client_surface_retired_resource
 };
 extern BOOL x11drv_client_surface_prepare_resource_retirement(void);
 extern void x11drv_client_surface_retire_resource( struct x11drv_client_surface_retired_resource *resource );
-extern struct x11drv_client_source_frame *x11drv_client_surface_get_source(
-    struct client_surface *client, unsigned int index, unsigned int width,
-    unsigned int height, unsigned int depth );
+/* The prepared frame owns the capture, including when preparation fails.
+ * Native allocation/upload runs outside the surface's present lock. */
+extern struct x11drv_client_snapshot *x11drv_client_surface_prepare_gpu_snapshot(
+    struct client_surface *client, struct client_surface_frame *present );
 
 #endif /* __WINE_X11DRV_CLIENT_SURFACE_H */

@@ -134,7 +134,8 @@ void client_surface_release_handoff( struct client_surface *surface )
      * detached this mapping.  Keep the view and producer endpoint alive until
      * those frames have either published or abandoned their private reservation.
      * A source-capacity waiter also retains the view while its lock is dropped. */
-    if (surface->handoff->waiters || InterlockedCompareExchange( &surface->external_completion_count, 0, 0 ))
+    if (surface->handoff->waiters || surface->native_present_count ||
+        InterlockedCompareExchange( &surface->external_completion_count, 0, 0 ))
     {
         if (surface->handoff->waiters)
             TRACE( "retaining handoff mapping identity %s cookie %s for %u source waiters\n",

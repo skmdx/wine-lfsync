@@ -867,7 +867,11 @@ failed:
 
 static void client_surface_begin_present_locked( struct client_surface *surface )
 {
+    /* Native preparation borrows the handoff before a submitted completion
+     * owns it. Protect that interval from retirement by an older callback. */
+    pthread_mutex_lock( &surface->present_lock );
     surface->native_present_count++;
+    pthread_mutex_unlock( &surface->present_lock );
 }
 
 void client_surface_begin_present( struct client_surface *surface )
@@ -905,10 +909,13 @@ void client_surface_submit_present( struct client_surface *surface,
                                     struct client_surface_frame *present )
 {
     client_surface_lock_present( surface );
+    pthread_mutex_lock( &surface->present_lock );
     client_surface_submit_present_locked( surface, present );
     assert( surface->native_present_count > 0 );
     if (!--surface->native_present_count)
         pthread_cond_broadcast( &surface->completion_cond );
+    client_surface_handoff_completed( surface );
+    pthread_mutex_unlock( &surface->present_lock );
     client_surface_unlock_present( surface );
 }
 
