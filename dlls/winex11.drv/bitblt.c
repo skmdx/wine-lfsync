@@ -1825,21 +1825,26 @@ failed:
     return NULL;
 }
 
-static XRectangle *xrectangles_from_rects( const RECT *rects, UINT count )
+static XRectangle *xrectangles_from_rects( const RECT *rects, UINT *count )
 {
-    XRectangle *xrects;
-    if (!(xrects = malloc( count * sizeof(*xrects) ))) return NULL;
-    while (count--)
+    XRectangle *xrects, *xrect;
+    UINT i;
+
+    if (!(xrects = malloc( *count * sizeof(*xrects) ))) return NULL;
+    xrect = xrects;
+    for (i = 0; i < *count; i++)
     {
-        if (rects[count].left > SHRT_MAX) continue;
-        if (rects[count].top > SHRT_MAX) continue;
-        if (rects[count].right < SHRT_MIN) continue;
-        if (rects[count].bottom < SHRT_MIN) continue;
-        xrects[count].x      = max( min( rects[count].left, SHRT_MAX), SHRT_MIN);
-        xrects[count].y      = max( min( rects[count].top, SHRT_MAX), SHRT_MIN);
-        xrects[count].width  = max( min( rects[count].right, SHRT_MAX ) - xrects[count].x, 0);
-        xrects[count].height = max( min( rects[count].bottom, SHRT_MAX ) - xrects[count].y, 0);
+        if (rects[i].left > SHRT_MAX) continue;
+        if (rects[i].top > SHRT_MAX) continue;
+        if (rects[i].right < SHRT_MIN) continue;
+        if (rects[i].bottom < SHRT_MIN) continue;
+        xrect->x      = max( min( rects[i].left, SHRT_MAX), SHRT_MIN);
+        xrect->y      = max( min( rects[i].top, SHRT_MAX), SHRT_MIN);
+        xrect->width  = max( min( rects[i].right, SHRT_MAX ) - xrect->x, 0);
+        xrect->height = max( min( rects[i].bottom, SHRT_MAX ) - xrect->y, 0);
+        if (xrect->width && xrect->height) xrect++;
     }
+    *count = xrect - xrects;
     return xrects;
 }
 
@@ -1858,7 +1863,7 @@ static void x11drv_surface_set_clip( struct window_surface *window_surface, cons
         XSetClipMask( gdi_display, surface->gc, None );
     else if (!count)
         XSetClipRectangles( gdi_display, surface->gc, 0, 0, NULL, 0, YXBanded );
-    else if ((xrects = xrectangles_from_rects( rects, count )))
+    else if ((xrects = xrectangles_from_rects( rects, &count )))
     {
         XSetClipRectangles( gdi_display, surface->gc, 0, 0, xrects, count, YXBanded );
         free( xrects );
