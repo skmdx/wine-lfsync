@@ -951,6 +951,7 @@ void X11DRV_ThreadDetach(void)
     {
         struct x11drv_display_owner *owner = data->display_owner;
 
+        x11drv_window_thread_detach( data );
         xim_thread_detach( data );
         x11drv_clipboard_thread_detach( data );
         pthread_mutex_lock( &error_handlers_mutex );
@@ -1015,6 +1016,7 @@ struct x11drv_thread_data *x11drv_init_thread_data(void)
         ERR( "could not create data\n" );
         NtTerminateProcess( 0, 1 );
     }
+    list_init( &data->windows );
     if (!(data->display_owner = create_display_owner()))
     {
         free( data );
