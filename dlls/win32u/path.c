@@ -705,7 +705,10 @@ BOOL WINAPI NtGdiFillPath( HDC hdc )
 
     if (dc)
     {
-        PHYSDEV physdev = GET_DC_PHYSDEV( dc, pFillPath );
+        PHYSDEV physdev;
+
+        update_dc( dc );
+        physdev = GET_DC_PHYSDEV( dc, pFillPath );
         ret = physdev->funcs->pFillPath( physdev );
         release_dc_ptr( dc );
     }
@@ -1910,7 +1913,10 @@ BOOL WINAPI NtGdiStrokeAndFillPath( HDC hdc )
 
     if (dc)
     {
-        PHYSDEV physdev = GET_DC_PHYSDEV( dc, pStrokeAndFillPath );
+        PHYSDEV physdev;
+
+        update_dc( dc );
+        physdev = GET_DC_PHYSDEV( dc, pStrokeAndFillPath );
         ret = physdev->funcs->pStrokeAndFillPath( physdev );
         release_dc_ptr( dc );
     }
@@ -1928,7 +1934,10 @@ BOOL WINAPI NtGdiStrokePath( HDC hdc )
 
     if (dc)
     {
-        PHYSDEV physdev = GET_DC_PHYSDEV( dc, pStrokePath );
+        PHYSDEV physdev;
+
+        update_dc( dc );
+        physdev = GET_DC_PHYSDEV( dc, pStrokePath );
         ret = physdev->funcs->pStrokePath( physdev );
         release_dc_ptr( dc );
     }
