@@ -49,6 +49,7 @@ struct client_surface_cache_image
     client_surface_cache_callback complete;
     void *context;
     const struct client_surface_cache_transform *transform;
+    unsigned int transform_count;
     Pixmap pixmap, source;
     Window window;
     GC gc, transfer_gc;
@@ -275,12 +276,15 @@ static void transform_cache_image( struct client_surface_cache_image *image )
     Display *display = worker->display;
     XGCValues values = {.graphics_exposures = False};
     BOOL copied = TRUE, rendered = FALSE;
+    unsigned int index = 0;
     int error;
 
     worker->error = 0;
     if (!image->gc) image->gc = XCreateGC( display, image->pixmap, GCGraphicsExposures, &values );
-    if (image->gc)
+    for (; image->gc && copied && index < image->transform_count; ++index, transform = transform->next)
     {
+        assert( transform && (!index || !transform->catchup) );
+        rendered = FALSE;
         XSetClipMask( display, image->gc, None );
         XSetClipOrigin( display, image->gc, 0, 0 );
         if (transform->catchup)
@@ -297,16 +301,32 @@ static void transform_cache_image( struct client_surface_cache_image *image )
                 XSetClipRectangles( display, image->gc, transform->destination.left,
                                     transform->destination.top, (XRectangle *)transform->clips,
                                     transform->clip_count, YXBanded );
-            rendered = X11DRV_XRender_CopyClientSurface( display, transform->source,
-                transform->source_visual, image->pixmap, transform->destination_visual,
-                transform->source_width, transform->source_height, &transform->destination,
-                transform->clipped ? transform->clips : NULL,
-                transform->clipped ? transform->clip_count : 0, 0, 0 );
-            if (!rendered)
-                copied = client_surface_copy_image( display, &image->memory, transform->source,
-                    image->pixmap, image->gc, transform->source_visual, transform->destination_visual,
-                    transform->source_width, transform->source_height, &transform->destination );
+            if (transform->native)
+            {
+                const RECT *rect = &transform->source_damage;
+
+                XCopyArea( display, transform->source, image->pixmap, image->gc,
+                           rect->left, rect->top, rect->right - rect->left, rect->bottom - rect->top,
+                           transform->destination.left + rect->left, transform->destination.top + rect->top );
+            }
+            else
+            {
+                rendered = X11DRV_XRender_CopyClientSurface( display, transform->source,
+                    transform->source_visual, image->pixmap, transform->destination_visual,
+                    transform->source_width, transform->source_height, &transform->destination,
+                    transform->clipped ? transform->clips : NULL,
+                    transform->clipped ? transform->clip_count : 0, 0, 0 );
+                if (!rendered)
+                    copied = client_surface_copy_image( display, &image->memory, transform->source,
+                        image->pixmap, image->gc, transform->source_visual, transform->destination_visual,
+                        transform->source_width, transform->source_height, &transform->destination );
+            }
         }
+        if (image->transform_count > 1)
+            TRACE_(csperf)( "ticks=%llu event=output_transform_command image=%p command=%p index=%u count=%u "
+                           "source=%lx destination=%lx catchup=%lx native=%u rendered=%u copied=%u\n", cache_time(),
+                           image, transform, index, image->transform_count, transform->source, image->pixmap,
+                           transform->catchup, transform->native, rendered, copied );
     }
     XSync( display, False );
     error = worker->error;
@@ -320,9 +340,9 @@ static void transform_cache_image( struct client_surface_cache_image *image )
         XSync( display, False );
     }
     TRACE_(csperf)( "ticks=%llu event=output_transform_native image=%p source=%lx destination=%lx "
-                   "catchup=%lx display=%p rendered=%u error=%d success=%u\n", cache_time(),
-                   image, transform->source, image->pixmap, transform->catchup, display,
-                   rendered, error, image->success );
+                   "catchup=%lx display=%p rendered=%u error=%d success=%u count=%u executed=%u\n", cache_time(),
+                   image, image->transform->source, image->pixmap, image->transform->catchup, display,
+                   rendered, error, image->success, image->transform_count, index );
 }
 
 static void create_output_image( struct client_surface_cache_image *image )
@@ -736,9 +756,19 @@ BOOL client_surface_cache_write_pending( const struct client_surface_cache_image
 }
 
 BOOL client_surface_cache_transform_output( struct client_surface_cache_image *image,
-    const struct client_surface_cache_transform *transform,
+    const struct client_surface_cache_transform *transform, unsigned int count,
     client_surface_cache_callback complete, void *context )
 {
+    const struct client_surface_cache_transform *command = transform;
+    unsigned int i;
+
+    assert( count && count <= CLIENT_SURFACE_CACHE_TRANSFORM_LIMIT );
+    for (i = 0; i < count; ++i)
+    {
+        assert( command && (!i || !command->catchup) );
+        command = command->next;
+    }
+    assert( !command );
     pthread_mutex_lock( &cache_mutex );
     assert( image->purpose == CLIENT_SURFACE_MEMORY_OUTPUT );
     if (!image->acquired || image->refs != 1 || image->operation != CACHE_IDLE)
@@ -750,6 +780,7 @@ BOOL client_surface_cache_transform_output( struct client_surface_cache_image *i
     TRACE_(csperf)( "ticks=%llu event=cache_image_reference image=%p pixmap=%lx acquire=1 refs=%u\n",
                    cache_time(), image, image->pixmap, image->refs );
     image->transform = transform;
+    image->transform_count = count;
     queue_cache_image( image, CACHE_TRANSFORM, complete, context );
     pthread_mutex_unlock( &cache_mutex );
     return TRUE;
@@ -790,6 +821,7 @@ BOOL client_surface_complete_cache( unsigned int budget )
         if (!(completed_head = image->next)) completed_tail = &completed_head;
         image->operation = CACHE_IDLE;
         image->transform = NULL;
+        image->transform_count = 0;
         pthread_mutex_unlock( &cache_mutex );
         image->complete( image->context, image->success );
         progressed = TRUE;

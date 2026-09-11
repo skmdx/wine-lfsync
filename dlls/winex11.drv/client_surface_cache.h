@@ -60,21 +60,25 @@ void client_surface_cache_copy_output( struct client_surface_cache_image *image,
                                        unsigned int width, unsigned int height,
                                        client_surface_cache_callback complete, void *context );
 
-/* The caller owns this immutable description and both input images through
- * completion. Admission adds a destination write reference; the callback
- * releases it even if its target has already detached the result. */
+/* The caller owns this bounded command chain and all input images through
+ * completion. Only the first command may copy a catchup checkpoint.
+ * Admission adds one destination write reference for the whole chain; the
+ * callback releases it even if its target has already detached the result. */
+#define CLIENT_SURFACE_CACHE_TRANSFORM_LIMIT 64
+
 struct client_surface_cache_transform
 {
+    const struct client_surface_cache_transform *next;
     Pixmap source, catchup;
     VisualID source_visual, destination_visual;
     unsigned int source_width, source_height;
-    RECT destination, catchup_rect;
+    RECT destination, catchup_rect, source_damage;
     const XRectangle *clips;
     unsigned int clip_count;
-    BOOL clipped;
+    BOOL clipped, native;
 };
 BOOL client_surface_cache_transform_output( struct client_surface_cache_image *image,
-    const struct client_surface_cache_transform *transform,
+    const struct client_surface_cache_transform *transform, unsigned int count,
     client_surface_cache_callback complete, void *context );
 BOOL client_surface_copy_image( Display *display, struct client_surface_memory_scope *memory,
     Pixmap source, Pixmap destination, GC gc, VisualID source_visual, VisualID destination_visual,
