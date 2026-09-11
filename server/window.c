@@ -4078,8 +4078,13 @@ static void release_window_paint( struct window_paint *paint, int failed )
         }
         else
         {
+            unsigned int error = get_error();
+
+            /* Thread-exit cleanup can inherit an unrelated request error. */
+            clear_error();
             redraw_window( paint->window, NULL, RDW_INVALIDATE | RDW_ERASE | RDW_FRAME, 0 );
             restored = !get_error() && !!paint->window->update_region;
+            set_error( error );
         }
         if (restored) paint->window->paint_flags |= PAINT_ERASE;
         /* Never clear a different writer's untracked/admission failure. */
