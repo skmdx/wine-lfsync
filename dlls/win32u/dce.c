@@ -652,8 +652,22 @@ void window_surface_flush( struct window_surface *surface )
 
     if (intersect_rect( &dirty, &dirty, &bounds ) && (color_bits = window_surface_get_color( surface, color_info )))
     {
-        BOOL shape_changed = update_surface_shape( surface, &surface->rect, &dirty, color_info, color_bits );
-        void *shape_bits = window_surface_get_shape( surface, shape_info );
+        BOOL shape_changed;
+        void *shape_bits;
+
+        /* Normalize opaque layered pixels before shape allocation and upload.
+         * alpha_mask must still identify a layered surface to window DCs. */
+        if (surface->alpha_mask && surface->alpha_bits != ~0u && color_info->bmiHeader.biBitCount == 32)
+        {
+            unsigned int x, y, stride = color_info->bmiHeader.biSizeImage / abs(color_info->bmiHeader.biHeight);
+            BYTE *row = (BYTE *)color_bits + dirty.top * stride;
+
+            for (y = dirty.top; y < dirty.bottom; ++y, row += stride)
+                for (x = dirty.left; x < dirty.right; ++x)
+                    ((UINT32 *)row)[x] |= surface->alpha_bits;
+        }
+        shape_changed = update_surface_shape( surface, &surface->rect, &dirty, color_info, color_bits );
+        shape_bits = window_surface_get_shape( surface, shape_info );
 
         TRACE( "Flushing hwnd %p, surface %p %s, bounds %s, dirty %s\n", surface->hwnd, surface,
                wine_dbgstr_rect( &surface->rect ), wine_dbgstr_rect( &surface->bounds ), wine_dbgstr_rect( &dirty ) );

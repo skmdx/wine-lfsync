@@ -2649,7 +2649,9 @@ BOOL WINAPI NtUserUpdateLayeredWindow( HWND hwnd, HDC hdc_dst, const POINT *pts_
         window_surface_unlock( surface );
 
         if (!(flags & ULW_COLORKEY)) key = CLR_INVALID;
-        window_surface_set_layered( surface, key, -1, 0xff000000 );
+        window_surface_set_layered( surface, key,
+                                    (flags & ULW_ALPHA) && blend && (blend->AlphaFormat & AC_SRC_ALPHA) ? -1 : 0xff000000,
+                                    0xff000000 );
 
         user_driver->pUpdateLayeredWindow( hwnd, source_alpha, flags );
         window_surface_flush( surface );
