@@ -350,6 +350,8 @@ static inline void init_thread_structure( struct thread *thread )
     int i;
 
     thread->sync            = NULL;
+    list_init( &thread->window_paints );
+    thread->window_paint_count = 0;
     thread->alert_sync      = NULL;
     thread->unix_pid        = -1;  /* not known yet */
     thread->unix_tid        = -1;  /* not known yet */

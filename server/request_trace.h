@@ -3574,6 +3574,29 @@ static void dump_set_client_surface_native_barrier_reply( const struct set_clien
     dump_uint64( ", scene_generation=", &req->scene_generation );
 }
 
+static void dump_begin_window_paint_request( const struct begin_window_paint_request *req )
+{
+    fprintf( stderr, " handle=%08x", req->handle );
+    fprintf( stderr, ", tracked=%08x", req->tracked );
+}
+
+static void dump_begin_window_paint_reply( const struct begin_window_paint_reply *req )
+{
+    dump_uint64( " token=", &req->token );
+}
+
+static void dump_end_window_paint_request( const struct end_window_paint_request *req )
+{
+    dump_uint64( " token=", &req->token );
+    fprintf( stderr, ", cancel=%08x", req->cancel );
+}
+
+static void dump_complete_window_paint_request( const struct complete_window_paint_request *req )
+{
+    dump_uint64( " token=", &req->token );
+    fprintf( stderr, ", success=%08x", req->success );
+}
+
 static void dump_set_client_surface_state_request( const struct set_client_surface_state_request *req )
 {
     fprintf( stderr, " handle=%08x", req->handle );
@@ -3599,6 +3622,7 @@ static void dump_set_client_surface_state_reply( const struct set_client_surface
     fprintf( stderr, ", mode=%08x", req->mode );
     fprintf( stderr, ", active=%08x", req->active );
     fprintf( stderr, ", cached=%08x", req->cached );
+    dump_varargs_uints64( ", paint_serial=", cur_size );
 }
 
 static void dump_get_client_surface_clip_windows_request( const struct get_client_surface_clip_windows_request *req )
@@ -4100,6 +4124,9 @@ static const dump_func req_dumpers[REQ_NB_REQUESTS] =
     (dump_func)dump_allocate_client_surface_request,
     (dump_func)dump_release_client_surface_request,
     (dump_func)dump_set_client_surface_native_barrier_request,
+    (dump_func)dump_begin_window_paint_request,
+    (dump_func)dump_end_window_paint_request,
+    (dump_func)dump_complete_window_paint_request,
     (dump_func)dump_set_client_surface_state_request,
     (dump_func)dump_get_client_surface_clip_windows_request,
     (dump_func)dump_get_client_surface_handoff_request,
@@ -4432,6 +4459,9 @@ static const dump_func reply_dumpers[REQ_NB_REQUESTS] =
     (dump_func)dump_allocate_client_surface_reply,
     NULL,
     (dump_func)dump_set_client_surface_native_barrier_reply,
+    (dump_func)dump_begin_window_paint_reply,
+    NULL,
+    NULL,
     (dump_func)dump_set_client_surface_state_reply,
     (dump_func)dump_get_client_surface_clip_windows_reply,
     (dump_func)dump_get_client_surface_handoff_reply,
@@ -4764,6 +4794,9 @@ static const char * const req_names[REQ_NB_REQUESTS] =
     "allocate_client_surface",
     "release_client_surface",
     "set_client_surface_native_barrier",
+    "begin_window_paint",
+    "end_window_paint",
+    "complete_window_paint",
     "set_client_surface_state",
     "get_client_surface_clip_windows",
     "get_client_surface_handoff",

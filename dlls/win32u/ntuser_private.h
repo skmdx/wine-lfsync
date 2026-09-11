@@ -134,6 +134,7 @@ struct user_thread_info
     struct client_surface_completion_worker *completion_worker; /* current native completion domain */
     UINT64                        client_surface_domain; /* synchronous native execution identity */
     struct list                   known_pointers;         /* list of known pointers */
+    struct list                   window_paints;          /* this thread's BeginPaint obligations */
 };
 
 extern struct user_thread_info *get_user_thread_info(void);

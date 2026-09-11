@@ -7582,6 +7582,7 @@ static void thread_detach(void)
     struct user_thread_info *thread_info = get_user_thread_info();
 
     destroy_thread_windows();
+    cleanup_window_paints( 0 );
     destroy_thread_pointers();
     user_driver->pThreadDetach();
 

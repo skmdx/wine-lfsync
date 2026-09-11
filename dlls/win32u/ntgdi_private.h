@@ -224,6 +224,7 @@ extern UINT get_dib_dc_color_table( HDC hdc, UINT startpos, UINT entries,
 extern UINT set_dib_dc_color_table( HDC hdc, UINT startpos, UINT entries,
                                     const RGBQUAD *colors );
 extern void dibdrv_set_window_surface( DC *dc, struct window_surface *surface );
+extern void window_surface_record_paint( struct window_surface *surface );
 
 /* driver.c */
 extern const struct gdi_dc_funcs null_driver;

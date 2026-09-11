@@ -520,6 +520,7 @@ static inline void lock_surface( struct windrv_physdev *dev )
 
     if (!dev->lock_count++)
     {
+        window_surface_record_paint( surface );
         window_surface_lock( surface );
         if (IsRectEmpty( dev->dibdrv->bounds ) || !surface->draw_start_ticks)
             surface->draw_start_ticks = NtGetTickCount();

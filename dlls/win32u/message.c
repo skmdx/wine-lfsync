@@ -471,7 +471,14 @@ static LRESULT dispatch_win_proc_params( struct win_proc_params *params, size_t 
 
     if (thread_info->msg_call_depth > MAX_WINPROC_RECURSION) return 0;
     thread_info->msg_call_depth++;
-    status = KeUserModeCallback( NtUserCallWinProc, params, size, &ret_ptr, &ret_len );
+    if (params->msg == WM_PAINT || params->msg == WM_NCPAINT || params->msg == WM_ERASEBKGND)
+    {
+        struct window_paint *paint = begin_window_paint( params->hwnd );
+
+        status = KeUserModeCallback( NtUserCallWinProc, params, size, &ret_ptr, &ret_len );
+        end_window_paint( paint, !status );
+    }
+    else status = KeUserModeCallback( NtUserCallWinProc, params, size, &ret_ptr, &ret_len );
     thread_info->msg_call_depth--;
 
     if (status) return result;
@@ -2294,7 +2301,8 @@ static LRESULT handle_internal_message( HWND hwnd, UINT msg, WPARAM wparam, LPAR
             /* A native allocation completion can arrive after preparation
              * was cancelled. Let its owner distinguish that from a driver
              * which accepted a retry and is still preparing. */
-            if (!client_surface_begin_prepare( hwnd, &scene )) return STATUS_NOT_FOUND;
+            status = client_surface_begin_prepare( hwnd, &scene );
+            if (status != STATUS_SUCCESS) return status;
             status = prepare_window_client_surfaces( hwnd );
             if (status == STATUS_SUCCESS) client_surface_end_prepare( &scene );
             return status;

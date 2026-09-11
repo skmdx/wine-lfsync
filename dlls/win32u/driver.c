@@ -863,6 +863,11 @@ static LRESULT nulldrv_WindowMessage( HWND hwnd, UINT msg, WPARAM wparam, LPARAM
     return 0;
 }
 
+static NTSTATUS nulldrv_WindowPaint( HWND hwnd, UINT operation, UINT64 token )
+{
+    return STATUS_NOT_SUPPORTED;
+}
+
 static BOOL nulldrv_WindowPosChanging( HWND hwnd, UINT swp_flags, BOOL shaped, const struct window_rects *rects )
 {
     return TRUE;
@@ -1320,6 +1325,7 @@ static const struct user_driver_funcs lazy_load_driver =
     nulldrv_SysCommand,
     loaderdrv_UpdateLayeredWindow,
     nulldrv_WindowMessage,
+    nulldrv_WindowPaint,
     nulldrv_WindowPosChanging,
     nulldrv_GetWindowStyleMasks,
     nulldrv_GetWindowStateUpdates,
@@ -1423,6 +1429,7 @@ void __wine_set_user_driver( const struct user_driver_funcs *funcs, UINT version
     SET_USER_FUNC(SysCommand);
     SET_USER_FUNC(UpdateLayeredWindow);
     SET_USER_FUNC(WindowMessage);
+    SET_USER_FUNC(WindowPaint);
     SET_USER_FUNC(WindowPosChanging);
     SET_USER_FUNC(GetWindowStyleMasks);
     SET_USER_FUNC(GetWindowStateUpdates);
