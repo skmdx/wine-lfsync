@@ -194,6 +194,7 @@ struct client_surface_compositor_frame
 {
     struct client_surface_compositor_job *waiter;
     Pixmap pixmap;
+    struct client_surface_cache_image *image; /* borrowed from the installed pair/mailbox */
 #ifdef SONAME_LIBXPRESENT
     struct rb_entry pixmap_entry;
 #endif
@@ -301,13 +302,15 @@ static int compare_client_surface_compositor_pixmap( const void *key, const stru
 static struct rb_tree client_surface_compositor_pixmaps = {compare_client_surface_compositor_pixmap};
 #endif
 
-static void set_client_surface_compositor_pixmap( struct client_surface_compositor_frame *frame, Pixmap pixmap )
+static void set_client_surface_compositor_pixmap( struct client_surface_compositor_frame *frame, Pixmap pixmap,
+                                                 struct client_surface_cache_image *image )
 {
 #ifdef SONAME_LIBXPRESENT
     assert( !frame->reply_target && !frame->serial );
     if (frame->pixmap) rb_remove( &client_surface_compositor_pixmaps, &frame->pixmap_entry );
 #endif
     frame->pixmap = pixmap;
+    frame->image = image;
 #ifdef SONAME_LIBXPRESENT
     if (pixmap)
     {
@@ -315,6 +318,14 @@ static void set_client_surface_compositor_pixmap( struct client_surface_composit
         rb_put( &client_surface_compositor_pixmaps, &pixmap, &frame->pixmap_entry );
     }
 #endif
+}
+
+/* Read leases are admitted only on the actor, after checking outstanding
+ * writers. Selection and every explicit destination write run on that same
+ * actor, so the shared check and native submission cannot race a new reader. */
+static BOOL client_surface_compositor_frame_writable( const struct client_surface_compositor_frame *frame )
+{
+    return frame->image && !client_surface_cache_shared( frame->image );
 }
 
 static pthread_mutex_t client_surface_compositor_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -392,6 +403,7 @@ enum client_surface_compositor_op
     CLIENT_SURFACE_COMPOSITOR_RETIRE_POOL,
     CLIENT_SURFACE_COMPOSITOR_RENEW_DIRECT,
     CLIENT_SURFACE_COMPOSITOR_CREATE_POOL,
+    CLIENT_SURFACE_COMPOSITOR_COPY_POOL,
 };
 
 struct client_surface_direct_completion
@@ -419,10 +431,12 @@ struct client_surface_compositor_job
             Drawable source, destination;
             int source_x, source_y, destination_x, destination_y;
             unsigned int width, height;
+            BOOL shared;
         } copy;
         /* CREATE_POOL returns independently owned pending storage.
-         * REPLACE_POOL consumes completed storage, borrows its checkpoint
-         * sources and returns new pixmaps only on success.
+         * COPY_POOL admits an owned read of a completed OUTPUT rectangle.
+         * REPLACE_POOL installs that checked copy, or synchronously reads
+         * the borrowed Window checkpoint for the remaining legacy paths.
          * UPDATE_TARGET borrows the registered pair and uses the same
          * installation payload as the replacement transaction. */
         struct
@@ -435,6 +449,8 @@ struct client_surface_compositor_job
             Pixmap pixmaps[2];
             VisualID visual;
             DWORD shrink_start;
+            struct client_surface_scene scene;
+            BOOL stale, invalid_source;
         } pool;
         /* FREE_POOL transfers its detached pair and accounting on enqueue. */
         Pixmap retired_pixmaps[2];
@@ -619,6 +635,16 @@ struct client_surface_output_allocation
     UINT64 bytes;
     UINT64 serial;
     unsigned int width, height, depth;
+    /* A capacity-only replacement reads a completed OUTPUT, never Window
+     * pixels. This lease survives cancellation and target/pool removal. */
+    struct client_surface_cache_image *source_image;
+    struct x11drv_native_window *window_owner;
+    struct client_surface_scene scene;
+    Pixmap source, published;
+    Window window;
+    UINT64 source_revision;
+    unsigned int window_width, window_height, copy_width, copy_height;
+    BOOL checkpoint, copy_wait, force;
     /* The GUI owns the pending pointer. The callbacks retain this object
      * until both native operations finish, even after the GUI abandons it.
      * These three fields use compositor_mutex; no callback touches win_data. */
@@ -1093,9 +1119,18 @@ static void update_client_surface_notification_plan( struct client_surface_compo
 
 static void wake_client_surface_compositor(void);
 
+static void release_client_surface_output_checkpoint( struct client_surface_output_allocation *allocation )
+{
+    client_surface_cache_release( allocation->source_image );
+    allocation->source_image = NULL;
+    if (allocation->window_owner) x11drv_native_window_release( allocation->window_owner );
+    allocation->window_owner = NULL;
+}
+
 static void free_client_surface_pending_allocation( struct client_surface_output_allocation *allocation )
 {
     assert( !allocation->pending );
+    release_client_surface_output_checkpoint( allocation );
     client_surface_cache_release( allocation->images[0] );
     client_surface_cache_release( allocation->images[1] );
     release_client_surface_compositor_queue( allocation->release.queue );
@@ -1124,8 +1159,9 @@ static void client_surface_output_allocation_complete( void *context, BOOL succe
             ++client_surface_output_notification_count;
         }
     }
-    TRACE_(csperf)( "ticks=%llu event=output_pair_create_complete request=%p serial=%llu pending=%u failed=%u abandoned=%u\n",
-                   client_surface_perf_time(), allocation, (unsigned long long)allocation->serial, allocation->pending,
+    TRACE_(csperf)( "ticks=%llu event=%s request=%p serial=%llu pending=%u failed=%u abandoned=%u\n",
+                   client_surface_perf_time(), allocation->checkpoint ? "output_pair_copy_complete" : "output_pair_create_complete",
+                   allocation, (unsigned long long)allocation->serial, allocation->pending,
                    allocation->failed, allocation->abandoned );
     pthread_mutex_unlock( &client_surface_compositor_mutex );
     /* A cancelled GUI owner may release the object immediately after
@@ -1167,6 +1203,15 @@ static BOOL create_client_surface_output_allocation( struct client_surface_compo
     client_surface_cache_create_output_pair( allocation->images, allocation->width, allocation->height,
                                               allocation->depth, client_surface_output_allocation_complete, allocation );
     return TRUE;
+}
+
+static void register_client_surface_output_allocation( struct client_surface_output_allocation *allocation )
+{
+    release_client_surface_output_checkpoint( allocation );
+    pthread_mutex_lock( &client_surface_compositor_mutex );
+    allocation->next = client_surface_output_allocations;
+    client_surface_output_allocations = allocation;
+    pthread_mutex_unlock( &client_surface_compositor_mutex );
 }
 
 static BOOL client_surface_alloc_on_compositor( struct client_surface_compositor_job *job )
@@ -1219,10 +1264,7 @@ static BOOL client_surface_alloc_on_compositor( struct client_surface_compositor
     if (gc && !error)
     {
         memcpy( allocation->pixmaps, job->u.pool.pixmaps, sizeof(allocation->pixmaps) );
-        pthread_mutex_lock( &client_surface_compositor_mutex );
-        allocation->next = client_surface_output_allocations;
-        client_surface_output_allocations = allocation;
-        pthread_mutex_unlock( &client_surface_compositor_mutex );
+        register_client_surface_output_allocation( allocation );
         return TRUE;
     }
 
@@ -1649,7 +1691,7 @@ static void complete_client_surface_compositor_mailbox( void *context, BOOL succ
     }
     assert( target->window == mailbox->window && target->width == mailbox->width &&
             target->height == mailbox->height && target->depth == mailbox->depth );
-    set_client_surface_compositor_pixmap( &target->frames[2], client_surface_cache_pixmap( mailbox->image ) );
+    set_client_surface_compositor_pixmap( &target->frames[2], client_surface_cache_pixmap( mailbox->image ), mailbox->image );
     target->next_frame = 0;
     target->replay_member = 0;
 }
@@ -1701,7 +1743,7 @@ static void free_client_surface_compositor_mailbox( struct client_surface_compos
     if (!mailbox) return;
     assert( !frame->serial && !frame->copy_binding );
     target->mailbox = NULL;
-    set_client_surface_compositor_pixmap( frame, 0 );
+    set_client_surface_compositor_pixmap( frame, 0, NULL );
     TRACE_(csperf)( "ticks=%llu event=output_mailbox_detach mailbox=%p image=%p window=%lx pending=%u\n",
                    client_surface_perf_time(), mailbox, mailbox->image, mailbox->window, mailbox->pending );
     if (!mailbox->pending) release_client_surface_compositor_mailbox( mailbox );
@@ -1728,7 +1770,8 @@ static struct client_surface_compositor_frame *get_client_surface_compositor_fra
             target->frames[index].pixmap == target->latest ||
             target->frames[index].pixmap == target->published ||
             (target->mailbox_pending && index == target->mailbox_frame) ||
-            (target->assembly_pending && index == target->assembly_frame)) continue;
+            (target->assembly_pending && index == target->assembly_frame) ||
+            !client_surface_compositor_frame_writable( &target->frames[index] )) continue;
         target->next_frame = (index + 1) % ARRAY_SIZE(target->frames);
         return &target->frames[index];
     }
@@ -1818,8 +1861,10 @@ static struct client_surface_compositor_frame *acquire_client_surface_compositor
         /* A GUI snapshot may have advanced latest while published still
          * names the previous visible image. Keep both checkpoints intact
          * until the new assembly has completed and become visible. */
-        if (!frame->pixmap || frame->serial || frame->pixmap == target->latest || frame->pixmap == target->published ||
-            (target->mailbox_pending && index == target->mailbox_frame))
+        if (!frame->pixmap || frame->serial ||
+            frame->pixmap == target->latest || frame->pixmap == target->published ||
+            (target->mailbox_pending && index == target->mailbox_frame) ||
+            !client_surface_compositor_frame_writable( frame ))
             continue;
         target->next_frame = (index + 1) % ARRAY_SIZE(target->frames);
         return frame;
@@ -2458,11 +2503,12 @@ static BOOL update_client_surface_compositor_target( struct client_surface_compo
         {
             client_surface_xcb_free_gc( client_surface_compositor_display, &target->frames[i].xcb_gc );
             if (target->frames[i].gc) XFreeGC( client_surface_compositor_display, target->frames[i].gc );
-            if (i < 2) set_client_surface_compositor_pixmap( &target->frames[i], 0 );
+            if (i < 2) set_client_surface_compositor_pixmap( &target->frames[i], 0, NULL );
         }
         memset( target->frames, 0, sizeof(target->frames) );
-        set_client_surface_compositor_pixmap( &target->frames[0], job->u.pool.pixmaps[0] );
-        set_client_surface_compositor_pixmap( &target->frames[1], job->u.pool.pixmaps[1] );
+        for (i = 0; i < 2; ++i)
+            set_client_surface_compositor_pixmap( &target->frames[i], job->u.pool.pixmaps[i],
+                allocation->images[allocation->pixmaps[0] != job->u.pool.pixmaps[i]] );
         target->published = job->u.pool.pixmaps[0];
         target->published_width = job->u.pool.valid_width;
         target->published_height = job->u.pool.valid_height;
@@ -2516,6 +2562,145 @@ failed:
     return FALSE;
 }
 
+static BOOL client_surface_output_checkpoint_scene_current( const struct client_surface_scene *expected )
+{
+    struct client_surface_scene current;
+
+    return client_surface_capture_scene_state( expected->toplevel, &current ) &&
+           current.toplevel == expected->toplevel && current.epoch == expected->epoch &&
+           current.generation == expected->generation && current.mode == expected->mode;
+}
+
+static struct client_surface_compositor_frame *client_surface_output_checkpoint_frame(
+    struct client_surface_compositor_target *target, Pixmap source, BOOL *busy )
+{
+    unsigned int i;
+
+    *busy = FALSE;
+    if (!target || target->backing != source) return NULL;
+    for (i = 0; i < ARRAY_SIZE(target->frames); ++i)
+    {
+        struct client_surface_compositor_frame *frame = &target->frames[i];
+
+        if (frame->pixmap != source || !frame->image) continue;
+        /* A partial assembly is not a completed checkpoint, even before its
+         * next native request is queued. Admission never waits for it. */
+        if (target->copy_frame == frame ||
+            (target->assembly_pending && target->assembly_frame == i) ||
+            (client_surface_copy_batch.count && client_surface_copy_batch.frame == frame))
+        {
+            *busy = TRUE;
+            return NULL;
+        }
+        if (!frame->revision) return NULL;
+        return frame;
+    }
+    return NULL;
+}
+
+static BOOL copy_client_surface_compositor_pool( struct client_surface_compositor_job *job )
+{
+    struct client_surface_output_allocation *allocation = job->u.pool.allocation;
+    struct client_surface_compositor_target *target = find_client_surface_compositor_target( job->toplevel );
+    struct client_surface_compositor_frame *frame;
+    BOOL busy;
+    unsigned int i;
+
+    assert( allocation && !allocation->checkpoint && !allocation->pending && !allocation->failed );
+    frame = client_surface_output_checkpoint_frame( target, job->u.pool.source, &busy );
+    if (!target || !allocation->window_owner || target->window != job->u.pool.destination ||
+        target->backing != job->u.pool.source ||
+        target->depth != job->u.pool.depth || target->visual != job->u.pool.visual ||
+        !job->u.pool.window_width || !job->u.pool.window_height ||
+        job->u.pool.preserve_width < job->u.pool.window_width ||
+        job->u.pool.preserve_height < job->u.pool.window_height ||
+        job->u.pool.preserve_width > min( target->width, allocation->width ) ||
+        job->u.pool.preserve_height > min( target->height, allocation->height ) ||
+        !client_surface_output_checkpoint_scene_current( &job->u.pool.scene ))
+    {
+        job->u.pool.stale = TRUE;
+        return FALSE;
+    }
+    allocation->source = job->u.pool.source;
+    allocation->source_revision = target->revision;
+    allocation->published = target->published;
+    allocation->scene = job->u.pool.scene;
+    allocation->window = target->window;
+    allocation->window_width = job->u.pool.window_width;
+    allocation->window_height = job->u.pool.window_height;
+    allocation->copy_width = job->u.pool.preserve_width;
+    allocation->copy_height = job->u.pool.preserve_height;
+    if (!frame && !busy)
+    {
+        /* Failed partial writes invalidate the GUI's old validity hint.
+         * Require a fresh checkpoint, not an endless source-ready wait. */
+        job->u.pool.stale = job->u.pool.invalid_source = TRUE;
+        return FALSE;
+    }
+    if (!frame)
+    {
+        /* Admission owns this bounded notification, not a stack job parked
+         * behind the source's writer. REMOVE can cancel it without a read. */
+        pthread_mutex_lock( &client_surface_compositor_mutex );
+        allocation->copy_wait = TRUE;
+        list_add_tail( &client_surface_output_notifications, &allocation->notification_entry );
+        ++client_surface_output_notification_count;
+        pthread_mutex_unlock( &client_surface_compositor_mutex );
+        TRACE_(csperf)( "ticks=%llu event=output_pair_copy_wait request=%p serial=%llu hwnd=%p source=%lx\n",
+                       client_surface_perf_time(), allocation, (unsigned long long)allocation->serial,
+                       job->toplevel, allocation->source );
+        return TRUE;
+    }
+    allocation->source_image = client_surface_cache_acquire( frame->image );
+    pthread_mutex_lock( &client_surface_compositor_mutex );
+    allocation->copy_wait = FALSE;
+    allocation->checkpoint = TRUE;
+    allocation->pending = ARRAY_SIZE(allocation->images);
+    pthread_mutex_unlock( &client_surface_compositor_mutex );
+    TRACE_(csperf)( "ticks=%llu event=output_pair_copy_submit request=%p serial=%llu hwnd=%p window=%lx "
+                   "source_image=%p source=%lx first=%lx second=%lx width=%u height=%u preserve_width=%u preserve_height=%u "
+                   "epoch=%llu generation=%llu revision=%llu\n", client_surface_perf_time(), allocation,
+                   (unsigned long long)allocation->serial, job->toplevel, allocation->window,
+                   allocation->source_image, allocation->source, allocation->pixmaps[0], allocation->pixmaps[1],
+                   allocation->window_width, allocation->window_height, allocation->copy_width, allocation->copy_height,
+                   (unsigned long long)allocation->scene.epoch, (unsigned long long)allocation->scene.generation,
+                   (unsigned long long)allocation->source_revision );
+    for (i = 0; i < ARRAY_SIZE(allocation->images); ++i)
+        client_surface_cache_copy_output( allocation->images[i], allocation->source,
+            allocation->copy_width, allocation->copy_height, client_surface_output_allocation_complete, allocation );
+    return TRUE;
+}
+
+static BOOL install_client_surface_output_checkpoint( struct client_surface_compositor_job *job )
+{
+    struct client_surface_output_allocation *allocation = job->u.pool.allocation;
+    struct client_surface_compositor_target *target = find_client_surface_compositor_target( job->toplevel );
+    struct client_surface_compositor_frame *frame;
+    BOOL current, busy;
+
+    assert( allocation->checkpoint && !allocation->pending && !allocation->failed );
+    frame = client_surface_output_checkpoint_frame( target, allocation->source, &busy );
+    current = frame && frame->image == allocation->source_image && target->revision == allocation->source_revision &&
+              target->published == allocation->published && target->window == allocation->window &&
+              target->depth == job->u.pool.depth && target->visual == job->u.pool.visual &&
+              allocation->width == job->u.pool.width && allocation->height == job->u.pool.height &&
+              job->u.pool.source == allocation->source && job->u.pool.destination == allocation->window &&
+              job->u.pool.window_width == allocation->window_width && job->u.pool.window_height == allocation->window_height &&
+              job->u.pool.preserve_width == allocation->copy_width && job->u.pool.preserve_height == allocation->copy_height &&
+              client_surface_output_checkpoint_scene_current( &allocation->scene );
+    TRACE_(csperf)( "ticks=%llu event=output_pair_copy_install request=%p serial=%llu hwnd=%p source=%lx current=%u\n",
+                   client_surface_perf_time(), allocation, (unsigned long long)allocation->serial,
+                   job->toplevel, allocation->source, current );
+    if (!current)
+    {
+        job->u.pool.stale = TRUE;
+        return FALSE;
+    }
+    memcpy( job->u.pool.pixmaps, allocation->pixmaps, sizeof(job->u.pool.pixmaps) );
+    register_client_surface_output_allocation( allocation );
+    return TRUE;
+}
+
 static BOOL replace_client_surface_compositor_pool( struct client_surface_compositor_job *job )
 {
     struct client_surface_compositor_target *target;
@@ -2523,7 +2708,9 @@ static BOOL replace_client_surface_compositor_pool( struct client_surface_compos
     /* Completed empty storage becomes an output pool only after checked
      * checkpoint copies and installation. The GUI keeps the old pair until
      * this job succeeds; failure leaves its pending publication intact. */
-    if (!client_surface_compositor_open() || !client_surface_alloc_on_compositor( job ))
+    if (!client_surface_compositor_open() ||
+        !(job->u.pool.allocation->checkpoint ? install_client_surface_output_checkpoint( job ) :
+                                              client_surface_alloc_on_compositor( job )))
     {
         free_client_surface_pending_allocation( job->u.pool.allocation );
         job->u.pool.allocation = NULL;
@@ -2552,7 +2739,7 @@ static BOOL remove_client_surface_compositor_target( HWND toplevel )
     {
         client_surface_xcb_free_gc( client_surface_compositor_display, &target->frames[i].xcb_gc );
         if (target->frames[i].gc) XFreeGC( client_surface_compositor_display, target->frames[i].gc );
-        if (i < 2) set_client_surface_compositor_pixmap( &target->frames[i], 0 );
+        if (i < 2) set_client_surface_compositor_pixmap( &target->frames[i], 0, NULL );
     }
     free_client_surface_compositor_mailbox( target );
     rb_remove( &client_surface_compositor_target_registry, &target->registry_entry );
@@ -2589,7 +2776,7 @@ static BOOL retire_client_surface_compositor_pool( HWND toplevel )
     {
         client_surface_xcb_free_gc( client_surface_compositor_display, &target->frames[i].xcb_gc );
         if (target->frames[i].gc) XFreeGC( client_surface_compositor_display, target->frames[i].gc );
-        if (i < 2) set_client_surface_compositor_pixmap( &target->frames[i], 0 );
+        if (i < 2) set_client_surface_compositor_pixmap( &target->frames[i], 0, NULL );
     }
     free_client_surface_compositor_mailbox( target );
     memset( target->frames, 0, sizeof(target->frames) );
@@ -3355,6 +3542,7 @@ static BOOL copy_client_surface_handoff_to_frame(
     int error = 0;
     GC gc;
 
+    if (!client_surface_compositor_frame_writable( frame )) return FALSE;
     if (!target->latest || !get_client_surface_compositor_catchup( target, frame, &catchup ))
         return FALSE;
     clipped = clip_count != 1 || clips[0].x || clips[0].y ||
@@ -4015,7 +4203,7 @@ static BOOL compose_client_surface_cached_frame( struct client_surface_composito
         else
             frame = acquire_client_surface_compositor_assembly_frame( target );
 
-        if (!frame)
+        if (!frame || !client_surface_compositor_frame_writable( frame ))
         {
 retry:
             /* Output backpressure retains the owner cache, never a producer
@@ -4585,6 +4773,8 @@ static BOOL execute_client_surface_compositor_job( struct client_surface_composi
                                                           job );
     if (job->op == CLIENT_SURFACE_COMPOSITOR_UPDATE_TARGET)
         return update_client_surface_compositor_target( job );
+    if (job->op == CLIENT_SURFACE_COMPOSITOR_COPY_POOL)
+        return copy_client_surface_compositor_pool( job );
     if (job->op == CLIENT_SURFACE_COMPOSITOR_REPLACE_POOL)
         return replace_client_surface_compositor_pool( job );
     if (job->op == CLIENT_SURFACE_COMPOSITOR_REMOVE_TARGET)
@@ -4644,7 +4834,7 @@ static BOOL client_surface_compositor_job_ready( struct client_surface_composito
     BOOL drain = FALSE;
 
     *rejected = FALSE;
-    if (job->op == CLIENT_SURFACE_COMPOSITOR_CREATE_POOL) return TRUE;
+    if (job->op == CLIENT_SURFACE_COMPOSITOR_CREATE_POOL || job->op == CLIENT_SURFACE_COMPOSITOR_COPY_POOL) return TRUE;
     if (!target) return TRUE;
     if (job->op == CLIENT_SURFACE_COMPOSITOR_DIRECT_PLAN ||
         job->op == CLIENT_SURFACE_COMPOSITOR_RETIRE_POOL)
@@ -4686,6 +4876,17 @@ static BOOL client_surface_compositor_job_ready( struct client_surface_composito
         job->op == CLIENT_SURFACE_COMPOSITOR_RESOLVE_SOURCES) return TRUE;
     /* Expose restoration records its own deferred work if necessary. */
     if (job->op == CLIENT_SURFACE_COMPOSITOR_RESTORE_TARGET) return TRUE;
+    if (job->op == CLIENT_SURFACE_COMPOSITOR_COPY)
+        for (i = 0; i < ARRAY_SIZE(target->frames); ++i)
+            if (target->frames[i].pixmap == job->u.copy.destination &&
+                !client_surface_compositor_frame_writable( &target->frames[i] ))
+            {
+                /* The GUI must COW a shared spare, not wait behind another
+                 * actor request before learning that this image is leased. */
+                job->u.copy.shared = TRUE;
+                *rejected = TRUE;
+                return TRUE;
+            }
     /* Preserve the scene, binding and frame referenced by the request. Only
      * this target waits; jobs for independent targets remain eligible. */
     if (target->copy_frame) return FALSE;
@@ -4800,6 +5001,7 @@ static void finish_client_surface_notification( struct client_surface_compositor
 static BOOL client_surface_compositor_control_job( const struct client_surface_compositor_job *job )
 {
     return job->op == CLIENT_SURFACE_COMPOSITOR_CREATE_POOL ||
+           job->op == CLIENT_SURFACE_COMPOSITOR_COPY_POOL ||
            job->op == CLIENT_SURFACE_COMPOSITOR_TRY_BEGIN_UPDATE ||
            job->op == CLIENT_SURFACE_COMPOSITOR_CHECK_UPDATE ||
            job->op == CLIENT_SURFACE_COMPOSITOR_FINISH_UPDATE ||
@@ -4989,8 +5191,25 @@ static BOOL notify_client_surface_output_allocations( struct client_surface_comp
         /* Queue the scalar server message and publish that fact atomically
          * with respect to its GUI receiver and cancellation. No native call
          * or window-data lookup runs while this metadata lock is held. */
-        posted = NtUserPostMessage( allocation->release.toplevel, WM_X11DRV_CLIENT_SURFACE_POOL,
-                                    (UINT)allocation->serial, (UINT)(allocation->serial >> 32) );
+        posted = TRUE;
+        if (allocation->copy_wait)
+        {
+            struct client_surface_compositor_target *target =
+                find_client_surface_compositor_target( allocation->release.toplevel );
+
+            /* A gone/replaced source also wakes the GUI to discard the old
+             * request. A live writer does not generate periodic GUI retries. */
+            if (target && target->window == allocation->window && target->backing == allocation->source)
+            {
+                BOOL busy;
+
+                client_surface_output_checkpoint_frame( target, allocation->source, &busy );
+                posted = !busy;
+            }
+        }
+        if (posted)
+            posted = NtUserPostMessage( allocation->release.toplevel, WM_X11DRV_CLIENT_SURFACE_POOL,
+                                        (UINT)allocation->serial, (UINT)(allocation->serial >> 32) );
         list_remove( &allocation->notification_entry );
         if (posted)
         {
@@ -5435,10 +5654,10 @@ void X11DRV_client_surface_complete_direct( struct client_surface *surface,
     post_client_surface_compositor_job( &job );
 }
 
-static BOOL client_surface_backing_copy_area( HWND toplevel, Drawable source, Drawable destination,
-                                              int source_x, int source_y,
-                                              int destination_x, int destination_y,
-                                              unsigned int width, unsigned int height )
+static NTSTATUS client_surface_backing_copy_area( HWND toplevel, Drawable source, Drawable destination,
+                                                  int source_x, int source_y,
+                                                  int destination_x, int destination_y,
+                                                  unsigned int width, unsigned int height )
 {
     struct client_surface_compositor_job job =
     {
@@ -5457,7 +5676,8 @@ static BOOL client_surface_backing_copy_area( HWND toplevel, Drawable source, Dr
         },
     };
 
-    return submit_client_surface_compositor_job( &job );
+    if (submit_client_surface_compositor_job( &job )) return STATUS_SUCCESS;
+    return job.u.copy.shared ? STATUS_SHARING_VIOLATION : STATUS_UNSUCCESSFUL;
 }
 
 void X11DRV_client_surface_backing_cancel_allocation( struct x11drv_win_data *data )
@@ -5477,8 +5697,9 @@ void X11DRV_client_surface_backing_cancel_allocation( struct x11drv_win_data *da
         list_init( &allocation->notification_entry );
         --client_surface_output_notification_count;
     }
-    TRACE_(csperf)( "ticks=%llu event=output_pair_create_cancel request=%p serial=%llu pending=%u\n",
-                   client_surface_perf_time(), allocation, (unsigned long long)allocation->serial, allocation->pending );
+    TRACE_(csperf)( "ticks=%llu event=output_pair_create_cancel request=%p serial=%llu pending=%u checkpoint=%u waiting=%u\n",
+                   client_surface_perf_time(), allocation, (unsigned long long)allocation->serial, allocation->pending,
+                   allocation->checkpoint, allocation->copy_wait );
     pthread_mutex_unlock( &client_surface_compositor_mutex );
     if (!pending) free_client_surface_pending_allocation( allocation );
 }
@@ -5507,7 +5728,7 @@ UINT X11DRV_client_surface_backing_pool_ready( HWND hwnd, UINT64 serial )
 }
 
 static NTSTATUS prepare_client_surface_output_allocation( struct x11drv_win_data *data,
-                                                          unsigned int width, unsigned int height,
+                                                          unsigned int width, unsigned int height, BOOL force,
                                                           struct client_surface_output_allocation **result )
 {
     struct client_surface_output_allocation *allocation = data->client_surface_pending_allocation;
@@ -5528,6 +5749,7 @@ static NTSTATUS prepare_client_surface_output_allocation( struct x11drv_win_data
     {
         if (!submit_client_surface_compositor_job( &job )) return STATUS_UNSUCCESSFUL;
         data->client_surface_pending_allocation = job.u.pool.allocation;
+        job.u.pool.allocation->force = force;
         data->client_surface_allocation_serial = job.u.pool.allocation->serial;
         data->client_surface_allocation_update = WINE_UPDATE_CLIENT_SURFACE_BACKING;
         return STATUS_PENDING;
@@ -5543,7 +5765,7 @@ static NTSTATUS prepare_client_surface_output_allocation( struct x11drv_win_data
     return status;
 }
 
-static BOOL replace_client_surface_backing( struct x11drv_win_data *data,
+static NTSTATUS replace_client_surface_backing( struct x11drv_win_data *data,
                                             struct client_surface_output_allocation *allocation, unsigned int width,
                                             unsigned int height, unsigned int window_width,
                                             unsigned int window_height, BOOL snapshot,
@@ -5576,20 +5798,43 @@ static BOOL replace_client_surface_backing( struct x11drv_win_data *data,
     if (snapshot && (width < window_width || height < window_height))
     {
         free_client_surface_pending_allocation( allocation );
-        return FALSE;
+        return STATUS_UNSUCCESSFUL;
+    }
+    if (!snapshot && !allocation->checkpoint && preserve_width >= window_width &&
+        preserve_height >= window_height && data->native_window &&
+        client_surface_capture_scene_state( data->hwnd, &job.u.pool.scene ))
+    {
+        /* The legacy Window seed is completely overwritten by this valid
+         * OUTPUT rectangle. Admit that owned read without touching Window. */
+        release_client_surface_output_checkpoint( allocation );
+        allocation->window_owner = x11drv_native_window_acquire( data->native_window );
+        job.op = CLIENT_SURFACE_COMPOSITOR_COPY_POOL;
+        if (submit_client_surface_compositor_job( &job ))
+        {
+            data->client_surface_pending_allocation = allocation;
+            data->client_surface_allocation_update = WINE_UPDATE_CLIENT_SURFACE_BACKING;
+            return STATUS_PENDING;
+        }
+        if (job.u.pool.invalid_source)
+        {
+            data->client_surface_backing_valid = FALSE;
+            data->client_surface_backing_valid_width = data->client_surface_backing_valid_height = 0;
+        }
+        free_client_surface_pending_allocation( allocation );
+        return job.u.pool.stale ? STATUS_RETRY : STATUS_UNSUCCESSFUL;
     }
     /* Complete the GUI connection's drawing before the actor reads it. */
-    XSync( data->display, False );
+    if (!allocation->checkpoint) XSync( data->display, False );
     if (!submit_client_surface_compositor_job( &job ))
     {
         /* A refusal before execution leaves the completed allocation here.
          * The actor clears this pointer when it consumes that ownership. */
         if (job.u.pool.allocation) free_client_surface_pending_allocation( job.u.pool.allocation );
-        return FALSE;
+        return job.u.pool.stale ? STATUS_RETRY : STATUS_UNSUCCESSFUL;
     }
     *first = job.u.pool.pixmaps[0];
     *second = job.u.pool.pixmaps[1];
-    return TRUE;
+    return STATUS_SUCCESS;
 }
 
 static void client_surface_backing_free( Pixmap first, Pixmap second )
@@ -5610,7 +5855,7 @@ static BOOL client_surface_backing_copy( HWND toplevel, Drawable source, Drawabl
                                          unsigned int width, unsigned int height )
 {
     return client_surface_backing_copy_area( toplevel, source, destination, 0, 0, 0, 0,
-                                             width, height );
+                                             width, height ) == STATUS_SUCCESS;
 }
 
 static BOOL client_surface_backing_present( HWND toplevel, Window window, Pixmap pixmap,
@@ -6210,32 +6455,34 @@ NTSTATUS X11DRV_client_surface_prepare_owner( struct x11drv_win_data *data )
     return status;
 }
 
-static BOOL copy_client_surface_backing_snapshot( struct x11drv_win_data *data, Pixmap pixmap,
+static NTSTATUS copy_client_surface_backing_snapshot( struct x11drv_win_data *data, Pixmap pixmap,
                                                   unsigned int width, unsigned int height,
                                                   unsigned int window_width, unsigned int window_height )
 {
-    if (width < window_width || height < window_height) return FALSE;
+    if (width < window_width || height < window_height) return STATUS_UNSUCCESSFUL;
     /* The compositor uses another connection. Complete the owner's drawing
      * before copying the complete checkpoint, including its GDI pixels. */
     XSync( data->display, False );
-    return client_surface_backing_copy( data->hwnd, data->whole_window, pixmap, window_width, window_height );
+    return client_surface_backing_copy_area( data->hwnd, data->whole_window, pixmap,
+                                            0, 0, 0, 0, window_width, window_height );
 }
 
-static BOOL snapshot_client_surface_backing( struct x11drv_win_data *data, BOOL invalidate, BOOL ensure_on_failure,
+static NTSTATUS snapshot_client_surface_backing( struct x11drv_win_data *data, BOOL invalidate, BOOL ensure_on_failure,
                                              unsigned int window_width, unsigned int window_height )
 {
     Pixmap previous;
+    NTSTATUS status;
 
-    if (!copy_client_surface_backing_snapshot( data, data->client_surface_backing_spare,
+    if ((status = copy_client_surface_backing_snapshot( data, data->client_surface_backing_spare,
             data->client_surface_backing_width, data->client_surface_backing_height,
-            window_width, window_height ))
+            window_width, window_height )) != STATUS_SUCCESS)
     {
         /* A failed snapshot must still apply the capacity check's validity
          * and native extent to the old target. Successful snapshots combine
          * that update with their checkpoint rotation below. */
-        if (ensure_on_failure && update_client_surface_backing_target( data ))
+        if (status != STATUS_SHARING_VIOLATION && ensure_on_failure && update_client_surface_backing_target( data ))
             refresh_client_surface_handoffs( data->hwnd );
-        return FALSE;
+        return status;
     }
     previous = data->client_surface_backing;
     data->client_surface_backing = data->client_surface_backing_spare;
@@ -6245,7 +6492,7 @@ static BOOL snapshot_client_surface_backing( struct x11drv_win_data *data, BOOL 
     data->client_surface_backing_valid = FALSE;
     data->client_surface_backing_valid_width = 0;
     data->client_surface_backing_valid_height = 0;
-    if (!update_client_surface_backing_target( data )) return FALSE;
+    if (!update_client_surface_backing_target( data )) return STATUS_UNSUCCESSFUL;
     refresh_client_surface_handoffs( data->hwnd );
     if (!invalidate)
     {
@@ -6253,26 +6500,48 @@ static BOOL snapshot_client_surface_backing( struct x11drv_win_data *data, BOOL 
         data->client_surface_backing_valid_width = window_width;
         data->client_surface_backing_valid_height = window_height;
     }
-    return TRUE;
+    return STATUS_SUCCESS;
+}
+
+static BOOL client_surface_output_checkpoint_matches( struct x11drv_win_data *data,
+                                                       struct client_surface_output_allocation *allocation,
+                                                       unsigned int window_width, unsigned int window_height )
+{
+    return allocation->window_owner == data->native_window && allocation->window == data->whole_window &&
+           allocation->source == data->client_surface_backing && data->client_surface_backing_valid &&
+           allocation->window_width == window_width && allocation->window_height == window_height &&
+           allocation->copy_width == min( data->client_surface_backing_valid_width, allocation->width ) &&
+           allocation->copy_height == min( data->client_surface_backing_valid_height, allocation->height ) &&
+           client_surface_output_checkpoint_scene_current( &allocation->scene );
 }
 
 /* Align capacities to tiles, with modest growth slack and delayed shrinking.
  * Only the owner
  * compositor uses these Pixmaps, so replaced pools can be freed once its
  * target update has drained the old Present requests. */
-static NTSTATUS ensure_client_surface_backing( struct x11drv_win_data *data, BOOL snapshot, BOOL invalidate )
+static NTSTATUS ensure_client_surface_backing( struct x11drv_win_data *data, BOOL snapshot, BOOL invalidate, BOOL force )
 {
     struct client_surface_output_allocation *allocation;
     unsigned int width, height, window_width, window_height;
     unsigned int old_valid_width, old_valid_height;
-    BOOL old_valid, valid, shrink = FALSE;
+    BOOL old_valid, valid, shrink;
     Pixmap pixmap, spare, old_pixmap, old_spare;
     NTSTATUS status;
 
+retry:
+    shrink = FALSE;
     if (!data->whole_window) return STATUS_UNSUCCESSFUL;
     if (!get_client_surface_window_extent( data, &window_width, &window_height )) return STATUS_UNSUCCESSFUL;
     width = client_surface_backing_extent( data->rects.visible.right - data->rects.visible.left );
     height = client_surface_backing_extent( data->rects.visible.bottom - data->rects.visible.top );
+    allocation = data->client_surface_pending_allocation;
+    if (allocation && (allocation->checkpoint || allocation->copy_wait) &&
+        !client_surface_output_checkpoint_matches( data, allocation, window_width, window_height ))
+    {
+        X11DRV_client_surface_backing_cancel_allocation( data );
+        allocation = NULL;
+    }
+    if (allocation && allocation->force) force = TRUE;
     if (data->client_surface_backing &&
         (UINT64)data->client_surface_backing_width * data->client_surface_backing_height >= (UINT64)width * height * 2)
     {
@@ -6290,7 +6559,7 @@ static NTSTATUS ensure_client_surface_backing( struct x11drv_win_data *data, BOO
     }
     else data->client_surface_backing_shrink_start = 0;
     if (data->client_surface_backing && data->client_surface_backing_spare &&
-        !shrink &&
+        !shrink && !force &&
         data->client_surface_backing_width >= width &&
         data->client_surface_backing_height >= height)
     {
@@ -6315,11 +6584,20 @@ static NTSTATUS ensure_client_surface_backing( struct x11drv_win_data *data, BOO
                 min( data->client_surface_backing_valid_height, window_height );
         }
         if (snapshot)
-            return snapshot_client_surface_backing( data, invalidate, TRUE, window_width, window_height ) ?
-                   STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
-        if (!update_client_surface_backing_target( data )) return STATUS_UNSUCCESSFUL;
-        refresh_client_surface_handoffs( data->hwnd );
-        return STATUS_SUCCESS;
+        {
+            status = snapshot_client_surface_backing( data, invalidate, TRUE, window_width, window_height );
+            if (status != STATUS_SHARING_VIOLATION) return status;
+            /* The old request may already be cancelled, but its native read
+             * still owns this spare. Replace the pair through normal bounded
+             * admission; no wait or failed scene is needed for shared storage. */
+            force = TRUE;
+        }
+        else
+        {
+            if (!update_client_surface_backing_target( data )) return STATUS_UNSUCCESSFUL;
+            refresh_client_surface_handoffs( data->hwnd );
+            return STATUS_SUCCESS;
+        }
     }
 
     if (snapshot && (data->client_surface_backing || data->client_surface_backing_spare))
@@ -6328,10 +6606,9 @@ static NTSTATUS ensure_client_surface_backing( struct x11drv_win_data *data, BOO
          * the published checkpoint, separate from the new GUI snapshot.
          * Keep that capacity-only replacement before rotating the snapshot;
          * the one-checkpoint shortcut below is only for an empty pool. */
-        if ((status = ensure_client_surface_backing( data, FALSE, FALSE )) != STATUS_SUCCESS) return status;
+        if ((status = ensure_client_surface_backing( data, FALSE, FALSE, force )) != STATUS_SUCCESS) return status;
         if (!get_client_surface_window_extent( data, &window_width, &window_height )) return STATUS_UNSUCCESSFUL;
-        return snapshot_client_surface_backing( data, invalidate, FALSE, window_width, window_height ) ?
-               STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
+        return snapshot_client_surface_backing( data, invalidate, FALSE, window_width, window_height );
     }
 
     /* Grow the axis which needs space, without retaining the historical
@@ -6340,10 +6617,9 @@ static NTSTATUS ensure_client_surface_backing( struct x11drv_win_data *data, BOO
         width = max( width, client_surface_backing_extent( data->client_surface_backing_width * 9 / 8 ) );
     if (!shrink && height > data->client_surface_backing_height)
         height = max( height, client_surface_backing_extent( data->client_surface_backing_height * 9 / 8 ) );
-    /* Empty storage has no scene or Window contents. Native creation may
-     * finish after arbitrary GUI updates; only this retry reads the current
-     * checkpoint and chooses the old completed intersection to preserve. */
-    if ((status = prepare_client_surface_output_allocation( data, width, height, &allocation )) != STATUS_SUCCESS)
+    /* CREATE has no content identity. A resumed COPY instead retains its
+     * exact source and scene; the matching check above precedes consumption. */
+    if ((status = prepare_client_surface_output_allocation( data, width, height, force, &allocation )) != STATUS_SUCCESS)
         return status;
     old_valid = data->client_surface_backing_valid;
     old_valid_width = min( data->client_surface_backing_valid_width, width );
@@ -6351,14 +6627,18 @@ static NTSTATUS ensure_client_surface_backing( struct x11drv_win_data *data, BOO
 
     /* Until a larger pool has been installed, the old Pixmap no longer
      * represents the complete host extent and must not satisfy Expose. */
-    data->client_surface_backing_valid = FALSE;
-    data->client_surface_backing_valid_width = 0;
-    data->client_surface_backing_valid_height = 0;
+    if (snapshot || !old_valid || old_valid_width < window_width || old_valid_height < window_height)
+    {
+        data->client_surface_backing_valid = FALSE;
+        data->client_surface_backing_valid_width = 0;
+        data->client_surface_backing_valid_height = 0;
+    }
 
-    if (!replace_client_surface_backing( data, allocation, width, height, window_width, window_height,
-                                         snapshot, !snapshot && old_valid ? old_valid_width : 0,
-                                         !snapshot && old_valid ? old_valid_height : 0, &pixmap, &spare ))
-        return STATUS_UNSUCCESSFUL;
+    status = replace_client_surface_backing( data, allocation, width, height, window_width, window_height,
+                                             snapshot, !snapshot && old_valid ? old_valid_width : 0,
+                                             !snapshot && old_valid ? old_valid_height : 0, &pixmap, &spare );
+    if (status == STATUS_RETRY) goto retry;
+    if (status != STATUS_SUCCESS) return status;
 
     /* The actor installed the checked checkpoint pair. Publish GUI ownership
      * only after success, so failure never requires restoring these handles. */
@@ -6393,12 +6673,12 @@ static NTSTATUS ensure_client_surface_backing( struct x11drv_win_data *data, BOO
 
 NTSTATUS X11DRV_client_surface_backing_ensure( struct x11drv_win_data *data )
 {
-    return ensure_client_surface_backing( data, FALSE, FALSE );
+    return ensure_client_surface_backing( data, FALSE, FALSE, FALSE );
 }
 
 NTSTATUS X11DRV_client_surface_backing_snapshot( struct x11drv_win_data *data, BOOL invalidate )
 {
-    return ensure_client_surface_backing( data, TRUE, invalidate );
+    return ensure_client_surface_backing( data, TRUE, invalidate, FALSE );
 }
 
 BOOL X11DRV_client_surface_backing_publish( struct x11drv_win_data *data )
@@ -6471,5 +6751,5 @@ BOOL X11DRV_client_surface_backing_restore( struct x11drv_win_data *data,
                                              rect->left, rect->top,
                                              rect->left, rect->top,
                                              rect->right - rect->left,
-                                             rect->bottom - rect->top );
+                                             rect->bottom - rect->top ) == STATUS_SUCCESS;
 }

@@ -51,6 +51,7 @@ struct client_surface_cache_image
     Window window;
     GC gc, transfer_gc;
     unsigned int width, height, depth;
+    unsigned int copy_width, copy_height;
     unsigned int xcb_gc;
     unsigned int refs;
     enum client_surface_memory_class purpose;
@@ -145,15 +146,22 @@ static void create_cache_image( struct client_surface_cache_image *image )
 static void copy_cache_image( struct client_surface_cache_image *image )
 {
     struct cache_worker *worker = image->worker;
+    XGCValues values = {.graphics_exposures = False};
 
     worker->error = 0;
-    XCopyArea( worker->display, image->source, image->pixmap, image->gc,
-               0, 0, image->width, image->height, 0, 0 );
+    /* OUTPUT creation only reserves the Pixmap. Its first private copy owns
+     * this GC, including a failed native allocation, through actual reclaim. */
+    if (!image->gc) image->gc = XCreateGC( worker->display, image->pixmap, GCGraphicsExposures, &values );
+    if (image->gc)
+        XCopyArea( worker->display, image->source, image->pixmap, image->gc,
+                   0, 0, image->copy_width, image->copy_height, 0, 0 );
     XSync( worker->display, False );
-    image->success = !worker->error;
-    TRACE_(csperf)( "ticks=%llu event=cache_native_fallback image=%p source=%lx destination=%lx "
-                   "display=%p error=%d sync_calls=1\n", cache_time(), image, image->source,
-                   image->pixmap, worker->display, worker->error );
+    image->success = image->gc && !worker->error;
+    TRACE_(csperf)( "ticks=%llu event=%s image=%p source=%lx destination=%lx "
+                   "display=%p width=%u height=%u error=%d sync_calls=1 success=%u\n", cache_time(),
+                   image->purpose == CLIENT_SURFACE_MEMORY_OUTPUT ? "output_pair_native_copy" : "cache_native_fallback",
+                   image, image->source, image->pixmap, worker->display, image->copy_width,
+                   image->copy_height, worker->error, image->success );
 }
 
 static void create_output_image( struct client_surface_cache_image *image )
@@ -514,6 +522,22 @@ void client_surface_cache_copy( struct client_surface_cache_image *image, Pixmap
     pthread_mutex_lock( &cache_mutex );
     assert( image->acquired && image->refs == 1 && image->purpose == CLIENT_SURFACE_MEMORY_SOURCE );
     image->source = source;
+    image->copy_width = image->width;
+    image->copy_height = image->height;
+    queue_cache_image( image, CACHE_COPY, complete, context );
+    pthread_mutex_unlock( &cache_mutex );
+}
+
+void client_surface_cache_copy_output( struct client_surface_cache_image *image, Pixmap source,
+                                       unsigned int width, unsigned int height,
+                                       client_surface_cache_callback complete, void *context )
+{
+    pthread_mutex_lock( &cache_mutex );
+    assert( image->acquired && image->refs == 1 && image->purpose == CLIENT_SURFACE_MEMORY_OUTPUT );
+    assert( source && width && height && width <= image->width && height <= image->height );
+    image->source = source;
+    image->copy_width = width;
+    image->copy_height = height;
     queue_cache_image( image, CACHE_COPY, complete, context );
     pthread_mutex_unlock( &cache_mutex );
 }

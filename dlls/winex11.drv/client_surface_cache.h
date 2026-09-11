@@ -53,6 +53,11 @@ struct client_surface_cache_image *client_surface_cache_acquire( struct client_s
 BOOL client_surface_cache_shared( const struct client_surface_cache_image *image );
 void client_surface_cache_copy( struct client_surface_cache_image *image, Pixmap source,
                                 client_surface_cache_callback complete, void *context );
+/* Copy a completed, independently retained OUTPUT rectangle into private
+ * storage. The caller owns the source read until this callback returns. */
+void client_surface_cache_copy_output( struct client_surface_cache_image *image, Pixmap source,
+                                       unsigned int width, unsigned int height,
+                                       client_surface_cache_callback complete, void *context );
 
 /* Each output read holds a reference through its checked reply. A shared
  * image is immutable; replace a shared spare before beginning another write.

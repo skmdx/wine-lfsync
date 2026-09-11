@@ -4366,8 +4366,8 @@ LRESULT X11DRV_WindowMessage( HWND hwnd, UINT msg, WPARAM wp, LPARAM lp )
         {
             NTSTATUS status;
 
-            /* These messages evaluate current server state. The allocation
-             * carries no old scene or borrowed native Window to publish. */
+            /* Retry validates any captured checkpoint against current state.
+             * CREATE can advance to COPY under this same owned serial. */
             status = send_message( hwnd, WM_WINE_UPDATEWINDOWSTATE, update, 0 );
             if ((data = get_win_data( hwnd )))
             {
@@ -4375,7 +4375,8 @@ LRESULT X11DRV_WindowMessage( HWND hwnd, UINT msg, WPARAM wp, LPARAM lp )
                 {
                     if (update == WINE_PREPARE_CLIENT_SURFACES && status == STATUS_NOT_FOUND)
                         X11DRV_client_surface_backing_cancel_allocation( data );
-                    else data->client_surface_allocation_serial = 0;
+                    else if (!data->client_surface_pending_allocation)
+                        data->client_surface_allocation_serial = 0;
                 }
                 release_win_data( data );
             }
