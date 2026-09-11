@@ -13,6 +13,13 @@ struct client_surface_cache_image *client_surface_cache_create(
     unsigned int depth, UINT64 bytes, void (*wake)(void),
     client_surface_cache_callback complete, void *context );
 
+/* Output admission retains its own purpose charge. Native storage has no
+ * borrowed target pointer; the caller validates installation on completion. */
+struct client_surface_cache_image *client_surface_cache_create_output(
+    const struct client_surface_memory_scope *memory, Window window, unsigned int width, unsigned int height,
+    unsigned int depth, UINT64 bytes, void (*wake)(void),
+    client_surface_cache_callback complete, void *context );
+
 /* These descriptors are available after successful creation. The GC is for
  * checked XCB reads only; Xlib drawing uses a separate, private GC. */
 Pixmap client_surface_cache_pixmap( const struct client_surface_cache_image *image );

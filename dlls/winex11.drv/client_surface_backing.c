@@ -265,7 +265,7 @@ struct client_surface_compositor_target
     BOOL update_notified;
     BOOL update_resumed;
     UINT deferred_update_types;
-    UINT64 mailbox_bytes;
+    struct client_surface_compositor_mailbox *mailbox;
     DWORD shrink_start;
     XID present_event;
     unsigned int width;
@@ -274,6 +274,16 @@ struct client_surface_compositor_target
     unsigned int window_height;
     unsigned int depth;
     VisualID visual;
+};
+
+struct client_surface_compositor_mailbox
+{
+    struct client_surface_memory_scope memory;
+    struct client_surface_cache_image *image;
+    HWND toplevel;
+    Window window;
+    unsigned int width, height, depth;
+    BOOL pending;
 };
 
 #ifdef SONAME_LIBXPRESENT
@@ -1470,63 +1480,106 @@ static void process_client_surface_present_events(void)
 
 #endif
 
+static void wake_client_surface_compositor(void);
+
+static void release_client_surface_compositor_mailbox( struct client_surface_compositor_mailbox *mailbox )
+{
+    client_surface_cache_release( mailbox->image );
+    client_surface_free_owned_metadata( &mailbox->memory, mailbox, sizeof(*mailbox) );
+}
+
+static void retry_client_surface_compositor_mailbox( struct client_surface_compositor_target *target )
+{
+    struct client_surface_compositor_mailbox *mailbox = target->mailbox;
+
+    /* A failed native allocation is retried after new source/scene input,
+     * not on its own completion wake or another target's maintenance. */
+    if (!mailbox || mailbox->pending || mailbox->image) return;
+    target->mailbox = NULL;
+    release_client_surface_compositor_mailbox( mailbox );
+}
+
+static void complete_client_surface_compositor_mailbox( void *context, BOOL success )
+{
+    struct client_surface_compositor_mailbox *mailbox = context;
+    struct client_surface_compositor_target *target = find_client_surface_compositor_target( mailbox->toplevel );
+    BOOL current = target && target->mailbox == mailbox;
+
+    assert( mailbox->pending );
+    mailbox->pending = FALSE;
+    TRACE_(csperf)( "ticks=%llu event=output_mailbox_complete mailbox=%p image=%p window=%lx success=%u current=%u\n",
+                   client_surface_perf_time(), mailbox, mailbox->image, mailbox->window, success, current );
+    /* The allocation object survives target removal and pool replacement.
+     * An HWND or target address can be reused, but this live object cannot. */
+    if (!current)
+    {
+        release_client_surface_compositor_mailbox( mailbox );
+        return;
+    }
+    if (!success)
+    {
+        client_surface_cache_release( mailbox->image );
+        mailbox->image = NULL;
+        return;
+    }
+    assert( target->window == mailbox->window && target->width == mailbox->width &&
+            target->height == mailbox->height && target->depth == mailbox->depth );
+    set_client_surface_compositor_pixmap( &target->frames[2], client_surface_cache_pixmap( mailbox->image ) );
+    target->next_frame = 0;
+    target->replay_member = 0;
+}
+
 static struct client_surface_compositor_frame *alloc_client_surface_compositor_mailbox(
     struct client_surface_compositor_target *target )
 {
-    Display *display = client_surface_compositor_display;
-    struct client_surface_compositor_frame *frame = &target->frames[2];
+    struct client_surface_compositor_mailbox *mailbox;
+    struct client_surface_memory_scope memory = {0};
     UINT64 bytes;
-    Pixmap pixmap;
-    int error = 0;
 
-    /* Preparation needs the checkpoint pair even if a producer subsequently
-     * admits DIRECT. Allocate the third image only when composition cannot
-     * reuse either existing image without overwriting a completed checkpoint. */
-    if (frame->pixmap || !target->frames[0].pixmap || !target->frames[1].pixmap) return NULL;
-    bytes = client_surface_pixmap_bytes( target->width, target->height, target->depth );
-    if (!client_surface_reserve_scoped_memory( &target->memory, CLIENT_SURFACE_MEMORY_OUTPUT, bytes )) return NULL;
-    X11DRV_expect_error( display, client_surface_compositor_error, &error );
-    pixmap = XCreatePixmap( display, target->window, target->width, target->height, target->depth );
-    XSync( display, False );
-    X11DRV_check_error();
-    TRACE_(csperf)( "ticks=%llu event=output_mailbox_alloc window=%lx pixmap=%lx width=%u height=%u "
-                   "depth=%u sync_calls=1 error=%d success=%u\n",
-                   client_surface_perf_time(), target->window, pixmap, target->width, target->height,
-                   target->depth, error, !error );
-    if (error)
+    /* Keep both completed checkpoints. The empty third slot owns a pending
+     * allocation, not permission to delay the actor on native storage work. */
+    if (target->mailbox || !target->frames[0].pixmap || !target->frames[1].pixmap) return NULL;
+    client_surface_memory_scope_copy( &memory, &target->memory, TRUE );
+    if (!(mailbox = client_surface_alloc_scoped_metadata( &memory, 1, sizeof(*mailbox) )))
     {
-        X11DRV_expect_error( display, client_surface_compositor_error, &error );
-        XFreePixmap( display, pixmap );
-        XSync( display, False );
-        X11DRV_check_error();
-        client_surface_release_scoped_memory( &target->memory, CLIENT_SURFACE_MEMORY_OUTPUT, bytes );
+        client_surface_memory_scope_destroy( &memory );
         return NULL;
     }
-    set_client_surface_compositor_pixmap( frame, pixmap );
-    target->mailbox_bytes = bytes;
-    target->next_frame = 0;
-    x11drv_client_surface_trace_image( "acquire", "output_mailbox", display, pixmap, bytes );
-    return frame;
+    mailbox->memory = memory;
+    mailbox->toplevel = target->toplevel;
+    mailbox->window = target->window;
+    mailbox->width = target->width;
+    mailbox->height = target->height;
+    mailbox->depth = target->depth;
+    bytes = client_surface_pixmap_bytes( target->width, target->height, target->depth );
+    mailbox->image = client_surface_cache_create_output( &mailbox->memory, target->window,
+        target->width, target->height, target->depth, bytes,
+        wake_client_surface_compositor, complete_client_surface_compositor_mailbox, mailbox );
+    if (!mailbox->image)
+    {
+        release_client_surface_compositor_mailbox( mailbox );
+        return NULL;
+    }
+    mailbox->pending = TRUE;
+    target->mailbox = mailbox;
+    TRACE_(csperf)( "ticks=%llu event=output_mailbox_pending mailbox=%p image=%p window=%lx width=%u height=%u depth=%u\n",
+                   client_surface_perf_time(), mailbox, mailbox->image, mailbox->window,
+                   mailbox->width, mailbox->height, mailbox->depth );
+    return NULL;
 }
 
 static void free_client_surface_compositor_mailbox( struct client_surface_compositor_target *target )
 {
-    Display *display = client_surface_compositor_display;
     struct client_surface_compositor_frame *frame = &target->frames[2];
-    int error = 0;
+    struct client_surface_compositor_mailbox *mailbox = target->mailbox;
 
-    if (!frame->pixmap) return;
+    if (!mailbox) return;
     assert( !frame->serial && !frame->copy_binding );
-    x11drv_client_surface_trace_image( "retire", "output_mailbox", display, frame->pixmap, target->mailbox_bytes );
-    X11DRV_expect_error( display, client_surface_compositor_error, &error );
-    XFreePixmap( display, frame->pixmap );
-    XSync( display, False );
-    X11DRV_check_error();
-    x11drv_client_surface_trace_image( "free", "output_mailbox", display, frame->pixmap, target->mailbox_bytes );
-    client_surface_release_scoped_memory( &target->memory, CLIENT_SURFACE_MEMORY_OUTPUT, target->mailbox_bytes );
-    if (error) WARN( "failed to release client-surface mailbox %#lx, error %d\n", frame->pixmap, error );
+    target->mailbox = NULL;
     set_client_surface_compositor_pixmap( frame, 0 );
-    target->mailbox_bytes = 0;
+    TRACE_(csperf)( "ticks=%llu event=output_mailbox_detach mailbox=%p image=%p window=%lx pending=%u\n",
+                   client_surface_perf_time(), mailbox, mailbox->image, mailbox->window, mailbox->pending );
+    if (!mailbox->pending) release_client_surface_compositor_mailbox( mailbox );
 }
 
 static struct client_surface_compositor_frame *get_client_surface_compositor_frame(
@@ -2131,6 +2184,7 @@ static BOOL install_client_surface_scene_plan( struct client_surface_compositor_
     target->quiescing = target->native_updates || target->deferred_update;
     target->receipts = receipts;
     target->replay_member = 0;
+    retry_client_surface_compositor_mailbox( target );
     for (i = 0; i < count; ++i)
     {
         members[i]->scene_index = i;
@@ -2264,6 +2318,11 @@ static BOOL update_client_surface_compositor_target( struct client_surface_compo
      * Keep it across pool replacement and an acknowledged DIRECT plan. */
     if (target->window && target->window != job->u.pool.destination)
         free_client_surface_compositor_present_input( target );
+    if (target->mailbox && target->mailbox->pending &&
+        (target->window != job->u.pool.destination || target->width != job->u.pool.width ||
+         target->height != job->u.pool.height || target->depth != job->u.pool.depth))
+        free_client_surface_compositor_mailbox( target );
+    retry_client_surface_compositor_mailbox( target );
     target->window = job->u.pool.destination;
     if (!same_pool)
     {
@@ -2279,7 +2338,6 @@ static BOOL update_client_surface_compositor_target( struct client_surface_compo
         memset( target->frames, 0, sizeof(target->frames) );
         set_client_surface_compositor_pixmap( &target->frames[0], job->u.pool.pixmaps[0] );
         set_client_surface_compositor_pixmap( &target->frames[1], job->u.pool.pixmaps[1] );
-        target->mailbox_bytes = 0;
         target->published = job->u.pool.pixmaps[0];
         target->published_width = job->u.pool.valid_width;
         target->published_height = job->u.pool.valid_height;
@@ -2404,7 +2462,6 @@ static BOOL retire_client_surface_compositor_pool( HWND toplevel )
     }
     free_client_surface_compositor_mailbox( target );
     memset( target->frames, 0, sizeof(target->frames) );
-    target->mailbox_bytes = 0;
     target->backing = target->latest = target->published = None;
     target->published_width = target->published_height = 0;
     SetRectEmpty( &target->restore_rect );
@@ -2745,7 +2802,11 @@ static void release_client_surface_cached_source( struct client_surface_composit
         binding->replay_epoch = 0;
         /* A new completed source also retries preceding dirty scene members.
          * No target pointer is borrowed across this native copy. */
-        if (target) target->replay_member = 0;
+        if (target)
+        {
+            target->replay_member = 0;
+            retry_client_surface_compositor_mailbox( target );
+        }
     }
     /* A producer may have filled the ring while the read was pending. Its
      * hint was consumed then; recheck the authoritative sequence after the
