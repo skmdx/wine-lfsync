@@ -361,6 +361,10 @@ WND *get_win_ptr( HWND hwnd )
     {
         if (is_desktop_window( hwnd )) win = WND_DESKTOP;
     }
+    /* A service desktop can be server-created in this process without a WND.
+     * A missing local object alone is not proof that its handle is still valid. */
+    else if (!win && hwnd && is_desktop_window( hwnd ) && is_valid_entry( hwnd, NTUSER_OBJ_WINDOW ))
+        win = WND_DESKTOP;
     return win;
 }
 
@@ -5070,7 +5074,7 @@ static BOOL show_window( HWND hwnd, INT cmd )
         goto done;
     }
 
-    if (!(win = get_win_ptr( hwnd )) || win == WND_OTHER_PROCESS) goto done;
+    if (!(win = get_win_ptr( hwnd )) || win == WND_OTHER_PROCESS || win == WND_DESKTOP) goto done;
 
     if (win->flags & WIN_NEED_SIZE)
     {
@@ -5464,7 +5468,7 @@ LRESULT destroy_window( HWND hwnd )
 
     /* free resources associated with the window */
 
-    if (!(win = get_win_ptr( hwnd )) || win == WND_OTHER_PROCESS) return 0;
+    if (!(win = get_win_ptr( hwnd )) || win == WND_OTHER_PROCESS || win == WND_DESKTOP) return 0;
     if ((win->dwStyle & (WS_CHILD | WS_POPUP)) != WS_CHILD)
         menu = get_window_menu( hwnd );
     sys_menu = win->hSysMenu;
