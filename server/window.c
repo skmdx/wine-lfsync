@@ -5537,13 +5537,51 @@ DECL_HANDLER(set_client_surface_state)
     if (!(win = get_window( req->handle ))) return;
     top = get_toplevel_window( win );
     was_pending = top->client_surface_dirty;
-    if (req->flags & CLIENT_SURFACE_STATE_FAILED)
+    if (req->flags & (CLIENT_SURFACE_STATE_STAGED | CLIENT_SURFACE_STATE_FAILED))
     {
-        if (req->flags != CLIENT_SURFACE_STATE_FAILED || !top->thread ||
-            top->thread->process != current->process)
+        if ((req->flags != CLIENT_SURFACE_STATE_STAGED && req->flags != CLIENT_SURFACE_STATE_FAILED) ||
+            req->surface || req->producer_sequence)
+        {
+            set_error( STATUS_INVALID_PARAMETER );
+            return;
+        }
+        if (!top->thread || top->thread->process != current->process)
+        {
             set_error( STATUS_ACCESS_DENIED );
-        else fail_client_surface_publication( top );
-        return;
+            return;
+        }
+        /* The native result belongs to the scene captured before the call.
+         * PREPARING has a stable scene but no composition generation yet.
+         * A reparented owner or superseded scene must remain untouched. */
+        if (win != top || req->scene_toplevel != top->handle ||
+            !req->scene_generation || (req->scene_generation & 1) ||
+            req->scene_generation != top->client_surface_scene_generation ||
+            req->generation != client_surface_transaction_generation( top ))
+            return;
+
+        if (req->flags == CLIENT_SURFACE_STATE_FAILED)
+            fail_client_surface_publication( top );
+        else
+        {
+            /* A show transition starts a new staged episode. Retire a live
+             * replay first, preserving the deadline across staged restarts.
+             * Accepting this result legitimately advances the scene epoch. */
+            if (!top->client_surface_transaction.staged && client_surface_is_composing( top ))
+            {
+                clear_client_surface_subtree_generation( top, client_surface_transaction_generation( top ) );
+                finish_client_surface_generation( top );
+            }
+            if (client_surface_is_preparing( top )) top->client_surface_transaction.phase = CLIENT_SURFACE_PHASE_IDLE;
+            top->client_surface_transaction.prepared = 0;
+            top->client_surface_transaction.staged = top->client_surface_dirty && is_visible( top );
+            /* Producers may already have complete frames from while hidden.
+             * Restart notifies their owners to recompose those cached frames. */
+            if (top->client_surface_transaction.staged)
+                restart_client_surface_generation( top );
+            else
+                finish_client_surface_publication( top );
+        }
+        goto done;
     }
     owner = get_client_surface_owner( win, current->process,
                                       req->flags & (CLIENT_SURFACE_STATE_REGISTER |
@@ -5670,32 +5708,6 @@ DECL_HANDLER(set_client_surface_state)
         !has_client_surface( top ))
         finish_client_surface_publication( top );
     if (owner) release_client_surface_owner( owner );
-    if (req->flags & CLIENT_SURFACE_STATE_STAGED)
-    {
-        /* A show transition starts a new staged episode.  Retire a live replay
-         * first, but preserve the absolute deadline across staged restarts. */
-        if (!top->client_surface_transaction.staged && client_surface_is_composing( top ))
-        {
-            clear_client_surface_subtree_generation( top,
-                                                     client_surface_transaction_generation( top ) );
-            finish_client_surface_generation( top );
-        }
-        if (client_surface_is_preparing( top )) top->client_surface_transaction.phase = CLIENT_SURFACE_PHASE_IDLE;
-        top->client_surface_transaction.prepared = 0;
-        top->client_surface_transaction.staged = top->client_surface_dirty && is_visible( top );
-        if (top->client_surface_transaction.staged)
-            restart_client_surface_generation( top );
-        else
-            finish_client_surface_publication( top );
-        /* The host driver has now mapped the top-level window into its private
-         * staging buffer.  A client surface may already contain a complete
-         * frame presented while the hierarchy was hidden and the application
-         * is not required to present another one merely because it became
-         * visible.  Notify each owning process to recompose that cached frame
-         * into this publication generation.  Incomplete cached surfaces are
-         * rejected by the client-side completeness check and remain staged
-         * until an application present completes them. */
-    }
     if (req->flags & CLIENT_SURFACE_STATE_BYPASS)
         finish_client_surface_publication( top );
     if ((req->flags & CLIENT_SURFACE_STATE_PREPARE_BEGIN) && top->thread == current &&
@@ -5813,8 +5825,10 @@ DECL_HANDLER(set_client_surface_state)
         reply->publish = 1;
     }
 
+done:
     reply->toplevel = top->handle;
-    reply->wake = was_pending && is_visible( top ) && !top->client_surface_dirty;
+    reply->wake = req->flags != CLIENT_SURFACE_STATE_FAILED &&
+                  was_pending && is_visible( top ) && !top->client_surface_dirty;
     reply->generation = client_surface_transaction_generation( top );
     reply->scene_generation = top->client_surface_scene_generation;
     reply->pending = top->client_surface_transaction.pending;

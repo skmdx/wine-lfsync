@@ -136,6 +136,7 @@ static unsigned int set_surface_state_source( HWND hwnd, UINT64 surface, UINT fl
     status = p_wine_server_call( &info );
     if (!status && state)
     {
+        memset( state, 0, sizeof(*state) );
         state->toplevel = wine_server_ptr_handle( reply->toplevel );
         state->generation = reply->generation;
         state->scene_generation = reply->scene_generation;
@@ -161,9 +162,26 @@ static unsigned int set_surface_state_scene( HWND hwnd, UINT64 surface, UINT fla
     return set_surface_state_source( hwnd, surface, flags, generation, scene_generation, source_top, 0, state );
 }
 
+static unsigned int set_surface_result( HWND hwnd, UINT flags, const struct surface_state *expected,
+                                        struct surface_state *state )
+{
+    return set_surface_state_source( hwnd, 0, flags, expected->generation, expected->scene_generation,
+                                     expected->toplevel, 0, state );
+}
+
 static unsigned int set_surface_state( HWND hwnd, UINT64 surface, UINT flags,
                                        UINT64 generation, struct surface_state *state )
 {
+    if (flags == CLIENT_SURFACE_STATE_STAGED || flags == CLIENT_SURFACE_STATE_FAILED)
+    {
+        struct surface_state expected;
+        unsigned int status;
+
+        /* Fresh owner results share one capture. Stale-result tests instead
+         * pass their saved token directly to set_surface_result(). */
+        if ((status = set_surface_state_scene( hwnd, 0, 0, 0, 0, &expected ))) return status;
+        return set_surface_result( hwnd, flags, &expected, state );
+    }
     return set_surface_state_scene( hwnd, surface, flags, generation, 0, state );
 }
 
@@ -2651,6 +2669,40 @@ static UINT drain_scene_notifications( UINT *owner_updates, UINT *prepares )
     return drain_scene_notifications_for_surface( owner_updates, prepares, 0 );
 }
 
+static void check_scene_result_rejected( HWND hwnd, const struct surface_state *expected, UINT expected_status )
+{
+    static const UINT results[] = {CLIENT_SURFACE_STATE_STAGED, CLIENT_SURFACE_STATE_FAILED};
+    struct surface_state before, after, result;
+    struct shared_surface_state shared_before, shared_after;
+    struct scene_notification_counts counts;
+    UINT status, i, producers, updates, prepares;
+
+    status = set_surface_state( hwnd, 0, 0, 0, &before );
+    ok( !status, "result state query status %#x\n", status );
+    if (status) return;
+    counts.window = before.toplevel;
+    if (!read_shared_surface_state( before.toplevel, &shared_before )) return;
+    drain_scene_notifications( &updates, &prepares );
+    for (i = 0; i < ARRAY_SIZE(results); ++i)
+    {
+        winetest_push_context( "scene result %#x", results[i] );
+        status = set_surface_result( hwnd, results[i], expected, &result );
+        ok( status == expected_status && (status || (!result.toplevel && !result.wake)),
+            "obsolete/unauthorized result status %#x, expected %#x\n", status, expected_status );
+        status = set_surface_state( hwnd, 0, 0, 0, &after );
+        ok( !status && !memcmp( &before, &after, sizeof(before) ),
+            "rejected result changed server state, status %#x\n", status );
+        ok( read_shared_surface_state( before.toplevel, &shared_after ) &&
+            !memcmp( &shared_before, &shared_after, sizeof(shared_before) ),
+            "rejected result changed shared scene or flags\n" );
+        producers = drain_scene_notification_counts( &updates, &prepares, 0, &counts );
+        ok( !producers && !updates && !prepares && !counts.backing && !counts.prepare && !counts.publish,
+            "rejected result notified producer %u owner %u preparation %u backing %u publish %u\n",
+            producers, updates, prepares, counts.backing, counts.publish );
+        winetest_pop_context();
+    }
+}
+
 /* Create and destroy at the real server boundary. Public DestroyWindow hides
  * and unlinks first; thread/process teardown can destroy a linked visible HWND. */
 static HWND create_scene_occluder( HWND parent, HWND class_window )
@@ -3672,8 +3724,10 @@ static void test_handoff_receipts(void)
     status = complete_surface_handoffs( hwnd, state.generation, state.scene_generation, &receipt, 1, &accepted );
     ok( !status && !accepted, "publication ticket reserved twice, status %#x\n", status );
     before = state;
-    status = set_surface_state( hwnd, 0, CLIENT_SURFACE_STATE_FAILED, 0, NULL );
-    ok( !status, "failed native publication status %#x\n", status );
+    status = set_surface_result( hwnd, CLIENT_SURFACE_STATE_FAILED, &before, &state );
+    ok( !status && state.toplevel == hwnd && !state.wake,
+        "failed native publication status %#x accepted %p wake %u\n", status, state.toplevel, state.wake );
+    check_scene_result_rejected( hwnd, &before, 0 );
     status = set_surface_state_scene( hwnd, 0, CLIENT_SURFACE_STATE_PUBLISH_COMMIT,
         before.generation, before.scene_generation, &state );
     ok( !status && state.staged && state.scene_generation != before.scene_generation,
@@ -4828,6 +4882,7 @@ static void handoff_storage_exit_child( HWND hwnd, HANDLE ready, HANDLE release,
                                         BOOL completed )
 {
     struct handoff_binding binding;
+    struct surface_state state;
     struct scene_snapshot snapshot;
     struct client_surface_handoff_shared *shared;
     struct client_surface_handoff_channel *slot;
@@ -4850,6 +4905,9 @@ static void handoff_storage_exit_child( HWND hwnd, HANDLE ready, HANDLE release,
         status = request_owner_repair( hwnd, 0, NULL, 0, &accepted );
         ok( status == STATUS_ACCESS_DENIED && !accepted, "foreign producer requested owner repair, status %#x\n", status );
     }
+    status = set_surface_state( hwnd, 0, 0, 0, &state );
+    ok( !status, "foreign owner state query status %#x\n", status );
+    if (!status) check_scene_result_rejected( hwnd, &state, STATUS_ACCESS_DENIED );
     status = get_surface_handoff( hwnd, 0, identity, FALSE, &binding );
     ok( !status, "exit child producer bind status %#x\n", status );
     if (status) goto done;
@@ -5176,6 +5234,17 @@ static void test_generation_aba(void)
         wine_dbgstr_longlong( first.scene_generation ) );
     ok( second.pending == 1, "second pending count %u\n", second.pending );
 
+    check_scene_result_rejected( hwnd, &first, 0 );
+    stale = second;
+    stale.generation = 0;
+    check_scene_result_rejected( hwnd, &stale, 0 );
+    stale = second;
+    stale.toplevel = GetDesktopWindow();
+    check_scene_result_rejected( hwnd, &stale, 0 );
+    stale = second;
+    stale.scene_generation = 0;
+    check_scene_result_rejected( hwnd, &stale, 0 );
+
     status = commit_surface_state( hwnd, surface, &first, &stale );
     ok( !status, "stale commit failed, status %#x\n", status );
     ok( stale.staged && stale.generation == second.generation && stale.pending == 1,
@@ -5286,10 +5355,13 @@ static void test_publish_transaction(void)
 
 static void test_live_prepare_transaction(void)
 {
+    static const UINT results[] = {CLIENT_SURFACE_STATE_FAILED, CLIENT_SURFACE_STATE_STAGED};
     const UINT64 surface = allocate_surface();
     struct surface_state preparing, stale, current, ready;
+    struct shared_surface_state shared;
+    struct native_barrier_state barrier;
     HWND hwnd;
-    unsigned int status;
+    unsigned int status, i;
 
     hwnd = create_test_window( TRUE );
     ok( !!hwnd, "failed to create live prepare window, error %lu\n", GetLastError() );
@@ -5310,6 +5382,7 @@ static void test_live_prepare_transaction(void)
 
     SetWindowPos( hwnd, NULL, 11, 10, 0, 0,
                   SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE );
+    check_scene_result_rejected( hwnd, &preparing, 0 );
     status = set_surface_state_scene( hwnd, 0, CLIENT_SURFACE_STATE_PREPARE_COMMIT,
                                       0, preparing.scene_generation, &stale );
     ok( !status && !stale.generation && stale.scene_generation != preparing.scene_generation,
@@ -5317,6 +5390,15 @@ static void test_live_prepare_transaction(void)
         status, wine_dbgstr_longlong( stale.generation ),
         wine_dbgstr_longlong( preparing.scene_generation ),
         wine_dbgstr_longlong( stale.scene_generation ) );
+
+    status = set_native_barrier( hwnd, 0x1950, TRUE, &barrier );
+    ok( !status && (barrier.scene_generation & 1), "scene result barrier status %#x\n", status );
+    status = set_surface_state( hwnd, 0, 0, 0, &stale );
+    ok( !status, "sealed scene query status %#x\n", status );
+    check_scene_result_rejected( hwnd, &stale, 0 );
+    status = set_native_barrier( hwnd, 0x1950, FALSE, &barrier );
+    ok( !status, "scene result barrier end status %#x\n", status );
+    check_scene_result_rejected( hwnd, &preparing, 0 );
 
     status = set_surface_state( hwnd, 0, CLIENT_SURFACE_STATE_PREPARE_BEGIN, 0, &current );
     ok( !status && current.publish,
@@ -5335,6 +5417,31 @@ static void test_live_prepare_transaction(void)
     ok( !status && !ready.ready && !ready.generation,
         "live composition did not publish: status %#x ready %u generation %s\n",
         status, ready.ready, wine_dbgstr_longlong( ready.generation ) );
+
+    for (i = 0; i < ARRAY_SIZE(results); ++i)
+    {
+        /* Hide/show at the real server boundary retains the selected producer
+         * and requests a new owner checkpoint without dispatching its wake. */
+        status = set_scene_placement( hwnd, 0, 0, 0, SWP_HIDEWINDOW );
+        ok( !status, "preparing result hide status %#x\n", status );
+        status = set_scene_placement( hwnd, 0, 0, 0, SWP_SHOWWINDOW );
+        ok( !status, "preparing result show status %#x\n", status );
+        status = set_surface_state( hwnd, 0, CLIENT_SURFACE_STATE_PREPARE_BEGIN, 0, &preparing );
+        ok( !status && preparing.publish && !preparing.generation && preparing.scene_generation &&
+            !(preparing.scene_generation & 1), "result %#x missing stable PREPARING scene\n", results[i] );
+        ok( read_shared_surface_state( hwnd, &shared ) &&
+            (shared.flags & WINDOW_SHM_CLIENT_SURFACE_PREPARING), "missing shared PREPARING flag\n" );
+        status = set_surface_result( hwnd, results[i], &preparing, &current );
+        ok( !status && current.toplevel == hwnd && current.scene_generation != preparing.scene_generation,
+            "current result %#x was not accepted, status %#x\n", results[i], status );
+        if (results[i] == CLIENT_SURFACE_STATE_FAILED)
+            ok( !current.generation && !current.pending && !current.staged && !current.wake,
+                "failed preparation retained a transaction or requested a wake\n" );
+        else
+            ok( current.staged && current.pending == 1 && current.generation == current.scene_generation,
+                "successful preparation did not start the new staged scene\n" );
+        check_scene_result_rejected( hwnd, &preparing, 0 );
+    }
 
     set_surface_state( hwnd, surface, CLIENT_SURFACE_STATE_UNREGISTER, 0, NULL );
     DestroyWindow( hwnd );
@@ -5443,7 +5550,7 @@ static void test_demoted_native_barrier(void)
     const UINT64 surface = allocate_surface();
     const UINT_PTR barrier = 0x45676000;
     struct native_barrier_state sealed;
-    struct surface_state parent_before, parent_after;
+    struct surface_state parent_before, parent_after, original;
     HWND first, second;
     unsigned int status;
 
@@ -5453,6 +5560,8 @@ static void test_demoted_native_barrier(void)
     if (!first || !second) goto done;
     set_surface_state( first, surface, CLIENT_SURFACE_STATE_REGISTER, 0, NULL );
     claim_surface_state( first, surface, NULL );
+    status = set_surface_state( first, 0, 0, 0, &original );
+    ok( !status, "original owner state query status %#x\n", status );
 
     /* Native resource replacement must still seal the old owner after the
      * server hierarchy has changed, not the newly selected top-level. */
@@ -5460,6 +5569,9 @@ static void test_demoted_native_barrier(void)
     ok( !status, "server demotion failed, status %#x\n", status );
     status = set_surface_state( second, 0, 0, 0, &parent_before );
     ok( !status, "demotion parent query failed, status %#x\n", status );
+    check_scene_result_rejected( first, &original, 0 );
+    /* Even a token for the new parent does not let a descendant act as its owner. */
+    check_scene_result_rejected( first, &parent_before, 0 );
     status = set_native_barrier( first, barrier, TRUE, &sealed );
     ok( !status && (sealed.scene_generation & 1),
         "native barrier did not seal demoted target: status %#x scene %s\n",

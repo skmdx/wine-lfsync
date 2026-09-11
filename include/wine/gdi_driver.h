@@ -445,8 +445,6 @@ W32KAPI void client_surface_release_scoped_memory( struct client_surface_memory_
 W32KAPI BOOL client_surface_reserve_scoped_metadata( struct client_surface_memory_scope *scope, UINT64 bytes );
 W32KAPI void client_surface_release_scoped_metadata( struct client_surface_memory_scope *scope, UINT64 bytes );
 
-W32KAPI void client_surface_fail_scene( HWND hwnd );
-
 W32KAPI BOOL client_surface_reserve_memory( enum client_surface_memory_class type, UINT64 bytes );
 W32KAPI void client_surface_release_memory( enum client_surface_memory_class type, UINT64 bytes );
 W32KAPI BOOL client_surface_reserve_metadata_memory( UINT64 bytes );
@@ -618,6 +616,7 @@ W32KAPI void client_surface_geometry_ready( HWND hwnd );
 W32KAPI void client_surface_repair_owner( HWND hwnd );
 W32KAPI void client_surface_resolve_sources( HWND hwnd );
 W32KAPI BOOL client_surface_get_toplevel_scene( HWND toplevel, struct client_surface_scene *scene );
+W32KAPI BOOL client_surface_capture_scene_state( HWND toplevel, struct client_surface_scene *scene );
 struct client_surface_scene_member
 {
     HWND hwnd;
@@ -634,7 +633,8 @@ W32KAPI BOOL client_surface_get_scene_snapshot( HWND toplevel, const struct clie
                                                 struct client_surface_scene_member **members );
 W32KAPI BOOL client_surface_scene_snapshot_current( HWND toplevel, UINT64 scene_id );
 W32KAPI void client_surface_free_scene_snapshot( UINT count, struct client_surface_scene_member *members );
-W32KAPI void client_surface_set_staged( HWND hwnd );
+W32KAPI BOOL client_surface_set_staged( const struct client_surface_scene *scene );
+W32KAPI void client_surface_fail_scene( const struct client_surface_scene *scene );
 W32KAPI void client_surface_bypass_staging( HWND hwnd );
 W32KAPI BOOL client_surface_begin_native_barrier( HWND hwnd, UINT_PTR token );
 W32KAPI BOOL client_surface_end_native_barrier( HWND hwnd, UINT_PTR token );

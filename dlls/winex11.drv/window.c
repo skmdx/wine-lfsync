@@ -3600,9 +3600,10 @@ NTSTATUS X11DRV_UpdateClientSurfaceBacking( HWND hwnd, BOOL enable, BOOL prepare
     {
         /* This keeps the exact native geometry/identity checks, failed
          * renewal checkpoint fallback and server preparation handshake. */
+        client_surface_capture_scene_state( hwnd, &scene );
         if (!X11DRV_client_surface_prepare_owner( data ))
         {
-            client_surface_fail_scene( hwnd );
+            client_surface_fail_scene( &scene );
             status = STATUS_UNSUCCESSFUL;
         }
     }
@@ -3624,6 +3625,7 @@ BOOL X11DRV_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_hint, UIN
 {
     struct x11drv_win_data *data;
     UINT ex_style = NtUserGetWindowLongW( hwnd, GWL_EXSTYLE ), new_style = NtUserGetWindowLongW( hwnd, GWL_STYLE );
+    struct client_surface_scene scene;
     struct window_rects old_rects;
     BOOL is_managed, was_fullscreen, client_surface_pending = FALSE, size_changed;
     BOOL win32_visible = !!(new_style & WS_VISIBLE);
@@ -3776,16 +3778,22 @@ BOOL X11DRV_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_hint, UIN
     }
 
     window_set_wm_state( data, get_desired_wm_state( new_style, new_rects ), activate );
-    if (prepare_client_surface && !(ret = X11DRV_client_surface_prepare_owner( data )))
-        client_surface_fail_scene( hwnd );
+    if (prepare_client_surface)
+    {
+        client_surface_capture_scene_state( hwnd, &scene );
+        if (!(ret = X11DRV_client_surface_prepare_owner( data ))) client_surface_fail_scene( &scene );
+    }
     if (publish_client_surface)
     {
+        BOOL published;
+
         /* The server keeps the live or staged token active until this X
          * request has completed.  This is the native linearization point for
          * publication. */
-        BOOL published = X11DRV_client_surface_backing_publish( data );
+        client_surface_capture_scene_state( hwnd, &scene );
+        published = X11DRV_client_surface_backing_publish( data );
 
-        if (!published) client_surface_fail_scene( hwnd );
+        if (!published) client_surface_fail_scene( &scene );
         if (published && (data->client_surface_redirected || data->client_surface_opacity_staged))
             finish_client_surface_staging( data );
         X11DRV_sync_window_changes( data->display );
@@ -3794,18 +3802,21 @@ BOOL X11DRV_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_hint, UIN
     {
         /* The redirect and map must reach the X server before another process
          * is allowed to commit into this publication generation. */
+        client_surface_capture_scene_state( hwnd, &scene );
         X11DRV_sync_window_changes( data->display );
         if (X11DRV_client_surface_backing_snapshot( data, TRUE ))
         {
-            client_surface_set_staged( hwnd );
-            data->client_surface_staged = TRUE;
-            /* STAGED publishes the new scene epoch. Install it on the owner
-             * connection before consuming cached producer frames. */
-            X11DRV_client_surface_backing_ensure( data );
+            if (client_surface_set_staged( &scene ))
+            {
+                data->client_surface_staged = TRUE;
+                /* STAGED publishes the new scene epoch. Install it on the owner
+                 * connection before consuming cached producer frames. */
+                X11DRV_client_surface_backing_ensure( data );
+            }
         }
         else
         {
-            client_surface_fail_scene( hwnd );
+            client_surface_fail_scene( &scene );
         }
     }
     else if (win32_visible && !client_surface_pending &&

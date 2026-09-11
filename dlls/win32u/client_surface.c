@@ -713,6 +713,17 @@ BOOL client_surface_get_toplevel_scene( HWND toplevel, struct client_surface_sce
     return read_client_surface_scene( toplevel, scene, NULL, NULL ) && scene->valid;
 }
 
+BOOL client_surface_capture_scene_state( HWND toplevel, struct client_surface_scene *scene )
+{
+    /* PREPARING blocks producer publication, but its even scene and zero
+     * composition generation still identify the owner's native operation. */
+    if (read_client_surface_scene( toplevel, scene, NULL, NULL ) && scene->epoch &&
+        !(scene->epoch & 1) && (!scene->generation || scene->generation == scene->epoch))
+        return TRUE;
+    memset( scene, 0, sizeof(*scene) );
+    return FALSE;
+}
+
 BOOL client_surface_scene_snapshot_current( HWND toplevel, UINT64 scene_id )
 {
     struct client_surface_scene current;
@@ -1454,14 +1465,34 @@ void client_surface_resolve_sources( HWND hwnd )
     SERVER_END_REQ;
 }
 
-void client_surface_set_staged( HWND hwnd )
+static BOOL client_surface_set_scene_result( const struct client_surface_scene *scene, UINT flags )
 {
-    HWND toplevel;
-    BOOL wake;
+    BOOL accepted = FALSE, staged = FALSE;
 
-    TRACE( "client surface composition for %p is staged\n", hwnd );
-    toplevel = client_surface_set_server_state( hwnd, NULL, CLIENT_SURFACE_STATE_STAGED, 0, 0, &wake );
-    if (wake && toplevel) NtUserPostMessage( toplevel, WM_WINE_UPDATEWINDOWSTATE, 0, 0 );
+    if (!scene->toplevel || !scene->epoch) return FALSE;
+    SERVER_START_REQ( set_client_surface_state )
+    {
+        req->handle = req->scene_toplevel = wine_server_user_handle( scene->toplevel );
+        req->flags = flags;
+        req->generation = scene->generation;
+        req->scene_generation = scene->epoch;
+        if (!wine_server_call( req ) && reply->toplevel == wine_server_user_handle( scene->toplevel ))
+        {
+            accepted = TRUE;
+            staged = reply->staged;
+            if (reply->wake) NtUserPostMessage( scene->toplevel, WM_WINE_UPDATEWINDOWSTATE, 0, 0 );
+        }
+    }
+    SERVER_END_REQ;
+    TRACE( "client surface result %#x for %p generation %s scene %s accepted %u staged %u\n", flags,
+           scene->toplevel, wine_dbgstr_longlong( scene->generation ),
+           wine_dbgstr_longlong( scene->epoch ), accepted, staged );
+    return accepted && (flags != CLIENT_SURFACE_STATE_STAGED || staged);
+}
+
+BOOL client_surface_set_staged( const struct client_surface_scene *scene )
+{
+    return client_surface_set_scene_result( scene, CLIENT_SURFACE_STATE_STAGED );
 }
 
 void client_surface_bypass_staging( HWND hwnd )
@@ -1469,9 +1500,9 @@ void client_surface_bypass_staging( HWND hwnd )
     client_surface_set_server_state( hwnd, NULL, CLIENT_SURFACE_STATE_BYPASS, 0, 0, NULL );
 }
 
-void client_surface_fail_scene( HWND hwnd )
+void client_surface_fail_scene( const struct client_surface_scene *scene )
 {
-    client_surface_set_server_state( hwnd, NULL, CLIENT_SURFACE_STATE_FAILED, 0, 0, NULL );
+    client_surface_set_scene_result( scene, CLIENT_SURFACE_STATE_FAILED );
 }
 
 BOOL client_surface_begin_native_barrier( HWND hwnd, UINT_PTR token )
