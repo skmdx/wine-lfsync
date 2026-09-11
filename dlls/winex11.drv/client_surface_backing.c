@@ -5443,8 +5443,8 @@ struct client_surface_owner_notifications *X11DRV_client_surface_backing_begin_u
 
     /* Plain state notifications can be coalesced and reapplied from current
      * server state, including backing and preparation. A deferred prepare
-     * returns FALSE to win32u, which must not acknowledge it before replay.
-     * A new backing activation retains its synchronous native publication
+     * returns STATUS_PENDING to win32u, which must not acknowledge it before
+     * replay. A new backing activation retains its synchronous native publication
      * boundary. Repeated enables can coalesce with a pending disable while
      * the native backing is still enabled. */
     if (deferred && !job.u.update.invalidate_scene && !activation &&

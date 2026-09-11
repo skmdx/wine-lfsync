@@ -431,8 +431,8 @@ BOOL WAYLAND_WindowPosChanging(HWND hwnd, UINT swp_flags, BOOL shaped, const str
 /***********************************************************************
  *           WAYLAND_WindowPosChanged
  */
-BOOL WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UINT swp_flags,
-                              const struct window_rects *new_rects, struct window_surface *surface)
+NTSTATUS WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UINT swp_flags,
+                                  const struct window_rects *new_rects, struct window_surface *surface)
 {
     HWND owner = NtUserGetAncestor(hwnd, GA_ROOT);
     struct wayland_surface *owner_surface;
@@ -446,7 +446,7 @@ BOOL WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
      * acquire the lock itself internally. */
     if (!(managed = is_window_managed(hwnd, swp_flags, fullscreen)) && surface) owner = owner_hint;
 
-    if (!(data = wayland_win_data_get(hwnd))) return TRUE;
+    if (!(data = wayland_win_data_get(hwnd))) return STATUS_SUCCESS;
     owner_data = owner && owner != hwnd ? wayland_win_data_get(owner) : NULL;
     owner_surface = owner_data ? owner_data->wayland_surface : NULL;
 
@@ -470,7 +470,7 @@ BOOL WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UIN
 
     if (owner_data) wayland_win_data_release(owner_data);
     wayland_win_data_release(data);
-    return TRUE;
+    return STATUS_SUCCESS;
 }
 
 static void wayland_configure_window(HWND hwnd)

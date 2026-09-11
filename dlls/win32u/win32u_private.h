@@ -329,7 +329,7 @@ extern BOOL set_window_pos( WINDOWPOS *winpos, int parent_x, int parent_y );
 extern UINT set_window_style_bits( HWND hwnd, UINT set_bits, UINT clear_bits );
 extern void update_window_state( HWND hwnd );
 extern BOOL publish_window_state( HWND hwnd );
-extern BOOL prepare_window_client_surfaces( HWND hwnd );
+extern NTSTATUS prepare_window_client_surfaces( HWND hwnd );
 extern void client_surface_prepare_scene( struct client_surface *surface );
 extern void update_window_client_surface_backing( HWND hwnd );
 extern void detach_client_surface_identity( UINT64 identity );

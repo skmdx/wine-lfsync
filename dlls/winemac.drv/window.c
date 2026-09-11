@@ -1514,8 +1514,8 @@ BOOL macdrv_GetWindowStyleMasks(HWND hwnd, UINT style, UINT ex_style, UINT *styl
 /***********************************************************************
  *              WindowPosChanged   (MACDRV.@)
  */
-BOOL macdrv_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UINT swp_flags,
-                             const struct window_rects *new_rects, struct window_surface *surface)
+NTSTATUS macdrv_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UINT swp_flags,
+                                 const struct window_rects *new_rects, struct window_surface *surface)
 {
     BOOL fullscreen = swp_flags & WINE_SWP_FULLSCREEN;
     struct macdrv_thread_data *thread_data;
@@ -1523,7 +1523,7 @@ BOOL macdrv_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UINT
     unsigned int new_style = NtUserGetWindowLongW(hwnd, GWL_STYLE);
     struct window_rects old_rects;
 
-    if (!(data = get_win_data(hwnd))) return TRUE;
+    if (!(data = get_win_data(hwnd))) return STATUS_SUCCESS;
 
     thread_data = macdrv_thread_data();
 
@@ -1575,7 +1575,7 @@ BOOL macdrv_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UINT
 
 done:
     release_win_data(data);
-    return TRUE;
+    return STATUS_SUCCESS;
 }
 
 

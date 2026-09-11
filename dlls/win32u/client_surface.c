@@ -429,10 +429,16 @@ void client_surface_prepare_scene( struct client_surface *surface )
 
     if (toplevel && is_current_thread_window( toplevel ))
     {
-        if (client_surface_begin_prepare( toplevel, &generation ) &&
-            prepare_window_client_surfaces( toplevel ))
-            client_surface_end_prepare( toplevel, generation );
-        update_window_state( toplevel );
+        NTSTATUS status = STATUS_SUCCESS;
+
+        if (client_surface_begin_prepare( toplevel, &generation ))
+        {
+            status = prepare_window_client_surfaces( toplevel );
+            if (status == STATUS_SUCCESS) client_surface_end_prepare( toplevel, generation );
+        }
+        /* Keep the deferred native update on its owned replay path instead
+         * of submitting the same owner again here. */
+        if (status != STATUS_PENDING) update_window_state( toplevel );
     }
     else if (wake && toplevel)
         NtUserPostMessage( toplevel, WM_WINE_UPDATEWINDOWSTATE, 0, 0 );

@@ -2122,7 +2122,7 @@ static BOOL is_fullscreen( const MONITORINFO *info, const RECT *rect )
  * Backend implementation of SetWindowPos.
  */
 static BOOL apply_window_pos( HWND hwnd, HWND insert_after, UINT swp_flags, struct window_surface *new_surface,
-                              const struct window_rects *new_rects, const RECT *valid_rects )
+                              const struct window_rects *new_rects, const RECT *valid_rects, NTSTATUS *native_status )
 {
     struct window_rects monitor_rects;
     WND *win;
@@ -2137,7 +2137,9 @@ static BOOL apply_window_pos( HWND hwnd, HWND insert_after, UINT swp_flags, stru
     struct window_surface *old_surface;
     HICON icon, icon_small;
     ICONINFO ii, ii_small;
+    NTSTATUS status;
 
+    if (native_status) *native_status = STATUS_UNSUCCESSFUL;
     toplevel = NtUserGetAncestor( hwnd, GA_ROOT );
     is_layered = new_surface && new_surface->alpha_mask;
     is_child = toplevel && toplevel != hwnd;
@@ -2323,13 +2325,16 @@ static BOOL apply_window_pos( HWND hwnd, HWND insert_after, UINT swp_flags, stru
             scene.mode == CLIENT_SURFACE_PRESENTATION_DIRECT)
             swp_flags &= ~SWP_FRAMECHANGED;
 
-        if (!user_driver->pWindowPosChanged( hwnd, insert_after, owner_hint, swp_flags, &monitor_rects,
-                                             get_driver_window_surface( new_surface, raw_dpi ) ))
+        status = user_driver->pWindowPosChanged( hwnd, insert_after, owner_hint, swp_flags, &monitor_rects,
+                                                get_driver_window_surface( new_surface, raw_dpi ) );
+        TRACE( "win %p flags %#x native update status %#lx\n", hwnd, swp_flags, (unsigned long)status );
+        if (native_status) *native_status = status;
+        if (status != STATUS_SUCCESS)
         {
-            /* State notifications may wait for native work asynchronously.
-             * Win32 state is already committed, but a prepare/publication
-             * handshake must not acknowledge a native change still pending. */
-            return !(swp_flags & (WINE_SWP_CLIENT_SURFACE_PREPARE | WINE_SWP_CLIENT_SURFACE_PUBLISH));
+            /* Win32 geometry is already committed. Owner handshakes retain
+             * the native result; producer surfaces may only be refreshed
+             * after the native update completes. */
+            return TRUE;
         }
         /* Win32 geometry precedes the native resize. Repair the completed
          * host extent from owner images when possible; cold or legacy sources
@@ -2599,7 +2604,7 @@ BOOL WINAPI NtUserUpdateLayeredWindow( HWND hwnd, HDC hdc_dst, const POINT *pts_
     TRACE( "window %p new_rects %s\n", hwnd, debugstr_window_rects( &new_rects ) );
 
     surface = get_window_surface( hwnd, swp_flags, TRUE, &new_rects, &surface_rect );
-    apply_window_pos( hwnd, 0, swp_flags, surface, &new_rects, NULL );
+    apply_window_pos( hwnd, 0, swp_flags, surface, &new_rects, NULL, NULL );
     if (!surface) return FALSE;
 
     if (!hdc_src || surface == &dummy_surface || NtUserWindowFromDC( hdc_src ) == hwnd)
@@ -4012,7 +4017,7 @@ BOOL set_window_pos( WINDOWPOS *winpos, int parent_x, int parent_y )
 
     surface = get_window_surface( winpos->hwnd, winpos->flags, FALSE, &new_rects, &surface_rect );
     if (!apply_window_pos( winpos->hwnd, winpos->hwndInsertAfter, winpos->flags, surface,
-                           &new_rects, valid_rects ))
+                           &new_rects, valid_rects, NULL ))
     {
         if (surface) window_surface_release( surface );
         goto done;
@@ -4787,7 +4792,7 @@ UINT WINAPI NtUserArrangeIconicWindows( HWND parent )
  *
  * Trigger an update of the window's driver state and surface.
  */
-static BOOL update_window_state_flags( HWND hwnd, UINT driver_flags )
+static NTSTATUS update_window_state_flags( HWND hwnd, UINT driver_flags )
 {
     const UINT swp_flags = SWP_NOSIZE | SWP_NOMOVE | SWP_NOCLIENTSIZE | SWP_NOCLIENTMOVE |
                            SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOREDRAW | driver_flags;
@@ -4796,12 +4801,13 @@ static BOOL update_window_state_flags( HWND hwnd, UINT driver_flags )
     struct window_surface *surface;
     struct client_surface_scene scene;
     struct window_rects new_rects;
-    BOOL ret, preserve_bits = TRUE;
+    BOOL preserve_bits = TRUE;
+    NTSTATUS status;
 
     if (!is_current_thread_window( hwnd ))
     {
         if (!driver_flags) NtUserPostMessage( hwnd, WM_WINE_UPDATEWINDOWSTATE, 0, 0 );
-        return FALSE;
+        return STATUS_UNSUCCESSFUL;
     }
 
     context = set_thread_dpi_awareness_context( get_window_dpi_awareness_context( hwnd ));
@@ -4814,11 +4820,11 @@ static BOOL update_window_state_flags( HWND hwnd, UINT driver_flags )
      * into the newly attached native client window would erase that frame. */
     if (!surface && client_surface_get_toplevel_scene( hwnd, &scene ) &&
         scene.mode == CLIENT_SURFACE_PRESENTATION_DIRECT) preserve_bits = FALSE;
-    ret = apply_window_pos( hwnd, 0, swp_flags, surface, &new_rects, preserve_bits ? valid_rects : NULL );
+    apply_window_pos( hwnd, 0, swp_flags, surface, &new_rects, preserve_bits ? valid_rects : NULL, &status );
     if (surface) window_surface_release( surface );
 
     set_thread_dpi_awareness_context( context );
-    return ret;
+    return status;
 }
 
 void update_window_state( HWND hwnd )
@@ -4828,10 +4834,10 @@ void update_window_state( HWND hwnd )
 
 BOOL publish_window_state( HWND hwnd )
 {
-    return update_window_state_flags( hwnd, WINE_SWP_CLIENT_SURFACE_PUBLISH );
+    return update_window_state_flags( hwnd, WINE_SWP_CLIENT_SURFACE_PUBLISH ) == STATUS_SUCCESS;
 }
 
-BOOL prepare_window_client_surfaces( HWND hwnd )
+NTSTATUS prepare_window_client_surfaces( HWND hwnd )
 {
     return update_window_state_flags( hwnd, WINE_SWP_CLIENT_SURFACE_PREPARE );
 }
@@ -4874,7 +4880,7 @@ static NTSTATUS update_client_surface_backing_state( HWND hwnd, BOOL enable, BOO
         rects = map_window_rects_virt_to_raw( rects, get_thread_dpi() );
         status = user_driver->pUpdateClientSurfaceBacking( hwnd, enable, prepare, &rects );
     }
-    if (!status) update_client_surfaces( hwnd );
+    if (status == STATUS_SUCCESS) update_client_surfaces( hwnd );
     set_thread_dpi_awareness_context( context );
     return status;
 }
@@ -4903,8 +4909,8 @@ void update_window_client_surface_backing( HWND hwnd )
     if (prepare) driver_flags |= WINE_SWP_CLIENT_SURFACE_PREPARE;
     status = update_client_surface_backing_state( hwnd, enable, prepare );
     if (status == STATUS_NOT_SUPPORTED)
-        status = update_window_state_flags( hwnd, driver_flags ) ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
-    if (!status && prepare) client_surface_end_prepare( hwnd, scene_generation );
+        status = update_window_state_flags( hwnd, driver_flags );
+    if (status == STATUS_SUCCESS && prepare) client_surface_end_prepare( hwnd, scene_generation );
 }
 
 /***********************************************************************
@@ -6032,7 +6038,7 @@ HWND WINAPI NtUserCreateWindowEx( DWORD ex_style, UNICODE_STRING *class_name,
     new_rects.client = new_rects.window;
 
     surface = get_window_surface( hwnd, SWP_NOZORDER | SWP_NOACTIVATE, FALSE, &new_rects, &surface_rect );
-    if (!apply_window_pos( hwnd, 0, SWP_NOZORDER | SWP_NOACTIVATE, surface, &new_rects, NULL ))
+    if (!apply_window_pos( hwnd, 0, SWP_NOZORDER | SWP_NOACTIVATE, surface, &new_rects, NULL, NULL ))
     {
         if (surface) window_surface_release( surface );
         goto failed;
@@ -6071,7 +6077,7 @@ HWND WINAPI NtUserCreateWindowEx( DWORD ex_style, UNICODE_STRING *class_name,
         map_window_points( 0, parent, (POINT *)&new_rects.client, 2, win_dpi );
 
         surface = get_window_surface( hwnd, SWP_NOACTIVATE, FALSE, &new_rects, &surface_rect );
-        apply_window_pos( hwnd, insert_after, SWP_NOACTIVATE, surface, &new_rects, NULL );
+        apply_window_pos( hwnd, insert_after, SWP_NOACTIVATE, surface, &new_rects, NULL, NULL );
         if (surface) window_surface_release( surface );
     }
     else goto failed;

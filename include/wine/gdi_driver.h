@@ -220,7 +220,7 @@ struct gdi_dc_funcs
 };
 
 /* increment this when changing driver tables or shared driver-facing structures */
-#define WINE_GDI_DRIVER_VERSION 148
+#define WINE_GDI_DRIVER_VERSION 149
 
 #define GDI_PRIORITY_NULL_DRV        0  /* null driver */
 #define GDI_PRIORITY_FONT_DRV      100  /* any font driver */
@@ -800,11 +800,13 @@ struct user_driver_funcs
     BOOL    (*pRepairClientSurfaceOwner)(HWND,BOOL);
     /* Release staging after the actor completed this exact native scene. */
     BOOL    (*pExposeClientSurface)(HWND,UINT64);
-    /* State-only backing update; STATUS_NOT_SUPPORTED requests a full window update. */
+    /* Native updates complete only on STATUS_SUCCESS. STATUS_PENDING retains
+     * the driver's deferred continuation; errors must not acknowledge it.
+     * STATUS_NOT_SUPPORTED requests a full window update for backing changes. */
     NTSTATUS (*pUpdateClientSurfaceBacking)(HWND,BOOL,BOOL,const struct window_rects *);
     BOOL    (*pCreateWindowSurface)(HWND,BOOL,const RECT *,struct window_surface**);
     void    (*pMoveWindowBits)(HWND,const struct window_rects *,const struct window_rects *,const RECT *);
-    BOOL    (*pWindowPosChanged)(HWND,HWND,HWND,UINT,const struct window_rects*,struct window_surface*);
+    NTSTATUS (*pWindowPosChanged)(HWND,HWND,HWND,UINT,const struct window_rects*,struct window_surface*);
     /* system parameters */
     BOOL    (*pSystemParametersInfo)(UINT,UINT,void*,UINT);
     /* wintab support */

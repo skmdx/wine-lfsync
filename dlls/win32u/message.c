@@ -2291,7 +2291,7 @@ static LRESULT handle_internal_message( HWND hwnd, UINT msg, WPARAM wparam, LPAR
             UINT64 scene_generation;
 
             if (client_surface_begin_prepare( hwnd, &scene_generation ) &&
-                prepare_window_client_surfaces( hwnd ))
+                prepare_window_client_surfaces( hwnd ) == STATUS_SUCCESS)
                 client_surface_end_prepare( hwnd, scene_generation );
         }
         else if (wparam == WINE_UPDATE_CLIENT_SURFACE_HANDOFFS)

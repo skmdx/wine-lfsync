@@ -3620,8 +3620,8 @@ done:
 /***********************************************************************
  *		WindowPosChanged   (X11DRV.@)
  */
-BOOL X11DRV_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_hint, UINT swp_flags,
-                              const struct window_rects *new_rects, struct window_surface *surface )
+NTSTATUS X11DRV_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_hint, UINT swp_flags,
+                                  const struct window_rects *new_rects, struct window_surface *surface )
 {
     struct x11drv_win_data *data;
     UINT ex_style = NtUserGetWindowLongW( hwnd, GWL_EXSTYLE ), new_style = NtUserGetWindowLongW( hwnd, GWL_STYLE );
@@ -3635,7 +3635,8 @@ BOOL X11DRV_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_hint, UIN
     BOOL enable_client_surface_backing = !!(swp_flags & WINE_SWP_CLIENT_SURFACE_BACKING_ENABLE);
     BOOL disable_client_surface_backing = !!(swp_flags & WINE_SWP_CLIENT_SURFACE_BACKING_DISABLE);
     struct client_surface_owner_notifications *owner_update;
-    BOOL deferred, ret = TRUE;
+    BOOL deferred;
+    NTSTATUS status = STATUS_SUCCESS;
 
     if ((is_managed = is_window_managed( hwnd, swp_flags, fullscreen ))) make_owner_managed( hwnd );
 
@@ -3653,7 +3654,7 @@ BOOL X11DRV_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_hint, UIN
         {
             /* Selection/retirement may race the snapshot, and allocation can
              * fail. Neither failure may skip the native hide: an ordinary
-             * WindowPosChanged FALSE has no deferred continuation in win32u.
+             * WindowPosChanged error has no deferred continuation in win32u.
              * Leave one normal owner refresh, without reposting when that
              * refresh itself fails. Unread images stay owned by the channel;
              * target writers can cancel an outstanding source-capacity wait. */
@@ -3663,11 +3664,13 @@ BOOL X11DRV_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_hint, UIN
         }
     }
     owner_update = X11DRV_client_surface_backing_begin_update( hwnd, new_rects, swp_flags, &deferred );
-    if (deferred) return FALSE;
+    /* This exact target owns the deferred state reasons and its GUI wake.
+     * No native preparation or STAGED result has run yet. */
+    if (deferred) return STATUS_PENDING;
     if (!(data = get_win_data( hwnd )))
     {
         if (owner_update) X11DRV_client_surface_backing_end_update( NULL, owner_update );
-        return TRUE;
+        return STATUS_SUCCESS;
     }
     if (is_managed) window_set_managed( data, TRUE );
 
@@ -3721,7 +3724,7 @@ BOOL X11DRV_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_hint, UIN
             client_surface_bypass_staging( hwnd );
         if (owner_update) X11DRV_client_surface_backing_end_update( data, owner_update );
         release_win_data( data );
-        return TRUE;
+        return STATUS_SUCCESS;
     }
 
     /* don't change position if we are about to minimize or maximize a managed window */
@@ -3771,7 +3774,7 @@ BOOL X11DRV_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_hint, UIN
             if (!prepare_client_surface)
             {
                 if (data->client_surface_backing) X11DRV_client_surface_backing_ensure( data );
-                else X11DRV_client_surface_backing_snapshot( data, FALSE );
+                else if (!X11DRV_client_surface_backing_snapshot( data, FALSE )) status = STATUS_UNSUCCESSFUL;
             }
         }
         else if (!X11DRV_client_surface_backing_retire( data )) destroy_client_surface_backing( data );
@@ -3781,7 +3784,11 @@ BOOL X11DRV_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_hint, UIN
     if (prepare_client_surface)
     {
         client_surface_capture_scene_state( hwnd, &scene );
-        if (!(ret = X11DRV_client_surface_prepare_owner( data ))) client_surface_fail_scene( &scene );
+        if (!X11DRV_client_surface_prepare_owner( data ))
+        {
+            client_surface_fail_scene( &scene );
+            status = STATUS_UNSUCCESSFUL;
+        }
     }
     if (publish_client_surface)
     {
@@ -3793,12 +3800,16 @@ BOOL X11DRV_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_hint, UIN
         client_surface_capture_scene_state( hwnd, &scene );
         published = X11DRV_client_surface_backing_publish( data );
 
-        if (!published) client_surface_fail_scene( &scene );
+        if (!published)
+        {
+            client_surface_fail_scene( &scene );
+            status = STATUS_UNSUCCESSFUL;
+        }
         if (published && (data->client_surface_redirected || data->client_surface_opacity_staged))
             finish_client_surface_staging( data );
         X11DRV_sync_window_changes( data->display );
     }
-    else if (client_surface_pending && !data->client_surface_staged)
+    else if (status == STATUS_SUCCESS && client_surface_pending && !data->client_surface_staged)
     {
         /* The redirect and map must reach the X server before another process
          * is allowed to commit into this publication generation. */
@@ -3817,6 +3828,7 @@ BOOL X11DRV_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_hint, UIN
         else
         {
             client_surface_fail_scene( &scene );
+            status = STATUS_UNSUCCESSFUL;
         }
     }
     else if (win32_visible && !client_surface_pending &&
@@ -3845,7 +3857,7 @@ BOOL X11DRV_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_hint, UIN
     release_win_data( data );
 
     if (was_fullscreen) NtUserClipCursor( NULL );
-    return ret;
+    return status;
 }
 
 /* check if the window icon should be hidden (i.e. moved off-screen) */
