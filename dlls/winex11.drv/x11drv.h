@@ -49,6 +49,9 @@ typedef int Status;
 #define INT64 X_INT64
 #include <X11/Xmd.h>
 #include <X11/Xproto.h>
+#ifdef HAVE_X11_EXTENSIONS_XINPUT2_H
+#include <X11/extensions/XI2proto.h>
+#endif
 #ifdef HAVE_X11_EXTENSIONS_XF86VMODE_H
 #include <X11/extensions/xf86vmode.h>
 #endif
@@ -424,6 +427,7 @@ struct display_state
 };
 
 struct x11drv_display_owner;
+struct x11drv_native_window;
 extern struct x11drv_display_owner *x11drv_display_owner_acquire( struct x11drv_display_owner *owner );
 extern void x11drv_display_owner_release( struct x11drv_display_owner *owner );
 extern void x11drv_display_owner_set_clipboard( struct x11drv_display_owner *owner );
@@ -708,6 +712,7 @@ struct x11drv_win_data
 {
     Display    *display;        /* display connection for the thread owning the window */
     struct x11drv_display_owner *display_owner; /* retained creator, independent of GUI thread data */
+    struct x11drv_native_window *native_window; /* current native creation, retained by drawable users */
     XVisualInfo vis;            /* X visual used by this window */
     Colormap    whole_colormap; /* colormap if non-default visual */
     HWND        hwnd;           /* hwnd that this private data belongs to */
@@ -770,6 +775,16 @@ extern struct x11drv_win_data *get_win_data( HWND hwnd );
 extern void release_win_data( struct x11drv_win_data *data );
 extern void set_window_parent( struct x11drv_win_data *data, Window parent );
 extern Window X11DRV_get_whole_window( HWND hwnd );
+extern struct x11drv_native_window *x11drv_native_window_alloc( Display *display,
+    struct x11drv_display_owner *creator, HWND hwnd, BOOL desktop );
+extern Window x11drv_native_window_parent( struct x11drv_native_window *window );
+extern void x11drv_native_window_publish( struct x11drv_native_window *window, Window xid, Colormap colormap );
+extern struct x11drv_native_window *x11drv_native_window_acquire( struct x11drv_native_window *window );
+extern void x11drv_native_window_release( struct x11drv_native_window *window );
+extern void x11drv_native_window_retire( struct x11drv_native_window *window, BOOL destroyed );
+extern void x11drv_native_window_set_root( Window window );
+extern struct x11drv_native_window *x11drv_native_window_take_desktop( Window window, Display *display );
+extern void x11drv_native_window_thread_detach( Display *display );
 extern void X11DRV_client_surface_backing_destroy( struct x11drv_win_data *data );
 extern BOOL X11DRV_client_surface_backing_retire( struct x11drv_win_data *data );
 extern BOOL X11DRV_client_surface_prepare_direct( struct client_surface *surface,
@@ -825,7 +840,7 @@ extern Window create_client_window( HWND hwnd, RECT client_rect, const XVisualIn
 extern void detach_client_window( struct x11drv_win_data *data, Window client_window );
 extern void attach_client_window( struct x11drv_win_data *data, Window client_window );
 extern void destroy_client_window( HWND hwnd, Window client_window );
-extern void set_window_visual( struct x11drv_win_data *data, const XVisualInfo *vis, BOOL use_alpha );
+extern BOOL set_window_visual( struct x11drv_win_data *data, const XVisualInfo *vis, BOOL use_alpha );
 extern void change_systray_owner( Display *display, Window systray_window );
 extern BOOL update_clipboard( HWND hwnd );
 extern void init_win_context(void);
@@ -867,6 +882,10 @@ struct x11drv_error_handler
 };
 extern void X11DRV_register_error_handler( struct x11drv_error_handler *handler );
 extern void X11DRV_unregister_error_handler( struct x11drv_error_handler *handler );
+extern void x11drv_display_owner_register_error_handler( struct x11drv_display_owner *owner,
+                                                        struct x11drv_error_handler *handler );
+extern void x11drv_display_owner_unregister_error_handler( struct x11drv_display_owner *owner,
+                                                          struct x11drv_error_handler *handler );
 extern void X11DRV_expect_error( Display *display, x11drv_error_callback callback, void *arg );
 extern int X11DRV_check_error(void);
 extern POINT virtual_screen_to_root( INT x, INT y );

@@ -54,7 +54,7 @@ BOOL is_virtual_desktop(void)
 void X11DRV_init_desktop( Window win )
 {
     host_primary_rect = get_host_primary_monitor_rect();
-    root_window = win;
+    x11drv_native_window_set_root( win );
     managed_mode = FALSE;  /* no managed windows in desktop mode */
 }
 
@@ -68,8 +68,14 @@ BOOL X11DRV_CreateDesktop( const WCHAR *name, UINT width, UINT height )
     XSetWindowAttributes win_attr;
     Window win;
     Display *display = thread_init_display();
+    struct x11drv_native_window *native_window;
+    Window parent;
 
     TRACE( "%s %ux%u\n", debugstr_w(name), width, height );
+
+    if (!(native_window = x11drv_native_window_alloc( display, x11drv_thread_data()->display_owner,
+                                                      0, TRUE ))) return FALSE;
+    parent = x11drv_native_window_parent( native_window );
 
     /* Create window */
     win_attr.event_mask = ExposureMask | KeyPressMask | KeyReleaseMask | EnterWindowMask |
@@ -78,15 +84,22 @@ BOOL X11DRV_CreateDesktop( const WCHAR *name, UINT width, UINT height )
     win_attr.cursor = XCreateFontCursor( display, XC_top_left_arrow );
 
     if (default_visual.visual != DefaultVisual( display, DefaultScreen(display) ))
-        win_attr.colormap = XCreateColormap( display, DefaultRootWindow(display),
+        win_attr.colormap = XCreateColormap( display, parent,
                                              default_visual.visual, AllocNone );
     else
         win_attr.colormap = None;
 
-    win = XCreateWindow( display, DefaultRootWindow(display),
+    win = XCreateWindow( display, parent,
                          0, 0, width, height, 0, default_visual.depth, InputOutput,
                          default_visual.visual, CWEventMask | CWCursor | CWColormap, &win_attr );
-    if (!win) return FALSE;
+    /* The Window retains the cursor after its client resource is released. */
+    if (win_attr.cursor) XFreeCursor( display, win_attr.cursor );
+    x11drv_native_window_publish( native_window, win, win_attr.colormap );
+    if (!win)
+    {
+        x11drv_native_window_retire( native_window, FALSE );
+        return FALSE;
+    }
 
     x11drv_xinput2_enable( display, win );
     XFlush( display );
