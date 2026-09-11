@@ -472,6 +472,9 @@ struct x11drv_thread_data
 
 extern struct x11drv_thread_data *x11drv_init_thread_data(void);
 extern void x11drv_clipboard_thread_detach( struct x11drv_thread_data *data );
+extern NTSTATUS X11DRV_WindowPaint( HWND hwnd, UINT operation, UINT64 token );
+extern BOOL x11drv_window_paint_event( XClientMessageEvent *event );
+extern void x11drv_flush_window_paints(void);
 extern void x11drv_window_thread_detach( struct x11drv_thread_data *data );
 extern pthread_key_t x11drv_thread_data_key;
 extern void X11DRV_sync_window_changes( Display *display );
@@ -553,6 +556,7 @@ enum x11drv_atoms
     XATOM_WM_NORMAL_HINTS,
     XATOM_WM_STATE,
     XATOM_WM_TAKE_FOCUS,
+    XATOM__WINE_WINDOW_PAINT,
     XATOM_XIM_SERVERS,
     XATOM_DndProtocol,
     XATOM_DndSelection,

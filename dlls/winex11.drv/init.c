@@ -396,6 +396,7 @@ static const struct user_driver_funcs x11drv_funcs =
     .pUpdateClipboard = X11DRV_UpdateClipboard,
     .pUpdateLayeredWindow = X11DRV_UpdateLayeredWindow,
     .pWindowMessage = X11DRV_WindowMessage,
+    .pWindowPaint = X11DRV_WindowPaint,
     .pWindowPosChanging = X11DRV_WindowPosChanging,
     .pGetWindowStyleMasks = X11DRV_GetWindowStyleMasks,
     .pGetWindowStateUpdates = X11DRV_GetWindowStateUpdates,
