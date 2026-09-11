@@ -243,6 +243,19 @@ BOOL client_surface_xcb_copy( Display *display, Pixmap source, Pixmap destinatio
     return TRUE;
 }
 
+void client_surface_xcb_free_gc_async( Display *display, unsigned int gc,
+                                      struct client_surface_xcb_request *request )
+{
+    xcb_connection_t *connection = pXGetXCBConnection( display );
+
+    XFlush( display );
+    request->count = 1;
+    request->cookies[0] = pxcb_free_gc_checked( connection, gc ).sequence;
+    TRACE_(csperf)( "ticks=%llu event=xcb_free_gc_request display=%p cookie=%u gc=%u\n",
+                   client_surface_xcb_perf_time(), display, request->cookies[0], gc );
+    client_surface_xcb_flush( display, request );
+}
+
 void client_surface_xcb_free_gc( Display *display, unsigned int *gc )
 {
     xcb_connection_t *connection;
@@ -349,6 +362,11 @@ BOOL client_surface_xcb_copy( Display *display, Pixmap source, Pixmap destinatio
 }
 
 void client_surface_xcb_free_gc( Display *display, unsigned int *gc )
+{
+}
+
+void client_surface_xcb_free_gc_async( Display *display, unsigned int gc,
+                                      struct client_surface_xcb_request *request )
 {
 }
 
