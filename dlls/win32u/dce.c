@@ -146,6 +146,7 @@ struct scaled_surface
     struct window_surface *target_surface;
     struct ratio dpi_from;
     struct ratio dpi_to;
+    BOOL clip_pending;
     BOOL shape_pending;
 };
 
@@ -154,12 +155,27 @@ static struct scaled_surface *get_scaled_surface( struct window_surface *window_
     return CONTAINING_RECORD( window_surface, struct scaled_surface, header );
 }
 
+static BOOL scaled_surface_apply_clip( struct scaled_surface *surface )
+{
+    HRGN hrgn = 0;
+
+    if (!surface->clip_pending) return TRUE;
+    if (surface->header.clip_region &&
+        !(hrgn = map_dpi_region( surface->header.clip_region, surface->dpi_from, surface->dpi_to )))
+        return FALSE;
+    window_surface_set_clip( surface->target_surface, hrgn );
+    if (hrgn) NtGdiDeleteObjectApp( hrgn );
+    surface->clip_pending = FALSE;
+    return TRUE;
+}
+
 static void scaled_surface_set_clip( struct window_surface *window_surface, const RECT *rects, UINT count )
 {
     struct scaled_surface *surface = get_scaled_surface( window_surface );
-    HRGN hrgn = map_dpi_region( window_surface->clip_region, surface->dpi_from, surface->dpi_to );
-    window_surface_set_clip( surface->target_surface, hrgn );
-    if (hrgn) NtGdiDeleteObjectApp( hrgn );
+
+    surface->clip_pending = TRUE;
+    window_surface->bounds = window_surface->rect;
+    scaled_surface_apply_clip( surface );
 }
 
 static BOOL scaled_surface_flush( struct window_surface *window_surface, const RECT *rect, const RECT *dirty,
@@ -172,6 +188,7 @@ static BOOL scaled_surface_flush( struct window_surface *window_surface, const R
     BOOL ret;
 
     surface->shape_pending |= shape_changed;
+    if (!scaled_surface_apply_clip( surface )) return FALSE;
 
     src.left &= ~7;
     src.top &= ~7;
@@ -243,6 +260,7 @@ static void scaled_surface_set_target( struct scaled_surface *surface, struct wi
     if (previous != target || memcmp( &surface->dpi_to, &dpi_to, sizeof(dpi_to) ))
     {
         surface->header.bounds = surface->header.rect;
+        surface->clip_pending = TRUE;
         surface->shape_pending = TRUE;
     }
     surface->target_surface = target;
