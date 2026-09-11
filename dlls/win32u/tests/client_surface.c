@@ -75,6 +75,7 @@ static unsigned int (CDECL *p_wine_server_call)(void *);
 static void pump_messages( DWORD timeout );
 static BOOL read_shared_surface_state( HWND hwnd, struct shared_surface_state *state );
 static UINT set_scene_placement( HWND hwnd, int offset, int grow, int frame, UINT flags );
+static UINT get_paint_update( HWND hwnd, BOOL validate );
 static UINT drain_scene_notification_counts( UINT *owner_updates, UINT *prepares, UINT64 expected_surface,
                                              struct scene_notification_counts *counts );
 
@@ -2841,11 +2842,24 @@ static UINT destroy_scene_window( HWND hwnd )
 
 static void destroy_scene_child( HWND hwnd )
 {
-    UINT status;
+    struct surface_state state;
+    UINT status, before, hidden, destroyed;
 
     if (!hwnd) return;
+    status = set_surface_state( hwnd, 0, 0, 0, &state );
+    ok( !status, "scene child %p cleanup query status %#x\n", hwnd, status );
+    if (status) return;
+    before = get_paint_update( state.toplevel, FALSE );
+    /* Fixture cleanup must not expose a new parent paint. Visible destruction
+     * itself is tested separately through destroy_scene_window(). */
+    status = set_scene_placement( hwnd, 0, 0, 0, SWP_HIDEWINDOW );
+    ok( !status, "scene child %p cleanup hide status %#x\n", hwnd, status );
+    hidden = get_paint_update( state.toplevel, FALSE );
     status = destroy_scene_window( hwnd );
     ok( !status, "scene child %p destruction status %#x\n", hwnd, status );
+    destroyed = get_paint_update( state.toplevel, FALSE );
+    ok( !before && !hidden && !destroyed, "scene child %p cleanup parent %p update %#x -> %#x -> %#x\n",
+        hwnd, state.toplevel, before, hidden, destroyed );
 }
 
 static void check_source_free_destruction( HWND hwnd, const struct client_surface_handoff_receipt *receipt )
