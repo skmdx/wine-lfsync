@@ -220,7 +220,7 @@ struct gdi_dc_funcs
 };
 
 /* increment this when changing driver tables or shared driver-facing structures */
-#define WINE_GDI_DRIVER_VERSION 149
+#define WINE_GDI_DRIVER_VERSION 150
 
 #define GDI_PRIORITY_NULL_DRV        0  /* null driver */
 #define GDI_PRIORITY_FONT_DRV      100  /* any font driver */
@@ -363,6 +363,7 @@ struct client_surface_scene
 {
     UINT64 generation;
     UINT64 epoch;
+    UINT64 paint_serial; /* GUI content invalidation serial; PREPARE also requires no pending paints */
     UINT64 native_candidate; /* may prepare DIRECT, but owns no completed image */
     UINT64 producer_sequence; /* completed selection on the producer's HWND */
     HWND toplevel;
@@ -640,7 +641,7 @@ W32KAPI BOOL client_surface_begin_native_barrier( HWND hwnd, UINT_PTR token );
 W32KAPI BOOL client_surface_end_native_barrier( HWND hwnd, UINT_PTR token );
 W32KAPI UINT client_surface_begin_publish( HWND hwnd, UINT64 *generation, UINT64 *scene_generation );
 W32KAPI BOOL client_surface_end_publish( HWND hwnd, UINT64 generation, UINT64 scene_generation, BOOL success );
-W32KAPI BOOL client_surface_begin_prepare( HWND hwnd, struct client_surface_scene *scene );
+W32KAPI NTSTATUS client_surface_begin_prepare( HWND hwnd, struct client_surface_scene *scene );
 W32KAPI BOOL client_surface_end_prepare( const struct client_surface_scene *scene );
 W32KAPI void update_client_surfaces( HWND hwnd );
 W32KAPI void detach_client_surfaces( HWND hwnd );
@@ -727,6 +728,10 @@ struct gdi_device_manager
 #define WINE_SWP_CLIENT_SURFACE_BACKING_DISABLE 0x04000000
 #define WINE_SWP_CLIENT_SURFACE_PREPARE 0x02000000
 
+#define WINDOW_PAINT_RESERVE 0
+#define WINDOW_PAINT_SUBMIT  1
+#define WINDOW_PAINT_CANCEL  2
+
 struct vulkan_driver_funcs;
 struct opengl_driver_funcs;
 
@@ -792,6 +797,7 @@ struct user_driver_funcs
     LRESULT (*pSysCommand)(HWND,WPARAM,LPARAM,const POINT*);
     void    (*pUpdateLayeredWindow)(HWND,BYTE,UINT);
     LRESULT (*pWindowMessage)(HWND,UINT,WPARAM,LPARAM);
+    NTSTATUS (*pWindowPaint)(HWND,UINT,UINT64);
     BOOL    (*pWindowPosChanging)(HWND,UINT,BOOL,const struct window_rects *);
     BOOL    (*pGetWindowStyleMasks)(HWND,UINT,UINT,UINT*,UINT*);
     BOOL    (*pGetWindowStateUpdates)(HWND,UINT*,UINT*,RECT*,HWND*);

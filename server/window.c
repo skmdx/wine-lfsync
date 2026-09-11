@@ -107,6 +107,9 @@ static int client_surface_direct_registration_candidate( struct window *top );
 static int client_surface_direct_eligible( struct window *top );
 static enum client_surface_presentation_mode client_surface_presentation_mode( struct window *top );
 static void update_window_first_child( struct window *win );
+static void cancel_thread_window_paints( struct thread *thread );
+static void cancel_window_paints( struct window *win );
+static void wake_window_paint_prepare( struct window *top );
 
 static unsigned int client_surface_ref_hash( struct process *process, UINT64 id )
 {
@@ -280,6 +283,9 @@ struct window
     unsigned int     client_surface_dirty; /* top-level composition changed while hidden */
     struct client_surface_transaction client_surface_transaction;
     client_ptr_t     client_surface_native_barrier; /* owner token sealing native target replacement */
+    UINT64          paint_serial; /* invalidation / BeginPaint sequence for this backing owner */
+    unsigned int    paint_waiting : 1;
+    unsigned int    paint_failed : 1;
     unsigned long long client_surface_scene_generation; /* even when the scene is stable */
     unsigned long long client_surface_direct_scene; /* authenticated owner strategy */
     unsigned long long client_surface_ack_scene; /* last successful owner publication */
@@ -353,6 +359,7 @@ static void update_client_surface_publication( struct window *top )
     {
         shared->client_surface_generation = client_surface_transaction_generation( top );
         shared->client_surface_scene_generation = top->client_surface_scene_generation;
+        shared->client_surface_paint_serial = top->paint_serial;
         shared->client_surface_native_candidate = !top->client_surface_transaction.staged &&
             !top->client_surface_native_barrier && candidate ? candidate->id : 0;
         shared->client_surface_flags =
@@ -1104,6 +1111,8 @@ static struct window *create_window( struct window *parent, struct window *owner
     win->client_surface_dirty  = 0;
     win->client_surface_transaction = (struct client_surface_transaction){0};
     win->client_surface_native_barrier = 0;
+    win->paint_serial = 0;
+    win->paint_waiting = win->paint_failed = 0;
     win->present_rect = empty_rect;
     win->client_surface_scene_generation = 0;
     win->client_surface_direct_scene = win->client_surface_direct_surface = 0;
@@ -1130,6 +1139,7 @@ static struct window *create_window( struct window *parent, struct window *owner
         shared->extra_size      = extra_size;
         shared->client_surface_generation = 0;
         shared->client_surface_scene_generation = 0;
+        shared->client_surface_paint_serial = 0;
         shared->client_surface_flags = 0;
         shared->client_surface_process = 0;
         shared->client_surface_id = 0;
@@ -1192,6 +1202,8 @@ void destroy_thread_windows( struct thread *thread )
 {
     user_handle_t handle = 0;
     struct window *win;
+
+    cancel_thread_window_paints( thread );
 
     while ((win = next_user_handle( &handle, NTUSER_OBJ_WINDOW )))
     {
@@ -3562,6 +3574,37 @@ done:
 }
 
 
+static void invalidate_window_paint( struct window *win )
+{
+    struct window *top = get_toplevel_window( win );
+
+    if (top->paint_serial == ~(UINT64)0)
+    {
+        win->paint_failed = 1;
+        return;
+    }
+    ++top->paint_serial;
+    SHARED_WRITE_BEGIN( top->shared, window_shm_t )
+    {
+        shared->client_surface_paint_serial = top->paint_serial;
+    }
+    SHARED_WRITE_END;
+    /* Paint is a content change. PREPARING checkpoints compare its own serial;
+     * only an already running publication needs the existing scene restart. */
+    if (!has_client_surface( top ) || !client_surface_is_composing( top ) ||
+        top->client_surface_scene_change_depth) return;
+    if (client_surface_is_publishing( top ))
+    {
+        if (top->client_surface_transaction.epoch == top->client_surface_scene_generation)
+            invalidate_client_surface_scene( top );
+    }
+    else
+    {
+        begin_client_surface_cached_scene_change( top );
+        end_client_surface_scene_change( top );
+    }
+}
+
 /* set a region as new update region for the window */
 static void set_update_region( struct window *win, struct region *region )
 {
@@ -3570,6 +3613,7 @@ static void set_update_region( struct window *win, struct region *region )
         if (!win->update_region) inc_window_paint_count( win, 1 );
         else free_region( win->update_region );
         win->update_region = region;
+        invalidate_window_paint( win );
     }
     else
     {
@@ -3581,6 +3625,7 @@ static void set_update_region( struct window *win, struct region *region )
         win->paint_flags &= ~(PAINT_ERASE | PAINT_DELAYED_ERASE | PAINT_NONCLIENT);
         win->update_region = NULL;
         if (region) free_region( region );
+        wake_window_paint_prepare( get_toplevel_window( win ) );
     }
 }
 
@@ -3673,6 +3718,7 @@ static void validate_whole_window( struct window *win )
         win->paint_flags &= ~PAINT_INTERNAL;
         inc_window_paint_count( win, -1 );
     }
+    wake_window_paint_prepare( get_toplevel_window( win ) );
 }
 
 
@@ -3771,11 +3817,13 @@ static void redraw_window( struct window *win, struct region *region, unsigned i
     {
         win->paint_flags |= PAINT_INTERNAL;
         inc_window_paint_count( win, 1 );
+        invalidate_window_paint( win );
     }
     else if ((flags & RDW_NOINTERNALPAINT) && (win->paint_flags & PAINT_INTERNAL))
     {
         win->paint_flags &= ~PAINT_INTERNAL;
         inc_window_paint_count( win, -1 );
+        wake_window_paint_prepare( get_toplevel_window( win ) );
     }
 
     /* now process children recursively */
@@ -3949,6 +3997,205 @@ static unsigned int get_window_update_flags( struct window *win, struct window *
     return 0;
 }
 
+
+struct window_paint
+{
+    struct list entry, thread_entry;
+    struct thread *thread;
+    struct window *window, *top;
+    struct region *region; /* window-coordinate update actually consumed by paint validation */
+    struct rectangle window_rect, client_rect;
+    struct ratio dpi;
+    UINT64 token, scene;
+    int ended, failed;
+};
+
+static struct list window_paints = LIST_INIT( window_paints );
+static UINT64 window_paint_token;
+static unsigned int window_paint_count;
+
+#define WINDOW_PAINT_THREAD_LIMIT 64
+#define WINDOW_PAINT_LIMIT 4096
+
+static int window_paint_failed( struct window *win )
+{
+    struct window *child;
+
+    if (win->paint_failed) return 1;
+    LIST_FOR_EACH_ENTRY( child, &win->children, struct window, entry )
+        if (is_visible( child ) && window_paint_failed( child )) return 1;
+    return 0;
+}
+
+static int window_paint_pending( struct window *top )
+{
+    struct window_paint *paint;
+    struct window *child;
+
+    if (window_paint_failed( top )) return 1;
+    if (get_window_update_flags( top, NULL, UPDATE_PAINT | UPDATE_INTERNALPAINT |
+                                 UPDATE_NONCLIENT | UPDATE_ERASE | UPDATE_ALLCHILDREN, &child ))
+        return 1;
+    LIST_FOR_EACH_ENTRY( paint, &window_paints, struct window_paint, entry )
+        if (paint->top == top || get_toplevel_window( paint->window ) == top) return 1;
+    return 0;
+}
+
+static void wake_window_paint_prepare( struct window *top )
+{
+    if (!top->handle || !top->thread || !top->paint_waiting) return;
+    if (!window_paint_failed( top ) && window_paint_pending( top )) return;
+    post_message_coalesced( top->handle, WM_WINE_UPDATEWINDOWSTATE,
+                           client_surface_is_preparing( top ) ? WINE_PREPARE_CLIENT_SURFACES :
+                           WINE_UPDATE_CLIENT_SURFACE_HANDOFFS, 0 );
+}
+
+static void release_window_paint( struct window_paint *paint, int failed )
+{
+    struct window *top = get_toplevel_window( paint->window );
+    struct ratio dpi = get_window_dpi( paint->window );
+
+    list_remove( &paint->entry );
+    list_remove( &paint->thread_entry );
+    --paint->thread->window_paint_count;
+    --window_paint_count;
+    /* Failed paints restore the consumed region to ordinary WM_PAINT. This
+     * is error recovery, not an extra paint used to manufacture a checkpoint. */
+    if (failed && paint->window->handle && has_client_surface( top ))
+    {
+        int restored = 0;
+
+        /* A saved update region is not transformed along with subsequent
+         * frame, DPI, or parent changes. Repaint the current window instead. */
+        if (paint->region && top == paint->top && paint->scene == top->client_surface_scene_generation &&
+            is_rect_equal( &paint->window_rect, &paint->window->window_rect ) &&
+            is_rect_equal( &paint->client_rect, &paint->window->client_rect ) &&
+            dpi.num == paint->dpi.num && dpi.den == paint->dpi.den)
+        {
+            struct region *region = paint->region;
+            paint->region = NULL;
+            restored = add_update_region( paint->window, region );
+        }
+        else
+        {
+            redraw_window( paint->window, NULL, RDW_INVALIDATE | RDW_ERASE | RDW_FRAME, 0 );
+            restored = !get_error() && !!paint->window->update_region;
+        }
+        if (restored) paint->window->paint_flags |= PAINT_ERASE;
+        /* Never clear a different writer's untracked/admission failure. */
+        if (!restored) paint->window->paint_failed = 1;
+    }
+    if (paint->region) free_region( paint->region );
+    wake_window_paint_prepare( top );
+    if (top != paint->top) wake_window_paint_prepare( paint->top );
+    release_object( paint->window );
+    release_object( paint->top );
+    release_object( paint->thread );
+    free( paint );
+}
+
+static void cancel_thread_window_paints( struct thread *thread )
+{
+    struct window_paint *paint, *next;
+
+    LIST_FOR_EACH_ENTRY_SAFE( paint, next, &thread->window_paints, struct window_paint, thread_entry )
+        release_window_paint( paint, 1 );
+}
+
+static void cancel_window_paints( struct window *win )
+{
+    struct window_paint *paint, *next;
+
+    LIST_FOR_EACH_ENTRY_SAFE( paint, next, &window_paints, struct window_paint, entry )
+        if (paint->window == win) release_window_paint( paint, 0 );
+}
+
+static struct window_paint *get_window_paint( UINT64 token )
+{
+    struct window_paint *paint;
+
+    LIST_FOR_EACH_ENTRY( paint, &current->window_paints, struct window_paint, thread_entry )
+        if (paint->token == token)
+            return paint;
+    set_error( STATUS_INVALID_PARAMETER );
+    return NULL;
+}
+
+DECL_HANDLER(begin_window_paint)
+{
+    struct window *win = get_window( req->handle ), *top;
+    struct window_paint *paint;
+
+    if (!win) return;
+    top = get_toplevel_window( win );
+    invalidate_window_paint( win );
+    if (!req->tracked || window_paint_token == ~(UINT64)0 || window_paint_count == WINDOW_PAINT_LIMIT ||
+        current->window_paint_count == WINDOW_PAINT_THREAD_LIMIT || !(paint = mem_alloc( sizeof(*paint) )))
+    {
+        win->paint_failed = 1;
+        if (window_paint_token == ~(UINT64)0) set_error( STATUS_TOO_MANY_CONTEXT_IDS );
+        else if (!req->tracked || window_paint_count == WINDOW_PAINT_LIMIT ||
+                 current->window_paint_count == WINDOW_PAINT_THREAD_LIMIT)
+            set_error( STATUS_NO_MEMORY );
+        return;
+    }
+    paint->thread = (struct thread *)grab_object( current );
+    paint->window = (struct window *)grab_object( win );
+    paint->top = (struct window *)grab_object( top );
+    paint->token = ++window_paint_token;
+    paint->scene = top->client_surface_scene_generation;
+    paint->window_rect = win->window_rect;
+    paint->client_rect = win->client_rect;
+    paint->dpi = get_window_dpi( win );
+    paint->ended = paint->failed = 0;
+    paint->region = NULL;
+    list_add_tail( &window_paints, &paint->entry );
+    list_add_head( &current->window_paints, &paint->thread_entry );
+    ++current->window_paint_count;
+    ++window_paint_count;
+    reply->token = paint->token;
+}
+
+DECL_HANDLER(end_window_paint)
+{
+    struct window_paint *paint = get_window_paint( req->token );
+
+    if (!paint) return;
+    if (paint->ended) set_error( STATUS_INVALID_PARAMETER );
+    else if (req->cancel) release_window_paint( paint, !!paint->region );
+    else if (paint->failed) release_window_paint( paint, 1 );
+    else paint->ended = 1;
+}
+
+DECL_HANDLER(complete_window_paint)
+{
+    struct window_paint *paint = get_window_paint( req->token );
+
+    if (!paint) return;
+    if (!paint->ended && !req->success) paint->failed = 1;
+    else if (!paint->ended) set_error( STATUS_INVALID_PARAMETER );
+    else
+    {
+        /* Invalidate checkpoints admitted while this writer's native upload
+         * was still pending, even when geometry and the paint set stayed fixed. */
+        if (req->success) invalidate_window_paint( paint->window );
+        release_window_paint( paint, !req->success );
+    }
+}
+
+static int record_window_paint_region( struct window *win )
+{
+    struct window_paint *paint;
+
+    if (!win->update_region) return 1;
+    LIST_FOR_EACH_ENTRY( paint, &current->window_paints, struct window_paint, thread_entry )
+    {
+        if (paint->window != win || paint->ended) continue;
+        if (!paint->region && !(paint->region = create_empty_region())) return 0;
+        return !!union_region( paint->region, paint->region, win->update_region );
+    }
+    return 1;
+}
 
 /* expose the areas revealed by a vis region change on the window parent */
 /* returns the region exposed on the window itself (in client coordinates) */
@@ -4303,6 +4550,7 @@ void free_window_handle( struct window *win )
     int scene_change, wake_client_surface;
 
     assert( win->handle );
+    cancel_window_paints( win );
     client_surface_top = get_toplevel_window( win );
     scene_change = client_surface_top->client_surface_subtree_count &&
                    (win->client_surface_subtree_count || (win->is_linked && (win->style & WS_VISIBLE)));
@@ -5550,7 +5798,7 @@ DECL_HANDLER(set_client_surface_state)
     {
         if ((req->flags != CLIENT_SURFACE_STATE_STAGED && req->flags != CLIENT_SURFACE_STATE_FAILED &&
              req->flags != CLIENT_SURFACE_STATE_PREPARE_COMMIT) ||
-            req->surface || req->producer_sequence)
+            req->surface)
         {
             set_error( STATUS_INVALID_PARAMETER );
             return;
@@ -5570,9 +5818,30 @@ DECL_HANDLER(set_client_surface_state)
             req->generation != client_surface_transaction_generation( top ))
             return;
 
+        if (req->flags == CLIENT_SURFACE_STATE_PREPARE_COMMIT && !client_surface_is_preparing( top )) return;
+        if (req->producer_sequence != top->paint_serial)
+        {
+            top->paint_waiting = 1;
+            wake_window_paint_prepare( top );
+            return;
+        }
+        if (req->flags != CLIENT_SURFACE_STATE_FAILED)
+        {
+            if (window_paint_failed( top ))
+            {
+                fail_client_surface_publication( top );
+                set_error( STATUS_UNSUCCESSFUL );
+                return;
+            }
+            if (window_paint_pending( top ))
+            {
+                top->paint_waiting = 1;
+                return;
+            }
+        }
+        top->paint_waiting = 0;
         if (req->flags == CLIENT_SURFACE_STATE_PREPARE_COMMIT)
         {
-            if (!client_surface_is_preparing( top )) return;
             top->client_surface_transaction.phase = CLIENT_SURFACE_PHASE_IDLE;
             top->client_surface_transaction.prepared = 1;
             restart_client_surface_generation_internal( top );
@@ -5731,7 +6000,30 @@ DECL_HANDLER(set_client_surface_state)
     if ((req->flags & CLIENT_SURFACE_STATE_PREPARE_BEGIN) && win == top && top->thread == current &&
         client_surface_is_preparing( top ) && top->client_surface_scene_generation &&
         !(top->client_surface_scene_generation & 1))
-        reply->publish = 1;
+    {
+        if (window_paint_failed( top ))
+        {
+            fail_client_surface_publication( top );
+            set_error( STATUS_UNSUCCESSFUL );
+        }
+        else if (window_paint_pending( top ))
+        {
+            top->paint_waiting = 1;
+            set_error( STATUS_PENDING );
+        }
+        else
+        {
+            if (get_reply_max_size() < sizeof(top->paint_serial))
+            {
+                set_error( STATUS_BUFFER_TOO_SMALL );
+                return;
+            }
+            set_reply_data( &top->paint_serial, sizeof(top->paint_serial) );
+            if (get_error()) return;
+            top->paint_waiting = 0;
+            reply->publish = 1;
+        }
+    }
     if (req->flags & CLIENT_SURFACE_STATE_GEOMETRY_READY)
     {
         /* Source recovery and backends without a complete owner cache still
@@ -6116,6 +6408,9 @@ DECL_HANDLER(get_update_region)
                                                &reply->total_size ))) return;
         set_reply_data_ptr( data, reply->total_size );
     }
+
+    if (reply->flags & (UPDATE_PAINT | UPDATE_INTERNALPAINT | UPDATE_NONCLIENT | UPDATE_ERASE))
+        if (!record_window_paint_region( win )) return;
 
     if (reply->flags & (UPDATE_PAINT|UPDATE_INTERNALPAINT)) /* validate everything */
     {

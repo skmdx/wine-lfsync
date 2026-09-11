@@ -1148,6 +1148,7 @@ typedef volatile struct
     struct window_info   info;             /* window info (GWLP_*) */
     unsigned __int64     client_surface_generation; /* active client-surface composition generation */
     unsigned __int64     client_surface_scene_generation; /* stable scene snapshot sequence */
+    unsigned __int64     client_surface_paint_serial; /* GUI paint content, independent of scene geometry */
     unsigned int         client_surface_flags;      /* WINDOW_SHM_CLIENT_SURFACE_* */
     process_id_t         client_surface_process;    /* authoritative producer process */
     unsigned __int64     client_surface_id;         /* authoritative server-issued surface lifetime */
@@ -4439,12 +4440,33 @@ enum inproc_sync_type
     unsigned __int64 scene_generation; /* scene sequence of the exact owner */
 @END
 
+/* BeginPaint owns a receipt before validating its update region.  A receipt
+ * belongs to the actual painting thread, including foreign-window DC users. */
+@REQ(begin_window_paint)
+    user_handle_t handle;
+    unsigned int tracked;       /* client admitted its matching lifetime record */
+@REPLY
+    unsigned __int64 token;
+@END
+
+@REQ(end_window_paint)
+    unsigned __int64 token;
+    unsigned int cancel;        /* BeginPaint failed before handing out its DC */
+@END
+
+/* The native driver returns the original writer's token after processing the
+ * upload marker. EndPaint or a client-side flush alone cannot complete it. */
+@REQ(complete_window_paint)
+    unsigned __int64 token;
+    unsigned int success;
+@END
+
 /* Track whether a client-rendered window has changed while its hierarchy was hidden. */
 @REQ(set_client_surface_state)
     user_handle_t  handle;        /* client surface window */
     user_handle_t  scene_toplevel; /* top-level of the completed source scene */
     unsigned __int64 surface;     /* server-issued client surface lifetime */
-    unsigned __int64 producer_sequence; /* completed selection observed before submission */
+    unsigned __int64 producer_sequence; /* completed selection; STAGED/FAILED/PREPARE_COMMIT use GUI paint serial */
     unsigned int   flags;         /* CLIENT_SURFACE_STATE_* */
     unsigned __int64 generation;  /* composition generation or native preparation serial */
     unsigned __int64 scene_generation; /* scene snapshot being committed */
@@ -4461,6 +4483,7 @@ enum inproc_sync_type
     unsigned int   mode;          /* enum client_surface_presentation_mode */
     unsigned int   active;        /* active surfaces on the requested window */
     unsigned int   cached;        /* cached surfaces on the requested window */
+    VARARG(paint_serial,uints64); /* exact PREPARE_BEGIN paint snapshot */
 @END
 #define CLIENT_SURFACE_STATE_REGISTER   0x01
 #define CLIENT_SURFACE_STATE_UNREGISTER 0x02

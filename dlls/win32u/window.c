@@ -4914,7 +4914,13 @@ void update_window_client_surface_backing( HWND hwnd )
     /* A published scene can need both backing activation and a new owner
      * checkpoint. Apply its native/GDI state once, but only acknowledge the
      * exact preparation admitted by the server, after the driver succeeds. */
-    prepare = enable && preparing && client_surface_begin_prepare( hwnd, &scene );
+    prepare = FALSE;
+    if (enable && preparing)
+    {
+        status = client_surface_begin_prepare( hwnd, &scene );
+        if (status != STATUS_SUCCESS) return;
+        prepare = TRUE;
+    }
     driver_flags = enable ? WINE_SWP_CLIENT_SURFACE_BACKING_ENABLE : WINE_SWP_CLIENT_SURFACE_BACKING_DISABLE;
     if (prepare) driver_flags |= WINE_SWP_CLIENT_SURFACE_PREPARE;
     status = update_client_surface_backing_state( hwnd, enable, prepare );
@@ -5399,6 +5405,7 @@ static void free_window_handle( HWND hwnd )
     WND *win;
 
     TRACE( "\n" );
+    cleanup_window_paints( hwnd );
 
     if ((win = get_user_handle_ptr( hwnd, NTUSER_OBJ_WINDOW )) && win != OBJ_OTHER_PROCESS)
     {

@@ -319,6 +319,9 @@ DECL_HANDLER(alpc_create_port);
 DECL_HANDLER(allocate_client_surface);
 DECL_HANDLER(release_client_surface);
 DECL_HANDLER(set_client_surface_native_barrier);
+DECL_HANDLER(begin_window_paint);
+DECL_HANDLER(end_window_paint);
+DECL_HANDLER(complete_window_paint);
 DECL_HANDLER(set_client_surface_state);
 DECL_HANDLER(get_client_surface_clip_windows);
 DECL_HANDLER(get_client_surface_handoff);
@@ -651,6 +654,9 @@ static const req_handler req_handlers[REQ_NB_REQUESTS] =
     (req_handler)req_allocate_client_surface,
     (req_handler)req_release_client_surface,
     (req_handler)req_set_client_surface_native_barrier,
+    (req_handler)req_begin_window_paint,
+    (req_handler)req_end_window_paint,
+    (req_handler)req_complete_window_paint,
     (req_handler)req_set_client_surface_state,
     (req_handler)req_get_client_surface_clip_windows,
     (req_handler)req_get_client_surface_handoff,
@@ -2452,6 +2458,17 @@ C_ASSERT( sizeof(struct set_client_surface_native_barrier_request) == 32 );
 C_ASSERT( offsetof(struct set_client_surface_native_barrier_reply, generation) == 8 );
 C_ASSERT( offsetof(struct set_client_surface_native_barrier_reply, scene_generation) == 16 );
 C_ASSERT( sizeof(struct set_client_surface_native_barrier_reply) == 24 );
+C_ASSERT( offsetof(struct begin_window_paint_request, handle) == 12 );
+C_ASSERT( offsetof(struct begin_window_paint_request, tracked) == 16 );
+C_ASSERT( sizeof(struct begin_window_paint_request) == 24 );
+C_ASSERT( offsetof(struct begin_window_paint_reply, token) == 8 );
+C_ASSERT( sizeof(struct begin_window_paint_reply) == 16 );
+C_ASSERT( offsetof(struct end_window_paint_request, token) == 16 );
+C_ASSERT( offsetof(struct end_window_paint_request, cancel) == 24 );
+C_ASSERT( sizeof(struct end_window_paint_request) == 32 );
+C_ASSERT( offsetof(struct complete_window_paint_request, token) == 16 );
+C_ASSERT( offsetof(struct complete_window_paint_request, success) == 24 );
+C_ASSERT( sizeof(struct complete_window_paint_request) == 32 );
 C_ASSERT( offsetof(struct set_client_surface_state_request, handle) == 12 );
 C_ASSERT( offsetof(struct set_client_surface_state_request, scene_toplevel) == 16 );
 C_ASSERT( offsetof(struct set_client_surface_state_request, surface) == 24 );

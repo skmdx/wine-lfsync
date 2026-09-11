@@ -1132,6 +1132,7 @@ typedef volatile struct
     struct window_info   info;
     unsigned __int64     client_surface_generation;
     unsigned __int64     client_surface_scene_generation;
+    unsigned __int64     client_surface_paint_serial;
     unsigned int         client_surface_flags;
     process_id_t         client_surface_process;
     unsigned __int64     client_surface_id;
@@ -6367,6 +6368,49 @@ struct set_client_surface_native_barrier_reply
     unsigned __int64 scene_generation;
 };
 
+/* BeginPaint owns a receipt before validating its update region.  A receipt
+ * belongs to the actual painting thread, including foreign-window DC users. */
+struct begin_window_paint_request
+{
+    struct request_header __header;
+    user_handle_t handle;
+    unsigned int tracked;
+    char __pad_20[4];
+};
+struct begin_window_paint_reply
+{
+    struct reply_header __header;
+    unsigned __int64 token;
+};
+
+struct end_window_paint_request
+{
+    struct request_header __header;
+    char __pad_12[4];
+    unsigned __int64 token;
+    unsigned int cancel;
+    char __pad_28[4];
+};
+struct end_window_paint_reply
+{
+    struct reply_header __header;
+};
+
+/* The native driver returns the original writer's token after processing the
+ * upload marker. EndPaint or a client-side flush alone cannot complete it. */
+struct complete_window_paint_request
+{
+    struct request_header __header;
+    char __pad_12[4];
+    unsigned __int64 token;
+    unsigned int success;
+    char __pad_28[4];
+};
+struct complete_window_paint_reply
+{
+    struct reply_header __header;
+};
+
 
 struct set_client_surface_state_request
 {
@@ -6396,6 +6440,7 @@ struct set_client_surface_state_reply
     unsigned int   mode;
     unsigned int   active;
     unsigned int   cached;
+    /* VARARG(paint_serial,uints64); */
 };
 #define CLIENT_SURFACE_STATE_REGISTER   0x01
 #define CLIENT_SURFACE_STATE_UNREGISTER 0x02
@@ -6992,6 +7037,9 @@ enum request
     REQ_allocate_client_surface,
     REQ_release_client_surface,
     REQ_set_client_surface_native_barrier,
+    REQ_begin_window_paint,
+    REQ_end_window_paint,
+    REQ_complete_window_paint,
     REQ_set_client_surface_state,
     REQ_get_client_surface_clip_windows,
     REQ_get_client_surface_handoff,
@@ -7327,6 +7375,9 @@ union generic_request
     struct allocate_client_surface_request allocate_client_surface_request;
     struct release_client_surface_request release_client_surface_request;
     struct set_client_surface_native_barrier_request set_client_surface_native_barrier_request;
+    struct begin_window_paint_request begin_window_paint_request;
+    struct end_window_paint_request end_window_paint_request;
+    struct complete_window_paint_request complete_window_paint_request;
     struct set_client_surface_state_request set_client_surface_state_request;
     struct get_client_surface_clip_windows_request get_client_surface_clip_windows_request;
     struct get_client_surface_handoff_request get_client_surface_handoff_request;
@@ -7660,6 +7711,9 @@ union generic_reply
     struct allocate_client_surface_reply allocate_client_surface_reply;
     struct release_client_surface_reply release_client_surface_reply;
     struct set_client_surface_native_barrier_reply set_client_surface_native_barrier_reply;
+    struct begin_window_paint_reply begin_window_paint_reply;
+    struct end_window_paint_reply end_window_paint_reply;
+    struct complete_window_paint_reply complete_window_paint_reply;
     struct set_client_surface_state_reply set_client_surface_state_reply;
     struct get_client_surface_clip_windows_reply get_client_surface_clip_windows_reply;
     struct get_client_surface_handoff_reply get_client_surface_handoff_reply;
@@ -7678,6 +7732,6 @@ union generic_reply
     struct set_window_present_rect_reply set_window_present_rect_reply;
 };
 
-#define SERVER_PROTOCOL_VERSION 1022
+#define SERVER_PROTOCOL_VERSION 1025
 
 #endif /* __WINE_WINE_SERVER_PROTOCOL_H */

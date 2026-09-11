@@ -428,9 +428,9 @@ void client_surface_prepare_scene( struct client_surface *surface )
 
     if (toplevel && is_current_thread_window( toplevel ))
     {
-        NTSTATUS status = STATUS_SUCCESS;
+        NTSTATUS status = client_surface_begin_prepare( toplevel, &scene );
 
-        if (client_surface_begin_prepare( toplevel, &scene ))
+        if (status == STATUS_SUCCESS)
         {
             status = prepare_window_client_surfaces( toplevel );
             if (status == STATUS_SUCCESS) client_surface_end_prepare( &scene );
@@ -689,6 +689,7 @@ static BOOL read_client_surface_scene( HWND toplevel, struct client_surface_scen
         scene->generation = (window_shm->client_surface_flags & WINDOW_SHM_CLIENT_SURFACE_COMPOSING) ?
                             window_shm->client_surface_generation : 0;
         scene->epoch = window_shm->client_surface_scene_generation;
+        scene->paint_serial = window_shm->client_surface_paint_serial;
         scene->native_candidate = window_shm->client_surface_native_candidate;
         scene->producer_sequence = window_shm->client_surface_producer_sequence;
         scene->mode = (window_shm->client_surface_flags & WINDOW_SHM_CLIENT_SURFACE_DIRECT) ?
@@ -1481,6 +1482,7 @@ static BOOL client_surface_set_scene_result( const struct client_surface_scene *
         req->flags = flags;
         req->generation = scene->generation;
         req->scene_generation = scene->epoch;
+        req->producer_sequence = scene->paint_serial;
         if (!wine_server_call( req ) && reply->toplevel == wine_server_user_handle( scene->toplevel ))
         {
             accepted = TRUE;
@@ -1604,9 +1606,9 @@ BOOL client_surface_end_publish( HWND hwnd, UINT64 generation, UINT64 scene_gene
     return !status && accepted && success;
 }
 
-BOOL client_surface_begin_prepare( HWND hwnd, struct client_surface_scene *scene )
+NTSTATUS client_surface_begin_prepare( HWND hwnd, struct client_surface_scene *scene )
 {
-    BOOL prepare = FALSE;
+    NTSTATUS status;
 
     memset( scene, 0, sizeof(*scene) );
     SERVER_START_REQ( set_client_surface_state )
@@ -1616,7 +1618,9 @@ BOOL client_surface_begin_prepare( HWND hwnd, struct client_surface_scene *scene
         req->flags = CLIENT_SURFACE_STATE_PREPARE_BEGIN;
         req->generation = 0;
         req->scene_generation = 0;
-        if (!wine_server_call( req ) && reply->publish &&
+        wine_server_set_reply( req, &scene->paint_serial, sizeof(scene->paint_serial) );
+        status = wine_server_call( req );
+        if (status == STATUS_SUCCESS && wine_server_reply_size( reply ) == sizeof(scene->paint_serial) && reply->publish &&
             reply->toplevel == wine_server_user_handle( hwnd ) &&
             reply->scene_generation && !(reply->scene_generation & 1))
         {
@@ -1625,11 +1629,11 @@ BOOL client_surface_begin_prepare( HWND hwnd, struct client_surface_scene *scene
             scene->toplevel = wine_server_ptr_handle( reply->toplevel );
             scene->epoch = reply->scene_generation;
             scene->generation = reply->generation;
-            prepare = TRUE;
         }
+        else if (status == STATUS_SUCCESS) status = STATUS_NOT_FOUND;
     }
     SERVER_END_REQ;
-    return prepare;
+    return status;
 }
 
 BOOL client_surface_end_prepare( const struct client_surface_scene *scene )

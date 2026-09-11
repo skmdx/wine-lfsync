@@ -2637,6 +2637,7 @@ static BOOL client_surface_output_checkpoint_scene_current( const struct client_
 
     return client_surface_capture_scene_state( expected->toplevel, &current ) &&
            current.toplevel == expected->toplevel && current.epoch == expected->epoch &&
+           current.paint_serial == expected->paint_serial &&
            current.generation == expected->generation && current.mode == expected->mode;
 }
 

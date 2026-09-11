@@ -33,6 +33,7 @@ struct surface_state
     HWND toplevel;
     UINT64 generation;
     UINT64 scene_generation;
+    UINT64 paint_serial;
     UINT pending;
     UINT staged;
     UINT ready;
@@ -52,7 +53,7 @@ struct native_barrier_state
 
 struct shared_surface_state
 {
-    UINT64 scene, surface, candidate, producer_sequence;
+    UINT64 scene, surface, candidate, producer_sequence, paint_serial;
     UINT flags;
 };
 
@@ -103,6 +104,7 @@ static unsigned int release_surface( UINT64 surface )
 static unsigned int set_surface_state_source( HWND hwnd, UINT64 surface, UINT flags,
                                               UINT64 generation, UINT64 scene_generation,
                                               HWND source_top, UINT64 producer_sequence,
+                                              UINT64 paint_serial,
                                               struct surface_state *state )
 {
     struct __server_request_info info;
@@ -113,7 +115,7 @@ static unsigned int set_surface_state_source( HWND hwnd, UINT64 surface, UINT fl
     unsigned int status;
 
     if ((flags & CLIENT_SURFACE_STATE_CLAIM) && !source_top && !scene_generation &&
-        !set_surface_state_source( hwnd, 0, 0, 0, 0, 0, 0, &initial ) &&
+        !set_surface_state_source( hwnd, 0, 0, 0, 0, 0, 0, 0, &initial ) &&
         read_shared_surface_state( hwnd, &current ))
     {
         /* Some cases reparent through the raw server API. The process-local
@@ -133,6 +135,10 @@ static unsigned int set_surface_state_source( HWND hwnd, UINT64 surface, UINT fl
     if (!generation && (flags & (CLIENT_SURFACE_STATE_NATIVE_CANDIDATE | CLIENT_SURFACE_STATE_CANCEL_CANDIDATE)))
         req->generation = 1;
     req->scene_generation = scene_generation;
+    if (flags == CLIENT_SURFACE_STATE_PREPARE_COMMIT || flags == CLIENT_SURFACE_STATE_STAGED ||
+        flags == CLIENT_SURFACE_STATE_FAILED) req->producer_sequence = paint_serial;
+    if (flags == CLIENT_SURFACE_STATE_PREPARE_BEGIN)
+        wine_server_set_reply( &info, &paint_serial, sizeof(paint_serial) );
     status = p_wine_server_call( &info );
     if (!status && state)
     {
@@ -140,6 +146,9 @@ static unsigned int set_surface_state_source( HWND hwnd, UINT64 surface, UINT fl
         state->toplevel = wine_server_ptr_handle( reply->toplevel );
         state->generation = reply->generation;
         state->scene_generation = reply->scene_generation;
+        state->paint_serial = paint_serial;
+        if (!flags && read_shared_surface_state( state->toplevel, &current ))
+            state->paint_serial = current.paint_serial;
         state->pending = reply->pending;
         state->staged = reply->staged;
         state->ready = reply->ready;
@@ -159,14 +168,14 @@ static unsigned int set_surface_state_scene( HWND hwnd, UINT64 surface, UINT fla
 {
     HWND source_top = scene_generation && (flags & (CLIENT_SURFACE_STATE_CLAIM | CLIENT_SURFACE_STATE_CANCEL_CANDIDATE)) ?
                       GetAncestor( hwnd, GA_ROOT ) : 0;
-    return set_surface_state_source( hwnd, surface, flags, generation, scene_generation, source_top, 0, state );
+    return set_surface_state_source( hwnd, surface, flags, generation, scene_generation, source_top, 0, 0, state );
 }
 
 static unsigned int set_surface_result( HWND hwnd, UINT flags, const struct surface_state *expected,
                                         struct surface_state *state )
 {
     return set_surface_state_source( hwnd, 0, flags, expected->generation, expected->scene_generation,
-                                     expected->toplevel, 0, state );
+                                     expected->toplevel, 0, expected->paint_serial, state );
 }
 
 static unsigned int set_surface_state( HWND hwnd, UINT64 surface, UINT flags,
@@ -580,6 +589,7 @@ static BOOL read_shared_surface_state( HWND hwnd, struct shared_surface_state *s
         state->surface = object->shm.window.client_surface_id;
         state->candidate = object->shm.window.client_surface_native_candidate;
         state->producer_sequence = object->shm.window.client_surface_producer_sequence;
+        state->paint_serial = object->shm.window.client_surface_paint_serial;
         state->flags = object->shm.window.client_surface_flags;
         MemoryBarrier();
     } while (ReadNoFence64( &object->seq ) != seq);
@@ -996,7 +1006,7 @@ static void test_candidate_selection(void)
 
     first_sequence = check_direct_shared_state( hwnd, first, state.scene_generation, FALSE, FALSE, TRUE );
     status = set_surface_state_source( hwnd, second, CLIENT_SURFACE_STATE_CLAIM, 0,
-                                       candidate.scene_generation, GetDesktopWindow(), first_sequence, &state );
+                                       candidate.scene_generation, GetDesktopWindow(), first_sequence, 0, &state );
     ok( !status && state.scene_generation == candidate.scene_generation,
         "completion for another top-level replaced the producer: status %#x\n", status );
     check_direct_shared_state( hwnd, first, state.scene_generation, FALSE, FALSE, TRUE );
@@ -1006,7 +1016,7 @@ static void test_candidate_selection(void)
         "third completion did not advance selection: status %#x\n", status );
     third_sequence = check_direct_shared_state( hwnd, third, latest.scene_generation, FALSE, FALSE, TRUE );
     status = set_surface_state_source( hwnd, second, CLIENT_SURFACE_STATE_CLAIM, 0,
-                                       candidate.scene_generation, hwnd, first_sequence, &state );
+                                       candidate.scene_generation, hwnd, first_sequence, 0, &state );
     ok( !status && state.scene_generation == latest.scene_generation,
         "stale second completion replaced third: status %#x\n", status );
     check_direct_shared_state( hwnd, third, state.scene_generation, FALSE, FALSE, TRUE );
@@ -1016,7 +1026,7 @@ static void test_candidate_selection(void)
         "stale cancellation changed third selection: status %#x\n", status );
     check_direct_shared_state( hwnd, third, state.scene_generation, FALSE, FALSE, TRUE );
     status = set_surface_state_source( hwnd, second, CLIENT_SURFACE_STATE_CLAIM, 0,
-                                       state.scene_generation, hwnd, third_sequence, &state );
+                                       state.scene_generation, hwnd, third_sequence, 0, &state );
     second_sequence = check_direct_shared_state( hwnd, second, state.scene_generation, FALSE, FALSE, TRUE );
     ok( !status && second_sequence > third_sequence,
         "new completion did not replace the third producer: status %#x\n", status );
@@ -2673,7 +2683,7 @@ static UINT drain_scene_notification_counts( UINT *owner_updates, UINT *prepares
              * backing allocation, since disable and stale wakes use it too. */
             status = set_surface_state( wine_server_ptr_handle( reply->win ), 0,
                                         CLIENT_SURFACE_STATE_PREPARE_BEGIN, 0, &state );
-            ok( !status, "backing preparation query status %#x\n", status );
+            ok( !status || status == STATUS_PENDING, "backing preparation query status %#x\n", status );
             if (!status && state.publish) ++*prepares;
         }
         if (reply->msg == WM_WINE_UPDATEWINDOWSTATE && reply->wparam == WINE_PUBLISH_CLIENT_SURFACES &&
@@ -5424,6 +5434,209 @@ static void test_publish_transaction(void)
     DestroyWindow( hwnd );
 }
 
+static UINT begin_paint_receipt( HWND hwnd, UINT64 *token )
+{
+    struct __server_request_info info = {0};
+    UINT status;
+
+    info.u.req.begin_window_paint_request.__header.req = REQ_begin_window_paint;
+    info.u.req.begin_window_paint_request.handle = wine_server_user_handle( hwnd );
+    info.u.req.begin_window_paint_request.tracked = TRUE;
+    status = p_wine_server_call( &info );
+    *token = status ? 0 : info.u.reply.begin_window_paint_reply.token;
+    return status;
+}
+
+static UINT end_paint_receipt( UINT64 token, BOOL cancel )
+{
+    struct __server_request_info info = {0};
+
+    info.u.req.end_window_paint_request.__header.req = REQ_end_window_paint;
+    info.u.req.end_window_paint_request.token = token;
+    info.u.req.end_window_paint_request.cancel = cancel;
+    return p_wine_server_call( &info );
+}
+
+static UINT complete_paint_receipt( UINT64 token, BOOL success )
+{
+    struct __server_request_info info = {0};
+
+    info.u.req.complete_window_paint_request.__header.req = REQ_complete_window_paint;
+    info.u.req.complete_window_paint_request.token = token;
+    info.u.req.complete_window_paint_request.success = success;
+    return p_wine_server_call( &info );
+}
+
+static UINT get_paint_update( HWND hwnd, BOOL validate )
+{
+    struct __server_request_info info = {0};
+    struct rectangle rects[16];
+    UINT status;
+
+    info.u.req.get_update_region_request.__header.req = REQ_get_update_region;
+    info.u.req.get_update_region_request.window = wine_server_user_handle( hwnd );
+    info.u.req.get_update_region_request.flags = UPDATE_NOCHILDREN | UPDATE_PAINT | UPDATE_INTERNALPAINT |
+                                                UPDATE_ERASE | UPDATE_NONCLIENT;
+    if (!validate) info.u.req.get_update_region_request.flags |= UPDATE_NOREGION;
+    wine_server_set_reply( &info, rects, sizeof(rects) );
+    status = p_wine_server_call( &info );
+    ok( !status, "paint update query status %#x\n", status );
+    return status ? 0 : info.u.reply.get_update_region_reply.flags;
+}
+
+static void set_paint_update( HWND hwnd, UINT flags )
+{
+    struct __server_request_info info = {0};
+    UINT status;
+
+    info.u.req.redraw_window_request.__header.req = REQ_redraw_window;
+    info.u.req.redraw_window_request.window = wine_server_user_handle( hwnd );
+    info.u.req.redraw_window_request.flags = flags | RDW_NOCHILDREN;
+    status = p_wine_server_call( &info );
+    ok( !status, "paint redraw status %#x\n", status );
+}
+
+struct paint_receipt_thread_data
+{
+    HWND hwnd;
+    UINT64 token;
+};
+
+static DWORD WINAPI paint_receipt_thread( void *arg )
+{
+    struct paint_receipt_thread_data *data = arg;
+
+    if (data->hwnd) return begin_paint_receipt( data->hwnd, &data->token );
+    return complete_paint_receipt( data->token, TRUE );
+}
+
+static void run_paint_receipt_thread( struct paint_receipt_thread_data *data, UINT expected )
+{
+    HANDLE thread = CreateThread( NULL, 0, paint_receipt_thread, data, 0, NULL );
+    DWORD wait, status = ~0u;
+
+    ok( !!thread, "paint thread creation error %lu\n", GetLastError() );
+    if (!thread) return;
+    wait = WaitForSingleObject( thread, 5000 );
+    ok( wait == WAIT_OBJECT_0, "paint thread wait %#lx\n", wait );
+    if (wait != WAIT_OBJECT_0) ExitProcess( 1 );
+    ok( GetExitCodeThread( thread, &status ), "paint thread exit query error %lu\n", GetLastError() );
+    CloseHandle( thread );
+    ok( status == expected, "paint thread status %#lx, expected %#x\n", status, expected );
+}
+
+static void test_paint_receipts(void)
+{
+    struct surface_state preparing, current, result;
+    struct paint_receipt_thread_data data;
+    struct scene_notification_counts counts;
+    HWND class_window = create_test_window( FALSE ), hwnd;
+    UINT64 surface = allocate_surface(), first, second;
+    UINT status, updates, prepares;
+
+    if (!class_window) return;
+    /* Use real server windows and requests to test receipt authentication.
+     * Supplying completion here does not test a backend's native marker. */
+    hwnd = create_scene_occluder( GetDesktopWindow(), class_window );
+    if (!hwnd) { DestroyWindow( class_window ); return; }
+    status = set_surface_state( hwnd, surface, CLIENT_SURFACE_STATE_REGISTER |
+                                CLIENT_SURFACE_STATE_SCENE_PUBLICATION, 0, NULL );
+    ok( !status, "paint surface registration status %#x\n", status );
+    status = claim_surface_state( hwnd, surface, &current );
+    ok( !status && !current.generation, "paint surface claim status %#x\n", status );
+    status = set_surface_state( hwnd, 0, CLIENT_SURFACE_STATE_PREPARE_BEGIN, 0, &preparing );
+    ok( !status && preparing.publish && !preparing.generation, "initial paint prepare status %#x\n", status );
+    drain_scene_notifications( &updates, &prepares );
+
+    set_paint_update( hwnd, RDW_INVALIDATE | RDW_ERASE | RDW_FRAME );
+    status = set_surface_state( hwnd, 0, CLIENT_SURFACE_STATE_PREPARE_BEGIN, 0, &current );
+    ok( status == STATUS_PENDING, "unstarted paint prepare status %#x\n", status );
+    status = begin_paint_receipt( hwnd, &first );
+    ok( !status && first, "first paint admission status %#x\n", status );
+    ok( get_paint_update( hwnd, TRUE ) & UPDATE_PAINT, "validation did not consume the real update\n" );
+    ok( !get_paint_update( hwnd, FALSE ), "update survived validation\n" );
+    status = begin_paint_receipt( hwnd, &second );
+    ok( !status && second && second != first, "second paint admission status %#x\n", status );
+    status = complete_paint_receipt( first, TRUE );
+    ok( status == STATUS_INVALID_PARAMETER, "pre-EndPaint completion status %#x\n", status );
+    status = end_paint_receipt( first, FALSE );
+    ok( !status, "paint end status %#x\n", status );
+    status = set_surface_state( hwnd, 0, CLIENT_SURFACE_STATE_PREPARE_BEGIN, 0, &current );
+    ok( status == STATUS_PENDING, "ended but uncompleted paint prepare status %#x\n", status );
+    status = set_surface_state( hwnd, 0, 0, 0, &current );
+    ok( !status, "pending paint capture status %#x\n", status );
+    status = set_surface_result( hwnd, CLIENT_SURFACE_STATE_STAGED, &current, &result );
+    ok( !status && !result.toplevel, "STAGED accepted pending paint, status %#x\n", status );
+    data.hwnd = NULL;
+    data.token = first;
+    run_paint_receipt_thread( &data, STATUS_INVALID_PARAMETER );
+    status = complete_paint_receipt( first, TRUE );
+    ok( !status, "first paint completion status %#x\n", status );
+    status = set_surface_state( hwnd, 0, CLIENT_SURFACE_STATE_PREPARE_BEGIN, 0, &current );
+    ok( status == STATUS_PENDING, "overlapping paint prepare status %#x\n", status );
+    status = end_paint_receipt( second, FALSE );
+    ok( !status, "second paint end status %#x\n", status );
+    status = complete_paint_receipt( second, TRUE );
+    ok( !status, "second paint completion status %#x\n", status );
+    status = complete_paint_receipt( second, TRUE );
+    ok( status == STATUS_INVALID_PARAMETER, "duplicate paint completion status %#x\n", status );
+    counts.window = hwnd;
+    drain_scene_notification_counts( &updates, &prepares, 0, &counts );
+    ok( counts.prepare == 1, "completed paints sent %u prepare notifications\n", counts.prepare );
+    status = set_surface_state( hwnd, 0, CLIENT_SURFACE_STATE_PREPARE_BEGIN, 0, &current );
+    ok( !status && current.publish && !current.generation &&
+        current.scene_generation == preparing.scene_generation && current.paint_serial > preparing.paint_serial,
+        "completed paint prepare status %#x, serial %s -> %s\n", status,
+        wine_dbgstr_longlong( preparing.paint_serial ), wine_dbgstr_longlong( current.paint_serial ) );
+    status = set_surface_result( hwnd, CLIENT_SURFACE_STATE_PREPARE_COMMIT, &preparing, &result );
+    ok( !status && !result.toplevel, "stale paint commit accepted, status %#x\n", status );
+    drain_scene_notification_counts( &updates, &prepares, 0, &counts );
+    ok( counts.prepare == 1, "stale paint commit sent %u retry notifications\n", counts.prepare );
+
+    /* Native failure before END is latched; it cannot retire an active writer. */
+    status = begin_paint_receipt( hwnd, &first );
+    ok( !status, "failed paint admission status %#x\n", status );
+    status = complete_paint_receipt( first, FALSE );
+    ok( !status, "early paint failure status %#x\n", status );
+    status = set_surface_state( hwnd, 0, CLIENT_SURFACE_STATE_PREPARE_BEGIN, 0, &current );
+    ok( status == STATUS_PENDING, "early failed paint prepare status %#x\n", status );
+    status = end_paint_receipt( first, FALSE );
+    ok( !status, "failed paint end status %#x\n", status );
+    ok( get_paint_update( hwnd, FALSE ) & UPDATE_PAINT, "failed paint lost its repaint obligation\n" );
+    status = begin_paint_receipt( hwnd, &first );
+    ok( !status, "recovery paint admission status %#x\n", status );
+    get_paint_update( hwnd, TRUE );
+    status = end_paint_receipt( first, FALSE );
+    ok( !status, "recovery paint end status %#x\n", status );
+    status = complete_paint_receipt( first, TRUE );
+    ok( !status, "recovery paint completion status %#x\n", status );
+
+    /* A writer exiting with an active token restores dirty work on the live
+     * foreign window; that token cannot be completed by a later thread. */
+    data.hwnd = hwnd;
+    data.token = 0;
+    run_paint_receipt_thread( &data, 0 );
+    status = complete_paint_receipt( data.token, TRUE );
+    ok( status == STATUS_INVALID_PARAMETER, "exited writer completion status %#x\n", status );
+    ok( get_paint_update( hwnd, TRUE ) & UPDATE_PAINT, "exited writer lost its repaint obligation\n" );
+    set_paint_update( hwnd, RDW_INTERNALPAINT );
+    status = set_surface_state( hwnd, 0, CLIENT_SURFACE_STATE_PREPARE_BEGIN, 0, &current );
+    ok( status == STATUS_PENDING, "internal paint prepare status %#x\n", status );
+    drain_scene_notifications( &updates, &prepares );
+    set_paint_update( hwnd, RDW_NOINTERNALPAINT );
+    drain_scene_notification_counts( &updates, &prepares, 0, &counts );
+    ok( counts.prepare == 1, "internal paint removal sent %u prepare notifications\n", counts.prepare );
+    status = set_surface_state( hwnd, 0, CLIENT_SURFACE_STATE_PREPARE_BEGIN, 0, &current );
+    ok( !status && current.publish, "recovered paint prepare status %#x\n", status );
+    status = set_surface_result( hwnd, CLIENT_SURFACE_STATE_PREPARE_COMMIT, &current, &result );
+    ok( !status && result.toplevel == hwnd && result.generation, "current paint commit status %#x\n", status );
+
+    set_surface_state( hwnd, surface, CLIENT_SURFACE_STATE_UNREGISTER, 0, NULL );
+    status = destroy_scene_window( hwnd );
+    ok( !status, "paint window destruction status %#x\n", status );
+    DestroyWindow( class_window );
+}
+
 static void test_live_prepare_transaction(void)
 {
     static const UINT results[] = {CLIENT_SURFACE_STATE_FAILED, CLIENT_SURFACE_STATE_STAGED};
@@ -6884,6 +7097,7 @@ static BOOL run_focused_test_case( const char *name, char **argv )
          test_publish_transaction},
         {"live-prepare", "live client surface prepare transaction",
          test_live_prepare_transaction},
+        {"paint-receipts", "GUI paint receipt authentication and preparation", test_paint_receipts},
         {"unbacked-live", "unbacked live client surface publication",
          test_unbacked_live_generation},
         {"native-backing-barrier", "native backing destruction barrier",
@@ -7124,6 +7338,7 @@ START_TEST(client_surface)
     test_publish_transaction();
     trace( "testing live client surface prepare transaction\n" );
     test_live_prepare_transaction();
+    test_paint_receipts();
     trace( "testing unbacked live client surface publication\n" );
     test_unbacked_live_generation();
     trace( "testing native backing destruction barrier\n" );

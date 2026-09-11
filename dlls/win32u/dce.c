@@ -52,6 +52,26 @@ static struct list dce_list = LIST_INIT(dce_list);
 static struct list window_surfaces = LIST_INIT( window_surfaces );
 static pthread_mutex_t surfaces_lock = PTHREAD_MUTEX_INITIALIZER;
 
+struct window_paint_surface
+{
+    struct list entry;
+    struct window_surface *surface;
+};
+
+struct window_paint
+{
+    struct list entry, surfaces;
+    HWND hwnd;
+    HDC hdc;
+    UINT64 token;
+    BOOL ended, failed, beginning, cancelled;
+    UINT surface_count;
+};
+
+/* These are EndPaint obligations, not a worker queue. The painting thread
+ * releases them after its existing surface flush path submits a native marker. */
+static void flush_window_paints(void);
+
 /*******************************************************************
  * Dummy window surface for windows that shouldn't get painted.
  */
@@ -233,8 +253,7 @@ static BOOL scaled_surface_flush( struct window_surface *window_surface, const R
         surface->shape_pending = FALSE;
     }
 
-    window_surface_flush( surface->target_surface );
-    return TRUE;
+    return window_surface_flush( surface->target_surface );
 }
 
 static void scaled_surface_destroy( struct window_surface *window_surface )
@@ -659,7 +678,7 @@ void window_surface_unlock( struct window_surface *surface )
     pthread_mutex_unlock( &surface->mutex );
 }
 
-void window_surface_flush( struct window_surface *surface )
+BOOL window_surface_flush( struct window_surface *surface )
 {
     char color_buf[FIELD_OFFSET( BITMAPINFO, bmiColors[256] )];
     char shape_buf[FIELD_OFFSET( BITMAPINFO, bmiColors[256] )];
@@ -667,6 +686,7 @@ void window_surface_flush( struct window_surface *surface )
     BITMAPINFO *shape_info = (BITMAPINFO *)shape_buf;
     RECT dirty = surface->rect, bounds;
     void *color_bits;
+    BOOL ret = TRUE;
 
     window_surface_lock( surface );
 
@@ -678,10 +698,16 @@ void window_surface_flush( struct window_surface *surface )
 
     OffsetRect( &dirty, -dirty.left, -dirty.top );
 
-    if (intersect_rect( &dirty, &dirty, &bounds ) && (color_bits = window_surface_get_color( surface, color_info )))
+    if (intersect_rect( &dirty, &dirty, &bounds ))
     {
         int shape_changed;
         void *shape_bits;
+
+        if (!(color_bits = window_surface_get_color( surface, color_info )))
+        {
+            ret = FALSE;
+            goto done;
+        }
 
         /* Normalize opaque layered pixels before shape allocation and upload.
          * alpha_mask must still identify a layered surface to window DCs. */
@@ -696,18 +722,23 @@ void window_surface_flush( struct window_surface *surface )
         }
         shape_changed = update_surface_shape( surface, &surface->rect, &dirty, color_info, color_bits,
                                               shape_info, &shape_bits );
-        if (shape_changed < 0) goto done;
+        if (shape_changed < 0)
+        {
+            ret = FALSE;
+            goto done;
+        }
 
         TRACE( "Flushing hwnd %p, surface %p %s, bounds %s, dirty %s\n", surface->hwnd, surface,
                wine_dbgstr_rect( &surface->rect ), wine_dbgstr_rect( &surface->bounds ), wine_dbgstr_rect( &dirty ) );
 
-        if (surface->funcs->flush( surface, &surface->rect, &dirty, color_info, color_bits,
-                                   shape_changed, shape_info, shape_bits ))
+        if ((ret = surface->funcs->flush( surface, &surface->rect, &dirty, color_info, color_bits,
+                                         shape_changed, shape_info, shape_bits )))
             reset_bounds( &surface->bounds );
     }
 
 done:
     window_surface_unlock( surface );
+    return ret;
 }
 
 void window_surface_set_layered( struct window_surface *surface, COLORREF color_key, UINT alpha_bits, UINT alpha_mask )
@@ -831,6 +862,7 @@ void flush_window_surfaces( BOOL idle )
         window_surface_flush( surface );
 done:
     pthread_mutex_unlock( &surfaces_lock );
+    flush_window_paints();
 }
 
 /***********************************************************************
@@ -1808,6 +1840,140 @@ void move_window_bits_surface( HWND hwnd, const RECT *window_rect, struct window
 }
 
 
+void window_surface_record_paint( struct window_surface *surface )
+{
+    struct window_paint_surface *entry;
+    struct window_paint *paint;
+
+    if (!surface || surface == &dummy_surface || surface->alpha_mask) return;
+    LIST_FOR_EACH_ENTRY( paint, &get_user_thread_info()->window_paints, struct window_paint, entry )
+    {
+        if (paint->ended || paint->cancelled) continue;
+        LIST_FOR_EACH_ENTRY( entry, &paint->surfaces, struct window_paint_surface, entry )
+            if (entry->surface == surface) break;
+        if (&entry->entry != &paint->surfaces) continue;
+        if (paint->surface_count == 64 || !(entry = malloc( sizeof(*entry) )))
+        {
+            paint->failed = TRUE;
+            continue;
+        }
+        window_surface_add_ref( (entry->surface = surface) );
+        list_add_tail( &paint->surfaces, &entry->entry );
+        ++paint->surface_count;
+    }
+}
+
+static void free_window_paint( struct window_paint *paint )
+{
+    struct window_paint_surface *entry, *next;
+
+    list_remove( &paint->entry );
+    LIST_FOR_EACH_ENTRY_SAFE( entry, next, &paint->surfaces, struct window_paint_surface, entry )
+    {
+        window_surface_release( entry->surface );
+        free( entry );
+    }
+    free( paint );
+}
+
+static void flush_window_paints(void)
+{
+    struct window_paint *paint, *next;
+
+    LIST_FOR_EACH_ENTRY_SAFE( paint, next, &get_user_thread_info()->window_paints, struct window_paint, entry )
+    {
+        struct window_paint_surface *entry;
+        BOOL flushed = TRUE;
+        NTSTATUS status;
+
+        if (!paint->ended) continue;
+        LIST_FOR_EACH_ENTRY( entry, &paint->surfaces, struct window_paint_surface, entry )
+            if (!window_surface_flush( entry->surface )) flushed = FALSE;
+        if (!flushed && !paint->failed)
+            continue;
+        status = paint->failed ? STATUS_UNSUCCESSFUL :
+                 user_driver->pWindowPaint( paint->hwnd, WINDOW_PAINT_SUBMIT, paint->token );
+        if (status != STATUS_SUCCESS)
+        {
+            user_driver->pWindowPaint( paint->hwnd, WINDOW_PAINT_CANCEL, paint->token );
+            SERVER_START_REQ( complete_window_paint )
+            {
+                req->token = paint->token;
+                req->success = FALSE;
+                wine_server_call( req );
+            }
+            SERVER_END_REQ;
+        }
+        free_window_paint( paint );
+    }
+}
+
+void cleanup_window_paints( HWND hwnd )
+{
+    struct window_paint *paint, *next;
+
+    LIST_FOR_EACH_ENTRY_SAFE( paint, next, &get_user_thread_info()->window_paints, struct window_paint, entry )
+    {
+        if (hwnd && paint->hwnd != hwnd) continue;
+        user_driver->pWindowPaint( paint->hwnd, WINDOW_PAINT_CANCEL, paint->token );
+        if (hwnd && paint->beginning) paint->cancelled = TRUE;
+        else free_window_paint( paint );
+    }
+}
+
+struct window_paint *begin_window_paint( HWND hwnd )
+{
+    struct window_paint *paint = calloc( 1, sizeof(*paint) );
+    UINT64 token = 0;
+
+    hwnd = get_full_window_handle( hwnd );
+    SERVER_START_REQ( begin_window_paint )
+    {
+        req->handle = wine_server_user_handle( hwnd );
+        req->tracked = !!paint;
+        if (!wine_server_call( req )) token = reply->token;
+    }
+    SERVER_END_REQ;
+    if (!token)
+    {
+        free( paint );
+        return NULL;
+    }
+    if (paint)
+    {
+        paint->hwnd = hwnd;
+        paint->token = token;
+        paint->beginning = TRUE;
+        list_init( &paint->surfaces );
+        paint->failed = user_driver->pWindowPaint( hwnd, WINDOW_PAINT_RESERVE, token ) != STATUS_SUCCESS;
+        list_add_head( &get_user_thread_info()->window_paints, &paint->entry );
+    }
+
+    return paint;
+}
+
+void end_window_paint( struct window_paint *paint, BOOL success )
+{
+    NTSTATUS status;
+
+    if (!paint) return;
+    paint->beginning = FALSE;
+    paint->ended = TRUE;
+    paint->failed |= !success;
+    SERVER_START_REQ( end_window_paint )
+    {
+        req->token = paint->token;
+        status = wine_server_call( req );
+    }
+    SERVER_END_REQ;
+    if (status != STATUS_SUCCESS || paint->cancelled)
+    {
+        user_driver->pWindowPaint( paint->hwnd, WINDOW_PAINT_CANCEL, paint->token );
+        free_window_paint( paint );
+    }
+    else flush_window_paints();
+}
+
 /***********************************************************************
  *           NtUserBeginPaint (win32u.@)
  */
@@ -1818,24 +1984,55 @@ HDC WINAPI NtUserBeginPaint( HWND hwnd, PAINTSTRUCT *ps )
     BOOL erase;
     RECT rect;
     UINT flags = UPDATE_NONCLIENT | UPDATE_ERASE | UPDATE_PAINT | UPDATE_INTERNALPAINT | UPDATE_NOCHILDREN;
+    struct window_paint *paint;
 
     NtUserHideCaret( hwnd );
 
-    if (!(hrgn = send_ncpaint( hwnd, NULL, &flags ))) return 0;
+    paint = begin_window_paint( hwnd );
+
+    if (!(hrgn = send_ncpaint( hwnd, NULL, &flags ))) goto failed;
 
     erase = send_erase( hwnd, flags, hrgn, &rect, &hdc );
 
     TRACE( "hdc = %p box = (%s), fErase = %d\n", hdc, wine_dbgstr_rect(&rect), erase );
 
-    if (!ps)
+    if (!ps || !hdc)
     {
         release_dc( hwnd, hdc, TRUE );
-        return 0;
+        goto failed;
+    }
+    if (paint)
+    {
+        paint->beginning = FALSE;
+        if (paint->cancelled)
+        {
+            free_window_paint( paint );
+            paint = NULL;
+        }
+    }
+    if (paint)
+    {
+        paint->hdc = hdc;
     }
     ps->fErase = erase;
     ps->rcPaint = rect;
     ps->hdc = hdc;
     return hdc;
+
+failed:
+    if (paint)
+    {
+        user_driver->pWindowPaint( hwnd, WINDOW_PAINT_CANCEL, paint->token );
+        SERVER_START_REQ( end_window_paint )
+        {
+            req->token = paint->token;
+            req->cancel = TRUE;
+            wine_server_call( req );
+        }
+        SERVER_END_REQ;
+        free_window_paint( paint );
+    }
+    return 0;
 }
 
 /***********************************************************************
@@ -1843,10 +2040,21 @@ HDC WINAPI NtUserBeginPaint( HWND hwnd, PAINTSTRUCT *ps )
  */
 BOOL WINAPI NtUserEndPaint( HWND hwnd, const PAINTSTRUCT *ps )
 {
+    struct window_paint *paint;
+
     NtUserShowCaret( hwnd );
     flush_window_surfaces( FALSE );
     if (!ps) return FALSE;
+    hwnd = get_full_window_handle( hwnd );
+    LIST_FOR_EACH_ENTRY( paint, &get_user_thread_info()->window_paints, struct window_paint, entry )
+    {
+        if (paint->ended || !paint->hdc ||
+            paint->hwnd != hwnd || paint->hdc != ps->hdc) continue;
+        break;
+    }
+    if (&paint->entry == &get_user_thread_info()->window_paints) paint = NULL;
     release_dc( hwnd, ps->hdc, TRUE );
+    end_window_paint( paint, TRUE );
     return TRUE;
 }
 
@@ -1864,14 +2072,25 @@ void erase_now( HWND hwnd, UINT rdw_flags )
     /* loop while we find a child to repaint */
     for (;;)
     {
+        struct window_paint *paint;
         UINT flags = UPDATE_NONCLIENT | UPDATE_ERASE;
 
         if (rdw_flags & RDW_NOCHILDREN) flags |= UPDATE_NOCHILDREN;
         else if (rdw_flags & RDW_ALLCHILDREN) flags |= UPDATE_ALLCHILDREN;
         if (need_erase) flags |= UPDATE_DELAYED_ERASE;
 
-        if (!(hrgn = send_ncpaint( hwnd, &child, &flags ))) break;
+        /* Select without validating, then reserve before consuming this exact
+         * child's region. A foreign WM_NCPAINT receiver has its own receipt. */
+        if (!get_update_flags( hwnd, &child, &flags ) || !flags) break;
+        paint = begin_window_paint( child );
+        flags = UPDATE_NONCLIENT | UPDATE_ERASE | UPDATE_NOCHILDREN;
+        if (!(hrgn = send_ncpaint( child, NULL, &flags )))
+        {
+            end_window_paint( paint, FALSE );
+            break;
+        }
         need_erase = send_erase( child, flags, hrgn, NULL, NULL );
+        end_window_paint( paint, TRUE );
 
         if (!flags) break;  /* nothing more to do */
         if ((rdw_flags & RDW_NOCHILDREN) && !need_erase) break;
@@ -2006,6 +2225,7 @@ INT WINAPI NtUserGetUpdateRgn( HWND hwnd, HRGN hrgn, BOOL erase )
     INT retval = ERROR;
     UINT flags = UPDATE_NOCHILDREN, context;
     HRGN update_rgn;
+    struct window_paint *paint = erase ? begin_window_paint( hwnd ) : NULL;
 
     context = set_thread_dpi_awareness_context( get_window_dpi_awareness_context( hwnd ));
 
@@ -2023,6 +2243,7 @@ INT WINAPI NtUserGetUpdateRgn( HWND hwnd, HRGN hrgn, BOOL erase )
         map_window_region( 0, hwnd, hrgn );
     }
     set_thread_dpi_awareness_context( context );
+    end_window_paint( paint, retval != ERROR );
     return retval;
 }
 
@@ -2034,10 +2255,15 @@ BOOL WINAPI NtUserGetUpdateRect( HWND hwnd, RECT *rect, BOOL erase )
     UINT flags = UPDATE_NOCHILDREN;
     HRGN update_rgn;
     BOOL need_erase;
+    struct window_paint *paint = erase ? begin_window_paint( hwnd ) : NULL;
 
     if (erase) flags |= UPDATE_NONCLIENT | UPDATE_ERASE;
 
-    if (!(update_rgn = send_ncpaint( hwnd, NULL, &flags ))) return FALSE;
+    if (!(update_rgn = send_ncpaint( hwnd, NULL, &flags )))
+    {
+        end_window_paint( paint, FALSE );
+        return FALSE;
+    }
 
     if (rect && NtGdiGetRgnBox( update_rgn, rect ) != NULLREGION)
     {
@@ -2051,6 +2277,7 @@ BOOL WINAPI NtUserGetUpdateRect( HWND hwnd, RECT *rect, BOOL erase )
         NtUserReleaseDC( hwnd, hdc );
     }
     need_erase = send_erase( hwnd, flags, update_rgn, NULL, NULL );
+    end_window_paint( paint, TRUE );
 
     /* check if we still have an update region */
     flags = UPDATE_PAINT | UPDATE_NOCHILDREN;
