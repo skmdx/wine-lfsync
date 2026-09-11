@@ -5212,6 +5212,14 @@ static int collect_client_surface_scene_snapshot( struct window *win, struct win
         if (layer.producer.visible && !(layer.flags & CLIENT_SURFACE_SCENE_PRESENT_RECT))
         {
             if (!(visible = get_visible_region( win, get_client_surface_scene_clip_flags( win ) ))) return 0;
+            /* A parent DC may draw outside its own window shape. An image
+             * contribution still belongs to that window, including when
+             * the general DC visibility starts with its parent's region. */
+            if (win->win_region && !intersect_region( visible, visible, win->win_region ))
+            {
+                free_region( visible );
+                return 0;
+            }
             offset_region( visible, win->window_rect.left - win->client_rect.left,
                             win->window_rect.top - win->client_rect.top );
             rects = get_region_rectangles( visible, &layer.visible_count );
