@@ -21,7 +21,6 @@
 #include "x11drv.h"
 #include "client_surface_query.h"
 
-WINE_DEFAULT_DEBUG_CHANNEL(x11drv);
 WINE_DECLARE_DEBUG_CHANNEL(csperf);
 
 /* Query storage is embedded in admitted bindings. Bound queued, running and

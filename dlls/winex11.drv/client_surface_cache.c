@@ -22,7 +22,6 @@
 #include "client_surface.h"
 #include "client_surface_cache.h"
 
-WINE_DEFAULT_DEBUG_CHANNEL(x11drv);
 WINE_DECLARE_DEBUG_CHANNEL(csperf);
 
 enum cache_operation { CACHE_IDLE, CACHE_CREATE, CACHE_COPY, CACHE_RELEASE };

@@ -274,7 +274,7 @@ static struct client_surface_memory_account *acquire_memory_account( enum memory
      * Pin that object even after exit, for as long as its images are retained. */
     if (kind == MEMORY_OWNER && (status = NtOpenProcess( &process, SYNCHRONIZE, &attr, &client_id )))
     {
-        WARN( "failed to retain image owner %s, status %#lx\n", wine_dbgstr_longlong( key ), status );
+        WARN( "failed to retain image owner %s, status %#x\n", wine_dbgstr_longlong( key ), (unsigned int)status );
         return NULL;
     }
     if (!client_surface_reserve_metadata_memory( sizeof(*next) )) goto failed;
