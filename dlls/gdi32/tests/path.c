@@ -1933,6 +1933,61 @@ static void test_clipped_polygon_fill(void)
     ReleaseDC( 0, hdc );
 }
 
+static void test_window_path(void)
+{
+    static const struct
+    {
+        const char *name;
+        BOOL (WINAPI *draw)(HDC);
+        COLORREF inside, edge;
+    } tests[] =
+    {
+        {"FillPath", FillPath, RGB(255,0,0), RGB(255,0,0)},
+        {"StrokePath", StrokePath, CLR_INVALID, RGB(0,0,255)},
+        {"StrokeAndFillPath", StrokeAndFillPath, RGB(255,0,0), RGB(0,0,255)},
+    };
+    HBRUSH brush = CreateSolidBrush(RGB(255,0,0));
+    HPEN pen = CreatePen(PS_SOLID, 1, RGB(0,0,255));
+    unsigned int i;
+
+    for (i = 0; i < ARRAY_SIZE(tests); ++i)
+    {
+        HWND hwnd = CreateWindowA("static", NULL, WS_POPUP | WS_VISIBLE, 100, 100, 64, 64,
+                                  NULL, NULL, NULL, NULL);
+        HDC dc = hwnd ? GetDC(hwnd) : 0;
+        COLORREF color;
+
+        winetest_push_context("%s", tests[i].name);
+        ok(!!hwnd && !!dc, "Failed to create window DC, error %lu\n", GetLastError());
+        if (hwnd && dc)
+        {
+            SelectObject(dc, brush);
+            SelectObject(dc, pen);
+            ok(PatBlt(dc, 0, 0, 64, 64, WHITENESS), "Failed to clear window\n");
+            ok(BeginPath(dc), "BeginPath failed\n");
+            ok(Rectangle(dc, 80, 80, 100, 100), "Rectangle failed\n");
+            ok(EndPath(dc), "EndPath failed\n");
+            /* Keep the same DC and closed path across a surface resize. The
+             * drawing call must refresh its destination before dispatch. */
+            ok(SetWindowPos(hwnd, NULL, 0, 0, 128, 128, SWP_NOMOVE | SWP_NOZORDER | SWP_NOREDRAW),
+               "SetWindowPos failed\n");
+            ok(tests[i].draw(dc), "Path drawing failed, error %lu\n", GetLastError());
+            if (tests[i].inside != CLR_INVALID)
+            {
+                color = GetPixel(dc, 90, 90);
+                ok(color == tests[i].inside, "Interior color %#lx, expected %#lx\n", color, tests[i].inside);
+            }
+            color = GetPixel(dc, 80, 90);
+            ok(color == tests[i].edge, "Edge color %#lx, expected %#lx\n", color, tests[i].edge);
+        }
+        if (dc) ReleaseDC(hwnd, dc);
+        if (hwnd) DestroyWindow(hwnd);
+        winetest_pop_context();
+    }
+    DeleteObject(pen);
+    DeleteObject(brush);
+}
+
 START_TEST(path)
 {
     test_path_state();
@@ -1947,4 +2002,5 @@ START_TEST(path)
     test_ellipse();
     test_clipped_polygon_fill();
     test_all_functions();
+    test_window_path();
 }
