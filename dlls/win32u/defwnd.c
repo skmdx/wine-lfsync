@@ -306,7 +306,7 @@ static BOOL set_window_text( HWND hwnd, const void *text, BOOL ansi )
 
     TRACE( "%p, %s\n", hwnd, debugstr_w(str) );
 
-    if (!(win = get_win_ptr( hwnd )))
+    if (!(win = get_win_ptr( hwnd )) || win == WND_OTHER_PROCESS || win == WND_DESKTOP)
     {
         free( str );
         return FALSE;
@@ -352,7 +352,7 @@ static HICON get_window_icon( HWND hwnd, WPARAM type )
     HICON ret;
     WND *win;
 
-    if (!(win = get_win_ptr( hwnd ))) return 0;
+    if (!(win = get_win_ptr( hwnd )) || win == WND_OTHER_PROCESS || win == WND_DESKTOP) return 0;
 
     switch(type)
     {
@@ -382,7 +382,7 @@ static HICON set_window_icon( HWND hwnd, WPARAM type, HICON icon )
     ICONINFO ii, ii_small;
     WND *win;
 
-    if (!(win = get_win_ptr( hwnd ))) return 0;
+    if (!(win = get_win_ptr( hwnd )) || win == WND_OTHER_PROCESS || win == WND_DESKTOP) return 0;
 
     switch (type)
     {
@@ -1727,7 +1727,7 @@ static void nc_paint( HWND hwnd, HRGN clip )
     HRGN hrgn;
     RECT rectClient;
 
-    if (!(win = get_win_ptr( hwnd )) || win == WND_OTHER_PROCESS) return;
+    if (!(win = get_win_ptr( hwnd )) || win == WND_OTHER_PROCESS || win == WND_DESKTOP) return;
     style = win->dwStyle;
     ex_style = win->dwExStyle;
     flags = win->flags;
@@ -2426,7 +2426,7 @@ LRESULT default_window_proc( HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam, 
     case WM_NCDESTROY:
         {
             WND *win = get_win_ptr( hwnd );
-            if (!win) return 0;
+            if (!win || win == WND_OTHER_PROCESS || win == WND_DESKTOP) return 0;
             free( win->text );
             win->text = NULL;
             free( win->pScroll );
@@ -2632,7 +2632,8 @@ LRESULT default_window_proc( HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam, 
     case WM_GETTEXTLENGTH:
         {
             WND *win = get_win_ptr( hwnd );
-            if (win && win->text)
+            if (!win || win == WND_OTHER_PROCESS || win == WND_DESKTOP) break;
+            if (win->text)
             {
                 if (ansi)
                     result = win32u_wctomb_size( &ansi_cp, win->text, wcslen( win->text ));
@@ -2648,7 +2649,7 @@ LRESULT default_window_proc( HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam, 
         {
             WND *win;
 
-            if (!(win = get_win_ptr( hwnd ))) break;
+            if (!(win = get_win_ptr( hwnd )) || win == WND_OTHER_PROCESS || win == WND_DESKTOP) break;
 
             __TRY
             {
@@ -2711,7 +2712,7 @@ LRESULT default_window_proc( HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam, 
             if (!(style & WS_VISIBLE) && !wparam) break;
             if (!get_window_relative( hwnd, GW_OWNER )) break;
             if (!(win = get_win_ptr( hwnd ))) break;
-            if (win == WND_OTHER_PROCESS) break;
+            if (win == WND_OTHER_PROCESS || win == WND_DESKTOP) break;
             if (wparam)
             {
                 if (!(win->flags & WIN_NEEDS_SHOW_OWNEDPOPUP))
