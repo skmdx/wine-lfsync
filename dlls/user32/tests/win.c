@@ -9396,6 +9396,187 @@ static void test_message_window_topmost(void)
 }
 
 
+static void layered_window_shape_read( HWND hwnd )
+{
+    HANDLE ready = OpenEventA( SYNCHRONIZE, FALSE, "test_layered_shape_ready" );
+    HANDLE done = OpenEventA( EVENT_MODIFY_STATE, FALSE, "test_layered_shape_done" );
+    DWORD pid = 0, start, ret;
+    unsigned int i;
+    COLORREF color;
+    HDC hdc;
+
+    ok( ready && done, "OpenEvent failed, error %lu\n", GetLastError() );
+    GetWindowThreadProcessId( hwnd, &pid );
+    ok( pid && pid != GetCurrentProcessId(), "Expected foreign window, owner pid %lu\n", pid );
+    if (!ready || !done || !pid || pid == GetCurrentProcessId()) goto done;
+    for (i = 0; i < 3; ++i)
+    {
+        ret = WaitForSingleObject( ready, 5000 );
+        ok( ret == WAIT_OBJECT_0, "Read %u wait returned %#lx\n", i, ret );
+        if (ret != WAIT_OBJECT_0) break;
+        /* A foreign DC cannot attach the owner's CPU window surface in Wine;
+         * it reads the native window. Reacquire to refresh its visible region. */
+        hdc = GetDC( hwnd );
+        ok( hdc != NULL, "GetDC failed, error %lu\n", GetLastError() );
+        if (!hdc) break;
+        {
+            RECT clip = {0};
+            ret = GetClipBox( hdc, &clip );
+            ok( ret == SIMPLEREGION && !clip.left && !clip.top && clip.right == (i ? 128 : 64) && clip.bottom == 128,
+                "Read %u clip type %lu rect %s\n", i, ret, wine_dbgstr_rect(&clip) );
+        }
+        start = GetTickCount();
+        do
+        {
+            color = GetPixel( hdc, i ? 96 : 32, 64 );
+            if (color == RGB(255,0,0)) break;
+            Sleep( 10 );
+        } while (GetTickCount() - start < 1000);
+        ReleaseDC( hwnd, hdc );
+        ok( color == RGB(255,0,0), "Read %u native window color %#lx, expected red\n", i, color );
+        if (!i && color != RGB(255,0,0)) break;
+        SetEvent( done );
+    }
+done:
+    if (ready) CloseHandle( ready );
+    if (done) CloseHandle( done );
+}
+
+static BOOL read_layered_window_shape( const PROCESS_INFORMATION *process, HANDLE ready, HANDLE done )
+{
+    HANDLE events[2] = {process->hProcess, done};
+    DWORD ret;
+
+    SetEvent( ready );
+    ret = WaitForMultipleObjects( 2, events, FALSE, 5000 );
+    ok( ret == WAIT_OBJECT_0 || ret == WAIT_OBJECT_0 + 1, "Reader wait returned %#lx\n", ret );
+    return ret == WAIT_OBJECT_0 + 1;
+}
+
+static void test_layered_window_shape_mode( const char *argv0, DWORD flags, BYTE alpha_format, DWORD pixel )
+{
+    WNDCLASSA cls = {0};
+    BITMAPINFO info = {{sizeof(BITMAPINFOHEADER), 128, -128, 1, 32, BI_RGB}};
+    BLENDFUNCTION blend = {AC_SRC_OVER, 0, 255, alpha_format};
+    STARTUPINFOA startup = {.cb = sizeof(startup)};
+    PROCESS_INFORMATION process = {0};
+    POINT position = {100, 100}, source = {0, 0};
+    SIZE size = {128, 128};
+    HANDLE ready = NULL, done = NULL;
+    HDC screen = NULL, memory = NULL;
+    HBITMAP bitmap = NULL, previous = NULL;
+    HWND hwnd = NULL;
+    HRGN region = NULL;
+    char command[MAX_PATH + 64];
+    DWORD *pixels;
+    BOOL ret;
+    unsigned int i;
+
+    if (!pUpdateLayeredWindow)
+    {
+        win_skip( "layered windows not supported\n" );
+        return;
+    }
+    cls.lpfnWndProc = DefWindowProcA;
+    cls.hInstance = GetModuleHandleA( NULL );
+    cls.lpszClassName = "layered_window_shape";
+    ret = RegisterClassA( &cls );
+    ok( ret, "RegisterClass failed, error %lu\n", GetLastError() );
+    if (!ret) return;
+
+    screen = GetDC( NULL );
+    memory = CreateCompatibleDC( screen );
+    bitmap = CreateDIBSection( screen, &info, DIB_RGB_COLORS, (void **)&pixels, NULL, 0 );
+    ok( screen && memory && bitmap, "Failed to create bitmap DCs\n" );
+    if (!screen || !memory || !bitmap) goto done;
+    previous = SelectObject( memory, bitmap );
+    ok( previous && previous != HGDI_ERROR, "SelectObject failed\n" );
+    if (!previous || previous == HGDI_ERROR)
+    {
+        previous = NULL;
+        goto done;
+    }
+    for (i = 0; i < 128 * 128; ++i) pixels[i] = pixel;
+    hwnd = CreateWindowExA( WS_EX_LAYERED | WS_EX_TOPMOST, cls.lpszClassName, NULL,
+                           WS_POPUP | WS_VISIBLE, position.x, position.y, size.cx, size.cy,
+                           NULL, NULL, cls.hInstance, NULL );
+    ok( hwnd != NULL, "CreateWindowEx failed, error %lu\n", GetLastError() );
+    if (!hwnd) goto done;
+
+    for (i = 0; i < 2; ++i)
+    {
+        region = CreateRectRgn( 0, 0, 64, 128 );
+        ok( region != NULL, "CreateRectRgn failed\n" );
+        if (!region) goto done;
+        ret = SetWindowRgn( hwnd, region, FALSE );
+        ok( ret, "SetWindowRgn failed, error %lu\n", GetLastError() );
+        if (!ret) goto done;
+        region = NULL;
+        if (!i)
+        {
+            /* Store the entire image while its right half is clipped out.
+             * No later paint or UpdateLayeredWindow supplies those pixels. */
+            ret = pUpdateLayeredWindow( hwnd, NULL, &position, &size, memory, &source, RGB(0,255,0),
+                                       flags & ULW_ALPHA ? &blend : NULL, flags );
+            ok( ret, "UpdateLayeredWindow failed, error %lu\n", GetLastError() );
+            if (!ret) goto done;
+            flush_events( TRUE ); /* Complete initial mapping, before testing shape changes. */
+            ready = CreateEventA( NULL, FALSE, FALSE, "test_layered_shape_ready" );
+            done = CreateEventA( NULL, FALSE, FALSE, "test_layered_shape_done" );
+            ok( ready && done, "CreateEvent failed, error %lu\n", GetLastError() );
+            if (!ready || !done) goto done;
+            snprintf( command, sizeof(command), "\"%s\" win layered_shape_read %p", argv0, hwnd );
+            ret = CreateProcessA( NULL, command, NULL, NULL, FALSE, 0, NULL, NULL, &startup, &process );
+            ok( ret, "CreateProcess failed, error %lu\n", GetLastError() );
+            if (!ret) goto done;
+            if (!read_layered_window_shape( &process, ready, done )) goto done;
+        }
+
+        if (!i)
+        {
+            region = CreateRectRgn( 0, 0, 128, 128 );
+            ok( region != NULL, "CreateRectRgn failed\n" );
+            if (!region) goto done;
+        }
+        ret = SetWindowRgn( hwnd, region, FALSE );
+        ok( ret, "SetWindowRgn expansion %u failed, error %lu\n", i, GetLastError() );
+        if (!ret) goto done;
+        region = NULL;
+        if (!read_layered_window_shape( &process, ready, done )) goto done;
+    }
+
+done:
+    if (process.hProcess) wait_child_process( &process );
+    if (ready) CloseHandle( ready );
+    if (done) CloseHandle( done );
+    if (region) DeleteObject( region );
+    if (hwnd) DestroyWindow( hwnd );
+    if (previous) SelectObject( memory, previous );
+    if (bitmap) DeleteObject( bitmap );
+    if (memory) DeleteDC( memory );
+    if (screen) ReleaseDC( NULL, screen );
+    UnregisterClassA( cls.lpszClassName, cls.hInstance );
+}
+
+static void test_layered_window_shape( const char *argv0 )
+{
+    static const struct { DWORD flags; BYTE alpha_format; DWORD pixel; } modes[] =
+    {
+        {ULW_OPAQUE, 0, 0x00ff0000},
+        {ULW_COLORKEY, 0, 0x00ff0000},
+        {ULW_ALPHA, 0, 0x00ff0000},
+        {ULW_ALPHA, AC_SRC_ALPHA, 0xffff0000},
+    };
+    unsigned int i;
+
+    for (i = 0; i < ARRAY_SIZE(modes); ++i)
+    {
+        winetest_push_context( "flags %#lx alpha %#x", modes[i].flags, modes[i].alpha_format );
+        test_layered_window_shape_mode( argv0, modes[i].flags, modes[i].alpha_format, modes[i].pixel );
+        winetest_pop_context();
+    }
+}
+
 static void test_layered_window(void)
 {
     HWND hwnd, child;
@@ -14736,6 +14917,11 @@ START_TEST(win)
             other_process_proc(hwnd);
             return;
         }
+        else if (!strcmp( argv[2], "layered_shape_read" ))
+        {
+            layered_window_shape_read( hwnd );
+            return;
+        }
     }
 
     if (argc == 3 && !strcmp(argv[2], "winproc_limit"))
@@ -14753,6 +14939,12 @@ START_TEST(win)
     if (argc == 3 && !strcmp( argv[2], "show_activation" ))
     {
         test_show_window_activation();
+        return;
+    }
+
+    if (argc == 3 && !strcmp( argv[2], "layered_shape" ))
+    {
+        test_layered_window_shape( argv[0] );
         return;
     }
 
@@ -14926,4 +15118,5 @@ START_TEST(win)
 
     test_shell_window();
     test_shell_tray();
+    test_layered_window_shape( argv[0] );
 }
