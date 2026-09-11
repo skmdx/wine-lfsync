@@ -3763,7 +3763,10 @@ static void test_handoff_receipts(void)
     status = get_surface_handoff( hwnd, GetCurrentProcessId(), identity, TRUE, &owner );
     ok( !status, "receipt owner bind status %#x\n", status );
     if (status) goto done;
-    ShowWindow( hwnd, SW_SHOW );
+    /* Match the server-only visibility changes below. Public ShowWindow also
+     * requests GUI painting, which must finish before STAGED can be accepted. */
+    status = set_scene_placement( hwnd, 0, 0, 0, SWP_SHOWWINDOW );
+    ok( !status, "receipt visibility status %#x\n", status );
     status = set_surface_state( hwnd, 0, CLIENT_SURFACE_STATE_STAGED, 0, &state );
     ok( !status && state.staged && state.pending == 1,
         "receipt scene status %#x staged %u pending %u\n", status, state.staged, state.pending );
