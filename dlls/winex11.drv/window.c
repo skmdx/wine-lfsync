@@ -3246,7 +3246,7 @@ BOOL X11DRV_DestroyNotify( HWND hwnd, XEvent *event )
 /* initialize the desktop window id in the desktop manager process */
 static BOOL create_desktop_win_data( Window win, HWND hwnd )
 {
-    struct x11drv_thread_data *thread_data = x11drv_thread_data();
+    struct x11drv_thread_data *thread_data = x11drv_init_thread_data();
     Display *display = thread_data->display;
     struct x11drv_win_data *data;
     struct x11drv_native_window *native_window;
@@ -3273,7 +3273,16 @@ static BOOL create_desktop_win_data( Window win, HWND hwnd )
  */
 void X11DRV_SetDesktopWindow( HWND hwnd )
 {
+    Window win = (Window)NtUserGetProp( hwnd, whole_window_prop );
     unsigned int width, height;
+
+    /* The desktop can return to zero size after its native Window was adopted.
+     * Its property, not its geometry, identifies an initialized desktop. */
+    if (win)
+    {
+        if (win != root_window) X11DRV_init_desktop( win );
+        return;
+    }
 
     /* retrieve the real size of the desktop */
     SERVER_START_REQ( get_window_rectangles )
@@ -3307,11 +3316,6 @@ void X11DRV_SetDesktopWindow( HWND hwnd )
             ERR( "Failed to create virtual desktop window data\n" );
             x11drv_native_window_set_root( DefaultRootWindow( gdi_display ) );
         }
-    }
-    else
-    {
-        Window win = (Window)NtUserGetProp( hwnd, whole_window_prop );
-        if (win && win != root_window) X11DRV_init_desktop( win );
     }
 }
 
