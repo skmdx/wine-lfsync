@@ -653,7 +653,8 @@ enum x11drv_window_messages
     WM_X11DRV_DELETE_TAB,
     WM_X11DRV_ADD_TAB,
     WM_X11DRV_SET_LAYERED_ATTRIBUTES,
-    WM_X11DRV_CLIENT_SURFACE_UPDATE
+    WM_X11DRV_CLIENT_SURFACE_UPDATE,
+    WM_X11DRV_CLIENT_SURFACE_POOL
 };
 
 /* _NET_WM_STATE properties that we keep track of */
@@ -737,6 +738,9 @@ struct x11drv_win_data
     unsigned long client_surface_opacity; /* desired _NET_WM_WINDOW_OPACITY value */
     Pixmap         client_surface_backing;
     Pixmap         client_surface_backing_spare;
+    struct client_surface_output_allocation *client_surface_pending_allocation;
+    UINT64         client_surface_allocation_serial;
+    UINT           client_surface_allocation_update;
     unsigned int   client_surface_backing_width;
     unsigned int   client_surface_backing_height;
     DWORD          client_surface_backing_shrink_start;
@@ -758,8 +762,10 @@ extern BOOL X11DRV_client_surface_prepare_direct( struct client_surface *surface
                                                  const struct client_surface_scene *scene );
 extern void X11DRV_client_surface_complete_direct( struct client_surface *surface,
                                                   const struct client_surface_frame *frame );
-extern BOOL X11DRV_client_surface_prepare_owner( struct x11drv_win_data *data );
-extern BOOL X11DRV_client_surface_backing_ensure( struct x11drv_win_data *data );
+extern NTSTATUS X11DRV_client_surface_prepare_owner( struct x11drv_win_data *data );
+extern NTSTATUS X11DRV_client_surface_backing_ensure( struct x11drv_win_data *data );
+extern UINT X11DRV_client_surface_backing_pool_ready( HWND hwnd, UINT64 serial );
+extern void X11DRV_client_surface_backing_cancel_allocation( struct x11drv_win_data *data );
 extern BOOL X11DRV_client_surface_bind_producers( HWND toplevel );
 struct client_surface_owner_notifications;
 extern struct client_surface_owner_notifications *X11DRV_client_surface_backing_begin_update(
@@ -771,9 +777,10 @@ extern void X11DRV_client_surface_backing_finish_deferred_update( HWND hwnd, UIN
 #define X11DRV_CLIENT_SURFACE_UPDATE_STATE   1
 #define X11DRV_CLIENT_SURFACE_UPDATE_BACKING 2
 #define X11DRV_CLIENT_SURFACE_UPDATE_PREPARE 4
-extern void X11DRV_client_surface_backing_end_update( struct x11drv_win_data *data,
-                                                       struct client_surface_owner_notifications *notifications );
-extern BOOL X11DRV_client_surface_backing_snapshot( struct x11drv_win_data *data, BOOL invalidate );
+extern NTSTATUS X11DRV_client_surface_backing_end_update( struct x11drv_win_data *data,
+                                                           struct client_surface_owner_notifications *notifications,
+                                                           NTSTATUS status );
+extern NTSTATUS X11DRV_client_surface_backing_snapshot( struct x11drv_win_data *data, BOOL invalidate );
 extern BOOL X11DRV_client_surface_backing_publish( struct x11drv_win_data *data );
 extern BOOL X11DRV_client_surface_backing_restore( struct x11drv_win_data *data,
                                                   Window window, const RECT *rect );

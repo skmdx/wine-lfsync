@@ -2289,10 +2289,15 @@ static LRESULT handle_internal_message( HWND hwnd, UINT msg, WPARAM wparam, LPAR
         else if (wparam == WINE_PREPARE_CLIENT_SURFACES)
         {
             struct client_surface_scene scene;
+            NTSTATUS status;
 
-            if (client_surface_begin_prepare( hwnd, &scene ) &&
-                prepare_window_client_surfaces( hwnd ) == STATUS_SUCCESS)
-                client_surface_end_prepare( &scene );
+            /* A native allocation completion can arrive after preparation
+             * was cancelled. Let its owner distinguish that from a driver
+             * which accepted a retry and is still preparing. */
+            if (!client_surface_begin_prepare( hwnd, &scene )) return STATUS_NOT_FOUND;
+            status = prepare_window_client_surfaces( hwnd );
+            if (status == STATUS_SUCCESS) client_surface_end_prepare( &scene );
+            return status;
         }
         else if (wparam == WINE_UPDATE_CLIENT_SURFACE_HANDOFFS)
             update_window_state( hwnd );

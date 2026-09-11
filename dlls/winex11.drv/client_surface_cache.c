@@ -63,9 +63,8 @@ struct client_surface_cache_image
  * Each admitted image already owns its work/release node. Scoped byte limits
  * apply independently. No native operation holds the scheduler mutex.
  * Connections belong to workers for the process lifetime, never to an owner
- * target. Worker-created images keep one connection for allocation, fallback
- * reads and destruction. Adopted output pairs retain their creator only as a
- * trace key; their final destruction uses the assigned worker's connection. */
+ * target. Images keep one connection for allocation, fallback reads and
+ * destruction, independently of the GUI and compositor connections. */
 #define CLIENT_SURFACE_CACHE_IMAGE_LIMIT 8192
 /* Source churn must not consume admission reserved for active output. This
  * is part of the same total bound, not an additional uncharged image pool. */
@@ -169,12 +168,13 @@ static void create_output_image( struct client_surface_cache_image *image )
     image->pixmap = XCreatePixmap( display, root_window, image->width, image->height, image->depth );
     XSync( display, False );
     image->success = image->pixmap && !worker->error;
-    TRACE_(csperf)( "ticks=%llu event=output_mailbox_alloc image=%p window=%lx pixmap=%lx display=%p "
+    TRACE_(csperf)( "ticks=%llu event=%s image=%p window=%lx pixmap=%lx display=%p "
                    "width=%u height=%u depth=%u sync_calls=1 error=%d success=%u\n",
-                   cache_time(), image, image->window, image->pixmap, display, image->width, image->height,
+                   cache_time(), image->kind == CACHE_IMAGE_OUTPUT_PAIR ? "output_pair_native_alloc" : "output_mailbox_alloc",
+                   image, image->window, image->pixmap, display, image->width, image->height,
                    image->depth, worker->error, image->success );
     if ((image->acquired = image->success))
-        x11drv_client_surface_trace_image( "acquire", "output_mailbox", display, image->pixmap, image->bytes );
+        x11drv_client_surface_trace_image( "acquire", cache_image_kind( image ), display, image->pixmap, image->bytes );
 }
 
 static BOOL destroy_cache_image( struct client_surface_cache_image *image )
@@ -423,8 +423,8 @@ BOOL client_surface_cache_reserve_output_pair(
         goto failed;
     }
     /* The first admitted worker also guarantees a release executor for the
-     * second record if another worker cannot be started. No work is queued
-     * until the caller returns its final reference after native use drains. */
+     * second record if another worker cannot be started. Creation is queued
+     * only after the caller has initialized the shared completion context. */
     images[1]->worker = select_cache_worker();
     assert( images[1]->worker );
     image_count += 2;
@@ -440,27 +440,23 @@ failed:
     return FALSE;
 }
 
-void client_surface_cache_adopt_output_pair( struct client_surface_cache_image *images[2],
-                                             Display *owner_display, const Pixmap pixmaps[2], BOOL valid )
+void client_surface_cache_create_output_pair( struct client_surface_cache_image *images[2],
+                                              unsigned int width, unsigned int height, unsigned int depth,
+                                              client_surface_cache_callback complete, void *context )
 {
     struct client_surface_cache_image *image;
     unsigned int i;
 
-    assert( owner_display && (!valid || (pixmaps[0] && pixmaps[1])) );
     pthread_mutex_lock( &cache_mutex );
     for (i = 0; i < 2; ++i)
     {
         image = images[i];
         assert( image && image->kind == CACHE_IMAGE_OUTPUT_PAIR && image->operation == CACHE_IDLE &&
                 image->refs == 1 && !image->owner_display && !image->pixmap );
-        image->owner_display = owner_display;
-        image->pixmap = pixmaps[i];
-        image->acquired = image->success = valid;
-        TRACE_(csperf)( "ticks=%llu event=output_pair_adopt image=%p pixmap=%lx display=%p valid=%u worker=%u\n",
-                       cache_time(), image, image->pixmap, owner_display, valid,
-                       (unsigned int)(image->worker - cache_workers) );
-        if (image->acquired)
-            x11drv_client_surface_trace_image( "acquire", "output_pair", owner_display, image->pixmap, image->bytes );
+        image->width = width;
+        image->height = height;
+        image->depth = depth;
+        queue_cache_image( image, CACHE_CREATE, complete, context );
     }
     pthread_mutex_unlock( &cache_mutex );
 }
