@@ -48,7 +48,6 @@ struct client_surface_cache_image
     client_surface_cache_callback complete;
     void *context;
     Pixmap pixmap, source;
-    Display *owner_display;
     Window window;
     GC gc, transfer_gc;
     unsigned int width, height, depth;
@@ -177,22 +176,14 @@ static void create_output_image( struct client_surface_cache_image *image )
         x11drv_client_surface_trace_image( "acquire", cache_image_kind( image ), display, image->pixmap, image->bytes );
 }
 
-static BOOL destroy_cache_image( struct client_surface_cache_image *image )
+static void destroy_cache_image( struct client_surface_cache_image *image )
 {
     struct cache_worker *worker = image->worker;
-    Display *display;
+    Display *display = worker->display;
 
-    if ((image->gc || image->transfer_gc || image->pixmap) && !open_cache_display( worker ))
-    {
-        TRACE_(csperf)( "ticks=%llu event=cache_native_release_deferred image=%p pixmap=%lx "
-                       "owner_display=%p display=%p kind=%s bytes=%llu purpose=%u worker=%u open_failed=1\n",
-                       cache_time(), image, image->pixmap, image->owner_display, worker->display,
-                       cache_image_kind( image ), (unsigned long long)image->bytes, image->purpose,
-                       (unsigned int)(worker - cache_workers) );
-        return FALSE;
-    }
-    display = worker->display;
-
+    /* Every native object was created on this worker's process-lifetime
+     * connection. An open failure can leave only an empty image record. */
+    assert( display || (!image->gc && !image->transfer_gc && !image->pixmap) );
     worker->error = 0;
     if (image->gc) XFreeGC( display, image->gc );
     if (image->transfer_gc) XFreeGC( display, image->transfer_gc );
@@ -200,13 +191,10 @@ static BOOL destroy_cache_image( struct client_surface_cache_image *image )
     if (image->gc || image->transfer_gc || image->pixmap) XSync( display, False );
     TRACE_(csperf)( "ticks=%llu event=cache_native_free image=%p pixmap=%lx display=%p error=%d "
                    "owner_display=%p kind=%s\n", cache_time(), image, image->pixmap, display, worker->error,
-                   image->owner_display ? image->owner_display : display, cache_image_kind( image ) );
+                   display, cache_image_kind( image ) );
     if (image->acquired)
-        x11drv_client_surface_trace_image( "free", cache_image_kind( image ),
-                                          image->owner_display ? image->owner_display : display,
-                                          image->pixmap, image->bytes );
+        x11drv_client_surface_trace_image( "free", cache_image_kind( image ), display, image->pixmap, image->bytes );
     client_surface_release_scoped_memory( &image->memory, image->purpose, image->bytes );
-    return TRUE;
 }
 
 static void cache_worker_thread( void *context )
@@ -214,7 +202,6 @@ static void cache_worker_thread( void *context )
     struct cache_worker *worker = context;
     struct client_surface_cache_image *image;
     enum cache_operation operation;
-    const LARGE_INTEGER retry_delay = {.QuadPart = -10000000};
     void (*wake)(void);
 
     for (;;)
@@ -232,13 +219,7 @@ static void cache_worker_thread( void *context )
             else create_output_image( image );
             break;
         case CACHE_COPY: copy_cache_image( image ); break;
-        case CACHE_RELEASE:
-            /* Created XIDs retain their admitted release node and charge
-             * through a transient failure to open the private connection.
-             * A relative wait keeps this worker from spinning or borrowing
-             * the actor's Display; other workers remain independent. */
-            while (!destroy_cache_image( image )) NtDelayExecution( FALSE, &retry_delay );
-            break;
+        case CACHE_RELEASE: destroy_cache_image( image ); break;
         default: assert( 0 );
         }
 
@@ -452,7 +433,7 @@ void client_surface_cache_create_output_pair( struct client_surface_cache_image 
     {
         image = images[i];
         assert( image && image->kind == CACHE_IMAGE_OUTPUT_PAIR && image->operation == CACHE_IDLE &&
-                image->refs == 1 && !image->owner_display && !image->pixmap );
+                image->refs == 1 && !image->pixmap );
         image->width = width;
         image->height = height;
         image->depth = depth;
@@ -516,7 +497,7 @@ void client_surface_cache_release( struct client_surface_cache_image *image )
     {
         if (image->acquired)
             x11drv_client_surface_trace_image( "retire", cache_image_kind( image ),
-                                              image->owner_display ? image->owner_display : image->worker->display,
+                                              image->worker->display,
                                               image->pixmap, image->bytes );
         queue_cache_image( image, CACHE_RELEASE, NULL, NULL );
     }
