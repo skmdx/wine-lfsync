@@ -243,6 +243,7 @@ void *next_thread_user_object( UINT tid, HANDLE *handle, unsigned short type )
         if (!get_user_entry_at( i, type, &entry, handle )) continue;
         if (entry.pid != GetCurrentProcessId()) continue;
         if (tid != -1 && entry.tid != tid) continue;
+        if (!client_objects[i]) continue;  /* Server-created objects have no local allocation. */
         return client_objects[i];
     }
 
