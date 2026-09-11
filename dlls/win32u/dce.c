@@ -414,17 +414,18 @@ static void set_surface_shape_rect( BYTE *bits, UINT stride, const RECT *rect )
     }
 }
 
-static void *window_surface_get_shape( struct window_surface *surface, BITMAPINFO *info )
+static void *get_surface_bitmap_bits( HBITMAP bitmap, BITMAPINFO *info )
 {
     struct bitblt_coords coords = {0};
     struct gdi_image_bits gdi_bits;
     BITMAPOBJ *bmp;
+    DWORD err;
 
-    if (!(bmp = GDI_GetObjPtr( surface->shape_bitmap, NTGDI_OBJ_BITMAP ))) return NULL;
-    get_image_from_bitmap( bmp, info, &gdi_bits, &coords );
-    GDI_ReleaseObj( surface->shape_bitmap );
+    if (!(bmp = GDI_GetObjPtr( bitmap, NTGDI_OBJ_BITMAP ))) return NULL;
+    err = get_image_from_bitmap( bmp, info, &gdi_bits, &coords );
+    GDI_ReleaseObj( bitmap );
 
-    return gdi_bits.ptr;
+    return err ? NULL : gdi_bits.ptr;
 }
 
 static BYTE shape_from_alpha_mask( UINT32 *bits, UINT32 alpha_mask, UINT32 alpha )
@@ -448,12 +449,11 @@ static BYTE shape_from_color_key_32( UINT32 *bits, UINT32 color_mask, UINT32 col
     return ~mask;
 }
 
-static BOOL set_surface_shape( struct window_surface *surface, const RECT *rect, const RECT *dirty,
-                               const BITMAPINFO *color_info, void *color_bits )
+static int set_surface_shape( struct window_surface *surface, const RECT *rect, const RECT *dirty,
+                              const BITMAPINFO *color_info, void *color_bits,
+                              BITMAPINFO *shape_info, void **ret_bits )
 {
     UINT width, height, x, y, shape_stride, color_stride, alpha_mask = surface->alpha_mask;
-    char shape_buf[FIELD_OFFSET( BITMAPINFO, bmiColors[256] )];
-    BITMAPINFO *shape_info = (BITMAPINFO *)shape_buf;
     COLORREF color_key = surface->color_key;
     void *shape_bits, *old_shape = NULL;
     RECT *shape_rect, tmp_rect;
@@ -465,11 +465,11 @@ static BOOL set_surface_shape( struct window_surface *surface, const RECT *rect,
     assert( !(width & 7) ); /* expect 1bpp bitmap to be aligned on bytes */
 
     if ((is_new = !surface->shape_bitmap)) surface->shape_bitmap = NtGdiCreateBitmap( width, height, 1, 1, NULL );
-    if (!(shape_bits = window_surface_get_shape( surface, shape_info ))) return FALSE;
+    if (!(shape_bits = get_surface_bitmap_bits( surface->shape_bitmap, shape_info ))) goto failed;
 
     if (!is_new)
     {
-        old_shape = malloc( shape_info->bmiHeader.biSizeImage );
+        if (!(old_shape = malloc( shape_info->bmiHeader.biSizeImage ))) goto failed;
         memcpy( old_shape, shape_bits, shape_info->bmiHeader.biSizeImage );
     }
 
@@ -477,8 +477,9 @@ static BOOL set_surface_shape( struct window_surface *surface, const RECT *rect,
     shape_stride = shape_info->bmiHeader.biSizeImage / abs( shape_info->bmiHeader.biHeight );
 
     if (!surface->shape_region) set_surface_shape_rect( shape_bits, shape_stride, dirty );
-    else if ((data = GDI_GetObjPtr( surface->shape_region, NTGDI_OBJ_REGION )))
+    else
     {
+        if (!(data = GDI_GetObjPtr( surface->shape_region, NTGDI_OBJ_REGION ))) goto failed;
         if (EqualRect( rect, dirty )) memset( shape_bits, 0, shape_info->bmiHeader.biSizeImage );
         for (shape_rect = data->rects; shape_rect < data->rects + data->numRects; shape_rect++)
         {
@@ -543,7 +544,17 @@ static BOOL set_surface_shape( struct window_surface *surface, const RECT *rect,
 
     ret = is_new || memcmp( old_shape, shape_bits, shape_info->bmiHeader.biSizeImage );
     free( old_shape );
+    *ret_bits = shape_bits;
     return ret;
+
+failed:
+    if (is_new && surface->shape_bitmap)
+    {
+        NtGdiDeleteObjectApp( surface->shape_bitmap );
+        surface->shape_bitmap = 0;
+    }
+    free( old_shape );
+    return -1;
 }
 
 static BOOL clear_surface_shape( struct window_surface *surface )
@@ -554,23 +565,22 @@ static BOOL clear_surface_shape( struct window_surface *surface )
     return TRUE;
 }
 
-static BOOL update_surface_shape( struct window_surface *surface, const RECT *rect, const RECT *dirty,
-                                  const BITMAPINFO *color_info, void *color_bits )
+/* Return -1 on failure, otherwise whether the shape changed. */
+static int update_surface_shape( struct window_surface *surface, const RECT *rect, const RECT *dirty,
+                                 const BITMAPINFO *color_info, void *color_bits,
+                                 BITMAPINFO *shape_info, void **shape_bits )
 {
+    *shape_bits = NULL;
     if (surface == &dummy_surface) return FALSE;
 
     if (surface->shape_region || surface->alpha_mask || surface->color_key != CLR_INVALID)
-        return set_surface_shape( surface, rect, dirty, color_info, color_bits );
+        return set_surface_shape( surface, rect, dirty, color_info, color_bits, shape_info, shape_bits );
     else
         return clear_surface_shape( surface );
 }
 
 static void *window_surface_get_color( struct window_surface *surface, BITMAPINFO *info )
 {
-    struct bitblt_coords coords = {0};
-    struct gdi_image_bits gdi_bits;
-    BITMAPOBJ *bmp;
-
     if (surface == &dummy_surface)
     {
         static BITMAPINFOHEADER header = {.biSize = sizeof(header), .biWidth = 1, .biHeight = 1,
@@ -581,17 +591,14 @@ static void *window_surface_get_color( struct window_surface *surface, BITMAPINF
         return &dummy_data;
     }
 
-    if (!(bmp = GDI_GetObjPtr( surface->color_bitmap, NTGDI_OBJ_BITMAP ))) return NULL;
-    get_image_from_bitmap( bmp, info, &gdi_bits, &coords );
-    GDI_ReleaseObj( surface->color_bitmap );
-
-    return gdi_bits.ptr;
+    return get_surface_bitmap_bits( surface->color_bitmap, info );
 }
 
 struct window_surface *window_surface_create( UINT size, const struct window_surface_funcs *funcs, HWND hwnd,
                                               const RECT *rect, BITMAPINFO *info, HBITMAP bitmap )
 {
     struct window_surface *surface;
+    void *bits;
 
     if (!(surface = calloc( 1, size ))) return NULL;
     surface->funcs = funcs;
@@ -603,16 +610,19 @@ struct window_surface *window_surface_create( UINT size, const struct window_sur
     surface->alpha_mask = 0;
     reset_bounds( &surface->bounds );
 
-    if (!bitmap) bitmap = NtGdiCreateDIBSection( 0, NULL, 0, info, DIB_RGB_COLORS, 0, 0, 0, NULL );
-    if (!(surface->color_bitmap = bitmap))
+    surface->color_bitmap = bitmap;
+    if (!bitmap) surface->color_bitmap = NtGdiCreateDIBSection( 0, NULL, 0, info, DIB_RGB_COLORS, 0, 0, 0, NULL );
+    if (!surface->color_bitmap || !(bits = window_surface_get_color( surface, info )))
     {
+        /* The caller retains a supplied bitmap until creation succeeds. */
+        if (!bitmap && surface->color_bitmap) NtGdiDeleteObjectApp( surface->color_bitmap );
         free( surface );
         return NULL;
     }
 
     pthread_mutex_init( &surface->mutex, NULL );
 
-    memset( window_surface_get_color( surface, info ), 0xff, info->bmiHeader.biSizeImage );
+    memset( bits, 0xff, info->bmiHeader.biSizeImage );
 
     TRACE( "created surface %p for hwnd %p rect %s\n", surface, hwnd, wine_dbgstr_rect( &surface->rect ) );
     return surface;
@@ -670,7 +680,7 @@ void window_surface_flush( struct window_surface *surface )
 
     if (intersect_rect( &dirty, &dirty, &bounds ) && (color_bits = window_surface_get_color( surface, color_info )))
     {
-        BOOL shape_changed;
+        int shape_changed;
         void *shape_bits;
 
         /* Normalize opaque layered pixels before shape allocation and upload.
@@ -684,8 +694,9 @@ void window_surface_flush( struct window_surface *surface )
                 for (x = dirty.left; x < dirty.right; ++x)
                     ((UINT32 *)row)[x] |= surface->alpha_bits;
         }
-        shape_changed = update_surface_shape( surface, &surface->rect, &dirty, color_info, color_bits );
-        shape_bits = window_surface_get_shape( surface, shape_info );
+        shape_changed = update_surface_shape( surface, &surface->rect, &dirty, color_info, color_bits,
+                                              shape_info, &shape_bits );
+        if (shape_changed < 0) goto done;
 
         TRACE( "Flushing hwnd %p, surface %p %s, bounds %s, dirty %s\n", surface->hwnd, surface,
                wine_dbgstr_rect( &surface->rect ), wine_dbgstr_rect( &surface->bounds ), wine_dbgstr_rect( &dirty ) );
@@ -695,6 +706,7 @@ void window_surface_flush( struct window_surface *surface )
             reset_bounds( &surface->bounds );
     }
 
+done:
     window_surface_unlock( surface );
 }
 
@@ -1785,13 +1797,14 @@ void move_window_bits_surface( HWND hwnd, const RECT *window_rect, struct window
     OffsetRect( &dst, -window_rect->left, -window_rect->top );
 
     window_surface_lock( old_surface );
-    bits = window_surface_get_color( old_surface, info );
-    NtGdiSetDIBitsToDeviceInternal( hdc, dst.left, dst.top, dst.right - dst.left, dst.bottom - dst.top,
-                                    src.left - old_surface->rect.left, old_surface->rect.bottom - src.bottom,
-                                    0, old_surface->rect.bottom - old_surface->rect.top,
-                                    bits, info, DIB_RGB_COLORS, 0, 0, FALSE, NULL );
+    if ((bits = window_surface_get_color( old_surface, info )))
+        NtGdiSetDIBitsToDeviceInternal( hdc, dst.left, dst.top, dst.right - dst.left, dst.bottom - dst.top,
+                                        src.left - old_surface->rect.left, old_surface->rect.bottom - src.bottom,
+                                        0, old_surface->rect.bottom - old_surface->rect.top,
+                                        bits, info, DIB_RGB_COLORS, 0, 0, FALSE, NULL );
     window_surface_unlock( old_surface );
     NtUserReleaseDC( hwnd, hdc );
+    if (!bits) NtUserRedrawWindow( hwnd, NULL, 0, RDW_INVALIDATE | RDW_ERASE | RDW_FRAME | RDW_ALLCHILDREN );
 }
 
 
