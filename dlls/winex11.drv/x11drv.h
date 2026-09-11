@@ -430,6 +430,9 @@ struct x11drv_thread_data
     HWND     last_focus;           /* last window that had focus */
     HWND     keymapnotify_hwnd;    /* window that should receive modifier release events */
     XIM      xim;                  /* input method */
+    XIMStyle xim_style;            /* style negotiated with this input method */
+    BOOL     xim_enabled;          /* input method support attached to this thread */
+    BOOL     xim_reconnect;        /* reopen after the server destroy callback returns */
     HWND     last_xic_hwnd;        /* last xic window */
     XFontSet font_set;             /* international text drawing font set */
     Window   selection_wnd;        /* window used for selection interactions */
@@ -536,6 +539,7 @@ enum x11drv_atoms
     XATOM_WM_NORMAL_HINTS,
     XATOM_WM_STATE,
     XATOM_WM_TAKE_FOCUS,
+    XATOM_XIM_SERVERS,
     XATOM_DndProtocol,
     XATOM_DndSelection,
     XATOM__ICC_PROFILE,
@@ -1006,6 +1010,8 @@ extern struct x11drv_display_device_handler desktop_handler;
 /* XIM support */
 extern BOOL xim_init( const WCHAR *input_style );
 extern void xim_thread_attach( struct x11drv_thread_data *data );
+extern void xim_thread_detach( struct x11drv_thread_data *data );
+extern void xim_handle_event( struct x11drv_thread_data *data, XEvent *event );
 extern BOOL xim_in_compose_mode(void);
 extern void xim_set_result_string( HWND hwnd, const char *str, UINT count );
 extern XIC X11DRV_get_ic( HWND hwnd );

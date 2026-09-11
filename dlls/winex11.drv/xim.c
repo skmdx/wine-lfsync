@@ -46,7 +46,6 @@ WINE_DEFAULT_DEBUG_CHANNEL(xim);
 static WCHAR *ime_comp_buf;
 static DWORD ime_comp_cursor_pos = 0;
 
-static XIMStyle input_style = 0;
 static XIMStyle input_style_req = XIMPreeditCallbacks | XIMStatusCallbacks;
 
 static const char *debugstr_xim_style( XIMStyle style )
@@ -408,12 +407,12 @@ BOOL xim_init( const WCHAR *input_style )
     return TRUE;
 }
 
-static void xim_open( Display *display, XPointer user, XPointer arg );
 static void xim_destroy( XIM xim, XPointer user, XPointer arg );
 
 static XIM xim_create( struct x11drv_thread_data *data )
 {
     XIMCallback destroy = {.callback = xim_destroy, .client_data = (XPointer)data};
+    XIMStyle input_style;
     XIMStyle input_style_fallback = XIMPreeditNone | XIMStatusNone;
     XIMStyles *styles = NULL;
     INT i;
@@ -452,26 +451,35 @@ static XIM xim_create( struct x11drv_thread_data *data )
     XFree(styles);
 
     if (!input_style) input_style = input_style_fallback;
+    data->xim_style = input_style;
     TRACE( "selected style %#lx %s\n", input_style, debugstr_xim_style( input_style ) );
 
     return xim;
 }
 
-static void xim_open( Display *display, XPointer user, XPointer arg )
-{
-    struct x11drv_thread_data *data = (void *)user;
-    TRACE( "display %p, data %p, arg %p\n", display, user, arg );
-    if (!(data->xim = xim_create( data ))) return;
-    XUnregisterIMInstantiateCallback( display, NULL, NULL, NULL, xim_open, user );
-}
-
 static void xim_destroy( XIM xim, XPointer user, XPointer arg )
 {
-    struct x11drv_thread_data *data = x11drv_thread_data();
+    struct x11drv_thread_data *data = (void *)user;
     TRACE( "xim %p, user %p, arg %p\n", xim, user, arg );
     if (data->xim != xim) return;
     data->xim = NULL;
-    XRegisterIMInstantiateCallback( data->display, NULL, NULL, NULL, xim_open, user );
+    data->xim_reconnect = TRUE;
+}
+
+void xim_handle_event( struct x11drv_thread_data *data, XEvent *event )
+{
+    if (!data->xim_enabled || data->xim) return;
+    if (!data->xim_reconnect &&
+        (event->type != PropertyNotify || event->xproperty.window != RootWindow( data->display, 0 ) ||
+         event->xproperty.atom != x11drv_atom(XIM_SERVERS) || event->xproperty.state != PropertyNewValue))
+        return;
+
+    /* The root subscription precedes our first XOpenIM. Reconnect on the
+     * owning thread, after any server destroy callback has finished closing
+     * the old IM and its ICs. Instantiate callbacks are process-wide in Xlib
+     * and unregistering one does not drain calls selected on other threads. */
+    data->xim_reconnect = FALSE;
+    data->xim = xim_create( data );
 }
 
 void xim_thread_attach( struct x11drv_thread_data *data )
@@ -480,13 +488,29 @@ void xim_thread_attach( struct x11drv_thread_data *data )
     int i, count;
     char **list;
 
+    data->xim_enabled = TRUE;
+    /* XIM_SERVERS belongs to screen zero, even when DISPLAY selects another screen. */
+    if (RootWindow( display, 0 ) != DefaultRootWindow( display ))
+        XSelectInput( display, RootWindow( display, 0 ), PropertyChangeMask );
     data->font_set = XCreateFontSet( display, "fixed", &list, &count, NULL );
     TRACE( "created XFontSet %p, list %p, count %d\n", data->font_set, list, count );
     for (i = 0; list && i < count; ++i) TRACE( "  %d: %s\n", i, list[i] );
     if (list) XFreeStringList( list );
 
-    if ((data->xim = xim_create( data ))) return;
-    XRegisterIMInstantiateCallback( display, NULL, NULL, NULL, xim_open, (XPointer)data );
+    data->xim = xim_create( data );
+}
+
+void xim_thread_detach( struct x11drv_thread_data *data )
+{
+    XIM xim = data->xim;
+    XFontSet font_set = data->font_set;
+
+    data->xim = NULL;
+    data->xim_enabled = FALSE;
+    data->xim_reconnect = FALSE;
+    data->font_set = NULL;
+    if (xim) XCloseIM( xim );
+    if (font_set) XFreeFontSet( data->display, font_set );
 }
 
 static BOOL xic_destroy( XIC xic, XPointer user, XPointer arg )
@@ -535,7 +559,8 @@ static XIC xic_create( XIM xim, HWND hwnd, Window win )
                                   XNStatusDoneCallback, &status_done,
                                   XNStatusDrawCallback, &status_draw,
                                   NULL );
-    xic = XCreateIC( xim, XNInputStyle, input_style, XNPreeditAttributes, preedit, XNStatusAttributes, status,
+    xic = XCreateIC( xim, XNInputStyle, x11drv_thread_data()->xim_style,
+                     XNPreeditAttributes, preedit, XNStatusAttributes, status,
                      XNClientWindow, win, XNFocusWindow, win, XNDestroyCallback, &destroy, NULL );
     TRACE( "created XIC %p\n", xic );
 
@@ -573,11 +598,12 @@ void xim_set_focus( HWND hwnd, BOOL focus )
  */
 BOOL X11DRV_SetIMECompositionRect( HWND hwnd, RECT rect )
 {
+    struct x11drv_thread_data *thread_data = x11drv_thread_data();
     struct x11drv_win_data *data = NULL;
     XVaNestedList attr;
     XPoint xpoint;
 
-    if (!(input_style & XIMPreeditPosition))
+    if (!thread_data || !(thread_data->xim_style & XIMPreeditPosition))
         return FALSE;
 
     if (!(data = get_win_data( hwnd )) || !data->xic)

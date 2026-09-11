@@ -129,6 +129,7 @@ const char * const X11DRV_atom_names[NB_XATOMS - FIRST_XATOM] =
     "WM_NORMAL_HINTS",
     "WM_STATE",
     "WM_TAKE_FOCUS",
+    "XIM_SERVERS",
     "DndProtocol",
     "DndSelection",
     "_ICC_PROFILE",
@@ -822,8 +823,7 @@ void X11DRV_ThreadDetach(void)
 
     if (data)
     {
-        if (data->xim) XCloseIM( data->xim );
-        if (data->font_set) XFreeFontSet( data->display, data->font_set );
+        xim_thread_detach( data );
         if (data->net_supported) XFree( data->net_supported );
         XSync( gdi_display, False ); /* make sure XReparentWindow requests have completed before closing the thread display */
         XCloseDisplay( data->display );

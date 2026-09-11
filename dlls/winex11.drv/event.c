@@ -376,7 +376,9 @@ BOOL X11DRV_ProcessEvents( DWORD mask )
 
     for (count = 0; XCheckIfEvent( data->display, &event, filter_event, (XPointer)(UINT_PTR)mask ); count++)
     {
-        if (XFilterEvent( &event, None ) || host_window_filter_event( &event )) continue;
+        BOOL filtered = XFilterEvent( &event, None );
+        xim_handle_event( data, &event );
+        if (filtered || host_window_filter_event( &event )) continue;
         get_event_data( &event );
         call_event_handler( data->display, &event );
         free_event_data( &event );
