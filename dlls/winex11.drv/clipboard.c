@@ -188,7 +188,8 @@ static struct list format_list = LIST_INIT( format_list );
 
 #define GET_ATOM(prop)  (((prop) < FIRST_XATOM) ? (Atom)(prop) : X11DRV_Atoms[(prop) - FIRST_XATOM])
 
-static DWORD clipboard_thread_id;
+static LONG clipboard_thread_id;
+static Display *clipboard_display;
 static HWND clipboard_hwnd;
 static BOOL is_clipboard_owner;
 static Window selection_window;
@@ -198,9 +199,22 @@ static UINT rendered_formats;
 static ULONG last_clipboard_update;
 static struct clipboard_format **current_x11_formats;
 static unsigned int nb_current_x11_formats;
-static BOOL use_xfixes;
+static LONG use_xfixes;
+static struct
+{
+    Atom selection;
+    Window owner;
+    struct clipboard_format *format;
+    Atom type;
+    unsigned char *data;
+    size_t size;
+} selection_cache;
 
-Display *clipboard_display = NULL;
+static BOOL is_clipboard_thread( Display *display )
+{
+    return InterlockedCompareExchange( &clipboard_thread_id, 0, 0 ) == (LONG)GetCurrentThreadId() &&
+           display == clipboard_display;
+}
 
 static const char *debugstr_format( UINT id )
 {
@@ -298,9 +312,11 @@ static ATOM register_clipboard_format( const WCHAR *name )
  */
 static void register_builtin_formats(void)
 {
+    static BOOL registered;
     struct clipboard_format *formats;
     unsigned int i;
 
+    if (registered) return;
     if (!(formats = malloc( ARRAY_SIZE(builtin_formats) * sizeof(*formats)))) return;
 
     for (i = 0; i < ARRAY_SIZE(builtin_formats); i++)
@@ -315,6 +331,7 @@ static void register_builtin_formats(void)
         formats[i].export = builtin_formats[i].export;
         list_add_tail( &format_list, &formats[i].entry );
     }
+    registered = TRUE;
 }
 
 
@@ -353,7 +370,7 @@ static void register_win32_formats( const UINT *ids, UINT size )
     Atom atoms[256];
     WCHAR buffer[256];
 
-    if (list_empty( &format_list)) register_builtin_formats();
+    register_builtin_formats();
 
     while (size)
     {
@@ -390,7 +407,7 @@ static void register_x11_formats( const Atom *atoms, UINT size )
     Atom new_atoms[256];
     WCHAR buffer[256];
 
-    if (list_empty( &format_list)) register_builtin_formats();
+    register_builtin_formats();
 
     while (size)
     {
@@ -1961,13 +1978,6 @@ static BOOL request_selection_contents( Display *display, BOOL changed )
     size_t import_size, size = 0;
     Atom type = 0;
 
-    static Atom last_selection;
-    static Window last_owner;
-    static struct clipboard_format *last_format;
-    static Atom last_type;
-    static unsigned char *last_data;
-    static unsigned long last_size;
-
     assert( targets );
     assert( string );
 
@@ -1993,12 +2003,12 @@ static BOOL request_selection_contents( Display *display, BOOL changed )
 
     changed = (changed ||
                rendered_formats ||
-               last_selection != current_selection ||
-               last_owner != owner ||
-               last_format != format ||
-               last_type != type ||
-               last_size != size ||
-               memcmp( last_data, data, size ));
+               selection_cache.selection != current_selection ||
+               selection_cache.owner != owner ||
+               selection_cache.format != format ||
+               selection_cache.type != type ||
+               selection_cache.size != size ||
+               (size && memcmp( selection_cache.data, data, size )));
 
     if (!changed || !NtUserOpenClipboard( clipboard_hwnd, 0 ))
     {
@@ -2013,16 +2023,16 @@ static BOOL request_selection_contents( Display *display, BOOL changed )
 
     if (format) format->import( type, data, size, &import_size );
 
-    free( last_data );
-    last_selection = current_selection;
-    last_owner = owner;
-    last_format = format;
-    last_type = type;
-    last_data = data;
-    last_size = size;
+    free( selection_cache.data );
+    selection_cache.selection = current_selection;
+    selection_cache.owner = owner;
+    selection_cache.format = format;
+    selection_cache.type = type;
+    selection_cache.data = data;
+    selection_cache.size = size;
     last_clipboard_update = NtGetTickCount();
     NtUserCloseClipboard();
-    if (!use_xfixes)
+    if (!InterlockedCompareExchange( &use_xfixes, 0, 0 ))
         NtUserSetTimer( clipboard_hwnd, 1, SELECTION_UPDATE_DELAY, NULL, TIMERV_DEFAULT_COALESCING );
     return TRUE;
 }
@@ -2035,7 +2045,8 @@ static BOOL request_selection_contents( Display *display, BOOL changed )
  */
 BOOL update_clipboard( HWND hwnd )
 {
-    if (use_xfixes) return TRUE;
+    if (!is_clipboard_thread( thread_display() )) return TRUE;
+    if (InterlockedCompareExchange( &use_xfixes, 0, 0 )) return TRUE;
     if (hwnd != clipboard_hwnd) return TRUE;
     if (!is_clipboard_owner) return TRUE;
     if (NtGetTickCount() - last_clipboard_update <= SELECTION_UPDATE_DELAY) return TRUE;
@@ -2053,6 +2064,7 @@ static BOOL selection_notify_event( HWND hwnd, XEvent *event )
 {
     XFixesSelectionNotifyEvent *req = (XFixesSelectionNotifyEvent*)event;
 
+    if (!is_clipboard_thread( req->display ) || req->window != import_window) return FALSE;
     if (!is_clipboard_owner) return FALSE;
     if (req->owner == selection_window) return FALSE;
     request_selection_contents( req->display, TRUE );
@@ -2074,10 +2086,9 @@ static void xfixes_init(void)
 
     int event_base, error_base;
     int major = 3, minor = 0;
-    void *handle;
+    static void *handle;
 
-    handle = dlopen(SONAME_LIBXFIXES, RTLD_NOW);
-    if (!handle) return;
+    if (!handle && !(handle = dlopen(SONAME_LIBXFIXES, RTLD_NOW))) return;
 
     pXFixesQueryExtension = dlsym(handle, "XFixesQueryExtension");
     if (!pXFixesQueryExtension) return;
@@ -2089,8 +2100,8 @@ static void xfixes_init(void)
     if (!pXFixesQueryExtension(clipboard_display, &event_base, &error_base))
         return;
     pXFixesQueryVersion(clipboard_display, &major, &minor);
-    use_xfixes = (major >= 1);
-    if (!use_xfixes) return;
+    if (major < 1) return;
+    InterlockedExchange( &use_xfixes, TRUE );
 
     pXFixesSelectSelectionInput(clipboard_display, import_window, x11drv_atom(CLIPBOARD),
             XFixesSetSelectionOwnerNotifyMask |
@@ -2113,33 +2124,79 @@ static void xfixes_init(void)
 
 
 /**************************************************************************
+ *              x11drv_clipboard_thread_detach
+ */
+void x11drv_clipboard_thread_detach( struct x11drv_thread_data *data )
+{
+    Window selection, import;
+
+    if (!is_clipboard_thread( data->display )) return;
+    selection = selection_window;
+    import = import_window;
+    selection_window = import_window = None;
+    clipboard_hwnd = 0;
+    clipboard_display = NULL;
+    is_clipboard_owner = FALSE;
+    current_selection = None;
+    rendered_formats = last_clipboard_update = 0;
+    free( current_x11_formats );
+    current_x11_formats = NULL;
+    nb_current_x11_formats = 0;
+    free( selection_cache.data );
+    memset( &selection_cache, 0, sizeof(selection_cache) );
+    InterlockedExchange( &use_xfixes, FALSE );
+
+    /* Destroy only our Windows; setting a selection to None could clear a
+     * replacement owner. Destroying import also removes its XFixes watches.
+     * The Display owner retains its clipboard error policy through close. */
+    if (selection) XDestroyWindow( data->display, selection );
+    if (import) XDestroyWindow( data->display, import );
+    XFlush( data->display );
+    TRACE( "detached selection %lx import %lx\n", selection, import );
+    InterlockedExchange( &clipboard_thread_id, 0 );
+}
+
+
+/**************************************************************************
  *		clipboard_init
  *
  * Thread running inside the desktop process to manage the clipboard
  */
 static BOOL clipboard_init( HWND hwnd )
 {
+    struct x11drv_thread_data *data;
     XSetWindowAttributes attr;
 
+    if (InterlockedCompareExchange( &clipboard_thread_id, GetCurrentThreadId(), 0 )) return FALSE;
     clipboard_hwnd = hwnd;
-    clipboard_display = thread_init_display();
+    data = x11drv_init_thread_data();
+    clipboard_display = data->display;
+    x11drv_display_owner_set_clipboard( data->display_owner );
     attr.event_mask = PropertyChangeMask;
     import_window = XCreateWindow( clipboard_display, root_window, 0, 0, 1, 1, 0, CopyFromParent,
                                    InputOutput, CopyFromParent, CWEventMask, &attr );
     if (!import_window)
     {
         ERR( "failed to create import window\n" );
-        return FALSE;
+        goto failed;
     }
 
-    clipboard_thread_id = GetCurrentThreadId();
-    NtUserAddClipboardFormatListener( hwnd );
     register_builtin_formats();
+    if (!find_x11_format( x11drv_atom(TARGETS) ) || !find_x11_format( XA_STRING ))
+    {
+        ERR( "failed to register clipboard formats\n" );
+        goto failed;
+    }
+    NtUserAddClipboardFormatListener( hwnd );
     xfixes_init();
     request_selection_contents( clipboard_display, TRUE );
 
     TRACE( "clipboard thread running\n" );
     return TRUE;
+
+failed:
+    x11drv_clipboard_thread_detach( data );
+    return FALSE;
 }
 
 
@@ -2150,6 +2207,9 @@ static BOOL clipboard_init( HWND hwnd )
  */
 LRESULT X11DRV_ClipboardWindowProc( HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam )
 {
+    if (msg != WM_NCCREATE && (!is_clipboard_thread( thread_display() ) || hwnd != clipboard_hwnd))
+        return NtUserMessageCall( hwnd, msg, wparam, lparam, NULL, NtUserDefWindowProc, FALSE );
+
     switch (msg)
     {
     case WM_NCCREATE:
@@ -2181,17 +2241,17 @@ LRESULT X11DRV_ClipboardWindowProc( HWND hwnd, UINT msg, WPARAM wparam, LPARAM l
  */
 void X11DRV_UpdateClipboard(void)
 {
-    static ULONG last_update;
+    static LONG last_update;
     ULONG now;
     DWORD_PTR ret;
 
-    if (use_xfixes) return;
-    if (GetCurrentThreadId() == clipboard_thread_id) return;
+    if (InterlockedCompareExchange( &use_xfixes, 0, 0 )) return;
+    if (GetCurrentThreadId() == (DWORD)InterlockedCompareExchange( &clipboard_thread_id, 0, 0 )) return;
     now = NtGetTickCount();
-    if ((int)(now - last_update) <= SELECTION_UPDATE_DELAY) return;
+    if ((int)(now - InterlockedCompareExchange( &last_update, 0, 0 )) <= SELECTION_UPDATE_DELAY) return;
     if (send_message_timeout( NtUserGetClipboardOwner(), WM_X11DRV_UPDATE_CLIPBOARD, 0, 0,
                               SMTO_ABORTIFHUNG, 5000, &ret ) && ret)
-        last_update = now;
+        InterlockedExchange( &last_update, now );
 }
 
 
@@ -2209,7 +2269,7 @@ BOOL X11DRV_SelectionRequest( HWND hwnd, XEvent *xev )
            event->owner, debugstr_xatom( event->selection ), debugstr_xatom( event->target ),
            event->requestor, debugstr_xatom( event->property ));
 
-    if (event->owner != selection_window) goto done;
+    if (!is_clipboard_thread( display ) || event->owner != selection_window) goto done;
     if ((event->selection != x11drv_atom(CLIPBOARD)) &&
         (!use_primary_selection || event->selection != XA_PRIMARY)) goto done;
 
@@ -2244,7 +2304,7 @@ BOOL X11DRV_SelectionClear( HWND hwnd, XEvent *xev )
 {
     XSelectionClearEvent *event = &xev->xselectionclear;
 
-    if (event->window != selection_window) return FALSE;
+    if (!is_clipboard_thread( event->display ) || event->window != selection_window) return FALSE;
     if (event->selection != x11drv_atom(CLIPBOARD)) return FALSE;
 
     release_selection( event->display, event->time );

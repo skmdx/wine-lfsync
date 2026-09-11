@@ -4,6 +4,19 @@
 #define __WINE_CLIENT_SURFACE_CACHE_H
 
 struct client_surface_cache_image;
+/* Embedded work owns its storage through finished(). Prepare before creating
+ * native resources; submit cannot allocate or start a worker. */
+struct client_surface_native_work
+{
+    struct client_surface_native_work *next;
+    void (*execute)( struct client_surface_native_work *work );
+    void (*finished)( struct client_surface_native_work *work );
+};
+BOOL client_surface_prepare_native_work(void);
+void client_surface_submit_native_work( struct client_surface_native_work *work );
+BOOL x11drv_reserve_release_capacity( unsigned int count, SIZE_T bytes );
+void x11drv_return_release_capacity( unsigned int count, SIZE_T bytes );
+
 typedef void (*client_surface_cache_callback)( void *context, BOOL success );
 
 /* Admission does no native I/O. The caller retains its source and callback

@@ -884,7 +884,7 @@ static void release_client_surface_compositor_capacity( enum client_surface_comp
     pthread_mutex_unlock( &client_surface_compositor_mutex );
 }
 
-static BOOL reserve_client_surface_compositor_release( unsigned int count, SIZE_T bytes )
+BOOL x11drv_reserve_release_capacity( unsigned int count, SIZE_T bytes )
 {
     BOOL ret;
 
@@ -894,11 +894,16 @@ static BOOL reserve_client_surface_compositor_release( unsigned int count, SIZE_
     return ret;
 }
 
+void x11drv_return_release_capacity( unsigned int count, SIZE_T bytes )
+{
+    release_client_surface_compositor_capacity( CLIENT_SURFACE_COMPOSITOR_RELEASE_CAPACITY, count, bytes, NULL );
+}
+
 static void free_client_surface_compositor_release( struct client_surface_memory_scope *memory, void *data,
                                                     unsigned int count, SIZE_T bytes )
 {
     client_surface_free_owned_metadata( memory, data, bytes );
-    release_client_surface_compositor_capacity( CLIENT_SURFACE_COMPOSITOR_RELEASE_CAPACITY, count, bytes, NULL );
+    x11drv_return_release_capacity( count, bytes );
 }
 
 /* Routing storage is admitted before the actor starts. Its account uses the
@@ -1012,7 +1017,7 @@ static struct client_surface_compositor_target *alloc_client_surface_compositor_
     if (!(target = alloc_client_surface_compositor_metadata( toplevel, sizeof(*target), &memory ))) return NULL;
     target->memory = memory;
     target->toplevel = toplevel;
-    if (!reserve_client_surface_compositor_release( 3, sizeof(*notifications) ))
+    if (!x11drv_reserve_release_capacity( 3, sizeof(*notifications) ))
     {
         client_surface_free_owned_metadata( &target->memory, target, sizeof(*target) );
         return NULL;
@@ -1132,7 +1137,7 @@ static BOOL create_client_surface_output_allocation( struct client_surface_compo
     struct client_surface_memory_scope memory = {0};
     struct client_surface_output_allocation *allocation;
 
-    if (!reserve_client_surface_compositor_release( 1, sizeof(*allocation) )) return FALSE;
+    if (!x11drv_reserve_release_capacity( 1, sizeof(*allocation) )) return FALSE;
     if (!(allocation = alloc_client_surface_compositor_metadata( job->toplevel, sizeof(*allocation), &memory )))
     {
         release_client_surface_compositor_capacity( CLIENT_SURFACE_COMPOSITOR_RELEASE_CAPACITY, 1, sizeof(*allocation), NULL );

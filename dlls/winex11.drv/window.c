@@ -25,6 +25,7 @@
 #endif
 
 #include "config.h"
+#include <assert.h>
 
 #include <stdarg.h>
 #include <stdlib.h>
@@ -445,6 +446,8 @@ static struct x11drv_win_data *alloc_win_data( Display *display, HWND hwnd )
 
     if ((data = calloc( 1, sizeof(*data) )))
     {
+        assert( display == x11drv_thread_data()->display );
+        data->display_owner = x11drv_display_owner_acquire( x11drv_thread_data()->display_owner );
         data->display = display;
         data->vis = default_visual;
         data->hwnd = hwnd;
@@ -2939,6 +2942,7 @@ void X11DRV_DestroyWindow( HWND hwnd )
     free( data->icon_bits );
     XDeleteContext( gdi_display, (XID)hwnd, win_data_context );
     release_win_data( data );
+    x11drv_display_owner_release( data->display_owner );
     free( data );
 }
 

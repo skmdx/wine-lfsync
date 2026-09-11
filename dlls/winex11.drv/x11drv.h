@@ -423,9 +423,15 @@ struct display_state
     Window net_active_window;
 };
 
+struct x11drv_display_owner;
+extern struct x11drv_display_owner *x11drv_display_owner_acquire( struct x11drv_display_owner *owner );
+extern void x11drv_display_owner_release( struct x11drv_display_owner *owner );
+extern void x11drv_display_owner_set_clipboard( struct x11drv_display_owner *owner );
+
 struct x11drv_thread_data
 {
     Display *display;
+    struct x11drv_display_owner *display_owner;
     XEvent  *current_event;        /* event currently being processed */
     HWND     last_focus;           /* last window that had focus */
     HWND     keymapnotify_hwnd;    /* window that should receive modifier release events */
@@ -460,6 +466,7 @@ struct x11drv_thread_data
 };
 
 extern struct x11drv_thread_data *x11drv_init_thread_data(void);
+extern void x11drv_clipboard_thread_detach( struct x11drv_thread_data *data );
 extern pthread_key_t x11drv_thread_data_key;
 extern void X11DRV_sync_window_changes( Display *display );
 
@@ -514,7 +521,6 @@ extern int copy_default_colors;
 extern int alloc_system_colors;
 extern int xrender_error_base;
 extern char *process_name;
-extern Display *clipboard_display;
 
 /* atoms */
 
@@ -701,6 +707,7 @@ struct window_state
 struct x11drv_win_data
 {
     Display    *display;        /* display connection for the thread owning the window */
+    struct x11drv_display_owner *display_owner; /* retained creator, independent of GUI thread data */
     XVisualInfo vis;            /* X visual used by this window */
     Colormap    whole_colormap; /* colormap if non-default visual */
     HWND        hwnd;           /* hwnd that this private data belongs to */
