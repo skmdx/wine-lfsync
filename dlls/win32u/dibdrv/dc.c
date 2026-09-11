@@ -744,6 +744,18 @@ static BOOL windrv_ExtTextOut( PHYSDEV dev, INT x, INT y, UINT flags, const RECT
     return ret;
 }
 
+static BOOL windrv_FillPath( PHYSDEV dev )
+{
+    struct windrv_physdev *physdev = get_windrv_physdev( dev );
+    BOOL ret;
+
+    lock_surface( physdev );
+    dev = GET_NEXT_PHYSDEV( dev, pFillPath );
+    ret = dev->funcs->pFillPath( dev );
+    unlock_surface( physdev );
+    return ret;
+}
+
 static DWORD windrv_GetImage( PHYSDEV dev, BITMAPINFO *info,
                               struct gdi_image_bits *bits, struct bitblt_coords *src )
 {
@@ -990,6 +1002,30 @@ static INT windrv_StretchDIBits( PHYSDEV dev, INT x_dst, INT y_dst, INT width_ds
     return ret;
 }
 
+static BOOL windrv_StrokeAndFillPath( PHYSDEV dev )
+{
+    struct windrv_physdev *physdev = get_windrv_physdev( dev );
+    BOOL ret;
+
+    lock_surface( physdev );
+    dev = GET_NEXT_PHYSDEV( dev, pStrokeAndFillPath );
+    ret = dev->funcs->pStrokeAndFillPath( dev );
+    unlock_surface( physdev );
+    return ret;
+}
+
+static BOOL windrv_StrokePath( PHYSDEV dev )
+{
+    struct windrv_physdev *physdev = get_windrv_physdev( dev );
+    BOOL ret;
+
+    lock_surface( physdev );
+    dev = GET_NEXT_PHYSDEV( dev, pStrokePath );
+    ret = dev->funcs->pStrokePath( dev );
+    unlock_surface( physdev );
+    return ret;
+}
+
 static const struct gdi_dc_funcs window_driver =
 {
     NULL,                               /* pAbortDoc */
@@ -1014,7 +1050,7 @@ static const struct gdi_dc_funcs window_driver =
     NULL,                               /* pExtEscape */
     windrv_ExtFloodFill,                /* pExtFloodFill */
     windrv_ExtTextOut,                  /* pExtTextOut */
-    NULL,                               /* pFillPath */
+    windrv_FillPath,                    /* pFillPath */
     NULL,                               /* pFillRgn */
     NULL,                               /* pFontIsLinked */
     NULL,                               /* pFrameRgn */
@@ -1077,8 +1113,8 @@ static const struct gdi_dc_funcs window_driver =
     NULL,                               /* pStartPage */
     windrv_StretchBlt,                  /* pStretchBlt */
     windrv_StretchDIBits,               /* pStretchDIBits */
-    NULL,                               /* pStrokeAndFillPath */
-    NULL,                               /* pStrokePath */
+    windrv_StrokeAndFillPath,           /* pStrokeAndFillPath */
+    windrv_StrokePath,                  /* pStrokePath */
     NULL,                               /* pUnrealizePalette */
     GDI_PRIORITY_DIB_DRV + 10           /* priority */
 };

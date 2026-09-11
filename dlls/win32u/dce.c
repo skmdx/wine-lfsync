@@ -146,6 +146,7 @@ struct scaled_surface
     struct window_surface *target_surface;
     struct ratio dpi_from;
     struct ratio dpi_to;
+    BOOL shape_pending;
 };
 
 static struct scaled_surface *get_scaled_surface( struct window_surface *window_surface )
@@ -168,6 +169,9 @@ static BOOL scaled_surface_flush( struct window_surface *window_surface, const R
     struct scaled_surface *surface = get_scaled_surface( window_surface );
     RECT src = *dirty, dst;
     HDC hdc_dst, hdc_src;
+    BOOL ret;
+
+    surface->shape_pending |= shape_changed;
 
     src.left &= ~7;
     src.top &= ~7;
@@ -176,34 +180,40 @@ static BOOL scaled_surface_flush( struct window_surface *window_surface, const R
 
     dst = map_dpi_rect( src, surface->dpi_from, surface->dpi_to );
 
-    hdc_dst = NtGdiCreateCompatibleDC( 0 );
-    hdc_src = NtGdiCreateCompatibleDC( 0 );
-
-    NtGdiSelectBitmap( hdc_src, window_surface->color_bitmap );
-    NtGdiSelectBitmap( hdc_dst, surface->target_surface->color_bitmap );
+    if (!(hdc_dst = NtGdiCreateCompatibleDC( 0 ))) return FALSE;
+    if (!(hdc_src = NtGdiCreateCompatibleDC( 0 )))
+    {
+        NtGdiDeleteObjectApp( hdc_dst );
+        return FALSE;
+    }
 
     /* FIXME: implement HALFTONE with alpha for layered surfaces */
     if (!window_surface->alpha_mask) set_stretch_blt_mode( hdc_dst, STRETCH_HALFTONE );
 
-    NtGdiStretchBlt( hdc_dst, dst.left, dst.top, dst.right - dst.left, dst.bottom - dst.top,
-                     hdc_src, src.left, src.top, src.right - src.left, src.bottom - src.top,
-                     SRCCOPY, 0 );
+    /* Memory DCs do not use the window driver to lock the target bitmap. */
+    window_surface_lock( surface->target_surface );
+    ret = NtGdiSelectBitmap( hdc_src, window_surface->color_bitmap ) &&
+          NtGdiSelectBitmap( hdc_dst, surface->target_surface->color_bitmap ) &&
+          NtGdiStretchBlt( hdc_dst, dst.left, dst.top, dst.right - dst.left, dst.bottom - dst.top,
+                           hdc_src, src.left, src.top, src.right - src.left, src.bottom - src.top,
+                           SRCCOPY, 0 );
+    if (ret) add_bounds_rect( &surface->target_surface->bounds, &dst );
 
     NtGdiDeleteObjectApp( hdc_dst );
     NtGdiDeleteObjectApp( hdc_src );
-
-    window_surface_lock( surface->target_surface );
-    add_bounds_rect( &surface->target_surface->bounds, &dst );
     window_surface_unlock( surface->target_surface );
+    if (!ret) return FALSE;
 
-    if (shape_changed)
+    if (surface->shape_pending)
     {
         HRGN hrgn = map_dpi_region( window_surface->shape_region, surface->dpi_from, surface->dpi_to );
+        if (window_surface->shape_region && !hrgn) return FALSE;
         window_surface_set_shape( surface->target_surface, hrgn );
         if (hrgn) NtGdiDeleteObjectApp( hrgn );
 
         window_surface_set_layered( surface->target_surface, window_surface->color_key,
                                     window_surface->alpha_bits, window_surface->alpha_mask );
+        surface->shape_pending = FALSE;
     }
 
     window_surface_flush( surface->target_surface );
@@ -225,9 +235,20 @@ static const struct window_surface_funcs scaled_surface_funcs =
 
 static void scaled_surface_set_target( struct scaled_surface *surface, struct window_surface *target, struct ratio dpi_to )
 {
-    if (surface->target_surface) window_surface_release( surface->target_surface );
-    window_surface_add_ref( (surface->target_surface = target) );
+    struct window_surface *previous;
+
+    window_surface_add_ref( target );
+    window_surface_lock( &surface->header );
+    previous = surface->target_surface;
+    if (previous != target || memcmp( &surface->dpi_to, &dpi_to, sizeof(dpi_to) ))
+    {
+        surface->header.bounds = surface->header.rect;
+        surface->shape_pending = TRUE;
+    }
+    surface->target_surface = target;
     surface->dpi_to = dpi_to;
+    window_surface_unlock( &surface->header );
+    if (previous) window_surface_release( previous );
 }
 
 static struct window_surface *scaled_surface_create( HWND hwnd, const RECT *surface_rect, struct ratio dpi_from, struct ratio dpi_to,
