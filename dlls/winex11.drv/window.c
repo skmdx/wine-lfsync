@@ -678,6 +678,7 @@ static struct x11drv_win_data *alloc_win_data( Display *display, HWND hwnd )
         data->user_time = -1;
         pthread_mutex_lock( &win_data_mutex );
         XSaveContext( gdi_display, (XID)hwnd, win_data_context, (char *)data );
+        list_add_tail( &x11drv_thread_data()->windows, &data->entry );
     }
     return data;
 }
@@ -3171,15 +3172,11 @@ done:
 }
 
 
-/***********************************************************************
- *		DestroyWindow   (X11DRV.@)
- */
-void X11DRV_DestroyWindow( HWND hwnd )
+/* Takes ownership of the locked window data. */
+static void destroy_win_data( struct x11drv_win_data *data )
 {
     struct x11drv_thread_data *thread_data = x11drv_thread_data();
-    struct x11drv_win_data *data;
-
-    if (!(data = get_win_data( hwnd ))) return;
+    HWND hwnd = data->hwnd;
 
     destroy_whole_window( data, FALSE );
     if (thread_data->last_focus == hwnd) thread_data->last_focus = 0;
@@ -3189,9 +3186,38 @@ void X11DRV_DestroyWindow( HWND hwnd )
     if (data->parent) host_window_release( data->parent );
     free( data->icon_bits );
     XDeleteContext( gdi_display, (XID)hwnd, win_data_context );
+    list_remove( &data->entry );
     release_win_data( data );
     x11drv_display_owner_release( data->display_owner );
     free( data );
+}
+
+
+/***********************************************************************
+ *		DestroyWindow   (X11DRV.@)
+ */
+void X11DRV_DestroyWindow( HWND hwnd )
+{
+    struct x11drv_win_data *data;
+
+    if ((data = get_win_data( hwnd ))) destroy_win_data( data );
+}
+
+
+void x11drv_window_thread_detach( struct x11drv_thread_data *thread_data )
+{
+    struct list *entry;
+
+    /* A server-created desktop can have driver data without a local WND, so
+     * destroy_thread_windows() does not call DestroyWindow for it. Release
+     * any remaining data before closing its thread's input method. */
+    for (;;)
+    {
+        pthread_mutex_lock( &win_data_mutex );
+        if (!(entry = list_head( &thread_data->windows ))) break;
+        destroy_win_data( LIST_ENTRY( entry, struct x11drv_win_data, entry ) );
+    }
+    pthread_mutex_unlock( &win_data_mutex );
 }
 
 

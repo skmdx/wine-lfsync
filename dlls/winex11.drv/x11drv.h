@@ -436,6 +436,7 @@ struct x11drv_thread_data
 {
     Display *display;
     struct x11drv_display_owner *display_owner;
+    struct list windows;          /* private window data owned by this thread */
     XEvent  *current_event;        /* event currently being processed */
     HWND     last_focus;           /* last window that had focus */
     HWND     keymapnotify_hwnd;    /* window that should receive modifier release events */
@@ -471,6 +472,7 @@ struct x11drv_thread_data
 
 extern struct x11drv_thread_data *x11drv_init_thread_data(void);
 extern void x11drv_clipboard_thread_detach( struct x11drv_thread_data *data );
+extern void x11drv_window_thread_detach( struct x11drv_thread_data *data );
 extern pthread_key_t x11drv_thread_data_key;
 extern void X11DRV_sync_window_changes( Display *display );
 
@@ -710,6 +712,7 @@ struct window_state
 /* x11drv private window data */
 struct x11drv_win_data
 {
+    struct list entry;          /* owning thread's windows list, protected by win_data_mutex */
     Display    *display;        /* display connection for the thread owning the window */
     struct x11drv_display_owner *display_owner; /* retained creator, independent of GUI thread data */
     struct x11drv_native_window *native_window; /* current native creation, retained by drawable users */
