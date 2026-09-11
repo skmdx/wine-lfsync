@@ -35,6 +35,7 @@
 #include "xpresent.h"
 #include "client_surface_xcb.h"
 #include "client_surface_query.h"
+#include "client_surface_cache.h"
 #include "wine/server.h"
 #include "wine/rbtree.h"
 
@@ -74,11 +75,9 @@ struct client_surface_source_cache
 
 struct client_surface_cached_image
 {
-    struct client_surface_memory_scope memory;
+    struct client_surface_cache_image *storage;
     Pixmap pixmap;
-    GC gc;
     unsigned int xcb_gc;
-    UINT64 bytes;
     unsigned int width, height, depth;
 };
 
@@ -94,6 +93,7 @@ struct client_surface_cache_copy
 {
     struct client_surface_geometry_query query;
     BOOL query_pending;
+    BOOL native_pending;
     struct client_surface_compositor_reply reply;
     struct client_surface_xcb_request request;
     struct client_surface_handoff_slot frame;
@@ -128,7 +128,8 @@ struct client_surface_compositor_binding
 
 static BOOL client_surface_cache_read_pending( const struct client_surface_compositor_binding *binding )
 {
-    return binding->cache_copy.query_pending || binding->cache_copy.reply.requests;
+    return binding->cache_copy.query_pending || binding->cache_copy.native_pending ||
+           binding->cache_copy.reply.requests;
 }
 
 static void trace_client_surface_source( const char *event,
@@ -211,6 +212,7 @@ struct client_surface_compositor_frame
     struct client_surface_xcb_request request;
     unsigned int xcb_gc;
     struct client_surface_compositor_binding *copy_binding;
+    struct client_surface_cache_image *copy_image;
     unsigned int copy_index;
     UINT64 copy_control;
     UINT64 copy_sequence;
@@ -605,6 +607,7 @@ static struct client_surface_output_allocation *client_surface_output_allocation
 struct client_surface_owner_copy
 {
     struct client_surface_compositor_binding *binding;
+    struct client_surface_cache_image *image;
     unsigned int buffer_index;
     UINT64 control, generation, epoch;
     UINT64 sequence;
@@ -1723,30 +1726,9 @@ static void release_client_surface_compositor_pool( struct client_surface_compos
     assert( 0 );
 }
 
-static void free_client_surface_cached_image( struct client_surface_cached_image *image, BOOL acquired )
+static void free_client_surface_cached_image( struct client_surface_cached_image *image )
 {
-    int error = 0;
-
-    if (acquired)
-        x11drv_client_surface_trace_image( "retire", "owner_cache", client_surface_compositor_display,
-                                          image->pixmap, image->bytes );
-    client_surface_xcb_free_gc( client_surface_compositor_display, &image->xcb_gc );
-    if (image->pixmap || image->gc)
-        X11DRV_expect_error( client_surface_compositor_display, client_surface_compositor_error, &error );
-    if (image->gc) XFreeGC( client_surface_compositor_display, image->gc );
-    if (image->pixmap) XFreePixmap( client_surface_compositor_display, image->pixmap );
-    if (image->pixmap || image->gc)
-    {
-        XSync( client_surface_compositor_display, False );
-        X11DRV_check_error();
-        TRACE( "freed owner cache pixmap %#lx bytes %s error %u\n", image->pixmap,
-               wine_dbgstr_longlong( image->bytes ), error );
-    }
-    if (acquired)
-        x11drv_client_surface_trace_image( "free", "owner_cache", client_surface_compositor_display,
-                                          image->pixmap, image->bytes );
-    client_surface_release_scoped_memory( &image->memory, CLIENT_SURFACE_MEMORY_SOURCE, image->bytes );
-    client_surface_memory_scope_destroy( &image->memory );
+    client_surface_cache_release( image->storage );
     memset( image, 0, sizeof(*image) );
 }
 
@@ -1758,8 +1740,8 @@ static void free_client_surface_compositor_binding( struct client_surface_compos
      * our last native read and checked reply have completed. */
     release_client_surface_compositor_binding_server( binding );
     release_client_surface_compositor_pool( binding->pool );
-    free_client_surface_cached_image( &binding->latest_image, TRUE );
-    free_client_surface_cached_image( &binding->spare_image, TRUE );
+    free_client_surface_cached_image( &binding->latest_image );
+    free_client_surface_cached_image( &binding->spare_image );
     client_surface_free_owned_metadata( &binding->memory, binding, sizeof(*binding) );
 }
 
@@ -1784,10 +1766,11 @@ static void remove_client_surface_compositor_binding(
      * it cannot resume at the old consumer sequence without those images. */
     __atomic_store_n( &binding->channel->closed, 1, __ATOMIC_RELEASE );
     binding->retired = TRUE;
-    TRACE_(csperf)( "ticks=%llu event=cache_detach identity=%s cookie=%s pending=%u query_pending=%u token=%s barrier=%u "
+    TRACE_(csperf)( "ticks=%llu event=cache_detach identity=%s cookie=%s pending=%u query_pending=%u native_pending=%u token=%s barrier=%u "
                    "consumed=%s produced=%s endpoints=%u\n", client_surface_perf_time(),
                    wine_dbgstr_longlong( binding->identity ), wine_dbgstr_longlong( binding->cookie ),
                    !!binding->cache_copy.reply.requests, binding->cache_copy.query_pending,
+                   binding->cache_copy.native_pending,
                    wine_dbgstr_longlong( binding->cache_copy.control ),
                    binding->cache_copy.request.barrier,
                    wine_dbgstr_longlong( __atomic_load_n( &binding->channel->consumer_sequence, __ATOMIC_ACQUIRE ) ),
@@ -2789,10 +2772,9 @@ static void finish_client_surface_cache_copy( struct client_surface_compositor_b
     release_client_surface_cached_source( binding, success && !binding->retired );
 }
 
-static void complete_client_surface_cache_reply( struct client_surface_compositor_reply *reply, BOOL success )
+static void complete_client_surface_cache_read( struct client_surface_compositor_binding *binding,
+                                                BOOL success, BOOL async )
 {
-    struct client_surface_compositor_binding *binding =
-        CONTAINING_RECORD( reply, struct client_surface_compositor_binding, cache_copy.reply );
     struct client_surface_cache_copy *copy = &binding->cache_copy;
     struct client_surface_cached_image *image = &binding->spare_image;
     struct client_surface_compositor_target *target;
@@ -2801,14 +2783,14 @@ static void complete_client_surface_cache_reply( struct client_surface_composito
 
     TRACE_(csperf)( "ticks=%llu event=cache_native_copy identity=%s cookie=%s token=%s sequence=%s "
                    "source=%lx destination=%lx width=%u height=%u depth=%u pixel_bits=%u copied=1 error=%u "
-                   "sync_calls=0 async=1 elapsed=%s retired=%u\n",
+                   "sync_calls=%u async=%u elapsed=%s retired=%u\n",
                    client_surface_perf_time(), wine_dbgstr_longlong( binding->identity ),
                    wine_dbgstr_longlong( binding->cookie ), wine_dbgstr_longlong( copy->control ),
                    wine_dbgstr_longlong( copy->frame.source_sequence ), (Pixmap)copy->frame.source, image->pixmap,
                    image->width, image->height, image->depth,
-                   pixmap_formats[image->depth] ? pixmap_formats[image->depth]->bits_per_pixel : 0, !success,
+                   pixmap_formats[image->depth] ? pixmap_formats[image->depth]->bits_per_pixel : 0, !success, !async, async,
                    wine_dbgstr_longlong( client_surface_perf_time() - copy->started ), binding->retired );
-    if (!success) free_client_surface_cached_image( image, TRUE );
+    if (!success) free_client_surface_cached_image( image );
     finish_client_surface_cache_copy( binding, success );
     /* Give an accepted cache one bounded output opportunity before another
      * READY can start replacing it. Waiting for a newer read below must not
@@ -2816,6 +2798,49 @@ static void complete_client_surface_cache_reply( struct client_surface_composito
      * including its assembly obligations, rather than composing out of order. */
     if (success && !retired && (target = find_client_surface_compositor_target( binding->toplevel )))
         replay_client_surface_scene_sources( target, &budget );
+}
+
+static void complete_client_surface_cache_reply( struct client_surface_compositor_reply *reply, BOOL success )
+{
+    struct client_surface_compositor_binding *binding =
+        CONTAINING_RECORD( reply, struct client_surface_compositor_binding, cache_copy.reply );
+
+    complete_client_surface_cache_read( binding, success, TRUE );
+}
+
+static void start_client_surface_cache_copy( struct client_surface_compositor_binding *binding,
+                                             unsigned int depth );
+
+static void complete_client_surface_cache_creation( void *context, BOOL success )
+{
+    struct client_surface_compositor_binding *binding = context;
+    struct client_surface_cached_image *image = &binding->spare_image;
+
+    assert( binding->cache_copy.native_pending );
+    binding->cache_copy.native_pending = FALSE;
+    TRACE_(csperf)( "ticks=%llu event=cache_image_complete identity=%s cookie=%s token=%s image=%p "
+                   "success=%u retired=%u\n", client_surface_perf_time(),
+                   wine_dbgstr_longlong( binding->identity ), wine_dbgstr_longlong( binding->cookie ),
+                   wine_dbgstr_longlong( binding->cache_copy.control ), image->storage, success, binding->retired );
+    if (!success || binding->retired)
+    {
+        free_client_surface_cached_image( image );
+        release_client_surface_cached_source( binding, FALSE );
+        return;
+    }
+    image->pixmap = client_surface_cache_pixmap( image->storage );
+    image->xcb_gc = client_surface_cache_gc( image->storage );
+    start_client_surface_cache_copy( binding, image->depth );
+}
+
+static void complete_client_surface_cache_fallback( void *context, BOOL success )
+{
+    struct client_surface_compositor_binding *binding = context;
+    struct client_surface_cache_copy *copy = &binding->cache_copy;
+
+    assert( copy->native_pending );
+    copy->native_pending = FALSE;
+    complete_client_surface_cache_read( binding, success, FALSE );
 }
 
 static void start_client_surface_cache_copy( struct client_surface_compositor_binding *binding,
@@ -2827,27 +2852,30 @@ static void start_client_surface_cache_copy( struct client_surface_compositor_bi
     Display *display = client_surface_compositor_display;
     Pixmap source = frame.source;
     UINT64 control = copy->control;
-    BOOL created = FALSE;
-    int error = 0;
 
     assert( !binding->retired && !client_surface_cache_read_pending( binding ) );
     TRACE( "reading handoff hwnd %p identity %s sequence %s into owner cache\n", binding->window,
            wine_dbgstr_longlong( binding->identity ), wine_dbgstr_longlong( control ) );
-    if (image->width != frame.width || image->height != frame.height || image->depth != depth)
+    /* An old latest image can still be a scene output's source after swapping
+     * into the spare. Both cross-connection reclaim and fallback writes must
+     * wait for that read; retain its reference and admit a separate candidate. */
+    if (!image->storage || client_surface_cache_shared( image->storage ) ||
+        image->width != frame.width || image->height != frame.height || image->depth != depth)
     {
         UINT64 bytes = client_surface_pixmap_bytes( frame.width, frame.height, depth );
 
-        free_client_surface_cached_image( image, TRUE );
-        client_surface_memory_scope_copy( &image->memory, &binding->memory, TRUE );
-        if (!client_surface_reserve_scoped_memory( &image->memory, CLIENT_SURFACE_MEMORY_SOURCE, bytes ))
-        {
-            client_surface_memory_scope_destroy( &image->memory );
-            goto done;
-        }
-        image->bytes = bytes;
+        free_client_surface_cached_image( image );
+        image->storage = client_surface_cache_create( &binding->memory, frame.width, frame.height, depth, bytes,
+            wake_client_surface_compositor, complete_client_surface_cache_creation, binding );
+        if (!image->storage) goto done;
         image->width = frame.width;
         image->height = frame.height;
         image->depth = depth;
+        copy->native_pending = TRUE;
+        TRACE_(csperf)( "ticks=%llu event=cache_image_pending identity=%s cookie=%s token=%s image=%p operation=1\n",
+                       client_surface_perf_time(), wine_dbgstr_longlong( binding->identity ),
+                       wine_dbgstr_longlong( binding->cookie ), wine_dbgstr_longlong( control ), image->storage );
+        return;
     }
     /* Keep the last complete cache intact until the new full image and its
      * error check succeed. Neither buffer borrows a producer XID. */
@@ -2856,23 +2884,6 @@ static void start_client_surface_cache_copy( struct client_surface_compositor_bi
         RECT rect = {0, 0, frame.width, frame.height};
         XRectangle clip = {0, 0, frame.width, frame.height};
 
-        /* Native storage creation remains a checked cold operation. Steady
-         * copies into this private spare do not perform an XSync round trip. */
-        if (!image->pixmap)
-        {
-            X11DRV_expect_error( display, client_surface_compositor_error, &error );
-            image->pixmap = XCreatePixmap( display, root_window, image->width, image->height, image->depth );
-            XSync( display, False );
-            X11DRV_check_error();
-            TRACE_(csperf)( "ticks=%llu event=cache_native_alloc pixmap=%lx error=%u sync_calls=1\n",
-                           client_surface_perf_time(), image->pixmap, error );
-            if (!image->pixmap || error)
-            {
-                free_client_surface_cached_image( image, FALSE );
-                goto done;
-            }
-            x11drv_client_surface_trace_image( "acquire", "owner_cache", display, image->pixmap, image->bytes );
-        }
         if (client_surface_xcb_copy( display, source, image->pixmap, &image->xcb_gc,
                                     0, NULL, &rect, &rect, &clip, 1, FALSE, &copy->request, TRUE ))
         {
@@ -2886,32 +2897,11 @@ static void start_client_surface_cache_copy( struct client_surface_compositor_bi
             return;
         }
     }
-    X11DRV_expect_error( display, client_surface_compositor_error, &error );
-    if (!image->pixmap)
-    {
-        created = TRUE;
-        image->pixmap = XCreatePixmap( display, root_window, image->width, image->height, image->depth );
-    }
-    if (image->pixmap && !image->gc) image->gc = XCreateGC( display, image->pixmap, 0, NULL );
-    if (image->gc) XCopyArea( display, source, image->pixmap, image->gc,
-                            0, 0, frame.width, frame.height, 0, 0 );
-    XSync( display, False );
-    X11DRV_check_error();
-    TRACE_(csperf)( "ticks=%llu event=cache_native_copy identity=%s cookie=%s token=%s sequence=%s "
-                   "source=%lx destination=%lx width=%u height=%u depth=%u pixel_bits=%u copied=%u error=%d sync_calls=1\n",
+    copy->native_pending = TRUE;
+    client_surface_cache_copy( image->storage, source, complete_client_surface_cache_fallback, binding );
+    TRACE_(csperf)( "ticks=%llu event=cache_image_pending identity=%s cookie=%s token=%s image=%p operation=2\n",
                    client_surface_perf_time(), wine_dbgstr_longlong( binding->identity ),
-                   wine_dbgstr_longlong( binding->cookie ), wine_dbgstr_longlong( control ),
-                   wine_dbgstr_longlong( frame.source_sequence ), source, image->pixmap,
-                   frame.width, frame.height, depth,
-                   pixmap_formats[depth] ? pixmap_formats[depth]->bits_per_pixel : 0, !!image->gc, error );
-    if (!image->gc || error)
-    {
-        free_client_surface_cached_image( image, !created );
-        goto done;
-    }
-    if (created)
-        x11drv_client_surface_trace_image( "acquire", "owner_cache", display, image->pixmap, image->bytes );
-    finish_client_surface_cache_copy( binding, TRUE );
+                   wine_dbgstr_longlong( binding->cookie ), wine_dbgstr_longlong( control ), image->storage );
     return;
 done:
     release_client_surface_cached_source( binding, FALSE );
@@ -3428,6 +3418,7 @@ static void complete_client_surface_copy_batch( struct client_surface_copy_batch
         const struct client_surface_owner_copy *copy = &batch->copies[i];
         struct client_surface_compositor_binding *binding = copy->binding;
 
+        client_surface_cache_release( copy->image );
         trace_client_surface_source( copy->replay ?
                                      (batch->asynchronous ? "replay_copy_async" : "replay_copy_sync") :
                                      (batch->asynchronous ? "copy_async" : "copy_sync"),
@@ -3559,6 +3550,8 @@ static void complete_client_surface_output_reply( struct client_surface_composit
     assert( binding );
     control = frame->copy_control;
     frame->copy_binding = NULL;
+    client_surface_cache_release( frame->copy_image );
+    frame->copy_image = NULL;
     TRACE( "validated owner copy request %u pixmap %#lx success %u\n",
            frame->copy_request.cookies[0], frame->pixmap, success );
     trace_client_surface_source( frame->copy_replay ? "replay_copy_async" : "copy_async",
@@ -3874,7 +3867,8 @@ retry:
             }
             assert( client_surface_copy_batch.frame == frame );
             client_surface_copy_batch.copies[client_surface_copy_batch.count++] =
-                (struct client_surface_owner_copy){binding, buffer_index, control, plan.generation, plan.epoch,
+                (struct client_surface_owner_copy){binding, client_surface_cache_acquire( binding->latest_image.storage ),
+                                                   buffer_index, control, plan.generation, plan.epoch,
                                                    slot->source_sequence, replay};
             client_surface_copy_batch.requests[client_surface_copy_batch.count - 1] =
                 (struct client_surface_xcb_request){0};
@@ -3892,6 +3886,7 @@ retry:
         {
             target->copy_frame = frame;
             frame->copy_binding = binding;
+            frame->copy_image = client_surface_cache_acquire( binding->latest_image.storage );
             frame->copy_index = buffer_index;
             frame->copy_control = control;
             frame->copy_sequence = slot->source_sequence;
@@ -4887,6 +4882,7 @@ static void client_surface_compositor_thread( void *context )
             process_client_surface_present_events();
             progressed = client_surface_complete_queries( CLIENT_SURFACE_COPY_BATCH_SIZE );
             if (progressed) ++client_surface_compositor_query_generation;
+            progressed |= client_surface_complete_cache( CLIENT_SURFACE_COPY_BATCH_SIZE );
             progressed |= process_client_surface_compositor_replies();
             if (progressed) wake_client_surface_compositor_queues();
             progressed |= process_client_surface_compositor_jobs();
