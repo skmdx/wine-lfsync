@@ -2787,11 +2787,11 @@ static void check_scene_result_rejected( HWND hwnd, const struct surface_state *
 
 /* Create and destroy at the real server boundary. Public DestroyWindow hides
  * and unlinks first; thread/process teardown can destroy a linked visible HWND. */
-static HWND create_scene_occluder( HWND parent, HWND class_window )
+static HWND create_scene_window( HWND parent, HWND class_window, const struct rectangle *rect )
 {
     struct __server_request_info info = {0};
     struct create_window_request *req = &info.u.req.create_window_request;
-    struct rectangle rect = {10, 10, 50, 40}, extra[2] = {rect, rect};
+    struct rectangle extra[2] = {*rect, *rect};
     UINT status;
     HWND hwnd;
 
@@ -2808,11 +2808,26 @@ static HWND create_scene_occluder( HWND parent, HWND class_window )
     info.u.req.set_window_pos_request.__header.req = REQ_set_window_pos;
     info.u.req.set_window_pos_request.handle = wine_server_user_handle( hwnd );
     info.u.req.set_window_pos_request.swp_flags = SWP_SHOWWINDOW | SWP_NOACTIVATE | SWP_NOREDRAW;
-    info.u.req.set_window_pos_request.window = info.u.req.set_window_pos_request.client = rect;
+    info.u.req.set_window_pos_request.window = info.u.req.set_window_pos_request.client = *rect;
     wine_server_add_data( &info, extra, sizeof(extra) );
     status = p_wine_server_call( &info );
     ok( !status, "occluder placement status %#x\n", status );
     return hwnd;
+}
+
+static HWND create_scene_occluder( HWND parent, HWND class_window )
+{
+    static const struct rectangle rect = {10, 10, 50, 40};
+
+    return create_scene_window( parent, class_window, &rect );
+}
+
+static HWND create_scene_child( HWND parent, int x )
+{
+    const struct rectangle rect = {x, 10, x + 50, 50};
+
+    /* These receipt tests drive server scenes without requesting GUI paint. */
+    return create_scene_window( parent, parent, &rect );
 }
 
 static UINT destroy_scene_window( HWND hwnd )
@@ -2822,6 +2837,15 @@ static UINT destroy_scene_window( HWND hwnd )
     info.u.req.destroy_window_request.__header.req = REQ_destroy_window;
     info.u.req.destroy_window_request.handle = wine_server_user_handle( hwnd );
     return p_wine_server_call( &info );
+}
+
+static void destroy_scene_child( HWND hwnd )
+{
+    UINT status;
+
+    if (!hwnd) return;
+    status = destroy_scene_window( hwnd );
+    ok( !status, "scene child %p destruction status %#x\n", hwnd, status );
 }
 
 static void check_source_free_destruction( HWND hwnd, const struct client_surface_handoff_receipt *receipt )
@@ -3045,7 +3069,7 @@ static void check_owner_repair( HWND hwnd, const struct client_surface_handoff_r
         drain_scene_notifications( &owner_updates, &prepares );
         winetest_pop_context();
     }
-    child = create_test_child( hwnd, 10 );
+    child = create_scene_child( hwnd, 10 );
     ok( !!child, "could not create cold scene layer\n" );
     if (child)
     {
@@ -3057,7 +3081,7 @@ static void check_owner_repair( HWND hwnd, const struct client_surface_handoff_r
         ok( !status && !accepted, "incomplete owner cache accepted a cold selected layer, status %#x\n", status );
         status = request_owner_repair( child, state.scene_generation, receipt, sizeof(*receipt), &accepted );
         ok( status == STATUS_ACCESS_DENIED && !accepted, "child accepted as repair owner, status %#x\n", status );
-        DestroyWindow( child );
+        destroy_scene_child( child );
     }
 }
 
@@ -3195,7 +3219,7 @@ static void check_scene_source_subset( HWND hwnd, const struct client_surface_ha
     struct client_surface_handoff_channel *channel;
     struct surface_state state;
     const UINT64 identity = allocate_surface();
-    HWND child = create_test_child( hwnd, 10 );
+    HWND child = create_scene_child( hwnd, 10 );
     UINT status, producers, updates, prepares;
     void *view = NULL;
     BOOL accepted;
@@ -3271,7 +3295,7 @@ done:
     if (view) UnmapViewOfFile( view );
     if (producer.mapping) CloseHandle( producer.mapping );
     if (owner.mapping) CloseHandle( owner.mapping );
-    DestroyWindow( child );
+    destroy_scene_child( child );
     prepare_surface_state( hwnd, &state );
     complete_surface_handoffs( hwnd, state.generation, state.scene_generation, receipt, 1, &accepted );
     publish_handoff_state( hwnd, state.generation, state.scene_generation, &state );
@@ -3293,7 +3317,7 @@ static void check_zorder_scene_sources( HWND hwnd, const struct client_surface_h
     };
     struct surface_state state;
     struct native_barrier_state barrier;
-    HWND first = create_test_child( hwnd, 10 ), second = create_test_child( hwnd, 20 );
+    HWND first = create_scene_child( hwnd, 10 ), second = create_scene_child( hwnd, 20 );
     const struct scene_source_mutation mutation = {SCENE_SOURCE_ZORDER, "z-order", first};
     UINT i, status, producers, owner_updates, prepares;
     BOOL accepted;
@@ -3338,8 +3362,8 @@ static void check_zorder_scene_sources( HWND hwnd, const struct client_surface_h
         winetest_pop_context();
     }
 done:
-    if (second) DestroyWindow( second );
-    if (first) DestroyWindow( first );
+    destroy_scene_child( second );
+    destroy_scene_child( first );
     prepare_surface_state( hwnd, &state );
     /* Removing the source-free siblings preserves the source and requests
      * the current owner's inventory. Receipts cannot bypass that decision. */
@@ -3365,8 +3389,8 @@ static void check_child_placement_sources( HWND hwnd, const struct client_surfac
 
     for (i = 0; i < ARRAY_SIZE(names); ++i)
     {
-        first = create_test_child( hwnd, 10 );
-        second = create_test_child( hwnd, 20 );
+        first = create_scene_child( hwnd, 10 );
+        second = create_scene_child( hwnd, 20 );
         ok( !!first && !!second, "failed to create placement windows\n" );
         if (!first || !second) goto done;
         mutation = (struct scene_source_mutation){SCENE_SOURCE_MOVE + i, names[i], first, second};
@@ -3398,8 +3422,8 @@ static void check_child_placement_sources( HWND hwnd, const struct client_surfac
             winetest_pop_context();
         }
 done:
-        if (first) DestroyWindow( first );
-        if (second) DestroyWindow( second );
+        destroy_scene_child( first );
+        destroy_scene_child( second );
         prepare_surface_state( hwnd, &state );
         complete_surface_handoffs( hwnd, state.generation, state.scene_generation, receipt, 1, &accepted );
         publish_handoff_state( hwnd, state.generation, state.scene_generation, &state );
