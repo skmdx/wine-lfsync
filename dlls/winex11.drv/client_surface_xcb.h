@@ -26,5 +26,7 @@ BOOL client_surface_xcb_copy( Display *display, Pixmap source, Pixmap destinatio
                               const XRectangle *clips, unsigned int clip_count, BOOL clipped,
                               struct client_surface_xcb_request *request, BOOL flush );
 void client_surface_xcb_free_gc( Display *display, unsigned int *gc );
+void client_surface_xcb_free_gc_async( Display *display, unsigned int gc,
+                                      struct client_surface_xcb_request *request );
 
 #endif
