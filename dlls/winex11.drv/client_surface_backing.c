@@ -3893,6 +3893,16 @@ retry:
             target->replay_member = min( target->replay_member, binding->scene_index );
             return FALSE;
         }
+        /* A failed publication can leave staging without a generation.
+         * Once both retained source and output storage are usable, rebuild
+         * that publication before copying: a steady Present cannot expose
+         * the staged window. Keep these owned resources on rejection and
+         * wait for a current plan after repair changes the scene epoch. */
+        if (current.mode == CLIENT_SURFACE_PRESENTATION_STAGED && !current.generation)
+        {
+            repair_client_surface_compositor_owner( binding->toplevel, FALSE );
+            goto retry;
+        }
         if (plan.generation && !previous_publish && !target->assembly_pending)
         {
             target->assembly_pending = TRUE;
