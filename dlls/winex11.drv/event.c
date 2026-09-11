@@ -376,7 +376,10 @@ BOOL X11DRV_ProcessEvents( DWORD mask )
 
     for (count = 0; XCheckIfEvent( data->display, &event, filter_event, (XPointer)(UINT_PTR)mask ); count++)
     {
-        BOOL filtered = XFilterEvent( &event, None );
+        BOOL filtered;
+
+        if (event.type == ClientMessage && x11drv_window_paint_event( &event.xclient )) continue;
+        filtered = XFilterEvent( &event, None );
         xim_handle_event( data, &event );
         if (filtered || host_window_filter_event( &event )) continue;
         get_event_data( &event );
@@ -385,6 +388,7 @@ BOOL X11DRV_ProcessEvents( DWORD mask )
     }
 
     XFlush( gdi_display );
+    x11drv_flush_window_paints();
     if (count) TRACE( "processed %d events\n", count );
     NtUserSendHardwareInput( NULL, SEND_HWMSG_RAWINPUT, &input, 0 ); /* flush win32u accumulated motion */
 
