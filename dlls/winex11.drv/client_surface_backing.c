@@ -59,6 +59,8 @@ struct client_surface_compositor_pool
     unsigned int refs;
     unsigned int next_word;
     int ready_fd;
+    UINT64 query_generation;
+    UINT64 query_wait_bitmap[CLIENT_SURFACE_HANDOFF_BITMAP_WORDS];
     struct client_surface_compositor_binding *bindings[CLIENT_SURFACE_HANDOFF_CHANNELS];
 };
 
@@ -311,6 +313,7 @@ static struct client_surface_compositor_target *client_surface_compositor_target
 static struct client_surface_compositor_target *client_surface_compositor_next_target;
 static unsigned int client_surface_compositor_target_count;
 static UINT64 client_surface_compositor_target_generation;
+static UINT64 client_surface_compositor_query_generation;
 static UINT64 client_surface_compositor_mark;
 
 struct client_surface_compositor_scan
@@ -1770,6 +1773,7 @@ static void remove_client_surface_compositor_binding(
     assert( !target || !target->copy_frame );
     *cursor = binding->next;
     if (binding->pool->bindings[index] == binding) binding->pool->bindings[index] = NULL;
+    binding->pool->query_wait_bitmap[index / 64] &= ~((UINT64)1 << (index % 64));
     if (target)
     {
         finish_client_surface_compositor_assembly( target, TRUE );
@@ -4021,6 +4025,26 @@ static BOOL process_client_surface_handoffs(void)
         next = pool->next ? pool->next : client_surface_compositor_pools;
         next_pool_id = next->id;
         ++pool->refs; /* Removing a lost final binding must not unmap the scan. */
+        if (pool->query_generation != client_surface_compositor_query_generation)
+        {
+            unsigned int restored = 0;
+
+            /* Native return alone does not free query capacity: the actor
+             * must consume the result. Rearm parked hints once per actual
+             * capacity change, without repeatedly reporting FULL as work.
+             * New producer READYs can still coalesce or hit warm metadata. */
+            for (n = 0; n < CLIENT_SURFACE_HANDOFF_BITMAP_WORDS; ++n)
+            {
+                restored += __builtin_popcountll( pool->query_wait_bitmap[n] );
+                __atomic_fetch_or( &pool->shared->ready_bitmap[n], pool->query_wait_bitmap[n], __ATOMIC_RELEASE );
+                pool->query_wait_bitmap[n] = 0;
+            }
+            pool->query_generation = client_surface_compositor_query_generation;
+            if (restored)
+                TRACE_(csperf)( "ticks=%llu event=source_query_retry pool=%s generation=%s hints=%u\n",
+                               client_surface_perf_time(), wine_dbgstr_longlong( pool->id ),
+                               wine_dbgstr_longlong( pool->query_generation ), restored );
+        }
         for (n = 0; n < CLIENT_SURFACE_HANDOFF_BITMAP_WORDS; ++n)
         {
             unsigned int word = (start + n) % CLIENT_SURFACE_HANDOFF_BITMAP_WORDS;
@@ -4036,6 +4060,7 @@ static BOOL process_client_surface_handoffs(void)
 
                 bits &= bits - 1;
                 if (!binding) continue;
+                pool->query_wait_bitmap[word] &= ~((UINT64)1 << bit);
                 /* Clear the hint before acquiring the sequence. A concurrent
                  * publisher either appears in that load or leaves its bit set. */
                 __atomic_fetch_and( &pool->shared->ready_bitmap[word], ~((UINT64)1 << bit), __ATOMIC_ACQ_REL );
@@ -4073,7 +4098,11 @@ static BOOL process_client_surface_handoffs(void)
                                                         consumed + 1 ))
                     {
                         progressed |= consumed != previous;
-                        __atomic_fetch_or( &pool->shared->ready_bitmap[word], (UINT64)1 << bit, __ATOMIC_RELEASE );
+                        pool->query_wait_bitmap[word] |= (UINT64)1 << bit;
+                        TRACE_(csperf)( "ticks=%llu event=source_query_defer identity=%s cookie=%s token=%s pool=%s\n",
+                                       client_surface_perf_time(), wine_dbgstr_longlong( binding->identity ),
+                                       wine_dbgstr_longlong( binding->cookie ), wine_dbgstr_longlong( consumed + 1 ),
+                                       wine_dbgstr_longlong( pool->id ) );
                         break;
                     }
                     progressed = TRUE;
@@ -4857,6 +4886,7 @@ static void client_surface_compositor_thread( void *context )
 
             process_client_surface_present_events();
             progressed = client_surface_complete_queries( CLIENT_SURFACE_COPY_BATCH_SIZE );
+            if (progressed) ++client_surface_compositor_query_generation;
             progressed |= process_client_surface_compositor_replies();
             if (progressed) wake_client_surface_compositor_queues();
             progressed |= process_client_surface_compositor_jobs();
