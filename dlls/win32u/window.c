@@ -1932,8 +1932,6 @@ static void update_surface_region( HWND hwnd )
         if (win->dwExStyle & WS_EX_LAYOUTRTL) NtUserMirrorRgn( hwnd, shape );
         NtGdiDeleteObjectApp( region );
     }
-    window_surface_set_shape( win->surface, shape );
-
     if (get_window_region( hwnd, TRUE, &region, &visible )) goto done;
     if (!region) window_surface_set_clip( win->surface, shape );
     else
@@ -1943,6 +1941,10 @@ static void update_surface_region( HWND hwnd )
         window_surface_set_clip( win->surface, region );
         NtGdiDeleteObjectApp( region );
     }
+
+    /* Updating the shape flushes the surface. Install the new clip first so
+     * that pixels exposed by the shape change are not clipped out. */
+    window_surface_set_shape( win->surface, shape );
 
 done:
     if (shape) NtGdiDeleteObjectApp( shape );
