@@ -182,6 +182,7 @@ struct x11drv_native_window
     struct client_surface_memory_scope memory;
     struct client_surface_native_work work;
     struct x11drv_error_handler errors;
+    struct list desktop_entry;
     struct x11drv_display_owner *creator;
     struct x11drv_native_window *ancestor;
     Display *display;
@@ -192,6 +193,7 @@ struct x11drv_native_window
 };
 
 static pthread_mutex_t native_window_mutex = PTHREAD_MUTEX_INITIALIZER;
+static struct list native_desktops = LIST_INIT(native_desktops);
 static struct x11drv_native_window *native_root, *pending_desktop;
 static BOOL root_owned;
 
@@ -241,6 +243,7 @@ static void free_native_window( struct client_surface_native_work *work )
 
     pthread_mutex_lock( &native_window_mutex );
     if (native_root == window) native_root = NULL; /* retain root_owned until another root is selected */
+    list_remove( &window->desktop_entry );
     pthread_mutex_unlock( &native_window_mutex );
     client_surface_free_owned_metadata( &window->memory, window, sizeof(*window) );
     x11drv_return_release_capacity( 1, sizeof(*window) );
@@ -266,6 +269,7 @@ struct x11drv_native_window *x11drv_native_window_alloc( Display *display,
     window->display = display;
     window->work.execute = destroy_native_window;
     window->work.finished = free_native_window;
+    list_init( &window->desktop_entry );
     pthread_mutex_lock( &native_window_mutex );
     if ((desktop && pending_desktop) || (!desktop && root_owned && (!native_root || native_root->retired ||
         InterlockedCompareExchange( &native_root->destroyed, 0, 0 ))))
@@ -274,7 +278,11 @@ struct x11drv_native_window *x11drv_native_window_alloc( Display *display,
         goto failed;
     }
     window->parent = desktop ? DefaultRootWindow( display ) : root_window;
-    if (desktop) pending_desktop = window;
+    if (desktop)
+    {
+        pending_desktop = window;
+        list_add_head( &native_desktops, &window->desktop_entry );
+    }
     else window->ancestor = x11drv_native_window_acquire( native_root );
     pthread_mutex_unlock( &native_window_mutex );
     window->creator = x11drv_display_owner_acquire( creator );
@@ -346,11 +354,25 @@ void x11drv_native_window_retire( struct x11drv_native_window *window, BOOL dest
 
 void x11drv_native_window_set_root( Window window )
 {
+    struct x11drv_native_window *desktop;
+
     pthread_mutex_lock( &native_window_mutex );
+    /* Another thread can select a different desktop and then return to an
+     * already adopted one. Keep its ownership discoverable until actual free,
+     * including while retired, so it cannot become a borrowed ancestor. */
+    LIST_FOR_EACH_ENTRY( desktop, &native_desktops, struct x11drv_native_window, desktop_entry )
+        if (window && desktop->window == window)
+        {
+            native_root = desktop;
+            root_owned = TRUE;
+            root_window = window;
+            pthread_mutex_unlock( &native_window_mutex );
+            return;
+        }
     if (root_window != window || !root_owned)
     {
-        native_root = pending_desktop && pending_desktop->window == window ? pending_desktop : NULL;
-        root_owned = !!native_root;
+        native_root = NULL;
+        root_owned = FALSE;
         root_window = window;
     }
     pthread_mutex_unlock( &native_window_mutex );
