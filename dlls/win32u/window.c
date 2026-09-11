@@ -2148,7 +2148,8 @@ static BOOL apply_window_pos( HWND hwnd, HWND insert_after, UINT swp_flags, stru
     else monitor_dpi_from_rect( new_rects->window, dpi, &raw_dpi );
 
     get_window_rects( hwnd, COORDS_PARENT, &old_rects, dpi );
-    toplevel_size_changed = !is_child &&
+    /* A surviving child can have no root after its parent's thread exits. */
+    toplevel_size_changed = toplevel == hwnd &&
         (old_rects.visible.right - old_rects.visible.left !=
          new_rects->visible.right - new_rects->visible.left ||
          old_rects.visible.bottom - old_rects.visible.top !=
