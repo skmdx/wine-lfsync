@@ -1661,6 +1661,7 @@ struct x11drv_image
 struct x11drv_window_surface
 {
     struct window_surface header;
+    struct x11drv_native_window *native_window;
     Window                window;
     GC                    gc;
     struct x11drv_image  *image;
@@ -1947,6 +1948,7 @@ static void x11drv_surface_destroy( struct window_surface *window_surface )
     TRACE( "freeing %p\n", surface );
     if (surface->gc) XFreeGC( gdi_display, surface->gc );
     if (surface->image) x11drv_image_destroy( surface->image );
+    x11drv_native_window_release( surface->native_window );
 }
 
 static const struct window_surface_funcs x11drv_surface_funcs =
@@ -1959,8 +1961,8 @@ static const struct window_surface_funcs x11drv_surface_funcs =
 /***********************************************************************
  *           create_surface
  */
-static struct window_surface *create_surface( HWND hwnd, Window window, const XVisualInfo *vis, const RECT *rect,
-                                              BOOL use_alpha )
+static struct window_surface *create_surface( HWND hwnd, Window window, struct x11drv_native_window *native_window,
+                                              const XVisualInfo *vis, const RECT *rect, BOOL use_alpha )
 {
     const XPixmapFormatValues *format = pixmap_formats[vis->depth];
     char buffer[FIELD_OFFSET( BITMAPINFO, bmiColors[256] )];
@@ -1983,7 +1985,12 @@ static struct window_surface *create_surface( HWND hwnd, Window window, const XV
     info->bmiHeader.biSizeImage   = get_dib_image_size( info );
     set_color_info( vis, info, use_alpha );
 
-    if (!(image = x11drv_image_create( info, vis ))) return NULL;
+    native_window = x11drv_native_window_acquire( native_window );
+    if (!(image = x11drv_image_create( info, vis )))
+    {
+        x11drv_native_window_release( native_window );
+        return NULL;
+    }
 
     /* wrap the XImage data in a HBITMAP if we can write to the surface pixels directly */
     if ((byteswap = image_needs_byteswap( image->ximage, is_r8g8b8( vis ), info->bmiHeader.biBitCount )) ||
@@ -2015,10 +2022,12 @@ static struct window_surface *create_surface( HWND hwnd, Window window, const XV
     {
         if (bitmap) NtGdiDeleteObjectApp( bitmap );
         x11drv_image_destroy( image );
+        x11drv_native_window_release( native_window );
     }
     else
     {
         surface = get_x11_surface( window_surface );
+        surface->native_window = native_window;
         surface->image = image;
         surface->byteswap = byteswap;
         surface->window = window;
@@ -2058,20 +2067,24 @@ BOOL X11DRV_CreateWindowSurface( HWND hwnd, BOOL layered, const RECT *surface_re
         /* re-create window surface is window has changed, which can happen when changing visual */
         TRACE( "re-creating hwnd %p surface with new window %lx\n", data->hwnd, data->whole_window );
     }
-    if (previous) window_surface_release( previous );
-
     if (layered)
     {
+        if (!data->embedded && argb_visual.visualid && !set_window_visual( data, &argb_visual, TRUE ))
+        {
+            release_win_data( data );
+            return FALSE;
+        }
         data->layered = TRUE;
-        if (!data->embedded && argb_visual.visualid) set_window_visual( data, &argb_visual, TRUE );
     }
     else if (enable_direct_drawing( data, layered ))
     {
+        if (previous) window_surface_release( previous );
         *surface = NULL;  /* indicate that we want to draw directly to the window */
         goto done; /* draw directly to the window */
     }
 
-    *surface = create_surface( data->hwnd, data->whole_window, &data->vis, surface_rect,
+    if (previous) window_surface_release( previous );
+    *surface = create_surface( data->hwnd, data->whole_window, data->native_window, &data->vis, surface_rect,
                                layered ? data->use_alpha : FALSE );
 
 done:

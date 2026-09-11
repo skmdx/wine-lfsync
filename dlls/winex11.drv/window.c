@@ -51,6 +51,7 @@
 #include "ntstatus.h"
 
 #include "x11drv.h"
+#include "client_surface_cache.h"
 #include "xcomposite.h"
 #include "wingdi.h"
 #include "winuser.h"
@@ -175,6 +176,207 @@ static const char *debugstr_monitor_indices( const struct monitor_indices *monit
 }
 
 static pthread_mutex_t win_data_mutex;
+
+struct x11drv_native_window
+{
+    struct client_surface_memory_scope memory;
+    struct client_surface_native_work work;
+    struct x11drv_error_handler errors;
+    struct x11drv_display_owner *creator;
+    struct x11drv_native_window *ancestor;
+    Display *display;
+    Window window, parent;
+    Colormap colormap;
+    LONG refs, destroyed;
+    BOOL retired;
+};
+
+static pthread_mutex_t native_window_mutex = PTHREAD_MUTEX_INITIALIZER;
+static struct x11drv_native_window *native_root, *pending_desktop;
+static BOOL root_owned;
+
+static int native_window_error( Display *display, XErrorEvent *event, void *arg )
+{
+    struct x11drv_native_window *window = arg;
+
+    if (window->window && event->error_code == BadWindow && event->resourceid == window->window &&
+        (event->request_code == X_DestroyWindow || event->request_code == X_UnmapWindow ||
+         event->request_code == X_ChangeWindowAttributes
+#ifdef HAVE_X11_EXTENSIONS_XINPUT2_H
+         || (xinput2_opcode && event->request_code == xinput2_opcode && event->minor_code == X_XISelectEvents)
+#endif
+        ))
+    {
+        InterlockedExchange( &window->destroyed, TRUE );
+        TRACE_(csperf)( "event=native_window_lost record=%p window=%lx request=%u\n",
+                       window, window->window, event->request_code );
+        return 1;
+    }
+    return window->colormap && event->error_code == BadColor && event->request_code == X_FreeColormap &&
+           event->resourceid == window->colormap;
+}
+
+static void destroy_native_window( struct client_surface_native_work *work )
+{
+    struct x11drv_native_window *window = CONTAINING_RECORD( work, struct x11drv_native_window, work );
+
+    /* Complete GDI uses and client reparents before destroying their old
+     * ancestor. No registry or global expected-error lock spans native I/O. */
+    if (window->window) XSync( gdi_display, False );
+    if (window->window && !InterlockedCompareExchange( &window->destroyed, 0, 0 ))
+        XDestroyWindow( window->display, window->window );
+    if (window->colormap) XFreeColormap( window->display, window->colormap );
+    XSync( window->display, False );
+    x11drv_display_owner_unregister_error_handler( window->creator, &window->errors );
+    TRACE_(csperf)( "event=native_window_destroy_return record=%p display=%p window=%lx lost=%d\n",
+                   window, window->display, window->window, window->destroyed );
+}
+
+static void free_native_window( struct client_surface_native_work *work )
+{
+    struct x11drv_native_window *window = CONTAINING_RECORD( work, struct x11drv_native_window, work );
+    struct x11drv_native_window *ancestor = window->ancestor;
+    struct x11drv_display_owner *creator = window->creator;
+    ULONG_PTR identity = (ULONG_PTR)window;
+
+    pthread_mutex_lock( &native_window_mutex );
+    if (native_root == window) native_root = NULL; /* retain root_owned until another root is selected */
+    pthread_mutex_unlock( &native_window_mutex );
+    client_surface_free_owned_metadata( &window->memory, window, sizeof(*window) );
+    x11drv_return_release_capacity( 1, sizeof(*window) );
+    TRACE_(csperf)( "event=native_window_return record=0x%lx bytes=%zu\n", identity, sizeof(*window) );
+    x11drv_native_window_release( ancestor );
+    x11drv_display_owner_release( creator );
+}
+
+struct x11drv_native_window *x11drv_native_window_alloc( Display *display,
+    struct x11drv_display_owner *creator, HWND hwnd, BOOL desktop )
+{
+    struct client_surface_memory_scope memory = {0};
+    struct x11drv_native_window *window = NULL;
+    UINT64 domain;
+
+    /* The creator admitted the fixed native executors before XOpenDisplay. */
+    if (!x11drv_reserve_release_capacity( 1, sizeof(*window) )) return NULL;
+    domain = client_surface_allocate_completion_domains( 1 );
+    if (!domain || !client_surface_memory_scope_init( &memory, hwnd, domain )) goto failed;
+    if (!(window = client_surface_alloc_scoped_metadata( &memory, 1, sizeof(*window) ))) goto failed;
+    window->memory = memory;
+    window->refs = 1;
+    window->display = display;
+    window->work.execute = destroy_native_window;
+    window->work.finished = free_native_window;
+    pthread_mutex_lock( &native_window_mutex );
+    if ((desktop && pending_desktop) || (!desktop && root_owned && (!native_root || native_root->retired ||
+        InterlockedCompareExchange( &native_root->destroyed, 0, 0 ))))
+    {
+        pthread_mutex_unlock( &native_window_mutex );
+        goto failed;
+    }
+    window->parent = desktop ? DefaultRootWindow( display ) : root_window;
+    if (desktop) pending_desktop = window;
+    else window->ancestor = x11drv_native_window_acquire( native_root );
+    pthread_mutex_unlock( &native_window_mutex );
+    window->creator = x11drv_display_owner_acquire( creator );
+    TRACE_(csperf)( "event=native_window_reserve record=%p creator=%p ancestor=%p parent=%lx domain=%llu bytes=%zu\n",
+                   window, creator, window->ancestor, window->parent, (unsigned long long)domain, sizeof(*window) );
+    return window;
+failed:
+    if (window) client_surface_free_owned_metadata( &window->memory, window, sizeof(*window) );
+    else client_surface_memory_scope_destroy( &memory );
+    x11drv_return_release_capacity( 1, sizeof(*window) );
+    return NULL;
+}
+
+Window x11drv_native_window_parent( struct x11drv_native_window *window )
+{
+    return window->parent;
+}
+
+void x11drv_native_window_publish( struct x11drv_native_window *window, Window xid, Colormap colormap )
+{
+    pthread_mutex_lock( &native_window_mutex );
+    window->window = xid;
+    window->colormap = colormap;
+    window->errors.display = window->display;
+    window->errors.callback = native_window_error;
+    window->errors.arg = window;
+    x11drv_display_owner_register_error_handler( window->creator, &window->errors );
+    pthread_mutex_unlock( &native_window_mutex );
+    TRACE_(csperf)( "event=native_window_create record=%p display=%p window=%lx colormap=%lx\n",
+                   window, window->display, xid, colormap );
+}
+
+struct x11drv_native_window *x11drv_native_window_acquire( struct x11drv_native_window *window )
+{
+    LONG refs;
+    if (!window) return NULL;
+    refs = InterlockedIncrement( &window->refs );
+    assert( refs > 1 );
+    TRACE_(csperf)( "event=native_window_acquire record=%p window=%lx refs=%d\n", window, window->window, refs );
+    return window;
+}
+
+void x11drv_native_window_release( struct x11drv_native_window *window )
+{
+    LONG refs;
+    if (!window) return;
+    refs = InterlockedDecrement( &window->refs );
+    assert( refs >= 0 );
+    /* Another holder can complete the final release after this decrement. */
+    TRACE_(csperf)( "event=native_window_release record=%p refs=%d\n", window, refs );
+    if (refs) return;
+    assert( window->retired );
+    client_surface_submit_native_work( &window->work );
+}
+
+void x11drv_native_window_retire( struct x11drv_native_window *window, BOOL destroyed )
+{
+    if (!window) return;
+    pthread_mutex_lock( &native_window_mutex );
+    assert( !window->retired );
+    window->retired = TRUE;
+    if (pending_desktop == window) pending_desktop = NULL;
+    pthread_mutex_unlock( &native_window_mutex );
+    if (destroyed) InterlockedExchange( &window->destroyed, TRUE );
+    TRACE_(csperf)( "event=native_window_retire record=%p window=%lx refs=%d lost=%d\n",
+                   window, window->window, window->refs, window->destroyed );
+    x11drv_native_window_release( window );
+}
+
+void x11drv_native_window_set_root( Window window )
+{
+    pthread_mutex_lock( &native_window_mutex );
+    if (root_window != window || !root_owned)
+    {
+        native_root = pending_desktop && pending_desktop->window == window ? pending_desktop : NULL;
+        root_owned = !!native_root;
+        root_window = window;
+    }
+    pthread_mutex_unlock( &native_window_mutex );
+}
+
+struct x11drv_native_window *x11drv_native_window_take_desktop( Window xid, Display *display )
+{
+    struct x11drv_native_window *window;
+    pthread_mutex_lock( &native_window_mutex );
+    window = pending_desktop;
+    if (window && window->window == xid && window->display == display) pending_desktop = NULL;
+    else window = NULL;
+    pthread_mutex_unlock( &native_window_mutex );
+    return window;
+}
+
+void x11drv_native_window_thread_detach( Display *display )
+{
+    struct x11drv_native_window *window;
+    pthread_mutex_lock( &native_window_mutex );
+    window = pending_desktop;
+    if (window && window->display == display) pending_desktop = NULL;
+    else window = NULL;
+    pthread_mutex_unlock( &native_window_mutex );
+    x11drv_native_window_retire( window, FALSE );
+}
 
 static void host_window_add_ref( struct host_window *win )
 {
@@ -2672,7 +2874,7 @@ Window create_client_window( HWND hwnd, RECT client_rect, const XVisualInfo *vis
  *
  * Create the whole X window for a given window
  */
-static void create_whole_window( struct x11drv_win_data *data )
+static BOOL create_whole_window( struct x11drv_win_data *data, struct x11drv_native_window *native_window )
 {
     int cx, cy, mask;
     XSetWindowAttributes attr;
@@ -2682,6 +2884,11 @@ static void create_whole_window( struct x11drv_win_data *data )
     DWORD layered_flags;
     HRGN win_rgn;
     POINT pos;
+    Window parent;
+
+    if (!native_window && !(native_window = x11drv_native_window_alloc( data->display, data->display_owner,
+                                                                       data->hwnd, FALSE ))) return FALSE;
+    parent = x11drv_native_window_parent( native_window );
 
     if ((win_rgn = NtGdiCreateRectRgn( 0, 0, 0, 0 )) &&
         NtUserGetWindowRgnEx( data->hwnd, win_rgn, 0 ) == ERROR)
@@ -2692,7 +2899,7 @@ static void create_whole_window( struct x11drv_win_data *data )
     data->shaped = (win_rgn != 0);
 
     if (data->vis.visualid != default_visual.visualid)
-        data->whole_colormap = XCreateColormap( data->display, root_window, data->vis.visual, AllocNone );
+        data->whole_colormap = XCreateColormap( data->display, parent, data->vis.visual, AllocNone );
 
     data->managed = is_window_managed( data->hwnd, SWP_NOACTIVATE, FALSE );
     mask = get_window_attributes( data, &attr ) | CWOverrideRedirect;
@@ -2704,10 +2911,17 @@ static void create_whole_window( struct x11drv_win_data *data )
     else if (cy > 65535) cy = 65535;
 
     pos = virtual_screen_to_root( data->rects.visible.left, data->rects.visible.top );
-    data->whole_window = XCreateWindow( data->display, root_window, pos.x, pos.y,
+    data->whole_window = XCreateWindow( data->display, parent, pos.x, pos.y,
                                         cx, cy, 0, data->vis.depth, InputOutput,
                                         data->vis.visual, mask, &attr );
-    if (!data->whole_window) goto done;
+    x11drv_native_window_publish( native_window, data->whole_window, data->whole_colormap );
+    if (!data->whole_window)
+    {
+        data->whole_colormap = 0;
+        x11drv_native_window_retire( native_window, FALSE );
+        goto done;
+    }
+    data->native_window = native_window;
     SetRect( &data->current_state.rect, pos.x, pos.y, pos.x + cx, pos.y + cy );
     data->pending_state.rect = data->current_state.rect;
     data->desired_state.rect = data->current_state.rect;
@@ -2742,6 +2956,7 @@ static void create_whole_window( struct x11drv_win_data *data )
 
 done:
     if (win_rgn) NtGdiDeleteObjectApp( win_rgn );
+    return !!data->whole_window;
 }
 
 
@@ -2776,6 +2991,7 @@ static void destroy_client_surface_backing( struct x11drv_win_data *data )
  */
 static void destroy_whole_window( struct x11drv_win_data *data, BOOL already_destroyed )
 {
+    struct x11drv_native_window *native_window = data->native_window;
     BOOL barrier = FALSE;
 
     TRACE( "win %p xwin %lx/%lx\n", data->hwnd, data->whole_window, data->client_window );
@@ -2794,13 +3010,16 @@ static void destroy_whole_window( struct x11drv_win_data *data, BOOL already_des
         XDeleteContext( data->display, data->whole_window, winContext );
         if (!already_destroyed)
         {
-            XSync( gdi_display, False ); /* make sure XReparentWindow requests have completed before destroying whole_window */
-            XDestroyWindow( data->display, data->whole_window );
-            trace_window_response( "window_destroy_return", data->hwnd, data->display, data->whole_window,
+            /* Logical disappearance and event detach precede deferred native
+             * destruction. A retained surface can still own this exact XID. */
+            XSelectInput( data->display, data->whole_window, 0 );
+            x11drv_xinput2_disable( data->display, data->whole_window );
+            XUnmapWindow( data->display, data->whole_window );
+            trace_window_response( "window_retire", data->hwnd, data->display, data->whole_window,
                                    0, 0, NULL, TRUE );
         }
     }
-    if (data->whole_colormap) XFreeColormap( data->display, data->whole_colormap );
+    data->native_window = NULL;
     data->whole_window = data->client_window = 0;
     data->whole_colormap = 0;
     data->managed = FALSE;
@@ -2840,6 +3059,7 @@ static void destroy_whole_window( struct x11drv_win_data *data, BOOL already_des
 done:
     if (barrier && !client_surface_end_native_barrier( data->hwnd, (UINT_PTR)data ))
         ERR( "failed to release client-surface backing barrier for window %p\n", data->hwnd );
+    x11drv_native_window_retire( native_window, already_destroyed );
 }
 
 
@@ -2848,23 +3068,29 @@ done:
  *
  * Change the visual by destroying and recreating the X window if needed.
  */
-void set_window_visual( struct x11drv_win_data *data, const XVisualInfo *vis, BOOL use_alpha )
+BOOL set_window_visual( struct x11drv_win_data *data, const XVisualInfo *vis, BOOL use_alpha )
 {
     BOOL same_visual = (data->vis.visualid == vis->visualid);
+    struct x11drv_native_window *native_window;
     Window client_window = data->client_window;
+    BOOL ret;
 
-    if (!data->use_alpha == !use_alpha && same_visual) return;
-    data->use_alpha = use_alpha;
-
-    if (same_visual) return;
-    client_window = data->client_window;
+    if (same_visual)
+    {
+        data->use_alpha = use_alpha;
+        return TRUE;
+    }
+    if (!(native_window = x11drv_native_window_alloc( data->display, data->display_owner,
+                                                      data->hwnd, FALSE ))) return FALSE;
     /* detach the client before re-creating whole_window */
     detach_client_window( data, client_window );
     destroy_whole_window( data, FALSE );
+    data->use_alpha = use_alpha;
     data->vis = *vis;
-    create_whole_window( data );
+    ret = create_whole_window( data, native_window );
     /* attach the client back to the re-created whole_window */
     attach_client_window( data, client_window );
+    return ret;
 }
 
 
@@ -2909,8 +3135,8 @@ void X11DRV_SetWindowStyle( HWND hwnd, INT offset, STYLESTRUCT *style )
     {
         if (changed & WS_EX_LAYERED) /* changing WS_EX_LAYERED resets attributes */
         {
+            if (!set_window_visual( data, &default_visual, FALSE )) goto done;
             data->layered = FALSE;
-            set_window_visual( data, &default_visual, FALSE );
             set_window_opacity( data, 0, 0 );
         }
         if (changed & WS_EX_TRANSPARENT) sync_window_style( data );
@@ -2975,8 +3201,15 @@ static BOOL create_desktop_win_data( Window win, HWND hwnd )
     struct x11drv_thread_data *thread_data = x11drv_thread_data();
     Display *display = thread_data->display;
     struct x11drv_win_data *data;
+    struct x11drv_native_window *native_window;
 
-    if (!(data = alloc_win_data( display, hwnd ))) return FALSE;
+    if (!(native_window = x11drv_native_window_take_desktop( win, display ))) return FALSE;
+    if (!(data = alloc_win_data( display, hwnd )))
+    {
+        x11drv_native_window_retire( native_window, FALSE );
+        return FALSE;
+    }
+    data->native_window = native_window;
     data->whole_window = win;
     window_set_managed( data, TRUE );
     NtUserSetProp( data->hwnd, whole_window_prop, (HANDLE)win );
@@ -3024,7 +3257,7 @@ void X11DRV_SetDesktopWindow( HWND hwnd )
         if (!create_desktop_win_data( root_window, hwnd ))
         {
             ERR( "Failed to create virtual desktop window data\n" );
-            root_window = DefaultRootWindow( gdi_display );
+            x11drv_native_window_set_root( DefaultRootWindow( gdi_display ) );
         }
     }
     else
@@ -3165,7 +3398,7 @@ static struct x11drv_win_data *X11DRV_create_win_data( HWND hwnd, const struct w
 
     if (parent == NtUserGetDesktopWindow())
     {
-        create_whole_window( data );
+        create_whole_window( data, NULL );
         TRACE( "win %p/%lx window %s whole %s client %s\n",
                hwnd, data->whole_window, wine_dbgstr_rect( &data->rects.window ),
                wine_dbgstr_rect( &data->rects.visible ), wine_dbgstr_rect( &data->rects.client ));
@@ -3281,7 +3514,11 @@ BOOL X11DRV_SystrayDockInsert( HWND hwnd, UINT cx, UINT cy, void *icon )
     get_systray_visual_info( display, systray_window, &visual );
 
     if (!(data = get_win_data( hwnd ))) return FALSE;
-    set_window_visual( data, &visual, TRUE );
+    if (!set_window_visual( data, &visual, TRUE ))
+    {
+        release_win_data( data );
+        return FALSE;
+    }
     make_window_embedded( data );
     window = data->whole_window;
     release_win_data( data );
@@ -3477,7 +3714,7 @@ void X11DRV_SetParent( HWND hwnd, HWND parent, HWND old_parent )
     }
     else  /* new top level window */
     {
-        create_whole_window( data );
+        create_whole_window( data, NULL );
     }
 done:
     release_win_data( data );
@@ -3975,7 +4212,7 @@ void X11DRV_SetWindowRgn( HWND hwnd, HRGN hrgn, BOOL redraw )
  */
 static void set_layered_window_attributes( struct x11drv_win_data *data, BYTE alpha, DWORD flags )
 {
-    set_window_visual( data, &default_visual, FALSE );
+    if (!set_window_visual( data, &default_visual, FALSE )) return;
 
     if (data->whole_window)
     {

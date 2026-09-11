@@ -64,6 +64,7 @@ struct x11drv_display_owner
     struct client_surface_memory_scope memory;
     struct client_surface_native_work close_work;
     struct x11drv_error_handler errors;
+    struct list native_errors;
     Display *display;
     Window clip_window;
     LONG refs;
@@ -834,16 +835,39 @@ NTSTATUS __wine_unix_lib_init(void)
 static int display_owner_error( Display *display, XErrorEvent *event, void *arg )
 {
     struct x11drv_display_owner *owner = arg;
+    struct x11drv_error_handler *handler;
+
+    LIST_FOR_EACH_ENTRY( handler, &owner->native_errors, struct x11drv_error_handler, entry )
+        if (handler->callback( display, event, handler->arg )) return 1;
 
     /* An owned parent can already have destroyed its clip Window. */
     return owner->clip_window && event->request_code == X_DestroyWindow &&
            event->error_code == BadWindow && event->resourceid == owner->clip_window;
 }
 
+void x11drv_display_owner_register_error_handler( struct x11drv_display_owner *owner,
+                                                 struct x11drv_error_handler *handler )
+{
+    assert( handler->display == owner->display );
+    pthread_mutex_lock( &error_handlers_mutex );
+    list_add_head( &owner->native_errors, &handler->entry );
+    pthread_mutex_unlock( &error_handlers_mutex );
+}
+
+void x11drv_display_owner_unregister_error_handler( struct x11drv_display_owner *owner,
+                                                   struct x11drv_error_handler *handler )
+{
+    assert( handler->display == owner->display );
+    pthread_mutex_lock( &error_handlers_mutex );
+    list_remove( &handler->entry );
+    pthread_mutex_unlock( &error_handlers_mutex );
+}
+
 static void close_display_owner( struct client_surface_native_work *work )
 {
     struct x11drv_display_owner *owner = CONTAINING_RECORD( work, struct x11drv_display_owner, close_work );
 
+    assert( list_empty( &owner->native_errors ));
     XCloseDisplay( owner->display );
     X11DRV_unregister_error_handler( &owner->errors );
     TRACE_(csperf)( "event=display_close_return owner=%p display=%p\n", owner, owner->display );
@@ -873,6 +897,7 @@ static struct x11drv_display_owner *create_display_owner(void)
     if (!(owner = client_surface_alloc_scoped_metadata( &memory, 1, sizeof(*owner) ))) goto failed;
     owner->memory = memory;
     owner->refs = 1;
+    list_init( &owner->native_errors );
     owner->close_work.execute = close_display_owner;
     owner->close_work.finished = free_display_owner;
     if (!client_surface_prepare_native_work()) goto failed;
@@ -938,6 +963,7 @@ void X11DRV_ThreadDetach(void)
         if (data->net_supported) XFree( data->net_supported );
         XSync( gdi_display, False ); /* make sure XReparentWindow requests have completed before closing the thread display */
         XFlush( data->display );
+        x11drv_native_window_thread_detach( data->display );
         owner->detached = TRUE;
         TRACE_(csperf)( "event=display_detach owner=%p display=%p refs=%u\n", owner, owner->display,
                        (unsigned int)InterlockedCompareExchange( &owner->refs, 0, 0 ) );
