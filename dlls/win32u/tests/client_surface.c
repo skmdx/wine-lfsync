@@ -2229,6 +2229,24 @@ static void check_scene_layer_geometry( const struct scene_snapshot *snapshot, H
         {
             ok( GetDCOrgEx( dc, &origin ), "GetDCOrgEx failed, error %lu\n", GetLastError() );
             OffsetRgn( expected, -origin.x, -origin.y );
+            /* The parent-DC test class can draw beyond its window shape.
+             * Scene images must still respect that separately owned shape. */
+            if (GetClassLongW( hwnd, GCL_STYLE ) & CS_PARENTDC)
+            {
+                WINDOWINFO info = {sizeof(info)};
+                HRGN shape = CreateRectRgn( 0, 0, 0, 0 );
+
+                ok( !!shape, "could not allocate own shape\n" );
+                if (shape && GetWindowRgn( hwnd, shape ) != ERROR)
+                {
+                    ok( GetWindowInfo( hwnd, &info ), "could not get shape origin\n" );
+                    OffsetRgn( shape, info.rcWindow.left - info.rcClient.left,
+                                      info.rcWindow.top - info.rcClient.top );
+                    ok( CombineRgn( expected, expected, shape, RGN_AND ) != ERROR,
+                        "could not intersect own shape\n" );
+                }
+                if (shape) DeleteObject( shape );
+            }
             size = FIELD_OFFSET( RGNDATA, Buffer ) + layer->visible_count * sizeof(RECT);
             data = calloc( 1, size );
             ok( !!data, "could not allocate visible region data\n" );
@@ -2372,12 +2390,13 @@ static void test_scene_snapshot_parent_clip(void)
         {WS_CLIPCHILDREN, 0},
         {WS_CLIPSIBLINGS, WS_CLIPSIBLINGS},
         {WS_CLIPSIBLINGS, WS_CLIPCHILDREN},
+        {0, WS_BORDER},
     };
     WNDCLASSA class = {0};
     struct scene_snapshot snapshot;
     HWND windows[4];
     UINT64 identity;
-    UINT i, j, status;
+    UINT i, j, shape_index, status;
     HRGN shape;
 
     class.style = CS_PARENTDC;
@@ -2410,12 +2429,26 @@ static void test_scene_snapshot_parent_clip(void)
             status = claim_surface_state( windows[j], identity, NULL );
             ok( !status, "claim parent DC layer %u status %#x\n", j, status );
         }
-        status = get_scene_snapshot( windows[0], 0, sizeof(snapshot.data), &snapshot );
-        ok( !status && snapshot.count == ARRAY_SIZE(windows), "parent DC snapshot status %#x count %u\n",
-            status, snapshot.count );
-        if (!status)
-            for (j = 0; j < ARRAY_SIZE(windows); ++j)
-                check_scene_layer_geometry( &snapshot, windows[0], windows[j] );
+        for (shape_index = 0; shape_index < 3; ++shape_index)
+        {
+            winetest_push_context( "own shape %u", shape_index );
+            if (shape_index)
+            {
+                BOOL ret;
+
+                shape = CreateRectRgn( 3, 5, shape_index == 1 ? 67 : 3, 61 );
+                ret = shape && SetWindowRgn( windows[1], shape, FALSE );
+                ok( ret, "could not set parent DC own shape\n" );
+                if (shape && !ret) DeleteObject( shape );
+            }
+            status = get_scene_snapshot( windows[0], 0, sizeof(snapshot.data), &snapshot );
+            ok( !status && snapshot.count == ARRAY_SIZE(windows), "parent DC snapshot status %#x count %u\n",
+                status, snapshot.count );
+            if (!status)
+                for (j = 0; j < ARRAY_SIZE(windows); ++j)
+                    check_scene_layer_geometry( &snapshot, windows[0], windows[j] );
+            winetest_pop_context();
+        }
 next:
         if (windows[0]) DestroyWindow( windows[0] );
         winetest_pop_context();
