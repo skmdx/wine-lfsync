@@ -26,6 +26,7 @@ WINE_DEFAULT_DEBUG_CHANNEL(x11drv);
 WINE_DECLARE_DEBUG_CHANNEL(csperf);
 
 enum cache_operation { CACHE_IDLE, CACHE_CREATE, CACHE_COPY, CACHE_RELEASE };
+enum cache_image_kind { CACHE_IMAGE_SOURCE, CACHE_IMAGE_OUTPUT_MAILBOX, CACHE_IMAGE_OUTPUT_PAIR };
 
 struct cache_worker
 {
@@ -43,9 +44,11 @@ struct client_surface_cache_image
     struct client_surface_cache_image *next;
     struct cache_worker *worker;
     enum cache_operation operation;
+    enum cache_image_kind kind;
     client_surface_cache_callback complete;
     void *context;
     Pixmap pixmap, source;
+    Display *owner_display;
     Window window;
     GC gc, transfer_gc;
     unsigned int width, height, depth;
@@ -60,8 +63,9 @@ struct client_surface_cache_image
  * Each admitted image already owns its work/release node. Scoped byte limits
  * apply independently. No native operation holds the scheduler mutex.
  * Connections belong to workers for the process lifetime, never to an owner
- * target. An image stays on its creating connection for allocation, fallback
- * reads and destruction, so a blocked Display cannot capture another worker. */
+ * target. Worker-created images keep one connection for allocation, fallback
+ * reads and destruction. Adopted output pairs retain their creator only as a
+ * trace key; their final destruction uses the assigned worker's connection. */
 #define CLIENT_SURFACE_CACHE_IMAGE_LIMIT 8192
 /* Source churn must not consume admission reserved for active output. This
  * is part of the same total bound, not an additional uncharged image pool. */
@@ -71,6 +75,13 @@ static struct cache_worker cache_workers[4];
 static unsigned int worker_count, image_count, source_count, next_worker;
 static struct client_surface_cache_image *completed_head, **completed_tail = &completed_head;
 static void (*cache_wake)(void);
+
+static const char *cache_image_kind( const struct client_surface_cache_image *image )
+{
+    static const char *const names[] = {"owner_cache", "output_mailbox", "output_pair"};
+
+    return names[image->kind];
+}
 
 static unsigned long long cache_time(void)
 {
@@ -166,22 +177,36 @@ static void create_output_image( struct client_surface_cache_image *image )
         x11drv_client_surface_trace_image( "acquire", "output_mailbox", display, image->pixmap, image->bytes );
 }
 
-static void destroy_cache_image( struct client_surface_cache_image *image )
+static BOOL destroy_cache_image( struct client_surface_cache_image *image )
 {
     struct cache_worker *worker = image->worker;
-    Display *display = worker->display;
+    Display *display;
+
+    if ((image->gc || image->transfer_gc || image->pixmap) && !open_cache_display( worker ))
+    {
+        TRACE_(csperf)( "ticks=%llu event=cache_native_release_deferred image=%p pixmap=%lx "
+                       "owner_display=%p display=%p kind=%s bytes=%llu purpose=%u worker=%u open_failed=1\n",
+                       cache_time(), image, image->pixmap, image->owner_display, worker->display,
+                       cache_image_kind( image ), (unsigned long long)image->bytes, image->purpose,
+                       (unsigned int)(worker - cache_workers) );
+        return FALSE;
+    }
+    display = worker->display;
 
     worker->error = 0;
     if (image->gc) XFreeGC( display, image->gc );
     if (image->transfer_gc) XFreeGC( display, image->transfer_gc );
     if (image->pixmap) XFreePixmap( display, image->pixmap );
     if (image->gc || image->transfer_gc || image->pixmap) XSync( display, False );
-    TRACE_(csperf)( "ticks=%llu event=cache_native_free image=%p pixmap=%lx display=%p error=%d\n",
-                   cache_time(), image, image->pixmap, display, worker->error );
+    TRACE_(csperf)( "ticks=%llu event=cache_native_free image=%p pixmap=%lx display=%p error=%d "
+                   "owner_display=%p kind=%s\n", cache_time(), image, image->pixmap, display, worker->error,
+                   image->owner_display ? image->owner_display : display, cache_image_kind( image ) );
     if (image->acquired)
-        x11drv_client_surface_trace_image( "free", image->purpose == CLIENT_SURFACE_MEMORY_SOURCE ?
-                                          "owner_cache" : "output_mailbox", display, image->pixmap, image->bytes );
+        x11drv_client_surface_trace_image( "free", cache_image_kind( image ),
+                                          image->owner_display ? image->owner_display : display,
+                                          image->pixmap, image->bytes );
     client_surface_release_scoped_memory( &image->memory, image->purpose, image->bytes );
+    return TRUE;
 }
 
 static void cache_worker_thread( void *context )
@@ -189,6 +214,7 @@ static void cache_worker_thread( void *context )
     struct cache_worker *worker = context;
     struct client_surface_cache_image *image;
     enum cache_operation operation;
+    const LARGE_INTEGER retry_delay = {.QuadPart = -10000000};
     void (*wake)(void);
 
     for (;;)
@@ -206,7 +232,13 @@ static void cache_worker_thread( void *context )
             else create_output_image( image );
             break;
         case CACHE_COPY: copy_cache_image( image ); break;
-        case CACHE_RELEASE: destroy_cache_image( image ); break;
+        case CACHE_RELEASE:
+            /* Created XIDs retain their admitted release node and charge
+             * through a transient failure to open the private connection.
+             * A relative wait keeps this worker from spinning or borrowing
+             * the actor's Display; other workers remain independent. */
+            while (!destroy_cache_image( image )) NtDelayExecution( FALSE, &retry_delay );
+            break;
         default: assert( 0 );
         }
 
@@ -284,11 +316,16 @@ static void queue_cache_image( struct client_surface_cache_image *image, enum ca
     pthread_cond_signal( &worker->cond );
 }
 
-static struct client_surface_cache_image *create_client_surface_cache_image(
-    const struct client_surface_memory_scope *owners, enum client_surface_memory_class purpose,
-    Window window, unsigned int width, unsigned int height,
-    unsigned int depth, UINT64 bytes, void (*wake)(void),
-    client_surface_cache_callback complete, void *context )
+static void discard_cache_image( struct client_surface_cache_image *image )
+{
+    if (!image) return;
+    assert( image->operation == CACHE_IDLE && !image->pixmap && !image->acquired );
+    client_surface_release_scoped_memory( &image->memory, image->purpose, image->bytes );
+    client_surface_free_owned_metadata( &image->memory, image, sizeof(*image) );
+}
+
+static struct client_surface_cache_image *allocate_cache_image(
+    const struct client_surface_memory_scope *owners, enum client_surface_memory_class purpose, UINT64 bytes )
 {
     struct client_surface_memory_scope memory = {0};
     struct client_surface_cache_image *image;
@@ -302,9 +339,26 @@ static struct client_surface_cache_image *create_client_surface_cache_image(
     image->memory = memory;
     image->refs = 1;
     image->purpose = purpose;
-    image->window = window;
-    if (!client_surface_reserve_scoped_memory( &image->memory, purpose, bytes )) goto failed;
+    image->kind = purpose == CLIENT_SURFACE_MEMORY_SOURCE ? CACHE_IMAGE_SOURCE : CACHE_IMAGE_OUTPUT_MAILBOX;
+    if (!client_surface_reserve_scoped_memory( &image->memory, purpose, bytes ))
+    {
+        discard_cache_image( image );
+        return NULL;
+    }
     image->bytes = bytes;
+    return image;
+}
+
+static struct client_surface_cache_image *create_client_surface_cache_image(
+    const struct client_surface_memory_scope *owners, enum client_surface_memory_class purpose,
+    Window window, unsigned int width, unsigned int height,
+    unsigned int depth, UINT64 bytes, void (*wake)(void),
+    client_surface_cache_callback complete, void *context )
+{
+    struct client_surface_cache_image *image;
+
+    if (!(image = allocate_cache_image( owners, purpose, bytes ))) return NULL;
+    image->window = window;
     image->width = width;
     image->height = height;
     image->depth = depth;
@@ -326,8 +380,7 @@ static struct client_surface_cache_image *create_client_surface_cache_image(
     return image;
 
 failed:
-    client_surface_release_scoped_memory( &image->memory, image->purpose, image->bytes );
-    client_surface_free_owned_metadata( &image->memory, image, sizeof(*image) );
+    discard_cache_image( image );
     return NULL;
 }
 
@@ -347,6 +400,69 @@ struct client_surface_cache_image *client_surface_cache_create_output(
 {
     return create_client_surface_cache_image( owners, CLIENT_SURFACE_MEMORY_OUTPUT, window,
                                               width, height, depth, bytes, wake, complete, context );
+}
+
+BOOL client_surface_cache_reserve_output_pair(
+    const struct client_surface_memory_scope *memory, UINT64 bytes_per_image,
+    void (*wake)(void), struct client_surface_cache_image *images[2] )
+{
+    unsigned int i;
+
+    images[0] = images[1] = NULL;
+    for (i = 0; i < 2; ++i)
+    {
+        if (!(images[i] = allocate_cache_image( memory, CLIENT_SURFACE_MEMORY_OUTPUT, bytes_per_image ))) goto failed;
+        images[i]->kind = CACHE_IMAGE_OUTPUT_PAIR;
+    }
+    pthread_mutex_lock( &cache_mutex );
+    assert( !cache_wake || cache_wake == wake );
+    cache_wake = wake;
+    if (image_count > CLIENT_SURFACE_CACHE_IMAGE_LIMIT - 2 || !(images[0]->worker = select_cache_worker()))
+    {
+        pthread_mutex_unlock( &cache_mutex );
+        goto failed;
+    }
+    /* The first admitted worker also guarantees a release executor for the
+     * second record if another worker cannot be started. No work is queued
+     * until the caller returns its final reference after native use drains. */
+    images[1]->worker = select_cache_worker();
+    assert( images[1]->worker );
+    image_count += 2;
+    TRACE_(csperf)( "ticks=%llu event=output_pair_reserve first=%p second=%p bytes=%llu count=%u\n",
+                   cache_time(), images[0], images[1], (unsigned long long)bytes_per_image, image_count );
+    pthread_mutex_unlock( &cache_mutex );
+    return TRUE;
+
+failed:
+    discard_cache_image( images[0] );
+    discard_cache_image( images[1] );
+    images[0] = images[1] = NULL;
+    return FALSE;
+}
+
+void client_surface_cache_adopt_output_pair( struct client_surface_cache_image *images[2],
+                                             Display *owner_display, const Pixmap pixmaps[2], BOOL valid )
+{
+    struct client_surface_cache_image *image;
+    unsigned int i;
+
+    assert( owner_display && (!valid || (pixmaps[0] && pixmaps[1])) );
+    pthread_mutex_lock( &cache_mutex );
+    for (i = 0; i < 2; ++i)
+    {
+        image = images[i];
+        assert( image && image->kind == CACHE_IMAGE_OUTPUT_PAIR && image->operation == CACHE_IDLE &&
+                image->refs == 1 && !image->owner_display && !image->pixmap );
+        image->owner_display = owner_display;
+        image->pixmap = pixmaps[i];
+        image->acquired = image->success = valid;
+        TRACE_(csperf)( "ticks=%llu event=output_pair_adopt image=%p pixmap=%lx display=%p valid=%u worker=%u\n",
+                       cache_time(), image, image->pixmap, owner_display, valid,
+                       (unsigned int)(image->worker - cache_workers) );
+        if (image->acquired)
+            x11drv_client_surface_trace_image( "acquire", "output_pair", owner_display, image->pixmap, image->bytes );
+    }
+    pthread_mutex_unlock( &cache_mutex );
 }
 
 Pixmap client_surface_cache_pixmap( const struct client_surface_cache_image *image )
@@ -403,8 +519,8 @@ void client_surface_cache_release( struct client_surface_cache_image *image )
     if (!image->refs)
     {
         if (image->acquired)
-            x11drv_client_surface_trace_image( "retire", image->purpose == CLIENT_SURFACE_MEMORY_SOURCE ?
-                                              "owner_cache" : "output_mailbox", image->worker->display,
+            x11drv_client_surface_trace_image( "retire", cache_image_kind( image ),
+                                              image->owner_display ? image->owner_display : image->worker->display,
                                               image->pixmap, image->bytes );
         queue_cache_image( image, CACHE_RELEASE, NULL, NULL );
     }

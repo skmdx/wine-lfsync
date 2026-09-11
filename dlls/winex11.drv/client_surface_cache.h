@@ -20,6 +20,17 @@ struct client_surface_cache_image *client_surface_cache_create_output(
     unsigned int depth, UINT64 bytes, void (*wake)(void),
     client_surface_cache_callback complete, void *context );
 
+/* Reserve two idle records and both OUTPUT charges before native pair
+ * creation. Failure rolls back without native I/O. Adoption transfers every
+ * returned XID, including failed native allocations, to those records.
+ * owner_display is a process-lifetime trace key; reclaim uses private worker
+ * connections after the caller has drained all native readers and writers. */
+BOOL client_surface_cache_reserve_output_pair(
+    const struct client_surface_memory_scope *memory, UINT64 bytes_per_image,
+    void (*wake)(void), struct client_surface_cache_image *images[2] );
+void client_surface_cache_adopt_output_pair( struct client_surface_cache_image *images[2],
+                                             Display *owner_display, const Pixmap pixmaps[2], BOOL valid );
+
 /* These descriptors are available after successful creation. The GC is for
  * checked XCB reads only; Xlib drawing uses a separate, private GC. */
 Pixmap client_surface_cache_pixmap( const struct client_surface_cache_image *image );
