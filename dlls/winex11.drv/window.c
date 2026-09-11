@@ -3082,6 +3082,7 @@ BOOL X11DRV_CreateWindow( HWND hwnd )
         data->clip_window = XCreateWindow( data->display, root_window, 0, 0, 1, 1, 0, 0,
                                            InputOnly, default_visual.visual,
                                            CWOverrideRedirect | CWEventMask, &attr );
+        data->owns_clip_window = !!data->clip_window;
         XFlush( data->display );
         NtUserSetProp( hwnd, clip_window_prop, (HANDLE)data->clip_window );
         X11DRV_DisplayDevices_RegisterEventHandlers();

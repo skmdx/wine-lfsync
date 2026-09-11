@@ -438,6 +438,7 @@ struct x11drv_thread_data
     Window   selection_wnd;        /* window used for selection interactions */
     unsigned long warp_serial;     /* serial number of last pointer warp request */
     Window   clip_window;          /* window used for cursor clipping */
+    BOOL     owns_clip_window;     /* created here rather than borrowed from the desktop */
     BOOL     clipping_cursor;      /* whether thread is currently clipping the cursor */
     Atom    *net_supported;        /* list of _NET_SUPPORTED atoms */
     int      net_supported_count;  /* number of _NET_SUPPORTED atoms */
@@ -449,6 +450,7 @@ struct x11drv_thread_data
     double              raw_y;
     int      xinput2_pointer;      /* XInput2 master pointer device id */
     int      root_window_users;    /* counter for root window XISelectEvents */
+    BOOL     xinput2_initialized;  /* this Display negotiated XInput2 and selected root events */
 #endif /* HAVE_X11_EXTENSIONS_XINPUT2_H */
 
     struct display_state desired_state;       /* display state tracking the desired / win32 state */
@@ -641,6 +643,7 @@ extern BOOL X11DRV_GenericEvent( HWND hwnd, XEvent *event );
 extern int xinput2_opcode;
 extern void x11drv_xinput2_load(void);
 extern void x11drv_xinput2_init( struct x11drv_thread_data *data );
+extern void x11drv_mouse_thread_detach( struct x11drv_thread_data *data );
 extern void x11drv_xinput2_enable( Display *display, Window window );
 extern void x11drv_xinput2_disable( Display *display, Window window );
 

@@ -252,19 +252,22 @@ static void update_relative_valuators( XIAnyClassInfo **classes, int num_classes
 }
 
 
+static void select_xinput2_events( Display *display, Window window, unsigned char *mask_bits )
+{
+    XIEventMask mask = {XIAllMasterDevices, XIMaskLen(XI_LASTEVENT), mask_bits};
+
+    pXISelectEvents( display, window, &mask, 1 );
+}
+
 /***********************************************************************
  *              x11drv_xinput2_enable
  */
 void x11drv_xinput2_enable( Display *display, Window window )
 {
-    XIEventMask mask;
     unsigned char mask_bits[XIMaskLen(XI_LASTEVENT)];
 
     if (!xinput2_available) return;
 
-    mask.mask     = mask_bits;
-    mask.mask_len = sizeof(mask_bits);
-    mask.deviceid = XIAllMasterDevices;
     memset( mask_bits, 0, sizeof(mask_bits) );
 
     if (window == DefaultRootWindow( display ))
@@ -281,7 +284,7 @@ void x11drv_xinput2_enable( Display *display, Window window )
         XISetMask( mask_bits, XI_TouchEnd );
     }
 
-    pXISelectEvents( display, window, &mask, 1 );
+    select_xinput2_events( display, window, mask_bits );
 }
 
 
@@ -291,13 +294,9 @@ void x11drv_xinput2_enable( Display *display, Window window )
 void x11drv_xinput2_disable( Display *display, Window window )
 {
     unsigned char mask_bits[XIMaskLen(XI_LASTEVENT)];
-    XIEventMask mask;
 
     if (!xinput2_available) return;
 
-    mask.mask     = mask_bits;
-    mask.mask_len = sizeof(mask_bits);
-    mask.deviceid = XIAllMasterDevices;
     memset( mask_bits, 0, sizeof(mask_bits) );
 
     if (window == DefaultRootWindow( display ))
@@ -306,7 +305,7 @@ void x11drv_xinput2_disable( Display *display, Window window )
         XISetMask( mask_bits, XI_DeviceChanged );
     }
 
-    pXISelectEvents( display, window, &mask, 1 );
+    select_xinput2_events( display, window, mask_bits );
 }
 
 
@@ -317,7 +316,6 @@ void x11drv_xinput2_init( struct x11drv_thread_data *data )
 {
     unsigned char mask_bits[XIMaskLen(XI_LASTEVENT)];
     int major = 2, minor = 2;
-    XIEventMask mask;
     int count;
 
     if (!xinput2_available || pXIQueryVersion( data->display, &major, &minor ))
@@ -327,12 +325,10 @@ void x11drv_xinput2_init( struct x11drv_thread_data *data )
         return;
     }
 
-    mask.mask     = mask_bits;
-    mask.mask_len = sizeof(mask_bits);
-    mask.deviceid = XIAllMasterDevices;
     memset( mask_bits, 0, sizeof(mask_bits) );
     XISetMask( mask_bits, XI_DeviceChanged );
-    pXISelectEvents( data->display, DefaultRootWindow( data->display ), &mask, 1 );
+    select_xinput2_events( data->display, DefaultRootWindow( data->display ), mask_bits );
+    data->xinput2_initialized = TRUE;
 
     if (!pXIGetClientPointer( data->display, None, &data->xinput2_pointer ))
         WARN( "Failed to get xinput2 master pointer device\n" );
@@ -361,6 +357,38 @@ void x11drv_xinput2_init( struct x11drv_thread_data *data )
 }
 
 #endif /* HAVE_X11_EXTENSIONS_XINPUT2_H */
+
+static void ungrab_thread_pointer( struct x11drv_thread_data *data )
+{
+    XUngrabPointer( data->display, CurrentTime );
+    data->clipping_cursor = FALSE;
+}
+
+void x11drv_mouse_thread_detach( struct x11drv_thread_data *data )
+{
+#ifdef HAVE_X11_EXTENSIONS_XINPUT2_H
+    unsigned char mask_bits[XIMaskLen(XI_LASTEVENT)] = {0};
+
+    if (data->xinput2_initialized)
+    {
+        select_xinput2_events( data->display, DefaultRootWindow( data->display ), mask_bits );
+        data->xinput2_initialized = FALSE;
+        data->root_window_users = 0;
+    }
+#endif
+    /* Per-thread clipping flags can outlive a grab transferred to another
+     * thread. Release only this connection's grabs; don't reset the shared
+     * clipping state or unmap another owner's clip Window. */
+    ungrab_thread_pointer( data );
+    XUngrabKeyboard( data->display, CurrentTime );
+    if (data->clip_window)
+    {
+        if (data->owns_clip_window) XDestroyWindow( data->display, data->clip_window );
+        else XSelectInput( data->display, data->clip_window, 0 );
+    }
+    data->clip_window = 0;
+    data->owns_clip_window = FALSE;
+}
 
 /***********************************************************************
  *		grab_clipping_window
@@ -408,10 +436,11 @@ static BOOL grab_clipping_window( const RECT *clip )
         clip->right < clip_rect.right || clip->bottom < clip_rect.bottom)
         data->warp_serial = NextRequest( data->display );
 
-    if (!XGrabPointer( data->display, clip_window, False,
+    if (XGrabPointer( data->display, clip_window, False,
                        PointerMotionMask | ButtonPressMask | ButtonReleaseMask,
-                       GrabModeAsync, GrabModeAsync, clip_window, None, CurrentTime ))
-        clipping_cursor = TRUE;
+                       GrabModeAsync, GrabModeAsync, clip_window, None, CurrentTime ) != GrabSuccess)
+        return FALSE;
+    clipping_cursor = TRUE;
 
     SERVER_START_REQ( set_cursor )
     {
@@ -424,7 +453,6 @@ static BOOL grab_clipping_window( const RECT *clip )
 
     set_window_cursor( clip_window, cursor );
 
-    if (!clipping_cursor) return FALSE;
     clip_rect = *clip;
     data->clipping_cursor = TRUE;
     return TRUE;
@@ -1401,9 +1429,14 @@ BOOL X11DRV_GetCursorPos(LPPOINT pos)
  */
 BOOL X11DRV_ClipCursor( const RECT *clip, BOOL reset )
 {
-    if (reset || !clip || !grab_clipping_window( clip )) ungrab_clipping_window();
-    XFlush( x11drv_thread_data()->display );
-    return TRUE;
+    struct x11drv_thread_data *data = x11drv_init_thread_data();
+    BOOL ret = TRUE;
+
+    if (reset || !clip) ungrab_clipping_window();
+    else if (!(ret = grab_clipping_window( clip ))) ungrab_thread_pointer( data );
+    XFlush( data->display );
+    TRACE( "clip %s reset %u result %u\n", wine_dbgstr_rect(clip), reset, ret );
+    return ret;
 }
 
 /***********************************************************************

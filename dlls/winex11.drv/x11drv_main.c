@@ -814,6 +814,16 @@ NTSTATUS __wine_unix_lib_init(void)
 }
 
 
+static int thread_detach_error( Display *display, XErrorEvent *event, void *arg )
+{
+    Window clip_window = *(Window *)arg;
+
+    /* Destroying an owned parent (including a virtual desktop) may already
+     * have destroyed the clip Window. Only this terminal cleanup is optional. */
+    return event->request_code == X_DestroyWindow && event->error_code == BadWindow &&
+           event->resourceid == clip_window;
+}
+
 /***********************************************************************
  *           ThreadDetach (X11DRV.@)
  */
@@ -823,10 +833,20 @@ void X11DRV_ThreadDetach(void)
 
     if (data)
     {
+        Window clip_window = data->owns_clip_window ? data->clip_window : None;
+        struct x11drv_error_handler errors = {.display = data->display, .callback = thread_detach_error,
+                                             .arg = &clip_window};
+
         xim_thread_detach( data );
+        if (clip_window) X11DRV_register_error_handler( &errors );
+        x11drv_mouse_thread_detach( data );
+        XSelectInput( data->display, DefaultRootWindow( data->display ), 0 );
+        if (RootWindow( data->display, 0 ) != DefaultRootWindow( data->display ))
+            XSelectInput( data->display, RootWindow( data->display, 0 ), 0 );
         if (data->net_supported) XFree( data->net_supported );
         XSync( gdi_display, False ); /* make sure XReparentWindow requests have completed before closing the thread display */
         XCloseDisplay( data->display );
+        if (clip_window) X11DRV_unregister_error_handler( &errors );
         free( data );
         /* clear data in case we get re-entered from user32 before the thread is truly dead */
         pthread_setspecific( x11drv_thread_data_key, NULL );
