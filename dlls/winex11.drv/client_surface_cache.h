@@ -51,6 +51,7 @@ Pixmap client_surface_cache_pixmap( const struct client_surface_cache_image *ima
 unsigned int client_surface_cache_gc( const struct client_surface_cache_image *image );
 struct client_surface_cache_image *client_surface_cache_acquire( struct client_surface_cache_image *image );
 BOOL client_surface_cache_shared( const struct client_surface_cache_image *image );
+BOOL client_surface_cache_write_pending( const struct client_surface_cache_image *image );
 void client_surface_cache_copy( struct client_surface_cache_image *image, Pixmap source,
                                 client_surface_cache_callback complete, void *context );
 /* Copy a completed, independently retained OUTPUT rectangle into private
@@ -58,6 +59,26 @@ void client_surface_cache_copy( struct client_surface_cache_image *image, Pixmap
 void client_surface_cache_copy_output( struct client_surface_cache_image *image, Pixmap source,
                                        unsigned int width, unsigned int height,
                                        client_surface_cache_callback complete, void *context );
+
+/* The caller owns this immutable description and both input images through
+ * completion. Admission adds a destination write reference; the callback
+ * releases it even if its target has already detached the result. */
+struct client_surface_cache_transform
+{
+    Pixmap source, catchup;
+    VisualID source_visual, destination_visual;
+    unsigned int source_width, source_height;
+    RECT destination, catchup_rect;
+    const XRectangle *clips;
+    unsigned int clip_count;
+    BOOL clipped;
+};
+BOOL client_surface_cache_transform_output( struct client_surface_cache_image *image,
+    const struct client_surface_cache_transform *transform,
+    client_surface_cache_callback complete, void *context );
+BOOL client_surface_copy_image( Display *display, struct client_surface_memory_scope *memory,
+    Pixmap source, Pixmap destination, GC gc, VisualID source_visual, VisualID destination_visual,
+    unsigned int source_width, unsigned int source_height, const RECT *destination_rect );
 
 /* Each output read holds a reference through its checked reply. A shared
  * image is immutable; replace a shared spare before beginning another write.

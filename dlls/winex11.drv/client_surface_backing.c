@@ -241,6 +241,7 @@ struct client_surface_compositor_target
     Window window;
     struct client_surface_compositor_frame frames[CLIENT_SURFACE_COMPOSITOR_FRAME_COUNT];
     struct client_surface_compositor_frame *copy_frame;
+    struct client_surface_output_transform *transform;
     Pixmap backing;
     Pixmap latest;
     Pixmap published;
@@ -287,6 +288,22 @@ struct client_surface_compositor_mailbox
     Window window;
     unsigned int width, height, depth;
     BOOL pending;
+};
+
+/* Native completion owns no target, binding, mapping or Window pointer.
+ * The live target's matching receipt is the authority to adopt this image. */
+struct client_surface_output_transform
+{
+    struct client_surface_cache_transform native;
+    struct client_surface_cache_image *image, *source, *catchup;
+    HWND toplevel, window;
+    Window destination;
+    process_id_t process;
+    UINT64 identity, cookie, epoch, sequence, control, revision;
+    unsigned int scene_index, width, height;
+    BOOL replay;
+    RECT damage;
+    XRectangle clips[];
 };
 
 #ifdef SONAME_LIBXPRESENT
@@ -727,6 +744,17 @@ static struct client_surface_compositor_frame *get_client_surface_compositor_pix
     for (i = 0; i < ARRAY_SIZE(target->frames); ++i)
         if (target->frames[i].pixmap == pixmap) return &target->frames[i];
     return NULL;
+}
+
+static void detach_client_surface_output_transform( struct client_surface_compositor_target *target )
+{
+    if (!target->transform) return;
+    TRACE_(csperf)( "ticks=%llu event=output_transform_detach transform=%p hwnd=%p destination=%lx\n",
+                   client_surface_perf_time(), target->transform, target->toplevel, target->window );
+    target->transform = NULL;
+    /* The worker owns the image write until its checked completion. Shared
+     * storage cannot become a new destination even after logical removal. */
+    target->replay_member = 0;
 }
 
 static void note_client_surface_compositor_damage(
@@ -1981,6 +2009,7 @@ static void remove_client_surface_compositor_binding(
     binding->pool->query_wait_bitmap[index / 64] &= ~((UINT64)1 << (index % 64));
     if (target)
     {
+        detach_client_surface_output_transform( target );
         finish_client_surface_compositor_assembly( target, TRUE );
         target->scene.valid = FALSE;
     }
@@ -2236,6 +2265,7 @@ static void free_client_surface_scene_layouts( struct client_surface_scene_layou
 
 static void free_client_surface_scene_plan( struct client_surface_compositor_target *target )
 {
+    detach_client_surface_output_transform( target );
     client_surface_free_owned_array( target->receipts );
     client_surface_free_owned_array( target->scene.members );
     free_client_surface_scene_layouts( target->scene.layouts, target->scene.count );
@@ -2585,7 +2615,7 @@ static struct client_surface_compositor_frame *client_surface_output_checkpoint_
         if (frame->pixmap != source || !frame->image) continue;
         /* A partial assembly is not a completed checkpoint, even before its
          * next native request is queued. Admission never waits for it. */
-        if (target->copy_frame == frame ||
+        if (target->copy_frame == frame || client_surface_cache_write_pending( frame->image ) ||
             (target->assembly_pending && target->assembly_frame == i) ||
             (client_surface_copy_batch.count && client_surface_copy_batch.frame == frame))
         {
@@ -2703,7 +2733,20 @@ static BOOL install_client_surface_output_checkpoint( struct client_surface_comp
 
 static BOOL replace_client_surface_compositor_pool( struct client_surface_compositor_job *job )
 {
-    struct client_surface_compositor_target *target;
+    struct client_surface_compositor_target *target = find_client_surface_compositor_target( job->toplevel );
+    struct client_surface_compositor_frame *source;
+
+    if (!job->u.pool.allocation->checkpoint && target && job->u.pool.source &&
+        job->u.pool.preserve_width && job->u.pool.preserve_height &&
+        (source = get_client_surface_compositor_pixmap( target, job->u.pool.source )) &&
+        (!source->revision || client_surface_cache_write_pending( source->image )))
+    {
+        /* A detached transform may still be writing the former GUI backing.
+         * Do not preserve those uncommitted pixels over a fresh Window seed.
+         * Reuse the GUI's stale-hint retry without waiting for that writer. */
+        job->u.pool.stale = job->u.pool.invalid_source = TRUE;
+        return FALSE;
+    }
 
     /* Completed empty storage becomes an output pool only after checked
      * checkpoint copies and installation. The GUI keeps the old pair until
@@ -3402,104 +3445,6 @@ static BOOL get_client_surface_compositor_catchup(
     return TRUE;
 }
 
-static unsigned long convert_client_surface_component( unsigned long pixel,
-                                                        unsigned long source_mask,
-                                                        unsigned long destination_mask )
-{
-    unsigned int source_shift = 0, destination_shift = 0;
-    UINT64 value, source_max, destination_max;
-
-    if (!destination_mask) return 0;
-    if (!source_mask) return destination_mask;
-    while (!(source_mask & (1ul << source_shift))) ++source_shift;
-    while (!(destination_mask & (1ul << destination_shift))) ++destination_shift;
-    source_max = source_mask >> source_shift;
-    destination_max = destination_mask >> destination_shift;
-    value = (pixel & source_mask) >> source_shift;
-    return ((value * destination_max + source_max / 2) / source_max) << destination_shift;
-}
-
-static BOOL copy_client_surface_image( Display *display, struct client_surface_memory_scope *memory,
-                                       Pixmap source, Pixmap destination,
-                                       GC gc, VisualID source_id, VisualID destination_id,
-                                       unsigned int source_width, unsigned int source_height,
-                                       const RECT *rect )
-{
-    XVisualInfo source_template = {.visualid = source_id};
-    XVisualInfo destination_template = {.visualid = destination_id};
-    XVisualInfo *source_visual = NULL, *destination_visual = NULL;
-    const XPixmapFormatValues *format;
-    XImage *input = NULL, *output = NULL;
-    unsigned int width = rect->right - rect->left, height = rect->bottom - rect->top;
-    unsigned int x, y, source_y;
-    unsigned long source_alpha, destination_alpha;
-    UINT64 input_bytes, output_bytes, reserved = 0;
-    int count;
-    BOOL ret = FALSE;
-
-    /* Keep the exceptional conversion path on the owner connection too.
-     * The caller retains the source until its final XSync, covering both readback
-     * and upload. The destination GC carries the exact scene clip. */
-    if (!(source_visual = XGetVisualInfo( display, VisualIDMask, &source_template, &count )) ||
-        !count || (source_visual->class != TrueColor && source_visual->class != DirectColor))
-        goto done;
-    if (!(destination_visual = XGetVisualInfo( display, VisualIDMask, &destination_template, &count )) ||
-        !count || (destination_visual->class != TrueColor && destination_visual->class != DirectColor))
-        goto done;
-    if (!(output = XCreateImage( display, destination_visual->visual, destination_visual->depth,
-                                ZPixmap, 0, NULL, width, height, 32, 0 )))
-        goto done;
-    if (output->bytes_per_line <= 0 || height > ~(SIZE_T)0 / output->bytes_per_line)
-        goto done;
-    if (!(format = pixmap_formats[source_visual->depth]) || format->bits_per_pixel <= 0 ||
-        format->scanline_pad <= 0 || format->scanline_pad % 8)
-        goto done;
-    input_bytes = ((UINT64)source_width * format->bits_per_pixel + format->scanline_pad - 1) /
-                  format->scanline_pad * (format->scanline_pad / 8);
-    if (!input_bytes || source_height > ~(UINT64)0 / input_bytes) goto done;
-    input_bytes *= source_height;
-    output_bytes = (UINT64)output->bytes_per_line * height;
-    if (input_bytes > ~(UINT64)0 - output_bytes ||
-        !client_surface_reserve_scoped_memory( memory, CLIENT_SURFACE_MEMORY_STAGING, input_bytes + output_bytes ))
-        goto done;
-    reserved = input_bytes + output_bytes;
-    if (!(input = XGetImage( display, source, 0, 0, source_width, source_height,
-                             AllPlanes, ZPixmap )) ||
-        !(output->data = calloc( height, output->bytes_per_line )))
-        goto done;
-    source_alpha = ((1ull << source_visual->depth) - 1) &
-                   ~(source_visual->red_mask | source_visual->green_mask | source_visual->blue_mask);
-    destination_alpha = ((1ull << destination_visual->depth) - 1) &
-                        ~(destination_visual->red_mask | destination_visual->green_mask |
-                          destination_visual->blue_mask);
-    for (y = 0; y < height; ++y)
-    {
-        source_y = (UINT64)y * source_height / height;
-        for (x = 0; x < width; ++x)
-        {
-            unsigned long pixel = XGetPixel( input, (UINT64)x * source_width / width, source_y );
-            unsigned long converted =
-                convert_client_surface_component( pixel, source_visual->red_mask, destination_visual->red_mask ) |
-                convert_client_surface_component( pixel, source_visual->green_mask, destination_visual->green_mask ) |
-                convert_client_surface_component( pixel, source_visual->blue_mask, destination_visual->blue_mask ) |
-                convert_client_surface_component( pixel, source_alpha, destination_alpha );
-
-            XPutPixel( output, x, y, converted );
-        }
-    }
-    XPutImage( display, destination, gc, output, 0, 0, rect->left, rect->top, width, height );
-    TRACE( "software owner copy %ux%u to %ux%u visual %#lx -> %#lx\n",
-           source_width, source_height, width, height, source_id, destination_id );
-    ret = TRUE;
-done:
-    if (output) XDestroyImage( output );
-    if (input) XDestroyImage( input );
-    client_surface_release_scoped_memory( memory, CLIENT_SURFACE_MEMORY_STAGING, reserved );
-    if (destination_visual) XFree( destination_visual );
-    if (source_visual) XFree( source_visual );
-    return ret;
-}
-
 static void discard_client_surface_compositor_gc( struct client_surface_compositor_frame *frame )
 {
     Display *display = client_surface_compositor_display;
@@ -3520,13 +3465,82 @@ struct client_surface_composition_plan
 {
     UINT64 generation;
     UINT64 epoch;
+    BOOL steady;
     RECT destination;
     RECT source_damage;
     const RGNDATA *clip;
 };
 
+static void complete_client_surface_output_transform( void *context, BOOL success );
+
+static BOOL submit_client_surface_output_transform( struct client_surface_compositor_target *target,
+    struct client_surface_compositor_binding *binding, struct client_surface_compositor_frame *frame,
+    const struct client_surface_composition_plan *plan, const RECT *damage,
+    const RECT *catchup, BOOL needs_catchup, BOOL clipped )
+{
+    struct client_surface_compositor_frame *latest =
+        get_client_surface_compositor_pixmap( target, target->latest );
+    struct client_surface_output_transform *transform;
+    const struct client_surface_handoff_slot *slot = &binding->latest_frame;
+    SIZE_T count = plan->clip->rdh.nCount;
+
+    assert( plan->steady && !plan->generation && !target->transform && !target->copy_frame );
+    if (count > (~(SIZE_T)0 - sizeof(*transform)) / sizeof(XRectangle) ||
+        (needs_catchup && (!latest || !latest->image || !latest->revision ||
+                          client_surface_cache_write_pending( latest->image )))) return FALSE;
+    if (!(transform = client_surface_alloc_owned_array( &target->memory, 1,
+                         sizeof(*transform) + count * sizeof(XRectangle) ))) return FALSE;
+    transform->image = frame->image;
+    transform->source = client_surface_cache_acquire( binding->latest_image.storage );
+    if (needs_catchup) transform->catchup = client_surface_cache_acquire( latest->image );
+    transform->native = (struct client_surface_cache_transform){
+        .source = binding->latest_image.pixmap,
+        .catchup = needs_catchup ? target->latest : 0,
+        .source_visual = slot->source_visual, .destination_visual = target->visual,
+        .source_width = slot->width, .source_height = slot->height,
+        .destination = plan->destination, .catchup_rect = *catchup,
+        .clips = transform->clips, .clip_count = count, .clipped = clipped,
+    };
+    memcpy( transform->clips, plan->clip->Buffer, count * sizeof(XRectangle) );
+    transform->toplevel = target->toplevel;
+    transform->window = binding->window;
+    transform->destination = target->window;
+    transform->process = binding->process;
+    transform->identity = binding->identity;
+    transform->cookie = binding->cookie;
+    transform->epoch = plan->epoch;
+    transform->sequence = slot->source_sequence;
+    transform->control = binding->latest_control;
+    transform->revision = target->revision;
+    transform->scene_index = binding->scene_index;
+    transform->width = target->window_width;
+    transform->height = target->window_height;
+    transform->replay = binding->source_sequence == slot->source_sequence;
+    transform->damage = *damage;
+    if (!client_surface_cache_transform_output( frame->image, &transform->native,
+                                                complete_client_surface_output_transform, transform ))
+    {
+        client_surface_cache_release( transform->source );
+        client_surface_cache_release( transform->catchup );
+        client_surface_free_owned_array( transform );
+        return FALSE;
+    }
+    target->transform = transform;
+    /* Cancellation must not leave a partially written old checkpoint with
+     * a valid journal revision, even when its image remains in this pool. */
+    frame->revision = 0;
+    TRACE_(csperf)( "ticks=%llu event=output_transform_submit transform=%p hwnd=%p window=%lx "
+                   "image=%p source=%p catchup=%p destination=%lx epoch=%llu generation=0 sequence=%llu revision=%llu\n",
+                   client_surface_perf_time(), transform, target->toplevel, target->window,
+                   transform->image, transform->source, transform->catchup, frame->pixmap,
+                   (unsigned long long)transform->epoch, (unsigned long long)transform->sequence,
+                   (unsigned long long)transform->revision );
+    return TRUE;
+}
+
 static BOOL copy_client_surface_handoff_to_frame(
     struct client_surface_compositor_target *target,
+    struct client_surface_compositor_binding *binding,
     struct client_surface_compositor_frame *frame, Pixmap source, unsigned int source_depth,
     const struct client_surface_handoff_slot *slot,
     const struct client_surface_composition_plan *plan, const RECT *damage,
@@ -3572,12 +3586,18 @@ static BOOL copy_client_surface_handoff_to_frame(
         return copied;
     }
 
-    TRACE_(csperf)( "ticks=%llu event=copy_route native=%u full=%u transaction=%u assembly=%u "
+    TRACE_(csperf)( "ticks=%llu event=copy_route native=%u full=%u transaction=%u steady=%u assembly=%u "
                    "mailbox=%u ticket=%u latest=%u published=%u inflight=%u\n",
                    client_surface_perf_time(), native, incoming_full, !!plan->generation,
-                   target->assembly_pending, target->mailbox_pending,
+                   plan->steady, target->assembly_pending, target->mailbox_pending,
                    !!target->mailbox_publish_generation, frame->pixmap == target->latest,
                    frame->pixmap == target->published, !!frame->serial );
+    if (!batch && plan->steady && !native)
+    {
+        *pending = submit_client_surface_output_transform( target, binding, frame, plan, damage,
+                                                           &catchup, needs_catchup, clipped );
+        return *pending;
+    }
     if (!batch && !plan->generation && native &&
         !target->assembly_pending && !target->mailbox_pending &&
         frame->pixmap != target->latest && frame->pixmap != target->published &&
@@ -3634,7 +3654,7 @@ static BOOL copy_client_surface_handoff_to_frame(
                     slot->width, slot->height, &plan->destination,
                     clipped ? clips : NULL, clipped ? clip_count : 0, 0, 0 );
                 if (!overlay_copied)
-                    overlay_copied = copy_client_surface_image(
+                    overlay_copied = client_surface_copy_image(
                         display, &target->memory, source, frame->pixmap, gc, slot->source_visual, target->visual,
                         slot->width, slot->height, &plan->destination );
             }
@@ -3900,6 +3920,75 @@ static BOOL publish_client_surface_handoff_frame(
     return composed;
 }
 
+static void complete_client_surface_frame_copy( struct client_surface_compositor_target *target,
+    struct client_surface_compositor_frame *frame, struct client_surface_compositor_binding *binding,
+    UINT64 epoch, UINT64 sequence, const RECT *damage, BOOL success )
+{
+    if (!success)
+    {
+        binding->source_epoch = binding->source_sequence = 0;
+        binding->replay_epoch = 0;
+        frame->revision = 0;
+        return;
+    }
+    note_client_surface_source_copy( binding, epoch, sequence );
+    note_client_surface_compositor_damage( target, frame, damage );
+    publish_client_surface_handoff_frame( target, frame, NULL );
+}
+
+static void complete_client_surface_output_transform( void *context, BOOL success )
+{
+    struct client_surface_output_transform *transform = context;
+    struct client_surface_compositor_target *target =
+        find_client_surface_compositor_target( transform->toplevel );
+    struct client_surface_compositor_frame *frame = NULL;
+    struct client_surface_compositor_binding *binding = NULL;
+    struct client_surface_scene scene;
+    BOOL current = target && target->transform == transform;
+
+    if (current)
+    {
+        target->transform = NULL;
+        frame = get_client_surface_compositor_pixmap( target, client_surface_cache_pixmap( transform->image ) );
+        current = frame && frame->image == transform->image && !frame->serial &&
+                  target->window == transform->destination && !target->quiescing &&
+                  target->revision == transform->revision && target->window_width == transform->width &&
+                  target->window_height == transform->height && target->visual == transform->native.destination_visual &&
+                  target->scene.valid &&
+                  target->scene.epoch == transform->epoch && transform->scene_index < target->scene.count &&
+                  client_surface_get_toplevel_scene( target->toplevel, &scene ) &&
+                  scene.epoch == transform->epoch && scene.mode != CLIENT_SURFACE_PRESENTATION_DIRECT &&
+                  !scene.generation;
+        if (current)
+        {
+            binding = target->scene.members[transform->scene_index];
+            current = binding->window == transform->window && binding->process == transform->process &&
+                      binding->identity == transform->identity && binding->cookie == transform->cookie &&
+                      client_surface_compositor_binding_is_live( binding ) &&
+                      (binding->source_epoch != transform->epoch || binding->source_sequence <= transform->sequence);
+        }
+        if (!current) target->replay_member = 0;
+    }
+    TRACE_(csperf)( "ticks=%llu event=output_transform_complete transform=%p hwnd=%p window=%lx "
+                   "image=%p source=%p destination=%lx epoch=%llu sequence=%llu success=%u current=%u\n",
+                   client_surface_perf_time(), transform, transform->toplevel, transform->destination,
+                   transform->image, transform->source, client_surface_cache_pixmap( transform->image ),
+                   (unsigned long long)transform->epoch, (unsigned long long)transform->sequence, success, current );
+    /* Completion removed CACHE_TRANSFORM before invoking us. Drop all native
+     * leases even when REMOVE has already released the target and binding. */
+    client_surface_cache_release( transform->source );
+    client_surface_cache_release( transform->catchup );
+    client_surface_cache_release( transform->image );
+    if (current)
+    {
+        trace_client_surface_source( transform->replay ? "replay_transform" : "transform",
+            binding, transform->control, transform->sequence, target->window, frame->pixmap, success );
+        complete_client_surface_frame_copy( target, frame, binding, transform->epoch,
+                                            transform->sequence, &transform->damage, success );
+    }
+    client_surface_free_owned_array( transform );
+}
+
 static void complete_client_surface_output_reply( struct client_surface_compositor_reply *reply, BOOL success )
 {
     struct client_surface_compositor_frame *frame =
@@ -3937,19 +4026,9 @@ static void complete_client_surface_output_reply( struct client_surface_composit
     trace_client_surface_source( frame->copy_replay ? "replay_copy_async" : "copy_async",
                                  binding, control, frame->copy_sequence,
                                  target->window, frame->pixmap, success );
-    if (!success)
-    {
-        binding->source_epoch = binding->source_sequence = 0;
-        binding->replay_epoch = 0;
-        frame->revision = 0;
-        discard_client_surface_compositor_gc( frame );
-    }
-    if (success)
-    {
-        note_client_surface_source_copy( binding, frame->copy_epoch, frame->copy_sequence );
-        note_client_surface_compositor_damage( target, frame, &frame->copy_damage );
-        publish_client_surface_handoff_frame( target, frame, NULL );
-    }
+    if (!success) discard_client_surface_compositor_gc( frame );
+    complete_client_surface_frame_copy( target, frame, binding, frame->copy_epoch,
+                                        frame->copy_sequence, &frame->copy_damage, success );
 }
 
 static BOOL process_client_surface_compositor_replies(void)
@@ -4081,7 +4160,7 @@ static BOOL compose_client_surface_cached_frame( struct client_surface_composito
     BOOL composed = FALSE, copied = FALSE, dropped = TRUE, batch, pending = FALSE, asynchronous, replay;
 
     target = find_client_surface_compositor_target( binding->toplevel );
-    if (!target || target->copy_frame || target->quiescing || !target->scene.valid) return FALSE;
+    if (!target || target->copy_frame || target->transform || target->quiescing || !target->scene.valid) return FALSE;
     if (client_surface_pending_batch_count == ARRAY_SIZE(client_surface_pending_batches)) return FALSE;
     if (!binding->latest_image.pixmap) return FALSE;
     /* From here onwards only owner storage is read. The producer has already
@@ -4115,6 +4194,12 @@ static BOOL compose_client_surface_cached_frame( struct client_surface_composito
      * Its assembly was already accepted: newer images use the steady path
      * in the same scene, never another completion of that transaction. */
     plan.generation = current.publication_pending ? 0 : current.generation;
+    /* PREPARE and STAGED install a fresh GUI checkpoint, using pair COW if
+     * an older transform still owns its spare. Keep that checkpoint intact
+     * through the subsequent nonzero generation, including PUBLISHING where
+     * plan.generation is zero but the GUI still owes its native publication.
+     * Only a truly steady result may detach without a publication receipt. */
+    plan.steady = !current.generation;
     TRACE( "owner source window %#lx generation %s epoch %s publication %u output %s sequence %s\n",
            target->window, wine_dbgstr_longlong( current.generation ), wine_dbgstr_longlong( current.epoch ),
            current.publication_pending, wine_dbgstr_longlong( plan.generation ),
@@ -4129,7 +4214,7 @@ static BOOL compose_client_surface_cached_frame( struct client_surface_composito
          client_surface_copy_batch.copies[0].generation != plan.generation ||
          client_surface_copy_batch.copies[0].epoch != plan.epoch))
         flush_client_surface_copy_batch();
-    if (target->copy_frame ||
+    if (target->copy_frame || target->transform ||
         client_surface_pending_batch_count == ARRAY_SIZE(client_surface_pending_batches)) goto retry;
     if (target->scene.epoch != plan.epoch || binding->scene_index >= target->scene.count ||
         target->scene.members[binding->scene_index] != binding ||
@@ -4263,7 +4348,7 @@ retry:
             client_surface_copy_batch.requests[client_surface_copy_batch.count - 1] =
                 (struct client_surface_xcb_request){0};
         }
-        copied = copy_client_surface_handoff_to_frame( target, frame, source, source_depth,
+        copied = copy_client_surface_handoff_to_frame( target, binding, frame, source, source_depth,
                                                        slot, &plan, &damage, batch, &pending );
         if (copied)
         {
@@ -4274,6 +4359,7 @@ retry:
         }
         if (pending)
         {
+            if (target->transform) return TRUE;
             target->copy_frame = frame;
             frame->copy_binding = binding;
             frame->copy_image = client_surface_cache_acquire( binding->latest_image.storage );
@@ -4530,7 +4616,7 @@ static BOOL replay_client_surface_scene_sources( struct client_surface_composito
 
     /* Scene replay reads owner-local images. It never claims a returned
      * producer slot or depends on the producer retaining its previous XID. */
-    if (!target->scene.valid || target->quiescing || target->copy_frame) return FALSE;
+    if (!target->scene.valid || target->quiescing || target->copy_frame || target->transform) return FALSE;
     while (target->replay_member < target->scene.count && *budget)
     {
         struct client_surface_compositor_binding *binding = target->scene.members[target->replay_member];
@@ -4548,7 +4634,7 @@ static BOOL replay_client_surface_scene_sources( struct client_surface_composito
         }
         ++target->replay_member;
         progressed = TRUE;
-        if (target->copy_frame) break;
+        if (target->copy_frame || target->transform) break;
     }
     flush_client_surface_copy_batch();
     return progressed;
@@ -4629,6 +4715,7 @@ static void wait_client_surface_compositor_work( const struct client_surface_com
 static void quiesce_client_surface_compositor_target( struct client_surface_compositor_target *target )
 {
     target->quiescing = TRUE;
+    detach_client_surface_output_transform( target );
     if (target->copy_frame) return;
     finish_client_surface_compositor_assembly( target, TRUE );
     if (target->mailbox_pending && target->mailbox_publish_generation)
@@ -4853,6 +4940,7 @@ static BOOL client_surface_compositor_job_ready( struct client_surface_composito
          * Pause new work, but preserve assembly/mailbox ownership until the
          * exact scene RPC accepts. Other native barriers remain independent. */
         target->quiescing = TRUE;
+        detach_client_surface_output_transform( target );
         if (target->copy_frame) return FALSE;
         for (i = 0; i < ARRAY_SIZE(target->frames); ++i)
             if (target->frames[i].serial) return FALSE;
@@ -4876,6 +4964,26 @@ static BOOL client_surface_compositor_job_ready( struct client_surface_composito
         job->op == CLIENT_SURFACE_COMPOSITOR_RESOLVE_SOURCES) return TRUE;
     /* Expose restoration records its own deferred work if necessary. */
     if (job->op == CLIENT_SURFACE_COMPOSITOR_RESTORE_TARGET) return TRUE;
+    /* Unlike checked XCB copies, transforms own every native input and their
+     * completion record. Mutation/removal detaches adoption, not native work. */
+    detach_client_surface_output_transform( target );
+    if (job->op == CLIENT_SURFACE_COMPOSITOR_COPY || job->op == CLIENT_SURFACE_COMPOSITOR_PRESENT)
+    {
+        Pixmap source = job->op == CLIENT_SURFACE_COMPOSITOR_COPY ? job->u.copy.source : job->u.present.source;
+        struct client_surface_compositor_frame *frame = get_client_surface_compositor_pixmap( target, source );
+
+        if (frame && (!frame->revision || client_surface_cache_write_pending( frame->image )))
+        {
+            /* PREPARE/snapshot and its nonzero generation protect GUI
+             * publication. Expose fallback can still encounter a cancelled
+             * old backing: refuse that read and let its normal repaint run. */
+            TRACE_(csperf)( "ticks=%llu event=output_read_reject hwnd=%p op=%u source=%lx revision=%llu\n",
+                           client_surface_perf_time(), target->toplevel, job->op, source,
+                           (unsigned long long)frame->revision );
+            *rejected = TRUE;
+            return TRUE;
+        }
+    }
     if (job->op == CLIENT_SURFACE_COMPOSITOR_COPY)
         for (i = 0; i < ARRAY_SIZE(target->frames); ++i)
             if (target->frames[i].pixmap == job->u.copy.destination &&
@@ -5830,6 +5938,11 @@ static NTSTATUS replace_client_surface_backing( struct x11drv_win_data *data,
         /* A refusal before execution leaves the completed allocation here.
          * The actor clears this pointer when it consumes that ownership. */
         if (job.u.pool.allocation) free_client_surface_pending_allocation( job.u.pool.allocation );
+        if (job.u.pool.invalid_source)
+        {
+            data->client_surface_backing_valid = FALSE;
+            data->client_surface_backing_valid_width = data->client_surface_backing_valid_height = 0;
+        }
         return job.u.pool.stale ? STATUS_RETRY : STATUS_UNSUCCESSFUL;
     }
     *first = job.u.pool.pixmaps[0];

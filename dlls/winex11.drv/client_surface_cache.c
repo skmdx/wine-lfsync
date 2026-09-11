@@ -22,9 +22,10 @@
 #include "client_surface.h"
 #include "client_surface_cache.h"
 
+WINE_DEFAULT_DEBUG_CHANNEL(x11drv);
 WINE_DECLARE_DEBUG_CHANNEL(csperf);
 
-enum cache_operation { CACHE_IDLE, CACHE_CREATE, CACHE_COPY, CACHE_RELEASE };
+enum cache_operation { CACHE_IDLE, CACHE_CREATE, CACHE_COPY, CACHE_RELEASE, CACHE_TRANSFORM };
 enum cache_image_kind { CACHE_IMAGE_SOURCE, CACHE_IMAGE_OUTPUT_MAILBOX, CACHE_IMAGE_OUTPUT_PAIR };
 
 struct cache_worker
@@ -47,6 +48,7 @@ struct client_surface_cache_image
     enum cache_image_kind kind;
     client_surface_cache_callback complete;
     void *context;
+    const struct client_surface_cache_transform *transform;
     Pixmap pixmap, source;
     Window window;
     GC gc, transfer_gc;
@@ -116,6 +118,104 @@ static BOOL open_cache_display( struct cache_worker *worker )
     return TRUE;
 }
 
+static unsigned long convert_client_surface_component( unsigned long pixel,
+                                                        unsigned long source_mask,
+                                                        unsigned long destination_mask )
+{
+    unsigned int source_shift = 0, destination_shift = 0;
+    UINT64 value, source_max, destination_max;
+
+    if (!destination_mask) return 0;
+    if (!source_mask) return destination_mask;
+    while (!(source_mask & (1ul << source_shift))) ++source_shift;
+    while (!(destination_mask & (1ul << destination_shift))) ++destination_shift;
+    source_max = source_mask >> source_shift;
+    destination_max = destination_mask >> destination_shift;
+    value = (pixel & source_mask) >> source_shift;
+    return ((value * destination_max + source_max / 2) / source_max) << destination_shift;
+}
+
+BOOL client_surface_copy_image( Display *display, struct client_surface_memory_scope *memory,
+                                       Pixmap source, Pixmap destination,
+                                       GC gc, VisualID source_id, VisualID destination_id,
+                                       unsigned int source_width, unsigned int source_height,
+                                       const RECT *rect )
+{
+    XVisualInfo source_template = {.visualid = source_id};
+    XVisualInfo destination_template = {.visualid = destination_id};
+    XVisualInfo *source_visual = NULL, *destination_visual = NULL;
+    const XPixmapFormatValues *format;
+    XImage *input = NULL, *output = NULL;
+    unsigned int width = rect->right - rect->left, height = rect->bottom - rect->top;
+    unsigned int x, y, source_y;
+    unsigned long source_alpha, destination_alpha;
+    UINT64 input_bytes, output_bytes, reserved = 0;
+    int count;
+    BOOL ret = FALSE;
+
+    /* Keep the exceptional conversion path on the owner connection too.
+     * The caller retains the source until its final XSync, covering both readback
+     * and upload. The destination GC carries the exact scene clip. */
+    if (!(source_visual = XGetVisualInfo( display, VisualIDMask, &source_template, &count )) ||
+        !count || (source_visual->class != TrueColor && source_visual->class != DirectColor))
+        goto done;
+    if (!(destination_visual = XGetVisualInfo( display, VisualIDMask, &destination_template, &count )) ||
+        !count || (destination_visual->class != TrueColor && destination_visual->class != DirectColor))
+        goto done;
+    if (!(output = XCreateImage( display, destination_visual->visual, destination_visual->depth,
+                                ZPixmap, 0, NULL, width, height, 32, 0 )))
+        goto done;
+    if (output->bytes_per_line <= 0 || height > ~(SIZE_T)0 / output->bytes_per_line)
+        goto done;
+    if (!(format = pixmap_formats[source_visual->depth]) || format->bits_per_pixel <= 0 ||
+        format->scanline_pad <= 0 || format->scanline_pad % 8)
+        goto done;
+    input_bytes = ((UINT64)source_width * format->bits_per_pixel + format->scanline_pad - 1) /
+                  format->scanline_pad * (format->scanline_pad / 8);
+    if (!input_bytes || source_height > ~(UINT64)0 / input_bytes) goto done;
+    input_bytes *= source_height;
+    output_bytes = (UINT64)output->bytes_per_line * height;
+    if (input_bytes > ~(UINT64)0 - output_bytes ||
+        !client_surface_reserve_scoped_memory( memory, CLIENT_SURFACE_MEMORY_STAGING, input_bytes + output_bytes ))
+        goto done;
+    reserved = input_bytes + output_bytes;
+    if (!(input = XGetImage( display, source, 0, 0, source_width, source_height,
+                             AllPlanes, ZPixmap )) ||
+        !(output->data = calloc( height, output->bytes_per_line )))
+        goto done;
+    source_alpha = ((1ull << source_visual->depth) - 1) &
+                   ~(source_visual->red_mask | source_visual->green_mask | source_visual->blue_mask);
+    destination_alpha = ((1ull << destination_visual->depth) - 1) &
+                        ~(destination_visual->red_mask | destination_visual->green_mask |
+                          destination_visual->blue_mask);
+    for (y = 0; y < height; ++y)
+    {
+        source_y = (UINT64)y * source_height / height;
+        for (x = 0; x < width; ++x)
+        {
+            unsigned long pixel = XGetPixel( input, (UINT64)x * source_width / width, source_y );
+            unsigned long converted =
+                convert_client_surface_component( pixel, source_visual->red_mask, destination_visual->red_mask ) |
+                convert_client_surface_component( pixel, source_visual->green_mask, destination_visual->green_mask ) |
+                convert_client_surface_component( pixel, source_visual->blue_mask, destination_visual->blue_mask ) |
+                convert_client_surface_component( pixel, source_alpha, destination_alpha );
+
+            XPutPixel( output, x, y, converted );
+        }
+    }
+    XPutImage( display, destination, gc, output, 0, 0, rect->left, rect->top, width, height );
+    TRACE( "software owner copy %ux%u to %ux%u visual %#lx -> %#lx\n",
+           source_width, source_height, width, height, source_id, destination_id );
+    ret = TRUE;
+done:
+    if (output) XDestroyImage( output );
+    if (input) XDestroyImage( input );
+    client_surface_release_scoped_memory( memory, CLIENT_SURFACE_MEMORY_STAGING, reserved );
+    if (destination_visual) XFree( destination_visual );
+    if (source_visual) XFree( source_visual );
+    return ret;
+}
+
 static void create_cache_image( struct client_surface_cache_image *image )
 {
     struct cache_worker *worker = image->worker;
@@ -153,8 +253,12 @@ static void copy_cache_image( struct client_surface_cache_image *image )
      * this GC, including a failed native allocation, through actual reclaim. */
     if (!image->gc) image->gc = XCreateGC( worker->display, image->pixmap, GCGraphicsExposures, &values );
     if (image->gc)
+    {
+        XSetClipMask( worker->display, image->gc, None );
+        XSetClipOrigin( worker->display, image->gc, 0, 0 );
         XCopyArea( worker->display, image->source, image->pixmap, image->gc,
                    0, 0, image->copy_width, image->copy_height, 0, 0 );
+    }
     XSync( worker->display, False );
     image->success = image->gc && !worker->error;
     TRACE_(csperf)( "ticks=%llu event=%s image=%p source=%lx destination=%lx "
@@ -162,6 +266,63 @@ static void copy_cache_image( struct client_surface_cache_image *image )
                    image->purpose == CLIENT_SURFACE_MEMORY_OUTPUT ? "output_pair_native_copy" : "cache_native_fallback",
                    image, image->source, image->pixmap, worker->display, image->copy_width,
                    image->copy_height, worker->error, image->success );
+}
+
+static void transform_cache_image( struct client_surface_cache_image *image )
+{
+    const struct client_surface_cache_transform *transform = image->transform;
+    struct cache_worker *worker = image->worker;
+    Display *display = worker->display;
+    XGCValues values = {.graphics_exposures = False};
+    BOOL copied = TRUE, rendered = FALSE;
+    int error;
+
+    worker->error = 0;
+    if (!image->gc) image->gc = XCreateGC( display, image->pixmap, GCGraphicsExposures, &values );
+    if (image->gc)
+    {
+        XSetClipMask( display, image->gc, None );
+        XSetClipOrigin( display, image->gc, 0, 0 );
+        if (transform->catchup)
+        {
+            const RECT *rect = &transform->catchup_rect;
+
+            XCopyArea( display, transform->catchup, image->pixmap, image->gc,
+                       rect->left, rect->top, rect->right - rect->left, rect->bottom - rect->top,
+                       rect->left, rect->top );
+        }
+        if (transform->clip_count)
+        {
+            if (transform->clipped)
+                XSetClipRectangles( display, image->gc, transform->destination.left,
+                                    transform->destination.top, (XRectangle *)transform->clips,
+                                    transform->clip_count, YXBanded );
+            rendered = X11DRV_XRender_CopyClientSurface( display, transform->source,
+                transform->source_visual, image->pixmap, transform->destination_visual,
+                transform->source_width, transform->source_height, &transform->destination,
+                transform->clipped ? transform->clips : NULL,
+                transform->clipped ? transform->clip_count : 0, 0, 0 );
+            if (!rendered)
+                copied = client_surface_copy_image( display, &image->memory, transform->source,
+                    image->pixmap, image->gc, transform->source_visual, transform->destination_visual,
+                    transform->source_width, transform->source_height, &transform->destination );
+        }
+    }
+    XSync( display, False );
+    error = worker->error;
+    image->success = image->gc && copied && !error;
+    /* A failed GC allocation can still return an Xlib handle. Retire it on
+     * its private connection before returning this image to actor reuse. */
+    if (!image->success && image->gc)
+    {
+        XFreeGC( display, image->gc );
+        image->gc = NULL;
+        XSync( display, False );
+    }
+    TRACE_(csperf)( "ticks=%llu event=output_transform_native image=%p source=%lx destination=%lx "
+                   "catchup=%lx display=%p rendered=%u error=%d success=%u\n", cache_time(),
+                   image, transform->source, image->pixmap, transform->catchup, display,
+                   rendered, error, image->success );
 }
 
 static void create_output_image( struct client_surface_cache_image *image )
@@ -216,6 +377,7 @@ static void execute_cache_image( struct client_surface_native_work *work )
         else create_output_image( image );
         break;
     case CACHE_COPY: copy_cache_image( image ); break;
+    case CACHE_TRANSFORM: transform_cache_image( image ); break;
     case CACHE_RELEASE: destroy_cache_image( image ); break;
     default: assert( 0 );
     }
@@ -563,6 +725,36 @@ BOOL client_surface_cache_shared( const struct client_surface_cache_image *image
     return shared;
 }
 
+BOOL client_surface_cache_write_pending( const struct client_surface_cache_image *image )
+{
+    BOOL pending;
+
+    pthread_mutex_lock( &cache_mutex );
+    pending = image->operation != CACHE_IDLE;
+    pthread_mutex_unlock( &cache_mutex );
+    return pending;
+}
+
+BOOL client_surface_cache_transform_output( struct client_surface_cache_image *image,
+    const struct client_surface_cache_transform *transform,
+    client_surface_cache_callback complete, void *context )
+{
+    pthread_mutex_lock( &cache_mutex );
+    assert( image->purpose == CLIENT_SURFACE_MEMORY_OUTPUT );
+    if (!image->acquired || image->refs != 1 || image->operation != CACHE_IDLE)
+    {
+        pthread_mutex_unlock( &cache_mutex );
+        return FALSE;
+    }
+    ++image->refs;
+    TRACE_(csperf)( "ticks=%llu event=cache_image_reference image=%p pixmap=%lx acquire=1 refs=%u\n",
+                   cache_time(), image, image->pixmap, image->refs );
+    image->transform = transform;
+    queue_cache_image( image, CACHE_TRANSFORM, complete, context );
+    pthread_mutex_unlock( &cache_mutex );
+    return TRUE;
+}
+
 void client_surface_cache_release( struct client_surface_cache_image *image )
 {
     if (!image) return;
@@ -597,6 +789,7 @@ BOOL client_surface_complete_cache( unsigned int budget )
         }
         if (!(completed_head = image->next)) completed_tail = &completed_head;
         image->operation = CACHE_IDLE;
+        image->transform = NULL;
         pthread_mutex_unlock( &cache_mutex );
         image->complete( image->context, image->success );
         progressed = TRUE;
