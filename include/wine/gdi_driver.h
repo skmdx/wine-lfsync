@@ -640,8 +640,8 @@ W32KAPI BOOL client_surface_begin_native_barrier( HWND hwnd, UINT_PTR token );
 W32KAPI BOOL client_surface_end_native_barrier( HWND hwnd, UINT_PTR token );
 W32KAPI UINT client_surface_begin_publish( HWND hwnd, UINT64 *generation, UINT64 *scene_generation );
 W32KAPI BOOL client_surface_end_publish( HWND hwnd, UINT64 generation, UINT64 scene_generation, BOOL success );
-W32KAPI BOOL client_surface_begin_prepare( HWND hwnd, UINT64 *scene_generation );
-W32KAPI void client_surface_end_prepare( HWND hwnd, UINT64 scene_generation );
+W32KAPI BOOL client_surface_begin_prepare( HWND hwnd, struct client_surface_scene *scene );
+W32KAPI BOOL client_surface_end_prepare( const struct client_surface_scene *scene );
 W32KAPI void update_client_surfaces( HWND hwnd );
 W32KAPI void detach_client_surfaces( HWND hwnd );
 

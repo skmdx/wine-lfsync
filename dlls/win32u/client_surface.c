@@ -398,7 +398,6 @@ void client_surface_prepare_scene( struct client_surface *surface )
 {
     struct client_surface_scene scene;
     HWND toplevel = 0;
-    UINT64 generation;
     BOOL wake = FALSE;
 
     if (client_surface_get_scene( surface, &scene ) && scene.authoritative)
@@ -431,10 +430,10 @@ void client_surface_prepare_scene( struct client_surface *surface )
     {
         NTSTATUS status = STATUS_SUCCESS;
 
-        if (client_surface_begin_prepare( toplevel, &generation ))
+        if (client_surface_begin_prepare( toplevel, &scene ))
         {
             status = prepare_window_client_surfaces( toplevel );
-            if (status == STATUS_SUCCESS) client_surface_end_prepare( toplevel, generation );
+            if (status == STATUS_SUCCESS) client_surface_end_prepare( &scene );
         }
         /* Keep the deferred native update on its owned replay path instead
          * of submitting the same owner again here. */
@@ -1486,7 +1485,8 @@ static BOOL client_surface_set_scene_result( const struct client_surface_scene *
         {
             accepted = TRUE;
             staged = reply->staged;
-            if (reply->wake) NtUserPostMessage( scene->toplevel, WM_WINE_UPDATEWINDOWSTATE, 0, 0 );
+            if (reply->wake && flags != CLIENT_SURFACE_STATE_PREPARE_COMMIT)
+                NtUserPostMessage( scene->toplevel, WM_WINE_UPDATEWINDOWSTATE, 0, 0 );
         }
     }
     SERVER_END_REQ;
@@ -1604,11 +1604,11 @@ BOOL client_surface_end_publish( HWND hwnd, UINT64 generation, UINT64 scene_gene
     return !status && accepted && success;
 }
 
-BOOL client_surface_begin_prepare( HWND hwnd, UINT64 *scene_generation )
+BOOL client_surface_begin_prepare( HWND hwnd, struct client_surface_scene *scene )
 {
     BOOL prepare = FALSE;
 
-    *scene_generation = 0;
+    memset( scene, 0, sizeof(*scene) );
     SERVER_START_REQ( set_client_surface_state )
     {
         req->handle = wine_server_user_handle( hwnd );
@@ -1616,9 +1616,15 @@ BOOL client_surface_begin_prepare( HWND hwnd, UINT64 *scene_generation )
         req->flags = CLIENT_SURFACE_STATE_PREPARE_BEGIN;
         req->generation = 0;
         req->scene_generation = 0;
-        if (!wine_server_call( req ) && reply->publish)
+        if (!wine_server_call( req ) && reply->publish &&
+            reply->toplevel == wine_server_user_handle( hwnd ) &&
+            reply->scene_generation && !(reply->scene_generation & 1))
         {
-            *scene_generation = reply->scene_generation;
+            /* Keep the exact admission reply, including PREPARING generation
+             * zero. A later shared-state read could name another preparation. */
+            scene->toplevel = wine_server_ptr_handle( reply->toplevel );
+            scene->epoch = reply->scene_generation;
+            scene->generation = reply->generation;
             prepare = TRUE;
         }
     }
@@ -1626,10 +1632,9 @@ BOOL client_surface_begin_prepare( HWND hwnd, UINT64 *scene_generation )
     return prepare;
 }
 
-void client_surface_end_prepare( HWND hwnd, UINT64 scene_generation )
+BOOL client_surface_end_prepare( const struct client_surface_scene *scene )
 {
-    client_surface_set_server_state( hwnd, NULL, CLIENT_SURFACE_STATE_PREPARE_COMMIT,
-                                     0, scene_generation, NULL );
+    return client_surface_set_scene_result( scene, CLIENT_SURFACE_STATE_PREPARE_COMMIT );
 }
 
 BOOL client_surface_update( struct client_surface *surface )

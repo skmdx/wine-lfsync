@@ -5537,15 +5537,18 @@ DECL_HANDLER(set_client_surface_state)
     if (!(win = get_window( req->handle ))) return;
     top = get_toplevel_window( win );
     was_pending = top->client_surface_dirty;
-    if (req->flags & (CLIENT_SURFACE_STATE_STAGED | CLIENT_SURFACE_STATE_FAILED))
+    if (req->flags & (CLIENT_SURFACE_STATE_STAGED | CLIENT_SURFACE_STATE_FAILED |
+                      CLIENT_SURFACE_STATE_PREPARE_COMMIT))
     {
-        if ((req->flags != CLIENT_SURFACE_STATE_STAGED && req->flags != CLIENT_SURFACE_STATE_FAILED) ||
+        if ((req->flags != CLIENT_SURFACE_STATE_STAGED && req->flags != CLIENT_SURFACE_STATE_FAILED &&
+             req->flags != CLIENT_SURFACE_STATE_PREPARE_COMMIT) ||
             req->surface || req->producer_sequence)
         {
             set_error( STATUS_INVALID_PARAMETER );
             return;
         }
-        if (!top->thread || top->thread->process != current->process)
+        if (!top->thread || top->thread->process != current->process ||
+            (req->flags == CLIENT_SURFACE_STATE_PREPARE_COMMIT && top->thread != current))
         {
             set_error( STATUS_ACCESS_DENIED );
             return;
@@ -5559,7 +5562,14 @@ DECL_HANDLER(set_client_surface_state)
             req->generation != client_surface_transaction_generation( top ))
             return;
 
-        if (req->flags == CLIENT_SURFACE_STATE_FAILED)
+        if (req->flags == CLIENT_SURFACE_STATE_PREPARE_COMMIT)
+        {
+            if (!client_surface_is_preparing( top )) return;
+            top->client_surface_transaction.phase = CLIENT_SURFACE_PHASE_IDLE;
+            top->client_surface_transaction.prepared = 1;
+            restart_client_surface_generation_internal( top );
+        }
+        else if (req->flags == CLIENT_SURFACE_STATE_FAILED)
             fail_client_surface_publication( top );
         else
         {
@@ -5710,24 +5720,10 @@ DECL_HANDLER(set_client_surface_state)
     if (owner) release_client_surface_owner( owner );
     if (req->flags & CLIENT_SURFACE_STATE_BYPASS)
         finish_client_surface_publication( top );
-    if ((req->flags & CLIENT_SURFACE_STATE_PREPARE_BEGIN) && top->thread == current &&
-        client_surface_is_preparing( top ) &&
+    if ((req->flags & CLIENT_SURFACE_STATE_PREPARE_BEGIN) && win == top && top->thread == current &&
+        client_surface_is_preparing( top ) && top->client_surface_scene_generation &&
         !(top->client_surface_scene_generation & 1))
         reply->publish = 1;
-    if ((req->flags & CLIENT_SURFACE_STATE_PREPARE_COMMIT) && top->thread == current &&
-        client_surface_is_preparing( top ))
-    {
-        if (req->scene_generation == top->client_surface_scene_generation &&
-            !(req->scene_generation & 1))
-        {
-            top->client_surface_transaction.phase = CLIENT_SURFACE_PHASE_IDLE;
-            top->client_surface_transaction.prepared = 1;
-            restart_client_surface_generation_internal( top );
-        }
-        else
-            post_message_coalesced( top->handle, WM_WINE_UPDATEWINDOWSTATE,
-                                    WINE_PREPARE_CLIENT_SURFACES, 0 );
-    }
     if (req->flags & CLIENT_SURFACE_STATE_GEOMETRY_READY)
     {
         /* Source recovery and backends without a complete owner cache still

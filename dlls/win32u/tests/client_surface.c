@@ -264,8 +264,7 @@ static unsigned int prepare_surface_state( HWND hwnd, struct surface_state *stat
         if (state) *state = begin;
         return status;
     }
-    return set_surface_state_scene( hwnd, 0, CLIENT_SURFACE_STATE_PREPARE_COMMIT,
-                                    0, begin.scene_generation, state );
+    return set_surface_result( hwnd, CLIENT_SURFACE_STATE_PREPARE_COMMIT, &begin, state );
 }
 
 static unsigned int get_clip_state_in_bounds( HWND hwnd, UINT dpi, const RECT *bounds,
@@ -646,9 +645,9 @@ static void complete_direct_surface_generation( HWND hwnd, UINT64 surface, struc
     {
         status = direct_plan_request( hwnd, surface, preparing.scene_generation, FALSE, &accepted );
         ok( !status && !accepted, "PREPARING plan status %#x accepted %u\n", status, accepted );
-        status = set_surface_state_scene( hwnd, 0, CLIENT_SURFACE_STATE_PREPARE_COMMIT,
-                                          0, preparing.scene_generation, state );
-        ok( !status && state->generation && state->scene_generation != preparing.scene_generation,
+        status = set_surface_result( hwnd, CLIENT_SURFACE_STATE_PREPARE_COMMIT, &preparing, state );
+        ok( !status && state->toplevel == hwnd && state->generation &&
+            state->scene_generation != preparing.scene_generation,
             "DIRECT prepare commit status %#x generation %s old/new scenes %s/%s\n", status,
             wine_dbgstr_longlong( state->generation ), wine_dbgstr_longlong( preparing.scene_generation ),
             wine_dbgstr_longlong( state->scene_generation ) );
@@ -825,9 +824,9 @@ static void test_direct_strategy_scene(void)
         status, preparing.publish );
     status = prepare_direct_plan( hwnd, surface, preparing.scene_generation, &rejected );
     ok( !status && !rejected, "PREPARING reused an old ACK: status %#x\n", status );
-    status = set_surface_state_scene( hwnd, 0, CLIENT_SURFACE_STATE_PREPARE_COMMIT,
-                                      0, preparing.scene_generation, &state );
-    ok( !status && state.pending == 1, "post-mutation prepare status %#x pending %u\n", status, state.pending );
+    status = set_surface_result( hwnd, CLIENT_SURFACE_STATE_PREPARE_COMMIT, &preparing, &state );
+    ok( !status && state.toplevel == hwnd && state.pending == 1,
+        "post-mutation prepare status %#x pending %u\n", status, state.pending );
     generation = state;
     status = commit_surface_state( hwnd, surface, &generation, &state );
     ok( !status && state.ready, "failure-fixture composition status %#x ready %u\n", status, state.ready );
@@ -2669,13 +2668,27 @@ static UINT drain_scene_notifications( UINT *owner_updates, UINT *prepares )
     return drain_scene_notifications_for_surface( owner_updates, prepares, 0 );
 }
 
-static void check_scene_result_rejected( HWND hwnd, const struct surface_state *expected, UINT expected_status )
+struct scene_result_thread_data
 {
-    static const UINT results[] = {CLIENT_SURFACE_STATE_STAGED, CLIENT_SURFACE_STATE_FAILED};
+    HWND hwnd;
+    UINT flags;
+    struct surface_state expected, result;
+};
+
+static DWORD WINAPI scene_result_thread( void *arg )
+{
+    struct scene_result_thread_data *data = arg;
+
+    return set_surface_result( data->hwnd, data->flags, &data->expected, &data->result );
+}
+
+static void check_surface_result_rejected( HWND hwnd, UINT flags, const struct surface_state *expected,
+                                           UINT expected_status, BOOL foreign_thread )
+{
     struct surface_state before, after, result;
     struct shared_surface_state shared_before, shared_after;
     struct scene_notification_counts counts;
-    UINT status, i, producers, updates, prepares;
+    UINT status, producers, updates, prepares;
 
     status = set_surface_state( hwnd, 0, 0, 0, &before );
     ok( !status, "result state query status %#x\n", status );
@@ -2683,24 +2696,50 @@ static void check_scene_result_rejected( HWND hwnd, const struct surface_state *
     counts.window = before.toplevel;
     if (!read_shared_surface_state( before.toplevel, &shared_before )) return;
     drain_scene_notifications( &updates, &prepares );
-    for (i = 0; i < ARRAY_SIZE(results); ++i)
+    winetest_push_context( "scene result %#x foreign thread %u", flags, foreign_thread );
+    if (foreign_thread)
     {
-        winetest_push_context( "scene result %#x", results[i] );
-        status = set_surface_result( hwnd, results[i], expected, &result );
-        ok( status == expected_status && (status || (!result.toplevel && !result.wake)),
-            "obsolete/unauthorized result status %#x, expected %#x\n", status, expected_status );
-        status = set_surface_state( hwnd, 0, 0, 0, &after );
-        ok( !status && !memcmp( &before, &after, sizeof(before) ),
-            "rejected result changed server state, status %#x\n", status );
-        ok( read_shared_surface_state( before.toplevel, &shared_after ) &&
-            !memcmp( &shared_before, &shared_after, sizeof(shared_before) ),
-            "rejected result changed shared scene or flags\n" );
-        producers = drain_scene_notification_counts( &updates, &prepares, 0, &counts );
-        ok( !producers && !updates && !prepares && !counts.backing && !counts.prepare && !counts.publish,
-            "rejected result notified producer %u owner %u preparation %u backing %u publish %u\n",
-            producers, updates, prepares, counts.backing, counts.publish );
-        winetest_pop_context();
+        struct scene_result_thread_data data = { hwnd, flags, *expected };
+        DWORD wait, exit_code = ~0u;
+        HANDLE thread;
+
+        thread = CreateThread( NULL, 0, scene_result_thread, &data, 0, NULL );
+        ok( !!thread, "result thread creation error %lu\n", GetLastError() );
+        if (!thread) goto done;
+        wait = WaitForSingleObject( thread, 5000 );
+        ok( wait == WAIT_OBJECT_0, "result thread wait %#lx\n", wait );
+        /* The failed test must not return a live thread's stack context. */
+        if (wait != WAIT_OBJECT_0) ExitProcess( 1 );
+        ok( GetExitCodeThread( thread, &exit_code ), "result thread exit query error %lu\n", GetLastError() );
+        CloseHandle( thread );
+        status = exit_code;
+        result = data.result;
     }
+    else status = set_surface_result( hwnd, flags, expected, &result );
+    ok( status == expected_status && (status || (!result.toplevel && !result.wake)),
+        "obsolete/unauthorized result status %#x, expected %#x\n", status, expected_status );
+    status = set_surface_state( hwnd, 0, 0, 0, &after );
+    ok( !status && !memcmp( &before, &after, sizeof(before) ),
+        "rejected result changed server state, status %#x\n", status );
+    ok( read_shared_surface_state( before.toplevel, &shared_after ) &&
+        !memcmp( &shared_before, &shared_after, sizeof(shared_before) ),
+        "rejected result changed shared scene or flags\n" );
+    producers = drain_scene_notification_counts( &updates, &prepares, 0, &counts );
+    ok( !producers && !updates && !prepares && !counts.backing && !counts.prepare && !counts.publish,
+        "rejected result notified producer %u owner %u preparation %u backing %u publish %u\n",
+        producers, updates, prepares, counts.backing, counts.publish );
+done:
+    winetest_pop_context();
+}
+
+static void check_scene_result_rejected( HWND hwnd, const struct surface_state *expected, UINT expected_status )
+{
+    static const UINT results[] = {CLIENT_SURFACE_STATE_STAGED, CLIENT_SURFACE_STATE_FAILED,
+                                  CLIENT_SURFACE_STATE_PREPARE_COMMIT};
+    UINT i;
+
+    for (i = 0; i < ARRAY_SIZE(results); ++i)
+        check_surface_result_rejected( hwnd, results[i], expected, expected_status, FALSE );
 }
 
 /* Create and destroy at the real server boundary. Public DestroyWindow hides
@@ -2919,12 +2958,11 @@ static void check_owner_repair( HWND hwnd, const struct client_surface_handoff_r
             ok( !status, "superseding scene mutation status %#x\n", status );
             status = set_native_barrier( hwnd, 0x654321, FALSE, &barrier );
             ok( !status, "superseding scene unseal status %#x\n", status );
-            status = set_surface_state_scene( hwnd, 0, CLIENT_SURFACE_STATE_PREPARE_COMMIT,
-                                              0, preparing.scene_generation, &changed );
-            ok( !status && !changed.generation && changed.scene_generation != preparing.scene_generation,
+            status = set_surface_result( hwnd, CLIENT_SURFACE_STATE_PREPARE_COMMIT, &preparing, &changed );
+            ok( !status && !changed.toplevel && !changed.wake,
                 "old preparation committed the replacement scene, status %#x\n", status );
             drain_scene_notification_counts( &owner_updates, &prepares, 0, &counts );
-            ok( counts.backing == 1 && counts.prepare == 1 && !counts.publish,
+            ok( counts.backing == 1 && !counts.prepare && !counts.publish,
                 "in-flight restart notifications backing %u prepare %u publish %u\n",
                 counts.backing, counts.prepare, counts.publish );
         }
@@ -5376,20 +5414,27 @@ static void test_live_prepare_transaction(void)
         status, wine_dbgstr_longlong( preparing.generation ), preparing.pending );
 
     status = set_surface_state( hwnd, 0, CLIENT_SURFACE_STATE_PREPARE_BEGIN, 0, &preparing );
-    ok( !status && preparing.publish && !preparing.generation,
+    ok( !status && preparing.publish && preparing.toplevel == hwnd && !preparing.generation &&
+        preparing.scene_generation && !(preparing.scene_generation & 1),
         "live prepare begin failed: status %#x prepare %u generation %s\n",
         status, preparing.publish, wine_dbgstr_longlong( preparing.generation ) );
+
+    /* Generation zero is valid only for this exact PREPARING admission. */
+    stale = preparing;
+    stale.generation = preparing.scene_generation;
+    check_scene_result_rejected( hwnd, &stale, 0 );
+    stale = preparing;
+    stale.toplevel = GetDesktopWindow();
+    check_scene_result_rejected( hwnd, &stale, 0 );
+    stale = preparing;
+    stale.scene_generation = 0;
+    check_scene_result_rejected( hwnd, &stale, 0 );
+    check_surface_result_rejected( hwnd, CLIENT_SURFACE_STATE_PREPARE_COMMIT, &preparing,
+                                   STATUS_ACCESS_DENIED, TRUE );
 
     SetWindowPos( hwnd, NULL, 11, 10, 0, 0,
                   SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE );
     check_scene_result_rejected( hwnd, &preparing, 0 );
-    status = set_surface_state_scene( hwnd, 0, CLIENT_SURFACE_STATE_PREPARE_COMMIT,
-                                      0, preparing.scene_generation, &stale );
-    ok( !status && !stale.generation && stale.scene_generation != preparing.scene_generation,
-        "stale prepare started a live scene: status %#x generation %s old scene %s new scene %s\n",
-        status, wine_dbgstr_longlong( stale.generation ),
-        wine_dbgstr_longlong( preparing.scene_generation ),
-        wine_dbgstr_longlong( stale.scene_generation ) );
 
     status = set_native_barrier( hwnd, 0x1950, TRUE, &barrier );
     ok( !status && (barrier.scene_generation & 1), "scene result barrier status %#x\n", status );
@@ -5401,13 +5446,16 @@ static void test_live_prepare_transaction(void)
     check_scene_result_rejected( hwnd, &preparing, 0 );
 
     status = set_surface_state( hwnd, 0, CLIENT_SURFACE_STATE_PREPARE_BEGIN, 0, &current );
-    ok( !status && current.publish,
+    ok( !status && current.publish && !current.generation,
         "restarted live prepare begin failed: status %#x prepare %u\n", status, current.publish );
-    status = set_surface_state_scene( hwnd, 0, CLIENT_SURFACE_STATE_PREPARE_COMMIT,
-                                      0, current.scene_generation, &current );
-    ok( !status && current.generation && current.pending == 1,
+    preparing = current;
+    status = set_surface_result( hwnd, CLIENT_SURFACE_STATE_PREPARE_COMMIT, &preparing, &current );
+    ok( !status && current.toplevel == hwnd && current.generation && current.pending == 1,
         "live prepare commit did not start composition: status %#x generation %s pending %u\n",
         status, wine_dbgstr_longlong( current.generation ), current.pending );
+    check_scene_result_rejected( hwnd, &preparing, 0 );
+    /* An up-to-date token must not bypass the PREPARING phase check either. */
+    check_surface_result_rejected( hwnd, CLIENT_SURFACE_STATE_PREPARE_COMMIT, &current, 0, FALSE );
 
     status = commit_surface_state( hwnd, surface, &current, &ready );
     ok( !status && ready.ready && !ready.pending && ready.generation,
@@ -5441,6 +5489,7 @@ static void test_live_prepare_transaction(void)
             ok( current.staged && current.pending == 1 && current.generation == current.scene_generation,
                 "successful preparation did not start the new staged scene\n" );
         check_scene_result_rejected( hwnd, &preparing, 0 );
+        check_surface_result_rejected( hwnd, CLIENT_SURFACE_STATE_PREPARE_COMMIT, &current, 0, FALSE );
     }
 
     set_surface_state( hwnd, surface, CLIENT_SURFACE_STATE_UNREGISTER, 0, NULL );

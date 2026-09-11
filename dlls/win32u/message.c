@@ -2288,11 +2288,11 @@ static LRESULT handle_internal_message( HWND hwnd, UINT msg, WPARAM wparam, LPAR
         }
         else if (wparam == WINE_PREPARE_CLIENT_SURFACES)
         {
-            UINT64 scene_generation;
+            struct client_surface_scene scene;
 
-            if (client_surface_begin_prepare( hwnd, &scene_generation ) &&
+            if (client_surface_begin_prepare( hwnd, &scene ) &&
                 prepare_window_client_surfaces( hwnd ) == STATUS_SUCCESS)
-                client_surface_end_prepare( hwnd, scene_generation );
+                client_surface_end_prepare( &scene );
         }
         else if (wparam == WINE_UPDATE_CLIENT_SURFACE_HANDOFFS)
             update_window_state( hwnd );
