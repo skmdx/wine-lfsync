@@ -77,6 +77,8 @@ static BOOL read_shared_surface_state( HWND hwnd, struct shared_surface_state *s
 static UINT set_scene_placement( HWND hwnd, int offset, int grow, int frame, UINT flags );
 static UINT get_paint_update( HWND hwnd, BOOL validate );
 static void complete_scene_paint( HWND hwnd );
+static HWND create_scene_child( HWND parent, int x );
+static void destroy_scene_child( HWND hwnd );
 static UINT drain_scene_notification_counts( UINT *owner_updates, UINT *prepares, UINT64 expected_surface,
                                              struct scene_notification_counts *counts );
 
@@ -653,6 +655,12 @@ static void complete_direct_surface_generation( HWND hwnd, UINT64 surface, struc
 
     status = set_surface_state( hwnd, 0, CLIENT_SURFACE_STATE_PREPARE_BEGIN, 0, &preparing );
     ok( !status, "DIRECT prepare begin status %#x\n", status );
+    if (status)
+    {
+        /* A failed request has no initialized reply to use as a scene token. */
+        release_surface( unused );
+        return;
+    }
     if (preparing.publish)
     {
         status = direct_plan_request( hwnd, surface, preparing.scene_generation, FALSE, &accepted );
@@ -1112,7 +1120,7 @@ static void test_presentation_modes(void)
     set_surface_state( hwnd, 0, 0, 0, &state );
     complete_direct_surface_generation( hwnd, surface, &state );
 
-    child = create_test_child( hwnd, 10 );
+    child = create_scene_child( hwnd, 10 );
     ok( !!child, "failed to create presentation mode child, error %lu\n", GetLastError() );
     if (child)
     {
@@ -1127,7 +1135,7 @@ static void test_presentation_modes(void)
             "child attachment plan status %#x accepted %u\n", status, accepted );
         status = set_surface_state( child, child_surface, CLIENT_SURFACE_STATE_UNREGISTER, 0, &state );
         ok( !status, "child surface unregister failed, status %#x\n", status );
-        DestroyWindow( child );
+        destroy_scene_child( child );
         child = NULL;
         status = set_surface_state( hwnd, surface, 0, 0, &state );
         ok( !status, "post-child mode query failed, status %#x\n", status );
@@ -1137,12 +1145,13 @@ static void test_presentation_modes(void)
             "post-child mode %u, expected DIRECT, status %#x\n", state.mode, status );
     }
 
-    ShowWindow( hwnd, SW_HIDE );
-    pump_messages( 100 );
+    status = set_scene_placement( hwnd, 0, 0, 0, SWP_HIDEWINDOW );
+    ok( !status, "mode fixture hide status %#x\n", status );
     status = set_surface_state( hwnd, surface, 0, 0, &state );
     ok( !status && state.mode == CLIENT_SURFACE_PRESENTATION_COMPOSITED,
         "hidden idle mode %u, expected COMPOSITED, status %#x\n", state.mode, status );
-    ShowWindow( hwnd, SW_SHOW );
+    status = set_scene_placement( hwnd, 0, 0, 0, SWP_SHOWWINDOW );
+    ok( !status, "mode fixture show status %#x\n", status );
     status = set_surface_state( hwnd, surface, CLIENT_SURFACE_STATE_STAGED, 0, &state );
     ok( !status && state.mode == CLIENT_SURFACE_PRESENTATION_STAGED,
         "show transition mode %u, expected STAGED, status %#x\n", state.mode, status );
@@ -5343,7 +5352,8 @@ static void test_generation_aba(void)
     ok( !status, "register failed, status %#x\n", status );
     status = claim_surface_state( hwnd, surface, NULL );
     ok( !status, "claim failed, status %#x\n", status );
-    ShowWindow( hwnd, SW_SHOW );
+    status = set_scene_placement( hwnd, 0, 0, 0, SWP_SHOWWINDOW );
+    ok( !status, "generation fixture show status %#x\n", status );
 
     status = set_surface_state( hwnd, 0, CLIENT_SURFACE_STATE_STAGED, 0, &first );
     ok( !status, "first stage failed, status %#x\n", status );
@@ -5394,7 +5404,8 @@ static void test_generation_aba(void)
         current.staged, current.ready, current.pending );
     ok( !current.wake, "current commit exposed the top-level before publish\n" );
 
-    SetWindowPos( hwnd, NULL, 20, 20, 160, 120, SWP_NOACTIVATE | SWP_NOZORDER | SWP_NOSIZE );
+    status = set_scene_placement( hwnd, 10, 0, 0, 0 );
+    ok( !status, "generation fixture move status %#x\n", status );
     status = set_surface_state( hwnd, 0, 0, 0, &stale );
     ok( !status && stale.staged && !stale.ready && stale.pending == 1 &&
         stale.generation != current.generation &&
@@ -5437,7 +5448,8 @@ static void test_publish_transaction(void)
     set_surface_state( hwnd, surface, CLIENT_SURFACE_STATE_REGISTER |
                        CLIENT_SURFACE_STATE_SCENE_PUBLICATION, 0, NULL );
     claim_surface_state( hwnd, surface, NULL );
-    ShowWindow( hwnd, SW_SHOW );
+    status = set_scene_placement( hwnd, 0, 0, 0, SWP_SHOWWINDOW );
+    ok( !status, "publication fixture show status %#x\n", status );
     status = set_surface_state( hwnd, 0, CLIENT_SURFACE_STATE_STAGED, 0, &staged );
     ok( !status && staged.staged && staged.pending == 1,
         "failed to stage publish transaction: status %#x staged %u pending %u\n",
@@ -5452,8 +5464,8 @@ static void test_publish_transaction(void)
         "publish begin was rejected: status %#x publish %u staged %u ready %u\n",
         status, publishing.publish, publishing.staged, publishing.ready );
 
-    SetWindowPos( hwnd, NULL, 30, 30, 0, 0,
-                  SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE );
+    status = set_scene_placement( hwnd, 20, 0, 0, 0 );
+    ok( !status, "publication fixture move status %#x\n", status );
     status = set_surface_state( hwnd, 0, 0, 0, &changed );
     ok( !status && changed.staged && changed.ready &&
         changed.generation == publishing.generation &&
