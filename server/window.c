@@ -1203,7 +1203,10 @@ void destroy_thread_windows( struct thread *thread )
     user_handle_t handle = 0;
     struct window *win;
 
-    cancel_thread_window_paints( thread );
+    /* The client also calls this before its native thread teardown. Foreign
+     * windows may still have writes in flight; only thread termination can
+     * cancel those tokens. Owned windows cancel their paints when destroyed. */
+    if (thread->state == TERMINATED) cancel_thread_window_paints( thread );
 
     while ((win = next_user_handle( &handle, NTUSER_OBJ_WINDOW )))
     {

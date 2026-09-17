@@ -5598,13 +5598,28 @@ struct paint_receipt_thread_data
 {
     HWND hwnd;
     UINT64 token;
+    HANDLE destroyed, finish;
 };
 
 static DWORD WINAPI paint_receipt_thread( void *arg )
 {
     struct paint_receipt_thread_data *data = arg;
 
-    if (data->hwnd) return begin_paint_receipt( data->hwnd, &data->token );
+    if (data->hwnd)
+    {
+        UINT status = begin_paint_receipt( data->hwnd, &data->token );
+
+        if (!status && data->destroyed)
+        {
+            struct __server_request_info info = {0};
+
+            info.u.req.destroy_window_request.__header.req = REQ_destroy_window;
+            status = p_wine_server_call( &info );
+            SetEvent( data->destroyed );
+            if (WaitForSingleObject( data->finish, 5000 ) != WAIT_OBJECT_0) ExitProcess( 1 );
+        }
+        return status;
+    }
     return complete_paint_receipt( data->token, TRUE );
 }
 
@@ -5626,7 +5641,7 @@ static void run_paint_receipt_thread( struct paint_receipt_thread_data *data, UI
 static void test_paint_receipts(void)
 {
     struct surface_state preparing, current, result;
-    struct paint_receipt_thread_data data;
+    struct paint_receipt_thread_data data = {0};
     struct scene_notification_counts counts;
     HWND class_window = create_test_window( FALSE ), hwnd;
     UINT64 surface = allocate_surface(), first, second;
@@ -5717,6 +5732,37 @@ static void test_paint_receipts(void)
     status = complete_paint_receipt( data.token, TRUE );
     ok( status == STATUS_INVALID_PARAMETER, "exited writer completion status %#x\n", status );
     ok( get_paint_update( hwnd, TRUE ) & UPDATE_PAINT, "exited writer lost its repaint obligation\n" );
+    /* The all-windows RPC precedes native thread teardown. It must not retire
+     * a foreign writer while that thread is still alive. */
+    data.destroyed = CreateEventA( NULL, TRUE, FALSE, NULL );
+    data.finish = CreateEventA( NULL, TRUE, FALSE, NULL );
+    if (data.destroyed && data.finish)
+    {
+        HANDLE thread = CreateThread( NULL, 0, paint_receipt_thread, &data, 0, NULL );
+        DWORD wait, exit_code;
+
+        ok( !!thread, "foreign teardown thread creation error %lu\n", GetLastError() );
+        if (thread)
+        {
+            wait = WaitForSingleObject( data.destroyed, 5000 );
+            ok( wait == WAIT_OBJECT_0, "foreign teardown checkpoint wait %#lx\n", wait );
+            if (wait != WAIT_OBJECT_0) ExitProcess( 1 );
+            ok( WaitForSingleObject( thread, 0 ) == WAIT_TIMEOUT, "writer terminated before native teardown\n" );
+            ok( !get_paint_update( hwnd, FALSE ), "live foreign writer was cancelled by window teardown\n" );
+            status = set_surface_state( hwnd, 0, CLIENT_SURFACE_STATE_PREPARE_BEGIN, 0, &current );
+            ok( status == STATUS_PENDING, "live foreign writer prepare status %#x\n", status );
+            SetEvent( data.finish );
+            wait = WaitForSingleObject( thread, 5000 );
+            ok( wait == WAIT_OBJECT_0, "foreign writer exit wait %#lx\n", wait );
+            if (wait != WAIT_OBJECT_0) ExitProcess( 1 );
+            ok( GetExitCodeThread( thread, &exit_code ) && !exit_code, "foreign writer exit failed\n" );
+            CloseHandle( thread );
+            ok( get_paint_update( hwnd, TRUE ) & UPDATE_PAINT, "terminated foreign writer lost repaint\n" );
+        }
+    }
+    else ok( FALSE, "foreign writer event creation error %lu\n", GetLastError() );
+    if (data.destroyed) CloseHandle( data.destroyed );
+    if (data.finish) CloseHandle( data.finish );
     set_paint_update( hwnd, RDW_INTERNALPAINT );
     status = set_surface_state( hwnd, 0, CLIENT_SURFACE_STATE_PREPARE_BEGIN, 0, &current );
     ok( status == STATUS_PENDING, "internal paint prepare status %#x\n", status );
