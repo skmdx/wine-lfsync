@@ -6628,6 +6628,7 @@ static COLORREF get_gl_front_pixel( const RECT *rect )
 
 static BOOL wait_for_surface_idle( HWND hwnd, DWORD timeout, struct surface_state *state )
 {
+    struct shared_surface_state shared;
     DWORD start = GetTickCount();
     unsigned int status;
 
@@ -6635,7 +6636,17 @@ static BOOL wait_for_surface_idle( HWND hwnd, DWORD timeout, struct surface_stat
     {
         pump_messages( 10 );
         status = set_surface_state( hwnd, 0, 0, 0, state );
-        if (status || (!state->staged && !state->pending)) return !status;
+        if (status) return FALSE;
+        if (!state->staged && !state->pending && read_shared_surface_state( hwnd, &shared ))
+        {
+            /* PREPARING has no transaction generation or pending producers
+             * yet. It still precedes the native publication we must read. */
+            if (!(shared.flags & (WINDOW_SHM_CLIENT_SURFACE_PREPARING |
+                                  WINDOW_SHM_CLIENT_SURFACE_COMPOSING |
+                                  WINDOW_SHM_CLIENT_SURFACE_PUBLISHING |
+                                  WINDOW_SHM_CLIENT_SURFACE_SOURCE_PENDING))) return TRUE;
+            trace( "surface %p still publishing, flags %#x\n", hwnd, shared.flags );
+        }
     } while (GetTickCount() - start < timeout);
     return FALSE;
 }
@@ -6780,7 +6791,11 @@ static void test_handoff_bitmap_boundary(void)
         }
         color = GetPixel( dcs[i], 16, 16 );
         ok( color_matches( color, (i + 1) * 3, 128, 64 ),
-            "surface %u has unexpected destination pixel %#lx\n", i, color );
+            "surface %u hwnd %p has unexpected destination pixel %#lx, generation %s scene %s "
+            "pending %u staged %u ready %u publish %u compose %u mode %u active %u cached %u\n",
+            i, windows[i], color, wine_dbgstr_longlong( state.generation ),
+            wine_dbgstr_longlong( state.scene_generation ), state.pending, state.staged, state.ready,
+            state.publish, state.compose, state.mode, state.active, state.cached );
         if (!color_matches( color, (i + 1) * 3, 128, 64 )) goto done;
         ShowWindow( windows[i], SW_HIDE );
     }
