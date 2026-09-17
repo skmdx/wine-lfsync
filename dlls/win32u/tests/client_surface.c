@@ -76,6 +76,7 @@ static void pump_messages( DWORD timeout );
 static BOOL read_shared_surface_state( HWND hwnd, struct shared_surface_state *state );
 static UINT set_scene_placement( HWND hwnd, int offset, int grow, int frame, UINT flags );
 static UINT get_paint_update( HWND hwnd, BOOL validate );
+static void complete_scene_paint( HWND hwnd );
 static UINT drain_scene_notification_counts( UINT *owner_updates, UINT *prepares, UINT64 expected_surface,
                                              struct scene_notification_counts *counts );
 
@@ -2909,6 +2910,9 @@ static void check_source_free_destruction( HWND hwnd, const struct client_surfac
         }
         status = destroy_scene_window( child );
         ok( !status, "visible occluder teardown status %#x\n", status );
+        /* Visible destruction exposes background paint. This server-only
+         * fixture must complete that separate obligation before assembly. */
+        complete_scene_paint( hwnd );
         if (i == 2)
         {
             release_surface_handoff( hwnd, receipt->process, receipt->surface, receipt->cookie, TRUE );
@@ -3439,7 +3443,10 @@ done:
         destroy_scene_child( first );
         destroy_scene_child( second );
         prepare_surface_state( hwnd, &state );
+        status = resolve_scene_sources( hwnd, state.scene_generation, receipt, sizeof(*receipt), &accepted );
+        ok( !status && accepted, "placement cleanup inventory rejected, status %#x\n", status );
         complete_surface_handoffs( hwnd, state.generation, state.scene_generation, receipt, 1, &accepted );
+        ok( accepted, "placement cleanup receipt rejected\n" );
         publish_handoff_state( hwnd, state.generation, state.scene_generation, &state );
     }
 }
@@ -3447,7 +3454,7 @@ done:
 static void check_retained_subtree_parent( HWND top, HWND child,
                                            const struct client_surface_handoff_receipt *receipt )
 {
-    HWND parents[2] = {create_test_child( top, 0 ), create_test_child( top, 20 )};
+    HWND parents[2] = {create_scene_child( top, 0 ), create_scene_child( top, 20 )};
     struct client_surface_scene_layer initial;
     const struct client_surface_scene_layer *layer;
     struct scene_snapshot snapshot;
@@ -3492,8 +3499,8 @@ static void check_retained_subtree_parent( HWND top, HWND child,
         winetest_pop_context();
     }
 done:
-    if (parents[0]) DestroyWindow( parents[0] );
-    if (parents[1]) DestroyWindow( parents[1] );
+    destroy_scene_child( parents[0] );
+    destroy_scene_child( parents[1] );
 }
 
 static void test_child_visibility_sources(void)
@@ -3503,14 +3510,14 @@ static void test_child_visibility_sources(void)
     struct scene_snapshot snapshot;
     const struct client_surface_scene_layer *layer;
     struct surface_state state, before;
-    HWND top = create_test_window( TRUE ), child = NULL;
+    HWND top = create_test_window( FALSE ), child = NULL;
     UINT64 identity = allocate_surface();
     UINT status, notifications, updates, prepares;
     BOOL accepted;
 
     ok( !!top, "could not create visibility owner\n" );
     if (!top) return;
-    child = create_test_child( top, 10 );
+    child = create_scene_child( top, 10 );
     ok( !!child, "could not create visibility source\n" );
     if (!child) goto done;
     set_surface_state( child, identity, CLIENT_SURFACE_STATE_REGISTER | CLIENT_SURFACE_STATE_SCENE_PUBLICATION, 0, NULL );
@@ -3525,6 +3532,11 @@ static void test_child_visibility_sources(void)
         .handle = wine_server_user_handle( child ), .process = GetCurrentProcessId(),
         .surface = identity, .cookie = producer.cookie, .source_generation = 1, .buffer_index = 0,
     };
+    status = set_scene_placement( top, 0, 0, 0, SWP_SHOWWINDOW );
+    ok( !status, "visibility owner show status %#x\n", status );
+    status = set_surface_state( top, 0, CLIENT_SURFACE_STATE_STAGED, 0, &state );
+    ok( !status && state.staged && state.pending == 1, "visibility owner staging status %#x pending %u\n",
+        status, state.pending );
     prepare_surface_state( top, &state );
     complete_surface_handoffs( top, state.generation, state.scene_generation, &receipt, 1, &accepted );
     ok( accepted, "visibility bootstrap receipt rejected\n" );
@@ -3566,16 +3578,17 @@ done:
     if (owner.cookie) release_surface_handoff( child, GetCurrentProcessId(), identity, owner.cookie, TRUE );
     if (producer.mapping) CloseHandle( producer.mapping );
     if (owner.mapping) CloseHandle( owner.mapping );
-    if (child) DestroyWindow( child );
+    destroy_scene_child( child );
     DestroyWindow( top );
 
     /* A backend without scene publication needs real producer completion;
      * placement must not leave it waiting for an owner inventory callback. */
     top = create_test_window( TRUE );
-    child = top ? create_test_child( top, 10 ) : NULL;
+    child = top ? create_scene_child( top, 10 ) : NULL;
     ok( !!child, "could not create legacy placement source\n" );
     if (child)
     {
+        complete_scene_paint( top );
         identity = allocate_surface();
         set_surface_state( child, identity, CLIENT_SURFACE_STATE_REGISTER, 0, NULL );
         claim_surface_state( child, identity, &state );
@@ -3590,7 +3603,7 @@ done:
         status = resolve_scene_sources( top, state.scene_generation, NULL, 0, &accepted );
         ok( !status && !accepted, "legacy source accepted an owner inventory decision\n" );
         complete_single_surface_generation( child, identity, &state );
-        DestroyWindow( child );
+        destroy_scene_child( child );
     }
     if (top) DestroyWindow( top );
 }
@@ -5523,6 +5536,23 @@ static UINT get_paint_update( HWND hwnd, BOOL validate )
     status = p_wine_server_call( &info );
     ok( !status, "paint update query status %#x\n", status );
     return status ? 0 : info.u.reply.get_update_region_reply.flags;
+}
+
+static void complete_scene_paint( HWND hwnd )
+{
+    UINT64 token;
+    UINT status;
+
+    if (!get_paint_update( hwnd, FALSE )) return;
+    status = begin_paint_receipt( hwnd, &token );
+    ok( !status && token, "scene paint begin status %#x\n", status );
+    if (status || !token) return;
+    get_paint_update( hwnd, TRUE );
+    status = end_paint_receipt( token, FALSE );
+    ok( !status, "scene paint end status %#x\n", status );
+    status = complete_paint_receipt( token, TRUE );
+    ok( !status, "scene paint completion status %#x\n", status );
+    ok( !get_paint_update( hwnd, FALSE ), "scene paint update remains\n" );
 }
 
 static void set_paint_update( HWND hwnd, UINT flags )
