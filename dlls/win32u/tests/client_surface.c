@@ -79,6 +79,7 @@ static UINT get_paint_update( HWND hwnd, BOOL validate );
 static void complete_scene_paint( HWND hwnd );
 static HWND create_scene_child( HWND parent, int x );
 static void destroy_scene_child( HWND hwnd );
+static UINT destroy_scene_window( HWND hwnd );
 static UINT drain_scene_notification_counts( UINT *owner_updates, UINT *prepares, UINT64 expected_surface,
                                              struct scene_notification_counts *counts );
 
@@ -1210,7 +1211,8 @@ static void test_generation_membership(void)
     ok( state.active == 2 && state.cached == 1,
         "second counts active %u cached %u\n", state.active, state.cached );
 
-    ShowWindow( hwnd, SW_SHOW );
+    status = set_scene_placement( hwnd, 0, 0, 0, SWP_SHOWWINDOW );
+    ok( !status, "scene fixture visibility status %#x\n", status );
     status = set_surface_state( hwnd, 0, CLIENT_SURFACE_STATE_STAGED, 0, &staged );
     ok( !status, "membership stage failed, status %#x\n", status );
     ok( staged.staged && staged.generation && staged.pending == 1,
@@ -1251,8 +1253,10 @@ static void test_generation_membership(void)
     ok( state.active == 1 && state.cached == 1,
         "cached surface was not retained: active %u cached %u\n", state.active, state.cached );
 
-    ShowWindow( hwnd, SW_HIDE );
-    ShowWindow( hwnd, SW_SHOW );
+    status = set_scene_placement( hwnd, 0, 0, 0, SWP_HIDEWINDOW );
+    ok( !status, "scene fixture visibility status %#x\n", status );
+    status = set_scene_placement( hwnd, 0, 0, 0, SWP_SHOWWINDOW );
+    ok( !status, "scene fixture visibility status %#x\n", status );
     status = set_surface_state( hwnd, 0, CLIENT_SURFACE_STATE_STAGED, 0, &staged );
     ok( !status, "cached stage failed, status %#x\n", status );
     ok( staged.staged && staged.pending == 1,
@@ -1353,13 +1357,15 @@ static void test_clip_scene_snapshot(void)
     ok( clip_state_contains( &before, second ), "upper sibling missing from clip snapshot\n" );
     ok( clip_state_contains( &before, descendant ), "descendant missing from clip snapshot\n" );
 
-    hidden = CreateWindowExA( 0, "client_surface_test", "hidden non-producer", WS_CHILD,
-                              3, 4, 12, 13, parent, NULL, NULL, NULL );
+    hidden = create_scene_child( parent, 3 );
     ok( !!hidden, "failed to create hidden non-producer\n" );
     if (hidden)
     {
+        status = set_scene_placement( hidden, 0, 0, 0, SWP_HIDEWINDOW );
+        ok( !status, "non-producer hide status %#x\n", status );
         get_clip_state( first, &before );
-        ok( DestroyWindow( hidden ), "failed to destroy hidden non-producer\n" );
+        status = destroy_scene_window( hidden );
+        ok( !status, "hidden non-producer destroy status %#x\n", status );
         status = get_clip_state( first, &after );
         ok( !status && after.scene_generation == before.scene_generation && after.count == before.count,
             "hidden non-producer destruction changed scene %s/%u to %s/%u, status %#x\n",
@@ -1881,8 +1887,8 @@ static void test_subtree_generation_retirement(void)
     parent = create_test_window( FALSE );
     ok( !!parent, "failed to create subtree parent, error %lu\n", GetLastError() );
     if (!parent) return;
-    first = create_test_child( parent, 10 );
-    second = create_test_child( parent, 70 );
+    first = create_scene_child( parent, 10 );
+    second = create_scene_child( parent, 70 );
     ok( !!first && !!second, "failed to create subtree children, error %lu\n", GetLastError() );
     if (!first || !second)
     {
@@ -1903,7 +1909,8 @@ static void test_subtree_generation_retirement(void)
     status = claim_surface_state( second, second_surface, &state );
     ok( !status, "second child claim failed, status %#x\n", status );
 
-    ShowWindow( parent, SW_SHOW );
+    status = set_scene_placement( parent, 0, 0, 0, SWP_SHOWWINDOW );
+    ok( !status, "scene fixture visibility status %#x\n", status );
     status = set_surface_state( parent, 0, CLIENT_SURFACE_STATE_STAGED, 0, &staged );
     ok( !status, "subtree stage failed, status %#x\n", status );
     ok( staged.staged && staged.pending == 2,
@@ -1919,7 +1926,8 @@ static void test_subtree_generation_retirement(void)
         "duplicate commit changed pending state: staged %u pending %u wake %u\n",
         partial.staged, partial.pending, partial.wake );
 
-    ShowWindow( second, SW_HIDE );
+    status = set_scene_placement( second, 0, 0, 0, SWP_HIDEWINDOW );
+    ok( !status, "scene fixture visibility status %#x\n", status );
     status = set_surface_state( parent, 0, 0, 0, &state );
     ok( !status, "state query after child hide failed, status %#x\n", status );
     ok( state.staged && state.pending == 1 && state.generation != staged.generation,
@@ -1934,13 +1942,16 @@ static void test_subtree_generation_retirement(void)
         "restarted subtree did not publish: staged %u wake %u status %#x\n",
         partial.staged, partial.wake, status );
 
-    ShowWindow( parent, SW_HIDE );
-    ShowWindow( parent, SW_SHOW );
+    status = set_scene_placement( parent, 0, 0, 0, SWP_HIDEWINDOW );
+    ok( !status, "scene fixture visibility status %#x\n", status );
+    status = set_scene_placement( parent, 0, 0, 0, SWP_SHOWWINDOW );
+    ok( !status, "scene fixture visibility status %#x\n", status );
     status = set_surface_state( parent, 0, CLIENT_SURFACE_STATE_STAGED, 0, &staged );
     ok( !status, "second subtree stage failed, status %#x\n", status );
     ok( staged.staged && staged.pending == 1,
         "hidden child joined generation: staged %u pending %u\n", staged.staged, staged.pending );
-    ShowWindow( second, SW_SHOW );
+    status = set_scene_placement( second, 0, 0, 0, SWP_SHOWWINDOW );
+    ok( !status, "scene fixture visibility status %#x\n", status );
     status = set_surface_state( parent, 0, 0, 0, &state );
     ok( !status && state.generation != staged.generation && state.pending == 2,
         "shown child did not restart full generation: generation %s pending %u status %#x\n",
@@ -1960,8 +1971,10 @@ static void test_subtree_generation_retirement(void)
         "remaining child generation did not publish: staged %u wake %u status %#x\n",
         state.staged, state.wake, status );
 
-    ShowWindow( parent, SW_HIDE );
-    ShowWindow( parent, SW_SHOW );
+    status = set_scene_placement( parent, 0, 0, 0, SWP_HIDEWINDOW );
+    ok( !status, "scene fixture visibility status %#x\n", status );
+    status = set_scene_placement( parent, 0, 0, 0, SWP_SHOWWINDOW );
+    ok( !status, "scene fixture visibility status %#x\n", status );
     status = set_surface_state( parent, 0, CLIENT_SURFACE_STATE_STAGED, 0, &staged );
     ok( !status, "destroy subtree stage failed, status %#x\n", status );
     ok( staged.staged && staged.pending == 2,
@@ -1971,7 +1984,9 @@ static void test_subtree_generation_retirement(void)
     ok( state.staged && state.pending == 1 && !state.wake,
         "pre-destroy state: staged %u pending %u wake %u\n",
         state.staged, state.pending, state.wake );
-    ok( DestroyWindow( second ), "failed to destroy pending child, error %lu\n", GetLastError() );
+    status = destroy_scene_window( second );
+    ok( !status, "pending child destroy status %#x\n", status );
+    complete_scene_paint( parent );
     status = set_surface_state( parent, 0, 0, 0, &state );
     ok( !status, "state query after child destroy failed, status %#x\n", status );
     ok( state.staged && state.pending == 1 && state.generation != staged.generation,
@@ -5730,9 +5745,11 @@ static void test_live_prepare_transaction(void)
     HWND hwnd;
     unsigned int status, i;
 
-    hwnd = create_test_window( TRUE );
+    hwnd = create_test_window( FALSE );
     ok( !!hwnd, "failed to create live prepare window, error %lu\n", GetLastError() );
     if (!hwnd) return;
+    status = set_scene_placement( hwnd, 0, 0, 0, SWP_SHOWWINDOW );
+    ok( !status, "live fixture show status %#x\n", status );
 
     status = set_surface_state( hwnd, surface, CLIENT_SURFACE_STATE_REGISTER |
                                 CLIENT_SURFACE_STATE_SCENE_PUBLICATION, 0, NULL );
@@ -5761,8 +5778,8 @@ static void test_live_prepare_transaction(void)
     check_surface_result_rejected( hwnd, CLIENT_SURFACE_STATE_PREPARE_COMMIT, &preparing,
                                    STATUS_ACCESS_DENIED, TRUE );
 
-    SetWindowPos( hwnd, NULL, 11, 10, 0, 0,
-                  SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE );
+    status = set_scene_placement( hwnd, 1, 0, 0, 0 );
+    ok( !status, "live prepare fixture move status %#x\n", status );
     check_scene_result_rejected( hwnd, &preparing, 0 );
 
     status = set_native_barrier( hwnd, 0x1950, TRUE, &barrier );
@@ -5865,9 +5882,11 @@ static void test_native_backing_barrier(void)
     HWND hwnd;
     unsigned int status;
 
-    hwnd = create_test_window( TRUE );
+    hwnd = create_test_window( FALSE );
     ok( !!hwnd, "failed to create native barrier window, error %lu\n", GetLastError() );
     if (!hwnd) return;
+    status = set_scene_placement( hwnd, 0, 0, 0, SWP_SHOWWINDOW );
+    ok( !status, "live fixture show status %#x\n", status );
 
     status = set_surface_state( hwnd, surface, CLIENT_SURFACE_STATE_REGISTER |
                                 CLIENT_SURFACE_STATE_SCENE_PUBLICATION, 0, NULL );
@@ -6233,7 +6252,8 @@ static void test_late_present_cutover(void)
     set_surface_state( hwnd, surface, CLIENT_SURFACE_STATE_REGISTER |
                        CLIENT_SURFACE_STATE_SCENE_PUBLICATION, 0, NULL );
     claim_surface_state( hwnd, surface, NULL );
-    ShowWindow( hwnd, SW_SHOW );
+    status = set_scene_placement( hwnd, 0, 0, 0, SWP_SHOWWINDOW );
+    ok( !status, "late-present fixture show status %#x\n", status );
     status = set_surface_state( hwnd, 0, CLIENT_SURFACE_STATE_STAGED, 0, &staged );
     ok( !status && staged.staged && staged.pending == 1,
         "failed to stage late-present window: status %#x staged %u pending %u\n",
@@ -6452,7 +6472,8 @@ static BOOL run_child( char **argv, const char *mode, HWND hwnd, DWORD delay )
         struct surface_state state;
         unsigned int status;
 
-        ShowWindow( hwnd, SW_SHOW );
+        status = set_scene_placement( hwnd, 0, 0, 0, SWP_SHOWWINDOW );
+        ok( !status, "owner fixture show status %#x\n", status );
         status = set_surface_state( hwnd, 0, CLIENT_SURFACE_STATE_STAGED, 0, &state );
         ok( !status, "owner exit stage failed, status %#x\n", status );
         if (strcmp( mode, "owner_no_queue" ))
@@ -6484,8 +6505,8 @@ static BOOL run_child( char **argv, const char *mode, HWND hwnd, DWORD delay )
              * or enqueue one renderer notification per intermediate epoch. */
             while (GetTickCount() - start < 5500)
             {
-                SetWindowPos( hwnd, NULL, 10 + (move++ & 1), 10, 0, 0,
-                              SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE );
+                status = set_scene_placement( hwnd, move++ & 1 ? -1 : 1, 0, 0, 0 );
+                ok( !status, "owner fixture move status %#x\n", status );
                 Sleep( 50 );
             }
             Sleep( 1200 );
@@ -7125,7 +7146,8 @@ static void test_owner_exit_and_destroy( char **argv )
             state.active, state.cached, state.pending );
     }
 
-    ShowWindow( hwnd, SW_HIDE );
+    status = set_scene_placement( hwnd, 0, 0, 0, SWP_HIDEWINDOW );
+    ok( !status, "owner fixture hide status %#x\n", status );
     if (run_child( argv, "owner_stalled", hwnd, 0 ))
     {
         status = set_surface_state( hwnd, 0, 0, 0, &state );
@@ -7135,7 +7157,8 @@ static void test_owner_exit_and_destroy( char **argv )
             state.active, state.cached, state.pending );
     }
 
-    ShowWindow( hwnd, SW_HIDE );
+    status = set_scene_placement( hwnd, 0, 0, 0, SWP_HIDEWINDOW );
+    ok( !status, "owner fixture hide status %#x\n", status );
     if (run_child( argv, "owner_exit", hwnd, 0 ))
     {
         status = set_surface_state( hwnd, 0, 0, 0, &state );
