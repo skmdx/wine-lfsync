@@ -425,6 +425,7 @@ enum client_surface_compositor_op
     CLIENT_SURFACE_COMPOSITOR_RENEW_DIRECT,
     CLIENT_SURFACE_COMPOSITOR_CREATE_POOL,
     CLIENT_SURFACE_COMPOSITOR_DROP_SEED,
+    CLIENT_SURFACE_COMPOSITOR_SNAPSHOT,
     CLIENT_SURFACE_COMPOSITOR_COPY_POOL,
 };
 
@@ -457,13 +458,14 @@ struct client_surface_compositor_job
         } copy;
         /* CREATE_POOL returns independently owned pending storage.
          * COPY_POOL admits an owned read of a completed OUTPUT rectangle.
-         * REPLACE_POOL installs that checked copy, or synchronously reads
-         * the borrowed Window checkpoint for the remaining legacy paths.
+         * REPLACE_POOL installs the checked owned copy.
+         * SNAPSHOT reuses an existing member with an exclusive write lease.
          * UPDATE_TARGET borrows the registered pair and uses the same
          * installation payload as the replacement transaction. */
         struct
         {
             struct client_surface_output_allocation *allocation;
+            struct x11drv_native_window *window_owner;
             Drawable source, destination;
             unsigned int width, height, window_width, window_height;
             unsigned int copy_count, preserve_width, preserve_height;
@@ -663,7 +665,7 @@ struct client_surface_output_allocation
     struct x11drv_native_window *window_owner;
     struct x11drv_native_window_read seed_read;
     unsigned int seed_stage;
-    BOOL seed, seed_target, scene_wait;
+    BOOL seed, seed_target, scene_wait, snapshot, shared, stale;
     struct list seed_entry;
     struct client_surface_scene scene;
     Pixmap source, published;
@@ -1210,7 +1212,7 @@ static void client_surface_output_allocation_complete( void *context, BOOL succe
         if (!allocation->failed)
         {
             allocation->pixmaps[0] = client_surface_cache_pixmap( allocation->images[0] );
-            allocation->pixmaps[1] = client_surface_cache_pixmap( allocation->images[1] );
+            if (!allocation->snapshot) allocation->pixmaps[1] = client_surface_cache_pixmap( allocation->images[1] );
         }
         abandoned = allocation->abandoned;
         if (!abandoned)
@@ -1220,7 +1222,8 @@ static void client_surface_output_allocation_complete( void *context, BOOL succe
         }
     }
     TRACE_(csperf)( "ticks=%llu event=%s request=%p serial=%llu pending=%u failed=%u abandoned=%u\n",
-                   client_surface_perf_time(), allocation->checkpoint ? "output_pair_copy_complete" : "output_pair_create_complete",
+                   client_surface_perf_time(), allocation->snapshot ? "output_snapshot_complete" :
+                   allocation->checkpoint ? "output_pair_copy_complete" : "output_pair_create_complete",
                    allocation, (unsigned long long)allocation->serial, allocation->pending,
                    allocation->failed, allocation->abandoned );
     pthread_mutex_unlock( &client_surface_compositor_mutex );
@@ -1229,16 +1232,17 @@ static void client_surface_output_allocation_complete( void *context, BOOL succe
     if (abandoned) free_client_surface_pending_allocation( allocation );
 }
 
-static BOOL create_client_surface_output_allocation( struct client_surface_compositor_job *job )
+static struct client_surface_output_allocation *alloc_client_surface_output_request(
+    struct client_surface_compositor_job *job )
 {
     struct client_surface_memory_scope memory = {0};
     struct client_surface_output_allocation *allocation;
 
-    if (!x11drv_reserve_release_capacity( 1, sizeof(*allocation) )) return FALSE;
+    if (!x11drv_reserve_release_capacity( 1, sizeof(*allocation) )) return NULL;
     if (!(allocation = alloc_client_surface_compositor_metadata( job->toplevel, sizeof(*allocation), &memory )))
     {
         release_client_surface_compositor_capacity( CLIENT_SURFACE_COMPOSITOR_RELEASE_CAPACITY, 1, sizeof(*allocation), NULL );
-        return FALSE;
+        return NULL;
     }
     allocation->memory = memory;
     list_init( &allocation->notification_entry );
@@ -1246,19 +1250,26 @@ static BOOL create_client_surface_output_allocation( struct client_surface_compo
     allocation->release.queue = get_client_surface_compositor_queue( job->toplevel );
     assert( allocation->release.queue );
     allocation->release.toplevel = job->toplevel;
-    allocation->bytes = 2 * client_surface_pixmap_bytes( job->u.pool.width, job->u.pool.height, job->u.pool.depth );
-    if (!client_surface_cache_reserve_output_pair( &allocation->memory, allocation->bytes / 2,
-                                                   wake_client_surface_compositor, allocation->images ))
-    {
-        release_client_surface_compositor_queue( allocation->release.queue );
-        free_client_surface_compositor_release( &allocation->memory, allocation, 1, sizeof(*allocation) );
-        return FALSE;
-    }
     allocation->width = job->u.pool.width;
     allocation->height = job->u.pool.height;
     allocation->depth = job->u.pool.depth;
     if (!++client_surface_output_allocation_serial) ++client_surface_output_allocation_serial;
     allocation->serial = client_surface_output_allocation_serial;
+    return allocation;
+}
+
+static BOOL create_client_surface_output_allocation( struct client_surface_compositor_job *job )
+{
+    struct client_surface_output_allocation *allocation = alloc_client_surface_output_request( job );
+
+    if (!allocation) return FALSE;
+    allocation->bytes = 2 * client_surface_pixmap_bytes( allocation->width, allocation->height, allocation->depth );
+    if (!client_surface_cache_reserve_output_pair( &allocation->memory, allocation->bytes / 2,
+                                                   wake_client_surface_compositor, allocation->images ))
+    {
+        free_client_surface_pending_allocation( allocation );
+        return FALSE;
+    }
     allocation->pending = 2;
     job->u.pool.allocation = allocation;
     client_surface_cache_create_output_pair( allocation->images, allocation->width, allocation->height,
@@ -2659,11 +2670,17 @@ static void client_surface_output_seed_complete( void *context, BOOL success )
     pthread_mutex_lock( &client_surface_compositor_mutex );
     abandoned = allocation->abandoned;
     pthread_mutex_unlock( &client_surface_compositor_mutex );
+    if (allocation->snapshot)
+    {
+        allocation->seed_stage = 3;
+        client_surface_output_allocation_complete( allocation, success );
+        return;
+    }
     if (success && !abandoned && allocation->seed_stage == 1 && allocation->source_image)
     {
         allocation->seed_stage = 2;
         client_surface_cache_copy_output( allocation->images[0], allocation->source,
-            allocation->copy_width, allocation->copy_height, NULL,
+            allocation->copy_width, allocation->copy_height, NULL, FALSE,
             client_surface_output_seed_complete, allocation );
         return;
     }
@@ -2673,11 +2690,44 @@ static void client_surface_output_seed_complete( void *context, BOOL success )
         allocation->seed_stage = 3;
         client_surface_cache_copy_output( allocation->images[1], allocation->pixmaps[0],
             max( allocation->window_width, allocation->copy_width ),
-            max( allocation->window_height, allocation->copy_height ), NULL,
+            max( allocation->window_height, allocation->copy_height ), NULL, FALSE,
             client_surface_output_seed_complete, allocation );
         return;
     }
     client_surface_output_allocation_complete( allocation, success );
+}
+
+static void queue_client_surface_seed( struct client_surface_output_allocation *allocation,
+                                       struct client_surface_compositor_job *job,
+                                       struct client_surface_compositor_target *target )
+{
+    allocation->scene = job->u.pool.scene;
+    allocation->window = job->u.pool.destination;
+    allocation->window_width = job->u.pool.window_width;
+    allocation->window_height = job->u.pool.window_height;
+    allocation->source = job->u.pool.source;
+    allocation->copy_width = job->u.pool.preserve_width;
+    allocation->copy_height = job->u.pool.preserve_height;
+    allocation->checkpoint = allocation->seed = TRUE;
+    allocation->seed_target = !!target;
+    if (target)
+    {
+        allocation->source_revision = target->revision;
+        allocation->published = target->published;
+        target->seed_serial = allocation->serial;
+        target->quiescing = TRUE;
+        detach_client_surface_output_transform( target );
+    }
+    pthread_mutex_lock( &client_surface_compositor_mutex );
+    allocation->pending = 1;
+    pthread_mutex_unlock( &client_surface_compositor_mutex );
+    TRACE_(csperf)( "ticks=%llu event=%s request=%p serial=%llu hwnd=%p window=%lx source=%lx first=%lx second=%lx width=%u height=%u preserve_width=%u preserve_height=%u\n",
+                   client_surface_perf_time(), allocation->snapshot ? "output_snapshot_admit" : "output_pair_seed_admit",
+                   allocation, (unsigned long long)allocation->serial, job->toplevel,
+                   allocation->window, allocation->source, allocation->pixmaps[0], allocation->pixmaps[1],
+                   allocation->window_width, allocation->window_height, allocation->copy_width, allocation->copy_height );
+    list_add_tail( &client_surface_seed_requests, &allocation->seed_entry );
+    ++client_surface_seed_request_count;
 }
 
 static BOOL seed_client_surface_compositor_pool( struct client_surface_compositor_job *job )
@@ -2701,32 +2751,7 @@ static BOOL seed_client_surface_compositor_pool( struct client_surface_composito
         if (job->u.pool.preserve_width > min( target->width, allocation->width ) ||
             job->u.pool.preserve_height > min( target->height, allocation->height )) goto stale;
     }
-    allocation->scene = job->u.pool.scene;
-    allocation->window = job->u.pool.destination;
-    allocation->window_width = job->u.pool.window_width;
-    allocation->window_height = job->u.pool.window_height;
-    allocation->source = job->u.pool.source;
-    allocation->copy_width = job->u.pool.preserve_width;
-    allocation->copy_height = job->u.pool.preserve_height;
-    allocation->checkpoint = allocation->seed = TRUE;
-    allocation->seed_target = !!target;
-    if (target)
-    {
-        allocation->source_revision = target->revision;
-        allocation->published = target->published;
-        target->seed_serial = allocation->serial;
-        target->quiescing = TRUE;
-        detach_client_surface_output_transform( target );
-    }
-    pthread_mutex_lock( &client_surface_compositor_mutex );
-    allocation->pending = 1;
-    pthread_mutex_unlock( &client_surface_compositor_mutex );
-    TRACE_(csperf)( "ticks=%llu event=output_pair_seed_admit request=%p serial=%llu hwnd=%p window=%lx source=%lx first=%lx second=%lx width=%u height=%u preserve_width=%u preserve_height=%u\n",
-                   client_surface_perf_time(), allocation, (unsigned long long)allocation->serial, job->toplevel,
-                   allocation->window, allocation->source, allocation->pixmaps[0], allocation->pixmaps[1],
-                   allocation->window_width, allocation->window_height, allocation->copy_width, allocation->copy_height );
-    list_add_tail( &client_surface_seed_requests, &allocation->seed_entry );
-    ++client_surface_seed_request_count;
+    queue_client_surface_seed( allocation, job, target );
     return TRUE;
 stale:
     job->u.pool.stale = TRUE;
@@ -2740,6 +2765,43 @@ static BOOL client_surface_seed_current( struct client_surface_output_allocation
             target->window == allocation->window && target->revision == allocation->source_revision &&
             target->published == allocation->published : !target) &&
            client_surface_output_checkpoint_scene_current( &allocation->scene );
+}
+
+static BOOL snapshot_client_surface_compositor_pool( struct client_surface_compositor_job *job )
+{
+    struct client_surface_output_allocation *allocation = job->u.pool.allocation;
+    struct client_surface_compositor_target *target = find_client_surface_compositor_target( job->toplevel );
+    struct client_surface_compositor_frame *frame;
+    BOOL success;
+
+    if (!allocation)
+    {
+        if (!target || target->window != job->u.pool.destination || target->backing != job->u.pool.source ||
+            !job->u.pool.window_owner || !job->u.pool.window_width || !job->u.pool.window_height ||
+            job->u.pool.window_width > job->u.pool.width || job->u.pool.window_height > job->u.pool.height ||
+            !get_client_surface_compositor_pixmap( target, job->u.pool.pixmaps[0] )) return FALSE;
+        if (!(allocation = alloc_client_surface_output_request( job ))) return FALSE;
+        allocation->snapshot = TRUE;
+        allocation->window_owner = x11drv_native_window_acquire( job->u.pool.window_owner );
+        memcpy( allocation->pixmaps, job->u.pool.pixmaps, sizeof(allocation->pixmaps) );
+        client_surface_capture_scene_state( job->toplevel, &job->u.pool.scene );
+        queue_client_surface_seed( allocation, job, target );
+        job->u.pool.allocation = allocation;
+        return TRUE;
+    }
+    assert( allocation->snapshot && !allocation->pending );
+    frame = target ? get_client_surface_compositor_pixmap( target, allocation->pixmaps[0] ) : NULL;
+    success = !allocation->failed && allocation->seed_stage == 3 &&
+              client_surface_seed_current( allocation, target ) && frame && frame->image == allocation->images[0] &&
+              job->u.pool.pixmaps[0] == allocation->pixmaps[0] && job->u.pool.pixmaps[1] == allocation->pixmaps[1] &&
+              job->u.pool.window_width == allocation->window_width && job->u.pool.window_height == allocation->window_height;
+    job->u.pool.stale = !allocation->failed && !success;
+    if (success) success = update_client_surface_compositor_target( job );
+    TRACE_(csperf)( "ticks=%llu event=output_snapshot_install request=%p serial=%llu hwnd=%p current=%u\n",
+                   client_surface_perf_time(), allocation, (unsigned long long)allocation->serial, job->toplevel, success );
+    free_client_surface_pending_allocation( allocation );
+    job->u.pool.allocation = NULL;
+    return success;
 }
 
 static BOOL process_client_surface_seed_requests(void)
@@ -2763,6 +2825,14 @@ static BOOL process_client_surface_seed_requests(void)
         abandoned = allocation->abandoned;
         pthread_mutex_unlock( &client_surface_compositor_mutex );
         target = find_client_surface_compositor_target( allocation->release.toplevel );
+        if (allocation->snapshot && (!target || target->seed_serial != allocation->serial)) goto failed;
+        if (!abandoned && allocation->snapshot && !allocation->scene.epoch &&
+            !client_surface_capture_scene_state( allocation->release.toplevel, &allocation->scene ))
+        {
+            list_add_tail( &client_surface_seed_requests, &allocation->seed_entry );
+            ++client_surface_seed_request_count;
+            continue;
+        }
         if (abandoned || !client_surface_seed_current( allocation, target )) goto failed;
         if (target)
         {
@@ -2775,6 +2845,19 @@ static BOOL process_client_surface_seed_requests(void)
             ++client_surface_seed_request_count;
             continue;
         }
+        if (allocation->snapshot)
+        {
+            frame = target ? get_client_surface_compositor_pixmap( target, allocation->pixmaps[0] ) : NULL;
+            if (!frame || !client_surface_cache_acquire_output_write( frame->image ))
+            {
+                allocation->shared = TRUE;
+                goto failed;
+            }
+            allocation->images[0] = frame->image;
+            frame->revision = 0;
+            if (target->published == frame->pixmap)
+                target->published_width = target->published_height = 0;
+        }
         if (allocation->source && allocation->copy_width && allocation->copy_height)
         {
             frame = client_surface_output_checkpoint_frame( target, allocation->source, &busy );
@@ -2784,17 +2867,19 @@ static BOOL process_client_surface_seed_requests(void)
         allocation->seed_stage = 1;
         window = x11drv_native_window_read_init( &allocation->seed_read, allocation->window_owner );
         assert( window == allocation->window );
-        TRACE_(csperf)( "ticks=%llu event=output_pair_seed_submit request=%p serial=%llu hwnd=%p window=%lx source=%lx source_image=%p first=%lx second=%lx width=%u height=%u preserve_width=%u preserve_height=%u\n",
-                       client_surface_perf_time(), allocation, (unsigned long long)allocation->serial,
+        TRACE_(csperf)( "ticks=%llu event=%s request=%p serial=%llu hwnd=%p window=%lx source=%lx source_image=%p first=%lx second=%lx width=%u height=%u preserve_width=%u preserve_height=%u\n",
+                       client_surface_perf_time(), allocation->snapshot ? "output_snapshot_submit" : "output_pair_seed_submit",
+                       allocation, (unsigned long long)allocation->serial,
                        allocation->release.toplevel, window, allocation->source, allocation->source_image,
                        allocation->pixmaps[0], allocation->pixmaps[1], allocation->window_width, allocation->window_height,
                        allocation->copy_width, allocation->copy_height );
         client_surface_cache_copy_output( allocation->images[0], window,
-            allocation->window_width, allocation->window_height, &allocation->seed_read,
+            allocation->window_width, allocation->window_height, &allocation->seed_read, allocation->snapshot,
             client_surface_output_seed_complete, allocation );
         progressed = TRUE;
         continue;
 failed:
+        allocation->stale = !abandoned && !allocation->shared;
         client_surface_output_allocation_complete( allocation, FALSE );
         progressed = TRUE;
     }
@@ -2872,7 +2957,7 @@ static BOOL copy_client_surface_compositor_pool( struct client_surface_composito
                    (unsigned long long)allocation->source_revision );
     for (i = 0; i < ARRAY_SIZE(allocation->images); ++i)
         client_surface_cache_copy_output( allocation->images[i], allocation->source,
-            allocation->copy_width, allocation->copy_height, NULL, client_surface_output_allocation_complete, allocation );
+            allocation->copy_width, allocation->copy_height, NULL, FALSE, client_surface_output_allocation_complete, allocation );
     return TRUE;
 }
 
@@ -5194,6 +5279,8 @@ static BOOL execute_client_surface_compositor_job( struct client_surface_composi
                                                           job );
     if (job->op == CLIENT_SURFACE_COMPOSITOR_UPDATE_TARGET)
         return update_client_surface_compositor_target( job );
+    if (job->op == CLIENT_SURFACE_COMPOSITOR_SNAPSHOT)
+        return snapshot_client_surface_compositor_pool( job );
     if (job->op == CLIENT_SURFACE_COMPOSITOR_DROP_SEED)
     {
         struct client_surface_output_allocation *allocation =
@@ -5265,7 +5352,7 @@ static BOOL client_surface_compositor_job_ready( struct client_surface_composito
 
     *rejected = FALSE;
     if (job->op == CLIENT_SURFACE_COMPOSITOR_CREATE_POOL || job->op == CLIENT_SURFACE_COMPOSITOR_COPY_POOL ||
-        job->op == CLIENT_SURFACE_COMPOSITOR_DROP_SEED) return TRUE;
+        job->op == CLIENT_SURFACE_COMPOSITOR_DROP_SEED || job->op == CLIENT_SURFACE_COMPOSITOR_SNAPSHOT) return TRUE;
     if (!target) return TRUE;
     if (job->op == CLIENT_SURFACE_COMPOSITOR_DIRECT_PLAN ||
         job->op == CLIENT_SURFACE_COMPOSITOR_RETIRE_POOL)
@@ -5460,6 +5547,7 @@ static BOOL client_surface_compositor_control_job( const struct client_surface_c
 {
     return job->op == CLIENT_SURFACE_COMPOSITOR_CREATE_POOL ||
            job->op == CLIENT_SURFACE_COMPOSITOR_DROP_SEED ||
+           job->op == CLIENT_SURFACE_COMPOSITOR_SNAPSHOT ||
            job->op == CLIENT_SURFACE_COMPOSITOR_COPY_POOL ||
            job->op == CLIENT_SURFACE_COMPOSITOR_TRY_BEGIN_UPDATE ||
            job->op == CLIENT_SURFACE_COMPOSITOR_CHECK_UPDATE ||
@@ -6208,7 +6296,7 @@ static NTSTATUS prepare_client_surface_output_allocation( struct x11drv_win_data
     };
     NTSTATUS status;
 
-    if (allocation && (allocation->width != width || allocation->height != height || allocation->depth != data->vis.depth))
+    if (allocation && (allocation->snapshot || allocation->width != width || allocation->height != height || allocation->depth != data->vis.depth))
     {
         X11DRV_client_surface_backing_cancel_allocation( data );
         allocation = NULL;
@@ -6949,12 +7037,50 @@ static NTSTATUS copy_client_surface_backing_snapshot( struct x11drv_win_data *da
                                                   unsigned int width, unsigned int height,
                                                   unsigned int window_width, unsigned int window_height )
 {
+    struct client_surface_output_allocation *allocation;
+    struct client_surface_compositor_job job =
+    {
+        .op = CLIENT_SURFACE_COMPOSITOR_SNAPSHOT,
+        .toplevel = data->hwnd,
+        .u.pool = {.source = data->client_surface_backing, .destination = data->whole_window,
+                   .window_owner = data->native_window, .pixmaps = {pixmap, data->client_surface_backing},
+                   .width = width, .height = height, .depth = data->vis.depth, .visual = data->vis.visualid,
+                   .window_width = window_width, .window_height = window_height},
+    };
+    NTSTATUS status;
+
     if (width < window_width || height < window_height) return STATUS_UNSUCCESSFUL;
-    /* The compositor uses another connection. Complete the owner's drawing
-     * before copying the complete checkpoint, including its GDI pixels. */
-    XSync( data->display, False );
-    return client_surface_backing_copy_area( data->hwnd, data->whole_window, pixmap,
-                                            0, 0, 0, 0, window_width, window_height );
+retry:
+    allocation = data->client_surface_pending_allocation;
+    if (!allocation)
+    {
+        job.u.pool.allocation = NULL;
+        if (!submit_client_surface_compositor_job( &job )) return STATUS_UNSUCCESSFUL;
+        allocation = job.u.pool.allocation;
+        data->client_surface_pending_allocation = allocation;
+        data->client_surface_allocation_serial = allocation->serial;
+        data->client_surface_allocation_update = WINE_UPDATE_CLIENT_SURFACE_BACKING;
+        return STATUS_PENDING;
+    }
+    assert( allocation->snapshot );
+    pthread_mutex_lock( &client_surface_compositor_mutex );
+    status = allocation->pending || !list_empty( &allocation->notification_entry ) ? STATUS_PENDING :
+             allocation->shared ? STATUS_SHARING_VIOLATION : allocation->stale ? STATUS_RETRY :
+             allocation->failed ? STATUS_UNSUCCESSFUL : STATUS_SUCCESS;
+    pthread_mutex_unlock( &client_surface_compositor_mutex );
+    if (status == STATUS_PENDING) return status;
+    data->client_surface_pending_allocation = NULL;
+    data->client_surface_allocation_serial = 0;
+    if (status != STATUS_SUCCESS)
+    {
+        free_client_surface_pending_allocation( allocation );
+        if (status == STATUS_RETRY) goto retry;
+        return status;
+    }
+    job.u.pool.allocation = allocation;
+    if (submit_client_surface_compositor_job( &job )) return STATUS_SUCCESS;
+    if (job.u.pool.stale) goto retry;
+    return STATUS_UNSUCCESSFUL;
 }
 
 static NTSTATUS snapshot_client_surface_backing( struct x11drv_win_data *data, BOOL invalidate, BOOL ensure_on_failure,
@@ -6967,6 +7093,7 @@ static NTSTATUS snapshot_client_surface_backing( struct x11drv_win_data *data, B
             data->client_surface_backing_width, data->client_surface_backing_height,
             window_width, window_height )) != STATUS_SUCCESS)
     {
+        if (status == STATUS_PENDING) return status;
         /* A failed snapshot must still apply the capacity check's validity
          * and native extent to the old target. Successful snapshots combine
          * that update with their checkpoint rotation below. */
@@ -6982,7 +7109,6 @@ static NTSTATUS snapshot_client_surface_backing( struct x11drv_win_data *data, B
     data->client_surface_backing_valid = FALSE;
     data->client_surface_backing_valid_width = 0;
     data->client_surface_backing_valid_height = 0;
-    if (!update_client_surface_backing_target( data )) return STATUS_UNSUCCESSFUL;
     refresh_client_surface_handoffs( data->hwnd );
     if (!invalidate)
     {
@@ -6997,6 +7123,10 @@ static BOOL client_surface_output_checkpoint_matches( struct x11drv_win_data *da
                                                        struct client_surface_output_allocation *allocation,
                                                        unsigned int window_width, unsigned int window_height )
 {
+    if (allocation->snapshot)
+        return allocation->source == data->client_surface_backing && allocation->pixmaps[0] == data->client_surface_backing_spare &&
+               allocation->window_owner == data->native_window && allocation->window == data->whole_window &&
+               allocation->window_width == window_width && allocation->window_height == window_height;
     if (allocation->seed)
         return allocation->source == data->client_surface_backing && allocation->window_owner == data->native_window &&
                allocation->window == data->whole_window && allocation->window_width == window_width &&
@@ -7074,7 +7204,8 @@ retry:
         data->client_surface_backing_width >= width &&
         data->client_surface_backing_height >= height)
     {
-        if (data->client_surface_pending_allocation) X11DRV_client_surface_backing_cancel_allocation( data );
+        if (data->client_surface_pending_allocation && !data->client_surface_pending_allocation->snapshot)
+            X11DRV_client_surface_backing_cancel_allocation( data );
         /* Allocation capacity is not content validity.  After a shrink, the
          * unused tail can contain an older scene (or allocation black).  A
          * later growth within the same geometric allocation must therefore

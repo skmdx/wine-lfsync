@@ -4241,7 +4241,11 @@ NTSTATUS X11DRV_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_hint,
          * is allowed to commit into this publication generation. */
         client_surface_capture_scene_state( hwnd, &scene );
         X11DRV_sync_window_changes( data->display );
-        status = X11DRV_client_surface_backing_snapshot( data, TRUE );
+        /* PREPARE already completed the checkpoint (or renewed DIRECT)
+         * after staging and mapping above. Starting a second asynchronous
+         * snapshot here would leave preparation pending on every retry. */
+        if (!prepare_client_surface)
+            status = X11DRV_client_surface_backing_snapshot( data, TRUE );
         if (status == STATUS_SUCCESS)
         {
             if (client_surface_set_staged( &scene ))

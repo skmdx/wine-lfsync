@@ -731,11 +731,11 @@ void client_surface_cache_copy( struct client_surface_cache_image *image, Pixmap
 
 void client_surface_cache_copy_output( struct client_surface_cache_image *image, Pixmap source,
                                        unsigned int width, unsigned int height,
-                                       struct x11drv_native_window_read *read,
+                                       struct x11drv_native_window_read *read, BOOL write_ref,
                                        client_surface_cache_callback complete, void *context )
 {
     pthread_mutex_lock( &cache_mutex );
-    assert( image->acquired && image->refs == 1 && image->purpose == CLIENT_SURFACE_MEMORY_OUTPUT );
+    assert( image->acquired && image->refs == 1 + !!write_ref && image->purpose == CLIENT_SURFACE_MEMORY_OUTPUT );
     assert( source && width && height && width <= image->width && height <= image->height );
     image->source = source;
     image->read = read;
@@ -776,6 +776,26 @@ BOOL client_surface_cache_write_pending( const struct client_surface_cache_image
     return pending;
 }
 
+static BOOL acquire_output_write( struct client_surface_cache_image *image )
+{
+    assert( image->purpose == CLIENT_SURFACE_MEMORY_OUTPUT );
+    if (!image->acquired || image->refs != 1 || image->operation != CACHE_IDLE) return FALSE;
+    ++image->refs;
+    TRACE_(csperf)( "ticks=%llu event=cache_image_reference image=%p pixmap=%lx acquire=1 refs=%u\n",
+                   cache_time(), image, image->pixmap, image->refs );
+    return TRUE;
+}
+
+BOOL client_surface_cache_acquire_output_write( struct client_surface_cache_image *image )
+{
+    BOOL acquired;
+
+    pthread_mutex_lock( &cache_mutex );
+    acquired = acquire_output_write( image );
+    pthread_mutex_unlock( &cache_mutex );
+    return acquired;
+}
+
 BOOL client_surface_cache_transform_output( struct client_surface_cache_image *image,
     const struct client_surface_cache_transform *transform, unsigned int count,
     client_surface_cache_callback complete, void *context )
@@ -791,15 +811,11 @@ BOOL client_surface_cache_transform_output( struct client_surface_cache_image *i
     }
     assert( !command );
     pthread_mutex_lock( &cache_mutex );
-    assert( image->purpose == CLIENT_SURFACE_MEMORY_OUTPUT );
-    if (!image->acquired || image->refs != 1 || image->operation != CACHE_IDLE)
+    if (!acquire_output_write( image ))
     {
         pthread_mutex_unlock( &cache_mutex );
         return FALSE;
     }
-    ++image->refs;
-    TRACE_(csperf)( "ticks=%llu event=cache_image_reference image=%p pixmap=%lx acquire=1 refs=%u\n",
-                   cache_time(), image, image->pixmap, image->refs );
     image->transform = transform;
     image->transform_count = count;
     queue_cache_image( image, CACHE_TRANSFORM, complete, context );

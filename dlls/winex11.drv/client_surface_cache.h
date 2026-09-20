@@ -52,6 +52,7 @@ unsigned int client_surface_cache_gc( const struct client_surface_cache_image *i
 struct client_surface_cache_image *client_surface_cache_acquire( struct client_surface_cache_image *image );
 BOOL client_surface_cache_shared( const struct client_surface_cache_image *image );
 BOOL client_surface_cache_write_pending( const struct client_surface_cache_image *image );
+BOOL client_surface_cache_acquire_output_write( struct client_surface_cache_image *image );
 void client_surface_cache_copy( struct client_surface_cache_image *image, Pixmap source,
                                 client_surface_cache_callback complete, void *context );
 /* Copy an owned input into private OUTPUT storage. A Window read carries
@@ -59,7 +60,7 @@ void client_surface_cache_copy( struct client_surface_cache_image *image, Pixmap
 struct x11drv_native_window_read;
 void client_surface_cache_copy_output( struct client_surface_cache_image *image, Pixmap source,
                                        unsigned int width, unsigned int height,
-                                       struct x11drv_native_window_read *read,
+                                       struct x11drv_native_window_read *read, BOOL write_ref,
                                        client_surface_cache_callback complete, void *context );
 
 /* The caller owns this bounded command chain and all input images through
