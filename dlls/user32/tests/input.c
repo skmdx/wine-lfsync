@@ -4154,6 +4154,17 @@ static BOOL accept_mouse_messages_nomove( UINT msg )
     return is_mouse_message( msg ) && msg != WM_MOUSEMOVE;
 }
 
+static void set_mouse_message_window( struct user_call *sequence, HWND hwnd )
+{
+    POINT point = sequence[0].ll_hook_ms.point;
+
+    /* Low-level hooks use screen coordinates; button messages use client
+     * coordinates even when the window manager moved the destination. */
+    ok( ScreenToClient( hwnd, &point ), "ScreenToClient failed, error %lu\n", GetLastError() );
+    sequence[1].message.hwnd = hwnd;
+    sequence[1].message.lparam = MAKELONG( point.x, point.y );
+}
+
 static void test_SendInput_mouse_messages(void)
 {
 #define WIN_MSG(m, h, w, l, ...) {.func = MSG_TEST_WIN, .message = {.msg = m, .hwnd = h, .wparam = w, .lparam = l}, ## __VA_ARGS__}
@@ -4309,16 +4320,16 @@ static void test_SendInput_mouse_messages(void)
 
     mouse_event( MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0 );
     wait_messages( 5, FALSE );
-    button_down_hwnd[1].message.hwnd = hwnd;
+    set_mouse_message_window( button_down_hwnd, hwnd );
     ok_seq( button_down_hwnd );
 
     mouse_event( MOUSEEVENTF_LEFTUP, 0, 0, 0, 0 );
     wait_messages( 5, FALSE );
-    button_up_hwnd[1].message.hwnd = hwnd;
+    set_mouse_message_window( button_up_hwnd, hwnd );
     ok_seq( button_up_hwnd );
     mouse_event( MOUSEEVENTF_LEFTUP, 0, 0, 0, 0 );
     wait_messages( 5, FALSE );
-    button_up_hwnd[1].message.hwnd = hwnd;
+    set_mouse_message_window( button_up_hwnd, hwnd );
     ok_seq( button_up_hwnd );
 
 
@@ -4334,11 +4345,11 @@ static void test_SendInput_mouse_messages(void)
 
     mouse_event( MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0 );
     wait_messages( 5, FALSE );
-    button_down_hwnd[1].message.hwnd = other;
+    set_mouse_message_window( button_down_hwnd, other );
     ok_seq( button_down_hwnd );
     mouse_event( MOUSEEVENTF_LEFTUP, 0, 0, 0, 0 );
     wait_messages( 5, FALSE );
-    button_up_hwnd[1].message.hwnd = other;
+    set_mouse_message_window( button_up_hwnd, other );
     ok_seq( button_up_hwnd );
 
     ok_ret( 1, DestroyWindow( other ) );
@@ -4357,11 +4368,11 @@ static void test_SendInput_mouse_messages(void)
 
     mouse_event( MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0 );
     wait_messages( 5, FALSE );
-    button_down_hwnd[1].message.hwnd = other;
+    set_mouse_message_window( button_down_hwnd, other );
     ok_seq( button_down_hwnd );
     mouse_event( MOUSEEVENTF_LEFTUP, 0, 0, 0, 0 );
     wait_messages( 5, FALSE );
-    button_up_hwnd[1].message.hwnd = other;
+    set_mouse_message_window( button_up_hwnd, other );
     ok_seq( button_up_hwnd );
 
     ok_ret( 1, DestroyWindow( other ) );
@@ -4380,11 +4391,11 @@ static void test_SendInput_mouse_messages(void)
 
     mouse_event( MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0 );
     wait_messages( 5, FALSE );
-    button_down_hwnd_todo[1].message.hwnd = hwnd;
+    set_mouse_message_window( button_down_hwnd_todo, hwnd );
     ok_seq( button_down_hwnd_todo );
     mouse_event( MOUSEEVENTF_LEFTUP, 0, 0, 0, 0 );
     wait_messages( 5, FALSE );
-    button_up_hwnd_todo[1].message.hwnd = hwnd;
+    set_mouse_message_window( button_up_hwnd_todo, hwnd );
     ok_seq( button_up_hwnd_todo );
 
     ok_ret( 1, DestroyWindow( other ) );
@@ -4403,11 +4414,11 @@ static void test_SendInput_mouse_messages(void)
 
     mouse_event( MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0 );
     wait_messages( 5, FALSE );
-    button_down_hwnd[1].message.hwnd = hwnd;
+    set_mouse_message_window( button_down_hwnd, hwnd );
     ok_seq( button_down_hwnd );
     mouse_event( MOUSEEVENTF_LEFTUP, 0, 0, 0, 0 );
     wait_messages( 5, FALSE );
-    button_up_hwnd[1].message.hwnd = hwnd;
+    set_mouse_message_window( button_up_hwnd, hwnd );
     ok_seq( button_up_hwnd );
 
     ok_ret( 1, DestroyWindow( other ) );
@@ -4448,11 +4459,11 @@ static void test_SendInput_mouse_messages(void)
 
     mouse_event( MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0 );
     wait_messages( 5, FALSE );
-    button_down_hwnd[1].message.hwnd = hwnd;
+    set_mouse_message_window( button_down_hwnd, hwnd );
     ok_seq( button_down_hwnd );
     mouse_event( MOUSEEVENTF_LEFTUP, 0, 0, 0, 0 );
     wait_messages( 5, FALSE );
-    button_up_hwnd[1].message.hwnd = hwnd;
+    set_mouse_message_window( button_up_hwnd, hwnd );
     ok_seq( button_up_hwnd );
 
     ok_ret( 1, AttachThreadInput( thread_id, GetCurrentThreadId(), FALSE ) );
@@ -4477,11 +4488,11 @@ static void test_SendInput_mouse_messages(void)
 
     mouse_event( MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0 );
     wait_messages( 5, FALSE );
-    button_down_hwnd[1].message.hwnd = hwnd;
+    set_mouse_message_window( button_down_hwnd, hwnd );
     ok_seq( button_down_hwnd );
     mouse_event( MOUSEEVENTF_LEFTUP, 0, 0, 0, 0 );
     wait_messages( 5, FALSE );
-    button_up_hwnd[1].message.hwnd = hwnd;
+    set_mouse_message_window( button_up_hwnd, hwnd );
     ok_seq( button_up_hwnd );
 
     ok_ret( 1, DestroyWindow( other ) );
@@ -4504,11 +4515,11 @@ static void test_SendInput_mouse_messages(void)
 
     mouse_event( MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0 );
     wait_messages( 5, FALSE );
-    button_down_hwnd[1].message.hwnd = hwnd;
+    set_mouse_message_window( button_down_hwnd, hwnd );
     ok_seq( button_down_hwnd );
     mouse_event( MOUSEEVENTF_LEFTUP, 0, 0, 0, 0 );
     wait_messages( 5, FALSE );
-    button_up_hwnd[1].message.hwnd = hwnd;
+    set_mouse_message_window( button_up_hwnd, hwnd );
     ok_seq( button_up_hwnd );
 
     ok_ret( 1, DestroyWindow( other ) );
@@ -4552,13 +4563,13 @@ static void test_SendInput_mouse_messages(void)
 
         mouse_event( MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0 );
         wait_messages( 5, FALSE );
-        button_down_hwnd_todo[1].message.hwnd = test->expect_click ? other : hwnd;
+        set_mouse_message_window( button_down_hwnd_todo, test->expect_click ? other : hwnd );
         button_down_hwnd_todo[1].todo = !test->expect_click;
         button_down_hwnd_todo[2].todo = !test->alpha && (test->flags & LWA_ALPHA);
         ok_seq( button_down_hwnd_todo );
         mouse_event( MOUSEEVENTF_LEFTUP, 0, 0, 0, 0 );
         wait_messages( 5, FALSE );
-        button_up_hwnd_todo[1].message.hwnd = test->expect_click ? other : hwnd;
+        set_mouse_message_window( button_up_hwnd_todo, test->expect_click ? other : hwnd );
         button_up_hwnd_todo[1].todo = !test->expect_click;
         button_up_hwnd_todo[2].todo = !test->alpha && (test->flags & LWA_ALPHA);
         ok_seq( button_up_hwnd_todo );
@@ -4572,13 +4583,13 @@ static void test_SendInput_mouse_messages(void)
 
         mouse_event( MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0 );
         wait_messages( 5, FALSE );
-        button_down_hwnd_todo[1].message.hwnd = test->expect_click ? other : hwnd;
+        set_mouse_message_window( button_down_hwnd_todo, test->expect_click ? other : hwnd );
         button_down_hwnd_todo[1].todo = !test->expect_click;
         button_down_hwnd_todo[2].todo = !test->alpha && (test->flags & LWA_ALPHA);
         ok_seq( button_down_hwnd_todo );
         mouse_event( MOUSEEVENTF_LEFTUP, 0, 0, 0, 0 );
         wait_messages( 5, FALSE );
-        button_up_hwnd_todo[1].message.hwnd = test->expect_click ? other : hwnd;
+        set_mouse_message_window( button_up_hwnd_todo, test->expect_click ? other : hwnd );
         button_up_hwnd_todo[1].todo = !test->expect_click;
         button_up_hwnd_todo[2].todo = !test->alpha && (test->flags & LWA_ALPHA);
         ok_seq( button_up_hwnd_todo );
@@ -4607,11 +4618,11 @@ static void test_SendInput_mouse_messages(void)
 
     mouse_event( MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0 );
     wait_messages( 5, FALSE );
-    button_down_hwnd[1].message.hwnd = hwnd;
+    set_mouse_message_window( button_down_hwnd, hwnd );
     ok_seq( button_down_hwnd );
     mouse_event( MOUSEEVENTF_LEFTUP, 0, 0, 0, 0 );
     wait_messages( 5, FALSE );
-    button_up_hwnd[1].message.hwnd = hwnd;
+    set_mouse_message_window( button_up_hwnd, hwnd );
     ok_seq( button_up_hwnd );
 
     ok_ret( 1, DestroyWindow( other ) );
