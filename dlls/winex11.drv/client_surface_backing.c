@@ -7244,7 +7244,7 @@ BOOL X11DRV_RepairClientSurfaceOwner( HWND hwnd, BOOL resolve )
 void X11DRV_client_surface_backing_destroy( struct x11drv_win_data *data )
 {
     X11DRV_client_surface_backing_cancel_requests( data );
-    data->client_surface_wait_map = FALSE;
+    data->client_surface_map_update = 0;
     remove_client_surface_backing_target( data->hwnd );
     if (data->client_surface_backing || data->client_surface_backing_spare)
     {
@@ -7684,11 +7684,15 @@ static NTSTATUS ensure_client_surface_backing( struct x11drv_win_data *data, BOO
     if (status) return status;
     if (snapshot)
     {
-        data->client_surface_wait_map = data->client_surface_pending_geometry->geometry_query.map_state != IsViewable;
-        if (data->client_surface_wait_map)
+        data->client_surface_map_update =
+            data->client_surface_pending_geometry->geometry_query.map_state != IsViewable ? update : 0;
+        if (data->client_surface_map_update)
         {
             /* MapNotify must start a fresh observation, not reuse an
-             * unviewable result as permission to read Window pixels. */
+             * unviewable result as permission to read Window pixels. Keep the
+             * admitted operation: a generic backing update need not prepare
+             * a DIRECT candidate whose server backing flag is still clear. */
+            TRACE( "waiting for client-surface map hwnd %p update %#x\n", data->hwnd, update );
             X11DRV_client_surface_backing_cancel_geometry( data, 0 );
             return STATUS_PENDING;
         }

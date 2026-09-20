@@ -927,10 +927,13 @@ static BOOL X11DRV_MapNotify( HWND hwnd, XEvent *event )
         if (hwndFocus && NtUserIsChild( hwnd, hwndFocus ))
             set_input_focus( data );
     }
-    if (event->xany.window == data->whole_window && data->client_surface_wait_map)
+    if (event->xany.window == data->whole_window && data->client_surface_map_update)
     {
-        data->client_surface_wait_map = FALSE;
-        NtUserPostMessage( hwnd, WM_WINE_UPDATEWINDOWSTATE, WINE_UPDATE_CLIENT_SURFACE_BACKING, 0 );
+        UINT update = data->client_surface_map_update;
+
+        TRACE( "resuming client-surface map wait hwnd %p update %#x\n", hwnd, update );
+        data->client_surface_map_update = 0;
+        NtUserPostMessage( hwnd, WM_WINE_UPDATEWINDOWSTATE, update, 0 );
     }
     release_win_data( data );
     return TRUE;
