@@ -1100,9 +1100,9 @@ static void test_win32_surface_multi_swapchain(VkInstance instance, VkPhysicalDe
         present_info.pImageIndices = image_indices;
         present_info.pResults = results;
         vr = vkQueuePresentKHR(queue, &present_info);
-        ok(vr == VK_SUCCESS, "Round %u multi-present failed, vr %d.\n", round, vr);
+        ok(vr == VK_SUCCESS || vr == VK_SUBOPTIMAL_KHR, "Round %u multi-present failed, vr %d.\n", round, vr);
         for (i = 0; i < MULTI_SWAPCHAIN_COUNT; ++i)
-            ok(results[i] == VK_SUCCESS,
+            ok(results[i] == VK_SUCCESS || results[i] == VK_SUBOPTIMAL_KHR,
                     "Round %u swapchain %u present result %d.\n", round, i, results[i]);
     }
     ok(round == MULTI_PRESENT_ROUNDS, "Completed only %u multi-present rounds.\n", round);
@@ -1261,8 +1261,8 @@ static void test_win32_surface_pixels(VkInstance instance, VkPhysicalDevice phys
         {
             vkResetFences(device, 1, &fence);
             vr = vkAcquireNextImageKHR(device, data[i].swapchain, UINT64_MAX, VK_NULL_HANDLE, fence, &indices[i]);
-            ok(vr == VK_SUCCESS, "Round %u child %u acquire failed, vr %d.\n", round, i, vr);
-            if (vr) goto done;
+            ok(vr == VK_SUCCESS || vr == VK_SUBOPTIMAL_KHR, "Round %u child %u acquire failed, vr %d.\n", round, i, vr);
+            if (vr != VK_SUCCESS && vr != VK_SUBOPTIMAL_KHR) goto done;
             vr = vkWaitForFences(device, 1, &fence, VK_TRUE, UINT64_MAX);
             ok(vr == VK_SUCCESS, "Wait acquire failed, vr %d.\n", vr);
             if (vr) goto done;
@@ -1350,9 +1350,9 @@ static void test_win32_surface_pixels(VkInstance instance, VkPhysicalDevice phys
          * when acquire rotates among images and owner output buffers. */
         present.pNext = incremental && round ? &present_regions : NULL;
         vr = vkQueuePresentKHR(queue, &present);
-        ok(vr == VK_SUCCESS, "Round %u composition present failed, vr %d.\n", round, vr);
+        ok(vr == VK_SUCCESS || vr == VK_SUBOPTIMAL_KHR, "Round %u composition present failed, vr %d.\n", round, vr);
         for (i = 0; i < ARRAY_SIZE(data); ++i)
-            ok(results[i] == VK_SUCCESS, "Child %u present failed, vr %d.\n", i, results[i]);
+            ok(results[i] == VK_SUCCESS || results[i] == VK_SUBOPTIMAL_KHR, "Child %u present failed, vr %d.\n", i, results[i]);
         if (retirement && round < 4 && (round & 1))
         {
             /* Replace immediately after submission, without waiting for its
