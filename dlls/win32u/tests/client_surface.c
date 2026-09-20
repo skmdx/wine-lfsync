@@ -5894,6 +5894,22 @@ static void test_paint_receipts(void)
     drain_scene_notifications( &updates, &prepares );
 
     set_paint_update( hwnd, RDW_INVALIDATE | RDW_ERASE | RDW_FRAME );
+    status = set_surface_state( hwnd, 0, 0, 0, &current );
+    ok( !status, "paint state query status %#x\n", status );
+    for (i = 0; i < 3; ++i)
+    {
+        status = set_scene_placement( hwnd, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE );
+        ok( !status, "unchanged placement status %#x\n", status );
+        status = set_surface_state( hwnd, 0, 0, 0, &result );
+        ok( !status && result.paint_serial == current.paint_serial,
+            "unchanged damage advanced paint serial %s -> %s, status %#x\n",
+            wine_dbgstr_longlong( current.paint_serial ), wine_dbgstr_longlong( result.paint_serial ), status );
+        ok( get_paint_update( hwnd, FALSE ) & UPDATE_PAINT, "unchanged placement consumed pending paint\n" );
+    }
+    set_paint_update( hwnd, RDW_INVALIDATE | RDW_ERASE | RDW_FRAME );
+    status = set_surface_state( hwnd, 0, 0, 0, &result );
+    ok( !status && result.paint_serial > current.paint_serial,
+        "repeated invalidation did not advance paint serial, status %#x\n", status );
     status = set_surface_state( hwnd, 0, CLIENT_SURFACE_STATE_PREPARE_BEGIN, 0, &current );
     ok( status == STATUS_PENDING, "unstarted paint prepare status %#x\n", status );
     status = begin_paint_receipt( hwnd, &first );

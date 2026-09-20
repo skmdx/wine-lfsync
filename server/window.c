@@ -3659,6 +3659,17 @@ static int add_update_region( struct window *win, struct region *region )
 }
 
 
+/* Cropping existing damage does not invalidate its contents again. In
+ * particular, an unchanged state refresh must not restart composition and
+ * queue another refresh of the same pending paint region. */
+static void intersect_update_region( struct window *win, struct region *region )
+{
+    if (intersect_region( region, win->update_region, region ) &&
+        !is_region_equal( region, win->update_region ))
+        set_update_region( win, region );
+    else free_region( region );
+}
+
 /* crop the update region of children to the specified rectangle, in client coords */
 static void crop_children_update_region( struct window *win, struct rectangle *rect )
 {
@@ -3692,8 +3703,7 @@ static void crop_children_update_region( struct window *win, struct rectangle *r
         if (!(tmp = create_empty_region())) continue;
         set_region_rect( tmp, rect );
         offset_region( tmp, -child->window_rect.left, -child->window_rect.top );
-        if (intersect_region( tmp, child->update_region, tmp )) set_update_region( child, tmp );
-        else free_region( tmp );
+        intersect_update_region( child, tmp );
     }
 }
 
@@ -4483,10 +4493,7 @@ static void set_window_pos( struct window *win, struct window *previous,
             if (tmp)
             {
                 set_region_rect( tmp, &rect );
-                if (intersect_region( tmp, win->update_region, tmp ))
-                    set_update_region( win, tmp );
-                else
-                    free_region( tmp );
+                intersect_update_region( win, tmp );
             }
         }
         else set_update_region( win, NULL ); /* visible rect is empty */
