@@ -9445,10 +9445,26 @@ done:
 static BOOL read_layered_window_shape( const PROCESS_INFORMATION *process, HANDLE ready, HANDLE done )
 {
     HANDLE events[2] = {process->hProcess, done};
-    DWORD ret;
+    DWORD ret, start = GetTickCount(), elapsed;
+    MSG msg;
 
     SetEvent( ready );
-    ret = WaitForMultipleObjects( 2, events, FALSE, 5000 );
+    for (;;)
+    {
+        elapsed = GetTickCount() - start;
+        if (elapsed >= 5000)
+        {
+            ret = WAIT_TIMEOUT;
+            break;
+        }
+        ret = MsgWaitForMultipleObjects( 2, events, FALSE, 5000 - elapsed, QS_ALLINPUT );
+        if (ret != WAIT_OBJECT_0 + 2) break;
+        while (GetTickCount() - start < 5000 && PeekMessageW( &msg, NULL, 0, 0, PM_REMOVE ))
+        {
+            TranslateMessage( &msg );
+            DispatchMessageW( &msg );
+        }
+    }
     ok( ret == WAIT_OBJECT_0 || ret == WAIT_OBJECT_0 + 1, "Reader wait returned %#lx\n", ret );
     return ret == WAIT_OBJECT_0 + 1;
 }

@@ -183,6 +183,8 @@ static BOOL scaled_surface_apply_clip( struct scaled_surface *surface )
     if (surface->header.clip_region &&
         !(hrgn = map_dpi_region( surface->header.clip_region, surface->dpi_from, surface->dpi_to )))
         return FALSE;
+    TRACE( "scaled %p apply clip %p -> %p target %p\n", surface, surface->header.clip_region,
+           hrgn, surface->target_surface );
     window_surface_set_clip( surface->target_surface, hrgn );
     if (hrgn) NtGdiDeleteObjectApp( hrgn );
     surface->clip_pending = FALSE;
@@ -276,6 +278,9 @@ static void scaled_surface_set_target( struct scaled_surface *surface, struct wi
     window_surface_add_ref( target );
     window_surface_lock( &surface->header );
     previous = surface->target_surface;
+    TRACE( "scaled %p target %p -> %p clip %p dpi %u/%u -> %u/%u\n", surface,
+           previous, target, surface->header.clip_region, surface->dpi_from.num,
+           surface->dpi_from.den, dpi_to.num, dpi_to.den );
     if (previous != target || memcmp( &surface->dpi_to, &dpi_to, sizeof(dpi_to) ))
     {
         surface->header.bounds = surface->header.rect;
