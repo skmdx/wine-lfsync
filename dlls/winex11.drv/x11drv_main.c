@@ -1192,7 +1192,9 @@ void x11drv_window_paint_ready( UINT64 identity )
 {
     struct x11drv_thread_data *data = x11drv_thread_data();
 
-    if (data && data->display_owner->paint_identity == identity) x11drv_flush_window_paints();
+    /* A paint flush can read the GUI receipt into Xlib while handling errors.
+     * Process it even when the connection fd no longer signals readable data. */
+    if (data && data->display_owner->paint_identity == identity) X11DRV_ProcessEvents( QS_ALLINPUT );
 }
 
 NTSTATUS X11DRV_WindowPaint( HWND hwnd, UINT operation, UINT64 token )

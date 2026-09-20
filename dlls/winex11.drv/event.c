@@ -394,7 +394,9 @@ BOOL X11DRV_ProcessEvents( DWORD mask )
 
     if (mask != QS_ALLINPUT || check_fd_events( ConnectionNumber( data->display ), POLLIN )) return FALSE;
     XFlush( data->display ); /* all events have been processed, flush any pending request */
-    return TRUE;
+    /* Flushing requests can read replies and queue events in Xlib. The socket
+     * alone no longer describes pending work once those bytes were consumed. */
+    return !XEventsQueued( data->display, QueuedAlready );
 }
 
 
