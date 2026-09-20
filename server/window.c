@@ -4064,7 +4064,7 @@ static void release_window_paint( struct window_paint *paint, int failed )
     --window_paint_count;
     /* Failed paints restore the consumed region to ordinary WM_PAINT. This
      * is error recovery, not an extra paint used to manufacture a checkpoint. */
-    if (failed && paint->window->handle && has_client_surface( top ))
+    if (failed && paint->window->handle)
     {
         int restored = 0;
 
@@ -4140,7 +4140,8 @@ DECL_HANDLER(begin_window_paint)
     if (!req->tracked || window_paint_token == ~(UINT64)0 || window_paint_count == WINDOW_PAINT_LIMIT ||
         current->window_paint_count == WINDOW_PAINT_THREAD_LIMIT || !(paint = mem_alloc( sizeof(*paint) )))
     {
-        win->paint_failed = 1;
+        /* Admission precedes drawing and validation. A refused writer leaves
+         * its update intact; it must not permanently poison this window. */
         if (window_paint_token == ~(UINT64)0) set_error( STATUS_TOO_MANY_CONTEXT_IDS );
         else if (!req->tracked || window_paint_count == WINDOW_PAINT_LIMIT ||
                  current->window_paint_count == WINDOW_PAINT_THREAD_LIMIT)

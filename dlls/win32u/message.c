@@ -475,8 +475,12 @@ static LRESULT dispatch_win_proc_params( struct win_proc_params *params, size_t 
     {
         struct window_paint *paint = begin_window_paint( params->hwnd );
 
-        status = KeUserModeCallback( NtUserCallWinProc, params, size, &ret_ptr, &ret_len );
-        end_window_paint( paint, !status );
+        if (paint)
+        {
+            status = KeUserModeCallback( NtUserCallWinProc, params, size, &ret_ptr, &ret_len );
+            end_window_paint( paint, !status );
+        }
+        else status = STATUS_NO_MEMORY;
     }
     else status = KeUserModeCallback( NtUserCallWinProc, params, size, &ret_ptr, &ret_len );
     thread_info->msg_call_depth--;

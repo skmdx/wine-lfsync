@@ -1876,6 +1876,19 @@ static void free_window_paint( struct window_paint *paint )
     free( paint );
 }
 
+static void cancel_window_paint( struct window_paint *paint )
+{
+    user_driver->pWindowPaint( paint->hwnd, WINDOW_PAINT_CANCEL, paint->token );
+    SERVER_START_REQ( end_window_paint )
+    {
+        req->token = paint->token;
+        req->cancel = TRUE;
+        wine_server_call( req );
+    }
+    SERVER_END_REQ;
+    free_window_paint( paint );
+}
+
 static void flush_window_paints(void)
 {
     struct window_paint *paint, *next;
@@ -1937,7 +1950,7 @@ struct window_paint *begin_window_paint( HWND hwnd )
     if (!token)
     {
         free( paint );
-        return NULL;
+        goto failed;
     }
     if (paint)
     {
@@ -1947,9 +1960,21 @@ struct window_paint *begin_window_paint( HWND hwnd )
         list_init( &paint->surfaces );
         paint->failed = user_driver->pWindowPaint( hwnd, WINDOW_PAINT_RESERVE, token ) != STATUS_SUCCESS;
         list_add_head( &get_user_thread_info()->window_paints, &paint->entry );
+        if (paint->failed)
+        {
+            cancel_window_paint( paint );
+            goto failed;
+        }
     }
 
     return paint;
+
+failed:
+    /* A nested erase/nonclient callback can be refused after its caller has
+     * consumed the region. Make that enclosing receipt restore its work. */
+    LIST_FOR_EACH_ENTRY( paint, &get_user_thread_info()->window_paints, struct window_paint, entry )
+        if (!paint->ended && !paint->cancelled) paint->failed = TRUE;
+    return NULL;
 }
 
 void end_window_paint( struct window_paint *paint, BOOL success )
@@ -1986,9 +2011,9 @@ HDC WINAPI NtUserBeginPaint( HWND hwnd, PAINTSTRUCT *ps )
     UINT flags = UPDATE_NONCLIENT | UPDATE_ERASE | UPDATE_PAINT | UPDATE_INTERNALPAINT | UPDATE_NOCHILDREN;
     struct window_paint *paint;
 
-    NtUserHideCaret( hwnd );
-
     paint = begin_window_paint( hwnd );
+    if (!paint) return 0;
+    NtUserHideCaret( hwnd );
 
     if (!(hrgn = send_ncpaint( hwnd, NULL, &flags ))) goto failed;
 
@@ -2020,18 +2045,7 @@ HDC WINAPI NtUserBeginPaint( HWND hwnd, PAINTSTRUCT *ps )
     return hdc;
 
 failed:
-    if (paint)
-    {
-        user_driver->pWindowPaint( hwnd, WINDOW_PAINT_CANCEL, paint->token );
-        SERVER_START_REQ( end_window_paint )
-        {
-            req->token = paint->token;
-            req->cancel = TRUE;
-            wine_server_call( req );
-        }
-        SERVER_END_REQ;
-        free_window_paint( paint );
-    }
+    if (paint) cancel_window_paint( paint );
     return 0;
 }
 
@@ -2083,6 +2097,7 @@ void erase_now( HWND hwnd, UINT rdw_flags )
          * child's region. A foreign WM_NCPAINT receiver has its own receipt. */
         if (!get_update_flags( hwnd, &child, &flags ) || !flags) break;
         paint = begin_window_paint( child );
+        if (!paint) break;
         flags = UPDATE_NONCLIENT | UPDATE_ERASE | UPDATE_NOCHILDREN;
         if (!(hrgn = send_ncpaint( child, NULL, &flags )))
         {
@@ -2227,6 +2242,7 @@ INT WINAPI NtUserGetUpdateRgn( HWND hwnd, HRGN hrgn, BOOL erase )
     HRGN update_rgn;
     struct window_paint *paint = erase ? begin_window_paint( hwnd ) : NULL;
 
+    if (erase && !paint) return ERROR;
     context = set_thread_dpi_awareness_context( get_window_dpi_awareness_context( hwnd ));
 
     if (erase) flags |= UPDATE_NONCLIENT | UPDATE_ERASE;
@@ -2257,6 +2273,7 @@ BOOL WINAPI NtUserGetUpdateRect( HWND hwnd, RECT *rect, BOOL erase )
     BOOL need_erase;
     struct window_paint *paint = erase ? begin_window_paint( hwnd ) : NULL;
 
+    if (erase && !paint) return FALSE;
     if (erase) flags |= UPDATE_NONCLIENT | UPDATE_ERASE;
 
     if (!(update_rgn = send_ncpaint( hwnd, NULL, &flags )))

@@ -5644,10 +5644,15 @@ static void test_paint_receipts(void)
     struct paint_receipt_thread_data data = {0};
     struct scene_notification_counts counts;
     HWND class_window = create_test_window( FALSE ), hwnd;
-    UINT64 surface = allocate_surface(), first, second;
-    UINT status, updates, prepares;
+    UINT64 surface = allocate_surface(), first, second, held[64];
+    UINT status, updates, prepares, i, limit, admitted;
+    PAINTSTRUCT ps;
+    HDC hdc;
 
     if (!class_window) return;
+    SetWindowPos( class_window, NULL, 600, 500, 160, 120, SWP_NOACTIVATE | SWP_SHOWWINDOW );
+    UpdateWindow( class_window );
+    pump_messages( 20 );
     /* Use real server windows and requests to test receipt authentication.
      * Supplying completion here does not test a backend's native marker. */
     hwnd = create_scene_occluder( GetDesktopWindow(), class_window );
@@ -5705,6 +5710,46 @@ static void test_paint_receipts(void)
     ok( !status && !result.toplevel, "stale paint commit accepted, status %#x\n", status );
     drain_scene_notification_counts( &updates, &prepares, 0, &counts );
     ok( counts.prepare == 1, "stale paint commit sent %u retry notifications\n", counts.prepare );
+
+    /* A full writer refuses BeginPaint before validation; one spare slot
+     * admits BeginPaint but refuses its nested erase/nonclient callbacks. */
+    for (limit = ARRAY_SIZE(held); limit >= ARRAY_SIZE(held) - 1; --limit)
+    {
+        admitted = 0;
+        for (i = 0; i < limit; ++i)
+        {
+            status = begin_paint_receipt( hwnd, &held[i] );
+            ok( !status, "paint reservation %u status %#x\n", i, status );
+            if (status) break;
+            ++admitted;
+        }
+        if (admitted == limit)
+        {
+            if (limit == ARRAY_SIZE(held))
+            {
+                status = begin_paint_receipt( hwnd, &first );
+                ok( status == STATUS_NO_MEMORY, "overflow paint admission status %#x\n", status );
+            }
+            set_paint_update( class_window, RDW_INVALIDATE | RDW_ERASE | RDW_FRAME );
+            ok( get_paint_update( class_window, FALSE ) & UPDATE_PAINT, "paint refusal target has no update\n" );
+            hdc = BeginPaint( class_window, &ps );
+            ok( !!hdc == (limit < ARRAY_SIZE(held)), "BeginPaint admission at %u reservations returned %p\n", limit, hdc );
+            if (hdc) EndPaint( class_window, &ps );
+            ok( get_paint_update( class_window, FALSE ) & UPDATE_PAINT,
+                "refused paint at %u reservations lost its update\n", limit );
+        }
+        for (i = 0; i < admitted; ++i)
+        {
+            status = end_paint_receipt( held[i], TRUE );
+            ok( !status, "paint reservation %u cancellation status %#x\n", i, status );
+        }
+        hdc = BeginPaint( class_window, &ps );
+        ok( !!hdc, "BeginPaint did not recover after reservation return\n" );
+        if (hdc) EndPaint( class_window, &ps );
+        pump_messages( 20 );
+        status = set_surface_state( hwnd, 0, CLIENT_SURFACE_STATE_PREPARE_BEGIN, 0, &current );
+        ok( !status && current.publish, "paint admission failure poisoned recovery, status %#x\n", status );
+    }
 
     /* Native failure before END is latched; it cannot retire an active writer. */
     status = begin_paint_receipt( hwnd, &first );
