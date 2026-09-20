@@ -2840,6 +2840,9 @@ void destroy_client_window( HWND hwnd, Window client_window )
     }
 
     XDestroyWindow( gdi_display, client_window );
+    /* Retirement may be the last user of this connection. Send the deletion
+     * so the server can release an active Present without further client I/O. */
+    XFlush( gdi_display );
     trace_window_response( "window_client_destroy_return", hwnd, gdi_display, client_window,
                            0, 0, NULL, TRUE );
 }
