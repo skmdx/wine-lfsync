@@ -33,6 +33,7 @@
 #include "wine/debug.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(win);
+WINE_DECLARE_DEBUG_CHANNEL(csperf);
 
 struct dce
 {
@@ -1918,9 +1919,11 @@ static void flush_window_paints(void)
             {
                 req->token = paint->token;
                 req->success = FALSE;
-                wine_server_call( req );
+                status = wine_server_call( req );
             }
             SERVER_END_REQ;
+            TRACE_(csperf)( "event=window_paint_submit_failed token=%llu status=%#x\n",
+                           (unsigned long long)paint->token, (unsigned int)status );
         }
         free_window_paint( paint );
     }

@@ -5710,13 +5710,19 @@ static void check_paint_retirement_process( HWND hwnd, UINT64 retirement )
     struct surface_state state;
     char command[MAX_PATH * 2], **argv;
     DWORD wait, exit_code;
+    UINT64 token = 0;
     UINT status;
 
     ok( ready && release, "paint process event creation failed\n" );
     if (!ready || !release) goto done;
+    status = begin_paint_receipt( hwnd, &token );
+    ok( !status && token, "cross-process paint admission status %#x\n", status );
+    if (status) goto done;
+    status = end_paint_receipt( token, FALSE );
+    ok( !status, "cross-process paint end status %#x\n", status );
     winetest_get_mainargs( &argv );
-    sprintf( command, "\"%s\" %s paint_retirement_child %p %I64x %p %p",
-             argv[0], argv[1], hwnd, retirement, ready, release );
+    sprintf( command, "\"%s\" %s paint_retirement_child %p %I64x %p %p %I64x",
+             argv[0], argv[1], hwnd, retirement, ready, release, token );
     if (!CreateProcessA( NULL, command, NULL, NULL, TRUE, 0, NULL, NULL, &startup, &process ))
     {
         ok( FALSE, "paint child creation error %lu\n", GetLastError() );
@@ -5725,6 +5731,9 @@ static void check_paint_retirement_process( HWND hwnd, UINT64 retirement )
     wait = WaitForSingleObject( ready, 10000 );
     ok( wait == WAIT_OBJECT_0, "paint child ready wait %#lx\n", wait );
     if (wait != WAIT_OBJECT_0) ExitProcess( 1 );
+    status = complete_paint_receipt( token, TRUE );
+    ok( !status, "foreign process consumed writer token, status %#x\n", status );
+    token = 0;
     ok( !get_paint_update( hwnd, FALSE ), "live process lost detached paint\n" );
     status = set_surface_state( hwnd, 0, CLIENT_SURFACE_STATE_PREPARE_BEGIN, 0, &state );
     ok( status == STATUS_PENDING, "live process retirement prepare status %#x\n", status );
@@ -5737,6 +5746,7 @@ static void check_paint_retirement_process( HWND hwnd, UINT64 retirement )
     CloseHandle( process.hProcess );
     ok( get_paint_update( hwnd, TRUE ) & UPDATE_PAINT, "dead process lost detached paint update\n" );
 done:
+    if (token) complete_paint_receipt( token, FALSE );
     if (ready) CloseHandle( ready );
     if (release) CloseHandle( release );
 }
@@ -7591,16 +7601,23 @@ START_TEST(client_surface)
         return;
     }
 
-    if (argc > 6 && !strcmp( argv[2], "paint_retirement_child" ))
+    if (argc > 7 && !strcmp( argv[2], "paint_retirement_child" ))
     {
         struct paint_receipt_thread_data data = {.detach = TRUE};
         UINT64 retirement = strtoull( argv[4], NULL, 16 );
+        UINT64 token = strtoull( argv[7], NULL, 16 );
         HANDLE ready, release;
         UINT status;
 
         sscanf( argv[3], "%p", &data.hwnd );
         sscanf( argv[5], "%p", &ready );
         sscanf( argv[6], "%p", &release );
+        status = complete_paint_receipt( token, TRUE );
+        ok( status == STATUS_INVALID_PARAMETER, "foreign process completed paint, status %#x\n", status );
+        status = complete_paint_receipt( token, FALSE );
+        ok( status == STATUS_INVALID_PARAMETER, "foreign process failed paint, status %#x\n", status );
+        status = end_paint_receipt( token, TRUE );
+        ok( status == STATUS_INVALID_PARAMETER, "foreign process cancelled paint, status %#x\n", status );
         status = retire_paint_receipts( retirement );
         ok( status == STATUS_INVALID_PARAMETER, "foreign process retired another process's paint, status %#x\n", status );
         run_paint_receipt_thread( &data, 0 );

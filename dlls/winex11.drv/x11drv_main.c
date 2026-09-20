@@ -1215,6 +1215,10 @@ static void update_window_paint_admission( struct x11drv_display_owner *owner )
 static void remove_window_paint( struct x11drv_display_owner *owner, unsigned int index )
 {
     owner->paint_count--;
+    TRACE_(csperf)( "event=window_paint_return owner=%p endpoint=%lx token=%llu submitted=%d sent=%d cancelled=%d count=%u\n",
+                   owner, owner->paint_window, (unsigned long long)owner->paints[index].token,
+                   owner->paints[index].submitted, owner->paints[index].sent,
+                   owner->paints[index].cancelled, owner->paint_count );
     memmove( owner->paints + index, owner->paints + index + 1,
              (owner->paint_count - index) * sizeof(*owner->paints) );
     update_window_paint_admission( owner );
