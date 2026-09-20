@@ -2833,8 +2833,8 @@ static void client_surface_output_seed_complete( void *context, BOOL success )
     if (success && !abandoned && allocation->seed_stage == 1 && allocation->source_image)
     {
         allocation->seed_stage = 2;
-        client_surface_cache_copy_output( allocation->images[0], allocation->source,
-            allocation->copy_width, allocation->copy_height, NULL, FALSE,
+        client_surface_cache_copy_output( allocation->images[0], allocation->source_image,
+            allocation->copy_width, allocation->copy_height,
             client_surface_output_seed_complete, allocation );
         return;
     }
@@ -2842,9 +2842,9 @@ static void client_surface_output_seed_complete( void *context, BOOL success )
     {
         /* Clone the one checked seed, including its old OUTPUT intersection. */
         allocation->seed_stage = 3;
-        client_surface_cache_copy_output( allocation->images[1], allocation->pixmaps[0],
+        client_surface_cache_copy_output( allocation->images[1], allocation->images[0],
             max( allocation->window_width, allocation->copy_width ),
-            max( allocation->window_height, allocation->copy_height ), NULL, FALSE,
+            max( allocation->window_height, allocation->copy_height ),
             client_surface_output_seed_complete, allocation );
         return;
     }
@@ -3027,8 +3027,8 @@ static BOOL process_client_surface_seed_requests(void)
                        allocation->release.toplevel, window, allocation->source, allocation->source_image,
                        allocation->pixmaps[0], allocation->pixmaps[1], allocation->window_width, allocation->window_height,
                        allocation->copy_width, allocation->copy_height );
-        client_surface_cache_copy_output( allocation->images[0], window,
-            allocation->window_width, allocation->window_height, &allocation->seed_read, allocation->snapshot,
+        client_surface_cache_seed_window( allocation->images[0], &allocation->seed_read,
+            allocation->window_width, allocation->window_height, allocation->snapshot,
             client_surface_output_seed_complete, allocation );
         progressed = TRUE;
         continue;
@@ -3110,8 +3110,8 @@ static BOOL copy_client_surface_compositor_pool( struct client_surface_composito
                    (unsigned long long)allocation->scene.epoch, (unsigned long long)allocation->scene.generation,
                    (unsigned long long)allocation->source_revision );
     for (i = 0; i < ARRAY_SIZE(allocation->images); ++i)
-        client_surface_cache_copy_output( allocation->images[i], allocation->source,
-            allocation->copy_width, allocation->copy_height, NULL, FALSE, client_surface_output_allocation_complete, allocation );
+        client_surface_cache_copy_output( allocation->images[i], allocation->source_image,
+            allocation->copy_width, allocation->copy_height, client_surface_output_allocation_complete, allocation );
     return TRUE;
 }
 

@@ -52,6 +52,7 @@ struct client_surface_cache_image
     const struct client_surface_cache_transform *transform;
     unsigned int transform_count;
     struct x11drv_native_window_read *read;
+    struct client_surface_cache_image *copy_source;
     BOOL waiting;
     Pixmap pixmap, source;
     Window window;
@@ -827,20 +828,39 @@ void client_surface_cache_copy( struct client_surface_cache_image *image, Pixmap
     pthread_mutex_unlock( &cache_mutex );
 }
 
-void client_surface_cache_copy_output( struct client_surface_cache_image *image, Pixmap source,
-                                       unsigned int width, unsigned int height,
-                                       struct x11drv_native_window_read *read, BOOL write_ref,
-                                       client_surface_cache_callback complete, void *context )
+static void copy_output( struct client_surface_cache_image *image, struct client_surface_cache_image *source,
+                         struct x11drv_native_window_read *read, unsigned int width, unsigned int height,
+                         BOOL write_ref, client_surface_cache_callback complete, void *context )
 {
+    assert( !!source != !!read && source != image );
+    if (source) client_surface_cache_acquire( source );
     pthread_mutex_lock( &cache_mutex );
     assert( image->acquired && image->refs == 1 + !!write_ref && image->purpose == CLIENT_SURFACE_MEMORY_OUTPUT );
-    assert( source && width && height && width <= image->width && height <= image->height );
-    image->source = source;
+    assert( !image->copy_source && width && height && width <= image->width && height <= image->height );
+    assert( !source || (width <= source->width && height <= source->height) );
+    image->source = read ? x11drv_native_window_read_drawable( read ) : source->pixmap;
+    image->copy_source = source;
     image->read = read;
     image->copy_width = width;
     image->copy_height = height;
     queue_cache_image( image, CACHE_COPY, complete, context );
     pthread_mutex_unlock( &cache_mutex );
+}
+
+void client_surface_cache_seed_window( struct client_surface_cache_image *image,
+                                       struct x11drv_native_window_read *read,
+                                       unsigned int width, unsigned int height, BOOL write_ref,
+                                       client_surface_cache_callback complete, void *context )
+{
+    copy_output( image, NULL, read, width, height, write_ref, complete, context );
+}
+
+void client_surface_cache_copy_output( struct client_surface_cache_image *image,
+                                       struct client_surface_cache_image *source,
+                                       unsigned int width, unsigned int height,
+                                       client_surface_cache_callback complete, void *context )
+{
+    copy_output( image, source, NULL, width, height, FALSE, complete, context );
 }
 
 struct client_surface_cache_image *client_surface_cache_acquire( struct client_surface_cache_image *image )
@@ -942,7 +962,7 @@ void client_surface_cache_release( struct client_surface_cache_image *image )
 
 BOOL client_surface_complete_cache( unsigned int budget )
 {
-    struct client_surface_cache_image *image;
+    struct client_surface_cache_image *image, *source;
     BOOL progressed = FALSE;
 
     while (budget--)
@@ -954,10 +974,13 @@ BOOL client_surface_complete_cache( unsigned int budget )
             break;
         }
         if (!(completed_head = image->next)) completed_tail = &completed_head;
+        source = image->copy_source;
+        image->copy_source = NULL;
         image->operation = CACHE_IDLE;
         image->transform = NULL;
         image->transform_count = 0;
         pthread_mutex_unlock( &cache_mutex );
+        client_surface_cache_release( source );
         image->complete( image->context, image->success );
         progressed = TRUE;
     }

@@ -250,6 +250,12 @@ Window x11drv_native_window_read_init( struct x11drv_native_window_read *read,
     return window->window;
 }
 
+Window x11drv_native_window_read_drawable( const struct x11drv_native_window_read *read )
+{
+    assert( read->window );
+    return read->window->window;
+}
+
 BOOL x11drv_native_window_read_ready( struct x11drv_native_window_read *read )
 {
     struct x11drv_native_window *window = read->window;

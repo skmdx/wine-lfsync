@@ -59,12 +59,18 @@ BOOL client_surface_cache_write_pending( const struct client_surface_cache_image
 BOOL client_surface_cache_acquire_output_write( struct client_surface_cache_image *image );
 void client_surface_cache_copy( struct client_surface_cache_image *image, Pixmap source,
                                 client_surface_cache_callback complete, void *context );
-/* Copy an owned input into private OUTPUT storage. A Window read carries
- * both source-stream receipts; an immutable image needs no such preparation. */
+/* Window capture is an explicit owned-input boundary. Its caller retains
+ * the read record through the checked copy receipt. */
 struct x11drv_native_window_read;
-void client_surface_cache_copy_output( struct client_surface_cache_image *image, Pixmap source,
+void client_surface_cache_seed_window( struct client_surface_cache_image *image,
+                                       struct x11drv_native_window_read *read,
+                                       unsigned int width, unsigned int height, BOOL write_ref,
+                                       client_surface_cache_callback complete, void *context );
+/* Later preparation accepts only a completed image. Admission retains that
+ * image until the copy receipt; it cannot reinterpret an unowned Window XID. */
+void client_surface_cache_copy_output( struct client_surface_cache_image *image,
+                                       struct client_surface_cache_image *source,
                                        unsigned int width, unsigned int height,
-                                       struct x11drv_native_window_read *read, BOOL write_ref,
                                        client_surface_cache_callback complete, void *context );
 
 /* The caller owns this bounded command chain and all input images through

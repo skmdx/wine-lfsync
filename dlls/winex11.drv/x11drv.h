@@ -927,6 +927,7 @@ struct x11drv_native_window_read
 };
 extern Window x11drv_native_window_read_init( struct x11drv_native_window_read *read,
                                               struct x11drv_native_window *window );
+extern Window x11drv_native_window_read_drawable( const struct x11drv_native_window_read *read );
 extern BOOL x11drv_native_window_read_ready( struct x11drv_native_window_read *read );
 extern Display *x11drv_native_window_read_begin( struct x11drv_native_window_read *read );
 extern void x11drv_native_window_read_end( struct x11drv_native_window_read *read );
