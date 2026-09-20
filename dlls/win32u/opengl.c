@@ -423,6 +423,7 @@ struct framebuffer_surface
     UINT64                 storage_bytes;
     struct client_surface_memory_scope memory;
     BOOL                   storage_valid;
+    GLenum                 depth_format;
 };
 
 static pthread_mutex_t retired_framebuffers_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -578,7 +579,8 @@ static GLenum depth_format_from_pfd( const struct wgl_pixel_format *desc )
 static void init_framebuffer_attachment( struct opengl_drawable *drawable, GLenum fbo, GLenum attachment, GLenum type,
                                          GLuint name, const struct wgl_pixel_format *desc, SIZE size )
 {
-    GLenum internal_format = attachment == GL_DEPTH_ATTACHMENT ? depth_format_from_pfd( desc ) : color_format_from_pfd( desc, drawable->srgb );
+    GLenum internal_format = attachment == GL_DEPTH_ATTACHMENT ? framebuffer_from_opengl_drawable( drawable )->depth_format :
+                                                               color_format_from_pfd( desc, drawable->srgb );
     const char *kind = attachment == GL_DEPTH_ATTACHMENT ? "depth" : "color";
     const struct opengl_funcs *funcs = &display_funcs;
 
@@ -1042,11 +1044,24 @@ static struct opengl_drawable *framebuffer_surface_create( int format, struct cl
         if (surface->base.doublebuffer) opengl_drawable_map_buffer( &surface->base, GL_BACK_RIGHT, GL_COLOR_ATTACHMENT3 );
     }
 
-    if (!make_null_context_current( NULL ))
+    if (!make_null_context_current( target ))
     {
         opengl_drawable_release( &surface->base );
         RtlSetLastWin32Error( ERROR_NOT_ENOUGH_MEMORY );
         return NULL;
+    }
+
+    surface->depth_format = draw_desc.pfd.cDepthBits ? depth_format_from_pfd( &draw_desc ) : 0;
+    if (target && draw_desc.pfd.cDepthBits == 32 && !draw_desc.pfd.cStencilBits)
+    {
+        GLint type = GL_NONE;
+
+        /* PFD reports depth precision, not whether the native storage is
+         * floating point. Preservation blits require matching data types. */
+        display_funcs.p_glBindFramebuffer( GL_READ_FRAMEBUFFER, 0 );
+        display_funcs.p_glGetFramebufferAttachmentParameteriv( GL_READ_FRAMEBUFFER, GL_DEPTH,
+                                                               GL_FRAMEBUFFER_ATTACHMENT_COMPONENT_TYPE, &type );
+        if (type == GL_FLOAT) surface->depth_format = GL_DEPTH_COMPONENT32F;
     }
 
     read_desc.samples = read_desc.sample_buffers = 0;

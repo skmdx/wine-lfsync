@@ -4049,9 +4049,11 @@ static void test_default_draw_buffers(void)
         .dwFlags = PFD_DRAW_TO_WINDOW | PFD_SUPPORT_OPENGL | PFD_DOUBLEBUFFER,
         .iPixelType = PFD_TYPE_RGBA,
         .cColorBits = 24,
+        .cDepthBits = 32,
     };
     GLuint fbo, buffers[2];
     GLint value, rect[4];
+    GLfloat depth;
     UINT pixel, previous_back;
     HGLRC context;
     int format;
@@ -4108,6 +4110,11 @@ static void test_default_draw_buffers(void)
         glReadPixels( 1, 1, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, &previous_back );
         check_gl_error( GL_NO_ERROR );
         previous_back &= 0xffffff;
+        glClearDepth( 0.375 );
+        glClear( GL_DEPTH_BUFFER_BIT );
+        glReadPixels( 1, 1, 1, 1, GL_DEPTH_COMPONENT, GL_FLOAT, &depth );
+        check_gl_error( GL_NO_ERROR );
+        ok( depth > 0.3749f && depth < 0.3751f, "Initial depth is %.8f.\n", depth );
 
         ext.glGenFramebuffers( 1, &fbo );
         ext.glBindFramebuffer( GL_READ_FRAMEBUFFER, fbo );
@@ -4154,6 +4161,10 @@ static void test_default_draw_buffers(void)
         /* Restoring the default read FBO must preserve its old BACK selector,
          * even though a named read FBO was current during the operation. */
         ext.glBindFramebuffer( GL_READ_FRAMEBUFFER, 0 );
+        depth = -1.0f;
+        glReadPixels( 1, 1, 1, 1, GL_DEPTH_COMPONENT, GL_FLOAT, &depth );
+        check_gl_error( GL_NO_ERROR );
+        ok( depth > 0.3749f && depth < 0.3751f, "Preserved depth is %.8f.\n", depth );
         glGetIntegerv( GL_READ_BUFFER, &value );
         ok_x4( value, ==, GL_BACK );
         glReadPixels( 1, 1, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, &pixel );
