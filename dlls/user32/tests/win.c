@@ -15045,6 +15045,19 @@ START_TEST(win)
         ok(SetForegroundWindow(hwndMain), "SetForegroundWindow failed\n");
     }
 
+    if (argc == 3 && !strcmp( argv[2], "click_route" ))
+    {
+        POINT saved;
+
+        GetCursorPos( &saved );
+        SetCursorPos( 0, 0 );
+        flush_events( TRUE );
+        test_window_from_point( hwndMain, argv[0] );
+        SetCursorPos( saved.x, saved.y );
+        DestroyWindow( hwndMain );
+        return;
+    }
+
     SetLastError(0xdeafbeef);
     GetWindowLongPtrW(GetDesktopWindow(), GWLP_WNDPROC);
 

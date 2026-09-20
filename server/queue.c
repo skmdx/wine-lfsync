@@ -2808,7 +2808,8 @@ static int get_hardware_message( struct thread *thread, unsigned int hw_id, user
             {
                 /* wake the other thread */
                 set_queue_bits( win_thread->queue, msg_bit );
-                got_one = 1;
+                /* Driver notifications must not block another thread's input. */
+                if (msg_bit != QS_HARDWARE) got_one = 1;
             }
             else
             {
