@@ -188,7 +188,7 @@ struct x11drv_native_window
     struct x11drv_display_owner *creator;
     struct x11drv_native_window *ancestor;
     Display *display;
-    Window window, parent;
+    Window window, parent, private_parent;
     Colormap colormap;
     LONG refs, destroyed;
     BOOL retired;
@@ -220,6 +220,8 @@ static int native_window_error( Display *display, XErrorEvent *event, void *arg 
                        window, window->window, event->request_code );
         return 1;
     }
+    if (window->private_parent && event->error_code == BadWindow && event->request_code == X_DestroyWindow &&
+        event->resourceid == window->private_parent) return 1;
     return window->colormap && event->error_code == BadColor && event->request_code == X_FreeColormap &&
            event->resourceid == window->colormap;
 }
@@ -313,6 +315,7 @@ static void destroy_native_window( struct client_surface_native_work *work )
     {
         if (window->window && !InterlockedCompareExchange( &window->destroyed, 0, 0 ))
             XDestroyWindow( window->display, window->window );
+        if (window->private_parent) XDestroyWindow( window->display, window->private_parent );
         if (window->colormap) XFreeColormap( window->display, window->colormap );
         x11drv_queue_stream_barrier( window->display, &window->destroy_barrier );
     }
@@ -342,7 +345,7 @@ static void free_native_window( struct client_surface_native_work *work )
     x11drv_return_release_capacity( 1, sizeof(*window) );
     TRACE_(csperf)( "event=native_window_return record=0x%lx bytes=%zu\n", identity, sizeof(*window) );
     x11drv_native_window_release( ancestor );
-    x11drv_display_owner_release( creator );
+    if (creator) x11drv_display_owner_release( creator );
 }
 
 struct x11drv_native_window *x11drv_native_window_alloc( Display *display,
@@ -378,7 +381,8 @@ struct x11drv_native_window *x11drv_native_window_alloc( Display *display,
     }
     else window->ancestor = x11drv_native_window_acquire( native_root );
     pthread_mutex_unlock( &native_window_mutex );
-    window->creator = x11drv_display_owner_acquire( creator );
+    assert( creator || display == gdi_display );
+    window->creator = creator ? x11drv_display_owner_acquire( creator ) : NULL;
     TRACE_(csperf)( "event=native_window_reserve record=%p creator=%p ancestor=%p parent=%lx domain=%llu bytes=%zu\n",
                    window, creator, window->ancestor, window->parent, (unsigned long long)domain, sizeof(*window) );
     return window;
@@ -2951,33 +2955,24 @@ void attach_client_window( struct x11drv_win_data *data, Window client_window )
 /**********************************************************************
  *      destroy_client_window
  */
-void destroy_client_window( HWND hwnd, Window client_window )
+void destroy_client_window( HWND hwnd, struct x11drv_native_window *window )
 {
     struct x11drv_win_data *data;
-    char *parent;
+    Window client_window = window->window;
 
     TRACE( "%p destroying client window %lx\n", hwnd, client_window );
 
     if ((data = get_win_data( hwnd )))
     {
-        if (data->client_window == client_window)
-        {
-            if (data->whole_window) client_window_events_disable( data, client_window );
-            data->client_window = 0;
-        }
+        detach_client_window( data, client_window );
         release_win_data( data );
     }
 
-    XDestroyWindow( gdi_display, client_window );
-    if (!XFindContext( gdi_display, client_window, client_parent_context, &parent ))
-    {
-        XDeleteContext( gdi_display, client_window, client_parent_context );
-        XDestroyWindow( gdi_display, (Window)parent );
-    }
-    /* Retirement may be the last user of this connection. Send the deletion
-     * so the server can release an active Present without further client I/O. */
-    XFlush( gdi_display );
-    trace_window_response( "window_client_destroy_return", hwnd, gdi_display, client_window,
+    if (client_window) XDeleteContext( gdi_display, client_window, client_parent_context );
+    /* Outstanding DIRECT observations retain the physical Window and its
+     * private ancestor after the producer detaches its logical ownership. */
+    x11drv_native_window_retire( window, FALSE );
+    trace_window_response( "window_client_retire", hwnd, gdi_display, client_window,
                            0, 0, NULL, TRUE );
 }
 
@@ -2985,15 +2980,20 @@ void destroy_client_window( HWND hwnd, Window client_window )
 /**********************************************************************
  *		create_client_window
  */
-Window create_client_window( HWND hwnd, RECT client_rect, const XVisualInfo *visual, Colormap colormap )
+Window create_client_window( HWND hwnd, RECT client_rect, const XVisualInfo *visual, Colormap colormap,
+                             struct x11drv_native_window **owner )
 {
     struct x11drv_win_data *data = get_win_data( hwnd ), dummy = {0};
+    struct x11drv_native_window *native = NULL;
     XSetWindowAttributes attr;
     Window ret = 0, parent;
     int x, y, cx, cy;
 
     if (!data) data = &dummy; /* use a dummy window data for HWND_MESSAGE and foreign windows, to create an offscreen client window */
 
+    if (!client_surface_prepare_native_work() ||
+        !(native = x11drv_native_window_alloc( gdi_display, NULL, hwnd, FALSE ))) goto done;
+    *owner = native;
     detach_client_window( data, data->client_window );
 
     attr.colormap = colormap;
@@ -3011,6 +3011,7 @@ Window create_client_window( HWND hwnd, RECT client_rect, const XVisualInfo *vis
      * pixmap on that ancestor, so sharing it would outlive the client and keep
      * the final image in the window system until another client presents. */
     if (!(parent = create_client_parent())) goto done;
+    native->private_parent = parent;
     XSync( gdi_display, False ); /* make sure whole_window is known from gdi_display */
     ret = data->client_window = XCreateWindow( gdi_display,
                                                data->whole_window ? data->whole_window : parent,
@@ -3032,13 +3033,9 @@ Window create_client_window( HWND hwnd, RECT client_rect, const XVisualInfo *vis
         }
         TRACE( "%p xwin %lx/%lx\n", data->hwnd, data->whole_window, data->client_window );
     }
-    else
-    {
-        XDestroyWindow( gdi_display, parent );
-        XFlush( gdi_display );
-    }
 
  done:
+    if (native) x11drv_native_window_publish( native, ret, colormap == default_colormap ? 0 : colormap );
     if (data != &dummy) release_win_data( data );
     return ret;
 }

@@ -140,6 +140,7 @@ static WCHAR input_style[20];
 static pthread_mutex_t error_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t error_handlers_mutex = PTHREAD_MUTEX_INITIALIZER;
 static struct list error_handlers = LIST_INIT(error_handlers);
+static struct list gdi_native_errors = LIST_INIT(gdi_native_errors);
 
 #define IS_OPTION_TRUE(ch) \
     ((ch) == 'y' || (ch) == 'Y' || (ch) == 't' || (ch) == 'T' || (ch) == '1')
@@ -359,6 +360,9 @@ static int error_handler( Display *display, XErrorEvent *error_evt )
      * A stopped request on a private connection cannot hold it across I/O. */
     pthread_mutex_lock( &error_handlers_mutex );
     if (display == gdi_display)
+        LIST_FOR_EACH_ENTRY( handler, &gdi_native_errors, struct x11drv_error_handler, entry )
+            if ((handled = handler->callback( display, error_evt, handler->arg ))) break;
+    if (display == gdi_display && !handled)
         LIST_FOR_EACH_ENTRY( handler, &error_handlers, struct x11drv_error_handler, entry )
             if (handler->callback == display_owner_error)
             {
@@ -928,16 +932,16 @@ static int display_owner_error( Display *display, XErrorEvent *event, void *arg 
 void x11drv_display_owner_register_error_handler( struct x11drv_display_owner *owner,
                                                  struct x11drv_error_handler *handler )
 {
-    assert( handler->display == owner->display );
+    assert( handler->display == (owner ? owner->display : gdi_display) );
     pthread_mutex_lock( &error_handlers_mutex );
-    list_add_head( &owner->native_errors, &handler->entry );
+    list_add_head( owner ? &owner->native_errors : &gdi_native_errors, &handler->entry );
     pthread_mutex_unlock( &error_handlers_mutex );
 }
 
 void x11drv_display_owner_unregister_error_handler( struct x11drv_display_owner *owner,
                                                    struct x11drv_error_handler *handler )
 {
-    assert( handler->display == owner->display );
+    assert( handler->display == (owner ? owner->display : gdi_display) );
     pthread_mutex_lock( &error_handlers_mutex );
     list_remove( &handler->entry );
     pthread_mutex_unlock( &error_handlers_mutex );

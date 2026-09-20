@@ -47,6 +47,7 @@ struct x11drv_client_surface
     XWindowChanges changes;
     Colormap colormap;
     Window window;
+    struct x11drv_native_window *native_window; /* child, colormap and private parent lifetime */
     struct x11drv_client_snapshot *snapshot;
     BYTE *snapshot_pixels;
     SIZE_T snapshot_pixels_size;

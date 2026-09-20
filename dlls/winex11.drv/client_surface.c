@@ -184,8 +184,8 @@ static void x11drv_client_surface_destroy( struct client_surface *client )
     for (i = 0; i < ARRAY_SIZE(surface->sources); ++i)
         x11drv_client_surface_release_source_frame( surface->sources + i );
     x11drv_client_snapshot_release( surface->snapshot );
-    if (surface->colormap != default_colormap) XFreeColormap( gdi_display, surface->colormap );
-    if (surface->window) destroy_client_window( hwnd, surface->window );
+    if (surface->native_window) destroy_client_window( hwnd, surface->native_window );
+    else if (surface->colormap != default_colormap) XFreeColormap( gdi_display, surface->colormap );
     client_surface_memory_scope_destroy( &surface->memory );
 }
 
@@ -652,7 +652,7 @@ struct client_surface *X11DRV_CreateClientSurface( HWND hwnd, int format, BOOL r
     surface->source_depth = visual.depth;
     if (!x11drv_client_surface_completion_init( surface )) goto failed;
     rect = raw ? surface->client.target.monitor_rect : surface->client.target.virtual_rect;
-    if (!(surface->window = create_client_window( hwnd, rect, &visual, colormap ))) goto failed;
+    if (!(surface->window = create_client_window( hwnd, rect, &visual, colormap, &surface->native_window ))) goto failed;
     TRACE( "Created %s for client window %lx, owner compositor %u\n",
            debugstr_client_surface( &surface->client ), surface->window,
            backend == &x11drv_client_surface_backend );

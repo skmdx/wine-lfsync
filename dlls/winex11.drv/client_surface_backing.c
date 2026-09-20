@@ -168,6 +168,7 @@ struct client_surface_scene_plan
     enum { OWNER_COMPOSITE, DIRECT_ATTACH } strategy;
     UINT64 direct_identity;
     Window direct_drawable;
+    struct x11drv_native_window *direct_owner;
     struct client_surface_compositor_binding **members;
     struct client_surface_scene_layout *layouts;
     unsigned int count;
@@ -443,6 +444,13 @@ struct client_surface_window_query
 {
     struct client_surface_native_work work;
     struct x11drv_native_window_read read;
+    struct x11drv_native_window_read child_read;
+    struct x11drv_native_window *child_owner;
+    Window child;
+    UINT64 direct_epoch, direct_identity;
+    RECT direct_rect;
+    unsigned int direct_width, direct_height;
+    BOOL direct_checked;
     void (*finished)( struct client_surface_window_query *query );
     Window window;
     unsigned int width, height;
@@ -486,6 +494,7 @@ struct client_surface_compositor_job
             unsigned int copy_count, preserve_width, preserve_height;
             unsigned int valid_width, valid_height, depth;
             UINT geometry_update;
+            RECT geometry_rect;
             Pixmap pixmaps[2];
             VisualID visual;
             DWORD shrink_start;
@@ -543,14 +552,15 @@ struct client_surface_compositor_job
         {
             Drawable source, destination;
             UINT64 identity, scene_epoch;
-            struct x11drv_native_window *window_owner;
+            struct x11drv_native_window *window_owner, *source_owner;
             struct client_surface_window_query query;
         } direct_plan;
-        /* RENEW_DIRECT borrows only the owner's destination and geometry. */
+        /* RENEW_DIRECT consumes a completed, caller-owned observation. */
         struct
         {
             Drawable destination;
             UINT64 scene_epoch;
+            const struct client_surface_window_query *query;
             int source_x, source_y;
             unsigned int width, height, window_width, window_height;
         } direct_renew;
@@ -1194,6 +1204,8 @@ static void wake_client_surface_compositor(void);
 
 static void release_client_surface_output_checkpoint( struct client_surface_output_allocation *allocation )
 {
+    x11drv_native_window_release( allocation->geometry_query.child_owner );
+    allocation->geometry_query.child_owner = NULL;
     client_surface_cache_release( allocation->source_image );
     allocation->source_image = NULL;
     if (allocation->window_owner) x11drv_native_window_release( allocation->window_owner );
@@ -1290,9 +1302,15 @@ static void query_client_surface_window( struct client_surface_native_work *work
     struct client_surface_window_query *query = CONTAINING_RECORD( work, struct client_surface_window_query, work );
 
     query->waiting = !x11drv_native_window_read_ready( &query->read );
+    if (query->child_owner) query->waiting |= !x11drv_native_window_read_ready( &query->child_read );
     if (query->waiting) return;
     query->success = client_surface_native_query_window( query->window, &query->width, &query->height,
                                                         &query->map_state, &query->error );
+    if (query->success && query->child_owner && query->map_state == IsViewable &&
+        query->width == query->direct_width && query->height == query->direct_height)
+        query->direct_checked = client_surface_native_check_direct( query->window, query->child,
+            query->direct_width, query->direct_height, &query->direct_rect );
+    if (query->child_owner) x11drv_native_window_read_finish( &query->child_read );
     x11drv_native_window_read_finish( &query->read );
 }
 
@@ -1318,6 +1336,7 @@ static void start_client_surface_window_query( struct client_surface_window_quer
     query->started = TRUE;
     query->map_state = -1;
     query->window = x11drv_native_window_read_init( &query->read, window );
+    if (query->child_owner) query->child = x11drv_native_window_read_init( &query->child_read, query->child_owner );
     query->finished = finished;
     query->work.execute = query_client_surface_window;
     query->work.finished = finish_client_surface_window_query;
@@ -1334,12 +1353,18 @@ static void complete_client_surface_geometry_query( struct client_surface_window
     TRACE_(csperf)( "ticks=%llu event=geometry_query_reply request=%p serial=%llu width=%u height=%u success=%u\n",
                    client_surface_perf_time(), allocation, (unsigned long long)allocation->serial,
                    query->width, query->height, query->success );
+    if (query->child_owner)
+        TRACE_(csperf)( "ticks=%llu event=direct_query_reply request=%p serial=%llu previous=%llu child=%lx checked=%u\n",
+                       client_surface_perf_time(), allocation, (unsigned long long)allocation->serial,
+                       (unsigned long long)query->direct_epoch, query->child, query->direct_checked );
     client_surface_output_allocation_complete( allocation, query->success );
 }
 
 static BOOL create_client_surface_window_query( struct client_surface_compositor_job *job )
 {
     struct client_surface_output_allocation *allocation = job->u.pool.allocation;
+    struct client_surface_window_query *query;
+    struct client_surface_compositor_target *target;
 
     if (!allocation)
     {
@@ -1363,6 +1388,18 @@ static BOOL create_client_surface_window_query( struct client_surface_compositor
         ++client_surface_output_notification_count;
         pthread_mutex_unlock( &client_surface_compositor_mutex );
         return TRUE;
+    }
+    query = &allocation->geometry_query;
+    target = find_client_surface_compositor_target( job->toplevel );
+    if (job->u.pool.geometry_update == WINE_PREPARE_CLIENT_SURFACES && target &&
+        target->window == allocation->window && target->scene.valid && target->scene.strategy == DIRECT_ATTACH)
+    {
+        query->child_owner = x11drv_native_window_acquire( target->scene.direct_owner );
+        query->direct_epoch = target->scene.epoch;
+        query->direct_identity = target->scene.direct_identity;
+        query->direct_rect = job->u.pool.geometry_rect;
+        query->direct_width = job->u.pool.window_width;
+        query->direct_height = job->u.pool.window_height;
     }
     allocation->pending = 1;
     TRACE_(csperf)( "ticks=%llu event=geometry_query_queue request=%p serial=%llu window=%lx epoch=%llu\n",
@@ -2402,6 +2439,8 @@ static void free_client_surface_scene_layouts( struct client_surface_scene_layou
 static void free_client_surface_scene_plan( struct client_surface_compositor_target *target )
 {
     detach_client_surface_output_transform( target );
+    x11drv_native_window_release( target->scene.direct_owner );
+    target->scene.direct_owner = NULL;
     client_surface_free_owned_array( target->receipts );
     client_surface_free_owned_array( target->scene.members );
     free_client_surface_scene_layouts( target->scene.layouts, target->scene.count );
@@ -3296,6 +3335,7 @@ static BOOL install_client_surface_direct_plan( const struct client_surface_comp
     target->scene = (struct client_surface_scene_plan){
         .strategy = DIRECT_ATTACH, .direct_identity = job->u.direct_plan.identity,
         .direct_drawable = job->u.direct_plan.source, .epoch = scene_id, .valid = TRUE,
+        .direct_owner = x11drv_native_window_acquire( job->u.direct_plan.source_owner ),
     };
     update_client_surface_notification_plan( target );
     SetRectEmpty( &target->restore_rect );
@@ -3310,12 +3350,12 @@ static BOOL renew_client_surface_direct_plan( const struct client_surface_compos
 {
     struct client_surface_compositor_target *target = find_client_surface_compositor_target( job->toplevel );
     struct client_surface_scene current;
-    XWindowAttributes window, drawable;
-    Window root, parent, *children = NULL;
-    unsigned int count, i;
+    const struct client_surface_window_query *query = job->u.direct_renew.query;
+    RECT rect = {job->u.direct_renew.source_x, job->u.direct_renew.source_y,
+                 job->u.direct_renew.source_x + job->u.direct_renew.width,
+                 job->u.direct_renew.source_y + job->u.direct_renew.height};
+    unsigned int i;
     UINT64 scene_id = 0;
-    BOOL native;
-    int error = 0;
 
     /* Only a previously admitted attachment with its output pool already
      * retired can renew without preserving a composition checkpoint. */
@@ -3328,32 +3368,14 @@ static BOOL renew_client_surface_direct_plan( const struct client_surface_compos
     if (current.valid || !current.direct_candidate || current.generation ||
         current.epoch != job->u.direct_renew.scene_epoch || (current.epoch & 1)) return FALSE;
 
-    /* The GUI has completed its native changes. Check the retained child
-     * itself, including its parent and exact client extent, rather than
-     * treating the old scene's geometry or a DIRECT candidate as that proof. */
-    if (client_surface_xcb_available( client_surface_compositor_display ))
-    {
-        RECT rect = {job->u.direct_renew.source_x, job->u.direct_renew.source_y, job->u.direct_renew.source_x + job->u.direct_renew.width, job->u.direct_renew.source_y + job->u.direct_renew.height};
-
-        if (!client_surface_xcb_check_direct( client_surface_compositor_display, job->u.direct_renew.destination,
-                                              target->scene.direct_drawable, job->u.direct_renew.window_width,
-                                              job->u.direct_renew.window_height, &rect )) return FALSE;
-    }
-    else
-    {
-        X11DRV_expect_error( client_surface_compositor_display, client_surface_compositor_error, &error );
-        native = XGetWindowAttributes( client_surface_compositor_display, job->u.direct_renew.destination, &window ) &&
-                 XGetWindowAttributes( client_surface_compositor_display, target->scene.direct_drawable, &drawable ) &&
-                 XQueryTree( client_surface_compositor_display, target->scene.direct_drawable,
-                             &root, &parent, &children, &count );
-        if (children) XFree( children );
-        X11DRV_check_error();
-        if (!native || error || window.map_state != IsViewable || drawable.map_state != IsViewable ||
-            parent != job->u.direct_renew.destination || drawable.border_width ||
-            window.width != job->u.direct_renew.window_width || window.height != job->u.direct_renew.window_height ||
-            drawable.x != job->u.direct_renew.source_x || drawable.y != job->u.direct_renew.source_y ||
-            drawable.width != job->u.direct_renew.width || drawable.height != job->u.direct_renew.height) return FALSE;
-    }
+    /* The native worker checked both retained Windows. Accept only the same
+     * attachment and requested geometry, never a newer plan at a reused XID. */
+    if (!query || !query->complete || !query->success || !query->direct_checked ||
+        query->window != target->window || query->child_owner != target->scene.direct_owner ||
+        query->child != target->scene.direct_drawable || query->direct_epoch != target->scene.epoch ||
+        query->direct_identity != target->scene.direct_identity ||
+        query->direct_width != job->u.direct_renew.window_width ||
+        query->direct_height != job->u.direct_renew.window_height || !EqualRect( &query->direct_rect, &rect )) return FALSE;
 
     SERVER_START_REQ( prepare_client_surface_direct_plan )
     {
@@ -6299,6 +6321,7 @@ BOOL X11DRV_client_surface_prepare_direct( struct client_surface *surface,
             .scene_epoch = scene->epoch,
             .identity = ReadAcquire64( (LONG64 *)&surface->identity ),
             .source = impl_from_client_surface( surface )->window,
+            .source_owner = impl_from_client_surface( surface )->native_window,
         },
     };
 
@@ -7258,10 +7281,14 @@ BOOL X11DRV_client_surface_backing_retire( struct x11drv_win_data *data )
 static NTSTATUS ensure_client_surface_backing( struct x11drv_win_data *data, BOOL snapshot,
                                                BOOL invalidate, BOOL force, UINT update );
 
+static NTSTATUS query_client_surface_extent( struct x11drv_win_data *data, UINT update,
+                                             unsigned int *width, unsigned int *height );
+
 NTSTATUS X11DRV_client_surface_prepare_owner( struct x11drv_win_data *data )
 {
     struct client_surface_scene scene;
     NTSTATUS status;
+    unsigned int width, height;
 
     /* A sole retained native child can continue DIRECT after the owner and
      * producer applied the new geometry. Any Win32 child requires the normal
@@ -7288,7 +7315,9 @@ NTSTATUS X11DRV_client_surface_prepare_owner( struct x11drv_win_data *data )
             },
         };
 
-        X11DRV_sync_window_changes( data->display );
+        status = query_client_surface_extent( data, WINE_PREPARE_CLIENT_SURFACES, &width, &height );
+        if (status) return status;
+        job.u.direct_renew.query = &data->client_surface_pending_geometry->geometry_query;
         if (submit_client_surface_compositor_job( &job ))
         {
             X11DRV_client_surface_backing_cancel_allocation( data );
@@ -7585,7 +7614,13 @@ static NTSTATUS query_client_surface_extent( struct x11drv_win_data *data, UINT 
         .op = CLIENT_SURFACE_COMPOSITOR_QUERY_WINDOW,
         .toplevel = data->hwnd,
         .u.pool = {.window_owner = data->native_window, .source = data->client_surface_backing,
-                   .destination = data->whole_window, .geometry_update = update},
+                   .destination = data->whole_window, .geometry_update = update,
+                   .window_width = data->rects.visible.right - data->rects.visible.left,
+                   .window_height = data->rects.visible.bottom - data->rects.visible.top,
+                   .geometry_rect = {data->rects.client.left - data->rects.visible.left,
+                                     data->rects.client.top - data->rects.visible.top,
+                                     data->rects.client.right - data->rects.visible.left,
+                                     data->rects.client.bottom - data->rects.visible.top}},
     };
     NTSTATUS status;
 

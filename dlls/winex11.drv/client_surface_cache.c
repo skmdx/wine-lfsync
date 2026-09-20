@@ -21,6 +21,7 @@
 #include "x11drv.h"
 #include "client_surface.h"
 #include "client_surface_cache.h"
+#include "client_surface_xcb.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(x11drv);
 WINE_DECLARE_DEBUG_CHANNEL(csperf);
@@ -140,6 +141,33 @@ BOOL client_surface_native_query_window( Window window, unsigned int *width, uns
     *height = attrs.height;
     *map_state = attrs.map_state;
     return TRUE;
+}
+
+/* Runs on the same private native connection as the owned Window query.
+ * Both Window leases and creator receipts belong to that query's caller. */
+BOOL client_surface_native_check_direct( Window window, Window child, unsigned int width,
+                                         unsigned int height, const RECT *rect )
+{
+    XWindowAttributes owner, drawable;
+    Window root, parent, *children = NULL;
+    unsigned int count;
+    BOOL native;
+    Display *display;
+
+    assert( native_worker );
+    if (!open_cache_display( native_worker )) return FALSE;
+    display = native_worker->display;
+    if (client_surface_xcb_available( display ))
+        return client_surface_xcb_check_direct( display, window, child, width, height, rect );
+    native_worker->error = 0;
+    native = XGetWindowAttributes( display, window, &owner ) &&
+             XGetWindowAttributes( display, child, &drawable ) &&
+             XQueryTree( display, child, &root, &parent, &children, &count );
+    if (children) XFree( children );
+    return native && !native_worker->error && owner.map_state == IsViewable && drawable.map_state == IsViewable &&
+           parent == window && !drawable.border_width && owner.width == width && owner.height == height &&
+           drawable.x == rect->left && drawable.y == rect->top &&
+           drawable.width == rect->right - rect->left && drawable.height == rect->bottom - rect->top;
 }
 
 static unsigned long convert_client_surface_component( unsigned long pixel,
