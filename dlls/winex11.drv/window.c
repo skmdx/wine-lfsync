@@ -2527,6 +2527,9 @@ void set_net_active_window( HWND hwnd, HWND previous )
     if (!is_net_supported( x11drv_atom(_NET_ACTIVE_WINDOW) )) return;
     if (previous != hwnd) window_cancel_pending_activate( previous );
     if (!(window = X11DRV_get_whole_window( hwnd ))) return;
+    /* The host root is not a managed client. A request to activate it has no
+     * WM acknowledgement and would block later native foreground updates. */
+    if (window == DefaultRootWindow( data->display )) return;
     /* Another thread may have requested a different window since our last
      * activation. An outstanding request may also have been superseded
      * before WM_TAKE_FOCUS, so only skip a completed, unchanged activation. */
