@@ -125,6 +125,7 @@ XContext winContext = 0;
 /* X context to associate a struct x11drv_win_data to an hwnd */
 static XContext win_data_context = 0;
 static XContext host_window_context = 0;
+static XContext client_parent_context = 0;
 
 static const WCHAR whole_window_prop[] =
     {'_','_','w','i','n','e','_','x','1','1','_','w','h','o','l','e','_','w','i','n','d','o','w',0};
@@ -2720,44 +2721,40 @@ static void move_window_bits( HWND hwnd, Window window, const struct window_rect
 
 
 /***********************************************************************
- *              get_dummy_parent
+ *              create_client_parent
  *
- * Create a dummy parent window for child windows that don't have a true X11 parent.
+ * Create an owned offscreen parent for a client window.
  */
-Window get_dummy_parent(void)
+static Window create_client_parent(void)
 {
-    static Window dummy_parent;
+    Window dummy_parent;
+    XSetWindowAttributes attrib;
+    unsigned long opacity = 0;
 
-    if (!dummy_parent)
-    {
-        XSetWindowAttributes attrib;
-        unsigned long opacity = 0;
-
-        attrib.override_redirect = True;
-        attrib.border_pixel = 0;
-        attrib.colormap = default_colormap;
+    attrib.override_redirect = True;
+    attrib.border_pixel = 0;
+    attrib.colormap = default_colormap;
 
 #ifdef HAVE_LIBXSHAPE
-        {
-            static XRectangle empty_rect;
-            dummy_parent = XCreateWindow( gdi_display, root_window, 0, 0, 1, 1, 0,
-                                          default_visual.depth, InputOutput, default_visual.visual,
-                                          CWColormap | CWBorderPixel | CWOverrideRedirect, &attrib );
-            XShapeCombineRectangles( gdi_display, dummy_parent, ShapeBounding, 0, 0, &empty_rect, 1,
-                                     ShapeSet, YXBanded );
-            XShapeCombineRectangles( gdi_display, dummy_parent, ShapeInput, 0, 0, &empty_rect, 1,
-                                     ShapeSet, YXBanded );
-        }
-#else
-        dummy_parent = XCreateWindow( gdi_display, root_window, -1, -1, 1, 1, 0, default_visual.depth,
-                                      InputOutput, default_visual.visual,
+    {
+        static XRectangle empty_rect;
+        dummy_parent = XCreateWindow( gdi_display, root_window, 0, 0, 1, 1, 0,
+                                      default_visual.depth, InputOutput, default_visual.visual,
                                       CWColormap | CWBorderPixel | CWOverrideRedirect, &attrib );
-        WARN("Xshape support is not compiled in. Applications under XWayland may have poor performance.\n");
-#endif
-        XChangeProperty( gdi_display, dummy_parent, x11drv_atom(_NET_WM_WINDOW_OPACITY),
-                         XA_CARDINAL, 32, PropModeReplace, (unsigned char *)&opacity, 1 );
-        XMapWindow( gdi_display, dummy_parent );
+        XShapeCombineRectangles( gdi_display, dummy_parent, ShapeBounding, 0, 0, &empty_rect, 1,
+                                 ShapeSet, YXBanded );
+        XShapeCombineRectangles( gdi_display, dummy_parent, ShapeInput, 0, 0, &empty_rect, 1,
+                                 ShapeSet, YXBanded );
     }
+#else
+    dummy_parent = XCreateWindow( gdi_display, root_window, -1, -1, 1, 1, 0, default_visual.depth,
+                                  InputOutput, default_visual.visual,
+                                  CWColormap | CWBorderPixel | CWOverrideRedirect, &attrib );
+    WARN("Xshape support is not compiled in. Applications under XWayland may have poor performance.\n");
+#endif
+    XChangeProperty( gdi_display, dummy_parent, x11drv_atom(_NET_WM_WINDOW_OPACITY),
+                     XA_CARDINAL, 32, PropModeReplace, (unsigned char *)&opacity, 1 );
+    XMapWindow( gdi_display, dummy_parent );
     return dummy_parent;
 }
 
@@ -2780,14 +2777,21 @@ static void client_window_events_disable( struct x11drv_win_data *data, Window c
  */
 void detach_client_window( struct x11drv_win_data *data, Window client_window )
 {
+    char *parent;
+
     if (data->client_window != client_window || !client_window) return;
 
     TRACE( "%p/%lx detaching client window %lx\n", data->hwnd, data->whole_window, client_window );
 
     if (data->whole_window)
     {
+        if (XFindContext( gdi_display, client_window, client_parent_context, &parent ))
+        {
+            ERR( "missing offscreen parent for client window %lx\n", client_window );
+            return;
+        }
         client_window_events_disable( data, client_window );
-        XReparentWindow( gdi_display, client_window, get_dummy_parent(), 0, 0 );
+        XReparentWindow( gdi_display, client_window, (Window)parent, 0, 0 );
     }
 
     data->client_window = 0;
@@ -2826,6 +2830,7 @@ void attach_client_window( struct x11drv_win_data *data, Window client_window )
 void destroy_client_window( HWND hwnd, Window client_window )
 {
     struct x11drv_win_data *data;
+    char *parent;
 
     TRACE( "%p destroying client window %lx\n", hwnd, client_window );
 
@@ -2840,6 +2845,11 @@ void destroy_client_window( HWND hwnd, Window client_window )
     }
 
     XDestroyWindow( gdi_display, client_window );
+    if (!XFindContext( gdi_display, client_window, client_parent_context, &parent ))
+    {
+        XDeleteContext( gdi_display, client_window, client_parent_context );
+        XDestroyWindow( gdi_display, (Window)parent );
+    }
     /* Retirement may be the last user of this connection. Send the deletion
      * so the server can release an active Present without further client I/O. */
     XFlush( gdi_display );
@@ -2855,7 +2865,7 @@ Window create_client_window( HWND hwnd, RECT client_rect, const XVisualInfo *vis
 {
     struct x11drv_win_data *data = get_win_data( hwnd ), dummy = {0};
     XSetWindowAttributes attr;
-    Window ret;
+    Window ret = 0, parent;
     int x, y, cx, cy;
 
     if (!data) data = &dummy; /* use a dummy window data for HWND_MESSAGE and foreign windows, to create an offscreen client window */
@@ -2873,12 +2883,21 @@ Window create_client_window( HWND hwnd, RECT client_rect, const XVisualInfo *vis
     cx = min( max( 1, client_rect.right - client_rect.left ), 65535 );
     cy = min( max( 1, client_rect.bottom - client_rect.top ), 65535 );
 
+    /* Each client owns its offscreen ancestor. A Present flip may install its
+     * pixmap on that ancestor, so sharing it would outlive the client and keep
+     * the final image in the window system until another client presents. */
+    if (!(parent = create_client_parent())) goto done;
     XSync( gdi_display, False ); /* make sure whole_window is known from gdi_display */
     ret = data->client_window = XCreateWindow( gdi_display,
-                                               data->whole_window ? data->whole_window : get_dummy_parent(),
+                                               data->whole_window ? data->whole_window : parent,
                                                x, y, cx, cy, 0, visual->depth, InputOutput,
                                                visual->visual, CWBitGravity | CWWinGravity |
                                                CWBackingStore | CWColormap | CWBorderPixel, &attr );
+    if (ret && XSaveContext( gdi_display, ret, client_parent_context, (char *)parent ))
+    {
+        XDestroyWindow( gdi_display, ret );
+        data->client_window = ret = 0;
+    }
     if (data->client_window)
     {
         XMapWindow( gdi_display, data->client_window );
@@ -2889,7 +2908,13 @@ Window create_client_window( HWND hwnd, RECT client_rect, const XVisualInfo *vis
         }
         TRACE( "%p xwin %lx/%lx\n", data->hwnd, data->whole_window, data->client_window );
     }
+    else
+    {
+        XDestroyWindow( gdi_display, parent );
+        XFlush( gdi_display );
+    }
 
+ done:
     if (data != &dummy) release_win_data( data );
     return ret;
 }
@@ -4599,5 +4624,6 @@ void init_win_context(void)
     winContext = XUniqueContext();
     win_data_context = XUniqueContext();
     host_window_context = XUniqueContext();
+    client_parent_context = XUniqueContext();
     cursor_context = XUniqueContext();
 }

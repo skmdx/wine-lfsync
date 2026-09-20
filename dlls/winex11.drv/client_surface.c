@@ -643,7 +643,7 @@ struct client_surface *X11DRV_CreateClientSurface( HWND hwnd, int format, BOOL r
     /* All conversion and clipping, including extension fallbacks, is done on
      * the owner connection. The producer never writes the owner's backing. */
     if (visual.visualid == default_visual.visualid) colormap = default_colormap;
-    else colormap = XCreateColormap( gdi_display, get_dummy_parent(), visual.visual, visual_class_alloc( visual.class ) );
+    else colormap = XCreateColormap( gdi_display, root_window, visual.visual, visual_class_alloc( visual.class ) );
     if (!colormap) return NULL;
 
     if (!(surface = client_surface_create( sizeof(*surface), backend, hwnd, format, raw ))) goto failed;

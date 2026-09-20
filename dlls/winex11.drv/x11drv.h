@@ -822,7 +822,6 @@ extern NTSTATUS X11DRV_client_surface_backing_snapshot( struct x11drv_win_data *
 extern BOOL X11DRV_client_surface_backing_publish( struct x11drv_win_data *data );
 extern BOOL X11DRV_client_surface_backing_restore( struct x11drv_win_data *data,
                                                   Window window, const RECT *rect );
-extern Window get_dummy_parent(void);
 
 extern BOOL window_is_reparenting( HWND hwnd );
 extern BOOL window_should_take_focus( HWND hwnd, Time time );
