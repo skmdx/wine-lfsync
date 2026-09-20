@@ -2253,7 +2253,9 @@ BOOL X11DRV_GetWindowStateUpdates( HWND hwnd, UINT *state_cmd, UINT *swp_flags, 
 {
     struct x11drv_thread_data *thread_data = x11drv_thread_data();
     struct x11drv_win_data *data;
-    HWND old_foreground;
+    HWND old_foreground, native_foreground;
+    DWORD thread_id = GetCurrentThreadId();
+    BOOL native_desktop, foreground_owner;
 
     if (!state_cmd)
     {
@@ -2270,13 +2272,27 @@ BOOL X11DRV_GetWindowStateUpdates( HWND hwnd, UINT *state_cmd, UINT *swp_flags, 
     *foreground = 0;
     SetRectEmpty( rect );
 
-    if (!(old_foreground = NtUserGetForegroundWindow())) old_foreground = NtUserGetDesktopWindow();
-    if (!is_virtual_desktop() && NtUserGetWindowThread( old_foreground, NULL ) == GetCurrentThreadId() &&
+    old_foreground = NtUserGetForegroundWindow();
+    native_desktop = old_foreground == NtUserGetDesktopWindow();
+    if (!old_foreground) old_foreground = NtUserGetDesktopWindow();
+    foreground_owner = NtUserGetWindowThread( old_foreground, NULL ) == thread_id;
+    if (!is_virtual_desktop() && (foreground_owner || native_desktop) &&
         !window_has_pending_wm_state( old_foreground, NormalState ) && !window_is_reparenting( old_foreground ) &&
         !thread_data->net_active_window_serial)
     {
-        *foreground = hwnd_from_window( thread_data->display, thread_data->current_state.net_active_window );
-        if (*foreground == old_foreground) *foreground = 0;
+        if (foreground_owner)
+            native_foreground = hwnd_from_window( thread_data->display, thread_data->current_state.net_active_window );
+        else if (XFindContext( thread_data->display, thread_data->current_state.net_active_window,
+                               winContext, (char **)&native_foreground ) ||
+                 NtUserGetWindowThread( native_foreground, NULL ) != thread_id)
+            native_foreground = 0;
+
+        /* Complete a native handoff from the desktop on the new owner too.
+         * An explicit Win32 foreground clear or another application's
+         * activation must still be handled by the old owning thread. */
+        if (native_foreground && native_foreground != old_foreground &&
+            get_net_active_window( thread_data->display ) == thread_data->current_state.net_active_window)
+            *foreground = native_foreground;
     }
 
     if ((data = get_win_data( hwnd )))
@@ -2454,7 +2470,7 @@ void net_active_window_notify( unsigned long serial, Window value, Time time )
     Window *desired = &data->desired_state.net_active_window, *pending = &data->pending_state.net_active_window, *current = &data->current_state.net_active_window;
     unsigned long *expect_serial = &data->net_active_window_serial;
     const char *expected, *received;
-    HWND current_hwnd, pending_hwnd;
+    HWND current_hwnd, pending_hwnd, foreground;
 
     current_hwnd = hwnd_from_window( data->display, value );
     pending_hwnd = hwnd_from_window( data->display, *pending );
@@ -2465,7 +2481,11 @@ void net_active_window_notify( unsigned long serial, Window value, Time time )
                               current, expected, "", received, NULL ))
         return;
 
-    NtUserPostMessage( NtUserGetForegroundWindow(), WM_WINE_WINDOW_STATE_CHANGED, 0, 0 );
+    foreground = NtUserGetForegroundWindow();
+    NtUserPostMessage( foreground, WM_WINE_WINDOW_STATE_CHANGED, 0, 0 );
+    if (foreground == NtUserGetDesktopWindow() && current_hwnd != foreground &&
+        NtUserGetWindowThread( current_hwnd, NULL ) == GetCurrentThreadId())
+        NtUserPostMessage( current_hwnd, WM_WINE_WINDOW_STATE_CHANGED, 0, 0 );
 }
 
 Window get_net_active_window( Display *display )
