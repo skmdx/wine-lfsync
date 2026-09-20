@@ -1272,10 +1272,15 @@ static BOOL client_surface_alloc_on_compositor( struct client_surface_compositor
     {
         for (i = 0; i < job->u.pool.copy_count; ++i)
         {
-            XCopyArea( display, job->u.pool.destination, job->u.pool.pixmaps[i], gc, 0, 0,
+            /* Freeze the Window once in owned storage. A second Window read
+             * could observe a newer GDI write and initialize a different
+             * checkpoint in the other member of the same pool. */
+            Drawable seed = i ? job->u.pool.pixmaps[0] : job->u.pool.destination;
+
+            XCopyArea( display, seed, job->u.pool.pixmaps[i], gc, 0, 0,
                        copy_width, copy_height, 0, 0 );
             TRACE_(csperf)( "ticks=%llu event=xlib_copy_request source=%lx destination=%lx width=%u height=%u clipped=0 route=restore\n",
-                           client_surface_perf_time(), job->u.pool.destination, job->u.pool.pixmaps[i],
+                           client_surface_perf_time(), seed, job->u.pool.pixmaps[i],
                            copy_width, copy_height );
             /* The replacement job drained the old target before entering.
              * Preserve its completed intersection over the GUI seed without
@@ -1294,10 +1299,10 @@ static BOOL client_surface_alloc_on_compositor( struct client_surface_compositor
     XSync( display, False );
     X11DRV_check_error();
     TRACE_(csperf)( "ticks=%llu event=output_pool_alloc first=%lx second=%lx "
-                   "width=%u height=%u depth=%u checkpoint_copies=%u copy_width=%u copy_height=%u sync_calls=1 error=%d success=%u\n",
+                   "width=%u height=%u depth=%u checkpoint_copies=%u copy_width=%u copy_height=%u sync_calls=1 error=%d success=%u seed_window=%lx\n",
                    client_surface_perf_time(), job->u.pool.pixmaps[0], job->u.pool.pixmaps[1],
                    job->u.pool.width, job->u.pool.height, job->u.pool.depth, gc ? job->u.pool.copy_count : 0,
-                   copy_width, copy_height, error, !!gc && !error );
+                   copy_width, copy_height, error, !!gc && !error, job->u.pool.destination );
     if (gc && !error)
     {
         memcpy( allocation->pixmaps, job->u.pool.pixmaps, sizeof(allocation->pixmaps) );
