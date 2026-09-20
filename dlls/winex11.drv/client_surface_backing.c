@@ -6840,8 +6840,12 @@ retry:
     shrink = FALSE;
     if (!data->whole_window) return STATUS_UNSUCCESSFUL;
     if (!get_client_surface_window_extent( data, &window_width, &window_height )) return STATUS_UNSUCCESSFUL;
-    width = client_surface_backing_extent( data->rects.visible.right - data->rects.visible.left );
-    height = client_surface_backing_extent( data->rects.visible.bottom - data->rects.visible.top );
+    /* Native ConfigureNotify can precede the Win32 geometry update. The
+     * checkpoint must cover the actual Window even during that interval. */
+    width = client_surface_backing_extent( max( data->rects.visible.right - data->rects.visible.left, window_width ) );
+    height = client_surface_backing_extent( max( data->rects.visible.bottom - data->rects.visible.top, window_height ) );
+    TRACE_(csperf)( "event=backing_extent hwnd=%p native=%ux%u capacity=%ux%u desired=%s\n",
+                   data->hwnd, window_width, window_height, width, height, wine_dbgstr_rect( &data->rects.visible ) );
     allocation = data->client_surface_pending_allocation;
     if (allocation && (allocation->checkpoint || allocation->copy_wait) &&
         !client_surface_output_checkpoint_matches( data, allocation, window_width, window_height ))
