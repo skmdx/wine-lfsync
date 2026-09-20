@@ -4141,13 +4141,18 @@ static void cancel_window_paints( struct window *win )
         if (paint->window == win) release_window_paint( paint, 0 );
 }
 
-static struct window_paint *get_window_paint( UINT64 token )
+static struct window_paint *get_window_paint( UINT64 token, int worker )
 {
     struct window_paint *paint;
+    struct list *ptr, *list = worker ? &window_paints : &current->window_paints;
 
-    LIST_FOR_EACH_ENTRY( paint, &current->window_paints, struct window_paint, thread_entry )
-        if (paint->token == token && !paint->retirement)
+    LIST_FOR_EACH( ptr, list )
+    {
+        paint = worker ? LIST_ENTRY( ptr, struct window_paint, entry ) :
+                         LIST_ENTRY( ptr, struct window_paint, thread_entry );
+        if (paint->token == token && !paint->retirement && paint->thread->process == current->process)
             return paint;
+    }
     set_error( STATUS_INVALID_PARAMETER );
     return NULL;
 }
@@ -4191,7 +4196,7 @@ DECL_HANDLER(begin_window_paint)
 
 DECL_HANDLER(end_window_paint)
 {
-    struct window_paint *paint = get_window_paint( req->token );
+    struct window_paint *paint = get_window_paint( req->token, 0 );
 
     if (!paint) return;
     if (paint->ended) set_error( STATUS_INVALID_PARAMETER );
@@ -4202,7 +4207,10 @@ DECL_HANDLER(end_window_paint)
 
 DECL_HANDLER(complete_window_paint)
 {
-    struct window_paint *paint = get_window_paint( req->token );
+    /* A native worker in the writer's process may acknowledge completion.
+     * An unfinished paint can only be marked failed; only its writer may
+     * end or cancel it, and retirement still uses the separate batch path. */
+    struct window_paint *paint = get_window_paint( req->token, 1 );
 
     if (!paint) return;
     if (!paint->ended && !req->success) paint->failed = 1;

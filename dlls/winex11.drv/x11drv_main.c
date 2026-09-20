@@ -72,6 +72,7 @@ struct x11drv_display_owner
     struct client_surface_memory_scope memory;
     struct client_surface_native_work close_work;
     struct client_surface_native_work paint_work;
+    struct client_surface_native_work paint_events;
     struct x11drv_error_handler errors;
     struct list native_errors;
     Display *display;
@@ -90,6 +91,9 @@ struct x11drv_display_owner
     unsigned int paint_count;
     LONG paint_failed, paint_read;
     BOOL paint_ready, paint_draining, paint_drained, paint_blocked;
+    BOOL paint_events_active;
+    LONG paint_notify;
+    pthread_mutex_t paint_mutex;
     LONG refs;
     BOOL detached, clipboard;
 };
@@ -99,6 +103,8 @@ static BOOL window_paint_error( struct x11drv_display_owner *owner, Display *dis
 static void drain_window_paint_errors( struct client_surface_native_work *work );
 static void window_paint_errors_drained( struct client_surface_native_work *work );
 static BOOL poll_gdi_barrier( struct x11drv_gdi_barrier *barrier );
+static void process_window_paint_work( struct client_surface_native_work *work );
+static void window_paint_work_finished( struct client_surface_native_work *work );
 
 XVisualInfo default_visual = { 0 };
 XVisualInfo argb_visual = { 0 };
@@ -981,6 +987,7 @@ static void free_display_owner( struct client_surface_native_work *work )
         client_surface_submit_native_work( work );
         return;
     }
+    pthread_mutex_destroy( &owner->paint_mutex );
     client_surface_free_owned_metadata( &owner->memory, owner, sizeof(*owner) );
     x11drv_return_release_capacity( 1, sizeof(*owner) );
     TRACE_(csperf)( "event=display_owner_return owner=0x%lx display=%p bytes=%zu\n",
@@ -998,6 +1005,7 @@ static struct x11drv_display_owner *create_display_owner(void)
     if (!domain || !client_surface_memory_scope_init( &memory, 0, domain )) goto failed;
     if (!(owner = client_surface_alloc_scoped_metadata( &memory, 1, sizeof(*owner) ))) goto failed;
     owner->memory = memory;
+    init_recursive_mutex( &owner->paint_mutex );
     owner->paint_identity = domain;
     owner->paint_thread = GetCurrentThreadId();
     owner->refs = 1;
@@ -1006,12 +1014,18 @@ static struct x11drv_display_owner *create_display_owner(void)
     owner->close_work.finished = free_display_owner;
     owner->paint_work.execute = drain_window_paint_errors;
     owner->paint_work.finished = window_paint_errors_drained;
+    owner->paint_events.execute = process_window_paint_work;
+    owner->paint_events.finished = window_paint_work_finished;
     if (!client_surface_prepare_native_work()) goto failed;
     TRACE_(csperf)( "event=display_owner_reserve owner=%p domain=%llu bytes=%zu\n",
                    owner, (unsigned long long)domain, sizeof(*owner) );
     return owner;
 failed:
-    if (owner) client_surface_free_owned_metadata( &owner->memory, owner, sizeof(*owner) );
+    if (owner)
+    {
+        pthread_mutex_destroy( &owner->paint_mutex );
+        client_surface_free_owned_metadata( &owner->memory, owner, sizeof(*owner) );
+    }
     else client_surface_memory_scope_destroy( &memory );
     x11drv_return_release_capacity( 1, sizeof(*owner) );
     return NULL;
@@ -1165,6 +1179,14 @@ static BOOL send_window_paint( struct x11drv_display_owner *owner, Display *disp
     return ret;
 }
 
+static void notify_window_paint_owner( struct x11drv_display_owner *owner )
+{
+    if (!InterlockedCompareExchange( &owner->detached, 0, 0 ) &&
+        !InterlockedExchange( &owner->paint_notify, TRUE ))
+        NtUserPostThreadMessage( owner->paint_thread, WM_X11DRV_WINDOW_PAINT_READY,
+                                 (UINT)owner->paint_identity, owner->paint_identity >> 32 );
+}
+
 static void update_window_paint_admission( struct x11drv_display_owner *owner )
 {
     BOOL blocked = owner->paint_count == ARRAY_SIZE(owner->paints) ||
@@ -1173,6 +1195,12 @@ static void update_window_paint_admission( struct x11drv_display_owner *owner )
     NTSTATUS status;
 
     if (blocked == owner->paint_blocked) return;
+    if (GetCurrentThreadId() != owner->paint_thread)
+    {
+        notify_window_paint_owner( owner );
+        return;
+    }
+    InterlockedExchange( &owner->paint_notify, FALSE );
     SERVER_START_REQ( set_queue_paint_blocked )
     {
         req->blocked = blocked;
@@ -1192,15 +1220,11 @@ static void remove_window_paint( struct x11drv_display_owner *owner, unsigned in
     update_window_paint_admission( owner );
 }
 
-void x11drv_flush_window_paints(void)
+static void flush_window_paints( struct x11drv_display_owner *owner )
 {
-    struct x11drv_thread_data *data = x11drv_thread_data();
-    struct x11drv_display_owner *owner;
     unsigned int i;
     BOOL failed;
 
-    if (!data) return;
-    owner = data->display_owner;
     update_window_paint_admission( owner );
     failed = InterlockedCompareExchange( &owner->paint_failed, 0, 0 );
     if (failed)
@@ -1246,20 +1270,19 @@ void x11drv_window_paint_ready( UINT64 identity )
 
     /* A paint flush can read the GUI receipt into Xlib while handling errors.
      * Process it even when the connection fd no longer signals readable data. */
-    if (data && data->display_owner->paint_identity == identity) X11DRV_ProcessEvents( QS_ALLINPUT );
+    if (data && data->display_owner->paint_identity == identity)
+    {
+        InterlockedExchange( &data->display_owner->paint_notify, FALSE );
+        X11DRV_ProcessEvents( QS_ALLINPUT );
+        x11drv_flush_window_paints();
+    }
 }
 
-NTSTATUS X11DRV_WindowPaint( HWND hwnd, UINT operation, UINT64 token )
+static NTSTATUS window_paint( struct x11drv_display_owner *owner, HWND hwnd, UINT operation, UINT64 token )
 {
-    struct x11drv_thread_data *data = x11drv_thread_data();
-    struct x11drv_display_owner *owner;
     unsigned int i;
 
-    if (!token || operation > WINDOW_PAINT_CANCEL) return STATUS_INVALID_PARAMETER;
-    if (!data && operation == WINDOW_PAINT_CANCEL) return STATUS_SUCCESS;
-    if (!data) data = x11drv_init_thread_data();
-    owner = data->display_owner;
-    x11drv_flush_window_paints();
+    flush_window_paints( owner );
     for (i = 0; i < owner->paint_count; i++)
         if (owner->paints[i].token == token) break;
     if (operation == WINDOW_PAINT_CANCEL)
@@ -1306,21 +1329,21 @@ NTSTATUS X11DRV_WindowPaint( HWND hwnd, UINT operation, UINT64 token )
         {
             Window window;
 
-            XLockDisplay( data->display );
+            XLockDisplay( owner->display );
             pthread_mutex_lock( &error_handlers_mutex );
-            owner->paint_create_serial = NextRequest( data->display );
+            owner->paint_create_serial = NextRequest( owner->display );
             pthread_mutex_unlock( &error_handlers_mutex );
-            window = XCreateWindow( data->display, DefaultRootWindow(data->display), 0, 0, 1, 1,
+            window = XCreateWindow( owner->display, DefaultRootWindow(owner->display), 0, 0, 1, 1,
                                     0, 0, InputOnly, CopyFromParent, 0, NULL );
             pthread_mutex_lock( &error_handlers_mutex );
             owner->paint_window = window;
             pthread_mutex_unlock( &error_handlers_mutex );
-            if (!window || !send_window_paint( owner, data->display, 0, 0 ))
+            if (!window || !send_window_paint( owner, owner->display, 0, 0 ))
                 InterlockedExchange( &owner->paint_failed, TRUE );
-            XUnlockDisplay( data->display );
+            XUnlockDisplay( owner->display );
             if (InterlockedCompareExchange( &owner->paint_failed, 0, 0 ))
             {
-                x11drv_flush_window_paints();
+                flush_window_paints( owner );
                 return STATUS_NO_MEMORY;
             }
         }
@@ -1337,29 +1360,27 @@ NTSTATUS X11DRV_WindowPaint( HWND hwnd, UINT operation, UINT64 token )
     if (operation != WINDOW_PAINT_SUBMIT || i == owner->paint_count ||
         owner->paints[i].hwnd != hwnd || owner->paints[i].submitted) return STATUS_INVALID_PARAMETER;
     owner->paints[i].submitted = TRUE;
-    x11drv_flush_window_paints();
+    flush_window_paints( owner );
     return STATUS_SUCCESS;
 }
 
-BOOL x11drv_window_paint_event( XClientMessageEvent *event )
+static BOOL process_window_paint_event( struct x11drv_display_owner *owner, XClientMessageEvent *event )
 {
-    struct x11drv_thread_data *data = x11drv_thread_data();
-    struct x11drv_display_owner *owner = data->display_owner;
     UINT64 token, identity;
     unsigned int i;
 
     if (event->message_type != x11drv_atom(_WINE_WINDOW_PAINT)) return FALSE;
-    if (event->display != data->display || !event->send_event || event->format != 32) return TRUE;
+    if (event->display != owner->display || !event->send_event || event->format != 32) return TRUE;
     token = (UINT)event->data.l[0] | (UINT64)(UINT)event->data.l[1] << 32;
     identity = (UINT)event->data.l[2] | (UINT64)(UINT)event->data.l[3] << 32;
     if (identity != owner->paint_identity) return TRUE;
-    if (!token && owner->paint_draining && event->window == DefaultRootWindow( data->display ) &&
+    if (!token && owner->paint_draining && event->window == DefaultRootWindow( owner->display ) &&
         event->data.l[4] == 2)
     {
         owner->paint_drained = TRUE;
         TRACE_(csperf)( "event=window_paint_drain_receipt owner=%p endpoint=%lx identity=%llu phase=%ld\n",
                        owner, owner->paint_window, (unsigned long long)identity, event->data.l[4] );
-        x11drv_flush_window_paints();
+        flush_window_paints( owner );
         return TRUE;
     }
     if (event->window != owner->paint_window || InterlockedCompareExchange( &owner->paint_failed, 0, 0 ))
@@ -1369,7 +1390,7 @@ BOOL x11drv_window_paint_event( XClientMessageEvent *event )
         owner->paint_ready = TRUE;
         TRACE_(csperf)( "event=window_paint_ready owner=%p endpoint=%lx identity=%llu\n",
                        owner, owner->paint_window, (unsigned long long)identity );
-        x11drv_flush_window_paints();
+        flush_window_paints( owner );
     }
     else if (token && event->data.l[4] == 1 && owner->paint_ready)
     {
@@ -1381,6 +1402,115 @@ BOOL x11drv_window_paint_event( XClientMessageEvent *event )
     }
     return TRUE;
 }
+
+/* Only receipt ClientMessages are taken from another thread's Display. All
+ * other X events remain available to its normal GUI dispatch. */
+static Bool filter_window_paint_event( Display *display, XEvent *event, char *arg )
+{
+    return event->type == ClientMessage &&
+           event->xclient.message_type == x11drv_atom(_WINE_WINDOW_PAINT);
+}
+
+static BOOL window_paint_work_pending( struct x11drv_display_owner *owner )
+{
+    unsigned int i;
+
+    if (owner->detached) return FALSE;
+    if (owner->paint_draining && (!owner->paint_drained ||
+        !InterlockedCompareExchange( &owner->paint_read, 0, 0 ))) return TRUE;
+    for (i = 0; i < owner->paint_count; ++i)
+        if (owner->paints[i].submitted) return TRUE;
+    return FALSE;
+}
+
+static void process_window_paint_work( struct client_surface_native_work *work )
+{
+    struct x11drv_display_owner *owner = CONTAINING_RECORD( work, struct x11drv_display_owner, paint_events );
+    struct pollfd fd = { .fd = ConnectionNumber(owner->display), .events = POLLIN };
+    XEvent event;
+    unsigned int count;
+    BOOL pending = FALSE;
+
+    for (count = 0; count < ARRAY_SIZE(owner->paints) + 2 &&
+         XCheckIfEvent( owner->display, &event, filter_window_paint_event, NULL ); count++)
+    {
+        pthread_mutex_lock( &owner->paint_mutex );
+        if (!owner->detached) process_window_paint_event( owner, &event.xclient );
+        pthread_mutex_unlock( &owner->paint_mutex );
+    }
+    pthread_mutex_lock( &owner->paint_mutex );
+    if (!owner->detached)
+    {
+        flush_window_paints( owner );
+        pending = window_paint_work_pending( owner );
+    }
+    pthread_mutex_unlock( &owner->paint_mutex );
+    /* XCheckIfEvent may buffer unrelated input while reading a receipt. Keep
+     * that input visible to the GUI even if its connection fd is now empty. */
+    if (XEventsQueued( owner->display, QueuedAlready )) notify_window_paint_owner( owner );
+    /* Yield to the native FIFO after a bounded poll, without holding the
+     * receipt lock while the GUI may submit another paint or detach. */
+    if (pending && poll( &fd, 1, 100 ) > 0) poll( NULL, 0, 1 );
+}
+
+static void window_paint_work_finished( struct client_surface_native_work *work )
+{
+    struct x11drv_display_owner *owner = CONTAINING_RECORD( work, struct x11drv_display_owner, paint_events );
+    BOOL pending;
+
+    pthread_mutex_lock( &owner->paint_mutex );
+    pending = window_paint_work_pending( owner );
+    if (!pending) owner->paint_events_active = FALSE;
+    pthread_mutex_unlock( &owner->paint_mutex );
+    if (pending) client_surface_submit_native_work( work );
+    else x11drv_display_owner_release( owner );
+}
+
+void x11drv_flush_window_paints(void)
+{
+    struct x11drv_thread_data *data = x11drv_thread_data();
+    struct x11drv_display_owner *owner;
+
+    if (!data) return;
+    owner = data->display_owner;
+    pthread_mutex_lock( &owner->paint_mutex );
+    flush_window_paints( owner );
+    pthread_mutex_unlock( &owner->paint_mutex );
+}
+
+NTSTATUS X11DRV_WindowPaint( HWND hwnd, UINT operation, UINT64 token )
+{
+    struct x11drv_thread_data *data = x11drv_thread_data();
+    struct x11drv_display_owner *owner;
+    NTSTATUS status;
+
+    if (!token || operation > WINDOW_PAINT_CANCEL) return STATUS_INVALID_PARAMETER;
+    if (!data && operation == WINDOW_PAINT_CANCEL) return STATUS_SUCCESS;
+    if (!data) data = x11drv_init_thread_data();
+    owner = data->display_owner;
+    pthread_mutex_lock( &owner->paint_mutex );
+    status = window_paint( owner, hwnd, operation, token );
+    if (!owner->paint_events_active && (operation == WINDOW_PAINT_SUBMIT || owner->paint_draining))
+    {
+        owner->paint_events_active = TRUE;
+        x11drv_display_owner_acquire( owner );
+        client_surface_submit_native_work( &owner->paint_events );
+    }
+    pthread_mutex_unlock( &owner->paint_mutex );
+    return status;
+}
+
+BOOL x11drv_window_paint_event( XClientMessageEvent *event )
+{
+    struct x11drv_display_owner *owner = x11drv_thread_data()->display_owner;
+    BOOL ret;
+
+    pthread_mutex_lock( &owner->paint_mutex );
+    ret = process_window_paint_event( owner, event );
+    pthread_mutex_unlock( &owner->paint_mutex );
+    return ret;
+}
+
 
 /***********************************************************************
  *           ThreadDetach (X11DRV.@)
@@ -1404,6 +1534,7 @@ void X11DRV_ThreadDetach(void)
         if (RootWindow( data->display, 0 ) != DefaultRootWindow( data->display ))
             XSelectInput( data->display, RootWindow( data->display, 0 ), 0 );
         if (data->net_supported) XFree( data->net_supported );
+        pthread_mutex_lock( &owner->paint_mutex );
         SERVER_START_REQ( detach_window_paints )
         {
             wine_server_call( req );
@@ -1420,6 +1551,7 @@ void X11DRV_ThreadDetach(void)
         XFlush( data->display );
         x11drv_native_window_thread_detach( data->display );
         InterlockedExchange( &owner->detached, TRUE );
+        pthread_mutex_unlock( &owner->paint_mutex );
         TRACE_(csperf)( "event=display_detach owner=%p display=%p refs=%u\n", owner, owner->display,
                        (unsigned int)InterlockedCompareExchange( &owner->refs, 0, 0 ) );
         x11drv_display_owner_release( owner );

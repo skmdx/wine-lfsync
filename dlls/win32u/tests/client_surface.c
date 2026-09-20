@@ -1320,8 +1320,8 @@ static void test_clip_scene_snapshot(void)
         GetLastError() );
     if (!first || !second || !descendant) goto done;
 
-    SetWindowPos( first, HWND_BOTTOM, 10, 10, 50, 40, SWP_NOACTIVATE );
-    SetWindowPos( second, HWND_TOP, 20, 10, 50, 40, SWP_NOACTIVATE );
+    SetWindowPos( first, HWND_BOTTOM, 10, 10, 50, 40, SWP_NOACTIVATE | SWP_NOREDRAW );
+    SetWindowPos( second, HWND_TOP, 20, 10, 50, 40, SWP_NOACTIVATE | SWP_NOREDRAW );
     set_surface_state( first, first_surface, CLIENT_SURFACE_STATE_REGISTER, 0, NULL );
     claim_surface_state( first, first_surface, NULL );
     status = get_clip_state( first, &before );
@@ -1385,7 +1385,7 @@ static void test_clip_scene_snapshot(void)
     {
         CombineRgn( shape, shape, shape_part, RGN_OR );
         DeleteObject( shape_part );
-        if (!SetWindowRgn( second, shape, TRUE )) DeleteObject( shape );
+        if (!SetWindowRgn( second, shape, FALSE )) DeleteObject( shape );
         status = get_clip_state( first, &after );
         ok( !status, "shaped clip snapshot failed, status %#x\n", status );
         ok( after.count == 3 && clip_state_count( &after, second ) == 2 &&
@@ -1408,11 +1408,11 @@ static void test_clip_scene_snapshot(void)
         check_clip_bounds( first, 96, &bounds[i] );
         check_clip_bounds( first, 144, &bounds[i] );
     }
-    SetWindowPos( first, NULL, -10, -10, 50, 40, SWP_NOACTIVATE | SWP_NOZORDER );
+    SetWindowPos( first, NULL, -10, -10, 50, 40, SWP_NOACTIVATE | SWP_NOREDRAW | SWP_NOZORDER );
     check_clip_bounds( first, 96, &bounds[ARRAY_SIZE(bounds) - 1] );
     check_clip_bounds( first, 144, &bounds[ARRAY_SIZE(bounds) - 1] );
 
-    SetWindowPos( first, HWND_TOP, 10, 10, 50, 40, SWP_NOACTIVATE );
+    SetWindowPos( first, HWND_TOP, 10, 10, 50, 40, SWP_NOACTIVATE | SWP_NOREDRAW );
     status = get_clip_state( first, &after );
     ok( !status, "post-zorder clip snapshot failed, status %#x\n", status );
     ok( after.scene_generation != before.scene_generation,
@@ -2143,7 +2143,7 @@ static void test_scene_snapshot(void)
     cookie = binding.cookie;
     CloseHandle( binding.mapping );
     binding.mapping = NULL;
-    ShowWindow( first, SW_HIDE );
+    SetWindowPos( first, NULL, 0, 0, 0, 0, SWP_HIDEWINDOW | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOREDRAW );
     status = get_scene_snapshot( top, scene_id, sizeof(snapshot.data), &snapshot );
     ok( status == STATUS_RETRY && !snapshot.returned, "stale scene status %#x\n", status );
     status = get_scene_snapshot( top, 0, sizeof(snapshot.data), &snapshot );
@@ -2153,7 +2153,7 @@ static void test_scene_snapshot(void)
     layer = find_scene_layer( &snapshot, first );
     ok( layer && !layer->producer.visible && layer->producer.cookie == cookie &&
         !layer->visible_count && !layer->clip_count, "hidden channel cache membership lost\n" );
-    ShowWindow( first, SW_SHOW );
+    SetWindowPos( first, NULL, 0, 0, 0, 0, SWP_SHOWWINDOW | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOREDRAW );
     status = get_scene_snapshot( top, 0, sizeof(snapshot.data), &snapshot );
     ok( !status, "shown snapshot status %#x\n", status );
     layer = status ? NULL : find_scene_layer( &snapshot, first );
@@ -2396,7 +2396,9 @@ static void test_scene_snapshot_geometry(void)
                     96 : atoi( expected_dpi )), "layer %u DPI %u, expected prefix DPI %s\n",
                     j, GetDpiForWindow( windows[j] ), expected_dpi );
         }
-        status = get_scene_snapshot( windows[0], state.scene_generation, sizeof(snapshot.data), &snapshot );
+        /* Compare current geometry. Native paint completion may advance the
+         * scene after CLAIM without changing any window coordinates. */
+        status = get_scene_snapshot( windows[0], 0, sizeof(snapshot.data), &snapshot );
         ok( !status && snapshot.count == ARRAY_SIZE(windows), "geometry snapshot status %#x count %u\n",
             status, snapshot.count );
         if (!status)
@@ -5618,7 +5620,7 @@ struct paint_receipt_thread_data
 {
     HWND hwnd;
     UINT64 token, retirement;
-    BOOL detach;
+    BOOL detach, cancel, failed;
     HANDLE destroyed, finish;
 };
 
@@ -5679,7 +5681,8 @@ static DWORD WINAPI paint_receipt_thread( void *arg )
         }
         return status;
     }
-    return complete_paint_receipt( data->token, TRUE );
+    if (data->cancel) return end_paint_receipt( data->token, TRUE );
+    return complete_paint_receipt( data->token, !data->failed );
 }
 
 static void run_paint_receipt_thread( struct paint_receipt_thread_data *data, UINT expected )
@@ -5824,6 +5827,11 @@ static void test_paint_receipts(void)
     ok( !status && second && second != first, "second paint admission status %#x\n", status );
     status = complete_paint_receipt( first, TRUE );
     ok( status == STATUS_INVALID_PARAMETER, "pre-EndPaint completion status %#x\n", status );
+    data.token = first;
+    run_paint_receipt_thread( &data, STATUS_INVALID_PARAMETER );
+    data.cancel = TRUE;
+    run_paint_receipt_thread( &data, STATUS_INVALID_PARAMETER );
+    data.cancel = FALSE;
     status = end_paint_receipt( first, FALSE );
     ok( !status, "paint end status %#x\n", status );
     status = set_surface_state( hwnd, 0, CLIENT_SURFACE_STATE_PREPARE_BEGIN, 0, &current );
@@ -5839,9 +5847,9 @@ static void test_paint_receipts(void)
     ok( !status && !result.toplevel, "STAGED accepted pending paint, status %#x\n", status );
     data.hwnd = NULL;
     data.token = first;
-    run_paint_receipt_thread( &data, STATUS_INVALID_PARAMETER );
+    run_paint_receipt_thread( &data, 0 );
     status = complete_paint_receipt( first, TRUE );
-    ok( !status, "first paint completion status %#x\n", status );
+    ok( status == STATUS_INVALID_PARAMETER, "worker-completed paint reused, status %#x\n", status );
     status = set_surface_state( hwnd, 0, CLIENT_SURFACE_STATE_PREPARE_BEGIN, 0, &current );
     ok( status == STATUS_PENDING, "overlapping paint prepare status %#x\n", status );
     status = end_paint_receipt( second, FALSE );
@@ -5906,8 +5914,10 @@ static void test_paint_receipts(void)
     /* Native failure before END is latched; it cannot retire an active writer. */
     status = begin_paint_receipt( hwnd, &first );
     ok( !status, "failed paint admission status %#x\n", status );
-    status = complete_paint_receipt( first, FALSE );
-    ok( !status, "early paint failure status %#x\n", status );
+    data.token = first;
+    data.failed = TRUE;
+    run_paint_receipt_thread( &data, 0 );
+    data.failed = FALSE;
     status = set_surface_state( hwnd, 0, CLIENT_SURFACE_STATE_PREPARE_BEGIN, 0, &current );
     ok( status == STATUS_PENDING, "early failed paint prepare status %#x\n", status );
     status = end_paint_receipt( first, FALSE );
