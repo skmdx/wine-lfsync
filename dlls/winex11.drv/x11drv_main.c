@@ -1063,18 +1063,21 @@ void x11drv_queue_stream_barrier( Display *display, struct x11drv_stream_barrier
 {
     XSetWindowAttributes attr = { .event_mask = StructureNotifyMask };
     Window window;
+    unsigned long serial;
 
     /* A transient Window supplies a response on display itself, including
      * when CREATE fails. Issuing it does not wait for a native reply. */
     XLockDisplay( display );
+    serial = XNextRequest( display );
     pthread_mutex_lock( &error_handlers_mutex );
-    barrier->create_serial = NextRequest( display );
+    barrier->create_serial = serial;
     pthread_mutex_unlock( &error_handlers_mutex );
     window = XCreateWindow( display, DefaultRootWindow(display), 0, 0, 1, 1,
                             0, 0, InputOnly, CopyFromParent, CWEventMask, &attr );
+    serial = XNextRequest( display );
     pthread_mutex_lock( &error_handlers_mutex );
     barrier->window = window;
-    barrier->serial = NextRequest( display );
+    barrier->serial = serial;
     pthread_mutex_unlock( &error_handlers_mutex );
     XDestroyWindow( display, window );
     XFlush( display );

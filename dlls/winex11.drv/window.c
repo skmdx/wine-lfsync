@@ -273,16 +273,17 @@ BOOL x11drv_native_window_read_ready( struct x11drv_native_window_read *read )
 Display *x11drv_native_window_read_begin( struct x11drv_native_window_read *read )
 {
     assert( read->geometry.complete && !read->copy_serial );
-    /* The caller sends exactly one CopyArea using an already checked,
-     * immutable GC. The next marker belongs to this same serialized stream. */
+    /* XCB (including Vulkan WSI) also uses this Display. XNextRequest takes
+     * back the socket and refreshes Xlib's cached sequence before the copy.
+     * The immutable GC and following marker use the same locked stream. */
     XLockDisplay( gdi_display );
-    read->copy_serial = NextRequest( gdi_display );
+    read->copy_serial = XNextRequest( gdi_display );
     return gdi_display;
 }
 
 void x11drv_native_window_read_end( struct x11drv_native_window_read *read )
 {
-    assert( NextRequest( gdi_display ) == read->copy_serial + 1 );
+    assert( XNextRequest( gdi_display ) == read->copy_serial + 1 );
     x11drv_queue_stream_barrier( gdi_display, &read->drawing );
     XUnlockDisplay( gdi_display );
 }
