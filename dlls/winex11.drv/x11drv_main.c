@@ -60,13 +60,6 @@ WINE_DECLARE_DEBUG_CHANNEL(synchronous);
 WINE_DECLARE_DEBUG_CHANNEL(winediag);
 WINE_DECLARE_DEBUG_CHANNEL(csperf);
 
-struct x11drv_gdi_barrier
-{
-    Window window;
-    unsigned long create_serial, serial;
-    BOOL complete;
-};
-
 struct x11drv_display_owner
 {
     struct client_surface_memory_scope memory;
@@ -79,7 +72,7 @@ struct x11drv_display_owner
     Window clip_window;
     Window paint_window;
     unsigned long paint_create_serial, paint_destroy_serial;
-    struct x11drv_gdi_barrier paint_barrier, close_barrier;
+    struct x11drv_stream_barrier paint_barrier, close_barrier;
     UINT64 paint_identity, paint_retirement;
     DWORD paint_thread;
     struct
@@ -102,7 +95,6 @@ static int display_owner_error( Display *display, XErrorEvent *event, void *arg 
 static BOOL window_paint_error( struct x11drv_display_owner *owner, Display *display, XErrorEvent *event );
 static void drain_window_paint_errors( struct client_surface_native_work *work );
 static void window_paint_errors_drained( struct client_surface_native_work *work );
-static BOOL poll_gdi_barrier( struct x11drv_gdi_barrier *barrier );
 static void process_window_paint_work( struct client_surface_native_work *work );
 static void window_paint_work_finished( struct client_surface_native_work *work );
 
@@ -371,7 +363,7 @@ static int error_handler( Display *display, XErrorEvent *error_evt )
             if (handler->callback == display_owner_error)
             {
                 struct x11drv_display_owner *owner = handler->arg;
-                if (!(handled = window_paint_error( owner, display, error_evt ))) continue;
+                if (!(handled = display_owner_error( display, error_evt, owner ))) continue;
                 wake_thread = owner->paint_thread;
                 break;
             }
@@ -881,7 +873,7 @@ NTSTATUS __wine_unix_lib_init(void)
 }
 
 
-static BOOL gdi_barrier_error( struct x11drv_gdi_barrier *barrier, XErrorEvent *event )
+BOOL x11drv_stream_barrier_error( struct x11drv_stream_barrier *barrier, XErrorEvent *event )
 {
     return (barrier->create_serial && event->request_code == X_CreateWindow &&
             event->serial == barrier->create_serial) ||
@@ -892,7 +884,7 @@ static BOOL gdi_barrier_error( struct x11drv_gdi_barrier *barrier, XErrorEvent *
 static BOOL window_paint_error( struct x11drv_display_owner *owner, Display *display, XErrorEvent *event )
 {
     if (display == gdi_display &&
-        (gdi_barrier_error( &owner->paint_barrier, event ) || gdi_barrier_error( &owner->close_barrier, event )))
+        (x11drv_stream_barrier_error( &owner->paint_barrier, event ) || x11drv_stream_barrier_error( &owner->close_barrier, event )))
     {
         TRACE_(csperf)( "event=window_paint_read_error owner=%p endpoint=%lx serial=%lu request=%u error=%u\n",
                        owner, event->resourceid, event->serial, event->request_code, event->error_code );
@@ -926,6 +918,7 @@ static int display_owner_error( Display *display, XErrorEvent *event, void *arg 
     LIST_FOR_EACH_ENTRY( handler, &owner->native_errors, struct x11drv_error_handler, entry )
         if (handler->callback( display, event, handler->arg )) return 1;
     if (window_paint_error( owner, display, event )) return 1;
+    if (display != owner->display) return 0;
 
     /* An owned parent can already have destroyed its clip Window. */
     return owner->clip_window && event->request_code == X_DestroyWindow &&
@@ -957,7 +950,7 @@ static void close_display_owner( struct client_surface_native_work *work )
     assert( list_empty( &owner->native_errors ));
     /* The GUI thread never waits for gdi_display under loader serialization.
      * Its reparent/upload requests must finish before closing this connection. */
-    if (!poll_gdi_barrier( &owner->close_barrier )) return;
+    if (!x11drv_poll_stream_barrier( gdi_display, &owner->close_barrier, NULL )) return;
     XCloseDisplay( owner->display );
     X11DRV_unregister_error_handler( &owner->errors );
     TRACE_(csperf)( "event=display_close_return owner=%p display=%p\n", owner, owner->display );
@@ -1060,31 +1053,33 @@ void x11drv_display_owner_set_clipboard( struct x11drv_display_owner *owner )
     pthread_mutex_unlock( &error_handlers_mutex );
 }
 
-static void queue_gdi_barrier( struct x11drv_gdi_barrier *barrier )
+static void notify_display_owner_input( struct x11drv_display_owner *owner );
+
+void x11drv_queue_stream_barrier( Display *display, struct x11drv_stream_barrier *barrier )
 {
     XSetWindowAttributes attr = { .event_mask = StructureNotifyMask };
     Window window;
 
-    /* A transient Window supplies a response on gdi_display itself, including
+    /* A transient Window supplies a response on display itself, including
      * when CREATE fails. Issuing it does not wait for a native reply. */
-    XLockDisplay( gdi_display );
+    XLockDisplay( display );
     pthread_mutex_lock( &error_handlers_mutex );
-    barrier->create_serial = NextRequest( gdi_display );
+    barrier->create_serial = NextRequest( display );
     pthread_mutex_unlock( &error_handlers_mutex );
-    window = XCreateWindow( gdi_display, DefaultRootWindow(gdi_display), 0, 0, 1, 1,
+    window = XCreateWindow( display, DefaultRootWindow(display), 0, 0, 1, 1,
                             0, 0, InputOnly, CopyFromParent, CWEventMask, &attr );
     pthread_mutex_lock( &error_handlers_mutex );
     barrier->window = window;
-    barrier->serial = NextRequest( gdi_display );
+    barrier->serial = NextRequest( display );
     pthread_mutex_unlock( &error_handlers_mutex );
-    XDestroyWindow( gdi_display, window );
-    XFlush( gdi_display );
-    XUnlockDisplay( gdi_display );
+    XDestroyWindow( display, window );
+    XFlush( display );
+    XUnlockDisplay( display );
 }
 
-static Bool retired_gdi_barrier_event( Display *display, XEvent *event, char *arg )
+static Bool stream_barrier_event( Display *display, XEvent *event, char *arg )
 {
-    struct x11drv_gdi_barrier *barrier = (struct x11drv_gdi_barrier *)arg;
+    struct x11drv_stream_barrier *barrier = (struct x11drv_stream_barrier *)arg;
 
     if (event->type != DestroyNotify || event->xdestroywindow.window != barrier->window) return False;
     TRACE_(csperf)( "event=window_paint_read_event endpoint=%lx serial=%lu\n",
@@ -1092,18 +1087,20 @@ static Bool retired_gdi_barrier_event( Display *display, XEvent *event, char *ar
     return True;
 }
 
-static BOOL poll_gdi_barrier( struct x11drv_gdi_barrier *barrier )
+BOOL x11drv_poll_stream_barrier( Display *display, struct x11drv_stream_barrier *barrier,
+                                struct x11drv_display_owner *owner )
 {
-    struct pollfd fd = { .fd = ConnectionNumber(gdi_display), .events = POLLIN };
+    struct pollfd fd = { .fd = ConnectionNumber(display), .events = POLLIN };
     unsigned long processed;
     XEvent event;
 
     /* Consume only our DestroyNotify, or dispatch its error if CREATE failed.
      * Either response advances this connection past every old marker error. */
-    XCheckIfEvent( gdi_display, &event, retired_gdi_barrier_event, (char *)barrier );
-    XLockDisplay( gdi_display );
-    processed = LastKnownRequestProcessed( gdi_display );
-    XUnlockDisplay( gdi_display );
+    XCheckIfEvent( display, &event, stream_barrier_event, (char *)barrier );
+    if (owner) notify_display_owner_input( owner );
+    XLockDisplay( display );
+    processed = LastKnownRequestProcessed( display );
+    XUnlockDisplay( display );
     if ((long)(processed - barrier->serial) < 0)
     {
         if (poll( &fd, 1, 100 ) > 0) poll( NULL, 0, 1 );
@@ -1117,7 +1114,7 @@ static void drain_window_paint_errors( struct client_surface_native_work *work )
 {
     struct x11drv_display_owner *owner = CONTAINING_RECORD( work, struct x11drv_display_owner, paint_work );
 
-    if (!poll_gdi_barrier( &owner->paint_barrier )) return;
+    if (!x11drv_poll_stream_barrier( gdi_display, &owner->paint_barrier, NULL )) return;
     TRACE_(csperf)( "event=window_paint_errors_read owner=%p endpoint=%lx identity=%llu serial=%lu\n",
                    owner, owner->paint_window, (unsigned long long)owner->paint_identity, owner->paint_barrier.serial );
 }
@@ -1187,6 +1184,12 @@ static void notify_window_paint_owner( struct x11drv_display_owner *owner )
                                  (UINT)owner->paint_identity, owner->paint_identity >> 32 );
 }
 
+static void notify_display_owner_input( struct x11drv_display_owner *owner )
+{
+    /* Reading a receipt can buffer unrelated input and empty the native fd. */
+    if (XEventsQueued( owner->display, QueuedAlready )) notify_window_paint_owner( owner );
+}
+
 static void update_window_paint_admission( struct x11drv_display_owner *owner )
 {
     BOOL blocked = owner->paint_count == ARRAY_SIZE(owner->paints) ||
@@ -1238,7 +1241,7 @@ static void flush_window_paints( struct x11drv_display_owner *owner )
             owner->paint_draining = TRUE;
             TRACE_(csperf)( "event=window_paint_drain_queue owner=%p endpoint=%lx identity=%llu\n",
                            owner, owner->paint_window, (unsigned long long)owner->paint_identity );
-            queue_gdi_barrier( &owner->paint_barrier );
+            x11drv_queue_stream_barrier( gdi_display, &owner->paint_barrier );
             /* The subscribed root supplies the other connection's receipt. */
             XLockDisplay( owner->display );
             pthread_mutex_lock( &error_handlers_mutex );
@@ -1451,7 +1454,7 @@ static void process_window_paint_work( struct client_surface_native_work *work )
     pthread_mutex_unlock( &owner->paint_mutex );
     /* XCheckIfEvent may buffer unrelated input while reading a receipt. Keep
      * that input visible to the GUI even if its connection fd is now empty. */
-    if (XEventsQueued( owner->display, QueuedAlready )) notify_window_paint_owner( owner );
+    notify_display_owner_input( owner );
     /* Yield to the native FIFO after a bounded poll, without holding the
      * receipt lock while the GUI may submit another paint or detach. */
     if (pending && poll( &fd, 1, 100 ) > 0) poll( NULL, 0, 1 );
@@ -1546,7 +1549,7 @@ void X11DRV_ThreadDetach(void)
             owner->paint_retirement = reply->retirement;
         }
         SERVER_END_REQ;
-        queue_gdi_barrier( &owner->close_barrier );
+        x11drv_queue_stream_barrier( gdi_display, &owner->close_barrier );
         TRACE_(csperf)( "event=window_paint_detach owner=%p endpoint=%lx pending=%u\n",
                        owner, owner->paint_window, owner->paint_count );
         TRACE_(csperf)( "event=window_paint_retirement_queue owner=%p retirement=%llu serial=%lu\n",

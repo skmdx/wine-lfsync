@@ -183,6 +183,7 @@ struct x11drv_native_window
     struct client_surface_memory_scope memory;
     struct client_surface_native_work work;
     struct x11drv_error_handler errors;
+    struct x11drv_stream_barrier gdi_barrier, destroy_barrier;
     struct list desktop_entry;
     struct x11drv_display_owner *creator;
     struct x11drv_native_window *ancestor;
@@ -201,6 +202,10 @@ static BOOL root_owned;
 static int native_window_error( Display *display, XErrorEvent *event, void *arg )
 {
     struct x11drv_native_window *window = arg;
+
+    if (display == gdi_display && x11drv_stream_barrier_error( &window->gdi_barrier, event )) return 1;
+    if (display != window->display) return 0;
+    if (x11drv_stream_barrier_error( &window->destroy_barrier, event )) return 1;
 
     if (window->window && event->error_code == BadWindow && event->resourceid == window->window &&
         (event->request_code == X_DestroyWindow || event->request_code == X_UnmapWindow ||
@@ -223,13 +228,22 @@ static void destroy_native_window( struct client_surface_native_work *work )
 {
     struct x11drv_native_window *window = CONTAINING_RECORD( work, struct x11drv_native_window, work );
 
-    /* Complete GDI uses and client reparents before destroying their old
-     * ancestor. No registry or global expected-error lock spans native I/O. */
-    if (window->window) XSync( gdi_display, False );
-    if (window->window && !InterlockedCompareExchange( &window->destroyed, 0, 0 ))
-        XDestroyWindow( window->display, window->window );
-    if (window->colormap) XFreeColormap( window->display, window->colormap );
-    XSync( window->display, False );
+    /* The final reference follows every GDI use and client reparent. Keep
+     * both stream receipts in this owner; no shared Display is held while
+     * waiting for the server to process destruction. */
+    if (window->window && !window->gdi_barrier.complete)
+    {
+        if (!window->gdi_barrier.serial) x11drv_queue_stream_barrier( gdi_display, &window->gdi_barrier );
+        if (!x11drv_poll_stream_barrier( gdi_display, &window->gdi_barrier, NULL )) return;
+    }
+    if (!window->destroy_barrier.serial)
+    {
+        if (window->window && !InterlockedCompareExchange( &window->destroyed, 0, 0 ))
+            XDestroyWindow( window->display, window->window );
+        if (window->colormap) XFreeColormap( window->display, window->colormap );
+        x11drv_queue_stream_barrier( window->display, &window->destroy_barrier );
+    }
+    if (!x11drv_poll_stream_barrier( window->display, &window->destroy_barrier, window->creator )) return;
     x11drv_display_owner_unregister_error_handler( window->creator, &window->errors );
     TRACE_(csperf)( "event=native_window_destroy_return record=%p display=%p window=%lx lost=%d\n",
                    window, window->display, window->window, window->destroyed );
@@ -242,6 +256,11 @@ static void free_native_window( struct client_surface_native_work *work )
     struct x11drv_display_owner *creator = window->creator;
     ULONG_PTR identity = (ULONG_PTR)window;
 
+    if (!window->destroy_barrier.complete)
+    {
+        client_surface_submit_native_work( work );
+        return;
+    }
     pthread_mutex_lock( &native_window_mutex );
     if (native_root == window) native_root = NULL; /* retain root_owned until another root is selected */
     list_remove( &window->desktop_entry );

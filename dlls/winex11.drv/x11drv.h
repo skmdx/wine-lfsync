@@ -879,6 +879,19 @@ extern void move_resize_window( HWND hwnd, int dir, POINT pos );
 extern void x11drv_init_keyboard( Display *display );
 extern BOOL X11DRV_ProcessEvents( DWORD mask );
 
+/* Embedded in an admitted owner and retained until the stream has processed
+ * its marker. Polling consumes only this barrier's event, without a reply wait. */
+struct x11drv_stream_barrier
+{
+    Window window;
+    unsigned long create_serial, serial;
+    BOOL complete;
+};
+extern void x11drv_queue_stream_barrier( Display *display, struct x11drv_stream_barrier *barrier );
+extern BOOL x11drv_poll_stream_barrier( Display *display, struct x11drv_stream_barrier *barrier,
+                                       struct x11drv_display_owner *owner );
+extern BOOL x11drv_stream_barrier_error( struct x11drv_stream_barrier *barrier, XErrorEvent *event );
+
 typedef int (*x11drv_error_callback)( Display *display, XErrorEvent *event, void *arg );
 
 /* A private connection may own its error sink for its entire lifetime. The
