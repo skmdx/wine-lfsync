@@ -1659,7 +1659,9 @@ struct x11drv_image
     x11drv_xshm_info_t    shminfo;   /* XSHM extension info */
     struct client_surface_memory_scope memory;
     UINT64 bytes;
-    BOOL retiring;
+    BOOL retiring, attaching, direct;
+    unsigned long attach_serial;
+    unsigned int attach_error;
     LONG refs, pending;
     DWORD thread;
     struct client_surface_native_work work;
@@ -1684,16 +1686,12 @@ static struct x11drv_window_surface *get_x11_surface( struct window_surface *sur
 }
 
 #ifdef HAVE_LIBXXSHM
-static int xshm_error_handler( Display *display, XErrorEvent *event, void *arg )
-{
-    return 1;  /* FIXME: should check event contents */
-}
-
 static XImage *create_shm_image( const XVisualInfo *vis, int width, int height, x11drv_xshm_info_t *shminfo )
 {
     XImage *image;
 
     shminfo->shmid = -1;
+    if (!XShmQueryExtension( gdi_display )) return NULL;
     image = XShmCreateImage( gdi_display, vis->visual, vis->depth, ZPixmap, NULL, shminfo, width, height );
     if (!image) return NULL;
     if (image->bytes_per_line & 3) goto failed;  /* we need 32-bit alignment */
@@ -1704,19 +1702,14 @@ static XImage *create_shm_image( const XVisualInfo *vis, int width, int height, 
     shminfo->shmaddr = shmat( shminfo->shmid, 0, 0 );
     if (shminfo->shmaddr != (char *)-1)
     {
-        BOOL ok;
-
         shminfo->readOnly = True;
-        X11DRV_expect_error( gdi_display, xshm_error_handler, NULL );
-        ok = (XShmAttach( gdi_display, shminfo ) != 0);
-        XSync( gdi_display, False );
-        if (!X11DRV_check_error() && ok)
-        {
-            image->data = shminfo->shmaddr;
-            shmctl( shminfo->shmid, IPC_RMID, 0 );
-            return image;
-        }
-        shmdt( shminfo->shmaddr );
+        image->data = shminfo->shmaddr;
+#ifdef __linux__
+        /* Linux permits the server to attach a segment marked for deletion.
+         * Keep process death during the asynchronous attach from leaking it. */
+        shmctl( shminfo->shmid, IPC_RMID, 0 );
+#endif
+        return image;
     }
     shmctl( shminfo->shmid, IPC_RMID, 0 );
     shminfo->shmid = -1;
@@ -1724,6 +1717,20 @@ static XImage *create_shm_image( const XVisualInfo *vis, int width, int height, 
 failed:
     XDestroyImage( image );
     return NULL;
+}
+
+static BOOL attach_shm_image( x11drv_xshm_info_t *shminfo )
+{
+    return XShmAttach( gdi_display, shminfo ) != 0;
+}
+
+static void finish_shm_attach( XImage *image, x11drv_xshm_info_t *shminfo, BOOL success )
+{
+    shmctl( shminfo->shmid, IPC_RMID, 0 );
+    if (success) return;
+    shmdt( shminfo->shmaddr );
+    shminfo->shmid = -1;
+    image->data = NULL;
 }
 
 static BOOL destroy_shm_image( XImage *image, x11drv_xshm_info_t *shminfo )
@@ -1754,6 +1761,15 @@ static XImage *create_shm_image( const XVisualInfo *vis, int width, int height, 
 {
     shminfo->shmid = -1;
     return NULL;
+}
+
+static BOOL attach_shm_image( x11drv_xshm_info_t *shminfo )
+{
+    return FALSE;
+}
+
+static void finish_shm_attach( XImage *image, x11drv_xshm_info_t *shminfo, BOOL success )
+{
 }
 
 static BOOL destroy_shm_image( XImage *image, x11drv_xshm_info_t *shminfo )
@@ -1804,11 +1820,18 @@ static UINT get_dib_d3dddifmt( const BITMAPINFO *info )
     return D3DDDIFMT_UNKNOWN;
 }
 
-static void x11drv_image_queue( struct x11drv_image *image )
+static void x11drv_image_queue( struct x11drv_image *image, BOOL attach )
 {
+    XLockDisplay( gdi_display );
     memset( &image->barrier, 0, sizeof(image->barrier) );
     x11drv_display_owner_register_error_handler( NULL, &image->errors );
+    if (attach)
+    {
+        image->attach_serial = XNextRequest( gdi_display );
+        if (!attach_shm_image( &image->shminfo )) image->attach_error = BadAlloc;
+    }
     x11drv_queue_stream_barrier( gdi_display, &image->barrier );
+    XUnlockDisplay( gdi_display );
     client_surface_submit_native_work( &image->work );
 }
 
@@ -1830,7 +1853,7 @@ static void x11drv_image_destroy( struct x11drv_image *image )
         XDestroyImage( image->ximage );
         image->ximage = NULL;
     }
-    if (image->retiring) x11drv_image_queue( image );
+    if (image->retiring) x11drv_image_queue( image, FALSE );
     else x11drv_image_free( image );
 }
 
@@ -1838,6 +1861,11 @@ static int x11drv_image_error( Display *display, XErrorEvent *event, void *arg )
 {
     struct x11drv_image *image = arg;
 
+    if (image->attach_serial && event->serial == image->attach_serial)
+    {
+        image->attach_error = event->error_code;
+        return 1;
+    }
     return x11drv_stream_barrier_error( &image->barrier, event );
 }
 
@@ -1863,6 +1891,13 @@ static void x11drv_image_read_finished( struct client_surface_native_work *work 
     {
         x11drv_image_free( image );
         return;
+    }
+    if (image->attaching)
+    {
+        finish_shm_attach( image->ximage, &image->shminfo, !image->attach_error );
+        if (image->attach_error) WARN( "SHM attach failed with error %u, using image copies\n", image->attach_error );
+        image->attaching = FALSE;
+        image->attach_serial = 0;
     }
     InterlockedExchange( &image->pending, FALSE );
     /* Only a wake is transferred; no surface or bitmap is borrowed by the worker. */
@@ -1909,6 +1944,15 @@ static struct x11drv_image *x11drv_image_create( HWND hwnd, const BITMAPINFO *in
         if (!(image->ximage = XCreateImage( gdi_display, vis->visual, vis->depth, ZPixmap,
                                             0, NULL, width, height, 32, 0 ))) goto failed;
         if (!(image->ximage->data = malloc( info->bmiHeader.biSizeImage ))) goto failed;
+    }
+    image->direct = image->shminfo.shmid == -1;
+    if (!image->direct)
+    {
+        image->attaching = TRUE;
+        image->thread = GetCurrentThreadId();
+        InterlockedIncrement( &image->refs );
+        InterlockedExchange( &image->pending, TRUE );
+        x11drv_image_queue( image, TRUE );
     }
 
     return image;
@@ -1974,12 +2018,14 @@ static BOOL x11drv_surface_flush( struct window_surface *window_surface, const R
     struct x11drv_window_surface *surface = get_x11_surface( window_surface );
     XImage *ximage = surface->image->ximage;
     const unsigned char *src = color_bits;
-    unsigned char *dst = (unsigned char *)ximage->data;
+    unsigned char *dst;
 
     surface->shape_changed |= shape_changed;
     /* The CPU bitmap remains writable while the server consumes this image.
      * Retain dirty bounds and shape changes until the transfer slot is free. */
     if (InterlockedCompareExchange( &surface->image->pending, 0, 0 )) return FALSE;
+    if (!ximage->data && !(ximage->data = malloc( color_info->bmiHeader.biSizeImage ))) return FALSE;
+    dst = (unsigned char *)ximage->data;
 
     if (alpha_bits == -1)
     {
@@ -2043,7 +2089,7 @@ static BOOL x11drv_surface_flush( struct window_surface *window_surface, const R
         InterlockedIncrement( &image->refs );
         InterlockedExchange( &image->pending, TRUE );
         image->thread = GetCurrentThreadId();
-        x11drv_image_queue( image );
+        x11drv_image_queue( image, FALSE );
     }
 
     XFlush( gdi_display );
@@ -2109,7 +2155,7 @@ static struct window_surface *create_surface( HWND hwnd, Window window, struct x
     if ((byteswap = image_needs_byteswap( image->ximage, is_r8g8b8( vis ), info->bmiHeader.biBitCount )) ||
         info->bmiHeader.biBitCount <= 8 || !(d3d_format = get_dib_d3dddifmt( info )))
         WARN( "Cannot use direct rendering, falling back to copies\n" );
-    else if (image->shminfo.shmid == -1)
+    else if (image->direct)
     {
         D3DKMT_CREATEDCFROMMEMORY desc =
         {
