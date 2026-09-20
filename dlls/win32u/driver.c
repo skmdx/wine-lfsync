@@ -795,7 +795,7 @@ static BOOL nulldrv_ProcessEvents( DWORD mask )
     return FALSE;
 }
 
-static void nulldrv_ReleaseDC( HWND hwnd, HDC hdc )
+static void nulldrv_ReleaseDC( HWND hwnd, PHYSDEV physdev )
 {
 }
 

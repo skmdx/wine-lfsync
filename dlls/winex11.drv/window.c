@@ -3681,7 +3681,7 @@ Window X11DRV_get_whole_window( HWND hwnd )
 void X11DRV_GetDC( HDC hdc, HWND hwnd, HWND top, const RECT *win_rect,
                    const RECT *top_rect, DWORD flags, UINT scale_num, UINT scale_den )
 {
-    struct x11drv_escape_set_drawable escape;
+    struct x11drv_escape_set_drawable escape = {0};
     struct x11drv_win_data *data;
 
     /* The owner compositor performs the copies.  This DC supplies only the
@@ -3702,6 +3702,7 @@ void X11DRV_GetDC( HDC hdc, HWND hwnd, HWND top, const RECT *win_rect,
     if ((data = get_win_data( top )))
     {
         escape.drawable = data->whole_window;
+        escape.native_window = x11drv_native_window_acquire( data->native_window );
         escape.visual = data->vis;
         /* special case: when repainting the root window, clip out top-level windows */
         if (top == hwnd && data->whole_window == root_window) escape.mode = ClipByChildren;
@@ -3713,17 +3714,22 @@ void X11DRV_GetDC( HDC hdc, HWND hwnd, HWND top, const RECT *win_rect,
         escape.visual = default_visual; /* FIXME: use the right visual for other process window */
     }
 
-    if (!escape.drawable) return; /* don't create a GC for foreign windows */
+    if (!escape.drawable)  /* don't create a GC for foreign windows */
+    {
+        x11drv_native_window_release( escape.native_window );
+        return;
+    }
     NtGdiExtEscape( hdc, NULL, 0, X11DRV_ESCAPE, sizeof(escape), (LPSTR)&escape, 0, NULL );
+    x11drv_native_window_release( escape.native_window );
 }
 
 
 /***********************************************************************
  *		X11DRV_ReleaseDC  (X11DRV.@)
  */
-void X11DRV_ReleaseDC( HWND hwnd, HDC hdc )
+void X11DRV_ReleaseDC( HWND hwnd, PHYSDEV physdev )
 {
-    struct x11drv_escape_set_drawable escape;
+    struct x11drv_escape_set_drawable escape = {0};
 
     escape.code = X11DRV_SET_DRAWABLE;
     escape.drawable = root_window;
@@ -3731,7 +3737,7 @@ void X11DRV_ReleaseDC( HWND hwnd, HDC hdc )
     escape.readback_scale_num = escape.readback_scale_den = 1;
     escape.dc_rect = NtUserGetVirtualScreenRect( MDT_DEFAULT );
     OffsetRect( &escape.dc_rect, -2 * escape.dc_rect.left, -2 * escape.dc_rect.top );
-    NtGdiExtEscape( hdc, NULL, 0, X11DRV_ESCAPE, sizeof(escape), (LPSTR)&escape, 0, NULL );
+    physdev->funcs->pExtEscape( physdev, X11DRV_ESCAPE, sizeof(escape), (LPSTR)&escape, 0, NULL );
 }
 
 

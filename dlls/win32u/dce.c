@@ -1012,10 +1012,18 @@ static void update_visible_region( struct dce *dce )
  */
 static void release_dce( struct dce *dce )
 {
+    DC *dc;
+
     if (!dce->hwnd) return;  /* already released */
 
     set_visible_region( dce->hdc, 0, &dummy_surface.rect, &dummy_surface.rect, &dummy_surface );
-    user_driver->pReleaseDC( dce->hwnd, dce->hdc );
+    /* Cache DCs may already be disabled. Detach driver resources through
+     * the internal update path, without revalidating the dying window. */
+    if ((dc = get_dc_ptr_for_update( dce->hdc )))
+    {
+        user_driver->pReleaseDC( dce->hwnd, GET_DC_PHYSDEV( dc, pExtEscape ) );
+        release_dc_ptr( dc );
+    }
 
     if (dce->clip_rgn) NtGdiDeleteObjectApp( dce->clip_rgn );
     dce->clip_rgn = 0;

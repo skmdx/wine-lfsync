@@ -137,6 +137,7 @@ static BOOL X11DRV_DeleteDC( PHYSDEV dev )
     X11DRV_PDEVICE *physDev = get_x11drv_dev( dev );
 
     XFreeGC( gdi_display, physDev->gc );
+    x11drv_native_window_release( physDev->native_window );
     free( physDev );
     return TRUE;
 }
@@ -223,11 +224,15 @@ static INT X11DRV_ExtEscape( PHYSDEV dev, INT escape, INT in_count, LPCVOID in_d
                 if (in_count >= sizeof(struct x11drv_escape_set_drawable))
                 {
                     const struct x11drv_escape_set_drawable *data = in_data;
+                    struct x11drv_native_window *previous = physDev->native_window;
+
+                    physDev->native_window = x11drv_native_window_acquire( data->native_window );
                     physDev->dc_rect = data->dc_rect;
                     physDev->readback_scale_num = data->readback_scale_num ? data->readback_scale_num : 1;
                     physDev->readback_scale_den = data->readback_scale_den ? data->readback_scale_den : 1;
                     physDev->drawable = data->drawable;
                     XFreeGC( gdi_display, physDev->gc );
+                    x11drv_native_window_release( previous );
                     physDev->gc = XCreateGC( gdi_display, physDev->drawable, 0, NULL );
                     XSetGraphicsExposures( gdi_display, physDev->gc, False );
                     XSetSubwindowMode( gdi_display, physDev->gc, data->mode );

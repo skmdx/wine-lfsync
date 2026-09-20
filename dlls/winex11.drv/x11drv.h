@@ -124,6 +124,7 @@ typedef struct
     struct gdi_physdev dev;
     GC            gc;          /* X Window GC */
     Drawable      drawable;
+    struct x11drv_native_window *native_window; /* owned lifetime of a local Window drawable */
     RECT          dc_rect;       /* DC rectangle relative to drawable */
     UINT          readback_scale_num, readback_scale_den; /* virtual DC to native pixels */
     RECT         *bounds;        /* Graphics bounds */
@@ -235,7 +236,7 @@ extern void X11DRV_DestroyWindow( HWND hwnd );
 extern void X11DRV_FlashWindowEx( PFLASHWINFO pfinfo );
 extern void X11DRV_GetDC( HDC hdc, HWND hwnd, HWND top, const RECT *win_rect,
                          const RECT *top_rect, DWORD flags, UINT scale_num, UINT scale_den );
-extern void X11DRV_ReleaseDC( HWND hwnd, HDC hdc );
+extern void X11DRV_ReleaseDC( HWND hwnd, PHYSDEV physdev );
 extern BOOL X11DRV_ScrollDC( HDC hdc, INT dx, INT dy, HRGN update );
 extern void X11DRV_SetCapture( HWND hwnd, UINT flags, HWND previous );
 extern void X11DRV_SetDesktopWindow( HWND hwnd );
@@ -382,6 +383,7 @@ struct x11drv_escape_set_drawable
 {
     enum x11drv_escape_codes code;         /* escape code (X11DRV_SET_DRAWABLE) */
     Drawable                 drawable;     /* X drawable */
+    struct x11drv_native_window *native_window; /* borrowed for this escape; the DC acquires its own reference */
     int                      mode;         /* ClipByChildren or IncludeInferiors */
     RECT                     dc_rect;      /* DC rectangle relative to drawable */
     UINT                     readback_scale_num, readback_scale_den;
