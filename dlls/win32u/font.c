@@ -5807,13 +5807,13 @@ BOOL WINAPI NtGdiExtTextOutW( HDC hdc, INT x, INT y, UINT flags, const RECT *lpr
     SIZE sz;
     RECT rc;
     POINT *deltas = NULL, width = {0, 0};
-    DC * dc = get_dc_ptr( hdc );
+    DC *dc;
     PHYSDEV physdev;
     INT breakRem;
     static int quietfixme = 0;
 
-    if (!dc) return FALSE;
     if (count > INT_MAX) return FALSE;
+    if (!(dc = GET_DC_FOR_WRITE( hdc, pExtTextOut ))) return FALSE;
 
     align = dc->attr->text_align;
     breakRem = dc->breakRem;

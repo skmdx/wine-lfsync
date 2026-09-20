@@ -537,7 +537,7 @@ BOOL WINAPI NtGdiPatBlt( HDC hdc, INT left, INT top, INT width, INT height, DWOR
     BOOL ret = FALSE;
 
     if (rop_uses_src( rop )) return FALSE;
-    if ((dc = get_dc_ptr( hdc )))
+    if ((dc = GET_DC_FOR_WRITE( hdc, pPatBlt )))
     {
         struct bitblt_coords dst;
 
@@ -593,7 +593,7 @@ BOOL WINAPI NtGdiStretchBlt( HDC hdcDst, INT xDst, INT yDst, INT widthDst, INT h
 
     if (!rop_uses_src( rop )) return NtGdiPatBlt( hdcDst, xDst, yDst, widthDst, heightDst, rop );
 
-    if (!(dcDst = get_dc_ptr( hdcDst ))) return FALSE;
+    if (!(dcDst = GET_DC_FOR_WRITE( hdcDst, pStretchBlt ))) return FALSE;
 
     if ((dcSrc = get_dc_ptr( hdcSrc )))
     {
@@ -966,7 +966,7 @@ BOOL WINAPI NtGdiAlphaBlend( HDC hdcDst, int xDst, int yDst, int widthDst, int h
     dcSrc = get_dc_ptr( hdcSrc );
     if (!dcSrc) return FALSE;
 
-    if ((dcDst = get_dc_ptr( hdcDst )))
+    if ((dcDst = GET_DC_FOR_WRITE( hdcDst, pAlphaBlend )))
     {
         struct bitblt_coords src, dst;
 

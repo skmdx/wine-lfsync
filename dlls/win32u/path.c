@@ -701,7 +701,7 @@ HRGN WINAPI NtGdiPathToRegion( HDC hdc )
 BOOL WINAPI NtGdiFillPath( HDC hdc )
 {
     BOOL ret = FALSE;
-    DC *dc = get_dc_ptr( hdc );
+    DC *dc = GET_DC_FOR_WRITE( hdc, pFillPath );
 
     if (dc)
     {
@@ -1909,7 +1909,7 @@ static struct gdi_path *PATH_WidenPath(DC *dc)
 BOOL WINAPI NtGdiStrokeAndFillPath( HDC hdc )
 {
     BOOL ret = FALSE;
-    DC *dc = get_dc_ptr( hdc );
+    DC *dc = GET_DC_FOR_WRITE( hdc, pStrokeAndFillPath );
 
     if (dc)
     {
@@ -1930,7 +1930,7 @@ BOOL WINAPI NtGdiStrokeAndFillPath( HDC hdc )
 BOOL WINAPI NtGdiStrokePath( HDC hdc )
 {
     BOOL ret = FALSE;
-    DC *dc = get_dc_ptr( hdc );
+    DC *dc = GET_DC_FOR_WRITE( hdc, pStrokePath );
 
     if (dc)
     {

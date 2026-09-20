@@ -317,6 +317,23 @@ DC *get_dc_ptr( HDC hdc )
     return get_dc_ptr_ex( hdc, FALSE );
 }
 
+/* Drawing must join the scene's content ordering before issuing any native
+ * request. Memory DCs and nested drawing reuse the ordinary reference path. */
+DC *get_dc_ptr_for_write( HDC hdc, size_t function )
+{
+    DC *dc = get_dc_ptr( hdc );
+
+    /* Path recording does not change drawable contents. The eventual stroke
+     * or fill enrolls its actual destination instead. */
+    if (dc && get_physdev_entry_point( dc->physDev, function )->funcs != &path_driver &&
+        !begin_dc_write( dc ))
+    {
+        release_dc_ptr( dc );
+        return NULL;
+    }
+    return dc;
+}
+
 /* Internal visible-region updates must also detach surfaces from disabled
  * cache DCs. Keep the normal reference and thread ownership checks without
  * making the DC available to application GDI calls. */
@@ -333,6 +350,14 @@ void release_dc_ptr( DC *dc )
 {
     LONG ref;
 
+    if (dc->write_paint && dc->write_ref == dc->refcount)
+    {
+        struct window_paint *paint = dc->write_paint;
+
+        dc->write_paint = NULL;
+        dc->write_ref = 0;
+        end_window_paint( paint, TRUE );
+    }
     dc->thread = 0;
     ref = InterlockedDecrement( &dc->refcount );
     assert( ref >= 0 );

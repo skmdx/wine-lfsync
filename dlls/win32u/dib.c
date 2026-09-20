@@ -642,7 +642,7 @@ INT WINAPI NtGdiStretchDIBitsInternal( HDC hdc, INT xDst, INT yDst, INT widthDst
         return 0;
     }
 
-    if ((dc = get_dc_ptr( hdc )))
+    if ((dc = GET_DC_FOR_WRITE( hdc, pStretchDIBits )))
     {
         update_dc( dc );
         physdev = GET_DC_PHYSDEV( dc, pStretchDIBits );
@@ -904,7 +904,7 @@ INT WINAPI NtGdiSetDIBitsToDeviceInternal( HDC hdc, INT xDest, INT yDest, DWORD 
         return 0;
     }
 
-    if ((dc = get_dc_ptr( hdc )))
+    if ((dc = GET_DC_FOR_WRITE( hdc, pSetDIBitsToDevice )))
     {
         update_dc( dc );
         physdev = GET_DC_PHYSDEV( dc, pSetDIBitsToDevice );

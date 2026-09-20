@@ -256,7 +256,7 @@ BOOL nulldrv_PolylineTo( PHYSDEV dev, const POINT *points, INT count )
  */
 BOOL WINAPI NtGdiLineTo( HDC hdc, INT x, INT y )
 {
-    DC * dc = get_dc_ptr( hdc );
+    DC * dc = GET_DC_FOR_WRITE( hdc, pLineTo );
     PHYSDEV physdev;
     BOOL ret;
 
@@ -310,7 +310,7 @@ BOOL WINAPI NtGdiArcInternal( UINT type, HDC hdc, INT left, INT top, INT right,
     BOOL ret;
     DC *dc;
 
-    if (!(dc = get_dc_ptr( hdc ))) return FALSE;
+    if (!(dc = GET_DC_FOR_WRITE( hdc, pArc ))) return FALSE;
     update_dc( dc );
 
     switch (type)
@@ -371,7 +371,7 @@ BOOL WINAPI NtGdiEllipse( HDC hdc, INT left, INT top, INT right, INT bottom )
 {
     BOOL ret;
     PHYSDEV physdev;
-    DC * dc = get_dc_ptr( hdc );
+    DC * dc = GET_DC_FOR_WRITE( hdc, pEllipse );
 
     if (!dc) return FALSE;
     update_dc( dc );
@@ -389,7 +389,7 @@ BOOL WINAPI NtGdiRectangle( HDC hdc, INT left, INT top, INT right, INT bottom )
 {
     PHYSDEV physdev;
     BOOL ret;
-    DC * dc = get_dc_ptr( hdc );
+    DC * dc = GET_DC_FOR_WRITE( hdc, pRectangle );
 
     if (!dc) return FALSE;
     update_dc( dc );
@@ -408,7 +408,7 @@ BOOL WINAPI NtGdiRoundRect( HDC hdc, INT left, INT top, INT right,
 {
     PHYSDEV physdev;
     BOOL ret;
-    DC *dc = get_dc_ptr( hdc );
+    DC *dc = GET_DC_FOR_WRITE( hdc, pRoundRect );
 
     if (!dc) return FALSE;
     update_dc( dc );
@@ -425,7 +425,7 @@ COLORREF WINAPI NtGdiSetPixel( HDC hdc, INT x, INT y, COLORREF color )
 {
     PHYSDEV physdev;
     COLORREF ret;
-    DC * dc = get_dc_ptr( hdc );
+    DC * dc = GET_DC_FOR_WRITE( hdc, pSetPixel );
 
     if (!dc) return CLR_INVALID;
     update_dc( dc );
@@ -509,7 +509,7 @@ BOOL WINAPI NtGdiFillRgn( HDC hdc, HRGN hrgn, HBRUSH hbrush )
 {
     PHYSDEV physdev;
     BOOL retval;
-    DC * dc = get_dc_ptr( hdc );
+    DC * dc = GET_DC_FOR_WRITE( hdc, pFillRgn );
 
     if (!dc) return FALSE;
     update_dc( dc );
@@ -527,7 +527,7 @@ BOOL WINAPI NtGdiFrameRgn( HDC hdc, HRGN hrgn, HBRUSH hbrush, INT width, INT hei
 {
     PHYSDEV physdev;
     BOOL ret;
-    DC *dc = get_dc_ptr( hdc );
+    DC *dc = GET_DC_FOR_WRITE( hdc, pFrameRgn );
 
     if (!dc) return FALSE;
     update_dc( dc );
@@ -545,7 +545,7 @@ BOOL WINAPI NtGdiInvertRgn( HDC hdc, HRGN hrgn )
 {
     PHYSDEV physdev;
     BOOL ret;
-    DC *dc = get_dc_ptr( hdc );
+    DC *dc = GET_DC_FOR_WRITE( hdc, pInvertRgn );
 
     if (!dc) return FALSE;
     update_dc( dc );
@@ -570,7 +570,7 @@ ULONG WINAPI NtGdiPolyPolyDraw( HDC hdc, const POINT *points, const ULONG *count
         return HandleToULong( create_polypolygon_region( points, (const INT *)counts, count,
                                                          HandleToULong(hdc), NULL ));
 
-    if (!(dc = get_dc_ptr( hdc ))) return FALSE;
+    if (!(dc = GET_DC_FOR_WRITE( hdc, pPolyDraw ))) return FALSE;
     update_dc( dc );
 
     switch (function)
@@ -633,7 +633,7 @@ BOOL WINAPI NtGdiExtFloodFill( HDC hdc, INT x, INT y, COLORREF color, UINT fill_
 {
     PHYSDEV physdev;
     BOOL ret;
-    DC * dc = get_dc_ptr( hdc );
+    DC * dc = GET_DC_FOR_WRITE( hdc, pExtFloodFill );
 
     if (!dc) return FALSE;
     update_dc( dc );
@@ -658,7 +658,7 @@ BOOL WINAPI NtGdiAngleArc( HDC hdc, INT x, INT y, DWORD dwRadius, DWORD start_an
     if( (signed int)dwRadius < 0 )
 	return FALSE;
 
-    dc = get_dc_ptr( hdc );
+    dc = GET_DC_FOR_WRITE( hdc, pAngleArc );
     if(!dc) return FALSE;
 
     update_dc( dc );
@@ -679,7 +679,7 @@ BOOL WINAPI NtGdiAngleArc( HDC hdc, INT x, INT y, DWORD dwRadius, DWORD start_an
  */
 BOOL WINAPI NtGdiPolyDraw( HDC hdc, const POINT *points, const BYTE *types, DWORD count )
 {
-    DC *dc = get_dc_ptr( hdc );
+    DC *dc = GET_DC_FOR_WRITE( hdc, pPolyDraw );
     PHYSDEV physdev;
     BOOL result;
 
@@ -909,7 +909,7 @@ BOOL WINAPI NtGdiGradientFill( HDC hdc, TRIVERTEX *vert_array, ULONG nvert,
     for (i = 0; i < ngrad * (mode == GRADIENT_FILL_TRIANGLE ? 3 : 2); i++)
         if (((ULONG *)grad_array)[i] >= nvert) return FALSE;
 
-    if (!(dc = get_dc_ptr( hdc ))) return FALSE;
+    if (!(dc = GET_DC_FOR_WRITE( hdc, pGradientFill ))) return FALSE;
     update_dc( dc );
     physdev = GET_DC_PHYSDEV( dc, pGradientFill );
     ret = physdev->funcs->pGradientFill( physdev, vert_array, nvert, grad_array, ngrad, mode );

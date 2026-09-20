@@ -58,6 +58,8 @@ typedef struct tagDC
     DC_ATTR     *attr;             /* DC attributes accessible by client */
     struct tagDC *saved_dc;
     struct dce  *dce;              /* associated dce, if any */
+    struct window_paint *write_paint; /* receipt for an outermost GDI writer */
+    LONG         write_ref;        /* DC reference level that owns the receipt */
     UINT         bounds_enabled:1; /* bounds tracking is enabled */
     UINT         path_open:1;      /* path is currently open (only for saved DCs) */
     UINT         is_display:1;     /* DC is for display device */
@@ -180,6 +182,8 @@ static inline HRGN get_dc_region( DC *dc )
 extern DC *alloc_dc_ptr( DWORD magic );
 extern void free_dc_ptr( DC *dc );
 extern DC *get_dc_ptr( HDC hdc );
+extern DC *get_dc_ptr_for_write( HDC hdc, size_t function );
+#define GET_DC_FOR_WRITE(hdc,func) get_dc_ptr_for_write( hdc, FIELD_OFFSET(struct gdi_dc_funcs,func) )
 extern DC *get_dc_ptr_for_update( HDC hdc );
 extern void release_dc_ptr( DC *dc );
 extern BOOL is_dc_display( HDC hdc );
@@ -430,6 +434,7 @@ extern HRGN create_polypolygon_region( const POINT *pts, const INT *count, INT n
 
 /* dce.c */
 extern BOOL delete_dce( struct dce *dce );
+extern BOOL begin_dc_write( DC *dc );
 extern void update_dc( DC *dc );
 
 #define RGN_DEFAULT_RECTS 4

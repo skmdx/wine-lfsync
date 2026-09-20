@@ -1997,6 +1997,28 @@ failed:
     return NULL;
 }
 
+/* Enroll an individual operation, not the lifetime of a retained DC. An
+ * enclosing paint already owns the native receipt and surface flushes. */
+BOOL begin_dc_write( DC *dc )
+{
+    struct window_paint *paint;
+    HWND hwnd;
+
+    if (!dc->dce || dc->write_paint) return TRUE;
+    user_lock();
+    hwnd = dc->dce ? dc->dce->hwnd : 0;
+    user_unlock();
+    if (!hwnd || hwnd == get_desktop_window()) return TRUE;
+    if (user_driver->pWindowPaint( hwnd, WINDOW_PAINT_QUERY, 0 ) != STATUS_SUCCESS) return TRUE;
+    LIST_FOR_EACH_ENTRY( paint, &get_user_thread_info()->window_paints, struct window_paint, entry )
+        if (paint->hwnd == hwnd && !paint->ended && !paint->cancelled) return TRUE;
+    if (!(dc->write_paint = begin_window_paint( hwnd ))) return FALSE;
+    dc->write_ref = dc->refcount;
+    TRACE_(csperf)( "event=dc_write_begin hwnd=%p hdc=%p token=%llu ref=%d\n",
+                   hwnd, dc->hSelf, (unsigned long long)dc->write_paint->token, dc->write_ref );
+    return TRUE;
+}
+
 void end_window_paint( struct window_paint *paint, BOOL success )
 {
     NTSTATUS status;

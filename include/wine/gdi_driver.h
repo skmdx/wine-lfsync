@@ -731,6 +731,7 @@ struct gdi_device_manager
 #define WINDOW_PAINT_RESERVE 0
 #define WINDOW_PAINT_SUBMIT  1
 #define WINDOW_PAINT_CANCEL  2
+#define WINDOW_PAINT_QUERY   3  /* query receipt support without native I/O */
 
 struct vulkan_driver_funcs;
 struct opengl_driver_funcs;

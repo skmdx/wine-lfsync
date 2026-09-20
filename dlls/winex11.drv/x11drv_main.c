@@ -1488,6 +1488,7 @@ NTSTATUS X11DRV_WindowPaint( HWND hwnd, UINT operation, UINT64 token )
     struct x11drv_display_owner *owner;
     NTSTATUS status;
 
+    if (operation == WINDOW_PAINT_QUERY) return STATUS_SUCCESS;
     if (!token || operation > WINDOW_PAINT_CANCEL) return STATUS_INVALID_PARAMETER;
     if (!data && operation == WINDOW_PAINT_CANCEL) return STATUS_SUCCESS;
     if (!data) data = x11drv_init_thread_data();
