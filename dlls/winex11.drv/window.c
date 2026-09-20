@@ -4357,6 +4357,9 @@ LRESULT X11DRV_WindowMessage( HWND hwnd, UINT msg, WPARAM wp, LPARAM lp )
 
     switch(msg)
     {
+    case WM_X11DRV_WINDOW_PAINT_READY:
+        x11drv_window_paint_ready( (UINT64)(UINT)wp | ((UINT64)(UINT)lp << 32) );
+        return 0;
     case WM_X11DRV_CLIENT_SURFACE_POOL:
     {
         UINT64 serial = (UINT64)(UINT)wp | ((UINT64)(UINT)lp << 32);

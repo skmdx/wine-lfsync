@@ -338,6 +338,7 @@ DECL_HANDLER(complete_client_surface_direct_plan);
 DECL_HANDLER(request_client_surface_owner_repair);
 DECL_HANDLER(resolve_client_surface_scene_sources);
 DECL_HANDLER(set_window_present_rect);
+DECL_HANDLER(set_queue_paint_blocked);
 
 typedef void (*req_handler)( const void *req, void *reply );
 static const req_handler req_handlers[REQ_NB_REQUESTS] =
@@ -673,6 +674,7 @@ static const req_handler req_handlers[REQ_NB_REQUESTS] =
     (req_handler)req_request_client_surface_owner_repair,
     (req_handler)req_resolve_client_surface_scene_sources,
     (req_handler)req_set_window_present_rect,
+    (req_handler)req_set_queue_paint_blocked,
 };
 
 C_ASSERT( sizeof(abstime_t) == 8 );
@@ -2586,3 +2588,5 @@ C_ASSERT( offsetof(struct set_window_present_rect_request, handle) == 12 );
 C_ASSERT( offsetof(struct set_window_present_rect_request, rect) == 16 );
 C_ASSERT( offsetof(struct set_window_present_rect_request, dpi) == 32 );
 C_ASSERT( sizeof(struct set_window_present_rect_request) == 40 );
+C_ASSERT( offsetof(struct set_queue_paint_blocked_request, blocked) == 12 );
+C_ASSERT( sizeof(struct set_queue_paint_blocked_request) == 16 );

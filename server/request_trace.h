@@ -3808,6 +3808,11 @@ static void dump_set_window_present_rect_request( const struct set_window_presen
     dump_ratio( ", dpi=", &req->dpi );
 }
 
+static void dump_set_queue_paint_blocked_request( const struct set_queue_paint_blocked_request *req )
+{
+    fprintf( stderr, " blocked=%d", req->blocked );
+}
+
 typedef void (*dump_func)( const void *req );
 
 static const dump_func req_dumpers[REQ_NB_REQUESTS] =
@@ -4143,6 +4148,7 @@ static const dump_func req_dumpers[REQ_NB_REQUESTS] =
     (dump_func)dump_request_client_surface_owner_repair_request,
     (dump_func)dump_resolve_client_surface_scene_sources_request,
     (dump_func)dump_set_window_present_rect_request,
+    (dump_func)dump_set_queue_paint_blocked_request,
 };
 
 static const dump_func reply_dumpers[REQ_NB_REQUESTS] =
@@ -4477,6 +4483,7 @@ static const dump_func reply_dumpers[REQ_NB_REQUESTS] =
     (dump_func)dump_complete_client_surface_direct_plan_reply,
     (dump_func)dump_request_client_surface_owner_repair_reply,
     (dump_func)dump_resolve_client_surface_scene_sources_reply,
+    NULL,
     NULL,
 };
 
@@ -4813,6 +4820,7 @@ static const char * const req_names[REQ_NB_REQUESTS] =
     "request_client_surface_owner_repair",
     "resolve_client_surface_scene_sources",
     "set_window_present_rect",
+    "set_queue_paint_blocked",
 };
 
 static const struct

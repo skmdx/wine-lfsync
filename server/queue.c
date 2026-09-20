@@ -130,6 +130,7 @@ struct msg_queue
     struct fd             *fd;              /* optional file descriptor to poll */
     struct object         *sync;            /* sync object for wait/signal */
     int                    paint_count;     /* pending paint messages count */
+    int                    paint_blocked;   /* native paint admission is unavailable */
     int                    hotkey_count;    /* pending hotkey messages count */
     int                    quit_message;    /* is there a pending quit message? */
     int                    exit_code;       /* exit code of pending quit message */
@@ -277,6 +278,7 @@ static struct msg_queue *create_msg_queue( struct thread *thread, struct thread_
         queue->fd              = NULL;
         queue->sync            = NULL;
         queue->paint_count     = 0;
+        queue->paint_blocked   = 0;
         queue->hotkey_count    = 0;
         queue->quit_message    = 0;
         queue->cursor_count    = 0;
@@ -2868,7 +2870,7 @@ void inc_queue_paint_count( struct thread *thread, int incr )
 
     if ((queue->paint_count += incr) < 0) queue->paint_count = 0;
 
-    if (queue->paint_count)
+    if (queue->paint_count && !queue->paint_blocked)
         set_queue_bits( queue, QS_PAINT );
     else
         clear_queue_bits( queue, QS_PAINT );
@@ -3234,6 +3236,17 @@ DECL_HANDLER(set_queue_fd)
 }
 
 
+/* Retain dirty windows while native paint admission is unavailable. */
+DECL_HANDLER(set_queue_paint_blocked)
+{
+    struct msg_queue *queue = get_current_queue();
+
+    if (!queue) return;
+    if (queue->paint_blocked == !!req->blocked) return;
+    queue->paint_blocked = !!req->blocked;
+    inc_queue_paint_count( current, 0 );
+}
+
 /* set the current message queue wakeup mask */
 DECL_HANDLER(set_queue_mask)
 {
@@ -3507,7 +3520,7 @@ DECL_HANDLER(get_message)
 
     /* now check for WM_PAINT */
     if ((filter & QS_PAINT) &&
-        queue->paint_count &&
+        queue->paint_count && !queue->paint_blocked &&
         check_msg_filter( WM_PAINT, req->get_first, req->get_last ) &&
         (reply->win = find_window_to_repaint( get_win, current )))
     {

@@ -6722,6 +6722,18 @@ struct set_window_present_rect_reply
     struct reply_header __header;
 };
 
+/* Native paint admission gates generated WM_PAINT, not the dirty regions or
+ * posted/sent messages. The driver reopens it on its normal completion event. */
+struct set_queue_paint_blocked_request
+{
+    struct request_header __header;
+    int blocked;
+};
+struct set_queue_paint_blocked_reply
+{
+    struct reply_header __header;
+};
+
 
 enum request
 {
@@ -7056,6 +7068,7 @@ enum request
     REQ_request_client_surface_owner_repair,
     REQ_resolve_client_surface_scene_sources,
     REQ_set_window_present_rect,
+    REQ_set_queue_paint_blocked,
     REQ_NB_REQUESTS
 };
 
@@ -7394,6 +7407,7 @@ union generic_request
     struct request_client_surface_owner_repair_request request_client_surface_owner_repair_request;
     struct resolve_client_surface_scene_sources_request resolve_client_surface_scene_sources_request;
     struct set_window_present_rect_request set_window_present_rect_request;
+    struct set_queue_paint_blocked_request set_queue_paint_blocked_request;
 };
 union generic_reply
 {
@@ -7730,8 +7744,9 @@ union generic_reply
     struct request_client_surface_owner_repair_reply request_client_surface_owner_repair_reply;
     struct resolve_client_surface_scene_sources_reply resolve_client_surface_scene_sources_reply;
     struct set_window_present_rect_reply set_window_present_rect_reply;
+    struct set_queue_paint_blocked_reply set_queue_paint_blocked_reply;
 };
 
-#define SERVER_PROTOCOL_VERSION 1025
+#define SERVER_PROTOCOL_VERSION 1026
 
 #endif /* __WINE_WINE_SERVER_PROTOCOL_H */

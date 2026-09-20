@@ -4669,3 +4669,9 @@ enum inproc_sync_type
     struct rectangle rect;
     struct ratio dpi;
 @END
+
+/* Native paint admission gates generated WM_PAINT, not the dirty regions or
+ * posted/sent messages. The driver reopens it on its normal completion event. */
+@REQ(set_queue_paint_blocked)
+    int blocked;
+@END

@@ -81,7 +81,7 @@ struct x11drv_display_owner
     } paints[64];
     unsigned int paint_count;
     LONG paint_failed, paint_read;
-    BOOL paint_ready, paint_draining, paint_drained, paint_read_complete;
+    BOOL paint_ready, paint_draining, paint_drained, paint_read_complete, paint_blocked;
     LONG refs;
     BOOL detached, clipboard;
 };
@@ -1042,6 +1042,7 @@ static void drain_window_paint_errors( struct client_surface_native_work *work )
 static void window_paint_errors_drained( struct client_surface_native_work *work )
 {
     struct x11drv_display_owner *owner = CONTAINING_RECORD( work, struct x11drv_display_owner, paint_work );
+    UINT64 identity = owner->paint_identity;
 
     if (!owner->paint_read_complete)
     {
@@ -1052,7 +1053,8 @@ static void window_paint_errors_drained( struct client_surface_native_work *work
     }
     InterlockedExchange( &owner->paint_read, TRUE );
     if (!InterlockedCompareExchange( &owner->detached, 0, 0 ))
-        NtUserPostThreadMessage( owner->paint_thread, WM_NULL, 0, 0 );
+        NtUserPostThreadMessage( owner->paint_thread, WM_X11DRV_WINDOW_PAINT_READY,
+                                 (UINT)identity, identity >> 32 );
     x11drv_display_owner_release( owner );
 }
 
@@ -1094,11 +1096,31 @@ static BOOL send_window_paint( struct x11drv_display_owner *owner, Display *disp
     return ret;
 }
 
+static void update_window_paint_admission( struct x11drv_display_owner *owner )
+{
+    BOOL blocked = owner->paint_count == ARRAY_SIZE(owner->paints) ||
+        (InterlockedCompareExchange( &owner->paint_failed, 0, 0 ) &&
+         (owner->paint_count || !owner->paint_drained || !InterlockedCompareExchange( &owner->paint_read, 0, 0 )));
+    NTSTATUS status;
+
+    if (blocked == owner->paint_blocked) return;
+    SERVER_START_REQ( set_queue_paint_blocked )
+    {
+        req->blocked = blocked;
+        status = wine_server_call( req );
+    }
+    SERVER_END_REQ;
+    if (!status) owner->paint_blocked = blocked;
+    TRACE_(csperf)( "event=window_paint_admission owner=%p blocked=%d count=%u status=%#x\n",
+                   owner, blocked, owner->paint_count, (unsigned int)status );
+}
+
 static void remove_window_paint( struct x11drv_display_owner *owner, unsigned int index )
 {
     owner->paint_count--;
     memmove( owner->paints + index, owner->paints + index + 1,
              (owner->paint_count - index) * sizeof(*owner->paints) );
+    update_window_paint_admission( owner );
 }
 
 void x11drv_flush_window_paints(void)
@@ -1110,6 +1132,7 @@ void x11drv_flush_window_paints(void)
 
     if (!data) return;
     owner = data->display_owner;
+    update_window_paint_admission( owner );
     failed = InterlockedCompareExchange( &owner->paint_failed, 0, 0 );
     if (failed)
     {
@@ -1162,6 +1185,14 @@ void x11drv_flush_window_paints(void)
             complete_window_paint( owner, owner->paints[i].token, FALSE );
         remove_window_paint( owner, i );
     }
+    update_window_paint_admission( owner );
+}
+
+void x11drv_window_paint_ready( UINT64 identity )
+{
+    struct x11drv_thread_data *data = x11drv_thread_data();
+
+    if (data && data->display_owner->paint_identity == identity) x11drv_flush_window_paints();
 }
 
 NTSTATUS X11DRV_WindowPaint( HWND hwnd, UINT operation, UINT64 token )
@@ -1240,6 +1271,7 @@ NTSTATUS X11DRV_WindowPaint( HWND hwnd, UINT operation, UINT64 token )
         owner->paints[i].submitted = FALSE;
         owner->paints[i].sent = owner->paints[i].cancelled = FALSE;
         owner->paint_count++;
+        update_window_paint_admission( owner );
         TRACE_(csperf)( "event=window_paint_reserve owner=%p endpoint=%lx hwnd=%p token=%llu count=%u\n",
                        owner, owner->paint_window, hwnd, (unsigned long long)token, owner->paint_count );
         return STATUS_SUCCESS;
