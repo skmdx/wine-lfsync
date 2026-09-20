@@ -1245,7 +1245,13 @@ NTSTATUS X11DRV_WindowPaint( HWND hwnd, UINT operation, UINT64 token )
     }
     if (operation == WINDOW_PAINT_RESERVE)
     {
-        if (i < owner->paint_count || owner->paint_count == ARRAY_SIZE(owner->paints)) return STATUS_NO_MEMORY;
+        if (i < owner->paint_count || owner->paint_count == ARRAY_SIZE(owner->paints))
+        {
+            TRACE_(csperf)( "event=window_paint_reject owner=%p endpoint=%lx hwnd=%p token=%llu count=%u duplicate=%d\n",
+                           owner, owner->paint_window, hwnd, (unsigned long long)token, owner->paint_count,
+                           i < owner->paint_count );
+            return STATUS_NO_MEMORY;
+        }
         if (!owner->paint_window)
         {
             Window window;
