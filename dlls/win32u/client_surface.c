@@ -1633,6 +1633,9 @@ NTSTATUS client_surface_begin_prepare( HWND hwnd, struct client_surface_scene *s
         else if (status == STATUS_SUCCESS) status = STATUS_NOT_FOUND;
     }
     SERVER_END_REQ;
+    TRACE_(csperf)( "event=client_surface_prepare hwnd=%p status=%#x epoch=%llu generation=%llu paint_serial=%llu\n",
+                   hwnd, (unsigned int)status, (unsigned long long)scene->epoch,
+                   (unsigned long long)scene->generation, (unsigned long long)scene->paint_serial );
     return status;
 }
 

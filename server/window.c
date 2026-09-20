@@ -110,6 +110,7 @@ static void update_window_first_child( struct window *win );
 static void cancel_thread_window_paints( struct thread *thread );
 static void cancel_window_paints( struct window *win );
 static void wake_window_paint_prepare( struct window *top );
+static int window_paint_pending( struct window *top );
 
 static unsigned int client_surface_ref_hash( struct process *process, UINT64 id )
 {
@@ -1773,6 +1774,18 @@ static void client_surface_publication_timeout( void *private )
                  top->client_surface_transaction.epoch != top->client_surface_scene_generation;
 
     top->client_surface_transaction.timeout = NULL;
+    /* The owner acknowledged preparation and is waiting for real paint
+     * completion. This also applies when a previous scene is published:
+     * a deadline cannot turn unfinished GDI into a checkpoint. Receipt
+     * retirement / restored painting supplies the next wake. */
+    if (top->handle && client_surface_is_preparing( top ) &&
+        top->paint_waiting && window_paint_pending( top ))
+    {
+        /* The later composition has its own progress deadline; do not arm
+         * it with an already expired timestamp after paint completion. */
+        top->client_surface_transaction.deadline = 0;
+        return;
+    }
     if (top->handle && client_surface_scene_published( top ))
     {
         fail_client_surface_publication( top );

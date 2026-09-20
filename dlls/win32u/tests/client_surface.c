@@ -5681,6 +5681,11 @@ static void test_paint_receipts(void)
     ok( !status, "paint end status %#x\n", status );
     status = set_surface_state( hwnd, 0, CLIENT_SURFACE_STATE_PREPARE_BEGIN, 0, &current );
     ok( status == STATUS_PENDING, "ended but uncompleted paint prepare status %#x\n", status );
+    /* Expiring the six-second publication deadline cannot complete a paint
+     * receipt that the owner has already reported as pending. */
+    Sleep( 6200 );
+    status = set_surface_state( hwnd, 0, CLIENT_SURFACE_STATE_PREPARE_BEGIN, 0, &current );
+    ok( status == STATUS_PENDING, "paint deadline bypassed pending receipt, status %#x\n", status );
     status = set_surface_state( hwnd, 0, 0, 0, &current );
     ok( !status, "pending paint capture status %#x\n", status );
     status = set_surface_result( hwnd, CLIENT_SURFACE_STATE_STAGED, &current, &result );
