@@ -1988,6 +1988,7 @@ static void window_set_config( struct x11drv_win_data *data, RECT rect, BOOL abo
         mask |= CWStackMode;
     }
 
+    if (mask & (CWWidth | CWHeight)) ++data->client_surface_native_revision;
     data->pending_state.rect = *new_rect;
     data->pending_state.above = above;
     data->configure_serial = NextRequest( data->display );
@@ -2150,6 +2151,7 @@ static void window_set_wm_state( struct x11drv_win_data *data, UINT new_state, B
         window_set_user_time( data, activate ? -1 : 0, TRUE );
     }
 
+    ++data->client_surface_native_revision;
     data->pending_state.wm_state = new_state;
     data->pending_state.activate = activate;
     data->wm_state_serial = NextRequest( data->display );
@@ -3146,7 +3148,7 @@ static BOOL begin_client_surface_native_barrier( struct x11drv_win_data *data )
 
 static void destroy_client_surface_backing( struct x11drv_win_data *data )
 {
-    X11DRV_client_surface_backing_cancel_allocation( data );
+    X11DRV_client_surface_backing_cancel_requests( data );
     if (!data->client_surface_backing && !data->client_surface_backing_spare) return;
 
     /* Seal this exact HWND even if it has been reparented to another root. */
@@ -3563,6 +3565,7 @@ void set_window_parent( struct x11drv_win_data *data, Window parent )
 {
     if (!data->whole_window) return; /* only keep track of parent if we have a toplevel */
     TRACE( "window %p/%lx, parent %lx\n", data->hwnd, data->whole_window, parent );
+    ++data->client_surface_native_revision;
     host_window_reparent( &data->parent, parent, data->whole_window );
     if (data->parent)
     {
@@ -4016,6 +4019,7 @@ NTSTATUS X11DRV_UpdateClientSurfaceBacking( HWND hwnd, BOOL enable, BOOL prepare
     struct x11drv_win_data *data;
     struct client_surface_scene scene;
     NTSTATUS status = STATUS_NOT_SUPPORTED;
+    UINT64 geometry_scope;
 
     if (!(data = get_win_data( hwnd ))) return status;
     /* A retained native client draws directly, so no GDI surface needs to
@@ -4044,6 +4048,7 @@ NTSTATUS X11DRV_UpdateClientSurfaceBacking( HWND hwnd, BOOL enable, BOOL prepare
         (!scene.valid || scene.generation || scene.mode != CLIENT_SURFACE_PRESENTATION_DIRECT))
         goto done;
 
+    geometry_scope = X11DRV_client_surface_geometry_begin( data );
     XFlush( gdi_display );
     data->client_surface_backing_enabled = enable;
     status = STATUS_SUCCESS;
@@ -4057,6 +4062,7 @@ NTSTATUS X11DRV_UpdateClientSurfaceBacking( HWND hwnd, BOOL enable, BOOL prepare
             client_surface_fail_scene( &scene );
     }
     else if (!X11DRV_client_surface_backing_retire( data )) destroy_client_surface_backing( data );
+    X11DRV_client_surface_geometry_end( data, geometry_scope, status );
     TRACE( "win %p backing state enable %u prepare %u scene %s status %#x\n",
            hwnd, enable, prepare, wine_dbgstr_longlong(scene.epoch), (unsigned int)status );
     XFlush( data->display );
@@ -4086,6 +4092,7 @@ NTSTATUS X11DRV_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_hint,
     struct client_surface_owner_notifications *owner_update;
     BOOL deferred;
     NTSTATUS status = STATUS_SUCCESS;
+    UINT64 geometry_scope;
 
     if ((is_managed = is_window_managed( hwnd, swp_flags, fullscreen ))) make_owner_managed( hwnd );
 
@@ -4118,9 +4125,10 @@ NTSTATUS X11DRV_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_hint,
     if (deferred) return STATUS_PENDING;
     if (!(data = get_win_data( hwnd )))
     {
-        if (owner_update) X11DRV_client_surface_backing_end_update( NULL, owner_update, STATUS_SUCCESS );
+        if (owner_update) X11DRV_client_surface_backing_end_update( NULL, owner_update );
         return STATUS_SUCCESS;
     }
+    geometry_scope = X11DRV_client_surface_geometry_begin( data );
     if (is_managed) window_set_managed( data, TRUE );
 
     old_rects = data->rects;
@@ -4181,7 +4189,8 @@ NTSTATUS X11DRV_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_hint,
     {
         if (client_surface_pending || prepare_client_surface || publish_client_surface)
             client_surface_bypass_staging( hwnd );
-        if (owner_update) X11DRV_client_surface_backing_end_update( data, owner_update, STATUS_SUCCESS );
+        X11DRV_client_surface_geometry_end( data, geometry_scope, STATUS_SUCCESS );
+        if (owner_update) X11DRV_client_surface_backing_end_update( data, owner_update );
         release_win_data( data );
         return STATUS_SUCCESS;
     }
@@ -4212,15 +4221,13 @@ NTSTATUS X11DRV_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_hint,
 #endif
     }
 
-    /* Snapshot installs its final checkpoint and target itself. A retiring
-     * pool only needs the existing lifetime drain, not a preceding refresh.
-     * A successful BEGIN_UPDATE holds this target quiescent through the
-     * native changes below. Ordinary updates can install their final extent
-     * and scene in END_UPDATE once, after its GUI-connection barrier. A
-     * publication still needs its target before reading the backing. */
+    window_set_wm_state( data, get_desired_wm_state( new_style, new_rects ), activate );
+    /* Snapshot installs its checkpoint and target. Publication retains one
+     * owned observation through its own capacity and target installation.
+     * Ordinary updates with a native hold finish preparation below before
+     * returning that hold; END_UPDATE never initiates preparation. */
     if (data->client_surface_backing && !enable_client_surface_backing &&
-        !disable_client_surface_backing && !prepare_client_surface &&
-        (!owner_update || publish_client_surface))
+        !disable_client_surface_backing && !prepare_client_surface && !publish_client_surface && !owner_update)
         status = X11DRV_client_surface_backing_ensure( data );
     if (enable_client_surface_backing || disable_client_surface_backing)
     {
@@ -4239,7 +4246,6 @@ NTSTATUS X11DRV_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_hint,
         else if (!X11DRV_client_surface_backing_retire( data )) destroy_client_surface_backing( data );
     }
 
-    window_set_wm_state( data, get_desired_wm_state( new_style, new_rects ), activate );
     if (prepare_client_surface)
     {
         client_surface_capture_scene_state( hwnd, &scene );
@@ -4262,7 +4268,7 @@ NTSTATUS X11DRV_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_hint,
         }
         if (status == STATUS_SUCCESS && (data->client_surface_redirected || data->client_surface_opacity_staged))
             finish_client_surface_staging( data );
-        X11DRV_sync_window_changes( data->display );
+        if (status != STATUS_PENDING) X11DRV_sync_window_changes( data->display );
     }
     else if (status == STATUS_SUCCESS && client_surface_pending && !data->client_surface_staged)
     {
@@ -4282,7 +4288,7 @@ NTSTATUS X11DRV_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_hint,
                 data->client_surface_staged = TRUE;
                 /* STAGED publishes the new scene epoch. Install it on the owner
                  * connection before consuming cached producer frames. */
-                X11DRV_client_surface_backing_ensure( data );
+                status = X11DRV_client_surface_backing_staged( data );
             }
         }
         else if (status != STATUS_PENDING)
@@ -4290,7 +4296,7 @@ NTSTATUS X11DRV_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_hint,
             client_surface_fail_scene( &scene );
         }
     }
-    else if (win32_visible && !client_surface_pending &&
+    else if (status == STATUS_SUCCESS && win32_visible && !client_surface_pending &&
              (data->client_surface_redirected || data->client_surface_opacity_staged))
     {
         finish_client_surface_staging( data );
@@ -4311,7 +4317,12 @@ NTSTATUS X11DRV_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_hint,
     /* if window was fullscreen and is being hidden, release cursor clipping */
     was_fullscreen &= data->desired_state.wm_state != NormalState;
 
-    if (owner_update) status = X11DRV_client_surface_backing_end_update( data, owner_update, status );
+    /* Preparation belongs to this operation. END only returns its native
+     * mutation hold and must never start another geometry/preparation attempt. */
+    if (owner_update && status == STATUS_SUCCESS && data->client_surface_backing && !publish_client_surface)
+        status = X11DRV_client_surface_backing_ensure( data );
+    X11DRV_client_surface_geometry_end( data, geometry_scope, status );
+    if (owner_update) X11DRV_client_surface_backing_end_update( data, owner_update );
     XFlush( data->display );  /* make sure changes are done before we start painting again */
     release_win_data( data );
 
@@ -4413,13 +4424,18 @@ void X11DRV_SetWindowRgn( HWND hwnd, HRGN hrgn, BOOL redraw )
 
     if ((data = get_win_data( hwnd )))
     {
+        UINT64 geometry_scope = X11DRV_client_surface_geometry_begin( data );
+        NTSTATUS status = STATUS_SUCCESS;
+
         sync_window_region( data, hrgn );
-        if (owner_update) X11DRV_client_surface_backing_end_update( data, owner_update, STATUS_SUCCESS );
+        if (owner_update && data->client_surface_backing) status = X11DRV_client_surface_backing_ensure( data );
+        X11DRV_client_surface_geometry_end( data, geometry_scope, status );
+        if (owner_update) X11DRV_client_surface_backing_end_update( data, owner_update );
         release_win_data( data );
     }
     else
     {
-        if (owner_update) X11DRV_client_surface_backing_end_update( NULL, owner_update, STATUS_SUCCESS );
+        if (owner_update) X11DRV_client_surface_backing_end_update( NULL, owner_update );
         if (X11DRV_get_whole_window( hwnd )) send_message( hwnd, WM_X11DRV_SET_WIN_REGION, 0, 0 );
     }
 }
@@ -4533,6 +4549,11 @@ LRESULT X11DRV_WindowMessage( HWND hwnd, UINT msg, WPARAM wp, LPARAM lp )
         UINT64 serial = (UINT64)(UINT)wp | ((UINT64)(UINT)lp << 32);
         UINT update = X11DRV_client_surface_backing_pool_ready( hwnd, serial );
 
+        if (update == X11DRV_CLIENT_SURFACE_RESUME_RESTORE)
+        {
+            X11DRV_client_surface_backing_restore_ready( hwnd, serial );
+            return 0;
+        }
         if (update)
         {
             NTSTATUS status;
@@ -4542,6 +4563,10 @@ LRESULT X11DRV_WindowMessage( HWND hwnd, UINT msg, WPARAM wp, LPARAM lp )
             status = send_message( hwnd, WM_WINE_UPDATEWINDOWSTATE, update, 0 );
             if ((data = get_win_data( hwnd )))
             {
+                /* A rejected stale reservation may never enter the driver.
+                 * Return that completed query even when no adoption ran. */
+                if (status != STATUS_PENDING)
+                    X11DRV_client_surface_backing_cancel_geometry( data, serial );
                 if (data->client_surface_allocation_serial == serial)
                 {
                     if (update == WINE_PREPARE_CLIENT_SURFACES && status == STATUS_NOT_FOUND)

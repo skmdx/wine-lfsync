@@ -2281,9 +2281,9 @@ static LRESULT handle_internal_message( HWND hwnd, UINT msg, WPARAM wparam, LPAR
         return 0;
     case WM_WINE_UPDATEWINDOWSTATE:
         if (wparam == WINE_UPDATE_CLIENT_SURFACE_BACKING)
-            update_window_client_surface_backing( hwnd );
+            return update_window_client_surface_backing( hwnd );
         else if (wparam == WINE_PUBLISH_CLIENT_SURFACES)
-            client_surface_publish_window( hwnd );
+            return client_surface_publish_window( hwnd );
         else if (wparam == WINE_PREPARE_CLIENT_SURFACES)
         {
             struct client_surface_scene scene;

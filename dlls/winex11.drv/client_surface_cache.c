@@ -76,6 +76,7 @@ struct client_surface_cache_image
 #define CLIENT_SURFACE_CACHE_OUTPUT_RESERVE 1024
 static pthread_mutex_t cache_mutex = PTHREAD_MUTEX_INITIALIZER;
 static struct cache_worker cache_workers[4];
+static __thread struct cache_worker *native_worker;
 static unsigned int worker_count, image_count, source_count, next_worker;
 static struct client_surface_cache_image *completed_head, **completed_tail = &completed_head;
 static void (*cache_wake)(void);
@@ -118,6 +119,26 @@ static BOOL open_cache_display( struct cache_worker *worker )
         worker->display = NULL;
         return FALSE;
     }
+    return TRUE;
+}
+
+/* Only an executing native work item can use this private connection. */
+BOOL client_surface_native_query_window( Window window, unsigned int *width, unsigned int *height,
+                                         int *map_state, int *error )
+{
+    XWindowAttributes attrs;
+
+    assert( native_worker );
+    if (!open_cache_display( native_worker )) return FALSE;
+    native_worker->error = 0;
+    if (!XGetWindowAttributes( native_worker->display, window, &attrs ) || native_worker->error)
+    {
+        *error = native_worker->error;
+        return FALSE;
+    }
+    *width = attrs.width;
+    *height = attrs.height;
+    *map_state = attrs.map_state;
     return TRUE;
 }
 
@@ -504,6 +525,7 @@ static void cache_worker_thread( void *context )
     struct cache_worker *worker = context;
     struct client_surface_native_work *work;
 
+    native_worker = worker;
     for (;;)
     {
         pthread_mutex_lock( &cache_mutex );

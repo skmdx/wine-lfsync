@@ -12,6 +12,8 @@ struct client_surface_native_work
     void (*execute)( struct client_surface_native_work *work );
     void (*finished)( struct client_surface_native_work *work );
 };
+BOOL client_surface_native_query_window( Window window, unsigned int *width, unsigned int *height,
+                                         int *map_state, int *error );
 BOOL client_surface_prepare_native_work(void);
 void client_surface_submit_native_work( struct client_surface_native_work *work );
 BOOL x11drv_reserve_release_capacity( unsigned int count, SIZE_T bytes );

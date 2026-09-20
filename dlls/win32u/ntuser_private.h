@@ -73,6 +73,7 @@ typedef struct tagWND
     int                clip_clients;  /* Has client surfaces that needs to be clipped out */
     UINT64             publish_generation, publish_scene; /* reserved publication awaiting native continuation */
     BOOL               publish_busy; /* excludes nested dispatch while the owner callback is executing */
+    BOOL               publish_again; /* preserves a publication wake consumed by nested dispatch */
 } WND;
 
 /* WND flags values */

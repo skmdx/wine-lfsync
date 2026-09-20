@@ -6988,6 +6988,47 @@ static BOOL wait_for_surface_idle( HWND hwnd, DWORD timeout, struct surface_stat
     return FALSE;
 }
 
+static void test_native_publish_query(void)
+{
+    const UINT64 surface = allocate_surface();
+    struct surface_state state, ready;
+    DWORD start;
+    UINT status;
+    HWND hwnd = create_test_window( FALSE );
+
+    ok( !!hwnd, "failed to create native publication window\n" );
+    if (!hwnd) return;
+    status = set_surface_state( hwnd, surface, CLIENT_SURFACE_STATE_REGISTER |
+                                CLIENT_SURFACE_STATE_SCENE_PUBLICATION, 0, NULL );
+    ok( !status, "register status %#x\n", status );
+    claim_surface_state( hwnd, surface, NULL );
+    /* Exercise the real host mapping, background checkpoint and publication
+     * callback. The protocol fixture supplies the producer completion after
+     * the owner has prepared its actual native backing. */
+    ShowWindow( hwnd, SW_SHOWNA );
+    start = GetTickCount();
+    do
+    {
+        pump_messages( 10 );
+        status = set_surface_state( hwnd, 0, 0, 0, &state );
+        if (!status && state.staged && state.generation && state.pending == 1) break;
+    } while (GetTickCount() - start < 5000);
+    ok( !status && state.staged && state.generation && state.pending == 1,
+        "native backing did not prepare: status %#x staged %u pending %u generation %s\n",
+        status, state.staged, state.pending, wine_dbgstr_longlong( state.generation ) );
+    if (!status && state.staged && state.generation && state.pending == 1)
+    {
+        status = commit_surface_state( hwnd, surface, &state, &ready );
+        ok( !status && ready.ready, "producer completion status %#x ready %u\n", status, ready.ready );
+        ok( wait_for_surface_idle( hwnd, 5000, &state ), "native COPY publication did not finish\n" );
+        ok( !state.generation && !state.staged && !state.pending,
+            "native COPY kept reservation: generation %s staged %u pending %u\n",
+            wine_dbgstr_longlong( state.generation ), state.staged, state.pending );
+    }
+    set_surface_state( hwnd, surface, CLIENT_SURFACE_STATE_UNREGISTER, 0, NULL );
+    DestroyWindow( hwnd );
+}
+
 static BOOL color_matches( COLORREF color, BYTE red, BYTE green, BYTE blue )
 {
     return color != CLR_INVALID && abs( (int)GetRValue( color ) - red ) <= 24 &&
@@ -7551,6 +7592,7 @@ static BOOL run_focused_test_case( const char *name, char **argv )
         {"subtree-retirement", "client surface subtree retirement",
          test_subtree_generation_retirement},
         {"generation-aba", "client surface generation ABA exclusion", test_generation_aba},
+        {"native-publish-query", "native backing COPY publication continuation", test_native_publish_query},
         {"publish-transaction", "client surface host publication transaction",
          test_publish_transaction},
         {"live-prepare", "live client surface prepare transaction",

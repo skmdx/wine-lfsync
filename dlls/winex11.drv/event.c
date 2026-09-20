@@ -39,6 +39,7 @@
 #include <stdarg.h>
 #include <string.h>
 
+#include "ntstatus.h"
 #include "x11drv.h"
 #include "shellapi.h"
 
@@ -846,7 +847,8 @@ static BOOL X11DRV_Expose( HWND hwnd, XEvent *xev )
     POINT pos;
     struct x11drv_win_data *data;
     UINT flags = RDW_INVALIDATE | RDW_FRAME | RDW_ALLCHILDREN;
-    BOOL restored, repair;
+    NTSTATUS status;
+    BOOL repair;
 
     TRACE( "win %p (%lx) %d,%d %dx%d\n",
            hwnd, event->window, event->x, event->y, event->width, event->height );
@@ -864,7 +866,7 @@ static BOOL X11DRV_Expose( HWND hwnd, XEvent *xev )
     rect.top    = pos.y;
     rect.right  = pos.x + event->width;
     rect.bottom = pos.y + event->height;
-    restored = X11DRV_client_surface_backing_restore( data, event->window, &rect );
+    status = X11DRV_client_surface_backing_restore( data, event->window, &rect );
     repair = event->window == data->whole_window && data->client_surface_backing &&
              !data->client_surface_backing_valid;
 
@@ -896,8 +898,8 @@ static BOOL X11DRV_Expose( HWND hwnd, XEvent *xev )
 
     release_win_data( data );
 
-    if (repair) client_surface_repair_owner( hwnd );
-    if (!restored) NtUserExposeWindowSurface( hwnd, flags, &rect );
+    if (repair && status != STATUS_PENDING) client_surface_repair_owner( hwnd );
+    if (status != STATUS_SUCCESS && status != STATUS_PENDING) NtUserExposeWindowSurface( hwnd, flags, &rect );
     return TRUE;
 }
 
@@ -912,6 +914,7 @@ static BOOL X11DRV_MapNotify( HWND hwnd, XEvent *event )
     if (event->xany.window == x11drv_thread_data()->clip_window) return TRUE;
 
     if (!(data = get_win_data( hwnd ))) return FALSE;
+    if (event->xany.window == data->whole_window) ++data->client_surface_native_revision;
     if (data->reparenting)
     {
         TRACE( "window %p/%lx has been reparented\n", data->hwnd, data->whole_window );
@@ -942,6 +945,7 @@ static BOOL X11DRV_UnmapNotify( HWND hwnd, XEvent *event )
     struct x11drv_win_data *data;
 
     if (!(data = get_win_data( hwnd ))) return FALSE;
+    if (event->xany.window == data->whole_window) ++data->client_surface_native_revision;
     if (data->managed && !data->wm_state_serial && data->current_state.wm_state == NormalState)
     {
         WARN( "window %p/%lx unexpectedly unmapped, assuming reparenting\n", data->hwnd, data->whole_window );
@@ -1000,6 +1004,7 @@ static BOOL X11DRV_ConfigureNotify( HWND hwnd, XEvent *xev )
 
     if (!hwnd) return FALSE;
     if (!(data = get_win_data( hwnd ))) return FALSE;
+    if (event->window == data->whole_window) ++data->client_surface_native_revision;
 
     /* update our view of the window tree for mouse event coordinate mapping */
     if (data->whole_window && data->parent && !data->parent_invalid)
