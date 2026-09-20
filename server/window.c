@@ -6461,6 +6461,14 @@ DECL_HANDLER(get_update_region)
     reply->flags = get_window_update_flags( win, from_child, flags, &win );
     reply->child = win->handle;
 
+    /* Preserve traversal semantics while consuming only the admitted target. */
+    if (req->expected_child && req->expected_child != win->handle)
+    {
+        reply->flags = 0;
+        set_error( STATUS_RETRY );
+        return;
+    }
+
     if (flags & UPDATE_NOREGION) return;
 
     if (win->update_region)

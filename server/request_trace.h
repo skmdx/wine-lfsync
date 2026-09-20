@@ -1965,6 +1965,7 @@ static void dump_get_update_region_request( const struct get_update_region_reque
 {
     fprintf( stderr, " window=%08x", req->window );
     fprintf( stderr, ", from_child=%08x", req->from_child );
+    fprintf( stderr, ", expected_child=%08x", req->expected_child );
     fprintf( stderr, ", flags=%08x", req->flags );
 }
 

@@ -1588,7 +1588,7 @@ HWND WINAPI NtUserWindowFromDC( HDC hdc )
  *
  * Return update region (in screen coordinates) for a window.
  */
-static HRGN get_update_region( HWND hwnd, UINT *flags, HWND *child )
+static HRGN get_update_region( HWND hwnd, UINT *flags, HWND *child, HWND expected_child )
 {
     HRGN hrgn = 0;
     NTSTATUS status;
@@ -1607,6 +1607,7 @@ static HRGN get_update_region( HWND hwnd, UINT *flags, HWND *child )
         {
             req->window     = wine_server_user_handle( hwnd );
             req->from_child = wine_server_user_handle( child ? *child : 0 );
+            req->expected_child = wine_server_user_handle( expected_child );
             req->flags      = *flags;
             wine_server_set_reply( req, data->Buffer, size );
             if (!(status = wine_server_call( req )))
@@ -1666,6 +1667,7 @@ static BOOL get_update_flags( HWND hwnd, HWND *child, UINT *flags )
     {
         req->window     = wine_server_user_handle( hwnd );
         req->from_child = wine_server_user_handle( child ? *child : 0 );
+        req->expected_child = 0;
         req->flags      = *flags | UPDATE_NOREGION;
         if ((ret = !wine_server_call_err( req )))
         {
@@ -1683,9 +1685,9 @@ static BOOL get_update_flags( HWND hwnd, HWND *child, UINT *flags )
  * Send a WM_NCPAINT message if needed, and return the resulting update region (in screen coords).
  * Helper for erase_now and BeginPaint.
  */
-static HRGN send_ncpaint( HWND hwnd, HWND *child, UINT *flags )
+static HRGN send_ncpaint( HWND hwnd, HWND *child, UINT *flags, HWND expected_child )
 {
-    HRGN whole_rgn = get_update_region( hwnd, flags, child );
+    HRGN whole_rgn = get_update_region( hwnd, flags, child, expected_child );
     HRGN client_rgn = 0;
     DWORD style;
 
@@ -1798,7 +1800,7 @@ void move_window_bits( HWND hwnd, const struct window_rects *rects, const RECT *
         src.top - rects->visible.top != dst.top - rects->visible.top)
     {
         UINT flags = UPDATE_NOCHILDREN | UPDATE_CLIPCHILDREN;
-        HRGN rgn = get_update_region( hwnd, &flags, NULL );
+        HRGN rgn = get_update_region( hwnd, &flags, NULL, 0 );
         HDC hdc = NtUserGetDCEx( hwnd, rgn, DCX_CACHE | DCX_WINDOW | DCX_EXCLUDERGN );
 
         TRACE( "copying %s -> %s\n", wine_dbgstr_rect( &src ), wine_dbgstr_rect( &dst ));
@@ -1823,7 +1825,7 @@ void move_window_bits_surface( HWND hwnd, const RECT *window_rect, struct window
     char buffer[FIELD_OFFSET( BITMAPINFO, bmiColors[256] )];
     BITMAPINFO *info = (BITMAPINFO *)buffer;
     UINT flags = UPDATE_NOCHILDREN | UPDATE_CLIPCHILDREN;
-    HRGN rgn = get_update_region( hwnd, &flags, NULL );
+    HRGN rgn = get_update_region( hwnd, &flags, NULL, 0 );
     HDC hdc = NtUserGetDCEx( hwnd, rgn, DCX_CACHE | DCX_WINDOW | DCX_EXCLUDERGN );
     void *bits;
 
@@ -2023,7 +2025,7 @@ HDC WINAPI NtUserBeginPaint( HWND hwnd, PAINTSTRUCT *ps )
     if (!paint) return 0;
     NtUserHideCaret( hwnd );
 
-    if (!(hrgn = send_ncpaint( hwnd, NULL, &flags ))) goto failed;
+    if (!(hrgn = send_ncpaint( hwnd, NULL, &flags, 0 ))) goto failed;
 
     erase = send_erase( hwnd, flags, hrgn, &rect, &hdc );
 
@@ -2099,7 +2101,8 @@ void erase_now( HWND hwnd, UINT rdw_flags )
     for (;;)
     {
         struct window_paint *paint;
-        UINT flags = UPDATE_NONCLIENT | UPDATE_ERASE;
+        HWND from_child = child;
+        UINT request_flags, flags = UPDATE_NONCLIENT | UPDATE_ERASE;
 
         if (rdw_flags & RDW_NOCHILDREN) flags |= UPDATE_NOCHILDREN;
         else if (rdw_flags & RDW_ALLCHILDREN) flags |= UPDATE_ALLCHILDREN;
@@ -2107,11 +2110,12 @@ void erase_now( HWND hwnd, UINT rdw_flags )
 
         /* Select without validating, then reserve before consuming this exact
          * child's region. A foreign WM_NCPAINT receiver has its own receipt. */
+        request_flags = flags;
         if (!get_update_flags( hwnd, &child, &flags ) || !flags) break;
         paint = begin_window_paint( child );
         if (!paint) break;
-        flags = UPDATE_NONCLIENT | UPDATE_ERASE | UPDATE_NOCHILDREN;
-        if (!(hrgn = send_ncpaint( child, NULL, &flags )))
+        flags = request_flags;
+        if (!(hrgn = send_ncpaint( hwnd, &from_child, &flags, child )))
         {
             end_window_paint( paint, FALSE );
             break;
@@ -2259,7 +2263,7 @@ INT WINAPI NtUserGetUpdateRgn( HWND hwnd, HRGN hrgn, BOOL erase )
 
     if (erase) flags |= UPDATE_NONCLIENT | UPDATE_ERASE;
 
-    if ((update_rgn = send_ncpaint( hwnd, NULL, &flags )))
+    if ((update_rgn = send_ncpaint( hwnd, NULL, &flags, 0 )))
     {
         retval = NtGdiCombineRgn( hrgn, update_rgn, 0, RGN_COPY );
         if (send_erase( hwnd, flags, update_rgn, NULL, NULL ))
@@ -2288,7 +2292,7 @@ BOOL WINAPI NtUserGetUpdateRect( HWND hwnd, RECT *rect, BOOL erase )
     if (erase && !paint) return FALSE;
     if (erase) flags |= UPDATE_NONCLIENT | UPDATE_ERASE;
 
-    if (!(update_rgn = send_ncpaint( hwnd, NULL, &flags )))
+    if (!(update_rgn = send_ncpaint( hwnd, NULL, &flags, 0 )))
     {
         end_window_paint( paint, FALSE );
         return FALSE;

@@ -3973,7 +3973,9 @@ struct get_update_region_request
     struct request_header __header;
     user_handle_t  window;
     user_handle_t  from_child;
+    user_handle_t  expected_child;
     unsigned int   flags;
+    char __pad_28[4];
 };
 struct get_update_region_reply
 {
@@ -7779,6 +7781,6 @@ union generic_reply
     struct set_queue_paint_blocked_reply set_queue_paint_blocked_reply;
 };
 
-#define SERVER_PROTOCOL_VERSION 1027
+#define SERVER_PROTOCOL_VERSION 1028
 
 #endif /* __WINE_WINE_SERVER_PROTOCOL_H */

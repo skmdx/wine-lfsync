@@ -21486,6 +21486,12 @@ START_TEST(msg)
         goto done;
     }
 
+    if (argc == 3 && !strcmp( test_argv[2], "paint_messages" ))
+    {
+        test_paint_messages();
+        goto done;
+    }
+
     test_winevents();
     test_SendMessage_other_thread();
     test_setparent_status();
