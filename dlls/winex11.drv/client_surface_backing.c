@@ -6454,12 +6454,11 @@ static BOOL client_surface_backing_present( HWND toplevel, Window window, Pixmap
     return submit_client_surface_compositor_job( &job );
 }
 
-static BOOL update_client_surface_backing_target( struct x11drv_win_data *data )
+static BOOL update_client_surface_backing_target( struct x11drv_win_data *data,
+                                                   unsigned int window_width, unsigned int window_height )
 {
     struct client_surface_compositor_job job;
-    unsigned int window_width, window_height;
 
-    if (!get_client_surface_window_extent( data, &window_width, &window_height )) return FALSE;
     job = (struct client_surface_compositor_job)
     {
         .op = CLIENT_SURFACE_COMPOSITOR_UPDATE_TARGET,
@@ -7097,7 +7096,7 @@ static NTSTATUS snapshot_client_surface_backing( struct x11drv_win_data *data, B
         /* A failed snapshot must still apply the capacity check's validity
          * and native extent to the old target. Successful snapshots combine
          * that update with their checkpoint rotation below. */
-        if (status != STATUS_SHARING_VIOLATION && ensure_on_failure && update_client_surface_backing_target( data ))
+        if (status != STATUS_SHARING_VIOLATION && ensure_on_failure && update_client_surface_backing_target( data, window_width, window_height ))
             refresh_client_surface_handoffs( data->hwnd );
         return status;
     }
@@ -7144,31 +7143,18 @@ static BOOL client_surface_output_checkpoint_matches( struct x11drv_win_data *da
  * Only the owner
  * compositor uses these Pixmaps, so replaced pools can be freed once its
  * target update has drained the old Present requests. */
-static NTSTATUS ensure_client_surface_backing( struct x11drv_win_data *data, BOOL snapshot, BOOL invalidate, BOOL force )
+static NTSTATUS ensure_client_surface_backing_extent( struct x11drv_win_data *data, BOOL snapshot,
+                                                      BOOL invalidate, BOOL *force,
+                                                      unsigned int window_width, unsigned int window_height )
 {
     struct client_surface_output_allocation *allocation;
-    unsigned int width, height, window_width, window_height;
+    unsigned int width, height;
     unsigned int old_valid_width, old_valid_height;
     BOOL old_valid, valid, shrink;
     Pixmap pixmap, spare, old_pixmap, old_spare;
     NTSTATUS status;
 
-retry:
     shrink = FALSE;
-    if (!data->whole_window) return STATUS_UNSUCCESSFUL;
-    if (snapshot)
-    {
-        XWindowAttributes attrs;
-
-        if (!XGetWindowAttributes( data->display, data->whole_window, &attrs )) return STATUS_UNSUCCESSFUL;
-        /* A successful XCopyArea from an unmapped Window does not prove
-         * its pixels. MapNotify resumes preparation against the live scene. */
-        data->client_surface_wait_map = attrs.map_state != IsViewable;
-        if (data->client_surface_wait_map) return STATUS_PENDING;
-        window_width = attrs.width;
-        window_height = attrs.height;
-    }
-    else if (!get_client_surface_window_extent( data, &window_width, &window_height )) return STATUS_UNSUCCESSFUL;
     /* Native ConfigureNotify can precede the Win32 geometry update. The
      * checkpoint must cover the actual Window even during that interval. */
     width = client_surface_backing_extent( max( data->rects.visible.right - data->rects.visible.left, window_width ) );
@@ -7182,7 +7168,7 @@ retry:
         X11DRV_client_surface_backing_cancel_allocation( data );
         allocation = NULL;
     }
-    if (allocation && allocation->force) force = TRUE;
+    if (allocation && allocation->force) *force = TRUE;
     if (data->client_surface_backing &&
         (UINT64)data->client_surface_backing_width * data->client_surface_backing_height >= (UINT64)width * height * 2)
     {
@@ -7200,7 +7186,7 @@ retry:
     }
     else data->client_surface_backing_shrink_start = 0;
     if (data->client_surface_backing && data->client_surface_backing_spare &&
-        !shrink && !force &&
+        !shrink && !*force &&
         data->client_surface_backing_width >= width &&
         data->client_surface_backing_height >= height)
     {
@@ -7232,11 +7218,11 @@ retry:
             /* The old request may already be cancelled, but its native read
              * still owns this spare. Replace the pair through normal bounded
              * admission; no wait or failed scene is needed for shared storage. */
-            force = TRUE;
+            *force = TRUE;
         }
         else
         {
-            if (!update_client_surface_backing_target( data )) return STATUS_UNSUCCESSFUL;
+            if (!update_client_surface_backing_target( data, window_width, window_height )) return STATUS_UNSUCCESSFUL;
             refresh_client_surface_handoffs( data->hwnd );
             return STATUS_SUCCESS;
         }
@@ -7248,8 +7234,8 @@ retry:
          * the published checkpoint, separate from the new GUI snapshot.
          * Keep that capacity-only replacement before rotating the snapshot;
          * the one-checkpoint shortcut below is only for an empty pool. */
-        if ((status = ensure_client_surface_backing( data, FALSE, FALSE, force )) != STATUS_SUCCESS) return status;
-        if (!get_client_surface_window_extent( data, &window_width, &window_height )) return STATUS_UNSUCCESSFUL;
+        if ((status = ensure_client_surface_backing_extent( data, FALSE, FALSE, force,
+                                                           window_width, window_height )) != STATUS_SUCCESS) return status;
         return snapshot_client_surface_backing( data, invalidate, FALSE, window_width, window_height );
     }
 
@@ -7261,7 +7247,7 @@ retry:
         height = max( height, client_surface_backing_extent( data->client_surface_backing_height * 9 / 8 ) );
     /* CREATE has no content identity. A resumed COPY instead retains its
      * exact source and scene; the matching check above precedes consumption. */
-    if ((status = prepare_client_surface_output_allocation( data, width, height, force, &allocation )) != STATUS_SUCCESS)
+    if ((status = prepare_client_surface_output_allocation( data, width, height, *force, &allocation )) != STATUS_SUCCESS)
         return status;
     old_valid = data->client_surface_backing_valid;
     old_valid_width = min( data->client_surface_backing_valid_width, width );
@@ -7279,7 +7265,6 @@ retry:
     status = replace_client_surface_backing( data, allocation, width, height, window_width, window_height,
                                              snapshot, !snapshot && old_valid ? old_valid_width : 0,
                                              !snapshot && old_valid ? old_valid_height : 0, &pixmap, &spare );
-    if (status == STATUS_RETRY) goto retry;
     if (status != STATUS_SUCCESS) return status;
 
     /* The actor installed the checked checkpoint pair. Publish GUI ownership
@@ -7311,6 +7296,35 @@ retry:
         data->client_surface_backing_valid_height = window_height;
     }
     return STATUS_SUCCESS;
+}
+
+/* One native observation supplies capacity, snapshot and target installation
+ * for this attempt. A stale scene retries at the observation boundary, never
+ * by mixing a new native size into an already checked capacity decision. */
+static NTSTATUS ensure_client_surface_backing( struct x11drv_win_data *data, BOOL snapshot, BOOL invalidate, BOOL force )
+{
+    unsigned int window_width, window_height;
+    NTSTATUS status;
+
+    do
+    {
+        if (!data->whole_window) return STATUS_UNSUCCESSFUL;
+        if (snapshot)
+        {
+            XWindowAttributes attrs;
+
+            if (!XGetWindowAttributes( data->display, data->whole_window, &attrs )) return STATUS_UNSUCCESSFUL;
+            /* A successful copy from an unmapped Window does not prove its
+             * pixels. MapNotify resumes preparation against the live scene. */
+            data->client_surface_wait_map = attrs.map_state != IsViewable;
+            if (data->client_surface_wait_map) return STATUS_PENDING;
+            window_width = attrs.width;
+            window_height = attrs.height;
+        }
+        else if (!get_client_surface_window_extent( data, &window_width, &window_height )) return STATUS_UNSUCCESSFUL;
+        status = ensure_client_surface_backing_extent( data, snapshot, invalidate, &force, window_width, window_height );
+    } while (status == STATUS_RETRY);
+    return status;
 }
 
 NTSTATUS X11DRV_client_surface_backing_ensure( struct x11drv_win_data *data )
