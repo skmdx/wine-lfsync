@@ -47,6 +47,7 @@
 #endif
 
 #include "x11drv.h"
+#include "client_surface_cache.h"
 #include "winternl.h"
 #include "wine/debug.h"
 
@@ -1656,6 +1657,14 @@ struct x11drv_image
 {
     XImage               *ximage;    /* XImage used for X11 drawing */
     x11drv_xshm_info_t    shminfo;   /* XSHM extension info */
+    struct client_surface_memory_scope memory;
+    UINT64 bytes;
+    BOOL retiring;
+    LONG refs, pending;
+    DWORD thread;
+    struct client_surface_native_work work;
+    struct x11drv_stream_barrier barrier;
+    struct x11drv_error_handler errors;
 };
 
 struct x11drv_window_surface
@@ -1665,6 +1674,7 @@ struct x11drv_window_surface
     Window                window;
     GC                    gc;
     struct x11drv_image  *image;
+    BOOL                  shape_changed;
     BOOL                  byteswap;
 };
 
@@ -1794,22 +1804,105 @@ static UINT get_dib_d3dddifmt( const BITMAPINFO *info )
     return D3DDDIFMT_UNKNOWN;
 }
 
-static void x11drv_image_destroy( struct x11drv_image *image )
+static void x11drv_image_queue( struct x11drv_image *image )
 {
-    if (!destroy_shm_image( image->ximage, &image->shminfo ))
-        free( image->ximage->data );
-
-    image->ximage->data = NULL;
-    XDestroyImage( image->ximage );
-    free( image );
+    memset( &image->barrier, 0, sizeof(image->barrier) );
+    x11drv_display_owner_register_error_handler( NULL, &image->errors );
+    x11drv_queue_stream_barrier( gdi_display, &image->barrier );
+    client_surface_submit_native_work( &image->work );
 }
 
-static struct x11drv_image *x11drv_image_create( const BITMAPINFO *info, const XVisualInfo *vis )
+static void x11drv_image_free( struct x11drv_image *image )
+{
+    client_surface_release_scoped_memory( &image->memory, CLIENT_SURFACE_MEMORY_STAGING, image->bytes );
+    client_surface_free_owned_metadata( &image->memory, image, sizeof(*image) );
+    x11drv_return_release_capacity( 1, sizeof(*image) );
+}
+
+static void x11drv_image_destroy( struct x11drv_image *image )
+{
+    if (InterlockedDecrement( &image->refs )) return;
+    if (image->ximage)
+    {
+        image->retiring = destroy_shm_image( image->ximage, &image->shminfo );
+        if (!image->retiring) free( image->ximage->data );
+        image->ximage->data = NULL;
+        XDestroyImage( image->ximage );
+        image->ximage = NULL;
+    }
+    if (image->retiring) x11drv_image_queue( image );
+    else x11drv_image_free( image );
+}
+
+static int x11drv_image_error( Display *display, XErrorEvent *event, void *arg )
+{
+    struct x11drv_image *image = arg;
+
+    return x11drv_stream_barrier_error( &image->barrier, event );
+}
+
+static void x11drv_image_read( struct client_surface_native_work *work )
+{
+    struct x11drv_image *image = CONTAINING_RECORD( work, struct x11drv_image, work );
+
+    x11drv_poll_stream_barrier( gdi_display, &image->barrier, NULL );
+}
+
+static void x11drv_image_read_finished( struct client_surface_native_work *work )
+{
+    struct x11drv_image *image = CONTAINING_RECORD( work, struct x11drv_image, work );
+    DWORD thread = image->thread;
+
+    if (!image->barrier.complete)
+    {
+        client_surface_submit_native_work( work );
+        return;
+    }
+    x11drv_display_owner_unregister_error_handler( NULL, &image->errors );
+    if (image->retiring)
+    {
+        x11drv_image_free( image );
+        return;
+    }
+    InterlockedExchange( &image->pending, FALSE );
+    /* Only a wake is transferred; no surface or bitmap is borrowed by the worker. */
+    NtUserPostThreadMessage( thread, WM_X11DRV_SURFACE_FLUSH_READY, 0, 0 );
+    x11drv_image_destroy( image );
+}
+
+static struct x11drv_image *x11drv_image_create( HWND hwnd, const BITMAPINFO *info, const XVisualInfo *vis )
 {
     UINT width = info->bmiHeader.biWidth, height = abs( info->bmiHeader.biHeight );
     struct x11drv_image *image;
+    struct client_surface_memory_scope memory = {0};
+    UINT64 domain;
 
-    if (!(image = calloc( 1, sizeof(*image) ))) return NULL;
+    domain = client_surface_allocate_completion_domains( 1 );
+    if (!domain || !client_surface_memory_scope_init( &memory, hwnd, domain )) return NULL;
+    if (!x11drv_reserve_release_capacity( 1, sizeof(*image) ))
+    {
+        client_surface_memory_scope_destroy( &memory );
+        return NULL;
+    }
+    if (!(image = client_surface_alloc_scoped_metadata( &memory, 1, sizeof(*image) )))
+    {
+        client_surface_memory_scope_destroy( &memory );
+        x11drv_return_release_capacity( 1, sizeof(*image) );
+        return NULL;
+    }
+    image->memory = memory;
+    image->refs = 1;
+    image->work.execute = x11drv_image_read;
+    image->work.finished = x11drv_image_read_finished;
+    image->errors.display = gdi_display;
+    image->errors.callback = x11drv_image_error;
+    image->errors.arg = image;
+    /* Reserve the CPU canvas and transfer image before creating either.
+     * Keep their charge until the server has detached the shared segment. */
+    if (!client_surface_reserve_scoped_memory( &image->memory, CLIENT_SURFACE_MEMORY_STAGING,
+                                               (UINT64)info->bmiHeader.biSizeImage * 2 )) goto failed;
+    image->bytes = (UINT64)info->bmiHeader.biSizeImage * 2;
+    if (!client_surface_prepare_native_work()) goto failed;
 
     if (!(image->ximage = create_shm_image( vis, width, height, &image->shminfo )))
     {
@@ -1883,6 +1976,11 @@ static BOOL x11drv_surface_flush( struct window_surface *window_surface, const R
     const unsigned char *src = color_bits;
     unsigned char *dst = (unsigned char *)ximage->data;
 
+    surface->shape_changed |= shape_changed;
+    /* The CPU bitmap remains writable while the server consumes this image.
+     * Retain dirty bounds and shape changes until the transfer slot is free. */
+    if (InterlockedCompareExchange( &surface->image->pending, 0, 0 )) return FALSE;
+
     if (alpha_bits == -1)
     {
         if (alpha_mask || color_info->bmiHeader.biBitCount != 32) alpha_bits = 0;
@@ -1914,7 +2012,7 @@ static BOOL x11drv_surface_flush( struct window_surface *window_surface, const R
                 ptr[x] |= alpha_bits;
     }
 
-    if (shape_changed)
+    if (surface->shape_changed)
     {
 #ifdef HAVE_LIBXSHAPE
         if (!shape_bits)
@@ -1933,10 +2031,20 @@ static BOOL x11drv_surface_flush( struct window_surface *window_surface, const R
 #endif /* HAVE_LIBXSHAPE */
     }
 
+    surface->shape_changed = FALSE;
     if (!put_shm_image( ximage, &surface->image->shminfo, surface->window, surface->gc, rect, dirty ))
         XPutImage( gdi_display, surface->window, surface->gc, ximage, dirty->left,
                    dirty->top, rect->left + dirty->left, rect->top + dirty->top,
                    dirty->right - dirty->left, dirty->bottom - dirty->top );
+    else
+    {
+        struct x11drv_image *image = surface->image;
+
+        InterlockedIncrement( &image->refs );
+        InterlockedExchange( &image->pending, TRUE );
+        image->thread = GetCurrentThreadId();
+        x11drv_image_queue( image );
+    }
 
     XFlush( gdi_display );
 
@@ -1991,7 +2099,7 @@ static struct window_surface *create_surface( HWND hwnd, Window window, struct x
     set_color_info( vis, info, use_alpha );
 
     native_window = x11drv_native_window_acquire( native_window );
-    if (!(image = x11drv_image_create( info, vis )))
+    if (!(image = x11drv_image_create( hwnd, info, vis )))
     {
         x11drv_native_window_release( native_window );
         return NULL;
@@ -2001,7 +2109,7 @@ static struct window_surface *create_surface( HWND hwnd, Window window, struct x
     if ((byteswap = image_needs_byteswap( image->ximage, is_r8g8b8( vis ), info->bmiHeader.biBitCount )) ||
         info->bmiHeader.biBitCount <= 8 || !(d3d_format = get_dib_d3dddifmt( info )))
         WARN( "Cannot use direct rendering, falling back to copies\n" );
-    else
+    else if (image->shminfo.shmid == -1)
     {
         D3DKMT_CREATEDCFROMMEMORY desc =
         {
@@ -2018,6 +2126,9 @@ static struct window_surface *create_surface( HWND hwnd, Window window, struct x
         else
         {
             bitmap = desc.hBitmap;
+            client_surface_release_scoped_memory( &image->memory, CLIENT_SURFACE_MEMORY_STAGING,
+                                                   info->bmiHeader.biSizeImage );
+            image->bytes -= info->bmiHeader.biSizeImage;
             NtGdiDeleteObjectApp( desc.hDc );
         }
         if (desc.hDeviceDc) NtUserReleaseDC( hwnd, desc.hDeviceDc );

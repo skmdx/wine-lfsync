@@ -4545,6 +4545,8 @@ LRESULT X11DRV_WindowMessage( HWND hwnd, UINT msg, WPARAM wp, LPARAM lp )
 
     switch(msg)
     {
+    case WM_X11DRV_SURFACE_FLUSH_READY:
+        return 0; /* The message loop retries dirty window surfaces on wake. */
     case WM_X11DRV_WINDOW_PAINT_READY:
         x11drv_window_paint_ready( (UINT64)(UINT)wp | ((UINT64)(UINT)lp << 32) );
         return 0;
