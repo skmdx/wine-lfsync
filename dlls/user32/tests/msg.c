@@ -21522,6 +21522,7 @@ START_TEST(msg)
     test_WaitForInputIdle( test_argv[0] );
     test_scrollwindowex();
     test_messages();
+    if (argc == 3 && !strcmp( test_argv[2], "window_prefix" )) goto done;
     test_setwindowpos();
     test_showwindow();
     invisible_parent_tests();
