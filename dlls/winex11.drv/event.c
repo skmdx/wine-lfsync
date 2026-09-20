@@ -1010,6 +1010,8 @@ static BOOL X11DRV_ConfigureNotify( HWND hwnd, XEvent *xev )
     pos = root_to_virtual_screen( pos.x, pos.y );
     if (size.cx == 1 && size.cy == 1 && IsRectEmpty( &data->rects.window )) size.cx = size.cy = 0;
     SetRect( &rect, pos.x, pos.y, pos.x + size.cx, pos.y + size.cy );
+    TRACE( "window %p/%lx config %s serial %lu synthetic %u, pending %lu\n", hwnd,
+           event->window, wine_dbgstr_rect(&rect), event->serial, event->send_event, data->configure_serial );
     window_configure_notify( data, event->serial, &rect );
 
     release_win_data( data );

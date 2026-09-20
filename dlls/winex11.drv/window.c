@@ -4000,6 +4000,16 @@ NTSTATUS X11DRV_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_hint,
                    new_rects->visible.right - new_rects->visible.left ||
                    old_rects.visible.bottom - old_rects.visible.top !=
                    new_rects->visible.bottom - new_rects->visible.top;
+    /* A host configure can retain the fullscreen size while the WM is leaving
+     * fullscreen. Applying that geometry is not a new application request to
+     * enter fullscreen or fix its size. Keep the host state and thick-frame
+     * resizability when the application accepted the host rect unchanged;
+     * application-adjusted rects still determine their own fullscreen state. */
+    if (data->state_locks && EqualRect( &new_rects->visible, &data->current_state.rect ))
+    {
+        fullscreen = !!(data->current_state.net_wm_state & (1 << NET_WM_STATE_FULLSCREEN));
+        if (!fullscreen && (new_style & WS_THICKFRAME)) swp_flags |= WINE_SWP_RESIZABLE;
+    }
     was_fullscreen = data->is_fullscreen;
     if (!(new_style & WS_MINIMIZE) || is_virtual_desktop()) data->rects = *new_rects;
     data->is_fullscreen = fullscreen;

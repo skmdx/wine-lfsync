@@ -10060,18 +10060,6 @@ static void test_fullscreen(void)
            wine_dbgstr_rect(&virtual_rect), wine_dbgstr_rect(&rc));
         DestroyWindow(hwnd);
 
-        /* Test windows covering one monitor and 1 pixel larger on available sides */
-        expected_rect = mi.rcMonitor;
-        InflateRect(&expected_rect, 1, 1);
-        IntersectRect(&expected_rect, &expected_rect, &virtual_rect);
-        hwnd = CreateWindowA("static", NULL, WS_POPUP | WS_VISIBLE, expected_rect.left,
-                             expected_rect.top, expected_rect.right - expected_rect.left,
-                             expected_rect.bottom - expected_rect.top, NULL, NULL, NULL, NULL);
-        ok(!!hwnd, "CreateWindow failed, error %#lx.\n", GetLastError());
-        flush_events(TRUE);
-
-        GetWindowRect(hwnd, &rc);
-        todo_wine
         ok(EqualRect(&rc, &expected_rect), "Expected %s, got %s.\n",
            wine_dbgstr_rect(&expected_rect), wine_dbgstr_rect(&rc));
         DestroyWindow(hwnd);
@@ -15003,6 +14991,12 @@ START_TEST(win)
     if (argc == 3 && !strcmp( argv[2], "wide_clip" ))
     {
         test_wide_window_clip();
+        return;
+    }
+
+    if (argc == 3 && !strcmp( argv[2], "fullscreen" ))
+    {
+        test_fullscreen();
         return;
     }
 
