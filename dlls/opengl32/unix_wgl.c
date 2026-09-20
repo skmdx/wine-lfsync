@@ -990,6 +990,8 @@ BOOL wrap_wglSwapBuffers( TEB *teb, HDC hdc )
     const struct opengl_funcs *funcs = get_dc_funcs( hdc );
     BOOL ret;
 
+    if (!funcs->p_wglSwapBuffers) return FALSE;
+
     resolve_default_fbo( teb, FALSE );
 
     if (!(ret = funcs->p_wglSwapBuffers( hdc )))
