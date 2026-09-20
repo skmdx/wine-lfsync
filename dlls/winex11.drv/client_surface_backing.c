@@ -2389,7 +2389,7 @@ static int compare_client_surface_handoff_descs( const void *a, const void *b )
  * this job rather than borrowing pointers from an invalidated ScenePlan. */
 static BOOL reuse_client_surface_compositor_handoffs( const struct client_surface_compositor_job *job )
 {
-    struct client_surface_compositor_binding *binding, **members;
+    struct client_surface_compositor_binding *binding, **cursor, **members;
     unsigned int count = 0, i = 0;
 
     for (i = 0; i < job->u.reuse.count; ++i) job->u.reuse.reused[i] = FALSE;
@@ -2407,9 +2407,6 @@ static BOOL reuse_client_surface_compositor_handoffs( const struct client_surfac
         const struct client_surface_handoff_desc *desc = &job->u.reuse.handoffs[i];
         unsigned int low = 0, high = count;
 
-        /* A nonzero roster cookie includes server-side retirement checks;
-         * shared slot endpoints alone cannot authorize A -> B -> A reuse. */
-        if (!desc->cookie) continue;
         while (low < high)
         {
             unsigned int mid = low + (high - low) / 2;
@@ -2420,8 +2417,18 @@ static BOOL reuse_client_surface_compositor_handoffs( const struct client_surfac
         {
             binding = members[low];
             if (wine_server_user_handle( binding->window ) != desc->handle) break;
-            if (binding->process != desc->process || binding->identity != desc->surface ||
-                binding->cookie != desc->cookie) continue;
+            if (binding->process != desc->process || binding->identity != desc->surface) continue;
+            if (binding->cookie != desc->cookie)
+            {
+                /* A -> B -> A can leave the old consumer mapped although
+                 * the server has retired its cookie. Drop it before new
+                 * registration; pending source reads retain their endpoint
+                 * through the existing retirement path. */
+                for (cursor = &client_surface_compositor_bindings; *cursor != binding; cursor = &(*cursor)->next) {}
+                remove_client_surface_compositor_binding( cursor );
+                memmove( members + low, members + low + 1, (--count - low) * sizeof(*members) );
+                break;
+            }
             if ((job->u.reuse.reused[i] = client_surface_compositor_binding_is_live( binding )))
                 binding->mark = job->u.reuse.mark;
             break;
