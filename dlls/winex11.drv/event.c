@@ -924,6 +924,11 @@ static BOOL X11DRV_MapNotify( HWND hwnd, XEvent *event )
         if (hwndFocus && NtUserIsChild( hwnd, hwndFocus ))
             set_input_focus( data );
     }
+    if (event->xany.window == data->whole_window && data->client_surface_wait_map)
+    {
+        data->client_surface_wait_map = FALSE;
+        NtUserPostMessage( hwnd, WM_WINE_UPDATEWINDOWSTATE, WINE_UPDATE_CLIENT_SURFACE_BACKING, 0 );
+    }
     release_win_data( data );
     return TRUE;
 }

@@ -3093,8 +3093,10 @@ static BOOL client_surface_compositor_restore_ready( const struct client_surface
 static BOOL restore_client_surface_compositor_pixels( struct client_surface_compositor_target *target )
 {
     RECT rect = target->restore_rect;
+    struct client_surface_scene scene;
 
     SetRectEmpty( &target->restore_rect );
+    if (!client_surface_get_toplevel_scene( target->toplevel, &scene )) return FALSE;
     if (!target->published || target->published_width < target->window_width ||
         target->published_height < target->window_height) return FALSE;
     TRACE( "restoring target %p window %#lx from published pixmap %#lx rect %s\n",
@@ -6691,6 +6693,7 @@ static BOOL get_client_surface_window_extent( struct x11drv_win_data *data,
 void X11DRV_client_surface_backing_destroy( struct x11drv_win_data *data )
 {
     X11DRV_client_surface_backing_cancel_allocation( data );
+    data->client_surface_wait_map = FALSE;
     remove_client_surface_backing_target( data->hwnd );
     if (data->client_surface_backing || data->client_surface_backing_spare)
     {
@@ -6848,7 +6851,19 @@ static NTSTATUS ensure_client_surface_backing( struct x11drv_win_data *data, BOO
 retry:
     shrink = FALSE;
     if (!data->whole_window) return STATUS_UNSUCCESSFUL;
-    if (!get_client_surface_window_extent( data, &window_width, &window_height )) return STATUS_UNSUCCESSFUL;
+    if (snapshot)
+    {
+        XWindowAttributes attrs;
+
+        if (!XGetWindowAttributes( data->display, data->whole_window, &attrs )) return STATUS_UNSUCCESSFUL;
+        /* A successful XCopyArea from an unmapped Window does not prove
+         * its pixels. MapNotify resumes preparation against the live scene. */
+        data->client_surface_wait_map = attrs.map_state != IsViewable;
+        if (data->client_surface_wait_map) return STATUS_PENDING;
+        window_width = attrs.width;
+        window_height = attrs.height;
+    }
+    else if (!get_client_surface_window_extent( data, &window_width, &window_height )) return STATUS_UNSUCCESSFUL;
     /* Native ConfigureNotify can precede the Win32 geometry update. The
      * checkpoint must cover the actual Window even during that interval. */
     width = client_surface_backing_extent( max( data->rects.visible.right - data->rects.visible.left, window_width ) );
@@ -7031,11 +7046,15 @@ BOOL X11DRV_client_surface_backing_restore( struct x11drv_win_data *data,
                                            Window window, const RECT *rect )
 {
     struct client_surface_compositor_job job;
+    struct client_surface_scene scene;
     unsigned int window_width, window_height;
 
     if (window != data->whole_window || !data->client_surface_backing ||
         IsRectEmpty( rect ))
         return FALSE;
+    /* PREPARE owns the new GDI background. Replaying the old composition
+     * over it would contaminate the checkpoint with retired source pixels. */
+    if (!client_surface_get_toplevel_scene( data->hwnd, &scene )) return FALSE;
     if (!get_client_surface_window_extent( data, &window_width, &window_height )) return FALSE;
     if (rect->left < 0 || rect->top < 0 ||
         (unsigned int)rect->right > window_width ||

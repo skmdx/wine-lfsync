@@ -748,6 +748,7 @@ struct x11drv_win_data
     UINT        client_surface_opacity_valid : 1; /* desired opacity property is present */
     UINT        client_surface_backing_enabled : 1;
     UINT        client_surface_backing_valid : 1;
+    UINT        client_surface_wait_map : 1; /* checkpoint awaits a drawable native window */
     Window      embedder;       /* window id of embedder */
     Pixmap         icon_pixmap;
     Pixmap         icon_mask;
