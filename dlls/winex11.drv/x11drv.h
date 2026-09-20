@@ -822,7 +822,7 @@ extern NTSTATUS X11DRV_client_surface_backing_end_update( struct x11drv_win_data
                                                            struct client_surface_owner_notifications *notifications,
                                                            NTSTATUS status );
 extern NTSTATUS X11DRV_client_surface_backing_snapshot( struct x11drv_win_data *data, BOOL invalidate );
-extern BOOL X11DRV_client_surface_backing_publish( struct x11drv_win_data *data );
+extern NTSTATUS X11DRV_client_surface_backing_publish( struct x11drv_win_data *data );
 extern BOOL X11DRV_client_surface_backing_restore( struct x11drv_win_data *data,
                                                   Window window, const RECT *rect );
 

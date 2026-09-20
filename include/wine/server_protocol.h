@@ -6490,6 +6490,7 @@ struct set_client_surface_state_reply
 #define CLIENT_SURFACE_STATE_FAILED              0x800000
 #define CLIENT_SURFACE_STATE_NATIVE_CANDIDATE    0x1000000
 #define CLIENT_SURFACE_STATE_CANCEL_CANDIDATE    0x2000000
+#define CLIENT_SURFACE_STATE_PUBLISH_RESUME      0x4000000
 
 #define CLIENT_SURFACE_PUBLISH_COPY   1
 #define CLIENT_SURFACE_PUBLISH_EXPOSE 2
@@ -7781,6 +7782,6 @@ union generic_reply
     struct set_queue_paint_blocked_reply set_queue_paint_blocked_reply;
 };
 
-#define SERVER_PROTOCOL_VERSION 1028
+#define SERVER_PROTOCOL_VERSION 1029
 
 #endif /* __WINE_WINE_SERVER_PROTOCOL_H */

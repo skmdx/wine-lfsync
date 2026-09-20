@@ -4249,20 +4249,18 @@ NTSTATUS X11DRV_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_hint,
     }
     if (publish_client_surface)
     {
-        BOOL published;
-
         /* The server keeps the live or staged token active until this X
          * request has completed.  This is the native linearization point for
          * publication. */
         client_surface_capture_scene_state( hwnd, &scene );
-        published = X11DRV_client_surface_backing_publish( data );
+        status = X11DRV_client_surface_backing_publish( data );
 
-        if (!published)
+        if (status != STATUS_SUCCESS && status != STATUS_PENDING)
         {
             client_surface_fail_scene( &scene );
             status = STATUS_UNSUCCESSFUL;
         }
-        if (published && (data->client_surface_redirected || data->client_surface_opacity_staged))
+        if (status == STATUS_SUCCESS && (data->client_surface_redirected || data->client_surface_opacity_staged))
             finish_client_surface_staging( data );
         X11DRV_sync_window_changes( data->display );
     }

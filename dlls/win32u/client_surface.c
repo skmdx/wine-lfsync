@@ -1567,6 +1567,63 @@ UINT client_surface_begin_publish( HWND hwnd, UINT64 *generation, UINT64 *scene_
     return publish;
 }
 
+void client_surface_publish_window( HWND hwnd )
+{
+    UINT64 generation, scene;
+    NTSTATUS status = STATUS_NOT_FOUND;
+    UINT publish = 0;
+    WND *win;
+
+    if (!is_current_thread_window( hwnd ) || !(win = get_win_ptr( hwnd ))) return;
+    if (win == WND_DESKTOP || win == WND_OTHER_PROCESS) return;
+    if (win->publish_busy)
+    {
+        release_win_ptr( win );
+        return;
+    }
+    win->publish_busy = TRUE;
+    generation = win->publish_generation;
+    scene = win->publish_scene;
+    release_win_ptr( win );
+
+    if (generation)
+    {
+        SERVER_START_REQ( set_client_surface_state )
+        {
+            req->handle = wine_server_user_handle( hwnd );
+            req->flags = CLIENT_SURFACE_STATE_PUBLISH_RESUME;
+            req->surface = 0;
+            req->generation = generation;
+            req->scene_generation = scene;
+            if (!wine_server_call( req )) publish = reply->publish;
+        }
+        SERVER_END_REQ;
+        /* Retirement authenticates the old reservation independently. A
+         * stale continuation must never fail or commit a newer publication. */
+        if (!publish)
+        {
+            client_surface_end_publish( hwnd, generation, scene, FALSE );
+            /* This wake may already belong to the next READY transaction. */
+            publish = client_surface_begin_publish( hwnd, &generation, &scene );
+        }
+    }
+    else publish = client_surface_begin_publish( hwnd, &generation, &scene );
+    if (publish)
+    {
+        if (publish == CLIENT_SURFACE_PUBLISH_EXPOSE)
+            status = user_driver->pExposeClientSurface( hwnd, scene ) ? STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
+        else status = publish_window_state( hwnd );
+        if (status == STATUS_SUCCESS || publish == CLIENT_SURFACE_PUBLISH_EXPOSE)
+            client_surface_end_publish( hwnd, generation, scene, status == STATUS_SUCCESS );
+    }
+    if (!(win = get_win_ptr( hwnd ))) return;
+    if (win == WND_DESKTOP || win == WND_OTHER_PROCESS) return;
+    win->publish_generation = status == STATUS_PENDING ? generation : 0;
+    win->publish_scene = status == STATUS_PENDING ? scene : 0;
+    win->publish_busy = FALSE;
+    release_win_ptr( win );
+}
+
 BOOL client_surface_end_publish( HWND hwnd, UINT64 generation, UINT64 scene_generation, BOOL success )
 {
     BOOL accepted = FALSE;

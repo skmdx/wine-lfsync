@@ -4842,9 +4842,9 @@ void update_window_state( HWND hwnd )
     update_window_state_flags( hwnd, 0 );
 }
 
-BOOL publish_window_state( HWND hwnd )
+NTSTATUS publish_window_state( HWND hwnd )
 {
-    return update_window_state_flags( hwnd, WINE_SWP_CLIENT_SURFACE_PUBLISH ) == STATUS_SUCCESS;
+    return update_window_state_flags( hwnd, WINE_SWP_CLIENT_SURFACE_PUBLISH );
 }
 
 NTSTATUS prepare_window_client_surfaces( HWND hwnd )

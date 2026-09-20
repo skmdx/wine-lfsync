@@ -3661,6 +3661,9 @@ static DWORD WINAPI foreign_exposure_thread( void *arg )
                                       data->generation, data->scene, &state );
     ok( !status && !state.publish && state.staged && state.generation == data->generation,
         "foreign thread acknowledged exposure, status %#x\n", status );
+    status = set_surface_state_scene( data->hwnd, 0, CLIENT_SURFACE_STATE_PUBLISH_RESUME,
+                                      data->generation, data->scene, &state );
+    ok( status == STATUS_ACCESS_DENIED, "foreign thread resumed publication, status %#x\n", status );
     return 0;
 }
 
@@ -5463,7 +5466,10 @@ static void test_generation_aba(void)
 static void test_publish_transaction(void)
 {
     const UINT64 surface = allocate_surface();
-    struct surface_state staged, ready, publishing, changed, committed, repaired;
+    struct surface_state staged, ready, publishing, changed, committed, repaired, resumed;
+    struct exposure_thread_data thread_data;
+    HANDLE thread;
+    BOOL accepted;
     HWND hwnd;
     unsigned int status;
 
@@ -5485,10 +5491,43 @@ static void test_publish_transaction(void)
         "publish transaction did not become ready: status %#x ready %u pending %u\n",
         status, ready.ready, ready.pending );
 
+    status = set_surface_state_scene( hwnd, 0, CLIENT_SURFACE_STATE_PUBLISH_RESUME,
+                                      ready.generation, ready.scene_generation, &resumed );
+    ok( !status && !resumed.publish, "resume before BEGIN: status %#x publish %u\n", status, resumed.publish );
+
     status = set_surface_state( hwnd, 0, CLIENT_SURFACE_STATE_PUBLISH_BEGIN, 0, &publishing );
     ok( !status && publishing.publish && publishing.staged && publishing.ready,
         "publish begin was rejected: status %#x publish %u staged %u ready %u\n",
         status, publishing.publish, publishing.staged, publishing.ready );
+
+    status = set_surface_state( hwnd, 0, CLIENT_SURFACE_STATE_PUBLISH_BEGIN, 0, &resumed );
+    ok( !status && !resumed.publish, "duplicate BEGIN: status %#x publish %u\n", status, resumed.publish );
+    status = set_surface_state_scene( hwnd, 0, CLIENT_SURFACE_STATE_PUBLISH_RESUME,
+                                      publishing.generation, publishing.scene_generation, &resumed );
+    ok( !status && resumed.publish == CLIENT_SURFACE_PUBLISH_COPY &&
+        resumed.generation == publishing.generation && resumed.scene_generation == publishing.scene_generation &&
+        resumed.staged == publishing.staged && resumed.ready == publishing.ready,
+        "reserved COPY resume: status %#x publish %u generation %s scene %s\n", status, resumed.publish,
+        wine_dbgstr_longlong( resumed.generation ), wine_dbgstr_longlong( resumed.scene_generation ) );
+    status = set_surface_state_scene( hwnd, 0, CLIENT_SURFACE_STATE_PUBLISH_RESUME,
+                                      publishing.generation + 1, publishing.scene_generation, &resumed );
+    ok( !status && !resumed.publish, "wrong generation resume: status %#x publish %u\n", status, resumed.publish );
+    status = set_surface_state_scene( hwnd, 0, CLIENT_SURFACE_STATE_PUBLISH_RESUME,
+                                      publishing.generation, publishing.scene_generation + 2, &resumed );
+    ok( !status && !resumed.publish, "wrong scene resume: status %#x publish %u\n", status, resumed.publish );
+    status = set_surface_state_scene( hwnd, 0, CLIENT_SURFACE_STATE_PUBLISH_RESUME,
+                                      publishing.generation, publishing.scene_generation | 1, &resumed );
+    ok( !status && !resumed.publish, "odd scene resume: status %#x publish %u\n", status, resumed.publish );
+    thread_data.hwnd = hwnd;
+    thread_data.generation = publishing.generation;
+    thread_data.scene = publishing.scene_generation;
+    thread = CreateThread( NULL, 0, foreign_exposure_thread, &thread_data, 0, NULL );
+    ok( !!thread, "failed to create foreign publication thread\n" );
+    if (thread)
+    {
+        ok( WaitForSingleObject( thread, 5000 ) == WAIT_OBJECT_0, "foreign publication thread timed out\n" );
+        CloseHandle( thread );
+    }
 
     status = set_scene_placement( hwnd, 20, 0, 0, 0 );
     ok( !status, "publication fixture move status %#x\n", status );
@@ -5500,6 +5539,14 @@ static void test_publish_transaction(void)
         status, changed.staged, changed.ready, wine_dbgstr_longlong( changed.generation ),
         wine_dbgstr_longlong( changed.scene_generation ) );
 
+    status = set_surface_state_scene( hwnd, 0, CLIENT_SURFACE_STATE_PUBLISH_RESUME,
+                                      publishing.generation, publishing.scene_generation, &resumed );
+    ok( !status && !resumed.publish && resumed.generation == publishing.generation &&
+        resumed.scene_generation == changed.scene_generation && resumed.staged == changed.staged,
+        "stale resume changed reservation: status %#x publish %u generation %s scene %s\n",
+        status, resumed.publish, wine_dbgstr_longlong( resumed.generation ),
+        wine_dbgstr_longlong( resumed.scene_generation ) );
+
     status = set_surface_state_scene( hwnd, 0, CLIENT_SURFACE_STATE_PUBLISH_COMMIT,
                                       publishing.generation, publishing.scene_generation, &committed );
     ok( !status && !committed.staged && committed.wake && !committed.pending &&
@@ -5507,6 +5554,10 @@ static void test_publish_transaction(void)
         "publish ACK did not wait for owner snapshot: status %#x staged %u wake %u pending %u generation %s\n",
         status, committed.staged, committed.wake, committed.pending,
         wine_dbgstr_longlong( committed.generation ) );
+    status = set_surface_state_scene( hwnd, 0, CLIENT_SURFACE_STATE_PUBLISH_RESUME,
+                                      publishing.generation, publishing.scene_generation, &resumed );
+    ok( !status && !resumed.publish && !resumed.generation,
+        "retired reservation resumed: status %#x publish %u\n", status, resumed.publish );
     status = prepare_surface_state( hwnd, &committed );
     ok( !status && committed.pending == 1 && committed.generation != publishing.generation,
         "owner snapshot did not start live repair: status %#x pending %u generation %s\n",
@@ -5517,6 +5568,13 @@ static void test_publish_transaction(void)
         "live repair did not reach publication: status %#x staged %u ready %u pending %u generation %s\n",
         status, repaired.staged, repaired.ready, repaired.pending,
         wine_dbgstr_longlong( repaired.generation ) );
+    status = publish_native_surface( hwnd, publishing.generation, publishing.scene_generation, FALSE, &accepted );
+    ok( !status && !accepted, "stale cancellation retired new publication: status %#x accepted %u\n", status, accepted );
+    status = set_surface_state( hwnd, 0, 0, 0, &resumed );
+    ok( !status && resumed.generation == repaired.generation && resumed.scene_generation == repaired.scene_generation &&
+        resumed.ready == repaired.ready && resumed.staged == repaired.staged,
+        "new publication changed after stale cancellation: status %#x generation %s scene %s\n",
+        status, wine_dbgstr_longlong( resumed.generation ), wine_dbgstr_longlong( resumed.scene_generation ) );
     status = publish_surface_state( hwnd, &repaired );
     ok( !status && !repaired.staged && !repaired.pending && !repaired.generation,
         "live repair publication did not retire its epoch: status %#x staged %u pending %u generation %s\n",

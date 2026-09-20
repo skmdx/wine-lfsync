@@ -2283,20 +2283,7 @@ static LRESULT handle_internal_message( HWND hwnd, UINT msg, WPARAM wparam, LPAR
         if (wparam == WINE_UPDATE_CLIENT_SURFACE_BACKING)
             update_window_client_surface_backing( hwnd );
         else if (wparam == WINE_PUBLISH_CLIENT_SURFACES)
-        {
-            UINT64 generation, scene_generation;
-            UINT publish = client_surface_begin_publish( hwnd, &generation, &scene_generation );
-            BOOL success;
-
-            if (publish)
-            {
-                if (publish == CLIENT_SURFACE_PUBLISH_EXPOSE)
-                    success = user_driver->pExposeClientSurface( hwnd, scene_generation );
-                else success = publish_window_state( hwnd );
-                if (success || publish == CLIENT_SURFACE_PUBLISH_EXPOSE)
-                    client_surface_end_publish( hwnd, generation, scene_generation, success );
-            }
-        }
+            client_surface_publish_window( hwnd );
         else if (wparam == WINE_PREPARE_CLIENT_SURFACES)
         {
             struct client_surface_scene scene;

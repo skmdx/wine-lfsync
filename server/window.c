@@ -5867,6 +5867,21 @@ DECL_HANDLER(set_client_surface_state)
     if (!(win = get_window( req->handle ))) return;
     top = get_toplevel_window( win );
     was_pending = top->client_surface_dirty;
+    if (req->flags & CLIENT_SURFACE_STATE_PUBLISH_RESUME)
+    {
+        if (req->flags != CLIENT_SURFACE_STATE_PUBLISH_RESUME || req->surface || win != top)
+            set_error( STATUS_INVALID_PARAMETER );
+        else if (top->thread != current)
+            set_error( STATUS_ACCESS_DENIED );
+        else if (req->generation && req->generation == client_surface_transaction_generation( top ) &&
+                 req->scene_generation && !(req->scene_generation & 1) &&
+                 req->scene_generation == top->client_surface_scene_generation &&
+                 req->scene_generation == top->client_surface_transaction.epoch &&
+                 client_surface_is_publishing( top ) &&
+                 top->client_surface_transaction.publication == CLIENT_SURFACE_PUBLICATION_COPY)
+            reply->publish = CLIENT_SURFACE_PUBLISH_COPY;
+        goto done;
+    }
     if (req->flags & (CLIENT_SURFACE_STATE_STAGED | CLIENT_SURFACE_STATE_FAILED |
                       CLIENT_SURFACE_STATE_PREPARE_COMMIT))
     {

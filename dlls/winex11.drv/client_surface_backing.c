@@ -7337,16 +7337,16 @@ NTSTATUS X11DRV_client_surface_backing_snapshot( struct x11drv_win_data *data, B
     return ensure_client_surface_backing( data, TRUE, invalidate, FALSE );
 }
 
-BOOL X11DRV_client_surface_backing_publish( struct x11drv_win_data *data )
+NTSTATUS X11DRV_client_surface_backing_publish( struct x11drv_win_data *data )
 {
     unsigned int width, height, window_width, window_height;
 
     if (!data->whole_window || !data->client_surface_backing)
-        return FALSE;
-    if (!get_client_surface_window_extent( data, &window_width, &window_height )) return FALSE;
+        return STATUS_UNSUCCESSFUL;
+    if (!get_client_surface_window_extent( data, &window_width, &window_height )) return STATUS_UNSUCCESSFUL;
     width = min( data->client_surface_backing_width, window_width );
     height = min( data->client_surface_backing_height, window_height );
-    if (width != window_width || height != window_height) return FALSE;
+    if (width != window_width || height != window_height) return STATUS_UNSUCCESSFUL;
     if (!client_surface_backing_present( data->hwnd, data->whole_window, data->client_surface_backing,
                                          width, height ))
     {
@@ -7354,12 +7354,12 @@ BOOL X11DRV_client_surface_backing_publish( struct x11drv_win_data *data )
                data->client_surface_backing );
         if (!client_surface_backing_copy( data->hwnd, data->client_surface_backing,
                                           data->whole_window, width, height ))
-            return FALSE;
+            return STATUS_UNSUCCESSFUL;
     }
     data->client_surface_backing_valid = TRUE;
     data->client_surface_backing_valid_width = window_width;
     data->client_surface_backing_valid_height = window_height;
-    return TRUE;
+    return STATUS_SUCCESS;
 }
 
 BOOL X11DRV_client_surface_backing_restore( struct x11drv_win_data *data,
