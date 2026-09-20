@@ -3597,6 +3597,20 @@ static void dump_complete_window_paint_request( const struct complete_window_pai
     fprintf( stderr, ", success=%08x", req->success );
 }
 
+static void dump_detach_window_paints_request( const struct detach_window_paints_request *req )
+{
+}
+
+static void dump_detach_window_paints_reply( const struct detach_window_paints_reply *req )
+{
+    dump_uint64( " retirement=", &req->retirement );
+}
+
+static void dump_retire_window_paints_request( const struct retire_window_paints_request *req )
+{
+    dump_uint64( " retirement=", &req->retirement );
+}
+
 static void dump_set_client_surface_state_request( const struct set_client_surface_state_request *req )
 {
     fprintf( stderr, " handle=%08x", req->handle );
@@ -4132,6 +4146,8 @@ static const dump_func req_dumpers[REQ_NB_REQUESTS] =
     (dump_func)dump_begin_window_paint_request,
     (dump_func)dump_end_window_paint_request,
     (dump_func)dump_complete_window_paint_request,
+    (dump_func)dump_detach_window_paints_request,
+    (dump_func)dump_retire_window_paints_request,
     (dump_func)dump_set_client_surface_state_request,
     (dump_func)dump_get_client_surface_clip_windows_request,
     (dump_func)dump_get_client_surface_handoff_request,
@@ -4467,6 +4483,8 @@ static const dump_func reply_dumpers[REQ_NB_REQUESTS] =
     (dump_func)dump_set_client_surface_native_barrier_reply,
     (dump_func)dump_begin_window_paint_reply,
     NULL,
+    NULL,
+    (dump_func)dump_detach_window_paints_reply,
     NULL,
     (dump_func)dump_set_client_surface_state_reply,
     (dump_func)dump_get_client_surface_clip_windows_reply,
@@ -4804,6 +4822,8 @@ static const char * const req_names[REQ_NB_REQUESTS] =
     "begin_window_paint",
     "end_window_paint",
     "complete_window_paint",
+    "detach_window_paints",
+    "retire_window_paints",
     "set_client_surface_state",
     "get_client_surface_clip_windows",
     "get_client_surface_handoff",

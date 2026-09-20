@@ -5548,6 +5548,26 @@ static UINT complete_paint_receipt( UINT64 token, BOOL success )
     return p_wine_server_call( &info );
 }
 
+static UINT detach_paint_receipts( UINT64 *retirement )
+{
+    struct __server_request_info info = {0};
+    UINT status;
+
+    info.u.req.detach_window_paints_request.__header.req = REQ_detach_window_paints;
+    status = p_wine_server_call( &info );
+    *retirement = info.u.reply.detach_window_paints_reply.retirement;
+    return status;
+}
+
+static UINT retire_paint_receipts( UINT64 retirement )
+{
+    struct __server_request_info info = {0};
+
+    info.u.req.retire_window_paints_request.__header.req = REQ_retire_window_paints;
+    info.u.req.retire_window_paints_request.retirement = retirement;
+    return p_wine_server_call( &info );
+}
+
 static UINT get_paint_update( HWND hwnd, BOOL validate )
 {
     struct __server_request_info info = {0};
@@ -5597,7 +5617,8 @@ static void set_paint_update( HWND hwnd, UINT flags )
 struct paint_receipt_thread_data
 {
     HWND hwnd;
-    UINT64 token;
+    UINT64 token, retirement;
+    BOOL detach;
     HANDLE destroyed, finish;
 };
 
@@ -5609,6 +5630,44 @@ static DWORD WINAPI paint_receipt_thread( void *arg )
     {
         UINT status = begin_paint_receipt( data->hwnd, &data->token );
 
+        if (!status && data->detach)
+        {
+            UINT64 second, empty, held[62];
+            unsigned int i, count;
+
+            set_paint_update( data->hwnd, RDW_INVALIDATE | RDW_ERASE );
+            ok( get_paint_update( data->hwnd, TRUE ) & UPDATE_PAINT, "detached writer did not consume update\n" );
+            status = begin_paint_receipt( data->hwnd, &second );
+            ok( !status, "second detached paint begin status %#x\n", status );
+            status = end_paint_receipt( second, FALSE );
+            ok( !status, "second detached paint end status %#x\n", status );
+            status = detach_paint_receipts( &data->retirement );
+            ok( !status && data->retirement, "paint detach status %#x\n", status );
+            status = complete_paint_receipt( second, TRUE );
+            ok( status == STATUS_INVALID_PARAMETER, "detached writer completed old token, status %#x\n", status );
+            status = end_paint_receipt( data->token, TRUE );
+            ok( status == STATUS_INVALID_PARAMETER, "detached writer cancelled old token, status %#x\n", status );
+            status = detach_paint_receipts( &empty );
+            ok( !status && !empty, "duplicate detach status %#x identity %s\n", status, wine_dbgstr_longlong( empty ) );
+            /* Handoff must not evade the existing 64-receipt writer bound. */
+            for (count = 0; count < ARRAY_SIZE(held); count++)
+            {
+                status = begin_paint_receipt( data->hwnd, &held[count] );
+                ok( !status, "post-detach reservation %u status %#x\n", count, status );
+                if (status) break;
+            }
+            if (count == ARRAY_SIZE(held))
+            {
+                status = begin_paint_receipt( data->hwnd, &empty );
+                ok( status == STATUS_NO_MEMORY, "detached paints lost admission charge, status %#x\n", status );
+                if (!status) end_paint_receipt( empty, TRUE );
+            }
+            for (i = 0; i < count; i++)
+            {
+                status = end_paint_receipt( held[i], TRUE );
+                ok( !status, "post-detach cancellation %u status %#x\n", i, status );
+            }
+        }
         if (!status && data->destroyed)
         {
             struct __server_request_info info = {0};
@@ -5636,6 +5695,94 @@ static void run_paint_receipt_thread( struct paint_receipt_thread_data *data, UI
     ok( GetExitCodeThread( thread, &status ), "paint thread exit query error %lu\n", GetLastError() );
     CloseHandle( thread );
     ok( status == expected, "paint thread status %#lx, expected %#x\n", status, expected );
+}
+
+static void check_paint_retirement_process( HWND hwnd, UINT64 retirement )
+{
+    SECURITY_ATTRIBUTES attr = {sizeof(attr), NULL, TRUE};
+    STARTUPINFOA startup = {.cb = sizeof(startup)};
+    PROCESS_INFORMATION process;
+    HANDLE ready = CreateEventA( &attr, TRUE, FALSE, NULL );
+    HANDLE release = CreateEventA( &attr, TRUE, FALSE, NULL );
+    struct surface_state state;
+    char command[MAX_PATH * 2], **argv;
+    DWORD wait, exit_code;
+    UINT status;
+
+    ok( ready && release, "paint process event creation failed\n" );
+    if (!ready || !release) goto done;
+    winetest_get_mainargs( &argv );
+    sprintf( command, "\"%s\" %s paint_retirement_child %p %I64x %p %p",
+             argv[0], argv[1], hwnd, retirement, ready, release );
+    if (!CreateProcessA( NULL, command, NULL, NULL, TRUE, 0, NULL, NULL, &startup, &process ))
+    {
+        ok( FALSE, "paint child creation error %lu\n", GetLastError() );
+        goto done;
+    }
+    wait = WaitForSingleObject( ready, 10000 );
+    ok( wait == WAIT_OBJECT_0, "paint child ready wait %#lx\n", wait );
+    if (wait != WAIT_OBJECT_0) ExitProcess( 1 );
+    ok( !get_paint_update( hwnd, FALSE ), "live process lost detached paint\n" );
+    status = set_surface_state( hwnd, 0, CLIENT_SURFACE_STATE_PREPARE_BEGIN, 0, &state );
+    ok( status == STATUS_PENDING, "live process retirement prepare status %#x\n", status );
+    SetEvent( release );
+    wait = WaitForSingleObject( process.hProcess, 10000 );
+    ok( wait == WAIT_OBJECT_0, "paint child exit wait %#lx\n", wait );
+    if (wait != WAIT_OBJECT_0) ExitProcess( 1 );
+    ok( GetExitCodeProcess( process.hProcess, &exit_code ) && !exit_code, "paint child failed\n" );
+    CloseHandle( process.hThread );
+    CloseHandle( process.hProcess );
+    ok( get_paint_update( hwnd, TRUE ) & UPDATE_PAINT, "dead process lost detached paint update\n" );
+done:
+    if (ready) CloseHandle( ready );
+    if (release) CloseHandle( release );
+}
+
+static void test_paint_retirement( HWND hwnd, HWND class_window )
+{
+    struct paint_receipt_thread_data data = {.hwnd = hwnd, .detach = TRUE};
+    struct surface_state state;
+    HWND destroyed;
+    UINT64 fresh;
+    UINT status;
+
+    run_paint_receipt_thread( &data, 0 );
+    ok( !get_paint_update( hwnd, FALSE ), "writer exit restored paint before native retirement\n" );
+    status = set_surface_state( hwnd, 0, CLIENT_SURFACE_STATE_PREPARE_BEGIN, 0, &state );
+    ok( status == STATUS_PENDING, "detached writer admitted prepare, status %#x\n", status );
+    status = complete_paint_receipt( data.token, TRUE );
+    ok( status == STATUS_INVALID_PARAMETER, "peer completed detached token, status %#x\n", status );
+    check_paint_retirement_process( hwnd, data.retirement );
+    /* A newer writer must remain pending after the old batch is retired. */
+    status = begin_paint_receipt( hwnd, &fresh );
+    ok( !status, "new writer admission status %#x\n", status );
+    status = retire_paint_receipts( fresh );
+    ok( status == STATUS_INVALID_PARAMETER, "ordinary paint accepted as retirement, status %#x\n", status );
+    status = retire_paint_receipts( data.retirement );
+    ok( !status, "peer native retirement status %#x\n", status );
+    ok( get_paint_update( hwnd, TRUE ) & UPDATE_PAINT, "native retirement lost consumed update\n" );
+    status = retire_paint_receipts( data.retirement );
+    ok( status == STATUS_INVALID_PARAMETER, "duplicate retirement status %#x\n", status );
+    status = set_surface_state( hwnd, 0, CLIENT_SURFACE_STATE_PREPARE_BEGIN, 0, &state );
+    ok( status == STATUS_PENDING, "old retirement completed new writer, status %#x\n", status );
+    status = end_paint_receipt( fresh, FALSE );
+    ok( !status, "new writer end status %#x\n", status );
+    status = complete_paint_receipt( fresh, TRUE );
+    ok( !status, "new writer completion status %#x\n", status );
+    status = set_surface_state( hwnd, 0, CLIENT_SURFACE_STATE_PREPARE_BEGIN, 0, &state );
+    ok( !status && state.publish, "retirement leaked a pending paint, status %#x\n", status );
+    status = retire_paint_receipts( 0 );
+    ok( status == STATUS_INVALID_PARAMETER, "zero retirement status %#x\n", status );
+
+    destroyed = create_scene_occluder( GetDesktopWindow(), class_window );
+    ok( !!destroyed, "retirement destruction window creation failed\n" );
+    if (!destroyed) return;
+    data.hwnd = destroyed;
+    run_paint_receipt_thread( &data, 0 );
+    status = destroy_scene_window( destroyed );
+    ok( !status, "detached paint target destruction status %#x\n", status );
+    status = retire_paint_receipts( data.retirement );
+    ok( status == STATUS_INVALID_PARAMETER, "destroyed target late retirement status %#x\n", status );
 }
 
 static void test_paint_receipts(void)
@@ -5813,6 +5960,7 @@ static void test_paint_receipts(void)
     else ok( FALSE, "foreign writer event creation error %lu\n", GetLastError() );
     if (data.destroyed) CloseHandle( data.destroyed );
     if (data.finish) CloseHandle( data.finish );
+    test_paint_retirement( hwnd, class_window );
     set_paint_update( hwnd, RDW_INTERNALPAINT );
     status = set_surface_state( hwnd, 0, CLIENT_SURFACE_STATE_PREPARE_BEGIN, 0, &current );
     ok( status == STATUS_PENDING, "internal paint prepare status %#x\n", status );
@@ -7430,6 +7578,25 @@ START_TEST(client_surface)
     if (!p_wine_server_call)
     {
         win_skip( "Wine server interface is unavailable\n" );
+        return;
+    }
+
+    if (argc > 6 && !strcmp( argv[2], "paint_retirement_child" ))
+    {
+        struct paint_receipt_thread_data data = {.detach = TRUE};
+        UINT64 retirement = strtoull( argv[4], NULL, 16 );
+        HANDLE ready, release;
+        UINT status;
+
+        sscanf( argv[3], "%p", &data.hwnd );
+        sscanf( argv[5], "%p", &ready );
+        sscanf( argv[6], "%p", &release );
+        status = retire_paint_receipts( retirement );
+        ok( status == STATUS_INVALID_PARAMETER, "foreign process retired another process's paint, status %#x\n", status );
+        run_paint_receipt_thread( &data, 0 );
+        SetEvent( ready );
+        ok( WaitForSingleObject( release, 10000 ) == WAIT_OBJECT_0, "paint child release timed out\n" );
+        /* Leave the dead writer's batch to last-thread process cleanup. */
         return;
     }
 

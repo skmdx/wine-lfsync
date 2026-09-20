@@ -4022,7 +4022,7 @@ struct window_paint
     struct region *region; /* window-coordinate update actually consumed by paint validation */
     struct rectangle window_rect, client_rect;
     struct ratio dpi;
-    UINT64 token, scene;
+    UINT64 token, scene, retirement;
     int ended, failed;
 };
 
@@ -4120,7 +4120,17 @@ static void cancel_thread_window_paints( struct thread *thread )
     struct window_paint *paint, *next;
 
     LIST_FOR_EACH_ENTRY_SAFE( paint, next, &thread->window_paints, struct window_paint, thread_entry )
-        release_window_paint( paint, 1 );
+        if (!paint->retirement) release_window_paint( paint, 1 );
+}
+
+void cleanup_process_window_paints( struct process *process )
+{
+    struct window_paint *paint, *next;
+
+    /* Detached writers retain their thread, and through it their process.
+     * The last running thread's exit must break that ownership cycle. */
+    LIST_FOR_EACH_ENTRY_SAFE( paint, next, &window_paints, struct window_paint, entry )
+        if (paint->thread->process == process) release_window_paint( paint, 1 );
 }
 
 static void cancel_window_paints( struct window *win )
@@ -4136,7 +4146,7 @@ static struct window_paint *get_window_paint( UINT64 token )
     struct window_paint *paint;
 
     LIST_FOR_EACH_ENTRY( paint, &current->window_paints, struct window_paint, thread_entry )
-        if (paint->token == token)
+        if (paint->token == token && !paint->retirement)
             return paint;
     set_error( STATUS_INVALID_PARAMETER );
     return NULL;
@@ -4170,6 +4180,7 @@ DECL_HANDLER(begin_window_paint)
     paint->client_rect = win->client_rect;
     paint->dpi = get_window_dpi( win );
     paint->ended = paint->failed = 0;
+    paint->retirement = 0;
     paint->region = NULL;
     list_add_tail( &window_paints, &paint->entry );
     list_add_head( &current->window_paints, &paint->thread_entry );
@@ -4203,6 +4214,39 @@ DECL_HANDLER(complete_window_paint)
         if (req->success) invalidate_window_paint( paint->window );
         release_window_paint( paint, !req->success );
     }
+}
+
+DECL_HANDLER(detach_window_paints)
+{
+    struct window_paint *paint;
+
+    LIST_FOR_EACH_ENTRY( paint, &current->window_paints, struct window_paint, thread_entry )
+    {
+        if (paint->retirement) continue;
+        /* Tokens are never reused. Borrow one as the batch identity rather
+         * than allocating a new object during thread teardown. Keep every
+         * receipt charged to its original writer until native retirement. */
+        if (!reply->retirement) reply->retirement = paint->token;
+        paint->retirement = reply->retirement;
+        paint->ended = paint->failed = 1;
+    }
+}
+
+DECL_HANDLER(retire_window_paints)
+{
+    struct window_paint *paint, *next;
+    int found = 0;
+
+    if (req->retirement)
+        LIST_FOR_EACH_ENTRY_SAFE( paint, next, &window_paints, struct window_paint, entry )
+        {
+            if (paint->retirement != req->retirement || paint->thread->process != current->process) continue;
+            found = 1;
+            release_window_paint( paint, 1 );
+        }
+    /* Destruction of all target windows also retires the batch. A delayed or
+     * duplicate notification cannot act on another writer's later paints. */
+    if (!found) set_error( STATUS_INVALID_PARAMETER );
 }
 
 static int record_window_paint_region( struct window *win )

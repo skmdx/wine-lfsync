@@ -322,6 +322,8 @@ DECL_HANDLER(set_client_surface_native_barrier);
 DECL_HANDLER(begin_window_paint);
 DECL_HANDLER(end_window_paint);
 DECL_HANDLER(complete_window_paint);
+DECL_HANDLER(detach_window_paints);
+DECL_HANDLER(retire_window_paints);
 DECL_HANDLER(set_client_surface_state);
 DECL_HANDLER(get_client_surface_clip_windows);
 DECL_HANDLER(get_client_surface_handoff);
@@ -658,6 +660,8 @@ static const req_handler req_handlers[REQ_NB_REQUESTS] =
     (req_handler)req_begin_window_paint,
     (req_handler)req_end_window_paint,
     (req_handler)req_complete_window_paint,
+    (req_handler)req_detach_window_paints,
+    (req_handler)req_retire_window_paints,
     (req_handler)req_set_client_surface_state,
     (req_handler)req_get_client_surface_clip_windows,
     (req_handler)req_get_client_surface_handoff,
@@ -2471,6 +2475,11 @@ C_ASSERT( sizeof(struct end_window_paint_request) == 32 );
 C_ASSERT( offsetof(struct complete_window_paint_request, token) == 16 );
 C_ASSERT( offsetof(struct complete_window_paint_request, success) == 24 );
 C_ASSERT( sizeof(struct complete_window_paint_request) == 32 );
+C_ASSERT( sizeof(struct detach_window_paints_request) == 16 );
+C_ASSERT( offsetof(struct detach_window_paints_reply, retirement) == 8 );
+C_ASSERT( sizeof(struct detach_window_paints_reply) == 16 );
+C_ASSERT( offsetof(struct retire_window_paints_request, retirement) == 16 );
+C_ASSERT( sizeof(struct retire_window_paints_request) == 24 );
 C_ASSERT( offsetof(struct set_client_surface_state_request, handle) == 12 );
 C_ASSERT( offsetof(struct set_client_surface_state_request, scene_toplevel) == 16 );
 C_ASSERT( offsetof(struct set_client_surface_state_request, surface) == 24 );

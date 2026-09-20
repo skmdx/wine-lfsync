@@ -6411,6 +6411,32 @@ struct complete_window_paint_reply
     struct reply_header __header;
 };
 
+/* Transfer the current writer's receipts to process-owned native retirement.
+ * No allocation is needed; the returned identity is zero for an empty batch. */
+struct detach_window_paints_request
+{
+    struct request_header __header;
+    char __pad_12[4];
+};
+struct detach_window_paints_reply
+{
+    struct reply_header __header;
+    unsigned __int64 retirement;
+};
+
+/* Native use has ended. Only the originating process can retire the batch;
+ * detached paints always restore dirty work, never publish a checkpoint. */
+struct retire_window_paints_request
+{
+    struct request_header __header;
+    char __pad_12[4];
+    unsigned __int64 retirement;
+};
+struct retire_window_paints_reply
+{
+    struct reply_header __header;
+};
+
 
 struct set_client_surface_state_request
 {
@@ -7052,6 +7078,8 @@ enum request
     REQ_begin_window_paint,
     REQ_end_window_paint,
     REQ_complete_window_paint,
+    REQ_detach_window_paints,
+    REQ_retire_window_paints,
     REQ_set_client_surface_state,
     REQ_get_client_surface_clip_windows,
     REQ_get_client_surface_handoff,
@@ -7391,6 +7419,8 @@ union generic_request
     struct begin_window_paint_request begin_window_paint_request;
     struct end_window_paint_request end_window_paint_request;
     struct complete_window_paint_request complete_window_paint_request;
+    struct detach_window_paints_request detach_window_paints_request;
+    struct retire_window_paints_request retire_window_paints_request;
     struct set_client_surface_state_request set_client_surface_state_request;
     struct get_client_surface_clip_windows_request get_client_surface_clip_windows_request;
     struct get_client_surface_handoff_request get_client_surface_handoff_request;
@@ -7728,6 +7758,8 @@ union generic_reply
     struct begin_window_paint_reply begin_window_paint_reply;
     struct end_window_paint_reply end_window_paint_reply;
     struct complete_window_paint_reply complete_window_paint_reply;
+    struct detach_window_paints_reply detach_window_paints_reply;
+    struct retire_window_paints_reply retire_window_paints_reply;
     struct set_client_surface_state_reply set_client_surface_state_reply;
     struct get_client_surface_clip_windows_reply get_client_surface_clip_windows_reply;
     struct get_client_surface_handoff_reply get_client_surface_handoff_reply;
@@ -7747,6 +7779,6 @@ union generic_reply
     struct set_queue_paint_blocked_reply set_queue_paint_blocked_reply;
 };
 
-#define SERVER_PROTOCOL_VERSION 1026
+#define SERVER_PROTOCOL_VERSION 1027
 
 #endif /* __WINE_WINE_SERVER_PROTOCOL_H */
