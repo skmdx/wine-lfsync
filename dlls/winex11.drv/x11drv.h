@@ -904,6 +904,19 @@ struct x11drv_error_handler
     x11drv_error_callback callback;
     void *arg;
 };
+/* An owned Window input outlives GUI cancellation. Its caller keeps this
+ * record until both source streams and the checked image copy have finished. */
+struct x11drv_native_window_read
+{
+    struct x11drv_native_window *window;
+    struct x11drv_error_handler errors;
+    struct x11drv_stream_barrier geometry, drawing;
+};
+extern Window x11drv_native_window_read_init( struct x11drv_native_window_read *read,
+                                              struct x11drv_native_window *window );
+extern BOOL x11drv_native_window_read_ready( struct x11drv_native_window_read *read );
+extern void x11drv_native_window_read_finish( struct x11drv_native_window_read *read );
+
 extern void X11DRV_register_error_handler( struct x11drv_error_handler *handler );
 extern void X11DRV_unregister_error_handler( struct x11drv_error_handler *handler );
 extern void x11drv_display_owner_register_error_handler( struct x11drv_display_owner *owner,

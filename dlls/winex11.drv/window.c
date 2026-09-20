@@ -224,6 +224,48 @@ static int native_window_error( Display *display, XErrorEvent *event, void *arg 
            event->resourceid == window->colormap;
 }
 
+static int native_window_read_error( Display *display, XErrorEvent *event, void *arg )
+{
+    struct x11drv_native_window_read *read = arg;
+
+    return (display == read->window->display && x11drv_stream_barrier_error( &read->geometry, event )) ||
+           (display == gdi_display && x11drv_stream_barrier_error( &read->drawing, event ));
+}
+
+Window x11drv_native_window_read_init( struct x11drv_native_window_read *read,
+                                      struct x11drv_native_window *window )
+{
+    assert( !read->window && window->window );
+    read->window = x11drv_native_window_acquire( window );
+    read->errors = (struct x11drv_error_handler){ .display = window->display,
+                                                .callback = native_window_read_error, .arg = read };
+    x11drv_display_owner_register_error_handler( window->creator, &read->errors );
+    return window->window;
+}
+
+BOOL x11drv_native_window_read_ready( struct x11drv_native_window_read *read )
+{
+    struct x11drv_native_window *window = read->window;
+
+    /* Native creation/geometry and earlier GDI writers use distinct streams.
+     * Poll outside Display locks; later mutations invalidate scene adoption. */
+    if (!read->geometry.complete)
+    {
+        if (!read->geometry.serial) x11drv_queue_stream_barrier( window->display, &read->geometry );
+        if (!x11drv_poll_stream_barrier( window->display, &read->geometry, window->creator )) return FALSE;
+    }
+    if (!read->drawing.serial) x11drv_queue_stream_barrier( gdi_display, &read->drawing );
+    return read->drawing.complete || x11drv_poll_stream_barrier( gdi_display, &read->drawing, NULL );
+}
+
+void x11drv_native_window_read_finish( struct x11drv_native_window_read *read )
+{
+    assert( read->geometry.complete && read->drawing.complete );
+    x11drv_display_owner_unregister_error_handler( read->window->creator, &read->errors );
+    x11drv_native_window_release( read->window );
+    read->window = NULL;
+}
+
 static void destroy_native_window( struct client_surface_native_work *work )
 {
     struct x11drv_native_window *window = CONTAINING_RECORD( work, struct x11drv_native_window, work );

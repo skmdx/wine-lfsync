@@ -50,6 +50,8 @@ struct client_surface_cache_image
     void *context;
     const struct client_surface_cache_transform *transform;
     unsigned int transform_count;
+    struct x11drv_native_window_read *read;
+    BOOL waiting;
     Pixmap pixmap, source;
     Window window;
     GC gc, transfer_gc;
@@ -386,6 +388,8 @@ static void destroy_cache_image( struct client_surface_cache_image *image )
     client_surface_release_scoped_memory( &image->memory, image->purpose, image->bytes );
 }
 
+static void queue_native_work( struct cache_worker *worker, struct client_surface_native_work *work );
+
 static void execute_cache_image( struct client_surface_native_work *work )
 {
     struct client_surface_cache_image *image = CONTAINING_RECORD( work, struct client_surface_cache_image, work );
@@ -396,7 +400,16 @@ static void execute_cache_image( struct client_surface_native_work *work )
         if (image->purpose == CLIENT_SURFACE_MEMORY_SOURCE) create_cache_image( image );
         else create_output_image( image );
         break;
-    case CACHE_COPY: copy_cache_image( image ); break;
+    case CACHE_COPY:
+        image->waiting = image->read && !x11drv_native_window_read_ready( image->read );
+        if (image->waiting) break;
+        copy_cache_image( image );
+        if (image->read)
+        {
+            x11drv_native_window_read_finish( image->read );
+            image->read = NULL;
+        }
+        break;
     case CACHE_TRANSFORM: transform_cache_image( image ); break;
     case CACHE_RELEASE: destroy_cache_image( image ); break;
     default: assert( 0 );
@@ -411,6 +424,12 @@ static void finish_cache_image( struct client_surface_native_work *work )
     void (*wake)(void);
 
     pthread_mutex_lock( &cache_mutex );
+    if (image->waiting)
+    {
+        queue_native_work( worker, work );
+        pthread_mutex_unlock( &cache_mutex );
+        return;
+    }
     if (operation == CACHE_RELEASE)
     {
         --image_count;
@@ -712,12 +731,14 @@ void client_surface_cache_copy( struct client_surface_cache_image *image, Pixmap
 
 void client_surface_cache_copy_output( struct client_surface_cache_image *image, Pixmap source,
                                        unsigned int width, unsigned int height,
+                                       struct x11drv_native_window_read *read,
                                        client_surface_cache_callback complete, void *context )
 {
     pthread_mutex_lock( &cache_mutex );
     assert( image->acquired && image->refs == 1 && image->purpose == CLIENT_SURFACE_MEMORY_OUTPUT );
     assert( source && width && height && width <= image->width && height <= image->height );
     image->source = source;
+    image->read = read;
     image->copy_width = width;
     image->copy_height = height;
     queue_cache_image( image, CACHE_COPY, complete, context );

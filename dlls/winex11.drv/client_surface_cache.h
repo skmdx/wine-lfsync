@@ -54,10 +54,12 @@ BOOL client_surface_cache_shared( const struct client_surface_cache_image *image
 BOOL client_surface_cache_write_pending( const struct client_surface_cache_image *image );
 void client_surface_cache_copy( struct client_surface_cache_image *image, Pixmap source,
                                 client_surface_cache_callback complete, void *context );
-/* Copy a completed, independently retained OUTPUT rectangle into private
- * storage. The caller owns the source read until this callback returns. */
+/* Copy an owned input into private OUTPUT storage. A Window read carries
+ * both source-stream receipts; an immutable image needs no such preparation. */
+struct x11drv_native_window_read;
 void client_surface_cache_copy_output( struct client_surface_cache_image *image, Pixmap source,
                                        unsigned int width, unsigned int height,
+                                       struct x11drv_native_window_read *read,
                                        client_surface_cache_callback complete, void *context );
 
 /* The caller owns this bounded command chain and all input images through
