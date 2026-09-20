@@ -2097,15 +2097,21 @@ static void test_scene_snapshot(void)
     RECT rect = {30, 20, 150, 110};
     D3DKMT_ESCAPE desc = {0};
 
-    top = create_test_window( TRUE );
+    top = create_test_window( FALSE );
     first = create_test_child( top, 10 );
     second = create_test_child( top, 25 );
-    other = create_test_window( TRUE );
+    other = create_test_window( FALSE );
     ok( top && first && second && other, "could not create scene windows\n" );
     if (!top || !first || !second || !other) goto done;
-    SetWindowPos( first, HWND_BOTTOM, 10, 10, 80, 60, SWP_NOACTIVATE );
+    SetWindowPos( first, HWND_BOTTOM, 10, 10, 80, 60, SWP_NOACTIVATE | SWP_NOREDRAW );
     shape = CreateRectRgn( 4, 2, 21, 23 );
     SetWindowRgn( second, shape, FALSE );
+    /* Native paint completion invalidates the scene independently of these
+     * geometry requests. Show the fixture without scheduling GDI uploads. */
+    SetWindowPos( top, NULL, 0, 0, 0, 0, SWP_SHOWWINDOW | SWP_NOMOVE | SWP_NOSIZE |
+                  SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOREDRAW );
+    SetWindowPos( other, NULL, 0, 0, 0, 0, SWP_SHOWWINDOW | SWP_NOMOVE | SWP_NOSIZE |
+                  SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOREDRAW );
     set_surface_state( top, top_id, CLIENT_SURFACE_STATE_REGISTER, 0, NULL );
     set_surface_state( first, first_id, CLIENT_SURFACE_STATE_REGISTER, 0, NULL );
     set_surface_state( second, second_id, CLIENT_SURFACE_STATE_REGISTER, 0, NULL );
@@ -7522,6 +7528,16 @@ static BOOL run_focused_test_case( const char *name, char **argv )
     };
     unsigned int i;
 
+    if (!strcmp( name, "scene-snapshot-stress" ))
+    {
+        for (i = 0; i < 256; ++i)
+        {
+            winetest_push_context( "iteration %u", i );
+            test_scene_snapshot();
+            winetest_pop_context();
+        }
+        return TRUE;
+    }
     if (!strcmp( name, "surface-lifetimes" ))
     {
         trace( "testing server-issued surface lifetimes\n" );
