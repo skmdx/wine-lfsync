@@ -455,7 +455,8 @@ struct client_surface_window_query
     Window window;
     unsigned int width, height;
     int map_state, error;
-    BOOL started, waiting, success, complete;
+    BOOL started, waiting, success;
+    LONG complete;
 };
 
 struct client_surface_compositor_job
@@ -1317,14 +1318,17 @@ static void query_client_surface_window( struct client_surface_native_work *work
 static void finish_client_surface_window_query( struct client_surface_native_work *work )
 {
     struct client_surface_window_query *query = CONTAINING_RECORD( work, struct client_surface_window_query, work );
+    void (*finished)( struct client_surface_window_query *query ) = query->finished;
 
     if (query->waiting)
     {
         client_surface_submit_native_work( work );
         return;
     }
-    query->complete = TRUE;
-    if (query->finished) query->finished( query );
+    /* DIRECT's actor may release this request as soon as it observes the
+     * completion. Publish all results last and never reload its callback. */
+    WriteRelease( &query->complete, TRUE );
+    if (finished) finished( query );
     wake_client_surface_compositor();
 }
 
@@ -3276,7 +3280,7 @@ static BOOL install_client_surface_direct_plan( const struct client_surface_comp
     TRACE( "DIRECT native admission hwnd %p window %#lx queried %u map state %d error %d\n",
            job->toplevel, job->u.direct_plan.destination, job->u.direct_plan.query.success,
            job->u.direct_plan.query.map_state, job->u.direct_plan.query.error );
-    if (!job->u.direct_plan.query.complete || !job->u.direct_plan.query.success ||
+    if (!ReadAcquire( &job->u.direct_plan.query.complete ) || !job->u.direct_plan.query.success ||
         job->u.direct_plan.query.map_state != IsViewable) goto done;
     if (!current.generation)
     {
@@ -3370,7 +3374,7 @@ static BOOL renew_client_surface_direct_plan( const struct client_surface_compos
 
     /* The native worker checked both retained Windows. Accept only the same
      * attachment and requested geometry, never a newer plan at a reused XID. */
-    if (!query || !query->complete || !query->success || !query->direct_checked ||
+    if (!query || !ReadAcquire( &query->complete ) || !query->success || !query->direct_checked ||
         query->window != target->window || query->child_owner != target->scene.direct_owner ||
         query->child != target->scene.direct_drawable || query->direct_epoch != target->scene.epoch ||
         query->direct_identity != target->scene.direct_identity ||
@@ -5494,7 +5498,7 @@ static BOOL client_surface_compositor_job_ready( struct client_surface_composito
          * Scene admission is checked again after this receipt completes. */
         if (!query->started)
             start_client_surface_window_query( query, job->u.direct_plan.window_owner, NULL );
-        if (!query->complete) return FALSE;
+        if (!ReadAcquire( &query->complete )) return FALSE;
     }
     if (job->op == CLIENT_SURFACE_COMPOSITOR_QUERY_WINDOW) return TRUE;
     if (job->op == CLIENT_SURFACE_COMPOSITOR_CREATE_POOL || job->op == CLIENT_SURFACE_COMPOSITOR_COPY_POOL ||
