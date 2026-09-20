@@ -301,7 +301,7 @@ struct client_surface_output_transform
     Window destination;
     process_id_t process;
     UINT64 identity, cookie, epoch, sequence, control, revision;
-    UINT64 generation, frame_revision;
+    UINT64 generation, publication_generation, frame_revision;
     unsigned int buffer_index;
     unsigned int scene_index, width, height;
     BOOL replay;
@@ -3508,7 +3508,7 @@ static void discard_client_surface_compositor_gc( struct client_surface_composit
  * become a full copy for scene replay without changing the cached frame. */
 struct client_surface_composition_plan
 {
-    UINT64 generation;
+    UINT64 generation, publication_generation;
     UINT64 epoch;
     BOOL steady;
     RECT destination;
@@ -3561,6 +3561,7 @@ static struct client_surface_output_transform *alloc_client_surface_output_trans
     transform->control = binding->latest_control;
     transform->revision = target->revision;
     transform->generation = plan->generation;
+    transform->publication_generation = plan->publication_generation;
     transform->buffer_index = binding->latest_index;
     transform->scene_index = binding->scene_index;
     transform->width = target->window_width;
@@ -3590,7 +3591,8 @@ static BOOL submit_client_surface_output_transform( struct client_surface_compos
 {
     struct client_surface_output_transform *transform;
 
-    assert( plan->steady && !plan->generation );
+    assert( !plan->generation && (plan->steady || plan->publication_generation) );
+    assert( !plan->publication_generation || frame->pixmap != target->backing );
     if (!(transform = alloc_client_surface_output_transform( target, binding, frame, plan, damage,
                                                              catchup, needs_catchup, clipped, FALSE ))) return FALSE;
     if (!client_surface_cache_transform_output( frame->image, &transform->native, 1,
@@ -3604,11 +3606,11 @@ static BOOL submit_client_surface_output_transform( struct client_surface_compos
      * a valid journal revision, even when its image remains in this pool. */
     frame->revision = 0;
     TRACE_(csperf)( "ticks=%llu event=output_transform_submit transform=%p hwnd=%p window=%lx "
-                   "image=%p source=%p catchup=%p destination=%lx epoch=%llu generation=0 sequence=%llu revision=%llu\n",
+                   "image=%p source=%p catchup=%p destination=%lx epoch=%llu generation=0 sequence=%llu revision=%llu publication=%llu\n",
                    client_surface_perf_time(), transform, target->toplevel, target->window,
                    transform->image, transform->source, transform->catchup, frame->pixmap,
                    (unsigned long long)transform->epoch, (unsigned long long)transform->sequence,
-                   (unsigned long long)transform->revision );
+                   (unsigned long long)transform->revision, (unsigned long long)transform->publication_generation );
     return TRUE;
 }
 
@@ -3687,7 +3689,7 @@ static BOOL copy_client_surface_handoff_to_frame(
         if (needs_catchup || incoming_full) client_surface_copy_batch.revision = target->revision;
         return TRUE;
     }
-    if (plan->steady && !native)
+    if (!plan->generation && !native)
     {
         *pending = submit_client_surface_output_transform( target, binding, frame, plan, damage,
                                                            &catchup, needs_catchup, clipped );
@@ -4085,6 +4087,7 @@ static void complete_client_surface_output_transform( void *context, BOOL succes
         target->transform = NULL;
         frame = get_client_surface_compositor_pixmap( target, client_surface_cache_pixmap( transform->image ) );
         current = frame && frame->image == transform->image && !frame->serial &&
+                  (!transform->publication_generation || frame->pixmap != target->backing) &&
                   target->window == transform->destination && !target->quiescing &&
                   target->revision == transform->revision && target->window_width == transform->width &&
                   target->window_height == transform->height && target->visual == transform->native.destination_visual &&
@@ -4092,7 +4095,8 @@ static void complete_client_surface_output_transform( void *context, BOOL succes
                   target->scene.epoch == transform->epoch && transform->scene_index < target->scene.count &&
                   client_surface_get_toplevel_scene( target->toplevel, &scene ) &&
                   scene.epoch == transform->epoch && scene.mode != CLIENT_SURFACE_PRESENTATION_DIRECT &&
-                  !scene.generation;
+                  (!scene.generation || (scene.publication_pending &&
+                   scene.generation == transform->publication_generation));
         if (current)
         {
             binding = target->scene.members[transform->scene_index];
@@ -4104,10 +4108,11 @@ static void complete_client_surface_output_transform( void *context, BOOL succes
         if (!current) target->replay_member = 0;
     }
     TRACE_(csperf)( "ticks=%llu event=output_transform_complete transform=%p hwnd=%p window=%lx "
-                   "image=%p source=%p destination=%lx epoch=%llu sequence=%llu success=%u current=%u\n",
+                   "image=%p source=%p destination=%lx epoch=%llu sequence=%llu success=%u current=%u publication=%llu\n",
                    client_surface_perf_time(), transform, transform->toplevel, transform->destination,
                    transform->image, transform->source, client_surface_cache_pixmap( transform->image ),
-                   (unsigned long long)transform->epoch, (unsigned long long)transform->sequence, success, current );
+                   (unsigned long long)transform->epoch, (unsigned long long)transform->sequence, success, current,
+                   (unsigned long long)transform->publication_generation );
     /* Completion removed CACHE_TRANSFORM before invoking us. Drop all native
      * leases even when REMOVE has already released the target and binding. */
     client_surface_cache_release( transform->source );
@@ -4392,6 +4397,7 @@ static BOOL compose_client_surface_cached_frame( struct client_surface_composito
      * Its assembly was already accepted: newer images use the steady path
      * in the same scene, never another completion of that transaction. */
     plan.generation = current.publication_pending ? 0 : current.generation;
+    plan.publication_generation = current.publication_pending ? current.generation : 0;
     /* PREPARE and STAGED install a fresh GUI checkpoint, using pair COW if
      * an older transform still owns its spare. Keep that checkpoint intact
      * through the subsequent nonzero generation, including PUBLISHING where
