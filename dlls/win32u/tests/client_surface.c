@@ -6215,10 +6215,16 @@ static void test_demoted_native_barrier(void)
     HWND first, second;
     unsigned int status;
 
-    first = create_test_window( TRUE );
-    second = create_test_window( TRUE );
+    first = create_test_window( FALSE );
+    second = create_test_window( FALSE );
     ok( !!first && !!second, "failed to create demotion parents, error %lu\n", GetLastError() );
     if (!first || !second) goto done;
+    /* Change protocol visibility without starting native paints whose
+     * asynchronous completion would legitimately restart these scenes. */
+    status = set_scene_placement( first, 0, 0, 0, SWP_SHOWWINDOW );
+    ok( !status, "first protocol visibility failed, status %#x\n", status );
+    status = set_scene_placement( second, 0, 0, 0, SWP_SHOWWINDOW );
+    ok( !status, "second protocol visibility failed, status %#x\n", status );
     set_surface_state( first, surface, CLIENT_SURFACE_STATE_REGISTER, 0, NULL );
     claim_surface_state( first, surface, NULL );
     status = set_surface_state( first, 0, 0, 0, &original );
