@@ -9577,6 +9577,48 @@ static void test_layered_window_shape( const char *argv0 )
     }
 }
 
+static void test_wide_window_clip(void)
+{
+    static const RECT rects[] = {{33000,0,33016,4}, {0,4,16,8}, {32767,8,32768,12},
+                                 {34000,8,34016,12}, {0,12,16,16}};
+    HWND hwnd;
+    HRGN region, part;
+    RECT window;
+    unsigned int i;
+    BOOL ret;
+
+    hwnd = CreateWindowExA( WS_EX_TOOLWINDOW, "static", NULL, WS_POPUP | WS_VISIBLE,
+                           100, 100, 40000, 16, NULL, NULL, GetModuleHandleA(NULL), NULL );
+    ok( !!hwnd, "Failed to create wide window, error %lu\n", GetLastError() );
+    if (!hwnd) return;
+    GetWindowRect( hwnd, &window );
+    ok( window.right - window.left == 40000 && window.bottom - window.top == 16,
+        "Unexpected wide window rect %s\n", wine_dbgstr_rect(&window) );
+    trace( "Wide window rect %s\n", wine_dbgstr_rect(&window) );
+    region = CreateRectRgn( 0, 0, 0, 0 );
+    for (i = 0; i < ARRAY_SIZE(rects); ++i)
+    {
+        part = CreateRectRgnIndirect( &rects[i] );
+        ret = CombineRgn( region, region, part, RGN_OR );
+        ok( ret != ERROR, "Failed to combine clip rectangle %u\n", i );
+        DeleteObject( part );
+    }
+    ret = SetWindowRgn( hwnd, region, TRUE );
+    ok( ret, "Failed to set wide clip, error %lu\n", GetLastError() );
+    if (!ret) DeleteObject( region );
+    RedrawWindow( hwnd, NULL, NULL, RDW_INVALIDATE | RDW_ERASE | RDW_UPDATENOW );
+    flush_events( TRUE );
+    region = CreateRectRgnIndirect( &rects[0] );
+    ret = SetWindowRgn( hwnd, region, TRUE );
+    ok( ret, "Failed to set excluded clip, error %lu\n", GetLastError() );
+    if (!ret) DeleteObject( region );
+    flush_events( TRUE );
+    ret = SetWindowRgn( hwnd, NULL, TRUE );
+    ok( ret, "Failed to clear wide clip, error %lu\n", GetLastError() );
+    flush_events( TRUE );
+    DestroyWindow( hwnd );
+}
+
 static void test_layered_window(void)
 {
     HWND hwnd, child;
@@ -14942,6 +14984,12 @@ START_TEST(win)
         return;
     }
 
+    if (argc == 3 && !strcmp( argv[2], "wide_clip" ))
+    {
+        test_wide_window_clip();
+        return;
+    }
+
     if (argc == 3 && !strcmp( argv[2], "layered_shape" ))
     {
         test_layered_window_shape( argv[0] );
@@ -15071,6 +15119,7 @@ START_TEST(win)
     test_GetUpdateRect();
     test_Expose();
     test_layered_window();
+    test_wide_window_clip();
 
     test_SetForegroundWindow(hwndMain);
     test_handles( hwndMain );
