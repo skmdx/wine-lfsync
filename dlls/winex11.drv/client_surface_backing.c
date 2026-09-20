@@ -1789,7 +1789,7 @@ static void free_client_surface_compositor_mailbox( struct client_surface_compos
 }
 
 static struct client_surface_compositor_frame *get_client_surface_compositor_frame(
-    struct client_surface_compositor_target *target )
+    struct client_surface_compositor_target *target, BOOL preserve_backing )
 {
     unsigned int i;
 
@@ -1801,6 +1801,8 @@ static struct client_surface_compositor_frame *get_client_surface_compositor_fra
     {
         unsigned int index = (target->next_frame + i) % ARRAY_SIZE(target->frames);
 
+        /* PUBLISHING can outlive the transaction's Present ticket. The GUI
+         * still owns its prepared checkpoint until publication completes. */
         /* Neither a failed copy nor a rejected publication may damage the
          * native published image or the complete catchup checkpoint. When
          * all three images are owned, keep coalescing in the source caches;
@@ -1808,6 +1810,7 @@ static struct client_surface_compositor_frame *get_client_surface_compositor_fra
         if (!target->frames[index].pixmap || target->frames[index].serial ||
             target->frames[index].pixmap == target->latest ||
             target->frames[index].pixmap == target->published ||
+            (preserve_backing && target->frames[index].pixmap == target->backing) ||
             (target->mailbox_pending && index == target->mailbox_frame) ||
             (target->assembly_pending && index == target->assembly_frame) ||
             !client_surface_compositor_frame_writable( &target->frames[index] )) continue;
@@ -4475,7 +4478,7 @@ static BOOL compose_client_surface_cached_frame( struct client_surface_composito
             goto retry;
 #endif
         if (!plan.generation || previous_publish)
-            frame = get_client_surface_compositor_frame( target );
+            frame = get_client_surface_compositor_frame( target, !plan.steady );
         else if (target->assembly_pending &&
                  target->assembly_generation == plan.generation &&
                  target->assembly_epoch == plan.epoch)
