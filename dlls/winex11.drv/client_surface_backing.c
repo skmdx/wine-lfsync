@@ -1423,7 +1423,8 @@ static void complete_client_surface_present_request( struct client_surface_compo
         {
             TRACE_(csperf)( "ticks=%llu event=publish_copy_complete window=%lx pixmap=%lx serial=%u "
                            "generation=%llu epoch=%llu success=%u\n", client_surface_perf_time(), target->window,
-                           frame->pixmap, frame->serial, frame->publish_generation, frame->publish_epoch, success );
+                           frame->pixmap, frame->serial, (unsigned long long)frame->publish_generation,
+                           (unsigned long long)frame->publish_epoch, success );
             if (!success && frame->xcb_gc)
             {
                 /* A failed CreateGC may leave only an allocated XID. Keep the
@@ -1622,7 +1623,8 @@ static BOOL submit_client_surface_present( struct client_surface_compositor_targ
     if (copy)
         TRACE_(csperf)( "ticks=%llu event=publish_copy_submit window=%lx pixmap=%lx serial=%u "
                        "generation=%llu epoch=%llu cookie=%u barrier=%u\n", client_surface_perf_time(),
-                       target->window, frame->pixmap, serial, publish_generation, publish_epoch,
+                       target->window, frame->pixmap, serial, (unsigned long long)publish_generation,
+                       (unsigned long long)publish_epoch,
                        frame->request.cookies[frame->request.count - 1], frame->request.barrier );
     else
         TRACE_(csperf)( "ticks=%llu event=present window=%lx pixmap=%lx serial=%u\n",
