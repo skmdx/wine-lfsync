@@ -21471,6 +21471,15 @@ START_TEST(msg)
 
     start_foreground_window_thread();
 
+    if (argc == 3 && !strcmp( test_argv[2], "desktop_paint" ))
+    {
+        run_in_temp_desktop(test_swp_paint_regions);
+        run_in_temp_desktop(test_swp_paint_region_on_show);
+        run_in_temp_desktop(test_swp_paint_region_on_extend_zerosize);
+        run_in_temp_desktop(test_hvredraw);
+        goto done;
+    }
+
     test_winevents();
     test_SendMessage_other_thread();
     test_setparent_status();
@@ -21560,6 +21569,7 @@ START_TEST(msg)
     test_SetForegroundWindow();
     test_WM_COPYDATA(test_argv);
 
+done:
     UnhookWindowsHookEx(hCBT_hook);
     if (pUnhookWinEvent && hEvent_hook)
     {
