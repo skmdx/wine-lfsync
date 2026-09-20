@@ -1310,7 +1310,7 @@ static void test_clip_scene_snapshot(void)
     HWND parent, first, second, descendant, hidden;
     unsigned int status, i;
 
-    parent = create_test_window( TRUE );
+    parent = create_test_window( FALSE );
     ok( !!parent, "failed to create clip parent, error %lu\n", GetLastError() );
     if (!parent) return;
     first = create_test_child( parent, 10 );
@@ -1322,6 +1322,9 @@ static void test_clip_scene_snapshot(void)
 
     SetWindowPos( first, HWND_BOTTOM, 10, 10, 50, 40, SWP_NOACTIVATE | SWP_NOREDRAW );
     SetWindowPos( second, HWND_TOP, 20, 10, 50, 40, SWP_NOACTIVATE | SWP_NOREDRAW );
+    /* Keep native initial paints out of this explicitly driven scene. */
+    status = set_scene_placement( parent, 0, 0, 0, SWP_SHOWWINDOW );
+    ok( !status, "clip parent protocol visibility failed, status %#x\n", status );
     set_surface_state( first, first_surface, CLIENT_SURFACE_STATE_REGISTER, 0, NULL );
     claim_surface_state( first, first_surface, NULL );
     status = get_clip_state( first, &before );
