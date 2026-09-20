@@ -246,29 +246,77 @@ static void create_cache_image( struct client_surface_cache_image *image )
     }
 }
 
-static void copy_cache_image( struct client_surface_cache_image *image )
+static BOOL prepare_window_copy_gc( struct client_surface_cache_image *image )
 {
     struct cache_worker *worker = image->worker;
     XGCValues values = {.graphics_exposures = False};
 
-    worker->error = 0;
-    /* OUTPUT creation only reserves the Pixmap. Its first private copy owns
-     * this GC, including a failed native allocation, through actual reclaim. */
-    if (!image->gc) image->gc = XCreateGC( worker->display, image->pixmap, GCGraphicsExposures, &values );
-    if (image->gc)
+    if (!image->transfer_gc)
     {
-        XSetClipMask( worker->display, image->gc, None );
-        XSetClipOrigin( worker->display, image->gc, 0, 0 );
-        XCopyArea( worker->display, image->source, image->pixmap, image->gc,
-                   0, 0, image->copy_width, image->copy_height, 0, 0 );
+        image->transfer_gc = XCreateGC( worker->display, image->pixmap, GCGraphicsExposures, &values );
+        XSync( worker->display, False );
+        if (image->transfer_gc && !worker->error)
+            image->xcb_gc = XGContextFromGC( image->transfer_gc );
     }
-    XSync( worker->display, False );
-    image->success = image->gc && !worker->error;
+    return !!image->xcb_gc;
+}
+
+static void copy_cache_image( struct client_surface_cache_image *image )
+{
+    struct cache_worker *worker = image->worker;
+    struct x11drv_native_window_read *read = image->read;
+    XGCValues values = {.graphics_exposures = False};
+    Display *display = worker->display;
+    GC gc;
+
+    if (read && read->copy_serial) goto receipt;
+    worker->error = 0;
+    /* The Window input uses an immutable GC owned by this image's private
+     * connection. Check its creation before using its XID on the GDI stream;
+     * private transforms may continue to change the separate drawing GC. */
+    if (read)
+    {
+        if (!prepare_window_copy_gc( image ))
+        {
+            image->success = FALSE;
+            read->copy_error = worker->error;
+            goto done;
+        }
+        gc = image->transfer_gc;
+        display = x11drv_native_window_read_begin( read );
+    }
+    else
+    {
+        if (!image->gc) image->gc = XCreateGC( display, image->pixmap, GCGraphicsExposures, &values );
+        gc = image->gc;
+        if (gc)
+        {
+            XSetClipMask( display, gc, None );
+            XSetClipOrigin( display, gc, 0, 0 );
+        }
+    }
+    if (gc) XCopyArea( display, image->source, image->pixmap, gc,
+                      0, 0, image->copy_width, image->copy_height, 0, 0 );
+    if (read) x11drv_native_window_read_end( read );
+    else
+    {
+        XSync( display, False );
+        image->success = gc && !worker->error;
+    }
+receipt:
+    if (read)
+    {
+        display = gdi_display;
+        image->waiting = !x11drv_native_window_read_complete( read, &image->success );
+        if (image->waiting) return;
+    }
+done:
     TRACE_(csperf)( "ticks=%llu event=%s image=%p source=%lx destination=%lx "
-                   "display=%p width=%u height=%u error=%d sync_calls=1 success=%u\n", cache_time(),
+                   "display=%p width=%u height=%u error=%d sync_calls=%u receipt=%lu copy_serial=%lu success=%u\n", cache_time(),
                    image->purpose == CLIENT_SURFACE_MEMORY_OUTPUT ? "output_pair_native_copy" : "cache_native_fallback",
-                   image, image->source, image->pixmap, worker->display, image->copy_width,
-                   image->copy_height, worker->error, image->success );
+                   image, image->source, image->pixmap, display, image->copy_width,
+                   image->copy_height, read ? read->copy_error : worker->error, !read,
+                   read ? read->drawing.serial : 0, read ? read->copy_serial : 0, image->success );
 }
 
 static void transform_cache_image( struct client_surface_cache_image *image )
@@ -404,7 +452,7 @@ static void execute_cache_image( struct client_surface_native_work *work )
         image->waiting = image->read && !x11drv_native_window_read_ready( image->read );
         if (image->waiting) break;
         copy_cache_image( image );
-        if (image->read)
+        if (image->read && !image->waiting)
         {
             x11drv_native_window_read_finish( image->read );
             image->read = NULL;
