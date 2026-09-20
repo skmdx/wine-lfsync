@@ -2032,7 +2032,11 @@ HDC WINAPI NtUserBeginPaint( HWND hwnd, PAINTSTRUCT *ps )
     if (!ps || !hdc)
     {
         release_dc( hwnd, hdc, TRUE );
-        goto failed;
+        if (!hdc) goto failed;
+        /* A NULL output does not undo the nonclient and erase work, or the
+         * update-region validation already performed by BeginPaint. */
+        end_window_paint( paint, TRUE );
+        return 0;
     }
     if (paint)
     {
