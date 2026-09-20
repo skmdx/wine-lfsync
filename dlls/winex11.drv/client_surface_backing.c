@@ -3668,7 +3668,7 @@ static void start_client_surface_cache_copy( struct client_surface_compositor_bi
     struct client_surface_cached_image *image = &binding->spare_image;
     struct client_surface_cache_copy *copy = &binding->cache_copy;
     struct client_surface_handoff_slot frame = copy->frame;
-    Display *display = client_surface_compositor_display;
+    Display *display;
     Pixmap source = frame.source;
     UINT64 control = copy->control;
 
@@ -3698,6 +3698,9 @@ static void start_client_surface_cache_copy( struct client_surface_compositor_bi
     }
     /* Keep the last complete cache intact until the new full image and its
      * error check succeed. Neither buffer borrows a producer XID. */
+    /* Cache creation may complete before an output job opens the connection. */
+    if (!client_surface_compositor_open()) goto done;
+    display = client_surface_compositor_display;
     if (client_surface_xcb_available( display ))
     {
         RECT rect = {0, 0, frame.width, frame.height};
