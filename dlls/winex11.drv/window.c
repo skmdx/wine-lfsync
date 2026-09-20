@@ -2423,6 +2423,12 @@ void window_configure_notify( struct x11drv_win_data *data, unsigned long serial
     received = wine_dbg_sprintf( "config %s/%lu", wine_dbgstr_rect(value), serial );
     expected = *expect_serial ? wine_dbg_sprintf( ", expected %s/%lu", wine_dbgstr_rect(pending), *expect_serial ) : "";
 
+    /* A withdrawal can move the native window before a remap. Its queued
+     * configuration must not replace the position requested for that remap. */
+    if (data->wm_state_serial && serial < data->wm_state_serial &&
+        data->desired_state.wm_state == NormalState)
+        desired = pending;
+
     /* if we've delayed some config we want to continue with it, make sure handle_state_change doesn't overwrite it */
     if ((*expect_serial || window_needs_config_change_delay( data )) &&
         serial >= *expect_serial && !EqualRect( desired, pending ))
