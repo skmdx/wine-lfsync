@@ -5565,7 +5565,10 @@ static BOOL client_surface_compositor_job_ready( struct client_surface_composito
             quiesce_client_surface_compositor_target( target );
     }
 #ifdef SONAME_LIBXPRESENT
-    if (job->op == CLIENT_SURFACE_COMPOSITOR_REMOVE_TARGET)
+    /* An invalidating update discards the old scene, including output that
+     * has not started native execution. State-only refreshes keep it. */
+    if (job->op == CLIENT_SURFACE_COMPOSITOR_REMOVE_TARGET ||
+        (job->op == CLIENT_SURFACE_COMPOSITOR_BEGIN_UPDATE && job->u.update.invalidate_scene))
     {
         client_surface_cancel_native_presents( &target->native_presents );
         process_client_surface_native_present( target );
