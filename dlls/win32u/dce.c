@@ -1872,8 +1872,7 @@ void move_window_bits_surface( HWND hwnd, const RECT *window_rect, struct window
 
     /* The inner GDI call must not end its paint and flush older receipts
      * while this thread still holds their input surface mutex. */
-    if (user_driver->pWindowPaint( hwnd, WINDOW_PAINT_QUERY, 0 ) != STATUS_SUCCESS ||
-        (paint = begin_window_paint( hwnd )))
+    if ((paint = begin_window_paint( hwnd )))
     {
         window_surface_lock( old_surface );
         if ((bits = window_surface_get_color( old_surface, info )))
@@ -1897,7 +1896,7 @@ void window_surface_record_paint( struct window_surface *surface )
     if (!surface || surface == &dummy_surface || surface->alpha_mask) return;
     LIST_FOR_EACH_ENTRY( paint, &get_user_thread_info()->window_paints, struct window_paint, entry )
     {
-        if (paint->ended || paint->cancelled) continue;
+        if (!paint->token || paint->ended || paint->cancelled) continue;
         LIST_FOR_EACH_ENTRY( entry, &paint->surfaces, struct window_paint_surface, entry )
             if (entry->surface == surface) break;
         if (&entry->entry != &paint->surfaces) continue;
@@ -1942,6 +1941,11 @@ static void cancel_native_window_paint( struct window_paint *paint )
 
 static void cancel_window_paint( struct window_paint *paint )
 {
+    if (!paint->token)
+    {
+        free_window_paint( paint );
+        return;
+    }
     SERVER_START_REQ( end_window_paint )
     {
         req->token = paint->token;
@@ -1996,42 +2000,52 @@ struct window_paint *begin_window_paint( HWND hwnd )
 {
     struct window_paint *paint = calloc( 1, sizeof(*paint) );
     UINT64 token = 0;
+    NTSTATUS status;
 
     hwnd = get_full_window_handle( hwnd );
-    SERVER_START_REQ( begin_window_paint )
+    status = user_driver->pWindowPaint( hwnd, WINDOW_PAINT_QUERY, 0 );
+    /* Unsupported drivers keep a local BeginPaint/erase scope, but cannot
+     * promise native completion or acquire a server receipt. A supported
+     * driver's admission failure must never take this legacy path. */
+    if (status != STATUS_NOT_SUPPORTED)
     {
-        req->handle = wine_server_user_handle( hwnd );
-        req->tracked = !!paint;
-        if (!wine_server_call( req )) token = reply->token;
-    }
-    SERVER_END_REQ;
-    if (!token)
-    {
-        free( paint );
-        goto failed;
-    }
-    if (paint)
-    {
-        paint->hwnd = hwnd;
-        paint->token = token;
-        paint->beginning = TRUE;
-        list_init( &paint->surfaces );
-        paint->failed = user_driver->pWindowPaint( hwnd, WINDOW_PAINT_RESERVE, token ) != STATUS_SUCCESS;
-        list_add_head( &get_user_thread_info()->window_paints, &paint->entry );
-        if (paint->failed)
+        if (status == STATUS_SUCCESS)
         {
-            cancel_window_paint( paint );
+            SERVER_START_REQ( begin_window_paint )
+            {
+                req->handle = wine_server_user_handle( hwnd );
+                req->tracked = !!paint;
+                if (!wine_server_call( req )) token = reply->token;
+            }
+            SERVER_END_REQ;
+        }
+        if (!token)
+        {
+            free( paint );
             goto failed;
         }
+    }
+    if (!paint) goto failed;
+    paint->hwnd = hwnd;
+    paint->token = token;
+    paint->beginning = TRUE;
+    list_init( &paint->surfaces );
+    paint->failed = token && user_driver->pWindowPaint( hwnd, WINDOW_PAINT_RESERVE, token ) != STATUS_SUCCESS;
+    list_add_head( &get_user_thread_info()->window_paints, &paint->entry );
+    if (paint->failed)
+    {
+        cancel_window_paint( paint );
+        goto failed;
     }
 
     return paint;
 
 failed:
     /* A nested erase/nonclient callback can be refused after its caller has
-     * consumed the region. Make that enclosing receipt restore its work. */
+     * consumed the region. Make that enclosing receipt restore its work,
+     * without failing unrelated BeginPaint scopes that already returned. */
     LIST_FOR_EACH_ENTRY( paint, &get_user_thread_info()->window_paints, struct window_paint, entry )
-        if (!paint->ended && !paint->cancelled) paint->failed = TRUE;
+        if (paint->beginning && !paint->ended && !paint->cancelled) paint->failed = TRUE;
     return NULL;
 }
 
@@ -2041,13 +2055,16 @@ BOOL begin_dc_write( DC *dc )
 {
     struct window_paint *paint;
     HWND hwnd;
+    NTSTATUS status;
 
     if (!dc->dce || dc->write_paint) return TRUE;
     user_lock();
     hwnd = dc->dce ? dc->dce->hwnd : 0;
     user_unlock();
     if (!hwnd || hwnd == get_desktop_window()) return TRUE;
-    if (user_driver->pWindowPaint( hwnd, WINDOW_PAINT_QUERY, 0 ) != STATUS_SUCCESS) return TRUE;
+    status = user_driver->pWindowPaint( hwnd, WINDOW_PAINT_QUERY, 0 );
+    if (status == STATUS_NOT_SUPPORTED) return TRUE;
+    if (status != STATUS_SUCCESS) return FALSE;
     LIST_FOR_EACH_ENTRY( paint, &get_user_thread_info()->window_paints, struct window_paint, entry )
         if (paint->hwnd == hwnd && !paint->ended && !paint->cancelled) return TRUE;
     if (!(dc->write_paint = begin_window_paint( hwnd ))) return FALSE;
@@ -2062,6 +2079,11 @@ void end_window_paint( struct window_paint *paint, BOOL success )
     NTSTATUS status;
 
     if (!paint) return;
+    if (!paint->token)
+    {
+        free_window_paint( paint );
+        return;
+    }
     paint->beginning = FALSE;
     paint->ended = TRUE;
     paint->failed |= !success;
