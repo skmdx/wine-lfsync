@@ -1515,6 +1515,7 @@ static void complete_client_surface_compositor_frame(
     BOOL success = frame->last_complete_success;
 
     if (frame->request_pending || !frame->complete) return;
+    client_surface_release_native_present( &frame->native_present );
     if (frame->waiter)
     {
         assert( frame->waiter->op == CLIENT_SURFACE_COMPOSITOR_PRESENT );

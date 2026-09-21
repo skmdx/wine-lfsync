@@ -723,18 +723,30 @@ static void execute_native_present( struct client_surface_native_work *work )
 static void finish_native_present( struct client_surface_native_work *work )
 {
     struct client_surface_native_present *present = CONTAINING_RECORD( work, struct client_surface_native_present, work );
-    struct client_surface_native_present_queue *queue = present->queue;
     void (*wake)(void) = present->wake;
 
-    pthread_mutex_lock( &cache_mutex );
-    assert( queue->head == present );
-    if ((queue->head = present->next))
-        queue_native_work( select_existing_worker( present_workers, present_worker_count, &next_present_worker ), &queue->head->work );
-    else queue->tail = NULL;
-    pthread_mutex_unlock( &cache_mutex );
-    /* No request/queue access after publication: the actor may retire both. */
+    /* A checked reply proves receipt, not application of a Present. The
+     * actor releases the Window lane after Complete; workers remain free. */
     WriteRelease( &present->complete, TRUE );
     wake();
+}
+
+void client_surface_release_native_present( struct client_surface_native_present *present )
+{
+    struct client_surface_native_present_queue *queue;
+
+    pthread_mutex_lock( &cache_mutex );
+    if ((queue = present->queue))
+    {
+        assert( queue->head == present && ReadAcquire( &present->complete ) );
+        if ((queue->head = present->next))
+            queue_native_work( select_existing_worker( present_workers, present_worker_count, &next_present_worker ),
+                               &queue->head->work );
+        else queue->tail = NULL;
+        present->queue = NULL;
+        present->next = NULL;
+    }
+    pthread_mutex_unlock( &cache_mutex );
 }
 
 void client_surface_submit_native_present( struct client_surface_native_present_queue *queue,
@@ -781,8 +793,8 @@ void client_surface_cancel_native_presents( struct client_surface_native_present
     }
     if (i == present_worker_count)
     {
-        /* The head is executing (possibly already issued). Retain it; its
-         * finished callback alone may detach it from the Window FIFO. */
+        /* The head is executing or awaiting application. Only the actor's
+         * completion observation may release its Window ordering slot. */
         queue->tail = present;
         present = present->next;
         queue->head->next = NULL;
@@ -795,6 +807,8 @@ void client_surface_cancel_native_presents( struct client_surface_native_present
         TRACE_(csperf)( "ticks=%llu event=native_present_cancel window=%lx pixmap=%lx serial=%u issued=0\n",
                        cache_time(), present->window, present->pixmap, present->serial );
         present->success = FALSE;
+        present->queue = NULL;
+        present->next = NULL;
         WriteRelease( &present->complete, TRUE );
         present = next;
     }

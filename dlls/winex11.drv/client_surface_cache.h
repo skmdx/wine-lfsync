@@ -35,6 +35,9 @@ struct client_surface_native_present
 };
 void client_surface_submit_native_present( struct client_surface_native_present_queue *queue,
                                            struct client_surface_native_present *present );
+/* Release ordering only after the checked copy or Present Complete. Image
+ * lifetime still extends through the independently observed Present Idle. */
+void client_surface_release_native_present( struct client_surface_native_present *present );
 /* Cancel only requests still owned by the queues, never an executing head. */
 void client_surface_cancel_native_presents( struct client_surface_native_present_queue *queue );
 
