@@ -2293,6 +2293,11 @@ static BOOL enable_direct_drawing( struct x11drv_win_data *data, BOOL layered )
     if (data->embedded) return TRUE; /* draw directly to the window */
     if (data->whole_window == root_window) return TRUE; /* draw directly to the window */
     if (data->client_window) return TRUE; /* draw directly to the window */
+    /* A composited owner can be drawn by another process and by the owner
+     * compositor. Its private CPU surface cannot observe either writer.
+     * Select the shared drawable before surface creation, including PREPARE,
+     * rather than the driver's later WindowPosChanged acknowledgement. */
+    if (client_surface_needs_backing( data->hwnd )) return TRUE;
     if (!client_side_graphics) return TRUE; /* draw directly to the window */
     return FALSE;
 }

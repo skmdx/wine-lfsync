@@ -719,6 +719,18 @@ BOOL client_surface_get_toplevel_scene( HWND toplevel, struct client_surface_sce
     return read_client_surface_scene( toplevel, scene, NULL, NULL ) && scene->valid;
 }
 
+BOOL client_surface_needs_backing( HWND toplevel )
+{
+    struct object_lock lock = OBJECT_LOCK_INIT;
+    const window_shm_t *window_shm = NULL;
+    BOOL backing = FALSE;
+    NTSTATUS status;
+
+    while ((status = get_shared_window( toplevel, &lock, &window_shm )) == STATUS_PENDING)
+        backing = !!(window_shm->client_surface_flags & WINDOW_SHM_CLIENT_SURFACE_BACKING);
+    return !status && backing;
+}
+
 BOOL client_surface_capture_scene_state( HWND toplevel, struct client_surface_scene *scene )
 {
     /* PREPARING blocks producer publication, but its even scene and zero

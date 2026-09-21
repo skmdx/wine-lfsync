@@ -617,6 +617,7 @@ W32KAPI void client_surface_geometry_ready( HWND hwnd );
 W32KAPI void client_surface_repair_owner( HWND hwnd );
 W32KAPI void client_surface_resolve_sources( HWND hwnd );
 W32KAPI BOOL client_surface_get_toplevel_scene( HWND toplevel, struct client_surface_scene *scene );
+W32KAPI BOOL client_surface_needs_backing( HWND toplevel );
 W32KAPI BOOL client_surface_capture_scene_state( HWND toplevel, struct client_surface_scene *scene );
 struct client_surface_scene_member
 {
