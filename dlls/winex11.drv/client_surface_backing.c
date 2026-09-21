@@ -212,8 +212,7 @@ struct client_surface_compositor_frame
     BOOL last_complete_success;
     BOOL publish_pending;
     BOOL request_pending;
-    enum { OUTPUT_REQUEST_PRESENT, OUTPUT_REQUEST_COPY, OUTPUT_REQUEST_COPY_CLEANUP } request_op;
-    struct client_surface_xcb_request request;
+    struct client_surface_native_present native_present;
     unsigned int xcb_gc;
     struct client_surface_compositor_binding *copy_binding;
     struct client_surface_cache_image *copy_image;
@@ -240,6 +239,8 @@ struct client_surface_compositor_target
     struct client_surface_owner_notifications *notifications;
     HWND toplevel;
     Window window;
+    struct x11drv_native_window *window_owner;
+    struct client_surface_native_present_queue native_presents;
     struct client_surface_compositor_frame frames[CLIENT_SURFACE_COMPOSITOR_FRAME_COUNT];
     struct client_surface_compositor_frame *copy_frame;
     struct client_surface_output_transform *transform;
@@ -780,11 +781,11 @@ static void queue_client_surface_compositor_reply( struct client_surface_composi
                                                    struct client_surface_compositor_frame *frame,
                                                    struct client_surface_copy_batch *batch )
 {
-    assert( !frame->reply_target );
+    assert( !frame->reply_target && !frame->request_pending );
     frame->reply_target = target;
     frame->reply_batch = batch;
     queue_client_surface_reply( &frame->reply,
-        batch ? batch->requests : frame->request_pending ? &frame->request : &frame->copy_request,
+        batch ? batch->requests : &frame->copy_request,
         batch ? batch->count : 1, complete_client_surface_output_reply );
 }
 
@@ -1185,6 +1186,8 @@ static void free_client_surface_compositor_target( struct client_surface_composi
         release_client_surface_compositor_queue( notifications->queue );
         free_client_surface_compositor_release( &notifications->memory, notifications, 4, sizeof(*notifications) );
     }
+    assert( !target->native_presents.head );
+    x11drv_native_window_release( target->window_owner );
     client_surface_free_owned_metadata( &target->memory, target, sizeof(*target) );
 }
 
@@ -1508,7 +1511,7 @@ static void finish_client_surface_compositor_frame(
 {
     if (!frame->serial || frame->request_pending || !frame->complete || !frame->idle) return;
     TRACE( "%s serial %u pixmap %#lx completed and became idle\n",
-           frame->request_op ? "staged copy" : "X Present", frame->serial, frame->pixmap );
+           frame->native_present.copy ? "staged copy" : "X Present", frame->serial, frame->pixmap );
     frame->serial = 0;
     frame->complete = frame->idle = FALSE;
     /* Give completed sources a chance to replace a steady mailbox before it is
@@ -1542,61 +1545,6 @@ static void complete_client_surface_compositor_frame(
             frame->publish_generation, frame->publish_epoch, success );
         frame->publish_pending = FALSE;
     }
-}
-
-static void complete_client_surface_present_request( struct client_surface_compositor_target *target,
-                                                     struct client_surface_compositor_frame *frame, BOOL success )
-{
-    frame->request_pending = FALSE;
-    TRACE( "validated %s request %u serial %u success %u\n",
-           frame->request_op ? "staged copy" : "X Present", frame->request.cookies[0], frame->serial, success );
-    if (frame->request_op != OUTPUT_REQUEST_PRESENT)
-    {
-        if (frame->request_op == OUTPUT_REQUEST_COPY)
-        {
-            TRACE_(csperf)( "ticks=%llu event=publish_copy_complete window=%lx pixmap=%lx serial=%u "
-                           "generation=%llu epoch=%llu success=%u\n", client_surface_perf_time(), target->window,
-                           frame->pixmap, frame->serial, (unsigned long long)frame->publish_generation,
-                           (unsigned long long)frame->publish_epoch, success );
-            if (!success && frame->xcb_gc)
-            {
-                /* A failed CreateGC may leave only an allocated XID. Keep the
-                 * frame owned while its checked free consumes either result. */
-                frame->request_op = OUTPUT_REQUEST_COPY_CLEANUP;
-                frame->request_pending = TRUE;
-                client_surface_xcb_free_gc_async( client_surface_compositor_display,
-                                                  frame->xcb_gc, &frame->request );
-                queue_client_surface_compositor_reply( target, frame, NULL );
-                return;
-            }
-        }
-        else
-        {
-            TRACE_(csperf)( "ticks=%llu event=publish_copy_cleanup window=%lx pixmap=%lx serial=%u "
-                           "gc=%u success=%u\n", client_surface_perf_time(), target->window,
-                           frame->pixmap, frame->serial, frame->xcb_gc, success );
-            frame->xcb_gc = 0;
-            success = FALSE;
-        }
-        /* The checked destination copy owns its completion. Neither a Present
-         * event nor another copy may turn a failed receipt into exposure. */
-        frame->last_complete_success = success;
-        frame->last_complete_serial = frame->serial;
-        frame->complete = frame->idle = TRUE;
-    }
-    else if (!success)
-    {
-        TRACE_(csperf)( "ticks=%llu event=present_error window=%lx pixmap=%lx serial=%u\n",
-                       client_surface_perf_time(), target->window, frame->pixmap, frame->serial );
-        /* A rejected Present cannot generate Complete/Idle. Preserve
-         * the previous synchronous path's checked XCopy fallback. */
-        frame->last_complete_success = client_surface_copy_on_compositor(
-            frame->pixmap, target->window, 0, 0, 0, 0, target->width, target->height );
-        frame->last_complete_serial = frame->serial;
-        frame->complete = frame->idle = TRUE;
-    }
-    complete_client_surface_compositor_frame( target, frame );
-    finish_client_surface_compositor_frame( target, frame );
 }
 
 static void process_client_surface_present_events(void)
@@ -1693,29 +1641,56 @@ static BOOL wait_client_surface_compositor_pixmap_idle( Pixmap pixmap )
     return !frame->serial;
 }
 
+static BOOL process_client_surface_native_present( struct client_surface_compositor_target *target )
+{
+    unsigned int i;
+    BOOL progressed = FALSE;
+
+    for (i = 0; i < ARRAY_SIZE(target->frames); ++i)
+    {
+        struct client_surface_compositor_frame *frame = &target->frames[i];
+        struct client_surface_native_present *present = &frame->native_present;
+
+        if (!frame->request_pending || !ReadAcquire( &present->complete )) continue;
+        frame->request_pending = FALSE;
+        if (present->copied || !present->success)
+        {
+            frame->last_complete_success = present->success;
+            frame->last_complete_serial = frame->serial;
+            frame->complete = frame->idle = TRUE;
+        }
+        TRACE_(csperf)( "ticks=%llu event=native_present_receipt window=%lx pixmap=%lx serial=%u copy=%u success=%u\n",
+                       client_surface_perf_time(), target->window, frame->pixmap, frame->serial,
+                       present->copied, present->success );
+        if (present->copy)
+            TRACE_(csperf)( "ticks=%llu event=publish_copy_complete window=%lx pixmap=%lx serial=%u generation=%llu epoch=%llu success=%u\n",
+                           client_surface_perf_time(), target->window, frame->pixmap, frame->serial,
+                           (unsigned long long)frame->publish_generation,
+                           (unsigned long long)frame->publish_epoch, present->success );
+        complete_client_surface_compositor_frame( target, frame );
+        finish_client_surface_compositor_frame( target, frame );
+        progressed = TRUE;
+    }
+    if (progressed) wake_client_surface_compositor_queues();
+    return progressed;
+}
+
 static BOOL submit_client_surface_present( struct client_surface_compositor_target *target,
                                            struct client_surface_compositor_frame *frame,
                                            UINT64 publish_generation, UINT64 publish_epoch,
                                            uint32_t *serial_ret )
 {
-    Display *display = client_surface_compositor_display;
     struct client_surface_scene scene;
-    RECT full = {0, 0, target->width, target->height};
     BOOL copy;
     uint32_t serial;
-    int error = 0;
 
-    if (!usexpresent || !target->present_event || frame->serial) return FALSE;
-    /* A staged window withholds pixels until this publication completes.
-     * Waiting for its host frame callback can therefore wait on exposure
-     * itself. Copy into the withheld drawable and check that native write;
-     * visible scene transactions retain Present's normal completion. */
+    if (!usexpresent || !target->present_event || !target->window_owner || frame->serial) return FALSE;
+    /* STAGED publication cannot depend on exposure's frame callback. Both
+     * its copy and visible Present use the same per-Window native FIFO. */
     copy = publish_generation && client_surface_get_toplevel_scene( target->toplevel, &scene ) &&
            scene.toplevel == target->toplevel && scene.epoch == publish_epoch &&
            scene.generation == publish_generation && scene.mode == CLIENT_SURFACE_PRESENTATION_STAGED;
-    if (copy && !client_surface_xcb_available( display )) return FALSE;
     if (!(serial = ++client_surface_present_serial)) serial = ++client_surface_present_serial;
-
     frame->serial = serial;
     frame->last_complete_serial = 0;
     frame->last_complete_success = FALSE;
@@ -1723,47 +1698,20 @@ static BOOL submit_client_surface_present( struct client_surface_compositor_targ
     frame->publish_generation = publish_generation;
     frame->publish_epoch = publish_epoch;
     frame->publish_pending = !!publish_generation;
-    frame->request_op = copy ? OUTPUT_REQUEST_COPY : OUTPUT_REQUEST_PRESENT;
-    if (copy)
-        frame->request_pending = client_surface_xcb_copy( display, frame->pixmap, target->window,
-            &frame->xcb_gc, 0, &full, &full, &full, NULL, 1, FALSE, &frame->request, TRUE );
-    else
-        frame->request_pending = client_surface_xcb_present( display, target->window, frame->pixmap,
-                                                            serial, &frame->request );
-    if (copy && !frame->request_pending)
-    {
-        frame->serial = 0;
-        frame->publish_pending = FALSE;
-        return FALSE;
-    }
-    if (frame->request_pending) queue_client_surface_compositor_reply( target, frame, NULL );
-    if (!frame->request_pending)
-    {
-        X11DRV_expect_error( display, client_surface_compositor_error, &error );
-        pXPresentPixmap( display, target->window, frame->pixmap, serial, None, None, 0, 0, None,
-                         None, None, PresentOptionAsync | PresentOptionCopy,
-                         0, 0, 0, NULL, 0 );
-        XSync( display, False );
-        X11DRV_check_error();
-    }
-    if (error)
-    {
-        frame->serial = 0;
-        frame->publish_pending = FALSE;
-        return FALSE;
-    }
+    frame->request_pending = TRUE;
+    frame->native_present = (struct client_surface_native_present){
+        .window = target->window, .pixmap = frame->pixmap, .serial = serial,
+        .width = target->width, .height = target->height, .copy = copy,
+        .generation = publish_generation, .epoch = publish_epoch,
+        .wake = wake_client_surface_compositor};
+    /* Serial ownership prevents pool/target release and image reuse through
+     * both the checked native receipt and Present Complete/Idle. The embedded
+     * request is already covered by target admission; submit cannot allocate. */
+    client_surface_submit_native_present( &target->native_presents, &frame->native_present );
     if (serial_ret) *serial_ret = serial;
-    if (copy)
-        TRACE_(csperf)( "ticks=%llu event=publish_copy_submit window=%lx pixmap=%lx serial=%u "
-                       "generation=%llu epoch=%llu cookie=%u barrier=%u\n", client_surface_perf_time(),
-                       target->window, frame->pixmap, serial, (unsigned long long)publish_generation,
-                       (unsigned long long)publish_epoch,
-                       frame->request.cookies[frame->request.count - 1], frame->request.barrier );
-    else
-        TRACE_(csperf)( "ticks=%llu event=present window=%lx pixmap=%lx serial=%u\n",
-                       client_surface_perf_time(), target->window, frame->pixmap, serial );
-    TRACE( "queued %s serial %u pixmap %#lx generation %s\n", copy ? "staged copy" : "X Present",
-           serial, frame->pixmap, wine_dbgstr_longlong( publish_generation ) );
+    TRACE_(csperf)( "ticks=%llu event=native_present_admit window=%lx pixmap=%lx serial=%u copy=%u generation=%llu epoch=%llu\n",
+                   client_surface_perf_time(), target->window, frame->pixmap, serial, copy,
+                   (unsigned long long)publish_generation, (unsigned long long)publish_epoch );
     return TRUE;
 }
 
@@ -2709,6 +2657,12 @@ static BOOL update_client_surface_compositor_target( struct client_surface_compo
          target->height != job->u.pool.height || target->depth != job->u.pool.depth))
         free_client_surface_compositor_mailbox( target );
     retry_client_surface_compositor_mailbox( target );
+    if (target->window_owner != job->u.pool.window_owner)
+    {
+        struct x11drv_native_window *previous = target->window_owner;
+        target->window_owner = x11drv_native_window_acquire( job->u.pool.window_owner );
+        x11drv_native_window_release( previous );
+    }
     target->window = job->u.pool.destination;
     if (!same_pool)
     {
@@ -3322,6 +3276,7 @@ static BOOL install_client_surface_direct_plan( const struct client_surface_comp
     {
         if (!(target = alloc_client_surface_compositor_target( job->toplevel ))) goto done;
         target->window = job->u.direct_plan.destination;
+        target->window_owner = x11drv_native_window_acquire( job->u.direct_plan.window_owner );
         allocated = TRUE;
     }
     if (target->window != job->u.direct_plan.destination) goto done;
@@ -4565,13 +4520,7 @@ static void complete_client_surface_output_reply( struct client_surface_composit
 
     frame->reply_target = NULL;
     frame->reply_batch = NULL;
-    if (frame->request_pending)
-    {
-#ifdef SONAME_LIBXPRESENT
-        complete_client_surface_present_request( target, frame, success );
-#endif
-        return;
-    }
+    assert( !frame->request_pending );
     assert( target->copy_frame == frame );
     target->copy_frame = NULL;
     if (batch)
@@ -5979,6 +5928,9 @@ static BOOL process_client_surface_compositor_targets( struct client_surface_com
                 progressed |= target->update_notified;
             }
         }
+#ifdef SONAME_LIBXPRESENT
+        progressed |= process_client_surface_native_present( target );
+#endif
         progressed |= process_client_surface_compositor_restore( target );
         progressed |= replay_client_surface_scene_sources( target, &budget );
 #ifdef SONAME_LIBXPRESENT
@@ -6576,6 +6528,7 @@ static NTSTATUS replace_client_surface_backing( struct x11drv_win_data *data,
             .allocation = allocation,
             .source = snapshot ? 0 : data->client_surface_backing,
             .destination = data->whole_window,
+            .window_owner = data->native_window,
             .width = width,
             .height = height,
             .depth = data->vis.depth,
@@ -6706,6 +6659,7 @@ static BOOL update_client_surface_backing_target( struct x11drv_win_data *data,
         {
             .pixmaps = {data->client_surface_backing, data->client_surface_backing_spare},
             .destination = data->whole_window,
+            .window_owner = data->native_window,
             .width = data->client_surface_backing_width,
             .height = data->client_surface_backing_height,
             .window_width = window_width,

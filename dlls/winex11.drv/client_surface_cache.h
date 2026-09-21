@@ -12,6 +12,28 @@ struct client_surface_native_work
     void (*execute)( struct client_surface_native_work *work );
     void (*finished)( struct client_surface_native_work *work );
 };
+/* The caller reserves requests with its output frames and retains each frame
+ * and native Window until complete. One queue orders one Window's writes;
+ * no native connection or borrowed scene state belongs to the actor. */
+struct client_surface_native_present_queue
+{
+    struct client_surface_native_present *head, *tail;
+};
+struct client_surface_native_present
+{
+    struct client_surface_native_work work;
+    struct client_surface_native_present *next;
+    struct client_surface_native_present_queue *queue;
+    Window window;
+    Pixmap pixmap;
+    unsigned int width, height, serial;
+    UINT64 generation, epoch;
+    BOOL copy, copied, success, complete;
+    void (*wake)(void);
+};
+void client_surface_submit_native_present( struct client_surface_native_present_queue *queue,
+                                           struct client_surface_native_present *present );
+
 BOOL client_surface_native_query_window( Window window, unsigned int *width, unsigned int *height,
                                          int *map_state, int *error );
 BOOL client_surface_native_check_direct( Window window, Window child, unsigned int width,

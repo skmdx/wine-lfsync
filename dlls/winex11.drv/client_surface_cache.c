@@ -22,6 +22,7 @@
 #include "client_surface.h"
 #include "client_surface_cache.h"
 #include "client_surface_xcb.h"
+#include "xpresent.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(x11drv);
 WINE_DECLARE_DEBUG_CHANNEL(csperf);
@@ -639,6 +640,106 @@ void client_surface_submit_native_work( struct client_surface_native_work *work 
     pthread_mutex_lock( &cache_mutex );
     assert( worker_count );
     queue_native_work( select_existing_cache_worker(), work );
+    pthread_mutex_unlock( &cache_mutex );
+}
+
+static void execute_native_present( struct client_surface_native_work *work )
+{
+    struct client_surface_native_present *present = CONTAINING_RECORD( work, struct client_surface_native_present, work );
+    struct client_surface_xcb_request request = {0};
+    struct cache_worker *worker = native_worker;
+    Display *display;
+    GC gc;
+    RECT full = {0, 0, present->width, present->height};
+    unsigned int xcb_gc = 0;
+
+    if (!open_cache_display( worker )) return;
+    display = worker->display;
+    worker->error = 0;
+#ifdef SONAME_LIBXPRESENT
+    if (!present->copy)
+    {
+        if (client_surface_xcb_present( display, present->window, present->pixmap, present->serial, &request ))
+        {
+            TRACE_(csperf)( "ticks=%llu event=present window=%lx pixmap=%lx serial=%u\n",
+                           cache_time(), present->window, present->pixmap, present->serial );
+            present->success = client_surface_xcb_wait( display, &request );
+            TRACE( "validated X Present request %u serial %u success %u\n",
+                   request.cookies[0], present->serial, present->success );
+        }
+        else
+        {
+            pXPresentPixmap( display, present->window, present->pixmap, present->serial, None, None,
+                             0, 0, None, None, None, PresentOptionAsync | PresentOptionCopy, 0, 0, 0, NULL, 0 );
+            TRACE_(csperf)( "ticks=%llu event=present window=%lx pixmap=%lx serial=%u\n",
+                           cache_time(), present->window, present->pixmap, present->serial );
+            XSync( display, False );
+            present->success = !worker->error;
+        }
+        if (present->success) return;
+    }
+#endif
+    /* STAGED publication and the rejected-Present fallback have the same
+     * checked write boundary, on this worker's private connection. */
+    worker->error = 0;
+    present->copied = TRUE;
+    if (client_surface_xcb_copy( display, present->pixmap, present->window, &xcb_gc,
+                                0, &full, &full, &full, NULL, 1, FALSE, &request, TRUE ))
+    {
+        TRACE_(csperf)( "ticks=%llu event=publish_copy_submit window=%lx pixmap=%lx serial=%u generation=%llu epoch=%llu cookie=%u barrier=%u\n",
+                       cache_time(), present->window, present->pixmap, present->serial,
+                       (unsigned long long)present->generation, (unsigned long long)present->epoch,
+                       request.cookies[request.count - 1], request.barrier );
+        present->success = client_surface_xcb_wait( display, &request );
+        client_surface_xcb_free_gc( display, &xcb_gc );
+        return;
+    }
+    gc = XCreateGC( display, present->pixmap, 0, NULL );
+    if (gc)
+    {
+        XSetGraphicsExposures( display, gc, False );
+        XCopyArea( display, present->pixmap, present->window, gc, 0, 0,
+                   present->width, present->height, 0, 0 );
+        TRACE_(csperf)( "ticks=%llu event=xlib_copy_request source=%lx destination=%lx width=%u height=%u clipped=0 route=present\n",
+                       cache_time(), present->pixmap, present->window, present->width, present->height );
+        XFreeGC( display, gc );
+        XSync( display, False );
+        present->success = !worker->error;
+    }
+}
+
+static void finish_native_present( struct client_surface_native_work *work )
+{
+    struct client_surface_native_present *present = CONTAINING_RECORD( work, struct client_surface_native_present, work );
+    struct client_surface_native_present_queue *queue = present->queue;
+    void (*wake)(void) = present->wake;
+
+    pthread_mutex_lock( &cache_mutex );
+    assert( queue->head == present );
+    if ((queue->head = present->next))
+        queue_native_work( select_existing_cache_worker(), &queue->head->work );
+    else queue->tail = NULL;
+    pthread_mutex_unlock( &cache_mutex );
+    /* No request/queue access after publication: the actor may retire both. */
+    WriteRelease( &present->complete, TRUE );
+    wake();
+}
+
+void client_surface_submit_native_present( struct client_surface_native_present_queue *queue,
+                                           struct client_surface_native_present *present )
+{
+    present->queue = queue;
+    present->work.execute = execute_native_present;
+    present->work.finished = finish_native_present;
+    pthread_mutex_lock( &cache_mutex );
+    assert( worker_count );
+    if (queue->tail) queue->tail->next = present;
+    else
+    {
+        queue->head = present;
+        queue_native_work( select_existing_cache_worker(), &present->work );
+    }
+    queue->tail = present;
     pthread_mutex_unlock( &cache_mutex );
 }
 

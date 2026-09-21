@@ -34,6 +34,7 @@ static typeof(XGetXCBConnection) *pXGetXCBConnection;
 static typeof(xcb_present_pixmap_checked) *pxcb_present_pixmap_checked;
 static typeof(xcb_get_input_focus) *pxcb_get_input_focus;
 static typeof(xcb_poll_for_reply) *pxcb_poll_for_reply;
+static typeof(xcb_wait_for_reply) *pxcb_wait_for_reply;
 static typeof(xcb_request_check) *pxcb_request_check;
 static typeof(xcb_flush) *pxcb_flush;
 static typeof(xcb_generate_id) *pxcb_generate_id;
@@ -71,6 +72,7 @@ static void client_surface_xcb_init(void)
     LOAD_FUNCPTR( present, xcb_present_pixmap_checked );
     LOAD_FUNCPTR( xcb, xcb_get_input_focus );
     LOAD_FUNCPTR( xcb, xcb_poll_for_reply );
+    LOAD_FUNCPTR( xcb, xcb_wait_for_reply );
     LOAD_FUNCPTR( xcb, xcb_request_check );
     LOAD_FUNCPTR( xcb, xcb_flush );
     LOAD_FUNCPTR( xcb, xcb_generate_id );
@@ -277,8 +279,8 @@ BOOL client_surface_xcb_poll( Display *display, struct client_surface_xcb_reques
     return client_surface_xcb_poll_batch( display, request, 1, success );
 }
 
-BOOL client_surface_xcb_poll_batch( Display *display, struct client_surface_xcb_request *requests,
-                                    unsigned int count, BOOL *success )
+static BOOL check_client_surface_xcb_requests( Display *display, struct client_surface_xcb_request *requests,
+                                              unsigned int count, BOOL wait, BOOL *success )
 {
     xcb_connection_t *connection = pXGetXCBConnection( display );
     xcb_generic_error_t *error = NULL;
@@ -286,7 +288,8 @@ BOOL client_surface_xcb_poll_batch( Display *display, struct client_surface_xcb_
     void *reply = NULL;
 
     assert( count );
-    if (!pxcb_poll_for_reply( connection, requests[count - 1].barrier, &reply, &error )) return FALSE;
+    if (wait) reply = pxcb_wait_for_reply( connection, requests[count - 1].barrier, &error );
+    else if (!pxcb_poll_for_reply( connection, requests[count - 1].barrier, &reply, &error )) return FALSE;
     *success = reply && !error;
     TRACE_(csperf)( "ticks=%llu event=xcb_barrier_reply display=%p barrier=%u success=%u\n",
                    client_surface_xcb_perf_time(), display, requests[count - 1].barrier, *success );
@@ -317,7 +320,26 @@ BOOL client_surface_xcb_poll_batch( Display *display, struct client_surface_xcb_
     return TRUE;
 }
 
+BOOL client_surface_xcb_poll_batch( Display *display, struct client_surface_xcb_request *requests,
+                                    unsigned int count, BOOL *success )
+{
+    return check_client_surface_xcb_requests( display, requests, count, FALSE, success );
+}
+
+BOOL client_surface_xcb_wait( Display *display, struct client_surface_xcb_request *request )
+{
+    BOOL success;
+
+    check_client_surface_xcb_requests( display, request, 1, TRUE, &success );
+    return success;
+}
+
 #else
+
+BOOL client_surface_xcb_wait( Display *display, struct client_surface_xcb_request *request )
+{
+    return FALSE;
+}
 
 BOOL client_surface_xcb_check_direct( Display *display, Window owner, Window drawable,
                                       unsigned int width, unsigned int height, const RECT *rect )
