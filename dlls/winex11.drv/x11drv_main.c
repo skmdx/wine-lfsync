@@ -79,7 +79,7 @@ struct x11drv_display_owner
     {
         UINT64 token;
         HWND hwnd;
-        BOOL submitted, sent, cancelled;
+        BOOL submitted, sent, cancelled, failed_sent;
     } paints[64];
     unsigned int paint_count;
     LONG paint_failed, paint_read;
@@ -1265,15 +1265,25 @@ static void flush_window_paints( struct x11drv_display_owner *owner )
     if (!owner->paint_ready && !failed) return;
     for (i = 0; i < owner->paint_count;)
     {
-        if (!failed && (!owner->paints[i].submitted || owner->paints[i].sent)) { i++; continue; }
-        if (!failed && send_window_paint( owner, gdi_display, owner->paints[i].token, 1 ))
+        if (!owner->paints[i].submitted) { i++; continue; }
+        if (failed || owner->paints[i].cancelled)
         {
-            owner->paints[i++].sent = TRUE;
+            /* The endpoint's earlier error drain cannot cover writes made
+             * before this paint ended but after that drain was queued. The
+             * subscribed root remains usable when the endpoint is lost. */
+            if (!owner->paints[i].failed_sent &&
+                send_window_paint( owner, gdi_display, owner->paints[i].token, 3 ))
+                owner->paints[i].failed_sent = TRUE;
+            i++;
             continue;
         }
-        if (!owner->paints[i].cancelled)
-            complete_window_paint( owner, owner->paints[i].token, FALSE );
-        remove_window_paint( owner, i );
+        if (!owner->paints[i].sent)
+        {
+            if (send_window_paint( owner, gdi_display, owner->paints[i].token, 1 ))
+                owner->paints[i].sent = TRUE;
+            else owner->paints[i].cancelled = TRUE;
+        }
+        i++;
     }
     update_window_paint_admission( owner );
 }
@@ -1303,9 +1313,13 @@ static NTSTATUS window_paint( struct x11drv_display_owner *owner, HWND hwnd, UIN
     {
         if (i < owner->paint_count)
         {
-            if (owner->paints[i].sent || InterlockedCompareExchange( &owner->paint_failed, 0, 0 ))
-                owner->paints[i].cancelled = TRUE;
-            else remove_window_paint( owner, i );
+            /* Cancellation cannot retract commands already sent on the GDI
+             * connection. Return the failed receipt through the same marker
+             * (or checked error drain) as successful painting. */
+            owner->paints[i].cancelled = TRUE;
+            owner->paints[i].submitted = TRUE;
+            flush_window_paints( owner );
+            return STATUS_PENDING;
         }
         return STATUS_SUCCESS;
     }
@@ -1365,6 +1379,7 @@ static NTSTATUS window_paint( struct x11drv_display_owner *owner, HWND hwnd, UIN
         owner->paints[i].hwnd = hwnd;
         owner->paints[i].submitted = FALSE;
         owner->paints[i].sent = owner->paints[i].cancelled = FALSE;
+        owner->paints[i].failed_sent = FALSE;
         owner->paint_count++;
         update_window_paint_admission( owner );
         TRACE_(csperf)( "event=window_paint_reserve owner=%p endpoint=%lx hwnd=%p token=%llu count=%u\n",
@@ -1388,6 +1403,15 @@ static BOOL process_window_paint_event( struct x11drv_display_owner *owner, XCli
     token = (UINT)event->data.l[0] | (UINT64)(UINT)event->data.l[1] << 32;
     identity = (UINT)event->data.l[2] | (UINT64)(UINT)event->data.l[3] << 32;
     if (identity != owner->paint_identity) return TRUE;
+    if (token && event->data.l[4] == 3 && event->window == DefaultRootWindow( owner->display ))
+    {
+        for (i = 0; i < owner->paint_count; i++)
+            if (owner->paints[i].token == token && owner->paints[i].failed_sent) break;
+        if (i == owner->paint_count) return TRUE;
+        complete_window_paint( owner, token, FALSE );
+        remove_window_paint( owner, i );
+        return TRUE;
+    }
     if (!token && owner->paint_draining && event->window == DefaultRootWindow( owner->display ) &&
         event->data.l[4] == 2)
     {
@@ -1409,9 +1433,10 @@ static BOOL process_window_paint_event( struct x11drv_display_owner *owner, XCli
     else if (token && event->data.l[4] == 1 && owner->paint_ready)
     {
         for (i = 0; i < owner->paint_count; i++)
-            if (owner->paints[i].token == token && owner->paints[i].sent) break;
+            if (owner->paints[i].token == token && owner->paints[i].sent &&
+                !owner->paints[i].cancelled) break;
         if (i == owner->paint_count) return TRUE;
-        if (!owner->paints[i].cancelled) complete_window_paint( owner, token, TRUE );
+        complete_window_paint( owner, token, !owner->paints[i].cancelled );
         remove_window_paint( owner, i );
     }
     return TRUE;
@@ -1505,7 +1530,7 @@ NTSTATUS X11DRV_WindowPaint( HWND hwnd, UINT operation, UINT64 token )
     owner = data->display_owner;
     pthread_mutex_lock( &owner->paint_mutex );
     status = window_paint( owner, hwnd, operation, token );
-    if (!owner->paint_events_active && (operation == WINDOW_PAINT_SUBMIT || owner->paint_draining))
+    if (!owner->paint_events_active && window_paint_work_pending( owner ))
     {
         owner->paint_events_active = TRUE;
         x11drv_display_owner_acquire( owner );

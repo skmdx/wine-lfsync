@@ -4452,7 +4452,7 @@ enum inproc_sync_type
 
 @REQ(end_window_paint)
     unsigned __int64 token;
-    unsigned int cancel;        /* BeginPaint failed before handing out its DC */
+    unsigned int cancel;        /* invalidate paint; completion still drains native use */
 @END
 
 /* The native driver returns the original writer's token after processing the

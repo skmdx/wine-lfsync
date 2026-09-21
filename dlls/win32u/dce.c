@@ -1894,9 +1894,23 @@ static void free_window_paint( struct window_paint *paint )
     free( paint );
 }
 
+static void cancel_native_window_paint( struct window_paint *paint )
+{
+    /* A driver with outstanding native writes owns the failed receipt until
+     * those writes finish. A refused reservation has no native obligation. */
+    if (user_driver->pWindowPaint( paint->hwnd, WINDOW_PAINT_CANCEL, paint->token ) == STATUS_PENDING)
+        return;
+    SERVER_START_REQ( complete_window_paint )
+    {
+        req->token = paint->token;
+        req->success = FALSE;
+        wine_server_call( req );
+    }
+    SERVER_END_REQ;
+}
+
 static void cancel_window_paint( struct window_paint *paint )
 {
-    user_driver->pWindowPaint( paint->hwnd, WINDOW_PAINT_CANCEL, paint->token );
     SERVER_START_REQ( end_window_paint )
     {
         req->token = paint->token;
@@ -1904,6 +1918,7 @@ static void cancel_window_paint( struct window_paint *paint )
         wine_server_call( req );
     }
     SERVER_END_REQ;
+    cancel_native_window_paint( paint );
     free_window_paint( paint );
 }
 
@@ -1926,14 +1941,7 @@ static void flush_window_paints(void)
                  user_driver->pWindowPaint( paint->hwnd, WINDOW_PAINT_SUBMIT, paint->token );
         if (status != STATUS_SUCCESS)
         {
-            user_driver->pWindowPaint( paint->hwnd, WINDOW_PAINT_CANCEL, paint->token );
-            SERVER_START_REQ( complete_window_paint )
-            {
-                req->token = paint->token;
-                req->success = FALSE;
-                status = wine_server_call( req );
-            }
-            SERVER_END_REQ;
+            cancel_native_window_paint( paint );
             TRACE_(csperf)( "event=window_paint_submit_failed token=%llu status=%#x\n",
                            (unsigned long long)paint->token, (unsigned int)status );
         }
@@ -1948,9 +1956,8 @@ void cleanup_window_paints( HWND hwnd )
     LIST_FOR_EACH_ENTRY_SAFE( paint, next, &get_user_thread_info()->window_paints, struct window_paint, entry )
     {
         if (hwnd && paint->hwnd != hwnd) continue;
-        user_driver->pWindowPaint( paint->hwnd, WINDOW_PAINT_CANCEL, paint->token );
         if (hwnd && paint->beginning) paint->cancelled = TRUE;
-        else free_window_paint( paint );
+        else cancel_window_paint( paint );
     }
 }
 
@@ -2035,7 +2042,7 @@ void end_window_paint( struct window_paint *paint, BOOL success )
     SERVER_END_REQ;
     if (status != STATUS_SUCCESS || paint->cancelled)
     {
-        user_driver->pWindowPaint( paint->hwnd, WINDOW_PAINT_CANCEL, paint->token );
+        cancel_native_window_paint( paint );
         free_window_paint( paint );
     }
     else flush_window_paints();

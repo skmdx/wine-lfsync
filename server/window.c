@@ -4145,10 +4145,12 @@ void cleanup_process_window_paints( struct process *process )
 
 static void cancel_window_paints( struct window *win )
 {
-    struct window_paint *paint, *next;
+    struct window_paint *paint;
 
-    LIST_FOR_EACH_ENTRY_SAFE( paint, next, &window_paints, struct window_paint, entry )
-        if (paint->window == win) release_window_paint( paint, 0 );
+    /* Destroying the HWND invalidates adoption, not a foreign writer's
+     * outstanding native commands. Its receipt still owns that interval. */
+    LIST_FOR_EACH_ENTRY( paint, &window_paints, struct window_paint, entry )
+        if (paint->window == win) paint->failed = 1;
 }
 
 static struct window_paint *get_window_paint( UINT64 token, int worker )
@@ -4210,9 +4212,11 @@ DECL_HANDLER(end_window_paint)
 
     if (!paint) return;
     if (paint->ended) set_error( STATUS_INVALID_PARAMETER );
-    else if (req->cancel) release_window_paint( paint, !!paint->region );
-    else if (paint->failed) release_window_paint( paint, 1 );
-    else paint->ended = 1;
+    else
+    {
+        paint->ended = 1;
+        paint->failed |= !!req->cancel;
+    }
 }
 
 DECL_HANDLER(complete_window_paint)
@@ -4230,7 +4234,7 @@ DECL_HANDLER(complete_window_paint)
         /* Invalidate checkpoints admitted while this writer's native upload
          * was still pending, even when geometry and the paint set stayed fixed. */
         if (req->success) invalidate_window_paint( paint->window );
-        release_window_paint( paint, !req->success );
+        release_window_paint( paint, paint->failed || !req->success );
     }
 }
 

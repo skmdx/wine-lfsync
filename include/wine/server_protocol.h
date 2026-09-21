@@ -7782,6 +7782,6 @@ union generic_reply
     struct set_queue_paint_blocked_reply set_queue_paint_blocked_reply;
 };
 
-#define SERVER_PROTOCOL_VERSION 1029
+#define SERVER_PROTOCOL_VERSION 1030
 
 #endif /* __WINE_WINE_SERVER_PROTOCOL_H */
