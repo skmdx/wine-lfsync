@@ -24,6 +24,7 @@ struct client_surface_geometry
 extern BOOL client_surface_completion_init( struct client_surface *surface );
 extern struct client_surface_completion_job *client_surface_reserve_completion_domain(
     struct client_surface *surface, UINT64 domain );
+extern BOOL client_surface_activate_completion( struct client_surface_completion_job *job );
 extern void client_surface_completion_destroy( struct client_surface *surface );
 extern struct client_surface *client_surface_alloc( UINT size );
 extern void client_surface_handoff_destroy( struct client_surface *surface );

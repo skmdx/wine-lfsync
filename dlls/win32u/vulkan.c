@@ -3334,6 +3334,15 @@ reservation_failed:
             for (uint32_t j = 0; j < present_info->swapchainCount; ++j) present_info->pResults[j] = res;
         goto done;
     }
+    /* Storage and source preparation do not pin native execution slots. Take
+     * every required lease only after the batch's storage reservations, still
+     * outside surface locks and before any application wait is consumed. */
+    for (uint32_t i = 0; i < present_info->swapchainCount; ++i)
+        if (reservations[i].job && !client_surface_activate_completion( reservations[i].job ))
+        {
+            res = VK_ERROR_OUT_OF_HOST_MEMORY;
+            goto reservation_failed;
+        }
     have_snapshots = reserve_more = FALSE;
 
     /* Completion ordering is per client surface.  Acquire locks in a stable
