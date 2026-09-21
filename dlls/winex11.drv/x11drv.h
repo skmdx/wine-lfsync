@@ -937,6 +937,7 @@ struct x11drv_native_window_read
     struct x11drv_stream_barrier geometry, drawing;
     unsigned long copy_serial;
     int copy_error;
+    BOOL copy_complete, copy_exposed;
 };
 extern Window x11drv_native_window_read_init( struct x11drv_native_window_read *read,
                                               struct x11drv_native_window *window );

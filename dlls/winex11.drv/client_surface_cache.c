@@ -57,14 +57,14 @@ struct client_surface_cache_image
     BOOL waiting;
     Pixmap pixmap, source;
     Window window;
-    GC gc, transfer_gc;
+    GC gc, transfer_gc, window_gc;
     unsigned int width, height, depth;
     unsigned int copy_width, copy_height;
     unsigned int xcb_gc;
     unsigned int refs;
     enum client_surface_memory_class purpose;
     UINT64 bytes;
-    BOOL acquired, success;
+    BOOL acquired, success, window_gc_ready;
 };
 
 /* The bound includes live, queued, executing, completed and retiring images.
@@ -302,16 +302,16 @@ static void create_cache_image( struct client_surface_cache_image *image )
 static BOOL prepare_window_copy_gc( struct client_surface_cache_image *image )
 {
     struct cache_worker *worker = image->worker;
-    XGCValues values = {.graphics_exposures = False};
+    XGCValues values = {.graphics_exposures = True};
 
-    if (!image->transfer_gc)
-    {
-        image->transfer_gc = XCreateGC( worker->display, image->pixmap, GCGraphicsExposures, &values );
-        XSync( worker->display, False );
-        if (image->transfer_gc && !worker->error)
-            image->xcb_gc = XGContextFromGC( image->transfer_gc );
-    }
-    return !!image->xcb_gc;
+    if (image->window_gc_ready) return TRUE;
+    if (!image->window_gc)
+        image->window_gc = XCreateGC( worker->display, image->pixmap, GCGraphicsExposures, &values );
+    /* Window inputs need coverage receipts. Keep their immutable GC separate
+     * from the exposure-free transfer GC used by normal XCB cache copies. */
+    XSync( worker->display, False );
+    image->window_gc_ready = image->window_gc && !worker->error;
+    return image->window_gc_ready;
 }
 
 static void copy_cache_image( struct client_surface_cache_image *image )
@@ -335,7 +335,7 @@ static void copy_cache_image( struct client_surface_cache_image *image )
             read->copy_error = worker->error;
             goto done;
         }
-        gc = image->transfer_gc;
+        gc = image->window_gc;
         display = x11drv_native_window_read_begin( read );
     }
     else
@@ -475,12 +475,13 @@ static void destroy_cache_image( struct client_surface_cache_image *image )
 
     /* Every native object was created on this worker's process-lifetime
      * connection. An open failure can leave only an empty image record. */
-    assert( display || (!image->gc && !image->transfer_gc && !image->pixmap) );
+    assert( display || (!image->gc && !image->transfer_gc && !image->window_gc && !image->pixmap) );
     worker->error = 0;
     if (image->gc) XFreeGC( display, image->gc );
     if (image->transfer_gc) XFreeGC( display, image->transfer_gc );
+    if (image->window_gc) XFreeGC( display, image->window_gc );
     if (image->pixmap) XFreePixmap( display, image->pixmap );
-    if (image->gc || image->transfer_gc || image->pixmap) XSync( display, False );
+    if (image->gc || image->transfer_gc || image->window_gc || image->pixmap) XSync( display, False );
     TRACE_(csperf)( "ticks=%llu event=cache_native_free image=%p pixmap=%lx display=%p error=%d "
                    "owner_display=%p kind=%s\n", cache_time(), image, image->pixmap, display, worker->error,
                    display, cache_image_kind( image ) );

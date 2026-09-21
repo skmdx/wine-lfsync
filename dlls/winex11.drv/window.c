@@ -288,11 +288,39 @@ void x11drv_native_window_read_end( struct x11drv_native_window_read *read )
     XUnlockDisplay( gdi_display );
 }
 
+static Bool native_window_copy_event( Display *display, XEvent *event, char *arg )
+{
+    struct x11drv_native_window_read *read = (struct x11drv_native_window_read *)arg;
+
+    if (event->xany.send_event || event->xany.serial != read->copy_serial) return False;
+    if (event->type == NoExpose && event->xnoexpose.major_code == X_CopyArea)
+    {
+        read->copy_complete = TRUE;
+        return True;
+    }
+    if (event->type == GraphicsExpose && event->xgraphicsexpose.major_code == X_CopyArea)
+    {
+        read->copy_exposed = TRUE;
+        read->copy_complete = !event->xgraphicsexpose.count;
+        return True;
+    }
+    return False;
+}
+
 BOOL x11drv_native_window_read_complete( struct x11drv_native_window_read *read, BOOL *success )
 {
+    XEvent event;
+
     if (!read->drawing.complete && !x11drv_poll_stream_barrier( gdi_display, &read->drawing, NULL )) return FALSE;
     XLockDisplay( gdi_display );
-    *success = !read->copy_error;
+    /* A checked request can still leave unavailable Window pixels uncopied.
+     * The later drawing barrier also brings its exposure events into Xlib;
+     * consume only this copy's receipt, leaving other GDI exposures alone. */
+    while (XCheckIfEvent( gdi_display, &event, native_window_copy_event, (char *)read )) {}
+    *success = !read->copy_error && read->copy_complete && !read->copy_exposed;
+    TRACE_(csperf)( "event=native_window_copy_receipt window=%lx serial=%lu complete=%u exposed=%u error=%d success=%u\n",
+                   read->window->window, read->copy_serial, read->copy_complete, read->copy_exposed,
+                   read->copy_error, *success );
     XUnlockDisplay( gdi_display );
     return TRUE;
 }
