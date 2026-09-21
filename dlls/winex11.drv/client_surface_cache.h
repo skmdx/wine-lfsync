@@ -29,6 +29,7 @@ struct client_surface_native_present
     Pixmap pixmap;
     unsigned int width, height, serial;
     UINT64 generation, epoch;
+    RECT copy_rect; /* empty for full-frame publication; otherwise a restore */
     BOOL copy, copied, success, complete;
     void (*wake)(void);
 };

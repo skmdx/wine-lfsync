@@ -662,6 +662,7 @@ static void execute_native_present( struct client_surface_native_work *work )
     Display *display;
     GC gc;
     RECT full = {0, 0, present->width, present->height};
+    const RECT *rect = IsRectEmpty( &present->copy_rect ) ? &full : &present->copy_rect;
     unsigned int xcb_gc = 0;
 
     if (!open_cache_display( worker )) return;
@@ -695,7 +696,7 @@ static void execute_native_present( struct client_surface_native_work *work )
     worker->error = 0;
     present->copied = TRUE;
     if (client_surface_xcb_copy( display, present->pixmap, present->window, &xcb_gc,
-                                0, &full, &full, &full, NULL, 1, FALSE, &request, TRUE ))
+                                0, rect, rect, &full, NULL, 1, FALSE, &request, TRUE ))
     {
         TRACE_(csperf)( "ticks=%llu event=publish_copy_submit window=%lx pixmap=%lx serial=%u generation=%llu epoch=%llu cookie=%u barrier=%u\n",
                        cache_time(), present->window, present->pixmap, present->serial,
@@ -709,8 +710,8 @@ static void execute_native_present( struct client_surface_native_work *work )
     if (gc)
     {
         XSetGraphicsExposures( display, gc, False );
-        XCopyArea( display, present->pixmap, present->window, gc, 0, 0,
-                   present->width, present->height, 0, 0 );
+        XCopyArea( display, present->pixmap, present->window, gc, rect->left, rect->top,
+                   rect->right - rect->left, rect->bottom - rect->top, rect->left, rect->top );
         TRACE_(csperf)( "ticks=%llu event=xlib_copy_request source=%lx destination=%lx width=%u height=%u clipped=0 route=present\n",
                        cache_time(), present->pixmap, present->window, present->width, present->height );
         XFreeGC( display, gc );
