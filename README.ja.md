@@ -113,31 +113,20 @@ lfsync および Android 対応の検証中に見つかった、独立して意�
 | Vulkan の世代同期 | `dlls/win32u/vulkan.c`, `include/wine/vulkan_driver.h` |
 | Android の互換性 | `server/inproc_sync.c`, `dlls/wineandroid.drv/opengl.c` |
 
-## 6. 検証範囲と制限
+## 6. 検証と課題
 
-lock-free 共通実装には、イベント、セマフォ、ミューテックス、`WaitAny`、`WaitAll`、signal-and-wait、pulse、競合、所有者終了、および lease の寿命を対象とする専用テストがあります。開発時にはこれらの単体テスト、Wine 全体のビルド、および関連する Wine テストを実行しています。
+`libs/wine/lockfree_sync_test.c` はイベント、セマフォ、ミューテックス、複数待機、競合、所有者終了、lease の寿命を検査します。
 
-X11 の描画修正は、固定 RGB8 正解画像を持つ Win32/WGL テストアプリで、可視40状態、故障注入6種、非表示11状態を検査しています。さらに Steam のクリック、開閉、開いたままの切替、hover、4段階のリサイズを含む37遷移を検査し、固定メニュー画像を評価した66 captureで pixel mismatch、黒・白置換、外部遮蔽がすべて0であることを確認しています。
+描画の回帰テストは `dlls/win32u/tests/client_surface.c` にあります。`WINETEST_CLIENT_SURFACE_CASE` で対象を選択でき、通常の全体実行も同じテスト関数を使用します。
 
-### 描画不具合と回帰テストの対応
-
-Wine tree 内の `dlls/win32u/tests/client_surface.c` は、実アプリで見つかった不具合を次の最小境界へ分解して検査します。
-
-| 不具合の境界 | 最小回帰テスト |
+| 対象 | 主な focused case |
 | --- | --- |
-| completion の種類と、caller または queue が供給済みの結果を混同する | `test_completion_result_provenance()`。製品コードと同じ `client_surface_completion_result_is_external()` を使い、shared/exact と supplied/unsupplied の4組を検査する |
-| 別プロセス所有の HWND で WGL pixel format が失われる | `test_cross_process_pixel_format()`。親が `SetPixelFormat()` した HWND を子プロセスが `GetPixelFormat()` し、同じ値であることを検査する |
-| 非表示中の present、表示時の切替、リサイズ後の完了が欠落する | `test_hidden_present_resize()`、`test_grow64_present_completion()`、`test_paced_present_completion()`。固定色の GL front buffer と server の staged/pending 状態を検査する |
-| scene 変更、古い generation、重複 producer、遅延完了が新しい frame を上書きする | generation、scene snapshot、publish/live-prepare、writer barrier、native backing、late-present、concurrent-state の各テスト |
-| 通知 filter、thread/process 終了、destroy 競合で公開が停止または誤配送される | `test_notification_identity_aba()`、`test_writer_thread_exit()`、`test_present_destroy_race()`、`test_owner_exit_and_destroy()` |
-| Chromium 型の Job limit read/modify/write で `KILL_ON_JOB_CLOSE` が消える | `dlls/kernel32/tests/process.c` の `test_KillOnJobClose()`。Extended/Basic query、read/OR/write、Job close後の子プロセス終了を検査する |
+| completion の結果と供給元 | `completion-provenance` |
+| generation、scene、公開の順序 | `generation-membership`、`publish-transaction`、`live-prepare` |
+| native backing と通知の寿命 | `native-backing-barrier`、`notification-filter` |
+| 非表示中の present と resize | `hidden-present-resize`、`grow64-completion`、`paced-completion` |
+| 別プロセスの pixel format と終了 | `cross-process-pixel-format`、`owner-exit-destroy` |
 
-`WINETEST_CLIENT_SURFACE_CASE` には各テスト名に対応する focused case を指定できます。実アプリ由来の主要境界は `completion-provenance`、`generation-membership`、`publish-transaction`、`live-prepare`、`native-backing-barrier`、`notification-filter`、`hidden-present-resize`、`grow64-completion`、`paced-completion`、`cross-process-pixel-format`、`owner-exit-destroy` です。`WINETEST_PROCESS_CASE=job-limit-roundtrip` は Chromium と同じ Job query/read-modify-write/close だけを実行します。これらの入口は全suiteと同じテスト関数を呼ぶため、focused run と通常回帰の内容が分岐しません。
+`WINETEST_PROCESS_CASE=job-limit-roundtrip` は `dlls/kernel32/tests/process.c` の Job limit query、read-modify-write、Job close 後の子プロセス終了を検査します。画面の表示品質は、使用する X server・GPU ドライバで固定 RGB8 画像と実アプリの操作を照合します。
 
-completion provenance と cross-process pixel format は、意図的に修正を戻した境界で focused test が失敗することも確認しています。notification filter は修正前 wineserver で失敗し、Job round-trip は修正前 runtime で query flags 0・子process残留を検出しています。GL front buffer や server state の検査だけでは X11 compositor 上の黒・白・glitch を証明できないため、最終的な画面回帰は上記の固定 RGB8 Electron テストで別に判定します。実 Steam は操作経路とproduction固有のcross-process構成を確認しますが、network内容や更新に依存する画面を唯一の正解画像にはしません。
-
-ただし、このブランチは実験段階です。固定容量の共有領域が枯渇するケース、未検証のアプリケーション固有の同期パターン、および通常とは異なるプロセス終了経路については、追加検証が必要です。性能もワークロードに依存するため、ntsync や通常の wineserver 経路に常に優越するとは限りません。
-
-`d3dkmt` のテストには、Xvfb と llvmpipe の組み合わせで不足する OpenGL 拡張や、RADV が返す timeline semaphore 上限など、実行環境に依存する失敗があります。該当テスト本体は upstream と同一であり、これらを本ブランチの回帰とは扱っていません。ウィンドウおよび Vulkan の変更を評価する際は、使用する X server と GPU ドライバの能力を分けて確認する必要があります。
-
-このブランチの実装と本書は AI（gpt-5.6-sol、medium）により生成・整理された実験成果であり、利用時には対象環境での再検証を前提とします。
+client_surface の設計・採用条件は [Issue #4](https://github.com/skmdx/wine-lfsync/issues/4)、未完了課題は [Issues](https://github.com/skmdx/wine-lfsync/issues) に集約しています。検証結果には対象コミット、環境、実行条件を記録します。性能の比較条件は [Issue #22](https://github.com/skmdx/wine-lfsync/issues/22) を参照してください。
