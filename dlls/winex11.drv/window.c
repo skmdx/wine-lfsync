@@ -230,13 +230,20 @@ static int native_window_read_error( Display *display, XErrorEvent *event, void 
 {
     struct x11drv_native_window_read *read = arg;
 
-    if (display == gdi_display && read->copy_serial && event->serial == read->copy_serial)
+    return (display == read->window->display && x11drv_stream_barrier_error( &read->geometry, event )) ||
+           (display == gdi_display && x11drv_stream_barrier_error( &read->drawing, event ));
+}
+
+static int native_window_copy_error( Display *display, XErrorEvent *event, void *arg )
+{
+    struct x11drv_native_window_read *read = arg;
+
+    if (read->copy_serial && event->serial == read->copy_serial)
     {
         read->copy_error = event->error_code;
         return 1;
     }
-    return (display == read->window->display && x11drv_stream_barrier_error( &read->geometry, event )) ||
-           (display == gdi_display && x11drv_stream_barrier_error( &read->drawing, event ));
+    return x11drv_stream_barrier_error( &read->copy, event );
 }
 
 Window x11drv_native_window_read_init( struct x11drv_native_window_read *read,
@@ -260,7 +267,7 @@ BOOL x11drv_native_window_read_ready( struct x11drv_native_window_read *read )
 {
     struct x11drv_native_window *window = read->window;
 
-    /* Geometry must reach the server before a read in the GDI stream.
+    /* Geometry must reach the server before a private query or copy.
      * Later scene changes still invalidate adoption of the owned result. */
     if (!read->geometry.complete)
     {
@@ -270,22 +277,38 @@ BOOL x11drv_native_window_read_ready( struct x11drv_native_window_read *read )
     return TRUE;
 }
 
-Display *x11drv_native_window_read_begin( struct x11drv_native_window_read *read )
+BOOL x11drv_native_window_copy_ready( struct x11drv_native_window_read *read )
 {
-    assert( read->geometry.complete && !read->copy_serial );
-    /* XCB (including Vulkan WSI) also uses this Display. XNextRequest takes
-     * back the socket and refreshes Xlib's cached sequence before the copy.
-     * The immutable GC and following marker use the same locked stream. */
-    XLockDisplay( gdi_display );
-    read->copy_serial = XNextRequest( gdi_display );
-    return gdi_display;
+    if (!x11drv_native_window_read_ready( read )) return FALSE;
+    /* Pixel copies also depend on prior GDI commands. Geometry-only users
+     * must not acquire a drawing obligation they cannot retire. */
+    if (!read->drawing.complete)
+    {
+        if (!read->drawing.serial) x11drv_queue_stream_barrier( gdi_display, &read->drawing );
+        if (!x11drv_poll_stream_barrier( gdi_display, &read->drawing, NULL )) return FALSE;
+    }
+    return TRUE;
+}
+
+void x11drv_native_window_read_begin( struct x11drv_native_window_read *read, Display *display )
+{
+    assert( read->geometry.complete && read->drawing.complete && !read->copy_serial );
+    assert( display != gdi_display && display != read->window->display );
+    read->display = display;
+    read->copy_errors = (struct x11drv_error_handler){ .display = display,
+                                                     .callback = native_window_copy_error, .arg = read };
+    X11DRV_register_error_handler( &read->copy_errors );
+    /* The checked copy and its receipt use only the worker's connection.
+     * A stopped native copy must not hold the shared GDI Display lock. */
+    XLockDisplay( display );
+    read->copy_serial = XNextRequest( display );
 }
 
 void x11drv_native_window_read_end( struct x11drv_native_window_read *read )
 {
-    assert( XNextRequest( gdi_display ) == read->copy_serial + 1 );
-    x11drv_queue_stream_barrier( gdi_display, &read->drawing );
-    XUnlockDisplay( gdi_display );
+    assert( XNextRequest( read->display ) == read->copy_serial + 1 );
+    x11drv_queue_stream_barrier( read->display, &read->copy );
+    XUnlockDisplay( read->display );
 }
 
 static Bool native_window_copy_event( Display *display, XEvent *event, char *arg )
@@ -311,12 +334,12 @@ BOOL x11drv_native_window_read_complete( struct x11drv_native_window_read *read,
 {
     XEvent event;
 
-    if (!read->drawing.complete && !x11drv_poll_stream_barrier( gdi_display, &read->drawing, NULL )) return FALSE;
-    XLockDisplay( gdi_display );
+    if (!read->copy.complete && !x11drv_poll_stream_barrier( read->display, &read->copy, NULL )) return FALSE;
+    XLockDisplay( read->display );
     /* A checked request can still leave unavailable Window pixels uncopied.
-     * The later drawing barrier also brings its exposure events into Xlib;
-     * consume only this copy's receipt, leaving other GDI exposures alone. */
-    while (XCheckIfEvent( gdi_display, &event, native_window_copy_event, (char *)read )) {}
+     * The private barrier also brings its exposure events into Xlib;
+     * consume only this copy's receipt, leaving other copies' events alone. */
+    while (XCheckIfEvent( read->display, &event, native_window_copy_event, (char *)read )) {}
     *success = !read->copy_error && read->copy_complete && !read->copy_exposed;
     if (TRACE_ON(csperf))
     {
@@ -327,14 +350,16 @@ BOOL x11drv_native_window_read_complete( struct x11drv_native_window_read *read,
                        (unsigned long long)ticks.QuadPart, read->window->window, read->copy_serial,
                        read->copy_complete, read->copy_exposed, read->copy_error, *success );
     }
-    XUnlockDisplay( gdi_display );
+    XUnlockDisplay( read->display );
     return TRUE;
 }
 
 void x11drv_native_window_read_finish( struct x11drv_native_window_read *read )
 {
     assert( (!read->geometry.serial || read->geometry.complete) &&
-            (!read->drawing.serial || read->drawing.complete) );
+            (!read->drawing.serial || read->drawing.complete) &&
+            (!read->copy.serial || read->copy.complete) );
+    if (read->display) X11DRV_unregister_error_handler( &read->copy_errors );
     x11drv_display_owner_unregister_error_handler( read->window->creator, &read->errors );
     x11drv_native_window_release( read->window );
     read->window = NULL;

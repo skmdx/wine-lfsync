@@ -337,7 +337,7 @@ static void copy_cache_image( struct client_surface_cache_image *image )
     if (read && read->copy_serial) goto receipt;
     worker->error = 0;
     /* The Window input uses an immutable GC owned by this image's private
-     * connection. Check its creation before using its XID on the GDI stream;
+     * connection. Check its creation before admitting the copy;
      * private transforms may continue to change the separate drawing GC. */
     if (read)
     {
@@ -348,7 +348,7 @@ static void copy_cache_image( struct client_surface_cache_image *image )
             goto done;
         }
         gc = image->window_gc;
-        display = x11drv_native_window_read_begin( read );
+        x11drv_native_window_read_begin( read, display );
     }
     else
     {
@@ -371,7 +371,6 @@ static void copy_cache_image( struct client_surface_cache_image *image )
 receipt:
     if (read)
     {
-        display = gdi_display;
         image->waiting = !x11drv_native_window_read_complete( read, &image->success );
         if (image->waiting) return;
     }
@@ -381,7 +380,7 @@ done:
                    image->purpose == CLIENT_SURFACE_MEMORY_OUTPUT ? "output_pair_native_copy" : "cache_native_fallback",
                    image, image->source, image->pixmap, display, image->copy_width,
                    image->copy_height, read ? read->copy_error : worker->error, !read,
-                   read ? read->drawing.serial : 0, read ? read->copy_serial : 0, image->success );
+                   read ? read->copy.serial : 0, read ? read->copy_serial : 0, image->success );
 }
 
 static void transform_cache_image( struct client_surface_cache_image *image )
@@ -515,7 +514,7 @@ static void execute_cache_image( struct client_surface_native_work *work )
         else create_output_image( image );
         break;
     case CACHE_COPY:
-        image->waiting = image->read && !x11drv_native_window_read_ready( image->read );
+        image->waiting = image->read && !x11drv_native_window_copy_ready( image->read );
         if (image->waiting) break;
         copy_cache_image( image );
         if (image->read && !image->waiting)

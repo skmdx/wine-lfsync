@@ -933,8 +933,9 @@ struct x11drv_error_handler
 struct x11drv_native_window_read
 {
     struct x11drv_native_window *window;
-    struct x11drv_error_handler errors;
-    struct x11drv_stream_barrier geometry, drawing;
+    struct x11drv_error_handler errors, copy_errors;
+    struct x11drv_stream_barrier geometry, drawing, copy;
+    Display *display;
     unsigned long copy_serial;
     int copy_error;
     BOOL copy_complete, copy_exposed;
@@ -943,7 +944,8 @@ extern Window x11drv_native_window_read_init( struct x11drv_native_window_read *
                                               struct x11drv_native_window *window );
 extern Window x11drv_native_window_read_drawable( const struct x11drv_native_window_read *read );
 extern BOOL x11drv_native_window_read_ready( struct x11drv_native_window_read *read );
-extern Display *x11drv_native_window_read_begin( struct x11drv_native_window_read *read );
+extern BOOL x11drv_native_window_copy_ready( struct x11drv_native_window_read *read );
+extern void x11drv_native_window_read_begin( struct x11drv_native_window_read *read, Display *display );
 extern void x11drv_native_window_read_end( struct x11drv_native_window_read *read );
 extern BOOL x11drv_native_window_read_complete( struct x11drv_native_window_read *read, BOOL *success );
 extern void x11drv_native_window_read_finish( struct x11drv_native_window_read *read );
