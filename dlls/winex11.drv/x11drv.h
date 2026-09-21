@@ -126,7 +126,7 @@ typedef struct
     Drawable      drawable;
     struct x11drv_native_window *native_window; /* owned lifetime of a local Window drawable */
     RECT          dc_rect;       /* DC rectangle relative to drawable */
-    UINT          readback_scale_num, readback_scale_den; /* virtual DC to native pixels */
+    UINT          drawable_scale_num, drawable_scale_den; /* virtual DC to native pixels */
     RECT         *bounds;        /* Graphics bounds */
     HRGN          region;        /* Device region (visible region & clip region) */
     X_PHYSPEN     pen;
@@ -386,7 +386,7 @@ struct x11drv_escape_set_drawable
     struct x11drv_native_window *native_window; /* borrowed for this escape; the DC acquires its own reference */
     int                      mode;         /* ClipByChildren or IncludeInferiors */
     RECT                     dc_rect;      /* DC rectangle relative to drawable */
-    UINT                     readback_scale_num, readback_scale_den;
+    UINT                     drawable_scale_num, drawable_scale_den;
     XVisualInfo              visual;       /* X visual used by drawable, may be unspecified if no change is needed */
 };
 
@@ -1113,6 +1113,17 @@ static inline BOOL is_window_rect_mapped( const RECT *rect )
 }
 
 /* GDI helpers */
+
+/* Scale absolute drawable coordinates, including the virtual DC origin.
+ * Scaling the origin and a DC-relative offset separately changes rounding.
+ * Public LPtoDP and device bounds continue to use virtual DC coordinates. */
+static inline int x11drv_scale_coord( const X11DRV_PDEVICE *physdev, int value )
+{
+    LONGLONG scaled = (LONGLONG)value * physdev->drawable_scale_num;
+    UINT den = physdev->drawable_scale_den;
+
+    return (scaled + (scaled < 0 ? -(LONGLONG)(den / 2) : den / 2)) / den;
+}
 
 static inline BOOL lp_to_dp( HDC hdc, POINT *points, INT count )
 {

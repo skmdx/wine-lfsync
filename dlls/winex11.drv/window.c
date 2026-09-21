@@ -3790,8 +3790,8 @@ void X11DRV_GetDC( HDC hdc, HWND hwnd, HWND top, const RECT *win_rect,
     escape.code = X11DRV_SET_DRAWABLE;
     escape.mode = IncludeInferiors;
     escape.drawable = 0;
-    escape.readback_scale_num = scale_num;
-    escape.readback_scale_den = scale_den;
+    escape.drawable_scale_num = scale_num;
+    escape.drawable_scale_den = scale_den;
 
     escape.dc_rect.left         = win_rect->left - top_rect->left;
     escape.dc_rect.top          = win_rect->top - top_rect->top;
@@ -3833,7 +3833,7 @@ void X11DRV_ReleaseDC( HWND hwnd, PHYSDEV physdev )
     escape.code = X11DRV_SET_DRAWABLE;
     escape.drawable = root_window;
     escape.mode = IncludeInferiors;
-    escape.readback_scale_num = escape.readback_scale_den = 1;
+    escape.drawable_scale_num = escape.drawable_scale_den = 1;
     escape.dc_rect = NtUserGetVirtualScreenRect( MDT_DEFAULT );
     OffsetRect( &escape.dc_rect, -2 * escape.dc_rect.left, -2 * escape.dc_rect.top );
     physdev->funcs->pExtEscape( physdev, X11DRV_ESCAPE, sizeof(escape), (LPSTR)&escape, 0, NULL );

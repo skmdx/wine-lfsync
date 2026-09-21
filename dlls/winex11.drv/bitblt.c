@@ -818,7 +818,7 @@ BOOL X11DRV_StretchBlt( PHYSDEV dst_dev, struct bitblt_coords *dst,
     GC gc;
 
     if (src_dev->funcs != dst_dev->funcs ||
-        physDevSrc->readback_scale_num != physDevSrc->readback_scale_den ||
+        physDevSrc->drawable_scale_num != physDevSrc->drawable_scale_den ||
         src->width != dst->width || src->height != dst->height ||  /* no stretching with core X11 */
         (physDevDst->depth == 1 && physDevSrc->depth != 1) ||  /* color -> mono done by hand */
         (X11DRV_PALETTE_XPixelToPalette && physDevSrc->depth != 1))  /* needs palette mapping */
@@ -1332,17 +1332,9 @@ static XImage *get_dc_image( X11DRV_PDEVICE *physdev, int x, int y, UINT width, 
     return image;
 }
 
-static int scale_readback_coord( X11DRV_PDEVICE *physdev, int value )
-{
-    LONGLONG scaled = (LONGLONG)value * physdev->readback_scale_num;
-    UINT den = physdev->readback_scale_den;
-
-    return (scaled + (scaled < 0 ? -(LONGLONG)(den / 2) : den / 2)) / den;
-}
-
 static int scale_readback_sample( X11DRV_PDEVICE *physdev, int value, int start, int end, int last )
 {
-    int sample = scale_readback_coord( physdev, value );
+    int sample = x11drv_scale_coord( physdev, value );
 
     /* Rounding the last logical pixel can reach the exclusive native edge
      * (e.g. 258 at 3/4 scale in a 259-pixel DC). Only extend that DC's last
@@ -1357,10 +1349,10 @@ static XImage *get_scaled_dc_image( X11DRV_PDEVICE *physdev, const XVisualInfo *
 {
     XImage *native, *image;
     const RECT *dc = &physdev->dc_rect;
-    int last_x = max( scale_readback_coord( physdev, dc->left ) + 1,
-                      scale_readback_coord( physdev, dc->right )) - 1;
-    int last_y = max( scale_readback_coord( physdev, dc->top ) + 1,
-                      scale_readback_coord( physdev, dc->bottom )) - 1;
+    int last_x = max( x11drv_scale_coord( physdev, dc->left ) + 1,
+                      x11drv_scale_coord( physdev, dc->right )) - 1;
+    int last_y = max( x11drv_scale_coord( physdev, dc->top ) + 1,
+                      x11drv_scale_coord( physdev, dc->bottom )) - 1;
     int left = scale_readback_sample( physdev, x, dc->left, dc->right, last_x );
     int top = scale_readback_sample( physdev, y, dc->top, dc->bottom, last_y );
     int right = scale_readback_sample( physdev, x + width - 1, dc->left, dc->right, last_x ) + 1;
@@ -1374,7 +1366,7 @@ static XImage *get_scaled_dc_image( X11DRV_PDEVICE *physdev, const XVisualInfo *
      * already been applied before this driver receives the source rectangle. */
     TRACE( "drawable %lx virtual %d,%d %ux%u native %d,%d %dx%d scale %u/%u\n",
            physdev->drawable, x, y, width, height, left, top, right - left, bottom - top,
-           physdev->readback_scale_num, physdev->readback_scale_den );
+           physdev->drawable_scale_num, physdev->drawable_scale_den );
     if (!(native = get_dc_image( physdev, left, top, right - left, bottom - top ))) return NULL;
     image = XCreateImage( gdi_display, vis->visual, vis->depth, ZPixmap, 0, NULL, width, height, 32, 0 );
     if (!image) goto done;
@@ -1457,7 +1449,7 @@ DWORD X11DRV_GetImage( PHYSDEV dev, BITMAPINFO *info,
     src->y -= y;
     OffsetRect( &src->visrect, -x, -y );
 
-    if (physdev->readback_scale_num != physdev->readback_scale_den)
+    if (physdev->drawable_scale_num != physdev->drawable_scale_den)
         image = get_scaled_dc_image( physdev, &vis, physdev->dc_rect.left + x,
                                       physdev->dc_rect.top + y, width, height );
     else image = get_dc_image( physdev, physdev->dc_rect.left + x, physdev->dc_rect.top + y, width, height );
