@@ -311,6 +311,18 @@ static BOOL prepare_window_copy_gc( struct client_surface_cache_image *image )
      * from the exposure-free transfer GC used by normal XCB cache copies. */
     XSync( worker->display, False );
     image->window_gc_ready = image->window_gc && !worker->error;
+    if (!image->window_gc_ready && image->window_gc)
+    {
+        int error = worker->error;
+
+        /* XCreateGC can return an Xlib object for a rejected server request.
+         * A surviving spare must not validate that stale object on its next
+         * read merely because this worker's error has since been cleared. */
+        XFreeGC( worker->display, image->window_gc );
+        image->window_gc = NULL;
+        XSync( worker->display, False );
+        worker->error = error;
+    }
     return image->window_gc_ready;
 }
 
