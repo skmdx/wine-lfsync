@@ -196,9 +196,7 @@ struct client_surface_compositor_frame
     struct client_surface_compositor_job *waiter;
     Pixmap pixmap;
     struct client_surface_cache_image *image; /* borrowed from the installed pair/mailbox */
-#ifdef SONAME_LIBXPRESENT
     struct rb_entry pixmap_entry;
-#endif
     GC gc;
     UINT64 revision;
     uint32_t serial;
@@ -312,7 +310,6 @@ struct client_surface_output_transform
     XRectangle clips[];
 };
 
-#ifdef SONAME_LIBXPRESENT
 static int compare_client_surface_compositor_pixmap( const void *key, const struct rb_entry *entry )
 {
     const struct client_surface_compositor_frame *frame =
@@ -323,24 +320,19 @@ static int compare_client_surface_compositor_pixmap( const void *key, const stru
 }
 
 static struct rb_tree client_surface_compositor_pixmaps = {compare_client_surface_compositor_pixmap};
-#endif
 
 static void set_client_surface_compositor_pixmap( struct client_surface_compositor_frame *frame, Pixmap pixmap,
                                                  struct client_surface_cache_image *image )
 {
-#ifdef SONAME_LIBXPRESENT
     assert( !frame->reply_target && !frame->serial );
     if (frame->pixmap) rb_remove( &client_surface_compositor_pixmaps, &frame->pixmap_entry );
-#endif
     frame->pixmap = pixmap;
     frame->image = image;
-#ifdef SONAME_LIBXPRESENT
     if (pixmap)
     {
         assert( !rb_get( &client_surface_compositor_pixmaps, &pixmap ) );
         rb_put( &client_surface_compositor_pixmaps, &pixmap, &frame->pixmap_entry );
     }
-#endif
 }
 
 /* Read leases are admitted only on the actor, after checking outstanding
@@ -852,10 +844,10 @@ static void note_client_surface_compositor_snapshot(
 
 #ifdef SONAME_LIBXPRESENT
 
-static uint32_t client_surface_present_serial;
 static int client_surface_present_opcode;
 
 #endif
+static uint32_t client_surface_present_serial;
 
 static struct client_surface_compositor_target *find_client_surface_compositor_target( HWND toplevel );
 static BOOL publish_client_surface_handoff_generation( HWND toplevel, UINT64 generation,
@@ -871,11 +863,9 @@ static void wake_client_surface_compositor_queues(void)
      * list in constant time; dispatch still inspects at most 64 queue heads. */
     list_move_tail( &client_surface_compositor_ready, &client_surface_compositor_parked );
 }
-#ifdef SONAME_LIBXPRESENT
 static BOOL wait_client_surface_compositor_pixmap_idle( Pixmap pixmap );
 static void flush_client_surface_compositor_mailbox(
     struct client_surface_compositor_target *target );
-#endif
 
 static int client_surface_compositor_error( Display *display, XErrorEvent *event, void *arg )
 {
@@ -944,9 +934,7 @@ static BOOL client_surface_copy_on_compositor( Drawable source, Drawable destina
                                                int destination_x, int destination_y,
                                                unsigned int width, unsigned int height )
 {
-#ifdef SONAME_LIBXPRESENT
-    if (usexpresent && !wait_client_surface_compositor_pixmap_idle( destination )) return FALSE;
-#endif
+    if (!wait_client_surface_compositor_pixmap_idle( destination )) return FALSE;
     return client_surface_copy_on_compositor_unchecked(
         source, destination, source_x, source_y, destination_x, destination_y, width, height );
 }
@@ -1505,6 +1493,7 @@ static struct client_surface_compositor_frame *find_client_surface_compositor_fr
     return NULL;
 }
 
+#endif
 static void finish_client_surface_compositor_frame(
     struct client_surface_compositor_target *target,
     struct client_surface_compositor_frame *frame )
@@ -1558,6 +1547,7 @@ static void process_client_surface_present_events(void)
     while (budget-- && XPending( display ))
     {
         XEvent event;
+#ifdef SONAME_LIBXPRESENT
         struct client_surface_compositor_target *target = NULL;
         struct client_surface_compositor_frame *frame = NULL;
 
@@ -1605,6 +1595,9 @@ static void process_client_surface_present_events(void)
             finish_client_surface_compositor_frame( target, frame );
             wake_client_surface_compositor_queues();
         }
+#else
+        XNextEvent( display, &event );
+#endif
     }
 }
 
@@ -1687,12 +1680,13 @@ static BOOL submit_client_surface_present( struct client_surface_compositor_targ
     BOOL copy;
     uint32_t serial;
 
-    if (!usexpresent || !target->present_event || !target->window_owner || frame->serial) return FALSE;
+    if (!target->window_owner || frame->serial) return FALSE;
     /* STAGED publication cannot depend on exposure's frame callback. Both
      * its copy and visible Present use the same per-Window native FIFO. */
-    copy = publish_generation && client_surface_get_toplevel_scene( target->toplevel, &scene ) &&
+    copy = !usexpresent || !target->present_event ||
+           (publish_generation && client_surface_get_toplevel_scene( target->toplevel, &scene ) &&
            scene.toplevel == target->toplevel && scene.epoch == publish_epoch &&
-           scene.generation == publish_generation && scene.mode == CLIENT_SURFACE_PRESENTATION_STAGED;
+           scene.generation == publish_generation && scene.mode == CLIENT_SURFACE_PRESENTATION_STAGED);
     if (copy_rect) copy = TRUE;
     if (!(serial = ++client_surface_present_serial)) serial = ++client_surface_present_serial;
     frame->serial = serial;
@@ -1724,7 +1718,6 @@ static void flush_client_surface_compositor_mailbox(
     struct client_surface_compositor_target *target )
 {
     struct client_surface_compositor_frame *frame;
-    BOOL copied;
 
     if (target->quiescing || target->copy_frame || !target->mailbox_pending ||
         count_client_surface_compositor_frames( target ) >= CLIENT_SURFACE_COMPOSITOR_MAX_INFLIGHT)
@@ -1740,39 +1733,18 @@ static void flush_client_surface_compositor_mailbox(
         return;
     }
 
-    /* A mailbox slot is reserved from generic copies and publications.  If
-     * Present cannot consume it, publish it synchronously rather than leaving
-     * the reservation behind with no X event capable of retrying it. */
-    copied = client_surface_copy_on_compositor( frame->pixmap, target->window,
-                                                0, 0, 0, 0,
-                                                target->width, target->height );
-    if (copied)
-    {
-        target->published = frame->pixmap;
-        target->published_width = frame->width;
-        target->published_height = frame->height;
-    }
+    /* Admission failure cannot bypass an executing request with an actor
+     * copy. Release this reservation and let the normal repair path retry. */
     if (target->mailbox_publish_generation)
         publish_client_surface_handoff_generation( target->toplevel,
-            target->mailbox_publish_generation, target->mailbox_publish_epoch, copied );
+            target->mailbox_publish_generation, target->mailbox_publish_epoch, FALSE );
+    NtUserPostMessage( target->toplevel, WM_WINE_UPDATEWINDOWSTATE,
+                       WINE_UPDATE_CLIENT_SURFACE_HANDOFFS, 0 );
     target->mailbox_pending = FALSE;
     target->mailbox_publish_generation = 0;
     target->mailbox_publish_epoch = 0;
 }
 
-#else
-
-static void process_client_surface_present_events(void)
-{
-    Display *display = client_surface_compositor_display;
-    unsigned int budget = 128;
-    XEvent event;
-
-    if (!display) return;
-    while (budget-- && XPending( display )) XNextEvent( display, &event );
-}
-
-#endif
 
 static void release_client_surface_compositor_mailbox( struct client_surface_compositor_mailbox *mailbox )
 {
@@ -2049,12 +2021,11 @@ static struct client_surface_compositor_target *find_client_surface_compositor_t
 
 static BOOL client_surface_present_on_compositor( struct client_surface_compositor_job *job )
 {
-#ifdef SONAME_LIBXPRESENT
     struct client_surface_compositor_target *target =
         find_client_surface_compositor_target( job->toplevel );
     struct client_surface_compositor_frame *frame;
 
-    if (!usexpresent || !target || target->window != job->u.present.destination ||
+    if (!target || target->window != job->u.present.destination ||
         !(frame = acquire_client_surface_compositor_frame( target, job->u.present.source )))
         return FALSE;
     frame->width = job->u.present.width;
@@ -2069,9 +2040,6 @@ static BOOL client_surface_present_on_compositor( struct client_surface_composit
     job->u.present.started = TRUE;
     job->u.present.start = NtGetTickCount();
     return TRUE;
-#else
-    return FALSE;
-#endif
 }
 
 static void release_client_surface_compositor_binding_server(
@@ -2285,13 +2253,10 @@ done:
 static void update_client_surface_compositor_scene(
     struct client_surface_compositor_target *target, UINT64 scene_epoch )
 {
-#ifdef SONAME_LIBXPRESENT
     unsigned int i;
-#endif
 
     if (target->scene.epoch == scene_epoch) return;
     finish_client_surface_compositor_assembly( target, TRUE );
-#ifdef SONAME_LIBXPRESENT
     for (i = 0; i < ARRAY_SIZE(target->frames); ++i)
     {
         struct client_surface_compositor_frame *frame = &target->frames[i];
@@ -2310,7 +2275,6 @@ static void update_client_surface_compositor_scene(
         target->mailbox_publish_generation = 0;
         target->mailbox_publish_epoch = 0;
     }
-#endif
     target->scene.epoch = scene_epoch;
 }
 
@@ -2558,12 +2522,9 @@ static BOOL sweep_client_surface_compositor_handoffs( HWND toplevel, UINT64 mark
 static void drain_client_surface_compositor_target(
     struct client_surface_compositor_target *target )
 {
-#ifdef SONAME_LIBXPRESENT
     unsigned int i;
-#endif
 
     assert( !target->copy_frame );
-#ifdef SONAME_LIBXPRESENT
 
     /* The scheduler reaches this boundary only after Complete and Idle.
      * A timeout must never manufacture permission to reuse a pixmap. */
@@ -2574,9 +2535,6 @@ static void drain_client_surface_compositor_target(
     target->mailbox_pending = FALSE;
     target->mailbox_publish_generation = 0;
     target->mailbox_publish_epoch = 0;
-#else
-    (void)target;
-#endif
 }
 
 static void free_client_surface_compositor_present_input( struct client_surface_compositor_target *target )
@@ -3420,8 +3378,6 @@ static BOOL restore_client_surface_compositor_pixels( struct client_surface_comp
         target->published_height < target->window_height) return FALSE;
     TRACE( "restoring target %p window %#lx from published pixmap %#lx rect %s\n",
            target->toplevel, target->window, target->published, wine_dbgstr_rect( &rect ) );
-#ifdef SONAME_LIBXPRESENT
-    if (usexpresent)
     {
         unsigned int i;
 
@@ -3432,10 +3388,6 @@ static BOOL restore_client_surface_compositor_pixels( struct client_surface_comp
                 return submit_client_surface_present( target, &target->frames[i], 0, 0, &rect, NULL );
         return FALSE;
     }
-#endif
-    return client_surface_copy_on_compositor( target->published, target->window,
-                                              rect.left, rect.top, rect.left, rect.top,
-                                              rect.right - rect.left, rect.bottom - rect.top );
 }
 
 static BOOL process_client_surface_compositor_restore( struct client_surface_compositor_target *target )
@@ -4192,28 +4144,16 @@ static BOOL publish_client_surface_handoff_assembly(
     if (!complete_client_surface_handoff_generation( target, generation, epoch ))
         goto done;
 
-#ifdef SONAME_LIBXPRESENT
-    if (usexpresent && !target->mailbox_pending &&
+    if (!target->mailbox_pending &&
         count_client_surface_compositor_frames( target ) < CLIENT_SURFACE_COMPOSITOR_MAX_INFLIGHT)
         visible = queued = submit_client_surface_present( target, frame, generation, epoch, NULL, NULL );
-    else if (usexpresent)
+    else
     {
         target->mailbox_frame = frame - target->frames;
         target->mailbox_pending = TRUE;
         target->mailbox_publish_generation = generation;
         target->mailbox_publish_epoch = epoch;
         visible = deferred = TRUE;
-    }
-#endif
-    if (!visible)
-        visible = client_surface_copy_on_compositor( frame->pixmap, target->window,
-                                                     0, 0, 0, 0,
-                                                     target->width, target->height );
-    if (visible && !queued && !deferred)
-    {
-        target->published = frame->pixmap;
-        target->published_width = frame->width;
-        target->published_height = frame->height;
     }
     if (!queued && !deferred)
         publish_client_surface_handoff_generation( target->toplevel, generation, epoch, visible );
@@ -4365,11 +4305,10 @@ static BOOL publish_client_surface_handoff_frame(
 {
     BOOL composed = FALSE;
 
-#ifdef SONAME_LIBXPRESENT
-    if (usexpresent && !target->mailbox_pending &&
+    if (!target->mailbox_pending &&
         count_client_surface_compositor_frames( target ) < CLIENT_SURFACE_COMPOSITOR_MAX_INFLIGHT)
         composed = submit_client_surface_present( target, frame, 0, 0, NULL, NULL );
-    else if (usexpresent)
+    else
     {
         target->mailbox_frame = frame - target->frames;
         target->mailbox_pending = TRUE;
@@ -4379,16 +4318,6 @@ static BOOL publish_client_surface_handoff_frame(
             target->mailbox_publish_epoch = 0;
         }
         composed = TRUE;
-    }
-#endif
-    if (!composed)
-        composed = client_surface_copy_on_compositor( frame->pixmap, target->window,
-                                                      0, 0, 0, 0, target->width, target->height );
-    if (composed && !frame->serial && !target->mailbox_pending)
-    {
-        target->published = frame->pixmap;
-        target->published_width = frame->width;
-        target->published_height = frame->height;
     }
     return composed;
 }
@@ -4803,17 +4732,15 @@ static BOOL compose_client_surface_cached_frame( struct client_surface_composito
             (target->assembly_generation != plan.generation ||
              target->assembly_epoch != plan.epoch))
             finish_client_surface_compositor_assembly( target, TRUE );
-#ifdef SONAME_LIBXPRESENT
         /* A single steady layer can retain newer complete images in its
          * owner cache until a native output can be submitted. Rewriting the
          * mailbox while both Present credits are owned only replaces work
          * that cannot become visible. Keep source_sequence at the last copy;
          * a skipped damage base then takes the existing full-image recovery.
          * Transactions and multi-layer replay keep their assembly ordering. */
-        if (!plan.generation && target->scene.count == 1 && usexpresent && target->present_event &&
+        if (!plan.generation && target->scene.count == 1 &&
             count_client_surface_compositor_frames( target ) >= CLIENT_SURFACE_COMPOSITOR_MAX_INFLIGHT)
             goto retry;
-#endif
         if (!plan.generation || previous_publish)
             frame = get_client_surface_compositor_frame( target, !plan.steady );
         else if (target->assembly_pending &&
@@ -4994,12 +4921,10 @@ static BOOL coalesce_client_surface_handoffs( struct client_surface_compositor_b
     }
     if (*consumed != previous) client_surface_handoff_wake_release( binding->pool->shared );
     if (produced - *consumed != 1) return FALSE;
-#ifdef SONAME_LIBXPRESENT
     /* Native Complete/Idle or a new READY wakes the actor. Preserve the hint
      * across its armed rescan without reporting a parked image as progress.
      * A newer READY may replace this one; the final image waits for credit. */
-    if (usexpresent && target->present_event &&
-        count_client_surface_compositor_frames( target ) >= CLIENT_SURFACE_COMPOSITOR_MAX_INFLIGHT)
+    if (count_client_surface_compositor_frames( target ) >= CLIENT_SURFACE_COMPOSITOR_MAX_INFLIGHT)
     {
         TRACE_(csperf)( "ticks=%llu event=cache_defer identity=%s cookie=%s token=%s sequence=%s scene=%s\n",
                        client_surface_perf_time(), wine_dbgstr_longlong( binding->identity ),
@@ -5007,7 +4932,6 @@ static BOOL coalesce_client_surface_handoffs( struct client_surface_compositor_b
                        wine_dbgstr_longlong( newest->source_sequence ), wine_dbgstr_longlong( scene.epoch ) );
         return TRUE;
     }
-#endif
     return FALSE;
 }
 
@@ -5270,7 +5194,6 @@ static BOOL client_surface_compositor_update_ready( struct client_surface_compos
     unsigned int i;
 
     if (target->copy_frame || target->native_updates) return FALSE;
-#ifdef SONAME_LIBXPRESENT
     /* A state notification can also follow a topology change. Do not wait
      * for unissued output from the server's invalidated scene before
      * allowing the GUI to adopt its replacement. Executing requests retain
@@ -5281,7 +5204,6 @@ static BOOL client_surface_compositor_update_ready( struct client_surface_compos
         client_surface_cancel_native_presents( &target->native_presents );
         process_client_surface_native_present( target );
     }
-#endif
     for (i = 0; i < ARRAY_SIZE(target->frames); ++i)
         if (target->frames[i].serial) return FALSE;
     if (!until)
@@ -5596,7 +5518,6 @@ static BOOL client_surface_compositor_job_ready( struct client_surface_composito
         else
             quiesce_client_surface_compositor_target( target );
     }
-#ifdef SONAME_LIBXPRESENT
     /* An invalidating update discards the old scene, including output that
      * has not started native execution. State-only refreshes keep it. */
     if (job->op == CLIENT_SURFACE_COMPOSITOR_REMOVE_TARGET ||
@@ -5605,7 +5526,6 @@ static BOOL client_surface_compositor_job_ready( struct client_surface_composito
         client_surface_cancel_native_presents( &target->native_presents );
         process_client_surface_native_present( target );
     }
-#endif
     for (i = 0; i < ARRAY_SIZE(target->frames); ++i)
     {
         struct client_surface_compositor_frame *frame = &target->frames[i];
@@ -5970,14 +5890,10 @@ static BOOL process_client_surface_compositor_targets( struct client_surface_com
                 progressed |= target->update_notified;
             }
         }
-#ifdef SONAME_LIBXPRESENT
         progressed |= process_client_surface_native_present( target );
-#endif
         progressed |= process_client_surface_compositor_restore( target );
         progressed |= replay_client_surface_scene_sources( target, &budget );
-#ifdef SONAME_LIBXPRESENT
         flush_client_surface_compositor_mailbox( target );
-#endif
         now = NtGetTickCount();
         if (target->shrink_start && !target->native_updates && !target->assembly_pending)
         {
