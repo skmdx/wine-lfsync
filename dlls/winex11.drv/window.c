@@ -318,9 +318,15 @@ BOOL x11drv_native_window_read_complete( struct x11drv_native_window_read *read,
      * consume only this copy's receipt, leaving other GDI exposures alone. */
     while (XCheckIfEvent( gdi_display, &event, native_window_copy_event, (char *)read )) {}
     *success = !read->copy_error && read->copy_complete && !read->copy_exposed;
-    TRACE_(csperf)( "event=native_window_copy_receipt window=%lx serial=%lu complete=%u exposed=%u error=%d success=%u\n",
-                   read->window->window, read->copy_serial, read->copy_complete, read->copy_exposed,
-                   read->copy_error, *success );
+    if (TRACE_ON(csperf))
+    {
+        LARGE_INTEGER ticks;
+
+        NtQueryPerformanceCounter( &ticks, NULL );
+        TRACE_(csperf)( "ticks=%llu event=native_window_copy_receipt window=%lx serial=%lu complete=%u exposed=%u error=%d success=%u\n",
+                       (unsigned long long)ticks.QuadPart, read->window->window, read->copy_serial,
+                       read->copy_complete, read->copy_exposed, read->copy_error, *success );
+    }
     XUnlockDisplay( gdi_display );
     return TRUE;
 }
