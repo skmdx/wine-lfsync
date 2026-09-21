@@ -2601,10 +2601,10 @@ Window get_net_active_window( Display *display )
     Atom type;
 
     if (!XGetWindowProperty( display, DefaultRootWindow( display ), x11drv_atom(_NET_ACTIVE_WINDOW), 0,
-                             65536 / sizeof(Window), False, XA_WINDOW, &type, &format, &count,
+                             1, False, XA_WINDOW, &type, &format, &count,
                              &remaining, (unsigned char **)&value ))
     {
-        if (type == XA_WINDOW && format == 32) window = *value;
+        if (type == XA_WINDOW && format == 32 && count == 1) window = *value;
         XFree( value );
     }
 
