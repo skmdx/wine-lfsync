@@ -397,6 +397,7 @@ enum client_surface_compositor_op
     CLIENT_SURFACE_COMPOSITOR_REPLACE_POOL,
     CLIENT_SURFACE_COMPOSITOR_FREE_POOL,
     CLIENT_SURFACE_COMPOSITOR_PRESENT,
+    CLIENT_SURFACE_COMPOSITOR_ADMIT_PRESENT,
     CLIENT_SURFACE_COMPOSITOR_REGISTER_HANDOFF,
     CLIENT_SURFACE_COMPOSITOR_REUSE_HANDOFFS,
     CLIENT_SURFACE_COMPOSITOR_CHECK_SCENE,
@@ -488,12 +489,13 @@ struct client_surface_compositor_job
         } pool;
         /* FREE_POOL transfers its detached pair and accounting on enqueue. */
         Pixmap retired_pixmaps[2];
-        /* PRESENT borrows registered output XIDs. The target keeps the native
-         * serial after a caller timeout; only its waiter pointer is detached. */
+        /* PRESENT owns its GUI continuation; the target retains native
+         * resources independently after cancellation or a caller deadline. */
         struct
         {
             Drawable source, destination;
             unsigned int width, height;
+            struct client_surface_output_allocation *allocation;
             BOOL started, done;
             DWORD start;
         } present;
@@ -683,7 +685,7 @@ struct client_surface_output_allocation
     struct x11drv_native_window *window_owner;
     struct x11drv_native_window_read seed_read;
     struct client_surface_window_query geometry_query;
-    BOOL geometry;
+    BOOL geometry, publication;
     UINT geometry_update;
     UINT64 geometry_scope, geometry_revision;
     RECT restore_rect;
@@ -1207,7 +1209,8 @@ static void client_surface_output_allocation_complete( void *context, BOOL succe
         }
     }
     TRACE_(csperf)( "ticks=%llu event=%s request=%p serial=%llu pending=%u failed=%u abandoned=%u\n",
-                   client_surface_perf_time(), allocation->geometry ? "geometry_query_complete" :
+                   client_surface_perf_time(), allocation->publication ? "output_publication_complete" :
+                   allocation->geometry ? "geometry_query_complete" :
                    allocation->snapshot ? "output_snapshot_complete" :
                    allocation->checkpoint ? "output_pair_copy_complete" : "output_pair_create_complete",
                    allocation, (unsigned long long)allocation->serial, allocation->pending,
@@ -5165,8 +5168,41 @@ static BOOL client_surface_compositor_update_ready( struct client_surface_compos
            (!queue->control_head || (until && queue->control_head->sequence >= until->sequence));
 }
 
+/* The existing geometry observation owns this continuation and its release
+ * capacity. Admission pins the exact completed input, without waiting for an
+ * older native publication or retaining any GUI window-data pointer. */
+static BOOL admit_client_surface_publication( struct client_surface_compositor_job *job )
+{
+    struct client_surface_output_allocation *allocation = job->u.present.allocation;
+    struct client_surface_compositor_target *target = find_client_surface_compositor_target( job->toplevel );
+    struct client_surface_compositor_frame *frame;
+
+    if (!target || target->window_owner != allocation->window_owner || target->window != allocation->window ||
+        !(frame = get_client_surface_compositor_pixmap( target, job->u.present.source )) ||
+        !frame->revision || client_surface_cache_write_pending( frame->image ) || target->seed_serial ||
+        !client_surface_output_checkpoint_scene_current( &allocation->scene )) return FALSE;
+    assert( allocation->geometry && !allocation->publication && !allocation->pending &&
+            !allocation->source_image && list_empty( &allocation->notification_entry ) );
+    allocation->source = job->u.present.source;
+    allocation->source_image = client_surface_cache_acquire( frame->image );
+    allocation->release.op = CLIENT_SURFACE_COMPOSITOR_PRESENT;
+    allocation->release.u.present = job->u.present;
+    allocation->release.async = TRUE;
+    pthread_mutex_lock( &client_surface_compositor_mutex );
+    allocation->publication = TRUE;
+    allocation->pending = 1;
+    enqueue_client_surface_compositor_job( &allocation->release );
+    pthread_mutex_unlock( &client_surface_compositor_mutex );
+    TRACE_(csperf)( "ticks=%llu event=output_publication_admit hwnd=%p serial=%llu source=%lx\n",
+                   client_surface_perf_time(), job->toplevel,
+                   (unsigned long long)allocation->serial, allocation->source );
+    return TRUE;
+}
+
 static BOOL execute_client_surface_compositor_job( struct client_surface_compositor_job *job )
 {
+    if (job->op == CLIENT_SURFACE_COMPOSITOR_ADMIT_PRESENT)
+        return admit_client_surface_publication( job );
     if (job->op == CLIENT_SURFACE_COMPOSITOR_QUERY_WINDOW)
         return create_client_surface_window_query( job );
     if (job->op == CLIENT_SURFACE_COMPOSITOR_CREATE_POOL)
@@ -5353,7 +5389,26 @@ static BOOL client_surface_compositor_job_ready( struct client_surface_composito
             start_client_surface_window_query( query, job->u.direct_plan.window_owner, NULL );
         if (!ReadAcquire( &query->complete )) return FALSE;
     }
-    if (job->op == CLIENT_SURFACE_COMPOSITOR_QUERY_WINDOW) return TRUE;
+    if (job->op == CLIENT_SURFACE_COMPOSITOR_QUERY_WINDOW ||
+        job->op == CLIENT_SURFACE_COMPOSITOR_ADMIT_PRESENT) return TRUE;
+    if (job->op == CLIENT_SURFACE_COMPOSITOR_PRESENT)
+    {
+        struct client_surface_output_allocation *allocation = job->u.present.allocation;
+        struct client_surface_compositor_frame *frame;
+        BOOL abandoned;
+
+        pthread_mutex_lock( &client_surface_compositor_mutex );
+        abandoned = allocation->abandoned;
+        pthread_mutex_unlock( &client_surface_compositor_mutex );
+        if (abandoned || !target || target->window_owner != allocation->window_owner ||
+            !(frame = get_client_surface_compositor_pixmap( target, allocation->source )) ||
+            frame->image != allocation->source_image ||
+            !client_surface_output_checkpoint_scene_current( &allocation->scene ))
+        {
+            *rejected = TRUE;
+            return TRUE;
+        }
+    }
     if (job->op == CLIENT_SURFACE_COMPOSITOR_CREATE_POOL || job->op == CLIENT_SURFACE_COMPOSITOR_COPY_POOL ||
         job->op == CLIENT_SURFACE_COMPOSITOR_DROP_SEED || job->op == CLIENT_SURFACE_COMPOSITOR_SNAPSHOT) return TRUE;
     if (!target) return TRUE;
@@ -5546,6 +5601,7 @@ static BOOL client_surface_compositor_control_job( const struct client_surface_c
 {
     return job->op == CLIENT_SURFACE_COMPOSITOR_CREATE_POOL ||
            job->op == CLIENT_SURFACE_COMPOSITOR_QUERY_WINDOW ||
+           job->op == CLIENT_SURFACE_COMPOSITOR_ADMIT_PRESENT ||
            job->op == CLIENT_SURFACE_COMPOSITOR_DROP_SEED ||
            job->op == CLIENT_SURFACE_COMPOSITOR_SNAPSHOT ||
            job->op == CLIENT_SURFACE_COMPOSITOR_COPY_POOL ||
@@ -5682,6 +5738,16 @@ static BOOL process_client_surface_compositor_jobs(void)
         if (job->async)
         {
             if (job->notifications) finish_client_surface_notification( job );
+            else if (job->op == CLIENT_SURFACE_COMPOSITOR_PRESENT)
+            {
+                struct client_surface_output_allocation *allocation = job->u.present.allocation;
+                BOOL success = job->result;
+
+                /* The job is unlinked and its frame waiter has detached.
+                 * Cancellation may free the continuation during this call. */
+                job->async = FALSE;
+                client_surface_output_allocation_complete( allocation, success );
+            }
             else
             {
                 struct client_surface_output_allocation *allocation =
@@ -6481,14 +6547,16 @@ static void client_surface_backing_free( Pixmap first, Pixmap second )
 }
 
 static BOOL client_surface_backing_present( HWND toplevel, Window window, Pixmap pixmap,
-                                            unsigned int width, unsigned int height )
+                                            unsigned int width, unsigned int height,
+                                            struct client_surface_output_allocation *allocation )
 {
     struct client_surface_compositor_job job =
     {
-        .op = CLIENT_SURFACE_COMPOSITOR_PRESENT,
+        .op = CLIENT_SURFACE_COMPOSITOR_ADMIT_PRESENT,
         .toplevel = toplevel,
         .u.present =
         {
+            .allocation = allocation,
             .source = pixmap,
             .destination = window,
             .width = width,
@@ -7539,6 +7607,7 @@ NTSTATUS X11DRV_client_surface_backing_snapshot( struct x11drv_win_data *data, B
 
 NTSTATUS X11DRV_client_surface_backing_publish( struct x11drv_win_data *data )
 {
+    struct client_surface_output_allocation *allocation;
     unsigned int window_width, window_height;
     BOOL force = FALSE;
     NTSTATUS status = STATUS_UNSUCCESSFUL;
@@ -7546,6 +7615,8 @@ NTSTATUS X11DRV_client_surface_backing_publish( struct x11drv_win_data *data )
     if (!data->whole_window || !data->client_surface_backing) goto done;
     status = query_client_surface_extent( data, WINE_PUBLISH_CLIENT_SURFACES, &window_width, &window_height );
     if (status) goto done;
+    allocation = data->client_surface_pending_geometry;
+    if (allocation->publication) goto published;
     /* This reservation owns one observation through capacity changes and
      * target installation. A deferred allocation resumes PUBLISH, not an
      * unrelated backing update which would consume another observation. */
@@ -7559,13 +7630,16 @@ NTSTATUS X11DRV_client_surface_backing_publish( struct x11drv_win_data *data )
         data->client_surface_allocation_update = WINE_PUBLISH_CLIENT_SURFACES;
     if (status) goto done;
     if (!client_surface_backing_present( data->hwnd, data->whole_window, data->client_surface_backing,
-                                         window_width, window_height ))
+                                         window_width, window_height, allocation ))
     {
         /* Native Present failure already uses the checked worker copy.
          * Refused admission must not bypass that Window's publication order. */
         status = STATUS_UNSUCCESSFUL;
         goto done;
     }
+    status = STATUS_PENDING;
+    goto done;
+published:
     data->client_surface_backing_valid = TRUE;
     data->client_surface_backing_valid_width = window_width;
     data->client_surface_backing_valid_height = window_height;
