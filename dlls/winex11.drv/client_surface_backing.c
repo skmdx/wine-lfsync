@@ -5250,6 +5250,18 @@ static BOOL client_surface_compositor_update_ready( struct client_surface_compos
     unsigned int i;
 
     if (target->copy_frame || target->native_updates) return FALSE;
+#ifdef SONAME_LIBXPRESENT
+    /* A state notification can also follow a topology change. Do not wait
+     * for unissued output from the server's invalidated scene before
+     * allowing the GUI to adopt its replacement. Executing requests retain
+     * their native completion boundary. */
+    if (count_client_surface_compositor_frames( target ) &&
+        !client_surface_scene_snapshot_current( target->toplevel, target->scene.epoch ))
+    {
+        client_surface_cancel_native_presents( &target->native_presents );
+        process_client_surface_native_present( target );
+    }
+#endif
     for (i = 0; i < ARRAY_SIZE(target->frames); ++i)
         if (target->frames[i].serial) return FALSE;
     if (!until)
