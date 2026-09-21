@@ -5085,10 +5085,10 @@ static BOOL process_client_surface_handoffs(void)
                     {
                         progressed |= consumed != previous;
                         pool->query_wait_bitmap[word] |= (UINT64)1 << bit;
-                        TRACE_(csperf)( "ticks=%llu event=source_query_defer identity=%s cookie=%s token=%s pool=%s\n",
+                        TRACE_(csperf)( "ticks=%llu event=source_query_defer identity=%s cookie=%s token=%s pool=%s hwnd=%p\n",
                                        client_surface_perf_time(), wine_dbgstr_longlong( binding->identity ),
                                        wine_dbgstr_longlong( binding->cookie ), wine_dbgstr_longlong( consumed + 1 ),
-                                       wine_dbgstr_longlong( pool->id ) );
+                                       wine_dbgstr_longlong( pool->id ), binding->window );
                         break;
                     }
                     progressed = TRUE;

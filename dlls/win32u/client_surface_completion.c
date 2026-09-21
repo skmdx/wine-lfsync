@@ -472,6 +472,9 @@ static struct client_surface_completion_result poll_completion_job( struct clien
     elapsed = now - job->wait_started;
     if (elapsed >= job->wait_timeout)
     {
+        TRACE_(csperf)( "ticks=%llu event=completion_timeout identity=%s serial=%s elapsed=%u timeout=%u poll_elapsed=%u\n",
+                       client_surface_perf_time(), wine_dbgstr_longlong( client_surface_get_identity( surface ) ),
+                       wine_dbgstr_longlong( job->present.serial ), elapsed, job->wait_timeout, now - poll_start );
         WARN( "timed out waiting for presentation completion for %s serial %s\n",
               debugstr_client_surface( surface ), wine_dbgstr_longlong( job->present.serial ) );
         return client_surface_completion_result( CLIENT_SURFACE_COMPLETION_FAILED );
