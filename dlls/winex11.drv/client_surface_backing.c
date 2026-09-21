@@ -5176,14 +5176,29 @@ static BOOL admit_client_surface_publication( struct client_surface_compositor_j
     struct client_surface_output_allocation *allocation = job->u.present.allocation;
     struct client_surface_compositor_target *target = find_client_surface_compositor_target( job->toplevel );
     struct client_surface_compositor_frame *frame;
+    BOOL busy;
 
     if (!target || target->window_owner != allocation->window_owner || target->window != allocation->window ||
-        !(frame = get_client_surface_compositor_pixmap( target, job->u.present.source )) ||
-        !frame->revision || client_surface_cache_write_pending( frame->image ) || target->seed_serial ||
+        target->seed_serial ||
         !client_surface_output_checkpoint_scene_current( &allocation->scene )) return FALSE;
     assert( allocation->geometry && !allocation->publication && !allocation->pending &&
             !allocation->source_image && list_empty( &allocation->notification_entry ) );
     allocation->source = job->u.present.source;
+    frame = client_surface_output_checkpoint_frame( target, allocation->source, &busy );
+    if (busy)
+    {
+        /* A completed revision can already be undergoing the next assembly.
+         * Reuse the checkpoint wake instead of pinning that mutable input or
+         * making the GUI wait behind its native writer. */
+        pthread_mutex_lock( &client_surface_compositor_mutex );
+        allocation->copy_wait = TRUE;
+        list_add_tail( &client_surface_output_notifications, &allocation->notification_entry );
+        ++client_surface_output_notification_count;
+        pthread_mutex_unlock( &client_surface_compositor_mutex );
+        return TRUE;
+    }
+    if (!frame) return FALSE;
+    allocation->copy_wait = FALSE;
     allocation->source_image = client_surface_cache_acquire( frame->image );
     allocation->release.op = CLIENT_SURFACE_COMPOSITOR_PRESENT;
     allocation->release.u.present = job->u.present;
