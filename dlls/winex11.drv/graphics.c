@@ -74,6 +74,46 @@ static const int X11DRV_XROPfunction[16] =
 };
 
 
+/* Native requests take absolute drawable coordinates. Keep their callers'
+ * geometry in virtual device coordinates for bounds, paths and pen layout. */
+static void draw_line( X11DRV_PDEVICE *dev, int x1, int y1, int x2, int y2 )
+{
+    XDrawLine( gdi_display, dev->drawable, dev->gc,
+               x11drv_scale_coord( dev, x1 ), x11drv_scale_coord( dev, y1 ),
+               x11drv_scale_coord( dev, x2 ), x11drv_scale_coord( dev, y2 ));
+}
+
+static RECT scale_rectangle( const X11DRV_PDEVICE *dev, int x, int y, int width, int height )
+{
+    RECT rect = { x, y, x + width, y + height };
+    return x11drv_scale_rect( dev, &rect );
+}
+
+static void draw_rectangle( X11DRV_PDEVICE *dev, BOOL fill, int x, int y, int width, int height )
+{
+    RECT rect = scale_rectangle( dev, x, y, width, height );
+
+    if (fill)
+        XFillRectangle( gdi_display, dev->drawable, dev->gc, rect.left, rect.top,
+                        rect.right - rect.left, rect.bottom - rect.top );
+    else
+        XDrawRectangle( gdi_display, dev->drawable, dev->gc, rect.left, rect.top,
+                        rect.right - rect.left, rect.bottom - rect.top );
+}
+
+static void draw_arc( X11DRV_PDEVICE *dev, BOOL fill, int x, int y, int width, int height,
+                      int start_angle, int diff_angle )
+{
+    RECT rect = scale_rectangle( dev, x, y, width, height );
+
+    if (fill)
+        XFillArc( gdi_display, dev->drawable, dev->gc, rect.left, rect.top,
+                  rect.right - rect.left, rect.bottom - rect.top, start_angle, diff_angle );
+    else
+        XDrawArc( gdi_display, dev->drawable, dev->gc, rect.left, rect.top,
+                  rect.right - rect.left, rect.bottom - rect.top, start_angle, diff_angle );
+}
+
 /* get the rectangle in device coordinates, with optional mirroring */
 static RECT get_device_rect( HDC hdc, int left, int top, int right, int bottom )
 {
@@ -163,7 +203,8 @@ DWORD X11DRV_GetRegionDataSize( HRGN hrgn )
 
 /* Fill caller-owned storage, preserving its original allocation size when
  * conversion below compacts or filters the native rectangle list. */
-BOOL X11DRV_FillRegionData( HRGN hrgn, HDC hdc_lptodp, RGNDATA *data, DWORD size )
+static BOOL fill_region_data( HRGN hrgn, HDC hdc_lptodp, RGNDATA *data, DWORD size,
+                             const X11DRV_PDEVICE *physdev )
 {
     unsigned int i;
     RECT *rect, tmp;
@@ -192,6 +233,9 @@ BOOL X11DRV_FillRegionData( HRGN hrgn, HDC hdc_lptodp, RGNDATA *data, DWORD size
             }
         }
     }
+
+    if (physdev)
+        for (i = 0; i < data->rdh.nCount; i++) rect[i] = x11drv_device_rect( physdev, &rect[i] );
 
     if (sizeof(XRectangle) > sizeof(RECT))
     {
@@ -244,15 +288,30 @@ BOOL X11DRV_FillRegionData( HRGN hrgn, HDC hdc_lptodp, RGNDATA *data, DWORD size
  * array to XRectangle format. The returned buffer must be freed by caller.
  * If hdc_lptodp is not 0, the rectangles are converted through LPtoDP.
  */
-RGNDATA *X11DRV_GetRegionData( HRGN hrgn, HDC hdc_lptodp )
+static RGNDATA *get_region_data( HRGN hrgn, HDC hdc_lptodp, const X11DRV_PDEVICE *physdev )
 {
     RGNDATA *data;
     DWORD size;
 
     if (!(size = X11DRV_GetRegionDataSize( hrgn )) || !(data = malloc( size ))) return NULL;
-    if (X11DRV_FillRegionData( hrgn, hdc_lptodp, data, size )) return data;
+    if (fill_region_data( hrgn, hdc_lptodp, data, size, physdev )) return data;
     free( data );
     return NULL;
+}
+
+BOOL X11DRV_FillRegionData( HRGN hrgn, HDC hdc_lptodp, RGNDATA *data, DWORD size )
+{
+    return fill_region_data( hrgn, hdc_lptodp, data, size, NULL );
+}
+
+RGNDATA *X11DRV_GetRegionData( HRGN hrgn, HDC hdc_lptodp )
+{
+    return get_region_data( hrgn, hdc_lptodp, NULL );
+}
+
+RGNDATA *X11DRV_GetDrawableRegion( const X11DRV_PDEVICE *physdev, HRGN hrgn, HDC hdc_lptodp )
+{
+    return get_region_data( hrgn, hdc_lptodp, physdev );
 }
 
 
@@ -267,9 +326,9 @@ static void update_x11_clipping( X11DRV_PDEVICE *physDev, HRGN rgn )
     {
         XSetClipMask( gdi_display, physDev->gc, None );
     }
-    else if ((data = X11DRV_GetRegionData( rgn, 0 )))
+    else if ((data = X11DRV_GetDrawableRegion( physDev, rgn, 0 )))
     {
-        XSetClipRectangles( gdi_display, physDev->gc, physDev->dc_rect.left, physDev->dc_rect.top,
+        XSetClipRectangles( gdi_display, physDev->gc, 0, 0,
                             (XRectangle *)data->Buffer, data->rdh.nCount, YXBanded );
         free( data );
     }
@@ -332,7 +391,8 @@ BOOL X11DRV_SetupGCForPatBlt( X11DRV_PDEVICE *physDev, GC gc, BOOL fMapColors )
     DWORD bk_color, text_color, rop_mode, bk_mode, poly_fill_mode;
     XGCValues val;
     unsigned long mask;
-    Pixmap pixmap = 0;
+    Pixmap pixmap = 0, pattern = physDev->brush.pixmap;
+    BOOL scaled = gc == physDev->gc && physDev->drawable_scale_num != physDev->drawable_scale_den;
     POINT pt;
 
     if (physDev->brush.style == BS_NULL) return FALSE;
@@ -374,33 +434,41 @@ BOOL X11DRV_SetupGCForPatBlt( X11DRV_PDEVICE *physDev, GC gc, BOOL fMapColors )
 	val.function = GXxor;
     }
     val.fill_style = physDev->brush.fillStyle;
+    NtGdiGetDCPoint( physDev->dev.hdc, NtGdiGetBrushOrgEx, &pt );
+    if (scaled && val.fill_style != FillSolid && !(pattern = X11DRV_GetScaledBrush( physDev, &pt )))
+        return FALSE;
     switch(val.fill_style)
     {
     case FillStippled:
     case FillOpaqueStippled:
         NtGdiGetDCDword( physDev->dev.hdc, NtGdiGetBkMode, &bk_mode );
         if (bk_mode == OPAQUE) val.fill_style = FillOpaqueStippled;
-	val.stipple = physDev->brush.pixmap;
+	val.stipple = pattern;
 	mask = GCStipple;
         break;
 
     case FillTiled:
         if (fMapColors && X11DRV_PALETTE_XPixelToPalette)
         {
-            register int x, y;
+            int x, y, width = physDev->brush.size.cx, height = physDev->brush.size.cy;
             XImage *image;
-            pixmap = XCreatePixmap( gdi_display, root_window, 8, 8, physDev->depth );
-            image = XGetImage( gdi_display, physDev->brush.pixmap, 0, 0, 8, 8,
+            pixmap = XCreatePixmap( gdi_display, root_window, width, height, physDev->depth );
+            image = XGetImage( gdi_display, pattern, 0, 0, width, height,
                                AllPlanes, ZPixmap );
-            for (y = 0; y < 8; y++)
-                for (x = 0; x < 8; x++)
+            if (!image)
+            {
+                XFreePixmap( gdi_display, pixmap );
+                return FALSE;
+            }
+            for (y = 0; y < height; y++)
+                for (x = 0; x < width; x++)
                     XPutPixel( image, x, y,
                                X11DRV_PALETTE_XPixelToPalette[XGetPixel( image, x, y)] );
-            XPutImage( gdi_display, pixmap, gc, image, 0, 0, 0, 0, 8, 8 );
+            XPutImage( gdi_display, pixmap, gc, image, 0, 0, 0, 0, width, height );
             XDestroyImage( image );
             val.tile = pixmap;
         }
-        else val.tile = physDev->brush.pixmap;
+        else val.tile = pattern;
 	mask = GCTile;
         break;
 
@@ -409,11 +477,16 @@ BOOL X11DRV_SetupGCForPatBlt( X11DRV_PDEVICE *physDev, GC gc, BOOL fMapColors )
         break;
     }
 
-    NtGdiGetDCPoint( physDev->dev.hdc, NtGdiGetBrushOrgEx, &pt );
     NtGdiGetDCDword( physDev->dev.hdc, NtGdiGetPolyFillMode, &poly_fill_mode );
 
     val.ts_x_origin = physDev->dc_rect.left + pt.x;
     val.ts_y_origin = physDev->dc_rect.top + pt.y;
+    if (scaled)
+    {
+        RECT rect = x11drv_device_rect( physDev, &physDev->brush.scaled_rect );
+        val.ts_x_origin = rect.left;
+        val.ts_y_origin = rect.top;
+    }
     val.fill_rule = poly_fill_mode == WINDING ? WindingRule : EvenOddRule;
     XChangeGC( gdi_display, gc,
 	       GCFunction | GCForeground | GCBackground | GCFillStyle |
@@ -446,6 +519,8 @@ static BOOL X11DRV_SetupGCForPen( X11DRV_PDEVICE *physDev )
 {
     DWORD rop2, bk_color, bk_mode;
     XGCValues val;
+    char dashes[MAX_DASHLEN];
+    unsigned int i;
 
     NtGdiGetDCDword( physDev->dev.hdc, NtGdiGetROP2, &rop2 );
 
@@ -515,7 +590,13 @@ static BOOL X11DRV_SetupGCForPen( X11DRV_PDEVICE *physDev )
         val.line_style = LineSolid;
 
     if (physDev->pen.dash_len)
-        XSetDashes( gdi_display, physDev->gc, 0, physDev->pen.dashes, physDev->pen.dash_len );
+    {
+        for (i = 0; i < physDev->pen.dash_len; i++)
+            dashes[i] = max( 1, min( 255, x11drv_scale_coord( physDev, (unsigned char)physDev->pen.dashes[i] )));
+        XSetDashes( gdi_display, physDev->gc, 0, dashes, physDev->pen.dash_len );
+    }
+    if (physDev->drawable_scale_num != physDev->drawable_scale_den)
+        val.line_width = max( 1, x11drv_scale_coord( physDev, max( 1, val.line_width )));
     XChangeGC( gdi_display, physDev->gc,
 	       GCFunction | GCForeground | GCBackground | GCLineWidth |
 	       GCLineStyle | GCCapStyle | GCJoinStyle | GCFillStyle, &val );
@@ -572,7 +653,7 @@ BOOL X11DRV_LineTo( PHYSDEV dev, INT x, INT y )
     add_pen_device_bounds( physDev, pt, 2 );
 
     if (X11DRV_SetupGCForPen( physDev ))
-        XDrawLine(gdi_display, physDev->drawable, physDev->gc,
+        draw_line( physDev,
                   physDev->dc_rect.left + pt[0].x, physDev->dc_rect.top + pt[0].y,
                   physDev->dc_rect.left + pt[1].x, physDev->dc_rect.top + pt[1].y );
     return TRUE;
@@ -592,12 +673,15 @@ static BOOL X11DRV_DrawArc( PHYSDEV dev, INT left, INT top, INT right, INT botto
 {
     X11DRV_PDEVICE *physDev = get_x11drv_dev( dev );
     INT xcenter, ycenter, istart_angle, idiff_angle;
-    INT width, oldwidth;
+    INT width, oldwidth, i;
     DWORD arc_dir;
     double start_angle, end_angle;
-    XPoint points[4];
+    POINT points[4];
+    XPoint native_points[4];
     POINT start, end;
     RECT rc = get_device_rect( dev->hdc, left, top, right, bottom );
+
+    if (lines && !X11DRV_PrepareBrush( physDev )) return FALSE;
 
     start.x = xstart;
     start.y = ystart;
@@ -653,7 +737,7 @@ static BOOL X11DRV_DrawArc( PHYSDEV dev, INT left, INT top, INT right, INT botto
 
     if ((lines > 0) && X11DRV_SetupGCForBrush( physDev )) {
         XSetArcMode( gdi_display, physDev->gc, (lines==1) ? ArcChord : ArcPieSlice);
-        XFillArc( gdi_display, physDev->drawable, physDev->gc,
+        draw_arc( physDev, TRUE,
                   physDev->dc_rect.left + rc.left, physDev->dc_rect.top + rc.top,
                   rc.right-rc.left-1, rc.bottom-rc.top-1, istart_angle, idiff_angle );
     }
@@ -662,7 +746,7 @@ static BOOL X11DRV_DrawArc( PHYSDEV dev, INT left, INT top, INT right, INT botto
 
     if (X11DRV_SetupGCForPen( physDev ))
     {
-        XDrawArc( gdi_display, physDev->drawable, physDev->gc,
+        draw_arc( physDev, FALSE,
                   physDev->dc_rect.left + rc.left, physDev->dc_rect.top + rc.top,
                   rc.right-rc.left-1, rc.bottom-rc.top-1, istart_angle, idiff_angle );
         if (lines) {
@@ -718,8 +802,13 @@ static BOOL X11DRV_DrawArc( PHYSDEV dev, INT left, INT top, INT right, INT botto
                 }
                 lines++;
 	    }
+            for (i = 0; i <= lines; i++)
+            {
+                native_points[i].x = x11drv_scale_coord( physDev, points[i].x );
+                native_points[i].y = x11drv_scale_coord( physDev, points[i].y );
+            }
             XDrawLines( gdi_display, physDev->drawable, physDev->gc,
-                        points, lines+1, CoordModeOrigin );
+                        native_points, lines+1, CoordModeOrigin );
         }
     }
 
@@ -767,6 +856,8 @@ BOOL X11DRV_Ellipse( PHYSDEV dev, INT left, INT top, INT right, INT bottom )
     INT width, oldwidth;
     RECT rc = get_device_rect( dev->hdc, left, top, right, bottom );
 
+    if (!X11DRV_PrepareBrush( physDev )) return FALSE;
+
     if ((rc.left == rc.right) || (rc.top == rc.bottom)) return TRUE;
 
     oldwidth = width = physDev->pen.width;
@@ -786,12 +877,12 @@ BOOL X11DRV_Ellipse( PHYSDEV dev, INT left, INT top, INT right, INT bottom )
     physDev->pen.width = width;
 
     if (X11DRV_SetupGCForBrush( physDev ))
-        XFillArc( gdi_display, physDev->drawable, physDev->gc,
+        draw_arc( physDev, TRUE,
                   physDev->dc_rect.left + rc.left, physDev->dc_rect.top + rc.top,
                   rc.right-rc.left-1, rc.bottom-rc.top-1, 0, 360*64 );
 
     if (X11DRV_SetupGCForPen( physDev ))
-        XDrawArc( gdi_display, physDev->drawable, physDev->gc,
+        draw_arc( physDev, FALSE,
                   physDev->dc_rect.left + rc.left, physDev->dc_rect.top + rc.top,
                   rc.right-rc.left-1, rc.bottom-rc.top-1, 0, 360*64 );
 
@@ -809,6 +900,8 @@ BOOL X11DRV_Rectangle(PHYSDEV dev, INT left, INT top, INT right, INT bottom)
     X11DRV_PDEVICE *physDev = get_x11drv_dev( dev );
     INT width, oldwidth, oldjoinstyle;
     RECT rc = get_device_rect( dev->hdc, left, top, right, bottom );
+
+    if (!X11DRV_PrepareBrush( physDev )) return FALSE;
 
     TRACE("(%d %d %d %d)\n", left, top, right, bottom);
 
@@ -838,13 +931,13 @@ BOOL X11DRV_Rectangle(PHYSDEV dev, INT left, INT top, INT right, INT bottom)
     if ((rc.right >= rc.left + width) && (rc.bottom >= rc.top + width))
     {
         if (X11DRV_SetupGCForBrush( physDev ))
-            XFillRectangle( gdi_display, physDev->drawable, physDev->gc,
+            draw_rectangle( physDev, TRUE,
                             physDev->dc_rect.left + rc.left + (width + 1) / 2,
                             physDev->dc_rect.top + rc.top + (width + 1) / 2,
                             rc.right-rc.left-width, rc.bottom-rc.top-width);
     }
     if (X11DRV_SetupGCForPen( physDev ))
-        XDrawRectangle( gdi_display, physDev->drawable, physDev->gc,
+        draw_rectangle( physDev, FALSE,
                         physDev->dc_rect.left + rc.left, physDev->dc_rect.top + rc.top,
                         rc.right-rc.left, rc.bottom-rc.top );
 
@@ -864,6 +957,8 @@ BOOL X11DRV_RoundRect( PHYSDEV dev, INT left, INT top, INT right, INT bottom,
     INT width, oldwidth, oldendcap;
     POINT pts[2];
     RECT rc = get_device_rect( dev->hdc, left, top, right, bottom );
+
+    if (!X11DRV_PrepareBrush( physDev )) return FALSE;
 
     TRACE("(%d %d %d %d  %d %d\n",
     	left, top, right, bottom, ell_width, ell_height);
@@ -902,52 +997,52 @@ BOOL X11DRV_RoundRect( PHYSDEV dev, INT left, INT top, INT right, INT bottom,
     {
         if (ell_width > (rc.right-rc.left) )
             if (ell_height > (rc.bottom-rc.top) )
-                XFillArc( gdi_display, physDev->drawable, physDev->gc,
+                draw_arc( physDev, TRUE,
                           physDev->dc_rect.left + rc.left, physDev->dc_rect.top + rc.top,
                           rc.right - rc.left - 1, rc.bottom - rc.top - 1,
                           0, 360 * 64 );
             else{
-                XFillArc( gdi_display, physDev->drawable, physDev->gc,
+                draw_arc( physDev, TRUE,
                           physDev->dc_rect.left + rc.left, physDev->dc_rect.top + rc.top,
                           rc.right - rc.left - 1, ell_height, 0, 180 * 64 );
-                XFillArc( gdi_display, physDev->drawable, physDev->gc,
+                draw_arc( physDev, TRUE,
                           physDev->dc_rect.left + rc.left,
                           physDev->dc_rect.top + rc.bottom - ell_height - 1,
                           rc.right - rc.left - 1, ell_height, 180 * 64,
                           180 * 64 );
             }
 	else if (ell_height > (rc.bottom-rc.top) ){
-            XFillArc( gdi_display, physDev->drawable, physDev->gc,
+            draw_arc( physDev, TRUE,
                       physDev->dc_rect.left + rc.left, physDev->dc_rect.top + rc.top,
                       ell_width, rc.bottom - rc.top - 1, 90 * 64, 180 * 64 );
-            XFillArc( gdi_display, physDev->drawable, physDev->gc,
+            draw_arc( physDev, TRUE,
                       physDev->dc_rect.left + rc.right - ell_width - 1, physDev->dc_rect.top + rc.top,
                       ell_width, rc.bottom - rc.top - 1, 270 * 64, 180 * 64 );
         }else{
-            XFillArc( gdi_display, physDev->drawable, physDev->gc,
+            draw_arc( physDev, TRUE,
                       physDev->dc_rect.left + rc.left, physDev->dc_rect.top + rc.top,
                       ell_width, ell_height, 90 * 64, 90 * 64 );
-            XFillArc( gdi_display, physDev->drawable, physDev->gc,
+            draw_arc( physDev, TRUE,
                       physDev->dc_rect.left + rc.left,
                       physDev->dc_rect.top + rc.bottom - ell_height - 1,
                       ell_width, ell_height, 180 * 64, 90 * 64 );
-            XFillArc( gdi_display, physDev->drawable, physDev->gc,
+            draw_arc( physDev, TRUE,
                       physDev->dc_rect.left + rc.right - ell_width - 1,
                       physDev->dc_rect.top + rc.bottom - ell_height - 1,
                       ell_width, ell_height, 270 * 64, 90 * 64 );
-            XFillArc( gdi_display, physDev->drawable, physDev->gc,
+            draw_arc( physDev, TRUE,
                       physDev->dc_rect.left + rc.right - ell_width - 1,
                       physDev->dc_rect.top + rc.top,
                       ell_width, ell_height, 0, 90 * 64 );
         }
         if (ell_width < rc.right - rc.left)
         {
-            XFillRectangle( gdi_display, physDev->drawable, physDev->gc,
+            draw_rectangle( physDev, TRUE,
                             physDev->dc_rect.left + rc.left + (ell_width + 1) / 2,
                             physDev->dc_rect.top + rc.top + 1,
                             rc.right - rc.left - ell_width - 1,
                             (ell_height + 1) / 2 - 1);
-            XFillRectangle( gdi_display, physDev->drawable, physDev->gc,
+            draw_rectangle( physDev, TRUE,
                             physDev->dc_rect.left + rc.left + (ell_width + 1) / 2,
                             physDev->dc_rect.top + rc.bottom - (ell_height) / 2 - 1,
                             rc.right - rc.left - ell_width - 1,
@@ -955,7 +1050,7 @@ BOOL X11DRV_RoundRect( PHYSDEV dev, INT left, INT top, INT right, INT bottom,
         }
         if  (ell_height < rc.bottom - rc.top)
         {
-            XFillRectangle( gdi_display, physDev->drawable, physDev->gc,
+            draw_rectangle( physDev, TRUE,
                             physDev->dc_rect.left + rc.left + 1,
                             physDev->dc_rect.top + rc.top + (ell_height + 1) / 2,
                             rc.right - rc.left - 2,
@@ -975,49 +1070,49 @@ BOOL X11DRV_RoundRect( PHYSDEV dev, INT left, INT top, INT right, INT bottom,
     {
         if (ell_width > (rc.right-rc.left) )
             if (ell_height > (rc.bottom-rc.top) )
-                XDrawArc( gdi_display, physDev->drawable, physDev->gc,
+                draw_arc( physDev, FALSE,
                           physDev->dc_rect.left + rc.left, physDev->dc_rect.top + rc.top,
                           rc.right - rc.left - 1, rc.bottom - rc.top - 1, 0 , 360 * 64 );
             else{
-                XDrawArc( gdi_display, physDev->drawable, physDev->gc,
+                draw_arc( physDev, FALSE,
                           physDev->dc_rect.left + rc.left, physDev->dc_rect.top + rc.top,
                           rc.right - rc.left - 1, ell_height - 1, 0 , 180 * 64 );
-                XDrawArc( gdi_display, physDev->drawable, physDev->gc,
+                draw_arc( physDev, FALSE,
                           physDev->dc_rect.left + rc.left,
                           physDev->dc_rect.top + rc.bottom - ell_height,
                           rc.right - rc.left - 1, ell_height - 1, 180 * 64 , 180 * 64 );
             }
 	else if (ell_height > (rc.bottom-rc.top) ){
-            XDrawArc( gdi_display, physDev->drawable, physDev->gc,
+            draw_arc( physDev, FALSE,
                       physDev->dc_rect.left + rc.left, physDev->dc_rect.top + rc.top,
                       ell_width - 1 , rc.bottom - rc.top - 1, 90 * 64 , 180 * 64 );
-            XDrawArc( gdi_display, physDev->drawable, physDev->gc,
+            draw_arc( physDev, FALSE,
                       physDev->dc_rect.left + rc.right - ell_width,
                       physDev->dc_rect.top + rc.top,
                       ell_width - 1 , rc.bottom - rc.top - 1, 270 * 64 , 180 * 64 );
 	}else{
-            XDrawArc( gdi_display, physDev->drawable, physDev->gc,
+            draw_arc( physDev, FALSE,
                       physDev->dc_rect.left + rc.left, physDev->dc_rect.top + rc.top,
                       ell_width - 1, ell_height - 1, 90 * 64, 90 * 64 );
-            XDrawArc( gdi_display, physDev->drawable, physDev->gc,
+            draw_arc( physDev, FALSE,
                       physDev->dc_rect.left + rc.left, physDev->dc_rect.top + rc.bottom - ell_height,
                       ell_width - 1, ell_height - 1, 180 * 64, 90 * 64 );
-            XDrawArc( gdi_display, physDev->drawable, physDev->gc,
+            draw_arc( physDev, FALSE,
                       physDev->dc_rect.left + rc.right - ell_width,
                       physDev->dc_rect.top + rc.bottom - ell_height,
                       ell_width - 1, ell_height - 1, 270 * 64, 90 * 64 );
-            XDrawArc( gdi_display, physDev->drawable, physDev->gc,
+            draw_arc( physDev, FALSE,
                       physDev->dc_rect.left + rc.right - ell_width, physDev->dc_rect.top + rc.top,
                       ell_width - 1, ell_height - 1, 0, 90 * 64 );
 	}
 	if (ell_width < rc.right - rc.left)
 	{
-            XDrawLine( gdi_display, physDev->drawable, physDev->gc,
+            draw_line( physDev,
                        physDev->dc_rect.left + rc.left + ell_width / 2,
                        physDev->dc_rect.top + rc.top,
                        physDev->dc_rect.left + rc.right - (ell_width+1) / 2,
                        physDev->dc_rect.top + rc.top);
-            XDrawLine( gdi_display, physDev->drawable, physDev->gc,
+            draw_line( physDev,
                        physDev->dc_rect.left + rc.left + ell_width / 2 ,
                        physDev->dc_rect.top + rc.bottom - 1,
                        physDev->dc_rect.left + rc.right - (ell_width+1)/ 2,
@@ -1025,12 +1120,12 @@ BOOL X11DRV_RoundRect( PHYSDEV dev, INT left, INT top, INT right, INT bottom,
 	}
 	if (ell_height < rc.bottom - rc.top)
 	{
-            XDrawLine( gdi_display, physDev->drawable, physDev->gc,
+            draw_line( physDev,
                        physDev->dc_rect.left + rc.right - 1,
                        physDev->dc_rect.top + rc.top + ell_height / 2,
                        physDev->dc_rect.left + rc.right - 1,
                        physDev->dc_rect.top + rc.bottom - (ell_height+1) / 2);
-            XDrawLine( gdi_display, physDev->drawable, physDev->gc,
+            draw_line( physDev,
                        physDev->dc_rect.left + rc.left,
                        physDev->dc_rect.top + rc.top + ell_height / 2,
                        physDev->dc_rect.left + rc.left,
@@ -1062,8 +1157,11 @@ COLORREF X11DRV_SetPixel( PHYSDEV dev, INT x, INT y, COLORREF color )
 
     XSetForeground( gdi_display, physDev->gc, pixel );
     XSetFunction( gdi_display, physDev->gc, GXcopy );
-    XDrawPoint( gdi_display, physDev->drawable, physDev->gc,
-                physDev->dc_rect.left + pt.x, physDev->dc_rect.top + pt.y );
+    SetRect( &rect, pt.x, pt.y, pt.x + 1, pt.y + 1 );
+    rect = x11drv_device_rect( physDev, &rect );
+    XSetFillStyle( gdi_display, physDev->gc, FillSolid );
+    XFillRectangle( gdi_display, physDev->drawable, physDev->gc,
+                    rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top );
 
     SetRect( &rect, pt.x, pt.y, pt.x + 1, pt.y + 1 );
     add_device_bounds( physDev, &rect );
@@ -1079,19 +1177,15 @@ BOOL X11DRV_PaintRgn( PHYSDEV dev, HRGN hrgn )
     X11DRV_PDEVICE *physDev = get_x11drv_dev( dev );
     RECT rc;
 
+    if (!X11DRV_PrepareBrush( physDev )) return FALSE;
+
     if (X11DRV_SetupGCForBrush( physDev ))
     {
-        unsigned int i;
         XRectangle *rect;
-        RGNDATA *data = X11DRV_GetRegionData( hrgn, dev->hdc );
+        RGNDATA *data = X11DRV_GetDrawableRegion( physDev, hrgn, dev->hdc );
 
         if (!data) return FALSE;
         rect = (XRectangle *)data->Buffer;
-        for (i = 0; i < data->rdh.nCount; i++)
-        {
-            rect[i].x += physDev->dc_rect.left;
-            rect[i].y += physDev->dc_rect.top;
-        }
 
         XFillRectangles( gdi_display, physDev->drawable, physDev->gc, rect, data->rdh.nCount );
         free( data );
@@ -1114,6 +1208,8 @@ static BOOL X11DRV_Polygon( PHYSDEV dev, const POINT* pt, INT count )
     POINT *points;
     XPoint *xpoints;
 
+    if (!X11DRV_PrepareBrush( physDev )) return FALSE;
+
     points = malloc( count * sizeof(*pt) );
     if (!points) return FALSE;
     memcpy( points, pt, count * sizeof(*pt) );
@@ -1127,8 +1223,8 @@ static BOOL X11DRV_Polygon( PHYSDEV dev, const POINT* pt, INT count )
     }
     for (i = 0; i < count; i++)
     {
-        xpoints[i].x = physDev->dc_rect.left + points[i].x;
-        xpoints[i].y = physDev->dc_rect.top + points[i].y;
+        xpoints[i].x = x11drv_scale_coord( physDev, physDev->dc_rect.left + points[i].x );
+        xpoints[i].y = x11drv_scale_coord( physDev, physDev->dc_rect.top + points[i].y );
     }
     xpoints[count] = xpoints[0];
 
@@ -1156,6 +1252,8 @@ BOOL X11DRV_PolyPolygon( PHYSDEV dev, const POINT* pt, const INT* counts, UINT p
     POINT *points;
     BOOL ret = FALSE;
 
+    if (!X11DRV_PrepareBrush( physDev )) return FALSE;
+
     if (polygons == 1) return X11DRV_Polygon( dev, pt, *counts );
 
     for (i = 0; i < polygons; i++)
@@ -1182,15 +1280,10 @@ BOOL X11DRV_PolyPolygon( PHYSDEV dev, const POINT* pt, const INT* counts, UINT p
         hrgn = UlongToHandle( NtGdiPolyPolyDraw( UlongToHandle(poly_fill_mode), points,
                                                  (const ULONG *)counts, polygons,
                                                  NtGdiPolyPolygonRgn ));
-        data = X11DRV_GetRegionData( hrgn, 0 );
+        data = X11DRV_GetDrawableRegion( physDev, hrgn, 0 );
         NtGdiDeleteObjectApp( hrgn );
         if (!data) goto done;
         rect = (XRectangle *)data->Buffer;
-        for (i = 0; i < data->rdh.nCount; i++)
-        {
-            rect[i].x += physDev->dc_rect.left;
-            rect[i].y += physDev->dc_rect.top;
-        }
 
         XFillRectangles( gdi_display, physDev->drawable, physDev->gc, rect, data->rdh.nCount );
         free( data );
@@ -1206,8 +1299,8 @@ BOOL X11DRV_PolyPolygon( PHYSDEV dev, const POINT* pt, const INT* counts, UINT p
         {
             for (j = 0; j < counts[i]; j++)
             {
-                xpoints[j].x = physDev->dc_rect.left + points[pos + j].x;
-                xpoints[j].y = physDev->dc_rect.top + points[pos + j].y;
+                xpoints[j].x = x11drv_scale_coord( physDev, physDev->dc_rect.left + points[pos + j].x );
+                xpoints[j].y = x11drv_scale_coord( physDev, physDev->dc_rect.top + points[pos + j].y );
             }
 	    xpoints[j] = xpoints[0];
             XDrawLines( gdi_display, physDev->drawable, physDev->gc, xpoints, j + 1, CoordModeOrigin );
@@ -1257,8 +1350,8 @@ BOOL X11DRV_PolyPolyline( PHYSDEV dev, const POINT* pt, const DWORD* counts, DWO
         {
             for (j = 0; j < counts[i]; j++)
             {
-                xpoints[j].x = physDev->dc_rect.left + points[pos + j].x;
-                xpoints[j].y = physDev->dc_rect.top + points[pos + j].y;
+                xpoints[j].x = x11drv_scale_coord( physDev, physDev->dc_rect.left + points[pos + j].x );
+                xpoints[j].y = x11drv_scale_coord( physDev, physDev->dc_rect.top + points[pos + j].y );
             }
             XDrawLines( gdi_display, physDev->drawable, physDev->gc, xpoints, j, CoordModeOrigin );
         }
@@ -1278,6 +1371,8 @@ static BOOL x11drv_stroke_and_fill_path( PHYSDEV dev, BOOL stroke, BOOL fill )
     XPoint *xpoints;
     int i, j, size;
 
+    if (fill && !X11DRV_PrepareBrush( physDev )) return FALSE;
+
     NtGdiFlattenPath( dev->hdc );
     if ((size = NtGdiGetPath( dev->hdc, NULL, NULL, 0 )) == -1) return FALSE;
     if (!size)
@@ -1296,16 +1391,11 @@ static BOOL x11drv_stroke_and_fill_path( PHYSDEV dev, BOOL stroke, BOOL fill )
     {
         XRectangle *rect;
         HRGN hrgn = NtGdiPathToRegion( dev->hdc );
-        RGNDATA *data = X11DRV_GetRegionData( hrgn, 0 );
+        RGNDATA *data = X11DRV_GetDrawableRegion( physDev, hrgn, 0 );
 
         NtGdiDeleteObjectApp( hrgn );
         if (!data) goto done;
         rect = (XRectangle *)data->Buffer;
-        for (i = 0; i < data->rdh.nCount; i++)
-        {
-            rect[i].x += physDev->dc_rect.left;
-            rect[i].y += physDev->dc_rect.top;
-        }
 
         XFillRectangles( gdi_display, physDev->drawable, physDev->gc, rect, data->rdh.nCount );
         free( data );
@@ -1324,8 +1414,8 @@ static BOOL x11drv_stroke_and_fill_path( PHYSDEV dev, BOOL stroke, BOOL fill )
                 }
                 j = 0;
             }
-            xpoints[j].x = physDev->dc_rect.left + points[i].x;
-            xpoints[j].y = physDev->dc_rect.top + points[i].y;
+            xpoints[j].x = x11drv_scale_coord( physDev, physDev->dc_rect.left + points[i].x );
+            xpoints[j].y = x11drv_scale_coord( physDev, physDev->dc_rect.top + points[i].y );
         }
         if (j > 1)
         {
@@ -1399,8 +1489,7 @@ static void X11DRV_InternalFloodFill(XImage *image, X11DRV_PDEVICE *physDev,
     bounds->top    = min( bounds->top, y );
     bounds->right  = max( bounds->right, right );
     bounds->bottom = max( bounds->bottom, y + 1 );
-    XFillRectangle( gdi_display, physDev->drawable, physDev->gc,
-                    xOrg + left, yOrg + y, right-left, 1 );
+    draw_rectangle( physDev, TRUE, xOrg + left, yOrg + y, right - left, 1 );
 
       /* Set the pixels of this line so we don't fill it again */
 
@@ -1443,10 +1532,6 @@ static void X11DRV_InternalFloodFill(XImage *image, X11DRV_PDEVICE *physDev,
 }
 
 
-static int ExtFloodFillXGetImageErrorHandler( Display *dpy, XErrorEvent *event, void *arg )
-{
-    return (event->request_code == X_GetImage && event->error_code == BadMatch);
-}
 
 /**********************************************************************
  *          X11DRV_ExtFloodFill
@@ -1457,6 +1542,8 @@ BOOL X11DRV_ExtFloodFill( PHYSDEV dev, INT x, INT y, COLORREF color, UINT fillTy
     XImage *image;
     RECT rect, bounds;
     POINT pt;
+
+    if (!X11DRV_PrepareBrush( physDev )) return FALSE;
 
     TRACE("X11DRV_ExtFloodFill %d,%d %s %d\n", x, y, debugstr_color(color), fillType );
 
@@ -1482,12 +1569,8 @@ BOOL X11DRV_ExtFloodFill( PHYSDEV dev, INT x, INT y, COLORREF color, UINT fillTy
     }
     if (pt.x < rect.left || pt.x >= rect.right || pt.y < rect.top || pt.y >= rect.bottom) return FALSE;
 
-    X11DRV_expect_error( gdi_display, ExtFloodFillXGetImageErrorHandler, NULL );
-    image = XGetImage( gdi_display, physDev->drawable,
-                       physDev->dc_rect.left + rect.left, physDev->dc_rect.top + rect.top,
-                       rect.right - rect.left, rect.bottom - rect.top,
-                       AllPlanes, ZPixmap );
-    if(X11DRV_check_error()) image = NULL;
+    image = X11DRV_GetDCImage( physDev, rect.left, rect.top,
+                               rect.right - rect.left, rect.bottom - rect.top );
     if (!image) return FALSE;
 
     if (X11DRV_SetupGCForBrush( physDev ))
@@ -1572,9 +1655,9 @@ BOOL X11DRV_GradientFill( PHYSDEV dev, TRIVERTEX *vert_array, ULONG nvert,
                                       (v[0].Blue  * (dx - x) + v[1].Blue  * x) / dx / 256) );
 
                 XSetForeground( gdi_display, physdev->gc, color );
-                XDrawLine( gdi_display, physdev->drawable, physdev->gc,
-                           physdev->dc_rect.left + rc.left + x, physdev->dc_rect.top + rc.top,
-                           physdev->dc_rect.left + rc.left + x, physdev->dc_rect.top + rc.bottom );
+                draw_rectangle( physdev, TRUE,
+                                physdev->dc_rect.left + rc.left + x, physdev->dc_rect.top + rc.top,
+                                1, rc.bottom - rc.top );
             }
         }
         add_device_bounds( physdev, &bounds );
@@ -1622,9 +1705,9 @@ BOOL X11DRV_GradientFill( PHYSDEV dev, TRIVERTEX *vert_array, ULONG nvert,
                                       (v[0].Blue  * (dy - y) + v[1].Blue  * y) / dy / 256) );
 
                 XSetForeground( gdi_display, physdev->gc, color );
-                XDrawLine( gdi_display, physdev->drawable, physdev->gc,
-                           physdev->dc_rect.left + rc.left, physdev->dc_rect.top + rc.top + y,
-                           physdev->dc_rect.left + rc.right, physdev->dc_rect.top + rc.top + y );
+                draw_rectangle( physdev, TRUE,
+                                physdev->dc_rect.left + rc.left, physdev->dc_rect.top + rc.top + y,
+                                rc.right - rc.left, 1 );
             }
         }
         add_device_bounds( physdev, &bounds );

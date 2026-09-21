@@ -611,11 +611,94 @@ static int XGetImage_handler( Display *dpy, XErrorEvent *event, void *arg )
  * Retrieve an area from the destination DC, mapping all the
  * pixels to Windows colors.
  */
+
+/* Resample logical pixel cells using the same rounded edges as drawing and
+ * clipping. This also handles negative origins and cells that disappear at
+ * fractional downscales without inventing a second inverse mapping. */
+XImage *X11DRV_ScaleImage( const X11DRV_PDEVICE *physdev, XImage *source, int src_x, int src_y,
+                          const RECT *rect, BOOL repeat )
+{
+    RECT native = x11drv_device_rect( physdev, rect );
+    XImage *image;
+    int x, y, nx, ny, left, right, top, bottom;
+    int width = native.right - native.left, height = native.bottom - native.top;
+
+    if (width <= 0 || height <= 0) return NULL;
+    image = XCreateImage( gdi_display, default_visual.visual, source->depth,
+                          ZPixmap, 0, NULL, width, height, 32, 0 );
+    if (!image) return NULL;
+    if (image->bytes_per_line <= 0 || height > SIZE_MAX / image->bytes_per_line ||
+        !(image->data = calloc( height, image->bytes_per_line )))
+    {
+        XDestroyImage( image );
+        return NULL;
+    }
+
+    top = 0;
+    for (y = rect->top; y < rect->bottom; y++, top = bottom)
+    {
+        bottom = x11drv_scale_coord( physdev, physdev->dc_rect.top + y + 1 ) - native.top;
+        if (top == bottom) continue;
+        left = 0;
+        for (x = rect->left; x < rect->right; x++, left = right)
+        {
+            unsigned long pixel;
+
+            right = x11drv_scale_coord( physdev, physdev->dc_rect.left + x + 1 ) - native.left;
+            if (left == right) continue;
+            if (repeat)
+                pixel = XGetPixel( source, ((src_x + x - rect->left) % source->width + source->width) % source->width,
+                                   ((src_y + y - rect->top) % source->height + source->height) % source->height );
+            else pixel = XGetPixel( source, src_x + x - rect->left, src_y + y - rect->top );
+            for (nx = left; nx < right; nx++) XPutPixel( image, nx, top, pixel );
+        }
+        for (ny = top + 1; ny < bottom; ny++)
+            memcpy( image->data + (size_t)ny * image->bytes_per_line,
+                    image->data + (size_t)top * image->bytes_per_line, image->bytes_per_line );
+    }
+    return image;
+}
+
+static BOOL put_dc_image( X11DRV_PDEVICE *physdev, XImage *source, int src_x, int src_y,
+                          const RECT *rect )
+{
+    RECT native = x11drv_device_rect( physdev, rect );
+    XImage *image = source;
+
+    if (IsRectEmpty( &native )) return TRUE;
+    if (physdev->drawable_scale_num != physdev->drawable_scale_den)
+    {
+        if (!(image = X11DRV_ScaleImage( physdev, source, src_x, src_y, rect, FALSE ))) return FALSE;
+        src_x = src_y = 0;
+    }
+    XPutImage( gdi_display, physdev->drawable, physdev->gc, image, src_x, src_y,
+               native.left, native.top, native.right - native.left, native.bottom - native.top );
+    if (image != source) XDestroyImage( image );
+    return TRUE;
+}
+
 static int BITBLT_GetDstArea(X11DRV_PDEVICE *physDev, Pixmap pixmap, GC gc, const RECT *visRectDst)
 {
     int exposures = 0;
     INT width  = visRectDst->right - visRectDst->left;
     INT height = visRectDst->bottom - visRectDst->top;
+
+    if (physDev->drawable_scale_num != physDev->drawable_scale_den)
+    {
+        XImage *image;
+        int x, y;
+
+        image = X11DRV_GetDCImage( physDev, visRectDst->left, visRectDst->top, width, height );
+        if (!image) return -1;
+        if (X11DRV_PALETTE_XPixelToPalette && physDev->depth != 1 &&
+            !(X11DRV_PALETTE_PaletteFlags & X11DRV_PALETTE_VIRTUAL))
+            for (y = 0; y < height; y++)
+                for (x = 0; x < width; x++)
+                    XPutPixel( image, x, y, X11DRV_PALETTE_XPixelToPalette[XGetPixel( image, x, y )] );
+        XPutImage( gdi_display, pixmap, gc, image, 0, 0, 0, 0, width, height );
+        XDestroyImage( image );
+        return 0;
+    }
 
     if (!X11DRV_PALETTE_XPixelToPalette || (physDev->depth == 1) ||
 	(X11DRV_PALETTE_PaletteFlags & X11DRV_PALETTE_VIRTUAL) )
@@ -638,15 +721,13 @@ static int BITBLT_GetDstArea(X11DRV_PDEVICE *physDev, Pixmap pixmap, GC gc, cons
         exposures++;
         image = XGetImage( gdi_display, pixmap, 0, 0, width, height,
                            AllPlanes, ZPixmap );
-        if (image)
-        {
-            for (y = 0; y < height; y++)
-                for (x = 0; x < width; x++)
-                    XPutPixel( image, x, y,
-                               X11DRV_PALETTE_XPixelToPalette[XGetPixel( image, x, y )]);
-            XPutImage( gdi_display, pixmap, gc, image, 0, 0, 0, 0, width, height );
-            XDestroyImage( image );
-        }
+        if (!image) return -1;
+        for (y = 0; y < height; y++)
+            for (x = 0; x < width; x++)
+                XPutPixel( image, x, y,
+                           X11DRV_PALETTE_XPixelToPalette[XGetPixel( image, x, y )]);
+        XPutImage( gdi_display, pixmap, gc, image, 0, 0, 0, 0, width, height );
+        XDestroyImage( image );
     }
     return exposures;
 }
@@ -658,39 +739,27 @@ static int BITBLT_GetDstArea(X11DRV_PDEVICE *physDev, Pixmap pixmap, GC gc, cons
  * Put an area back into the destination DC, mapping the pixel
  * colors to X pixels.
  */
-static int BITBLT_PutDstArea(X11DRV_PDEVICE *physDev, Pixmap pixmap, const RECT *visRectDst)
+static int BITBLT_PutDstArea( X11DRV_PDEVICE *physdev, Pixmap pixmap, const RECT *rect )
 {
-    int exposures = 0;
-    INT width  = visRectDst->right - visRectDst->left;
-    INT height = visRectDst->bottom - visRectDst->top;
+    int x, y, width = rect->right - rect->left, height = rect->bottom - rect->top;
+    BOOL ret, map_colors = X11DRV_PALETTE_PaletteToXPixel && physdev->depth != 1 &&
+                           !(X11DRV_PALETTE_PaletteFlags & X11DRV_PALETTE_VIRTUAL);
+    XImage *image;
 
-    /* !X11DRV_PALETTE_PaletteToXPixel is _NOT_ enough */
-
-    if (!X11DRV_PALETTE_PaletteToXPixel || (physDev->depth == 1) ||
-        (X11DRV_PALETTE_PaletteFlags & X11DRV_PALETTE_VIRTUAL) )
+    if (!map_colors && physdev->drawable_scale_num == physdev->drawable_scale_den)
     {
-        XCopyArea( gdi_display, pixmap, physDev->drawable, physDev->gc, 0, 0, width, height,
-                   physDev->dc_rect.left + visRectDst->left,
-                   physDev->dc_rect.top + visRectDst->top );
-        exposures++;
+        XCopyArea( gdi_display, pixmap, physdev->drawable, physdev->gc, 0, 0, width, height,
+                   physdev->dc_rect.left + rect->left, physdev->dc_rect.top + rect->top );
+        return 1;
     }
-    else
-    {
-        register INT x, y;
-        XImage *image = XGetImage( gdi_display, pixmap, 0, 0, width, height,
-                                   AllPlanes, ZPixmap );
+    if (!(image = XGetImage( gdi_display, pixmap, 0, 0, width, height, AllPlanes, ZPixmap ))) return -1;
+    if (map_colors)
         for (y = 0; y < height; y++)
             for (x = 0; x < width; x++)
-            {
-                XPutPixel( image, x, y,
-                           X11DRV_PALETTE_PaletteToXPixel[XGetPixel( image, x, y )]);
-            }
-        XPutImage( gdi_display, physDev->drawable, physDev->gc, image, 0, 0,
-                   physDev->dc_rect.left + visRectDst->left,
-                   physDev->dc_rect.top + visRectDst->top, width, height );
-        XDestroyImage( image );
-    }
-    return exposures;
+                XPutPixel( image, x, y, X11DRV_PALETTE_PaletteToXPixel[XGetPixel( image, x, y )] );
+    ret = put_dc_image( physdev, image, 0, 0, rect );
+    XDestroyImage( image );
+    return ret ? 0 : -1;
 }
 
 static BOOL same_format(X11DRV_PDEVICE *physDevSrc, X11DRV_PDEVICE *physDevDst)
@@ -702,11 +771,13 @@ static BOOL same_format(X11DRV_PDEVICE *physDevSrc, X11DRV_PDEVICE *physDevDst)
     return FALSE;
 }
 
-void execute_rop( X11DRV_PDEVICE *physdev, Pixmap src_pixmap, GC gc, const RECT *visrect, DWORD rop )
+BOOL execute_rop( X11DRV_PDEVICE *physdev, Pixmap src_pixmap, GC gc, const RECT *visrect, DWORD rop )
 {
     Pixmap pixmaps[3];
     Pixmap result = src_pixmap;
-    BOOL null_brush;
+    BOOL null_brush, ret = FALSE;
+    int exposures;
+    POINT origin = {0};
     const BYTE *opcode = BITBLT_Opcodes[(rop >> 16) & 0xff];
     BOOL use_pat = (((rop >> 4) & 0x0f0000) != (rop & 0x0f0000));
     BOOL use_dst = (((rop >> 1) & 0x550000) != (rop & 0x550000));
@@ -717,8 +788,14 @@ void execute_rop( X11DRV_PDEVICE *physdev, Pixmap src_pixmap, GC gc, const RECT 
     pixmaps[TMP] = 0;
     pixmaps[DST] = XCreatePixmap( gdi_display, root_window, width, height, physdev->depth );
 
-    if (use_dst) BITBLT_GetDstArea( physdev, pixmaps[DST], gc, visrect );
-    null_brush = use_pat && !X11DRV_SetupGCForPatBlt( physdev, gc, TRUE );
+    if (use_dst && BITBLT_GetDstArea( physdev, pixmaps[DST], gc, visrect ) < 0) goto done;
+    null_brush = use_pat && physdev->brush.style == BS_NULL;
+    if (use_pat && !null_brush && !X11DRV_SetupGCForPatBlt( physdev, gc, TRUE )) goto done;
+    if (use_pat)
+    {
+        NtGdiGetDCPoint( physdev->dev.hdc, NtGdiGetBrushOrgEx, &origin );
+        XSetTSOrigin( gdi_display, gc, origin.x - visrect->left, origin.y - visrect->top );
+    }
 
     for ( ; *opcode; opcode++)
     {
@@ -746,10 +823,15 @@ void execute_rop( X11DRV_PDEVICE *physdev, Pixmap src_pixmap, GC gc, const RECT 
         }
     }
     XSetFunction( gdi_display, physdev->gc, GXcopy );
-    physdev->exposures += BITBLT_PutDstArea( physdev, result, visrect );
+    exposures = BITBLT_PutDstArea( physdev, result, visrect );
+    if (exposures < 0) goto done;
+    physdev->exposures += exposures;
+    add_device_bounds( physdev, visrect );
+    ret = TRUE;
+done:
     XFreePixmap( gdi_display, pixmaps[DST] );
     if (pixmaps[TMP]) XFreePixmap( gdi_display, pixmaps[TMP] );
-    add_device_bounds( physdev, visrect );
+    return ret;
 }
 
 /***********************************************************************
@@ -758,9 +840,11 @@ void execute_rop( X11DRV_PDEVICE *physdev, Pixmap src_pixmap, GC gc, const RECT 
 BOOL X11DRV_PatBlt( PHYSDEV dev, struct bitblt_coords *dst, DWORD rop )
 {
     X11DRV_PDEVICE *physDev = get_x11drv_dev( dev );
+    RECT native_rect = x11drv_device_rect( physDev, &dst->visrect );
     BOOL usePat = (((rop >> 4) & 0x0f0000) != (rop & 0x0f0000));
     const BYTE *opcode = BITBLT_Opcodes[(rop >> 16) & 0xff];
 
+    if (usePat && !X11DRV_PrepareBrush( physDev )) return FALSE;
     if (usePat && !X11DRV_SetupGCForBrush( physDev )) return TRUE;
 
     XSetFunction( gdi_display, physDev->gc, OP_ROP(*opcode) );
@@ -795,10 +879,8 @@ BOOL X11DRV_PatBlt( PHYSDEV dev, struct bitblt_coords *dst, DWORD rop )
         break;
     }
     XFillRectangle( gdi_display, physDev->drawable, physDev->gc,
-                    physDev->dc_rect.left + dst->visrect.left,
-                    physDev->dc_rect.top + dst->visrect.top,
-                    dst->visrect.right - dst->visrect.left,
-                    dst->visrect.bottom - dst->visrect.top );
+                    native_rect.left, native_rect.top,
+                    native_rect.right - native_rect.left, native_rect.bottom - native_rect.top );
     add_device_bounds( physDev, &dst->visrect );
     return TRUE;
 }
@@ -816,9 +898,11 @@ BOOL X11DRV_StretchBlt( PHYSDEV dst_dev, struct bitblt_coords *dst,
     const BYTE *opcode;
     Pixmap src_pixmap;
     GC gc;
+    BOOL ret;
 
     if (src_dev->funcs != dst_dev->funcs ||
         physDevSrc->drawable_scale_num != physDevSrc->drawable_scale_den ||
+        physDevDst->drawable_scale_num != physDevDst->drawable_scale_den ||
         src->width != dst->width || src->height != dst->height ||  /* no stretching with core X11 */
         (physDevDst->depth == 1 && physDevSrc->depth != 1) ||  /* color -> mono done by hand */
         (X11DRV_PALETTE_XPixelToPalette && physDevSrc->depth != 1))  /* needs palette mapping */
@@ -920,11 +1004,11 @@ BOOL X11DRV_StretchBlt( PHYSDEV dst_dev, struct bitblt_coords *dst,
                    width, height, 0, 0 );
     }
 
-    execute_rop( physDevDst, src_pixmap, gc, &dst->visrect, rop );
+    ret = execute_rop( physDevDst, src_pixmap, gc, &dst->visrect, rop );
 
     XFreePixmap( gdi_display, src_pixmap );
     XFreeGC( gdi_display, gc );
-    return TRUE;
+    return ret;
 }
 
 
@@ -1275,9 +1359,8 @@ DWORD X11DRV_PutImage( PHYSDEV dev, HRGN clip, BITMAPINFO *info,
         if (!opcode[1] && OP_SRCDST(opcode[0]) == OP_ARGS(SRC,DST))
         {
             XSetFunction( gdi_display, physdev->gc, OP_ROP(*opcode) );
-            XPutImage( gdi_display, physdev->drawable, physdev->gc, image, src->visrect.left, 0,
-                       physdev->dc_rect.left + dst->visrect.left,
-                       physdev->dc_rect.top + dst->visrect.top, width, height );
+            ret = put_dc_image( physdev, image, src->visrect.left, 0, &dst->visrect ) ?
+                  ERROR_SUCCESS : ERROR_OUTOFMEMORY;
         }
         else
         {
@@ -1288,14 +1371,15 @@ DWORD X11DRV_PutImage( PHYSDEV dev, HRGN clip, BITMAPINFO *info,
             XSetGraphicsExposures( gdi_display, gc, False );
             XPutImage( gdi_display, src_pixmap, gc, image, src->visrect.left, 0, 0, 0, width, height );
 
-            execute_rop( physdev, src_pixmap, gc, &dst->visrect, rop );
+            ret = execute_rop( physdev, src_pixmap, gc, &dst->visrect, rop ) ?
+                  ERROR_SUCCESS : ERROR_OUTOFMEMORY;
 
             XFreePixmap( gdi_display, src_pixmap );
             XFreeGC( gdi_display, gc );
         }
 
         if (restore_region) restore_clipping_region( physdev );
-        add_device_bounds( physdev, &dst->visrect );
+        if (!ret) add_device_bounds( physdev, &dst->visrect );
         image->data = NULL;
     }
 
@@ -1391,6 +1475,19 @@ done:
     return image;
 }
 
+/* Return native-format pixels indexed in virtual, DC-relative coordinates. */
+XImage *X11DRV_GetDCImage( X11DRV_PDEVICE *physdev, int x, int y, UINT width, UINT height )
+{
+    XVisualInfo vis = default_visual;
+
+    vis.depth = physdev->depth;
+    x += physdev->dc_rect.left;
+    y += physdev->dc_rect.top;
+    if (physdev->drawable_scale_num != physdev->drawable_scale_den)
+        return get_scaled_dc_image( physdev, &vis, x, y, width, height );
+    return get_dc_image( physdev, x, y, width, height );
+}
+
 /***********************************************************************
  *           X11DRV_GetImage
  */
@@ -1449,10 +1546,7 @@ DWORD X11DRV_GetImage( PHYSDEV dev, BITMAPINFO *info,
     src->y -= y;
     OffsetRect( &src->visrect, -x, -y );
 
-    if (physdev->drawable_scale_num != physdev->drawable_scale_den)
-        image = get_scaled_dc_image( physdev, &vis, physdev->dc_rect.left + x,
-                                      physdev->dc_rect.top + y, width, height );
-    else image = get_dc_image( physdev, physdev->dc_rect.left + x, physdev->dc_rect.top + y, width, height );
+    image = X11DRV_GetDCImage( physdev, x, y, width, height );
 
     if (!image) return ERROR_OUTOFMEMORY;
 

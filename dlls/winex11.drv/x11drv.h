@@ -104,6 +104,11 @@ typedef struct
     int          fillStyle;
     int          pixel;
     Pixmap       pixmap;
+    SIZE         size;
+    Pixmap       scaled_pixmap;
+    RECT         scaled_dc, scaled_rect;
+    POINT        scaled_origin;
+    UINT         scaled_num, scaled_den;
 } X_PHYSBRUSH;
 
 typedef struct {
@@ -284,13 +289,20 @@ extern DWORD get_pixmap_image( Pixmap pixmap, int width, int height, const XVisu
                                BITMAPINFO *info, struct gdi_image_bits *bits );
 
 extern RGNDATA *X11DRV_GetRegionData( HRGN hrgn, HDC hdc_lptodp );
+extern RGNDATA *X11DRV_GetDrawableRegion( const X11DRV_PDEVICE *physdev, HRGN hrgn, HDC hdc_lptodp );
 extern DWORD X11DRV_GetRegionDataSize( HRGN hrgn );
 extern BOOL X11DRV_FillRegionData( HRGN hrgn, HDC hdc_lptodp, RGNDATA *data, DWORD size );
 extern BOOL add_extra_clipping_region( X11DRV_PDEVICE *dev, HRGN rgn );
 extern void restore_clipping_region( X11DRV_PDEVICE *dev );
 extern void add_device_bounds( X11DRV_PDEVICE *dev, const RECT *rect );
 
-extern void execute_rop( X11DRV_PDEVICE *physdev, Pixmap src_pixmap, GC gc, const RECT *visrect, DWORD rop );
+extern BOOL execute_rop( X11DRV_PDEVICE *physdev, Pixmap src_pixmap, GC gc, const RECT *visrect, DWORD rop );
+extern XImage *X11DRV_GetDCImage( X11DRV_PDEVICE *physdev, int x, int y, UINT width, UINT height );
+extern XImage *X11DRV_ScaleImage( const X11DRV_PDEVICE *physdev, XImage *source, int src_x, int src_y,
+                                const RECT *rect, BOOL repeat );
+extern void X11DRV_SetBrushPixmap( X11DRV_PDEVICE *physdev, Pixmap pixmap, int width, int height );
+extern Pixmap X11DRV_GetScaledBrush( X11DRV_PDEVICE *physdev, const POINT *origin );
+extern BOOL X11DRV_PrepareBrush( X11DRV_PDEVICE *physdev );
 
 extern BOOL X11DRV_SetupGCForPatBlt( X11DRV_PDEVICE *physDev, GC gc, BOOL fMapColors );
 extern BOOL X11DRV_SetupGCForBrush( X11DRV_PDEVICE *physDev );
@@ -1123,6 +1135,70 @@ static inline int x11drv_scale_coord( const X11DRV_PDEVICE *physdev, int value )
     UINT den = physdev->drawable_scale_den;
 
     return (scaled + (scaled < 0 ? -(LONGLONG)(den / 2) : den / 2)) / den;
+}
+
+static inline RECT x11drv_scale_rect( const X11DRV_PDEVICE *physdev, const RECT *rect )
+{
+    RECT ret;
+
+    ret.left   = x11drv_scale_coord( physdev, rect->left );
+    ret.top    = x11drv_scale_coord( physdev, rect->top );
+    ret.right  = x11drv_scale_coord( physdev, rect->right );
+    ret.bottom = x11drv_scale_coord( physdev, rect->bottom );
+    return ret;
+}
+
+/* Input is relative to the virtual DC; output is absolute in the drawable. */
+static inline RECT x11drv_device_rect( const X11DRV_PDEVICE *physdev, const RECT *rect )
+{
+    RECT ret = *rect;
+
+    OffsetRect( &ret, physdev->dc_rect.left, physdev->dc_rect.top );
+    return x11drv_scale_rect( physdev, &ret );
+}
+
+/* Outward rounding keeps virtual damage bounds conservative after native
+ * rasterization, whose hinting can differ from the logical glyph metrics. */
+static inline int x11drv_unscale_bound( const X11DRV_PDEVICE *physdev, int value, BOOL upper )
+{
+    LONGLONG scaled = (LONGLONG)value * physdev->drawable_scale_den;
+    UINT num = physdev->drawable_scale_num;
+
+    if (upper && scaled > 0) scaled += num - 1;
+    if (!upper && scaled < 0) scaled -= num - 1;
+    return scaled / num;
+}
+
+static inline RECT x11drv_virtual_rect( const X11DRV_PDEVICE *physdev, const RECT *rect )
+{
+    RECT ret;
+
+    ret.left   = x11drv_unscale_bound( physdev, rect->left, FALSE ) - physdev->dc_rect.left;
+    ret.top    = x11drv_unscale_bound( physdev, rect->top, FALSE ) - physdev->dc_rect.top;
+    ret.right  = x11drv_unscale_bound( physdev, rect->right, TRUE ) - physdev->dc_rect.left;
+    ret.bottom = x11drv_unscale_bound( physdev, rect->bottom, TRUE ) - physdev->dc_rect.top;
+    return ret;
+}
+
+/* Negative blit extents start at an inclusive last pixel. Transform the
+ * covered edges before restoring that convention in native coordinates. */
+static inline struct bitblt_coords x11drv_device_coords( const X11DRV_PDEVICE *physdev,
+                                                        const struct bitblt_coords *coords )
+{
+    struct bitblt_coords ret = *coords;
+    RECT rect;
+
+    rect.left   = coords->x + (coords->width < 0 ? coords->width + 1 : 0);
+    rect.top    = coords->y + (coords->height < 0 ? coords->height + 1 : 0);
+    rect.right  = coords->x + (coords->width < 0 ? 1 : coords->width);
+    rect.bottom = coords->y + (coords->height < 0 ? 1 : coords->height);
+    rect = x11drv_device_rect( physdev, &rect );
+    ret.x = coords->width < 0 ? rect.right - 1 : rect.left;
+    ret.y = coords->height < 0 ? rect.bottom - 1 : rect.top;
+    ret.width = coords->width < 0 ? rect.left - rect.right : rect.right - rect.left;
+    ret.height = coords->height < 0 ? rect.top - rect.bottom : rect.bottom - rect.top;
+    ret.visrect = x11drv_device_rect( physdev, &coords->visrect );
+    return ret;
 }
 
 static inline BOOL lp_to_dp( HDC hdc, POINT *points, INT count )

@@ -114,6 +114,7 @@ typedef struct
     LOGFONTW lf;
     XFORM    xform;
     SIZE     devsize;  /* size in device coords */
+    UINT     scale_num, scale_den;
     DWORD    hash;
 } LFANDSIZE;
 
@@ -129,7 +130,11 @@ typedef struct
     XRenderPictFormat *font_format;
     int nrealized;
     BOOL *realized;
-    XGlyphInfo *gis;
+    struct
+    {
+        XGlyphInfo native;
+        GLYPHMETRICS logical;
+    } *gis;
 } gsCacheEntryFormat;
 
 typedef struct
@@ -148,6 +153,7 @@ struct xrender_physdev
     enum wxr_format    format;
     UINT               aa_flags;
     int                cache_index;
+    UINT               font_scale_num, font_scale_den;
     BOOL               update_clip;
     Picture            pict;
     Picture            pict_src;
@@ -587,10 +593,10 @@ static void update_xrender_clipping( struct xrender_physdev *dev, HRGN rgn )
         pa.clip_mask = None;
         pXRenderChangePicture( gdi_display, dev->pict, CPClipMask, &pa );
     }
-    else if ((data = X11DRV_GetRegionData( rgn, 0 )))
+    else if ((data = X11DRV_GetDrawableRegion( dev->x11dev, rgn, 0 )))
     {
         pXRenderSetPictureClipRectangles( gdi_display, dev->pict,
-                                          dev->x11dev->dc_rect.left, dev->x11dev->dc_rect.top,
+                                          0, 0,
                                           (XRectangle *)data->Buffer, data->rdh.nCount );
         free( data );
     }
@@ -702,6 +708,7 @@ static Picture get_no_alpha_mask(void)
 static BOOL fontcmp(LFANDSIZE *p1, LFANDSIZE *p2)
 {
   if(p1->hash != p2->hash) return TRUE;
+  if (p1->scale_num != p2->scale_num || p1->scale_den != p2->scale_den) return TRUE;
   if(memcmp(&p1->devsize, &p2->devsize, sizeof(p1->devsize))) return TRUE;
   if(memcmp(&p1->xform, &p2->xform, sizeof(p1->xform))) return TRUE;
   if(memcmp(&p1->lf, &p2->lf, offsetof(LOGFONTW, lfFaceName))) return TRUE;
@@ -854,6 +861,8 @@ static void lfsz_calc_hash(LFANDSIZE *plfsz)
 
   hash ^= plfsz->devsize.cx;
   hash ^= plfsz->devsize.cy;
+  hash ^= plfsz->scale_num;
+  hash ^= plfsz->scale_den << 16;
   for(i = 0, ptr = (DWORD*)&plfsz->xform; i < sizeof(XFORM)/sizeof(DWORD); i++, ptr++)
     hash ^= *ptr;
   for(i = 0, ptr = (DWORD*)&plfsz->lf; i < 7; i++, ptr++)
@@ -983,12 +992,16 @@ static HFONT xrenderdrv_SelectFont( PHYSDEV dev, HFONT hfont, UINT *aa_flags )
     /* Not used fields, would break hashing */
     lfsz.xform.eDx = lfsz.xform.eDy = 0;
 
+    lfsz.scale_num = physdev->x11dev->drawable_scale_num;
+    lfsz.scale_den = physdev->x11dev->drawable_scale_den;
     lfsz_calc_hash(&lfsz);
 
     pthread_mutex_lock( &xrender_mutex );
     if (physdev->cache_index != -1)
         dec_ref_cache( physdev->cache_index );
     physdev->cache_index = GetCacheEntry( &lfsz );
+    physdev->font_scale_num = lfsz.scale_num;
+    physdev->font_scale_den = lfsz.scale_den;
     pthread_mutex_unlock( &xrender_mutex );
     return ret;
 }
@@ -1153,8 +1166,12 @@ static void UploadGlyph(struct xrender_physdev *physDev, UINT glyph, enum glyph_
     unsigned int buflen;
     char *buf;
     Glyph gid;
-    GLYPHMETRICS gm;
+    GLYPHMETRICS gm, logical;
     XGlyphInfo gi;
+    UINT outline_glyph = glyph;
+    ULONGLONG scale = ((ULONGLONG)physDev->font_scale_num * 65536 + physDev->font_scale_den / 2) /
+                     physDev->font_scale_den;
+    MAT2 transform = { {0}, {0}, {0}, {0} };
     gsCacheEntry *entry = glyphsetCache + physDev->cache_index;
     gsCacheEntryFormat *formatEntry;
     UINT ggo_format = physDev->aa_flags;
@@ -1163,24 +1180,28 @@ static void UploadGlyph(struct xrender_physdev *physDev, UINT glyph, enum glyph_
     static const char zero[4];
     static const MAT2 identity = { {0,1},{0,0},{0,0},{0,1} };
 
+    if (!scale || scale > INT_MAX) return;
+    transform.eM11.value = transform.eM22.value = scale >> 16;
+    transform.eM11.fract = transform.eM22.fract = scale & 0xffff;
+
     if (type == GLYPH_INDEX) ggo_format |= GGO_GLYPH_INDEX;
-    buflen = NtGdiGetGlyphOutline( physDev->dev.hdc, glyph, ggo_format, &gm, 0, NULL, &identity, FALSE );
+    buflen = NtGdiGetGlyphOutline( physDev->dev.hdc, outline_glyph, ggo_format, &gm, 0, NULL, &transform, FALSE );
     if(buflen == GDI_ERROR) {
         if(format != AA_None) {
             format = AA_None;
             physDev->aa_flags = GGO_BITMAP;
             ggo_format = (ggo_format & GGO_GLYPH_INDEX) | GGO_BITMAP;
-            buflen = NtGdiGetGlyphOutline( physDev->dev.hdc, glyph, ggo_format, &gm, 0, NULL,
-                                           &identity, FALSE);
+            buflen = NtGdiGetGlyphOutline( physDev->dev.hdc, outline_glyph, ggo_format, &gm, 0, NULL,
+                                           &transform, FALSE);
         }
         if(buflen == GDI_ERROR) {
             WARN("GetGlyphOutlineW failed using default glyph\n");
-            buflen = NtGdiGetGlyphOutline( physDev->dev.hdc, 0, ggo_format, &gm, 0, NULL,
-                                           &identity, FALSE );
+            buflen = NtGdiGetGlyphOutline( physDev->dev.hdc, (outline_glyph = 0), ggo_format, &gm, 0, NULL,
+                                           &transform, FALSE );
             if(buflen == GDI_ERROR) {
                 WARN("GetGlyphOutlineW failed for default glyph trying for space\n");
-                buflen = NtGdiGetGlyphOutline( physDev->dev.hdc, 0x20, ggo_format, &gm, 0, NULL,
-                                               &identity, FALSE );
+                buflen = NtGdiGetGlyphOutline( physDev->dev.hdc, (outline_glyph = 0x20), ggo_format, &gm, 0, NULL,
+                                               &transform, FALSE );
                 if(buflen == GDI_ERROR) {
                     ERR("GetGlyphOutlineW for all attempts unable to upload a glyph\n");
                     return;
@@ -1190,20 +1211,28 @@ static void UploadGlyph(struct xrender_physdev *physDev, UINT glyph, enum glyph_
         TRACE("Turning off antialiasing for this monochrome font\n");
     }
 
+    logical = gm;
+    if (scale != 65536 && NtGdiGetGlyphOutline( physDev->dev.hdc, outline_glyph, ggo_format,
+                                               &logical, 0, NULL, &identity, FALSE ) == GDI_ERROR) return;
+
     /* If there is nothing for the current type, we create the entry. */
     if( !entry->format[type][format] ) {
         entry->format[type][format] = calloc( 1, sizeof(gsCacheEntryFormat) );
     }
     formatEntry = entry->format[type][format];
+    if (!formatEntry) return;
 
     if(formatEntry->nrealized <= glyph) {
         size_t new_size = (glyph / 128 + 1) * 128;
 
-        formatEntry->realized = realloc( formatEntry->realized, new_size * sizeof(BOOL) );
+        void *storage;
+
+        if (!(storage = realloc( formatEntry->realized, new_size * sizeof(BOOL) ))) return;
+        formatEntry->realized = storage;
+        if (!(storage = realloc( formatEntry->gis, new_size * sizeof(formatEntry->gis[0]) ))) return;
+        formatEntry->gis = storage;
         memset( formatEntry->realized + formatEntry->nrealized, 0,
                 (new_size - formatEntry->nrealized) * sizeof(BOOL) );
-
-        formatEntry->gis = realloc( formatEntry->gis, new_size * sizeof(formatEntry->gis[0]) );
         memset( formatEntry->gis + formatEntry->nrealized, 0,
                 (new_size - formatEntry->nrealized) * sizeof(formatEntry->gis[0]) );
 
@@ -1239,10 +1268,16 @@ static void UploadGlyph(struct xrender_physdev *physDev, UINT glyph, enum glyph_
 
     buf = calloc( 1, buflen );
     if (buflen)
-        NtGdiGetGlyphOutline( physDev->dev.hdc, glyph, ggo_format, &gm, buflen, buf, &identity, FALSE );
-    else
-        gm.gmBlackBoxX = gm.gmBlackBoxY = 0;  /* empty glyph */
-    formatEntry->realized[glyph] = TRUE;
+    {
+        if (!buf) return;
+        if (NtGdiGetGlyphOutline( physDev->dev.hdc, outline_glyph, ggo_format,
+                                 &gm, buflen, buf, &transform, FALSE ) == GDI_ERROR)
+        {
+            free( buf );
+            return;
+        }
+    }
+    else gm.gmBlackBoxX = gm.gmBlackBoxY = 0;  /* empty glyph */
 
     TRACE("buflen = %d. Got metrics: %dx%d adv=%d,%d origin=%d,%d\n",
 	  buflen,
@@ -1266,7 +1301,7 @@ static void UploadGlyph(struct xrender_physdev *physDev, UINT glyph, enum glyph_
 	    for(i = 0; i < gi.height; i++) {
 	        line = (unsigned char*) buf + i * pitch;
 		output[0] = '\0';
-		for(j = 0; j < pitch * 8; j++) {
+		for(j = 0; j < pitch * 8 && j < sizeof(output) - 1; j++) {
 	            strcat(output, (line[j / 8] & (1 << (7 - (j % 8)))) ? "#" : " ");
 		}
 		TRACE("%s\n", output);
@@ -1280,7 +1315,7 @@ static void UploadGlyph(struct xrender_physdev *physDev, UINT glyph, enum glyph_
 	    for(i = 0; i < gi.height; i++) {
 	        line = (unsigned char*) buf + i * pitch;
 		output[0] = '\0';
-		for(j = 0; j < pitch; j++) {
+		for(j = 0; j < pitch && j < sizeof(output) - 1; j++) {
 		    str[0] = blks[line[j] >> 5];
 		    strcat(output, str);
 		}
@@ -1329,7 +1364,9 @@ static void UploadGlyph(struct xrender_physdev *physDev, UINT glyph, enum glyph_
     }
 
     free( buf );
-    formatEntry->gis[glyph] = gi;
+    formatEntry->gis[glyph].native = gi;
+    formatEntry->gis[glyph].logical = logical;
+    formatEntry->realized[glyph] = TRUE;
 }
 
 /*************************************************************
@@ -1435,6 +1472,15 @@ static BOOL xrenderdrv_ExtTextOut( PHYSDEV dev, INT x, INT y, UINT flags,
     RECT rect, bounds;
     enum glyph_type type = (flags & ETO_GLYPH_INDEX) ? GLYPH_INDEX : GLYPH_WCHAR;
 
+    if (count && (physdev->cache_index == -1 ||
+                  physdev->font_scale_num != physdev->x11dev->drawable_scale_num ||
+                  physdev->font_scale_den != physdev->x11dev->drawable_scale_den))
+    {
+        UINT aa_flags = physdev->aa_flags;
+        if (!xrenderdrv_SelectFont( dev, NtGdiGetDCObject( dev->hdc, NTGDI_OBJ_FONT ), &aa_flags ))
+            return FALSE;
+    }
+
     NtGdiGetDCDword( physdev->dev.hdc, NtGdiGetTextColor, &text_color );
     get_xrender_color( physdev, text_color, &col );
     pict = get_xrender_picture( physdev, 0, (flags & ETO_CLIPPED) ? lprect : NULL );
@@ -1453,12 +1499,10 @@ static BOOL xrenderdrv_ExtTextOut( PHYSDEV dev, INT x, INT y, UINT flags,
             get_xrender_color( physdev, bg_color, &bg );
         }
 
+        rect = x11drv_device_rect( physdev->x11dev, lprect );
         set_xrender_transformation( gdi_display, pict, 1, 1, 0, 0 );
         pXRenderFillRectangle( gdi_display, PictOpSrc, pict, &bg,
-                               physdev->x11dev->dc_rect.left + lprect->left,
-                               physdev->x11dev->dc_rect.top + lprect->top,
-                               lprect->right - lprect->left,
-                               lprect->bottom - lprect->top );
+                               rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top );
         add_device_bounds( physdev->x11dev, lprect );
     }
 
@@ -1469,26 +1513,30 @@ static BOOL xrenderdrv_ExtTextOut( PHYSDEV dev, INT x, INT y, UINT flags,
     entry = glyphsetCache + physdev->cache_index;
     formatEntry = entry->format[type][aa_type_from_flags( physdev->aa_flags )];
 
-    for(idx = 0; idx < count; idx++) {
-        if( !formatEntry ) {
-	    UploadGlyph(physdev, wstr[idx], type);
-            /* re-evaluate format entry since aa_flags may have changed */
-            formatEntry = entry->format[type][aa_type_from_flags( physdev->aa_flags )];
-        } else if( wstr[idx] >= formatEntry->nrealized || formatEntry->realized[wstr[idx]] == FALSE) {
-	    UploadGlyph(physdev, wstr[idx], type);
-	}
-    }
-    if (!formatEntry)
+    for (idx = 0; idx < count; idx++)
     {
-        WARN("could not upload requested glyphs\n");
-        pthread_mutex_unlock( &xrender_mutex );
-        return FALSE;
+        if (!formatEntry || wstr[idx] >= formatEntry->nrealized || !formatEntry->realized[wstr[idx]])
+        {
+            UploadGlyph( physdev, wstr[idx], type );
+            /* An upload can change the antialiasing format. */
+            formatEntry = entry->format[type][aa_type_from_flags( physdev->aa_flags )];
+        }
+        if (!formatEntry || wstr[idx] >= formatEntry->nrealized || !formatEntry->realized[wstr[idx]])
+        {
+            WARN( "could not upload requested glyph %04x\n", wstr[idx] );
+            pthread_mutex_unlock( &xrender_mutex );
+            return FALSE;
+        }
     }
 
     TRACE("Writing %s at %d,%d\n", debugstr_wn(wstr,count),
            physdev->x11dev->dc_rect.left + x, physdev->x11dev->dc_rect.top + y);
 
-    elts = malloc( sizeof(XGlyphElt16) * count );
+    if (!(elts = malloc( sizeof(XGlyphElt16) * count )))
+    {
+        pthread_mutex_unlock( &xrender_mutex );
+        return FALSE;
+    }
 
     /* There's a bug in XRenderCompositeText that ignores the xDst and yDst parameters.
        So we pass zeros to the function and move to our starting position using the first
@@ -1509,25 +1557,34 @@ static BOOL xrenderdrv_ExtTextOut( PHYSDEV dev, INT x, INT y, UINT flags,
     reset_bounds( &bounds );
     for(idx = 0; idx < count; idx++)
     {
+        const GLYPHMETRICS *logical = &formatEntry->gis[wstr[idx]].logical;
+        const XGlyphInfo *native = &formatEntry->gis[wstr[idx]].native;
+        POINT position = { x11drv_scale_coord( physdev->x11dev, desired.x ),
+                           x11drv_scale_coord( physdev->x11dev, desired.y ) };
+
         elts[idx].glyphset = formatEntry->glyphset;
         elts[idx].chars = wstr + idx;
         elts[idx].nchars = 1;
-        elts[idx].xOff = desired.x - current.x;
-        elts[idx].yOff = desired.y - current.y;
+        elts[idx].xOff = position.x - current.x;
+        elts[idx].yOff = position.y - current.y;
 
-        current.x += (elts[idx].xOff + formatEntry->gis[wstr[idx]].xOff);
-        current.y += (elts[idx].yOff + formatEntry->gis[wstr[idx]].yOff);
+        current.x += (elts[idx].xOff + native->xOff);
+        current.y += (elts[idx].yOff + native->yOff);
 
-        rect.left   = desired.x - physdev->x11dev->dc_rect.left - formatEntry->gis[wstr[idx]].x;
-        rect.top    = desired.y - physdev->x11dev->dc_rect.top - formatEntry->gis[wstr[idx]].y;
-        rect.right  = rect.left + formatEntry->gis[wstr[idx]].width;
-        rect.bottom = rect.top  + formatEntry->gis[wstr[idx]].height;
+        rect.left   = desired.x - physdev->x11dev->dc_rect.left + logical->gmptGlyphOrigin.x;
+        rect.top    = desired.y - physdev->x11dev->dc_rect.top - logical->gmptGlyphOrigin.y;
+        rect.right  = rect.left + logical->gmBlackBoxX;
+        rect.bottom = rect.top  + logical->gmBlackBoxY;
+        add_bounds_rect( &bounds, &rect );
+        SetRect( &rect, position.x - native->x, position.y - native->y,
+                 position.x - native->x + native->width, position.y - native->y + native->height );
+        rect = x11drv_virtual_rect( physdev->x11dev, &rect );
         add_bounds_rect( &bounds, &rect );
 
         if(!lpDx)
         {
-            desired.x += formatEntry->gis[wstr[idx]].xOff;
-            desired.y += formatEntry->gis[wstr[idx]].yOff;
+            desired.x += logical->gmCellIncX;
+            desired.y += logical->gmCellIncY;
         }
         else
         {
@@ -1751,8 +1808,8 @@ static void xrender_stretch_blit( struct xrender_physdev *physdev_src, struct xr
 {
     int x_dst, y_dst;
     Picture src_pict = 0, dst_pict, mask_pict = 0;
-    double xscale = src->width / (double)dst->width;
-    double yscale = src->height / (double)dst->height;
+    double xscale, yscale;
+    struct bitblt_coords native;
 
     if (drawable)  /* using an intermediate pixmap */
     {
@@ -1762,10 +1819,16 @@ static void xrender_stretch_blit( struct xrender_physdev *physdev_src, struct xr
     }
     else
     {
-        x_dst = physdev_dst->x11dev->dc_rect.left + dst->x;
-        y_dst = physdev_dst->x11dev->dc_rect.top + dst->y;
+        native = x11drv_device_coords( physdev_dst->x11dev, dst );
+        if (!native.width || !native.height) return;
         dst_pict = get_xrender_picture( physdev_dst, 0, &dst->visrect );
+        dst = &native;
+        x_dst = dst->x;
+        y_dst = dst->y;
     }
+
+    xscale = src->width / (double)dst->width;
+    yscale = src->height / (double)dst->height;
 
     src_pict = get_xrender_picture_source( physdev_src, FALSE );
 
@@ -1809,6 +1872,7 @@ static void xrender_put_image( Pixmap src_pixmap, Picture src_pict, Picture mask
     int x_dst, y_dst;
     Picture dst_pict;
     double xscale, yscale;
+    struct bitblt_coords native;
 
     if (drawable)  /* using an intermediate pixmap */
     {
@@ -1825,9 +1889,12 @@ static void xrender_put_image( Pixmap src_pixmap, Picture src_pict, Picture mask
     }
     else
     {
-        x_dst = physdev->x11dev->dc_rect.left + dst->x;
-        y_dst = physdev->x11dev->dc_rect.top + dst->y;
+        native = x11drv_device_coords( physdev->x11dev, dst );
+        if (!native.width || !native.height) return;
         dst_pict = get_xrender_picture( physdev, clip, &dst->visrect );
+        dst = &native;
+        x_dst = dst->x;
+        y_dst = dst->y;
     }
 
     if (!use_repeat)
@@ -1852,7 +1919,10 @@ static BOOL xrenderdrv_StretchBlt( PHYSDEV dst_dev, struct bitblt_coords *dst,
 {
     struct xrender_physdev *physdev_dst = get_xrender_dev( dst_dev );
     struct xrender_physdev *physdev_src = get_xrender_dev( src_dev );
-    BOOL stretch = (src->width != dst->width) || (src->height != dst->height);
+    BOOL stretch = (src->width != dst->width) || (src->height != dst->height) ||
+                   physdev_dst->x11dev->drawable_scale_num != physdev_dst->x11dev->drawable_scale_den;
+
+    BOOL ret = TRUE;
 
     if (src_dev->funcs != dst_dev->funcs)
     {
@@ -1890,15 +1960,15 @@ static BOOL xrenderdrv_StretchBlt( PHYSDEV dst_dev, struct bitblt_coords *dst,
                                     tmp.visrect.bottom - tmp.visrect.top, physdev_dst->pict_format->depth );
 
         xrender_stretch_blit( physdev_src, physdev_dst, tmp_pixmap, src, &tmp );
-        execute_rop( physdev_dst->x11dev, tmp_pixmap, tmpGC, &dst->visrect, rop );
+        ret = execute_rop( physdev_dst->x11dev, tmp_pixmap, tmpGC, &dst->visrect, rop );
 
         XFreePixmap( gdi_display, tmp_pixmap );
         XFreeGC( gdi_display, tmpGC );
     }
     else xrender_stretch_blit( physdev_src, physdev_dst, 0, src, dst );
 
-    add_device_bounds( physdev_dst->x11dev, &dst->visrect );
-    return TRUE;
+    if (ret) add_device_bounds( physdev_dst->x11dev, &dst->visrect );
+    return ret;
 
 x11drv_fallback:
     return X11DRV_StretchBlt( &physdev_dst->x11dev->dev, dst, &physdev_src->x11dev->dev, src, rop );
@@ -1963,7 +2033,8 @@ static DWORD xrenderdrv_PutImage( PHYSDEV dev, HRGN clip, BITMAPINFO *info,
 
             xrender_put_image( src_pixmap, src_pict, mask_pict, NULL, physdev->pict_format,
                                NULL, tmp_pixmap, src, &tmp, use_repeat );
-            execute_rop( physdev->x11dev, tmp_pixmap, gc, &dst->visrect, rop );
+            ret = execute_rop( physdev->x11dev, tmp_pixmap, gc, &dst->visrect, rop ) ?
+                  ERROR_SUCCESS : ERROR_OUTOFMEMORY;
 
             XFreePixmap( gdi_display, tmp_pixmap );
             XFreeGC( gdi_display, gc );
@@ -1972,7 +2043,7 @@ static DWORD xrenderdrv_PutImage( PHYSDEV dev, HRGN clip, BITMAPINFO *info,
         else xrender_put_image( src_pixmap, src_pict, mask_pict, clip,
                                 physdev->pict_format, physdev, 0, src, dst, use_repeat );
 
-        add_device_bounds( physdev->x11dev, &dst->visrect );
+        if (!ret) add_device_bounds( physdev->x11dev, &dst->visrect );
 
         pXRenderFreePicture( gdi_display, src_pict );
         XFreePixmap( gdi_display, src_pixmap );
@@ -1999,6 +2070,7 @@ static DWORD xrenderdrv_BlendImage( PHYSDEV dev, BITMAPINFO *info, const struct 
 {
     struct xrender_physdev *physdev = get_xrender_dev( dev );
     DWORD ret;
+    struct bitblt_coords native;
     enum wxr_format format;
     XRenderPictFormat *pict_format;
     Picture dst_pict, src_pict, mask_pict;
@@ -2022,6 +2094,9 @@ static DWORD xrenderdrv_BlendImage( PHYSDEV dev, BITMAPINFO *info, const struct 
 
     if (!bits) return ERROR_SUCCESS;  /* just querying the format */
 
+    native = x11drv_device_coords( physdev->x11dev, dst );
+    if (!native.width || !native.height) return ERROR_SUCCESS;
+
     ret = create_image_pixmap( info, bits, src, format, &src_pixmap, &src_pict, &use_repeat );
     if (!ret)
     {
@@ -2029,8 +2104,8 @@ static DWORD xrenderdrv_BlendImage( PHYSDEV dev, BITMAPINFO *info, const struct 
 
         if (!use_repeat)
         {
-            xscale = src->width / (double)dst->width;
-            yscale = src->height / (double)dst->height;
+            xscale = src->width / (double)native.width;
+            yscale = src->height / (double)native.height;
         }
         else xscale = yscale = 1;  /* no scaling needed with a repeating source */
 
@@ -2041,9 +2116,9 @@ static DWORD xrenderdrv_BlendImage( PHYSDEV dev, BITMAPINFO *info, const struct 
 
         xrender_blit( PictOpOver, src_pict, mask_pict, dst_pict,
                       src->x, src->y, src->width, src->height,
-                      physdev->x11dev->dc_rect.left + dst->x,
-                      physdev->x11dev->dc_rect.top + dst->y,
-                      dst->width, dst->height, xscale, yscale );
+                      native.x,
+                      native.y,
+                      native.width, native.height, xscale, yscale );
 
         pXRenderFreePicture( gdi_display, src_pict );
         XFreePixmap( gdi_display, src_pixmap );
@@ -2072,6 +2147,7 @@ static BOOL xrenderdrv_AlphaBlend( PHYSDEV dst_dev, struct bitblt_coords *dst,
     XRenderPictureAttributes pa;
     Pixmap tmp_pixmap = 0;
     double xscale, yscale;
+    struct bitblt_coords native;
 
     if (src_dev->funcs != dst_dev->funcs ||
         physdev_src->x11dev->drawable_scale_num != physdev_src->x11dev->drawable_scale_den)
@@ -2086,10 +2162,13 @@ static BOOL xrenderdrv_AlphaBlend( PHYSDEV dst_dev, struct bitblt_coords *dst,
         return FALSE;
     }
 
+    native = x11drv_device_coords( physdev_dst->x11dev, dst );
+    if (!native.width || !native.height) return TRUE;
+
     dst_pict = get_xrender_picture( physdev_dst, 0, &dst->visrect );
 
-    xscale = src->width / (double)dst->width;
-    yscale = src->height / (double)dst->height;
+    xscale = src->width / (double)native.width;
+    yscale = src->height / (double)native.height;
 
     src_pict = get_xrender_picture_source( physdev_src, FALSE );
 
@@ -2133,9 +2212,9 @@ static BOOL xrenderdrv_AlphaBlend( PHYSDEV dst_dev, struct bitblt_coords *dst,
                   physdev_src->x11dev->dc_rect.left + src->x,
                   physdev_src->x11dev->dc_rect.top + src->y,
                   src->width, src->height,
-                  physdev_dst->x11dev->dc_rect.left + dst->x,
-                  physdev_dst->x11dev->dc_rect.top + dst->y,
-                  dst->width, dst->height, xscale, yscale );
+                  native.x,
+                  native.y,
+                  native.width, native.height, xscale, yscale );
 
     if (tmp_pict) pXRenderFreePicture( gdi_display, tmp_pict );
     if (tmp_pixmap) XFreePixmap( gdi_display, tmp_pixmap );
@@ -2159,7 +2238,7 @@ static BOOL xrenderdrv_GradientFill( PHYSDEV dev, TRIVERTEX *vert_array, ULONG n
     Picture src_pict, dst_pict;
     unsigned int i;
     const GRADIENT_RECT *rect = grad_array;
-    RECT rc;
+    RECT rc, native;
     POINT pt[2];
 
     if (!pXRenderCreateLinearGradient) goto fallback;
@@ -2229,14 +2308,16 @@ static BOOL xrenderdrv_GradientFill( PHYSDEV dev, TRIVERTEX *vert_array, ULONG n
                    colors[0].red, colors[0].green, colors[0].blue, colors[0].alpha,
                    colors[1].red, colors[1].green, colors[1].blue, colors[1].alpha );
 
+            native = x11drv_device_rect( physdev->x11dev, &rc );
+            if (IsRectEmpty( &native )) continue;
             dst_pict = get_xrender_picture( physdev, 0, NULL );
 
             src_pict = pXRenderCreateLinearGradient( gdi_display, &gradient, stops, colors, 2 );
             xrender_blit( PictOpSrc, src_pict, 0, dst_pict,
                           0, 0, rc.right - rc.left, rc.bottom - rc.top,
-                          physdev->x11dev->dc_rect.left + rc.left,
-                          physdev->x11dev->dc_rect.top + rc.top,
-                          rc.right - rc.left, rc.bottom - rc.top, 1, 1 );
+                          native.left, native.top, native.right - native.left, native.bottom - native.top,
+                          (rc.right - rc.left) / (double)(native.right - native.left),
+                          (rc.bottom - rc.top) / (double)(native.bottom - native.top) );
             pXRenderFreePicture( gdi_display, src_pict );
             add_device_bounds( physdev->x11dev, &rc );
         }
@@ -2272,8 +2353,8 @@ static HBRUSH xrenderdrv_SelectBrush( PHYSDEV dev, HBRUSH hbrush, const struct b
                                        &pattern->bits, pattern->usage );
     if (!pixmap) return 0;
 
-    if (physdev->x11dev->brush.pixmap) XFreePixmap( gdi_display, physdev->x11dev->brush.pixmap );
-    physdev->x11dev->brush.pixmap = pixmap;
+    X11DRV_SetBrushPixmap( physdev->x11dev, pixmap, pattern->info->bmiHeader.biWidth,
+                          abs( pattern->info->bmiHeader.biHeight ));
     physdev->x11dev->brush.fillStyle = FillTiled;
     physdev->x11dev->brush.pixel = 0;  /* ignored */
     physdev->x11dev->brush.style = BS_PATTERN;

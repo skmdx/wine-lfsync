@@ -181,20 +181,110 @@ static Pixmap BRUSH_DitherMono( COLORREF color )
 /***********************************************************************
  *           BRUSH_SelectSolidBrush
  */
+void X11DRV_SetBrushPixmap( X11DRV_PDEVICE *physdev, Pixmap pixmap, int width, int height )
+{
+    if (physdev->brush.pixmap) XFreePixmap( gdi_display, physdev->brush.pixmap );
+    if (physdev->brush.scaled_pixmap) XFreePixmap( gdi_display, physdev->brush.scaled_pixmap );
+    physdev->brush.pixmap = pixmap;
+    physdev->brush.size.cx = width;
+    physdev->brush.size.cy = height;
+    physdev->brush.scaled_pixmap = 0;
+}
+
+static UINT brush_gcd( UINT a, UINT b )
+{
+    while (b)
+    {
+        UINT next = a % b;
+        a = b;
+        b = next;
+    }
+    return a;
+}
+
+Pixmap X11DRV_GetScaledBrush( X11DRV_PDEVICE *physdev, const POINT *origin )
+{
+    X_PHYSBRUSH *brush = &physdev->brush;
+    UINT den, width, height;
+    RECT rect = physdev->dc_rect;
+    POINT phase;
+    XImage *source, *image;
+    Pixmap pixmap;
+    GC gc;
+
+    if (!brush->pixmap || brush->size.cx <= 0 || brush->size.cy <= 0) return 0;
+    OffsetRect( &rect, -physdev->dc_rect.left, -physdev->dc_rect.top );
+    if (physdev->region && !NtGdiGetRgnBox( physdev->region, &rect )) return 0;
+    if (IsRectEmpty( &rect )) return 0;
+    phase.x = (origin->x % brush->size.cx + brush->size.cx) % brush->size.cx;
+    phase.y = (origin->y % brush->size.cy + brush->size.cy) % brush->size.cy;
+    /* Bound the tile by the clip, which can extend beyond a child DC when
+     * DCX_PARENTCLIP is used. Fractional scaling may require several logical
+     * pattern repetitions before the native tile repeats exactly. */
+    den = physdev->drawable_scale_den / brush_gcd( physdev->drawable_scale_num, physdev->drawable_scale_den );
+    width = rect.right - rect.left;
+    height = rect.bottom - rect.top;
+    rect.right = rect.left + min( (ULONGLONG)brush->size.cx * (den / brush_gcd( brush->size.cx, den )), width );
+    rect.bottom = rect.top + min( (ULONGLONG)brush->size.cy * (den / brush_gcd( brush->size.cy, den )), height );
+    if (brush->scaled_pixmap && EqualRect( &brush->scaled_dc, &physdev->dc_rect ) &&
+        EqualRect( &brush->scaled_rect, &rect ) &&
+        brush->scaled_origin.x == phase.x && brush->scaled_origin.y == phase.y &&
+        brush->scaled_num == physdev->drawable_scale_num && brush->scaled_den == physdev->drawable_scale_den)
+        return brush->scaled_pixmap;
+
+    source = XGetImage( gdi_display, brush->pixmap, 0, 0, brush->size.cx, brush->size.cy, AllPlanes, ZPixmap );
+    if (!source) return 0;
+    image = X11DRV_ScaleImage( physdev, source, rect.left - phase.x, rect.top - phase.y, &rect, TRUE );
+    XDestroyImage( source );
+    if (!image) return 0;
+    pixmap = XCreatePixmap( gdi_display, root_window, image->width, image->height, image->depth );
+    if (!pixmap || !(gc = XCreateGC( gdi_display, pixmap, 0, NULL )))
+    {
+        if (pixmap) XFreePixmap( gdi_display, pixmap );
+        XDestroyImage( image );
+        return 0;
+    }
+    XPutImage( gdi_display, pixmap, gc, image, 0, 0, 0, 0, image->width, image->height );
+    XFreeGC( gdi_display, gc );
+    XDestroyImage( image );
+    if (brush->scaled_pixmap) XFreePixmap( gdi_display, brush->scaled_pixmap );
+    brush->scaled_pixmap = pixmap;
+    brush->scaled_dc = physdev->dc_rect;
+    brush->scaled_rect = rect;
+    brush->scaled_origin = phase;
+    brush->scaled_num = physdev->drawable_scale_num;
+    brush->scaled_den = physdev->drawable_scale_den;
+    return pixmap;
+}
+
+BOOL X11DRV_PrepareBrush( X11DRV_PDEVICE *physdev )
+{
+    POINT origin;
+    RECT clip;
+
+    if (physdev->brush.style == BS_NULL || physdev->brush.fillStyle == FillSolid ||
+        physdev->drawable_scale_num == physdev->drawable_scale_den || IsRectEmpty( &physdev->dc_rect ))
+        return TRUE;
+    if (physdev->region && NtGdiGetRgnBox( physdev->region, &clip ) == NULLREGION) return TRUE;
+    if (!NtGdiGetDCPoint( physdev->dev.hdc, NtGdiGetBrushOrgEx, &origin )) return FALSE;
+    return !!X11DRV_GetScaledBrush( physdev, &origin );
+}
+
 static void BRUSH_SelectSolidBrush( X11DRV_PDEVICE *physDev, COLORREF color )
 {
     COLORREF colorRGB = X11DRV_PALETTE_GetColor( physDev, color );
+    X11DRV_SetBrushPixmap( physDev, 0, 0, 0 );
     if ((physDev->depth > 1) && (default_visual.depth <= 8) && !X11DRV_IsSolidColor( color ))
     {
 	  /* Dithered brush */
-	physDev->brush.pixmap = BRUSH_DitherColor( colorRGB, physDev->depth );
+        X11DRV_SetBrushPixmap( physDev, BRUSH_DitherColor( colorRGB, physDev->depth ), MATRIX_SIZE, MATRIX_SIZE );
 	physDev->brush.fillStyle = FillTiled;
 	physDev->brush.pixel = 0;
     }
     else if (physDev->depth == 1 && colorRGB != WHITE && colorRGB != BLACK)
     {
 	physDev->brush.pixel = 0;
-	physDev->brush.pixmap = BRUSH_DitherMono( colorRGB );
+        X11DRV_SetBrushPixmap( physDev, BRUSH_DitherMono( colorRGB ), 2, 2 );
 	physDev->brush.fillStyle = FillTiled;
     }
     else
@@ -217,8 +307,7 @@ static BOOL select_pattern_brush( X11DRV_PDEVICE *physdev, const struct brush_pa
     pixmap = create_pixmap_from_image( physdev->dev.hdc, &vis, info, &pattern->bits, pattern->usage );
     if (!pixmap) return FALSE;
 
-    if (physdev->brush.pixmap) XFreePixmap( gdi_display, physdev->brush.pixmap );
-    physdev->brush.pixmap = pixmap;
+    X11DRV_SetBrushPixmap( physdev, pixmap, info->bmiHeader.biWidth, abs( info->bmiHeader.biHeight ));
 
     if (vis.depth == 1)
     {
@@ -253,11 +342,7 @@ HBRUSH X11DRV_SelectBrush( PHYSDEV dev, HBRUSH hbrush, const struct brush_patter
 
     TRACE("hdc=%p hbrush=%p\n", dev->hdc, hbrush);
 
-    if (physDev->brush.pixmap)
-    {
-        XFreePixmap( gdi_display, physDev->brush.pixmap );
-        physDev->brush.pixmap = 0;
-    }
+    X11DRV_SetBrushPixmap( physDev, 0, 0, 0 );
     physDev->brush.style = logbrush.lbStyle;
     if (hbrush == GetStockObject( DC_BRUSH ))
         NtGdiGetDCDword( dev->hdc, NtGdiGetDCBrushColor, &logbrush.lbColor );
@@ -276,8 +361,8 @@ HBRUSH X11DRV_SelectBrush( PHYSDEV dev, HBRUSH hbrush, const struct brush_patter
       case BS_HATCHED:
 	TRACE("BS_HATCHED\n" );
 	physDev->brush.pixel = X11DRV_PALETTE_ToPhysical( physDev, logbrush.lbColor );
-        physDev->brush.pixmap = XCreateBitmapFromData( gdi_display, root_window,
-                                                       HatchBrushes[logbrush.lbHatch], 8, 8 );
+        X11DRV_SetBrushPixmap( physDev, XCreateBitmapFromData( gdi_display, root_window,
+                              HatchBrushes[logbrush.lbHatch], 8, 8 ), 8, 8 );
 	physDev->brush.fillStyle = FillStippled;
 	break;
     }

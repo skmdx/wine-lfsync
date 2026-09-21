@@ -137,6 +137,7 @@ static BOOL X11DRV_DeleteDC( PHYSDEV dev )
     X11DRV_PDEVICE *physDev = get_x11drv_dev( dev );
 
     XFreeGC( gdi_display, physDev->gc );
+    X11DRV_SetBrushPixmap( physDev, 0, 0, 0 );
     x11drv_native_window_release( physDev->native_window );
     free( physDev );
     return TRUE;
@@ -273,10 +274,11 @@ static INT X11DRV_ExtEscape( PHYSDEV dev, INT escape, INT in_count, LPCVOID in_d
                                 DWORD layout;
                                 RECT rect;
 
-                                rect.left   = event.xgraphicsexpose.x - physDev->dc_rect.left;
-                                rect.top    = event.xgraphicsexpose.y - physDev->dc_rect.top;
+                                rect.left   = event.xgraphicsexpose.x;
+                                rect.top    = event.xgraphicsexpose.y;
                                 rect.right  = rect.left + event.xgraphicsexpose.width;
                                 rect.bottom = rect.top + event.xgraphicsexpose.height;
+                                rect = x11drv_virtual_rect( physDev, &rect );
                                 if (NtGdiGetDCDword( dev->hdc, NtGdiGetLayout, &layout ) &&
                                     (layout & LAYOUT_RTL))
                                     mirror_rect( &physDev->dc_rect, &rect );
