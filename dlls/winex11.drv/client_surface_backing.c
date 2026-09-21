@@ -395,7 +395,6 @@ static void register_client_surface_compositor_target( struct client_surface_com
 enum client_surface_compositor_op
 {
     CLIENT_SURFACE_COMPOSITOR_REPLACE_POOL,
-    CLIENT_SURFACE_COMPOSITOR_COPY,
     CLIENT_SURFACE_COMPOSITOR_FREE_POOL,
     CLIENT_SURFACE_COMPOSITOR_PRESENT,
     CLIENT_SURFACE_COMPOSITOR_REGISTER_HANDOFF,
@@ -465,14 +464,6 @@ struct client_surface_compositor_job
     BOOL async;
     union
     {
-        /* COPY borrows the XIDs until synchronous completion. */
-        struct
-        {
-            Drawable source, destination;
-            int source_x, source_y, destination_x, destination_y;
-            unsigned int width, height;
-            BOOL shared;
-        } copy;
         /* CREATE_POOL returns independently owned pending storage.
          * COPY_POOL admits an owned read of a completed OUTPUT rectangle.
          * REPLACE_POOL installs the checked owned copy.
@@ -863,7 +854,6 @@ static void wake_client_surface_compositor_queues(void)
      * list in constant time; dispatch still inspects at most 64 queue heads. */
     list_move_tail( &client_surface_compositor_ready, &client_surface_compositor_parked );
 }
-static BOOL wait_client_surface_compositor_pixmap_idle( Pixmap pixmap );
 static void flush_client_surface_compositor_mailbox(
     struct client_surface_compositor_target *target );
 
@@ -902,41 +892,6 @@ static BOOL client_surface_compositor_open(void)
     client_surface_compositor_display = display;
     if (!usexpresent) TRACE( "client-surface compositor connection opened with XCopy fallback\n" );
     return TRUE;
-}
-
-static BOOL client_surface_copy_on_compositor_unchecked(
-    Drawable source, Drawable destination, int source_x, int source_y,
-    int destination_x, int destination_y, unsigned int width, unsigned int height )
-{
-    Display *display = client_surface_compositor_display;
-    int error = 0;
-    GC gc;
-
-    X11DRV_expect_error( display, client_surface_compositor_error, &error );
-    gc = XCreateGC( display, destination, 0, NULL );
-    if (gc)
-    {
-        XCopyArea( display, source, destination, gc, source_x, source_y,
-                   width, height, destination_x, destination_y );
-        TRACE_(csperf)( "ticks=%llu event=xlib_copy_request source=%lx destination=%lx width=%u height=%u clipped=0 route=restore\n",
-                       client_surface_perf_time(), source, destination, width, height );
-        XFreeGC( display, gc );
-    }
-    XSync( display, False );
-    X11DRV_check_error();
-    TRACE_(csperf)( "ticks=%llu event=xlib_restore_checked source=%lx destination=%lx copied=%u error=%d sync_calls=1\n",
-                   client_surface_perf_time(), source, destination, !!gc, error );
-    return gc && !error;
-}
-
-static BOOL client_surface_copy_on_compositor( Drawable source, Drawable destination,
-                                               int source_x, int source_y,
-                                               int destination_x, int destination_y,
-                                               unsigned int width, unsigned int height )
-{
-    if (!wait_client_surface_compositor_pixmap_idle( destination )) return FALSE;
-    return client_surface_copy_on_compositor_unchecked(
-        source, destination, source_x, source_y, destination_x, destination_y, width, height );
 }
 
 /* Capacity is reserved before allocation and returned after the real free.
@@ -1623,16 +1578,6 @@ static unsigned int count_client_surface_compositor_frames(
 
     for (i = 0; i < ARRAY_SIZE(target->frames); ++i) count += !!target->frames[i].serial;
     return count;
-}
-
-static BOOL wait_client_surface_compositor_pixmap_idle( Pixmap pixmap )
-{
-    struct client_surface_compositor_frame *frame;
-    struct rb_entry *entry;
-
-    if (!(entry = rb_get( &client_surface_compositor_pixmaps, &pixmap ))) return TRUE;
-    frame = CONTAINING_RECORD( entry, struct client_surface_compositor_frame, pixmap_entry );
-    return !frame->serial;
 }
 
 static BOOL process_client_surface_native_present( struct client_surface_compositor_target *target )
@@ -5366,15 +5311,9 @@ static BOOL execute_client_surface_compositor_job( struct client_surface_composi
         return release_client_surface_output_allocation( job->u.retired_pixmaps );
     case CLIENT_SURFACE_COMPOSITOR_PRESENT:
         return client_surface_present_on_compositor( job );
-    case CLIENT_SURFACE_COMPOSITOR_COPY:
-        break;
     default:
         return FALSE;
     }
-    return client_surface_copy_on_compositor( job->u.copy.source, job->u.copy.destination,
-                                              job->u.copy.source_x, job->u.copy.source_y,
-                                              job->u.copy.destination_x, job->u.copy.destination_y,
-                                              job->u.copy.width, job->u.copy.height );
 }
 
 static struct client_surface_compositor_target *client_surface_compositor_job_target(
@@ -5462,9 +5401,9 @@ static BOOL client_surface_compositor_job_ready( struct client_surface_composito
     /* Unlike checked XCB copies, transforms own every native input and their
      * completion record. Mutation/removal detaches adoption, not native work. */
     detach_client_surface_output_transform( target );
-    if (job->op == CLIENT_SURFACE_COMPOSITOR_COPY || job->op == CLIENT_SURFACE_COMPOSITOR_PRESENT)
+    if (job->op == CLIENT_SURFACE_COMPOSITOR_PRESENT)
     {
-        Pixmap source = job->op == CLIENT_SURFACE_COMPOSITOR_COPY ? job->u.copy.source : job->u.present.source;
+        Pixmap source = job->u.present.source;
         struct client_surface_compositor_frame *frame = get_client_surface_compositor_pixmap( target, source );
 
         if (target->seed_serial)
@@ -5485,17 +5424,6 @@ static BOOL client_surface_compositor_job_ready( struct client_surface_composito
             return TRUE;
         }
     }
-    if (job->op == CLIENT_SURFACE_COMPOSITOR_COPY)
-        for (i = 0; i < ARRAY_SIZE(target->frames); ++i)
-            if (target->frames[i].pixmap == job->u.copy.destination &&
-                !client_surface_compositor_frame_writable( &target->frames[i] ))
-            {
-                /* The GUI must COW a shared spare, not wait behind another
-                 * actor request before learning that this image is leased. */
-                job->u.copy.shared = TRUE;
-                *rejected = TRUE;
-                return TRUE;
-            }
     /* Preserve the scene, binding and frame referenced by the request. Only
      * this target waits; jobs for independent targets remain eligible. */
     if (target->copy_frame) return FALSE;
@@ -5533,7 +5461,6 @@ static BOOL client_surface_compositor_job_ready( struct client_surface_composito
 
         if (!frame->serial) continue;
         if (drain ||
-            (job->op == CLIENT_SURFACE_COMPOSITOR_COPY && frame->pixmap == job->u.copy.destination) ||
             (job->op == CLIENT_SURFACE_COMPOSITOR_PRESENT && frame->pixmap == job->u.present.source) ||
             (job->op == CLIENT_SURFACE_COMPOSITOR_FREE_POOL &&
              (frame->pixmap == job->u.retired_pixmaps[0] || frame->pixmap == job->u.retired_pixmaps[1]))) return FALSE;
@@ -6286,32 +6213,6 @@ void X11DRV_client_surface_complete_direct( struct client_surface *surface,
     post_client_surface_compositor_job( &job );
 }
 
-static NTSTATUS client_surface_backing_copy_area( HWND toplevel, Drawable source, Drawable destination,
-                                                  int source_x, int source_y,
-                                                  int destination_x, int destination_y,
-                                                  unsigned int width, unsigned int height )
-{
-    struct client_surface_compositor_job job =
-    {
-        .op = CLIENT_SURFACE_COMPOSITOR_COPY,
-        .toplevel = toplevel,
-        .u.copy =
-        {
-            .source = source,
-            .destination = destination,
-            .source_x = source_x,
-            .source_y = source_y,
-            .destination_x = destination_x,
-            .destination_y = destination_y,
-            .width = width,
-            .height = height,
-        },
-    };
-
-    if (submit_client_surface_compositor_job( &job )) return STATUS_SUCCESS;
-    return job.u.copy.shared ? STATUS_SHARING_VIOLATION : STATUS_UNSUCCESSFUL;
-}
-
 static void cancel_client_surface_output_request( struct client_surface_output_allocation *allocation )
 {
     BOOL pending;
@@ -6577,13 +6478,6 @@ static void client_surface_backing_free( Pixmap first, Pixmap second )
      * target removal/replacement drained and detached them. The actor owns
      * both XIDs and their accounting after enqueue; no GUI data is retained. */
     post_client_surface_compositor_job( &job );
-}
-
-static BOOL client_surface_backing_copy( HWND toplevel, Drawable source, Drawable destination,
-                                         unsigned int width, unsigned int height )
-{
-    return client_surface_backing_copy_area( toplevel, source, destination, 0, 0, 0, 0,
-                                             width, height ) == STATUS_SUCCESS;
 }
 
 static BOOL client_surface_backing_present( HWND toplevel, Window window, Pixmap pixmap,
@@ -7667,13 +7561,10 @@ NTSTATUS X11DRV_client_surface_backing_publish( struct x11drv_win_data *data )
     if (!client_surface_backing_present( data->hwnd, data->whole_window, data->client_surface_backing,
                                          window_width, window_height ))
     {
-        TRACE( "falling back to XCopyArea publication for pixmap %#lx\n", data->client_surface_backing );
-        if (!client_surface_backing_copy( data->hwnd, data->client_surface_backing,
-                                          data->whole_window, window_width, window_height ))
-        {
-            status = STATUS_UNSUCCESSFUL;
-            goto done;
-        }
+        /* Native Present failure already uses the checked worker copy.
+         * Refused admission must not bypass that Window's publication order. */
+        status = STATUS_UNSUCCESSFUL;
+        goto done;
     }
     data->client_surface_backing_valid = TRUE;
     data->client_surface_backing_valid_width = window_width;
@@ -7714,16 +7605,9 @@ static BOOL restore_client_surface_backing_extent( struct x11drv_win_data *data,
         data->client_surface_backing_valid_height = window_height;
         return TRUE;
     }
-    if (!data->client_surface_backing_valid ||
-        window_width > data->client_surface_backing_valid_width ||
-        window_height > data->client_surface_backing_valid_height)
-        return FALSE;
-    return client_surface_backing_copy_area( data->hwnd, data->client_surface_backing,
-                                             data->whole_window,
-                                             rect->left, rect->top,
-                                             rect->left, rect->top,
-                                             rect->right - rect->left,
-                                             rect->bottom - rect->top ) == STATUS_SUCCESS;
+    /* A stale or refused restore must repaint through the normal caller.
+     * The GUI's validity hint cannot authorize an unordered native write. */
+    return FALSE;
 }
 
 NTSTATUS X11DRV_client_surface_backing_restore( struct x11drv_win_data *data, Window window, RECT *rect )
