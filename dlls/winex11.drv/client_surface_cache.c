@@ -81,6 +81,8 @@ static pthread_mutex_t cache_mutex = PTHREAD_MUTEX_INITIALIZER;
 static struct cache_worker cache_workers[4];
 static __thread struct cache_worker *native_worker;
 static unsigned int worker_count, image_count, source_count, next_worker;
+static struct cache_worker present_workers[4];
+static unsigned int present_worker_count, next_present_worker;
 static struct client_surface_cache_image *completed_head, **completed_tail = &completed_head;
 static void (*cache_wake)(void);
 
@@ -571,12 +573,11 @@ static void cache_worker_thread( void *context )
     }
 }
 
-static struct cache_worker *create_cache_worker(void)
+static struct cache_worker *create_cache_worker( struct cache_worker *workers, unsigned int *count )
 {
-    struct cache_worker *worker = &cache_workers[worker_count];
+    struct cache_worker *worker = &workers[*count];
     HANDLE thread;
 
-    assert( worker_count < ARRAY_SIZE(cache_workers) );
     worker->tail = &worker->head;
     if (pthread_cond_init( &worker->cond, NULL )) return NULL;
     if (PsCreateSystemThread( &thread, THREAD_ALL_ACCESS, NULL, 0, NULL, cache_worker_thread, worker ))
@@ -584,23 +585,29 @@ static struct cache_worker *create_cache_worker(void)
         pthread_cond_destroy( &worker->cond );
         return NULL;
     }
-    ++worker_count;
+    ++*count;
     NtClose( thread );
+    return worker;
+}
+
+static struct cache_worker *select_existing_worker( struct cache_worker *workers, unsigned int count,
+                                                    unsigned int *next )
+{
+    struct cache_worker *worker = NULL;
+    unsigned int i, index;
+
+    for (i = 0; i < count; ++i)
+    {
+        index = (*next + i) % count;
+        if (!worker || workers[index].pending < worker->pending) worker = &workers[index];
+    }
+    if (worker) *next = (worker - workers + 1) % count;
     return worker;
 }
 
 static struct cache_worker *select_existing_cache_worker(void)
 {
-    struct cache_worker *worker = NULL;
-    unsigned int i, index;
-
-    for (i = 0; i < worker_count; ++i)
-    {
-        index = (next_worker + i) % worker_count;
-        if (!worker || cache_workers[index].pending < worker->pending) worker = &cache_workers[index];
-    }
-    if (worker) next_worker = (worker - cache_workers + 1) % worker_count;
-    return worker;
+    return select_existing_worker( cache_workers, worker_count, &next_worker );
 }
 
 static struct cache_worker *select_cache_worker(void)
@@ -608,7 +615,7 @@ static struct cache_worker *select_cache_worker(void)
     struct cache_worker *worker = select_existing_cache_worker(), *created;
 
     if ((!worker || worker->pending) && worker_count < ARRAY_SIZE(cache_workers))
-        if ((created = create_cache_worker())) worker = created;
+        if ((created = create_cache_worker( cache_workers, &worker_count ))) worker = created;
     if (worker) next_worker = (worker - cache_workers + 1) % worker_count;
     return worker;
 }
@@ -630,7 +637,11 @@ BOOL client_surface_prepare_native_work(void)
     /* All close executors exist before acquiring native resources. A stalled
      * close must not require the next GUI release to create its peer worker. */
     while (worker_count < ARRAY_SIZE(cache_workers))
-        if (!create_cache_worker()) { ret = FALSE; break; }
+        if (!create_cache_worker( cache_workers, &worker_count )) { ret = FALSE; break; }
+    /* Publication must make progress while cache resource destruction stalls.
+     * Prepare its bounded executor set at the same admission boundary. */
+    while (ret && present_worker_count < ARRAY_SIZE(present_workers))
+        if (!create_cache_worker( present_workers, &present_worker_count )) { ret = FALSE; break; }
     pthread_mutex_unlock( &cache_mutex );
     return ret;
 }
@@ -717,7 +728,7 @@ static void finish_native_present( struct client_surface_native_work *work )
     pthread_mutex_lock( &cache_mutex );
     assert( queue->head == present );
     if ((queue->head = present->next))
-        queue_native_work( select_existing_cache_worker(), &queue->head->work );
+        queue_native_work( select_existing_worker( present_workers, present_worker_count, &next_present_worker ), &queue->head->work );
     else queue->tail = NULL;
     pthread_mutex_unlock( &cache_mutex );
     /* No request/queue access after publication: the actor may retire both. */
@@ -732,15 +743,63 @@ void client_surface_submit_native_present( struct client_surface_native_present_
     present->work.execute = execute_native_present;
     present->work.finished = finish_native_present;
     pthread_mutex_lock( &cache_mutex );
-    assert( worker_count );
+    assert( present_worker_count );
     if (queue->tail) queue->tail->next = present;
     else
     {
         queue->head = present;
-        queue_native_work( select_existing_cache_worker(), &present->work );
+        queue_native_work( select_existing_worker( present_workers, present_worker_count, &next_present_worker ), &present->work );
     }
     queue->tail = present;
     pthread_mutex_unlock( &cache_mutex );
+}
+
+/* Only queue membership proves that native execution has not started. The
+ * executor removes its head under this same mutex before calling execute. */
+void client_surface_cancel_native_presents( struct client_surface_native_present_queue *queue )
+{
+    struct client_surface_native_present *present, *next;
+    void (*wake)(void) = NULL;
+    unsigned int i;
+
+    pthread_mutex_lock( &cache_mutex );
+    if (!(present = queue->head)) goto done;
+    for (i = 0; i < present_worker_count; ++i)
+    {
+        struct cache_worker *worker = &present_workers[i];
+        struct client_surface_native_work **cursor;
+
+        for (cursor = &worker->head; *cursor; cursor = &(*cursor)->next)
+            if (*cursor == &present->work) break;
+        if (!*cursor) continue;
+        *cursor = present->work.next;
+        if (!*cursor) worker->tail = cursor;
+        assert( worker->pending );
+        --worker->pending;
+        break;
+    }
+    if (i == present_worker_count)
+    {
+        /* The head is executing (possibly already issued). Retain it; its
+         * finished callback alone may detach it from the Window FIFO. */
+        queue->tail = present;
+        present = present->next;
+        queue->head->next = NULL;
+    }
+    else queue->head = queue->tail = NULL;
+    while (present)
+    {
+        next = present->next;
+        wake = present->wake;
+        TRACE_(csperf)( "ticks=%llu event=native_present_cancel window=%lx pixmap=%lx serial=%u issued=0\n",
+                       cache_time(), present->window, present->pixmap, present->serial );
+        present->success = FALSE;
+        WriteRelease( &present->complete, TRUE );
+        present = next;
+    }
+done:
+    pthread_mutex_unlock( &cache_mutex );
+    if (wake) wake();
 }
 
 static void queue_cache_image( struct client_surface_cache_image *image, enum cache_operation operation,

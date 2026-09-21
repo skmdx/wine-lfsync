@@ -5564,6 +5564,13 @@ static BOOL client_surface_compositor_job_ready( struct client_surface_composito
         else
             quiesce_client_surface_compositor_target( target );
     }
+#ifdef SONAME_LIBXPRESENT
+    if (job->op == CLIENT_SURFACE_COMPOSITOR_REMOVE_TARGET)
+    {
+        client_surface_cancel_native_presents( &target->native_presents );
+        process_client_surface_native_present( target );
+    }
+#endif
     for (i = 0; i < ARRAY_SIZE(target->frames); ++i)
     {
         struct client_surface_compositor_frame *frame = &target->frames[i];

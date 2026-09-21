@@ -12,9 +12,10 @@ struct client_surface_native_work
     void (*execute)( struct client_surface_native_work *work );
     void (*finished)( struct client_surface_native_work *work );
 };
-/* The caller reserves requests with its output frames and retains each frame
- * and native Window until complete. One queue orders one Window's writes;
- * no native connection or borrowed scene state belongs to the actor. */
+/* The caller reserves requests with its output frames and retains their
+ * native Window. Complete is the checked request receipt, not Present Idle:
+ * issued images remain owned through the separate Complete/Idle events.
+ * One queue orders one Window's writes on private native connections. */
 struct client_surface_native_present_queue
 {
     struct client_surface_native_present *head, *tail;
@@ -33,6 +34,8 @@ struct client_surface_native_present
 };
 void client_surface_submit_native_present( struct client_surface_native_present_queue *queue,
                                            struct client_surface_native_present *present );
+/* Cancel only requests still owned by the queues, never an executing head. */
+void client_surface_cancel_native_presents( struct client_surface_native_present_queue *queue );
 
 BOOL client_surface_native_query_window( Window window, unsigned int *width, unsigned int *height,
                                          int *map_state, int *error );
