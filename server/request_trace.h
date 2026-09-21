@@ -1938,6 +1938,8 @@ static void dump_get_visible_region_reply( const struct get_visible_region_reply
     dump_rectangle( ", win_rect=", &req->win_rect );
     fprintf( stderr, ", paint_flags=%08x", req->paint_flags );
     fprintf( stderr, ", total_size=%u", req->total_size );
+    fprintf( stderr, ", scene_toplevel=%08x", req->scene_toplevel );
+    dump_uint64( ", scene_generation=", &req->scene_generation );
     dump_varargs_rectangles( ", region=", cur_size );
 }
 

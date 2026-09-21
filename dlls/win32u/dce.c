@@ -44,6 +44,8 @@ struct dce
     UINT        flags;
     LONG        count;         /* usage count; 0 or 1 for cache DCEs, always 1 for window DCEs,
                                   always >= 1 for class DCEs */
+    HWND        scene_toplevel;
+    UINT64      scene_generation; /* server scene used to bind the drawable and clip */
 };
 
 static struct list dce_list = LIST_INIT(dce_list);
@@ -911,7 +913,8 @@ static void dump_rdw_flags(UINT flags)
 
 /* Fetch clipping independently of a DC and its native drawable. */
 static HRGN get_window_visible_region( HWND hwnd, DWORD flags, HWND *top_win,
-                                       RECT *win_rect, RECT *top_rect, DWORD *paint_flags )
+                                       RECT *win_rect, RECT *top_rect, DWORD *paint_flags,
+                                       HWND *scene_toplevel, UINT64 *scene_generation )
 {
     NTSTATUS status;
     HRGN vis_rgn = 0;
@@ -943,6 +946,8 @@ static HRGN get_window_visible_region( HWND hwnd, DWORD flags, HWND *top_win,
                 *win_rect    = wine_server_get_rect( reply->win_rect );
                 *top_rect    = wine_server_get_rect( reply->top_rect );
                 *paint_flags = reply->paint_flags;
+                *scene_toplevel = wine_server_ptr_handle( reply->scene_toplevel );
+                *scene_generation = reply->scene_generation;
             }
             else size = reply->total_size;
         }
@@ -966,13 +971,19 @@ static void update_visible_region( struct dce *dce )
     DWORD flags = dce->flags, paint_flags;
     UINT scale_num = 1, scale_den = 1;
     RECT win_rect, top_rect;
-    HWND top_win;
+    HWND top_win, scene_toplevel;
+    UINT64 scene_generation;
     HRGN vis_rgn;
     WND *win;
 
     if (flags & DCX_PARENTCLIP) flags &= ~DCX_CLIPSIBLINGS;
     if (!(vis_rgn = get_window_visible_region( dce->hwnd, flags, &top_win,
-                                               &win_rect, &top_rect, &paint_flags ))) return;
+                                               &win_rect, &top_rect, &paint_flags,
+                                               &scene_toplevel, &scene_generation ))) return;
+
+    /* pGetDC can re-enter update_dc through its drawable escape. Only a
+     * completed binding participates in the shared scene comparison. */
+    dce->scene_toplevel = 0;
 
     /* A native drawable uses raw monitor pixels even when the DC has no DIB
      * surface to perform DPI scaling. Keep the DC's virtual coordinates and
@@ -1004,6 +1015,8 @@ static void update_visible_region( struct dce *dce )
 
     if (!surface) SetRectEmpty( &top_rect );
     set_visible_region( dce->hdc, vis_rgn, &win_rect, &top_rect, surface );
+    dce->scene_toplevel = scene_toplevel;
+    dce->scene_generation = scene_generation;
     if (surface) window_surface_release( surface );
 }
 
@@ -1028,6 +1041,8 @@ static void release_dce( struct dce *dce )
     if (dce->clip_rgn) NtGdiDeleteObjectApp( dce->clip_rgn );
     dce->clip_rgn = 0;
     dce->hwnd     = 0;
+    dce->scene_toplevel = 0;
+    dce->scene_generation = 0;
     dce->flags   &= DCX_CACHE;
 }
 
@@ -1080,6 +1095,12 @@ BOOL delete_dce( struct dce *dce )
  */
 void update_dc( DC *dc )
 {
+    /* Local invalidation does not reach a DC retained by another process.
+     * Compare the scene returned with its region, not a later scene sampled
+     * after binding, which could incorrectly bless stale geometry. */
+    if (!dc->dirty && dc->dce && dc->dce->scene_toplevel &&
+        !client_surface_scene_snapshot_current( dc->dce->scene_toplevel, dc->dce->scene_generation ))
+        dc->dirty = 1;
     if (!dc->dirty) return;
     dc->dirty = 0;
     if (dc->dce)
@@ -1109,6 +1130,8 @@ static struct dce *alloc_dce(void)
     dce->clip_rgn  = 0;
     dce->flags     = 0;
     dce->count     = 1;
+    dce->scene_toplevel = 0;
+    dce->scene_generation = 0;
 
     set_dc_dce( dce->hdc, dce );
     return dce;
@@ -1837,7 +1860,8 @@ void move_window_bits_surface( HWND hwnd, const RECT *window_rect, struct window
     UINT flags = UPDATE_NOCHILDREN | UPDATE_CLIPCHILDREN;
     HRGN rgn = get_update_region( hwnd, &flags, NULL, 0, NULL );
     HDC hdc = NtUserGetDCEx( hwnd, rgn, DCX_CACHE | DCX_WINDOW | DCX_EXCLUDERGN );
-    void *bits;
+    struct window_paint *paint = NULL;
+    void *bits = NULL;
 
     RECT dst = valid_rects[0];
     RECT src = valid_rects[1];
@@ -1846,13 +1870,20 @@ void move_window_bits_surface( HWND hwnd, const RECT *window_rect, struct window
     OffsetRect( &src, -old_visible_rect->left, -old_visible_rect->top );
     OffsetRect( &dst, -window_rect->left, -window_rect->top );
 
-    window_surface_lock( old_surface );
-    if ((bits = window_surface_get_color( old_surface, info )))
-        NtGdiSetDIBitsToDeviceInternal( hdc, dst.left, dst.top, dst.right - dst.left, dst.bottom - dst.top,
-                                        src.left - old_surface->rect.left, old_surface->rect.bottom - src.bottom,
-                                        0, old_surface->rect.bottom - old_surface->rect.top,
-                                        bits, info, DIB_RGB_COLORS, 0, 0, FALSE, NULL );
-    window_surface_unlock( old_surface );
+    /* The inner GDI call must not end its paint and flush older receipts
+     * while this thread still holds their input surface mutex. */
+    if (user_driver->pWindowPaint( hwnd, WINDOW_PAINT_QUERY, 0 ) != STATUS_SUCCESS ||
+        (paint = begin_window_paint( hwnd )))
+    {
+        window_surface_lock( old_surface );
+        if ((bits = window_surface_get_color( old_surface, info )))
+            NtGdiSetDIBitsToDeviceInternal( hdc, dst.left, dst.top, dst.right - dst.left, dst.bottom - dst.top,
+                                            src.left - old_surface->rect.left, old_surface->rect.bottom - src.bottom,
+                                            0, old_surface->rect.bottom - old_surface->rect.top,
+                                            bits, info, DIB_RGB_COLORS, 0, 0, FALSE, NULL );
+        window_surface_unlock( old_surface );
+        end_window_paint( paint, !!bits );
+    }
     NtUserReleaseDC( hwnd, hdc );
     if (!bits) NtUserRedrawWindow( hwnd, NULL, 0, RDW_INVALIDATE | RDW_ERASE | RDW_FRAME | RDW_ALLCHILDREN );
 }

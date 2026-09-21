@@ -6358,11 +6358,14 @@ DECL_HANDLER(get_windows_offset)
 DECL_HANDLER(get_visible_region)
 {
     struct region *region;
-    struct window *top, *win = get_window( req->window );
+    struct window *top, *scene_top, *win = get_window( req->window );
 
     if (!win) return;
 
     top = get_top_clipping_window( win );
+    scene_top = get_toplevel_window( win );
+    reply->scene_toplevel = scene_top->handle;
+    reply->scene_generation = scene_top->client_surface_scene_generation;
     if ((region = get_visible_region( win, req->flags )))
     {
         struct rectangle *data;

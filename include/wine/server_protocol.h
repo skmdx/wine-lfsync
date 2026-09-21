@@ -3929,8 +3929,9 @@ struct get_visible_region_reply
     struct rectangle win_rect;
     unsigned int   paint_flags;
     data_size_t    total_size;
+    user_handle_t  scene_toplevel;
+    unsigned __int64 scene_generation;
     /* VARARG(region,rectangles); */
-    char __pad_52[4];
 };
 
 
@@ -7782,6 +7783,6 @@ union generic_reply
     struct set_queue_paint_blocked_reply set_queue_paint_blocked_reply;
 };
 
-#define SERVER_PROTOCOL_VERSION 1030
+#define SERVER_PROTOCOL_VERSION 1031
 
 #endif /* __WINE_WINE_SERVER_PROTOCOL_H */
