@@ -5735,7 +5735,12 @@ static DWORD WINAPI paint_receipt_thread( void *arg )
             {
                 status = end_paint_receipt( held[i], TRUE );
                 ok( !status, "post-detach cancellation %u status %#x\n", i, status );
+                status = complete_paint_receipt( held[i], FALSE );
+                ok( !status, "post-detach completion %u status %#x\n", i, status );
             }
+            /* Consume only the damage restored by these completed writers;
+             * the detached receipts still own their saved update region. */
+            get_paint_update( data->hwnd, TRUE );
         }
         if (!status && data->destroyed)
         {
@@ -5861,6 +5866,8 @@ static void test_paint_retirement( HWND hwnd, HWND class_window )
     run_paint_receipt_thread( &data, 0 );
     status = destroy_scene_window( destroyed );
     ok( !status, "detached paint target destruction status %#x\n", status );
+    status = retire_paint_receipts( data.retirement );
+    ok( !status, "destroyed target native retirement status %#x\n", status );
     status = retire_paint_receipts( data.retirement );
     ok( status == STATUS_INVALID_PARAMETER, "destroyed target late retirement status %#x\n", status );
 }
@@ -5988,6 +5995,9 @@ static void test_paint_receipts(void)
             hdc = BeginPaint( class_window, &ps );
             ok( !!hdc == (limit < ARRAY_SIZE(held)), "BeginPaint admission at %u reservations returned %p\n", limit, hdc );
             if (hdc) EndPaint( class_window, &ps );
+            /* A failed native paint restores its update after the marker
+             * completes, not synchronously when EndPaint returns. */
+            pump_messages( 20 );
             ok( get_paint_update( class_window, FALSE ) & UPDATE_PAINT,
                 "refused paint at %u reservations lost its update\n", limit );
         }
@@ -5996,6 +6006,19 @@ static void test_paint_receipts(void)
             status = end_paint_receipt( held[i], TRUE );
             ok( !status, "paint reservation %u cancellation status %#x\n", i, status );
         }
+        /* Cancellation ends the writer, but native completion still owns
+         * its reservation. These server-only receipts have no native work. */
+        if (admitted == ARRAY_SIZE(held))
+        {
+            status = begin_paint_receipt( hwnd, &first );
+            ok( status == STATUS_NO_MEMORY, "cancelled paints lost admission charge, status %#x\n", status );
+        }
+        for (i = 0; i < admitted; ++i)
+        {
+            status = complete_paint_receipt( held[i], FALSE );
+            ok( !status, "paint reservation %u completion status %#x\n", i, status );
+        }
+        complete_scene_paint( hwnd );
         hdc = BeginPaint( class_window, &ps );
         ok( !!hdc, "BeginPaint did not recover after reservation return\n" );
         if (hdc) EndPaint( class_window, &ps );
@@ -6015,6 +6038,10 @@ static void test_paint_receipts(void)
     ok( status == STATUS_PENDING, "early failed paint prepare status %#x\n", status );
     status = end_paint_receipt( first, FALSE );
     ok( !status, "failed paint end status %#x\n", status );
+    status = set_surface_state( hwnd, 0, CLIENT_SURFACE_STATE_PREPARE_BEGIN, 0, &current );
+    ok( status == STATUS_PENDING, "failed paint released before native completion, status %#x\n", status );
+    status = complete_paint_receipt( first, FALSE );
+    ok( !status, "failed paint completion status %#x\n", status );
     ok( get_paint_update( hwnd, FALSE ) & UPDATE_PAINT, "failed paint lost its repaint obligation\n" );
     status = begin_paint_receipt( hwnd, &first );
     ok( !status, "recovery paint admission status %#x\n", status );
