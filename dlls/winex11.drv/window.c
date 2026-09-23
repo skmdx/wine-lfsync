@@ -4614,11 +4614,6 @@ LRESULT X11DRV_WindowMessage( HWND hwnd, UINT msg, WPARAM wp, LPARAM lp )
         UINT64 serial = (UINT64)(UINT)wp | ((UINT64)(UINT)lp << 32);
         UINT update = X11DRV_client_surface_backing_pool_ready( hwnd, serial );
 
-        if (update == X11DRV_CLIENT_SURFACE_RESUME_RESTORE)
-        {
-            X11DRV_client_surface_backing_restore_ready( hwnd, serial );
-            return 0;
-        }
         if (update)
         {
             NTSTATUS status;

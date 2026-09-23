@@ -784,7 +784,6 @@ struct x11drv_win_data
     Pixmap         client_surface_backing_spare;
     struct client_surface_output_allocation *client_surface_pending_allocation;
     struct client_surface_output_allocation *client_surface_pending_geometry;
-    struct client_surface_output_allocation *client_surface_pending_restore;
     UINT64         client_surface_geometry_scope, client_surface_geometry_next;
     UINT64         client_surface_native_revision;
     UINT64         client_surface_allocation_serial;
@@ -841,13 +840,9 @@ extern NTSTATUS X11DRV_client_surface_backing_snapshot( struct x11drv_win_data *
 extern UINT64 X11DRV_client_surface_geometry_begin( struct x11drv_win_data *data );
 extern void X11DRV_client_surface_geometry_end( struct x11drv_win_data *data, UINT64 previous, NTSTATUS status );
 extern NTSTATUS X11DRV_client_surface_backing_staged( struct x11drv_win_data *data );
-#define X11DRV_CLIENT_SURFACE_RESUME_RESTORE 0x80000000u
 extern void X11DRV_client_surface_backing_cancel_requests( struct x11drv_win_data *data );
-extern void X11DRV_client_surface_backing_restore_ready( HWND hwnd, UINT64 serial );
 extern void X11DRV_client_surface_backing_cancel_geometry( struct x11drv_win_data *data, UINT64 serial );
 extern NTSTATUS X11DRV_client_surface_backing_publish( struct x11drv_win_data *data );
-extern NTSTATUS X11DRV_client_surface_backing_restore( struct x11drv_win_data *data,
-                                                       Window window, RECT *rect );
 
 extern BOOL window_is_reparenting( HWND hwnd );
 extern BOOL window_should_take_focus( HWND hwnd, Time time );

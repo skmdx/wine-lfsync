@@ -2375,13 +2375,12 @@ static BOOL expose_window_surface( HWND hwnd, UINT flags, const RECT *rect )
     }
 
     client_surface_get_toplevel_scene( hwnd, &scene );
-    /* A DIRECT attachment can receive Expose before the owner processes its
-     * deferred GDI surface removal. Its old CPU pixels no longer describe the
-     * native client image; request application repaint instead of replaying
-     * them over the first completed Present. Publication may still be pending:
-     * scene validity does not make the retired CPU image authoritative again. */
+    /* Native drawing can start before the owner removes its old CPU surface.
+     * Repaint through the current DC instead of replaying those stale pixels. */
     if (!surface || surface == &dummy_surface ||
-        scene.mode == CLIENT_SURFACE_PRESENTATION_DIRECT)
+        scene.mode == CLIENT_SURFACE_PRESENTATION_DIRECT ||
+        scene.mode == CLIENT_SURFACE_PRESENTATION_COMPOSITED ||
+        scene.mode == CLIENT_SURFACE_PRESENTATION_STAGED)
     {
         NtUserRedrawWindow( hwnd, rect ? &exposed_rect : NULL, NULL, flags );
         if (surface) window_surface_release( surface );

@@ -409,7 +409,6 @@ enum client_surface_compositor_op
     CLIENT_SURFACE_COMPOSITOR_SWEEP_HANDOFFS,
     CLIENT_SURFACE_COMPOSITOR_UPDATE_TARGET,
     CLIENT_SURFACE_COMPOSITOR_REMOVE_TARGET,
-    CLIENT_SURFACE_COMPOSITOR_RESTORE_TARGET,
     CLIENT_SURFACE_COMPOSITOR_BEGIN_UPDATE,
     CLIENT_SURFACE_COMPOSITOR_TRY_BEGIN_UPDATE,
     CLIENT_SURFACE_COMPOSITOR_CHECK_UPDATE,
@@ -555,15 +554,6 @@ struct client_surface_compositor_job
         } direct_renew;
         /* DIRECT_COMPLETE carries scalar attestations, no native lease. */
         struct client_surface_direct_completion direct_complete;
-        /* RESTORE_TARGET borrows the destination; deferred restoration is
-         * stored on the target, without retaining this stack job. */
-        struct
-        {
-            Drawable destination;
-            int destination_x, destination_y;
-            unsigned int width, height, window_width, window_height;
-            unsigned int valid_width, valid_height;
-        } restore;
         /* Native-update operations carry scalar barriers and return values. */
         struct
         {
@@ -690,7 +680,6 @@ struct client_surface_output_allocation
     BOOL geometry, publication;
     UINT geometry_update;
     UINT64 geometry_scope, geometry_revision;
-    RECT restore_rect;
     unsigned int seed_stage;
     BOOL seed, seed_target, scene_wait, snapshot, shared, stale;
     struct list seed_entry;
@@ -3430,35 +3419,6 @@ static BOOL process_client_surface_compositor_restore( struct client_surface_com
     return TRUE;
 }
 
-static BOOL restore_client_surface_compositor_target(
-    struct client_surface_compositor_job *job )
-{
-    struct client_surface_compositor_target *target =
-        find_client_surface_compositor_target( job->toplevel );
-    RECT rect = {job->u.restore.destination_x, job->u.restore.destination_y,
-                 job->u.restore.destination_x + job->u.restore.width, job->u.restore.destination_y + job->u.restore.height};
-
-    process_client_surface_present_events();
-    if (!target || !target->window || target->scene.strategy == DIRECT_ATTACH ||
-        target->window != job->u.restore.destination ||
-        target->window_width != job->u.restore.window_width ||
-        target->window_height != job->u.restore.window_height)
-        return FALSE;
-    job->u.restore.valid_width = target->published_width;
-    job->u.restore.valid_height = target->published_height;
-    if (IsRectEmpty( &target->restore_rect )) target->restore_rect = rect;
-    else add_bounds_rect( &target->restore_rect, &rect );
-    /* A newer Present may have reached the window before its Complete event
-     * reaches us. Do not overwrite it with the previously published image,
-     * or make the GUI caller wait for that Present. */
-    if (!client_surface_compositor_restore_ready( target ))
-    {
-        TRACE( "deferring restore for target %p rect %s\n",
-               target->toplevel, wine_dbgstr_rect( &target->restore_rect ) );
-        return TRUE;
-    }
-    return restore_client_surface_compositor_pixels( target );
-}
 
 static BOOL client_surface_source_cache_matches( const struct client_surface_source_cache *cache,
                                                  const struct client_surface_handoff_slot *slot )
@@ -5435,8 +5395,6 @@ static BOOL execute_client_surface_compositor_job( struct client_surface_composi
         return renew_client_surface_direct_plan( job );
     if (job->op == CLIENT_SURFACE_COMPOSITOR_DIRECT_COMPLETE)
         return complete_client_surface_direct_plan( job );
-    if (job->op == CLIENT_SURFACE_COMPOSITOR_RESTORE_TARGET)
-        return restore_client_surface_compositor_target( job );
     if (!client_surface_compositor_open()) return FALSE;
     switch (job->op)
     {
@@ -5549,7 +5507,6 @@ static BOOL client_surface_compositor_job_ready( struct client_surface_composito
         job->op == CLIENT_SURFACE_COMPOSITOR_CHECK_CACHE ||
         job->op == CLIENT_SURFACE_COMPOSITOR_RESOLVE_SOURCES) return TRUE;
     /* Expose restoration records its own deferred work if necessary. */
-    if (job->op == CLIENT_SURFACE_COMPOSITOR_RESTORE_TARGET) return TRUE;
     /* Unlike checked XCB copies, transforms own every native input and their
      * completion record. Mutation/removal detaches adoption, not native work. */
     detach_client_surface_output_transform( target );
@@ -6425,7 +6382,6 @@ void X11DRV_client_surface_backing_cancel_requests( struct x11drv_win_data *data
 {
     X11DRV_client_surface_backing_cancel_allocation( data );
     X11DRV_client_surface_backing_cancel_geometry( data, 0 );
-    cancel_client_surface_geometry_request( &data->client_surface_pending_restore, 0 );
 }
 
 UINT64 X11DRV_client_surface_geometry_begin( struct x11drv_win_data *data )
@@ -6484,13 +6440,6 @@ UINT X11DRV_client_surface_backing_pool_ready( HWND hwnd, UINT64 serial )
         pthread_mutex_lock( &client_surface_compositor_mutex );
         if (!allocation->pending && list_empty( &allocation->notification_entry ))
             update = allocation->geometry_update;
-        pthread_mutex_unlock( &client_surface_compositor_mutex );
-    }
-    if ((allocation = data->client_surface_pending_restore) && allocation->serial == serial)
-    {
-        pthread_mutex_lock( &client_surface_compositor_mutex );
-        if (!allocation->pending && list_empty( &allocation->notification_entry ))
-            update = X11DRV_CLIENT_SURFACE_RESUME_RESTORE;
         pthread_mutex_unlock( &client_surface_compositor_mutex );
     }
     release_win_data( data );
@@ -7592,8 +7541,7 @@ static NTSTATUS ensure_client_surface_backing_extent( struct x11drv_win_data *da
 static NTSTATUS query_client_surface_extent( struct x11drv_win_data *data, UINT update,
                                              unsigned int *width, unsigned int *height )
 {
-    struct client_surface_output_allocation **slot = update == X11DRV_CLIENT_SURFACE_RESUME_RESTORE ?
-        &data->client_surface_pending_restore : &data->client_surface_pending_geometry;
+    struct client_surface_output_allocation **slot = &data->client_surface_pending_geometry;
     struct client_surface_output_allocation *allocation = *slot;
     struct client_surface_compositor_job job =
     {
@@ -7742,110 +7690,4 @@ published:
     data->client_surface_backing_valid_height = window_height;
 done:
     return status;
-}
-
-static BOOL restore_client_surface_backing_extent( struct x11drv_win_data *data, Window window,
-                                                   const RECT *rect, unsigned int window_width,
-                                                   unsigned int window_height )
-{
-    struct client_surface_compositor_job job;
-
-    if (rect->left < 0 || rect->top < 0 ||
-        (unsigned int)rect->right > window_width ||
-        (unsigned int)rect->bottom > window_height)
-        return FALSE;
-    job = (struct client_surface_compositor_job)
-    {
-        .op = CLIENT_SURFACE_COMPOSITOR_RESTORE_TARGET,
-        .toplevel = data->hwnd,
-        .u.restore =
-        {
-            .destination = window,
-            .destination_x = rect->left,
-            .destination_y = rect->top,
-            .width = rect->right - rect->left,
-            .height = rect->bottom - rect->top,
-            .window_width = window_width,
-            .window_height = window_height,
-        },
-    };
-    if (submit_client_surface_compositor_job( &job ))
-    {
-        data->client_surface_backing_valid = TRUE;
-        data->client_surface_backing_valid_width = window_width;
-        data->client_surface_backing_valid_height = window_height;
-        return TRUE;
-    }
-    /* A stale or refused restore must repaint through the normal caller.
-     * The GUI's validity hint cannot authorize an unordered native write. */
-    return FALSE;
-}
-
-NTSTATUS X11DRV_client_surface_backing_restore( struct x11drv_win_data *data, Window window, RECT *rect )
-{
-    struct client_surface_output_allocation *allocation = data->client_surface_pending_restore;
-    struct client_surface_scene scene;
-    unsigned int width, height;
-    NTSTATUS status = STATUS_UNSUCCESSFUL;
-
-    if (window != data->whole_window || IsRectEmpty( rect )) return status;
-    /* Coalescing retains the complete damaged area in native coordinates.
-     * A superseding scene must not silently drop an older Expose rectangle. */
-    if (allocation && allocation->window == window)
-    {
-        rect->left = min( rect->left, allocation->restore_rect.left );
-        rect->top = min( rect->top, allocation->restore_rect.top );
-        rect->right = max( rect->right, allocation->restore_rect.right );
-        rect->bottom = max( rect->bottom, allocation->restore_rect.bottom );
-    }
-    if (!data->client_surface_backing || !client_surface_get_toplevel_scene( data->hwnd, &scene )) goto done;
-    status = query_client_surface_extent( data, X11DRV_CLIENT_SURFACE_RESUME_RESTORE, &width, &height );
-    if (status == STATUS_PENDING)
-    {
-        data->client_surface_pending_restore->restore_rect = *rect;
-        return status;
-    }
-    if (status == STATUS_SUCCESS)
-        status = restore_client_surface_backing_extent( data, window, rect, width, height ) ?
-                 STATUS_SUCCESS : STATUS_UNSUCCESSFUL;
-done:
-    cancel_client_surface_geometry_request( &data->client_surface_pending_restore, 0 );
-    return status;
-}
-
-void X11DRV_client_surface_backing_restore_ready( HWND hwnd, UINT64 serial )
-{
-    struct client_surface_output_allocation *allocation;
-    struct x11drv_win_data *data;
-    UINT flags = RDW_INVALIDATE | RDW_FRAME | RDW_ALLCHILDREN;
-    NTSTATUS status;
-    Window window;
-    BOOL repair;
-    RECT rect;
-
-    if (!(data = get_win_data( hwnd ))) return;
-    allocation = data->client_surface_pending_restore;
-    if (!allocation || allocation->serial != serial)
-    {
-        release_win_data( data );
-        return;
-    }
-    window = allocation->window;
-    rect = allocation->restore_rect;
-    if (window != data->whole_window)
-    {
-        cancel_client_surface_geometry_request( &data->client_surface_pending_restore, serial );
-        release_win_data( data );
-        return;
-    }
-    status = X11DRV_client_surface_backing_restore( data, window, &rect );
-    repair = data->client_surface_backing && !data->client_surface_backing_valid;
-    if (window != data->client_window)
-        OffsetRect( &rect, data->rects.visible.left - data->rects.client.left,
-                    data->rects.visible.top - data->rects.client.top );
-    if (window == root_window) flags &= ~RDW_ALLCHILDREN;
-    release_win_data( data );
-    if (status == STATUS_PENDING) return;
-    if (repair) client_surface_repair_owner( hwnd );
-    if (status != STATUS_SUCCESS) NtUserExposeWindowSurface( hwnd, flags, &rect );
 }

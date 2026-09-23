@@ -847,7 +847,6 @@ static BOOL X11DRV_Expose( HWND hwnd, XEvent *xev )
     POINT pos;
     struct x11drv_win_data *data;
     UINT flags = RDW_INVALIDATE | RDW_FRAME | RDW_ALLCHILDREN;
-    NTSTATUS status;
     BOOL repair;
 
     TRACE( "win %p (%lx) %d,%d %dx%d\n",
@@ -866,7 +865,8 @@ static BOOL X11DRV_Expose( HWND hwnd, XEvent *xev )
     rect.top    = pos.y;
     rect.right  = pos.x + event->width;
     rect.bottom = pos.y + event->height;
-    status = X11DRV_client_surface_backing_restore( data, event->window, &rect );
+    /* SOURCE exposure is handled on its private presentation window. An
+     * exposure of this GDI window must reach the application's paint path. */
     repair = event->window == data->whole_window && data->client_surface_backing &&
              !data->client_surface_backing_valid;
 
@@ -898,8 +898,8 @@ static BOOL X11DRV_Expose( HWND hwnd, XEvent *xev )
 
     release_win_data( data );
 
-    if (repair && status != STATUS_PENDING) client_surface_repair_owner( hwnd );
-    if (status != STATUS_SUCCESS && status != STATUS_PENDING) NtUserExposeWindowSurface( hwnd, flags, &rect );
+    if (repair) client_surface_repair_owner( hwnd );
+    NtUserExposeWindowSurface( hwnd, flags, &rect );
     return TRUE;
 }
 
