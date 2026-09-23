@@ -30,6 +30,9 @@ struct client_surface_native_present
     unsigned int width, height, serial;
     UINT64 generation, epoch;
     RECT copy_rect; /* empty for full-frame publication; otherwise a restore */
+    XRectangle *shape;
+    unsigned int shape_count;
+    BOOL update_shape;
     BOOL copy, copied, success, complete;
     void (*wake)(void);
 };

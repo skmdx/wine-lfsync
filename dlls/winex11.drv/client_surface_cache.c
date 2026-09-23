@@ -17,6 +17,7 @@
 
 #include <assert.h>
 #include <fcntl.h>
+#include <X11/extensions/shape.h>
 
 #include "x11drv.h"
 #include "client_surface.h"
@@ -302,11 +303,12 @@ static void create_cache_image( struct client_surface_cache_image *image )
 static BOOL prepare_window_copy_gc( struct client_surface_cache_image *image )
 {
     struct cache_worker *worker = image->worker;
-    XGCValues values = {.graphics_exposures = True};
+    XGCValues values = {.graphics_exposures = True, .subwindow_mode = IncludeInferiors};
 
     if (image->window_gc_ready) return TRUE;
     if (!image->window_gc)
-        image->window_gc = XCreateGC( worker->display, image->pixmap, GCGraphicsExposures, &values );
+        image->window_gc = XCreateGC( worker->display, image->pixmap,
+                                    GCGraphicsExposures | GCSubwindowMode, &values );
     /* Window inputs need coverage receipts. Keep their immutable GC separate
      * from the exposure-free transfer GC used by normal XCB cache copies. */
     XSync( worker->display, False );
@@ -680,6 +682,11 @@ static void execute_native_present( struct client_surface_native_work *work )
     if (!open_cache_display( worker )) return;
     display = worker->display;
     worker->error = 0;
+#ifdef HAVE_LIBXSHAPE
+    if (present->update_shape)
+        XShapeCombineRectangles( display, present->window, ShapeBounding, 0, 0,
+                                 present->shape, present->shape_count, ShapeSet, Unsorted );
+#endif
 #ifdef SONAME_LIBXPRESENT
     if (!present->copy)
     {
@@ -759,6 +766,8 @@ void client_surface_release_native_present( struct client_surface_native_present
         present->next = NULL;
     }
     pthread_mutex_unlock( &cache_mutex );
+    client_surface_free_owned_array( present->shape );
+    present->shape = NULL;
 }
 
 void client_surface_submit_native_present( struct client_surface_native_present_queue *queue,

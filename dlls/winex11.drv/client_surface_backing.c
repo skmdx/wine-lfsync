@@ -21,6 +21,7 @@
 #include <poll.h>
 #include <unistd.h>
 #include <sys/socket.h>
+#include <X11/extensions/shape.h>
 
 #ifdef __linux__
 #include <limits.h>
@@ -237,6 +238,7 @@ struct client_surface_compositor_target
     struct client_surface_owner_notifications *notifications;
     HWND toplevel;
     Window window;
+    Window present_window;
     struct x11drv_native_window *window_owner;
     struct client_surface_native_present_queue native_presents;
     struct client_surface_compositor_frame frames[CLIENT_SURFACE_COMPOSITOR_FRAME_COUNT];
@@ -1437,7 +1439,7 @@ static struct client_surface_compositor_target *find_client_surface_compositor_p
 
     if (!(entry = rb_get( &client_surface_compositor_present_registry, &event ))) return NULL;
     target = CONTAINING_RECORD( entry, struct client_surface_compositor_target, present_entry );
-    return target->window == window ? target : NULL;
+    return target->present_window == window ? target : NULL;
 }
 
 static struct client_surface_compositor_frame *find_client_surface_compositor_frame(
@@ -1452,6 +1454,16 @@ static struct client_surface_compositor_frame *find_client_surface_compositor_fr
 }
 
 #endif
+static void hide_client_surface_present_window( struct client_surface_compositor_target *target )
+{
+#ifdef HAVE_LIBXSHAPE
+    if (!target->present_window) return;
+    XShapeCombineRectangles( client_surface_compositor_display, target->present_window,
+                             ShapeBounding, 0, 0, NULL, 0, ShapeSet, YXBanded );
+    XFlush( client_surface_compositor_display );
+#endif
+}
+
 static void finish_client_surface_compositor_frame(
     struct client_surface_compositor_target *target,
     struct client_surface_compositor_frame *frame )
@@ -1506,11 +1518,24 @@ static void process_client_surface_present_events(void)
     while (budget-- && XPending( display ))
     {
         XEvent event;
-#ifdef SONAME_LIBXPRESENT
         struct client_surface_compositor_target *target = NULL;
+#ifdef SONAME_LIBXPRESENT
         struct client_surface_compositor_frame *frame = NULL;
+#endif
 
         XNextEvent( display, &event );
+        if (event.type == Expose)
+        {
+            RECT rect = {event.xexpose.x, event.xexpose.y,
+                         event.xexpose.x + event.xexpose.width, event.xexpose.y + event.xexpose.height};
+
+            for (target = client_surface_compositor_targets; target; target = target->next)
+                if (target->present_window == event.xexpose.window) break;
+            if (target && target->scene.valid && target->scene.strategy == OWNER_COMPOSITE)
+                add_bounds_rect( &target->restore_rect, &rect );
+            continue;
+        }
+#ifdef SONAME_LIBXPRESENT
         if (event.type != GenericEvent || event.xcookie.extension != client_surface_present_opcode ||
             !pXGetEventData || !pXGetEventData( display, &event ))
             continue;
@@ -1526,7 +1551,7 @@ static void process_client_surface_present_events(void)
                 BOOL success = notify->mode != PresentCompleteModeSkip;
 
                 TRACE_(csperf)( "ticks=%llu event=complete window=%lx pixmap=%lx serial=%u "
-                               "mode=%u ust=%s msc=%s event_id=%lx\n", client_surface_perf_time(), target->window,
+                               "mode=%u ust=%s msc=%s event_id=%lx\n", client_surface_perf_time(), notify->window,
                                frame->pixmap, frame->serial, notify->mode,
                                wine_dbgstr_longlong( notify->ust ), wine_dbgstr_longlong( notify->msc ), target->present_event );
                 frame->complete = TRUE;
@@ -1544,7 +1569,7 @@ static void process_client_surface_present_events(void)
                     notify->serial_number, notify->pixmap )))
             {
                 TRACE_(csperf)( "ticks=%llu event=idle window=%lx pixmap=%lx serial=%u event_id=%lx\n",
-                               client_surface_perf_time(), target->window, frame->pixmap, frame->serial, target->present_event );
+                               client_surface_perf_time(), notify->window, frame->pixmap, frame->serial, target->present_event );
                 frame->idle = TRUE;
             }
         }
@@ -1554,8 +1579,6 @@ static void process_client_surface_present_events(void)
             finish_client_surface_compositor_frame( target, frame );
             wake_client_surface_compositor_queues();
         }
-#else
-        XNextEvent( display, &event );
 #endif
     }
 }
@@ -1602,11 +1625,11 @@ static BOOL process_client_surface_native_present( struct client_surface_composi
             frame->complete = frame->idle = TRUE;
         }
         TRACE_(csperf)( "ticks=%llu event=native_present_receipt window=%lx pixmap=%lx serial=%u copy=%u success=%u\n",
-                       client_surface_perf_time(), target->window, frame->pixmap, frame->serial,
+                       client_surface_perf_time(), present->window, frame->pixmap, frame->serial,
                        present->copied, present->success );
         if (present->copy)
             TRACE_(csperf)( "ticks=%llu event=publish_copy_complete window=%lx pixmap=%lx serial=%u generation=%llu epoch=%llu success=%u\n",
-                           client_surface_perf_time(), target->window, frame->pixmap, frame->serial,
+                           client_surface_perf_time(), present->window, frame->pixmap, frame->serial,
                            (unsigned long long)frame->publish_generation,
                            (unsigned long long)frame->publish_epoch, present->success );
         if (!present->success && !IsRectEmpty( &present->copy_rect ))
@@ -1626,6 +1649,8 @@ static BOOL submit_client_surface_present( struct client_surface_compositor_targ
                                            const RECT *copy_rect, uint32_t *serial_ret )
 {
     struct client_surface_scene scene;
+    XRectangle *shape = NULL;
+    unsigned int shape_count = 0, i, j, index = 0;
     BOOL copy;
     uint32_t serial;
 
@@ -1637,6 +1662,24 @@ static BOOL submit_client_surface_present( struct client_surface_compositor_targ
            scene.toplevel == target->toplevel && scene.epoch == publish_epoch &&
            scene.generation == publish_generation && scene.mode == CLIENT_SURFACE_PRESENTATION_STAGED);
     if (copy_rect) copy = TRUE;
+    if (!copy_rect && target->scene.valid && target->scene.strategy == OWNER_COMPOSITE)
+    {
+        for (i = 0; i < target->scene.count; ++i) shape_count += target->scene.layouts[i].clip->rdh.nCount;
+        if (shape_count && !(shape = client_surface_alloc_owned_array( &target->memory, shape_count, sizeof(*shape) )))
+            return FALSE;
+        for (i = 0; i < target->scene.count; ++i)
+        {
+            const struct client_surface_scene_layout *layout = &target->scene.layouts[i];
+            const XRectangle *rects = (XRectangle *)layout->clip->Buffer;
+
+            for (j = 0; j < layout->clip->rdh.nCount; ++j)
+            {
+                shape[index] = rects[j];
+                shape[index].x += layout->geometry.monitor_rect.left;
+                shape[index++].y += layout->geometry.monitor_rect.top;
+            }
+        }
+    }
     if (!(serial = ++client_surface_present_serial)) serial = ++client_surface_present_serial;
     frame->serial = serial;
     frame->last_complete_serial = 0;
@@ -1647,9 +1690,10 @@ static BOOL submit_client_surface_present( struct client_surface_compositor_targ
     frame->publish_pending = !!publish_generation;
     frame->request_pending = TRUE;
     frame->native_present = (struct client_surface_native_present){
-        .window = target->window, .pixmap = frame->pixmap, .serial = serial,
+        .window = target->present_window, .pixmap = frame->pixmap, .serial = serial,
         .width = target->width, .height = target->height, .copy = copy,
         .generation = publish_generation, .epoch = publish_epoch,
+        .shape = shape, .shape_count = shape_count, .update_shape = !copy_rect,
         .wake = wake_client_surface_compositor};
     /* Serial ownership prevents pool/target release and image reuse through
      * both the checked native receipt and Present Complete/Idle. The embedded
@@ -1658,7 +1702,7 @@ static BOOL submit_client_surface_present( struct client_surface_compositor_targ
     client_surface_submit_native_present( &target->native_presents, &frame->native_present );
     if (serial_ret) *serial_ret = serial;
     TRACE_(csperf)( "ticks=%llu event=native_present_admit window=%lx pixmap=%lx serial=%u copy=%u generation=%llu epoch=%llu\n",
-                   client_surface_perf_time(), target->window, frame->pixmap, serial, copy,
+                   client_surface_perf_time(), frame->native_present.window, frame->pixmap, serial, copy,
                    (unsigned long long)publish_generation, (unsigned long long)publish_epoch );
     return TRUE;
 }
@@ -2498,18 +2542,49 @@ static void free_client_surface_compositor_present_input( struct client_surface_
          * target removal reaches the actor. The server already discarded
          * that window's event selection; check the late unregistration too. */
         X11DRV_expect_error( client_surface_compositor_display, client_surface_compositor_error, &error );
-        pXPresentFreeInput( client_surface_compositor_display, target->window,
+        pXPresentFreeInput( client_surface_compositor_display, target->present_window,
                             target->present_event );
         XSync( client_surface_compositor_display, False );
         X11DRV_check_error();
         TRACE_(csperf)( "ticks=%llu event=present_input_free window=%lx event_id=%lx error=%d\n",
-                       client_surface_perf_time(), target->window, target->present_event, error );
+                       client_surface_perf_time(), target->present_window, target->present_event, error );
         if (error && error != BadWindow) WARN( "failed to release Present input for window %#lx, error %d\n",
                                               target->window, error );
         target->present_event = 0;
     }
+#endif
+    if (target->present_window)
+    {
+        XDestroyWindow( client_surface_compositor_display, target->present_window );
+        target->present_window = 0;
+    }
+}
+
+static BOOL create_client_surface_present_window( struct client_surface_compositor_target *target )
+{
+#ifdef HAVE_LIBXSHAPE
+    Display *display = client_surface_compositor_display;
+    Window window;
+    int error = 0;
+
+    X11DRV_expect_error( display, client_surface_compositor_error, &error );
+    window = XCreateSimpleWindow( display, target->window, 0, 0,
+                                  target->window_width, target->window_height, 0, 0, 0 );
+    XShapeCombineRectangles( display, window, ShapeBounding, 0, 0, NULL, 0, ShapeSet, YXBanded );
+    XShapeCombineRectangles( display, window, ShapeInput, 0, 0, NULL, 0, ShapeSet, YXBanded );
+    XSelectInput( display, window, ExposureMask );
+    XMapWindow( display, window );
+    XSync( display, False );
+    X11DRV_check_error();
+    if (error)
+    {
+        XDestroyWindow( display, window );
+        return FALSE;
+    }
+    target->present_window = window;
+    return TRUE;
 #else
-    (void)target;
+    return FALSE;
 #endif
 }
 
@@ -2606,6 +2681,12 @@ static BOOL update_client_surface_compositor_target( struct client_surface_compo
     target->depth = job->u.pool.depth;
     target->visual = job->u.pool.visual;
     target->quiescing = target->native_updates || target->deferred_update || target->seed_serial;
+    if (!target->present_window)
+    {
+        if (!create_client_surface_present_window( target )) goto failed;
+    }
+    else XResizeWindow( client_surface_compositor_display, target->present_window,
+                        target->window_width, target->window_height );
     TRACE( "updated compositor target hwnd %p window %#lx size %ux%u depth %u visual %#lx\n",
            target->toplevel, target->window, target->window_width, target->window_height,
            target->depth, target->visual );
@@ -2622,7 +2703,7 @@ static BOOL update_client_surface_compositor_target( struct client_surface_compo
         X11DRV_expect_error( client_surface_compositor_display,
                              client_surface_compositor_error, &error );
         target->present_event = pXPresentSelectInput(
-            client_surface_compositor_display, target->window,
+            client_surface_compositor_display, target->present_window,
             PresentCompleteNotifyMask | PresentIdleNotifyMask );
         XSync( client_surface_compositor_display, False );
         X11DRV_check_error();
@@ -2631,8 +2712,8 @@ static BOOL update_client_surface_compositor_target( struct client_surface_compo
         {
             assert( !rb_get( &client_surface_compositor_present_registry, &target->present_event ) );
             rb_put( &client_surface_compositor_present_registry, &target->present_event, &target->present_entry );
-            TRACE_(csperf)( "ticks=%llu event=present_input_register window=%lx event_id=%lx\n",
-                           client_surface_perf_time(), target->window, target->present_event );
+            TRACE_(csperf)( "ticks=%llu event=present_input_register parent=%lx window=%lx event_id=%lx\n",
+                           client_surface_perf_time(), target->window, target->present_window, target->present_event );
         }
     }
 #endif
@@ -3215,6 +3296,7 @@ static BOOL install_client_surface_direct_plan( const struct client_surface_comp
         .direct_drawable = job->u.direct_plan.source, .epoch = scene_id, .valid = TRUE,
         .direct_owner = x11drv_native_window_acquire( job->u.direct_plan.source_owner ),
     };
+    hide_client_surface_present_window( target );
     update_client_surface_notification_plan( target );
     SetRectEmpty( &target->restore_rect );
     TRACE( "owner DIRECT_ATTACH hwnd %p scene %s identity %s drawable %#lx\n",
