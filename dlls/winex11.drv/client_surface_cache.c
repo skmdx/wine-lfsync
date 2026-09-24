@@ -1026,12 +1026,12 @@ void client_surface_cache_copy( struct client_surface_cache_image *image, Pixmap
 
 static void copy_output( struct client_surface_cache_image *image, struct client_surface_cache_image *source,
                          struct x11drv_native_window_read *read, unsigned int width, unsigned int height,
-                         BOOL write_ref, client_surface_cache_callback complete, void *context )
+                         client_surface_cache_callback complete, void *context )
 {
     assert( !!source != !!read && source != image );
     if (source) client_surface_cache_acquire( source );
     pthread_mutex_lock( &cache_mutex );
-    assert( image->acquired && image->refs == 1 + !!write_ref && image->purpose == CLIENT_SURFACE_MEMORY_OUTPUT );
+    assert( image->acquired && image->refs == 1 && image->purpose == CLIENT_SURFACE_MEMORY_OUTPUT );
     assert( !image->copy_source && width && height && width <= image->width && height <= image->height );
     assert( !source || (width <= source->width && height <= source->height) );
     image->source = read ? x11drv_native_window_read_drawable( read ) : source->pixmap;
@@ -1045,10 +1045,10 @@ static void copy_output( struct client_surface_cache_image *image, struct client
 
 void client_surface_cache_seed_window( struct client_surface_cache_image *image,
                                        struct x11drv_native_window_read *read,
-                                       unsigned int width, unsigned int height, BOOL write_ref,
+                                       unsigned int width, unsigned int height,
                                        client_surface_cache_callback complete, void *context )
 {
-    copy_output( image, NULL, read, width, height, write_ref, complete, context );
+    copy_output( image, NULL, read, width, height, complete, context );
 }
 
 void client_surface_cache_copy_output( struct client_surface_cache_image *image,
@@ -1056,7 +1056,7 @@ void client_surface_cache_copy_output( struct client_surface_cache_image *image,
                                        unsigned int width, unsigned int height,
                                        client_surface_cache_callback complete, void *context )
 {
-    copy_output( image, source, NULL, width, height, FALSE, complete, context );
+    copy_output( image, source, NULL, width, height, complete, context );
 }
 
 struct client_surface_cache_image *client_surface_cache_acquire( struct client_surface_cache_image *image )
@@ -1098,16 +1098,6 @@ static BOOL acquire_output_write( struct client_surface_cache_image *image )
     TRACE_(csperf)( "ticks=%llu event=cache_image_reference image=%p pixmap=%lx acquire=1 refs=%u\n",
                    cache_time(), image, image->pixmap, image->refs );
     return TRUE;
-}
-
-BOOL client_surface_cache_acquire_output_write( struct client_surface_cache_image *image )
-{
-    BOOL acquired;
-
-    pthread_mutex_lock( &cache_mutex );
-    acquired = acquire_output_write( image );
-    pthread_mutex_unlock( &cache_mutex );
-    return acquired;
 }
 
 BOOL client_surface_cache_transform_output( struct client_surface_cache_image *image,

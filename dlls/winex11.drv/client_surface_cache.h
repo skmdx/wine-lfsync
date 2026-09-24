@@ -88,7 +88,6 @@ unsigned int client_surface_cache_gc( const struct client_surface_cache_image *i
 struct client_surface_cache_image *client_surface_cache_acquire( struct client_surface_cache_image *image );
 BOOL client_surface_cache_shared( const struct client_surface_cache_image *image );
 BOOL client_surface_cache_write_pending( const struct client_surface_cache_image *image );
-BOOL client_surface_cache_acquire_output_write( struct client_surface_cache_image *image );
 void client_surface_cache_copy( struct client_surface_cache_image *image, Pixmap source,
                                 client_surface_cache_callback complete, void *context );
 /* Window capture is an explicit owned-input boundary. Its caller retains
@@ -96,7 +95,7 @@ void client_surface_cache_copy( struct client_surface_cache_image *image, Pixmap
 struct x11drv_native_window_read;
 void client_surface_cache_seed_window( struct client_surface_cache_image *image,
                                        struct x11drv_native_window_read *read,
-                                       unsigned int width, unsigned int height, BOOL write_ref,
+                                       unsigned int width, unsigned int height,
                                        client_surface_cache_callback complete, void *context );
 /* Later preparation accepts only a completed image. Admission retains that
  * image until the copy receipt; it cannot reinterpret an unowned Window XID. */
