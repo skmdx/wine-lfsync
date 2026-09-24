@@ -1246,7 +1246,7 @@ static void query_client_surface_window( struct client_surface_native_work *work
                                                         &query->map_state, &query->error );
     if (query->success && query->child_owner && query->map_state == IsViewable &&
         query->width == query->direct_width && query->height == query->direct_height)
-        query->direct_checked = client_surface_native_check_direct( query->window, query->child,
+        query->direct_checked = client_surface_native_check_direct( x11drv_native_window_content( query->read.window ), query->child,
             query->direct_width, query->direct_height, &query->direct_rect );
     if (query->child_owner) x11drv_native_window_read_finish( &query->child_read );
     x11drv_native_window_read_finish( &query->read );
@@ -2554,7 +2554,7 @@ static BOOL create_client_surface_present_window( struct client_surface_composit
     int error = 0;
 
     X11DRV_expect_error( display, client_surface_compositor_error, &error );
-    window = XCreateSimpleWindow( display, target->window, 0, 0,
+    window = XCreateSimpleWindow( display, x11drv_native_window_content( target->window_owner ), 0, 0,
                                   target->window_width, target->window_height, 0, 0, 0 );
     XShapeCombineRectangles( display, window, ShapeBounding, 0, 0, NULL, 0, ShapeSet, YXBanded );
     XShapeCombineRectangles( display, window, ShapeInput, 0, 0, NULL, 0, ShapeSet, YXBanded );

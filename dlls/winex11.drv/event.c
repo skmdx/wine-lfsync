@@ -867,7 +867,8 @@ static BOOL X11DRV_Expose( HWND hwnd, XEvent *xev )
     rect.bottom = pos.y + event->height;
     /* SOURCE exposure is handled on its private presentation window. An
      * exposure of this GDI window must reach the application's paint path. */
-    repair = event->window == data->whole_window && data->client_surface_backing &&
+    repair = (event->window == data->whole_window || event->window == data->content_window) &&
+             data->client_surface_backing &&
              !data->client_surface_backing_valid;
 
     if (event->window != data->client_window)

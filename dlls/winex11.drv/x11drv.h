@@ -741,6 +741,7 @@ struct x11drv_win_data
     Colormap    whole_colormap; /* colormap if non-default visual */
     HWND        hwnd;           /* hwnd that this private data belongs to */
     Window      whole_window;   /* X window for the complete window */
+    Window      content_window; /* stable GDI and SOURCE parent; shares whole_window storage until redirected */
     Window      client_window;  /* X window for the client area */
     struct window_rects rects;  /* window rects in monitor DPI, relative to parent client area */
     struct host_window *parent; /* the host window parent, frame or embedder, NULL if root_window */
@@ -938,6 +939,7 @@ struct x11drv_native_window_read
 extern Window x11drv_native_window_read_init( struct x11drv_native_window_read *read,
                                               struct x11drv_native_window *window );
 extern Window x11drv_native_window_read_drawable( const struct x11drv_native_window_read *read );
+extern Window x11drv_native_window_content( const struct x11drv_native_window *window );
 extern BOOL x11drv_native_window_read_ready( struct x11drv_native_window_read *read );
 extern BOOL x11drv_native_window_copy_ready( struct x11drv_native_window_read *read );
 extern void x11drv_native_window_read_begin( struct x11drv_native_window_read *read, Display *display );

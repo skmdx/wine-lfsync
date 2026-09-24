@@ -129,6 +129,8 @@ static XContext client_parent_context = 0;
 
 static const WCHAR whole_window_prop[] =
     {'_','_','w','i','n','e','_','x','1','1','_','w','h','o','l','e','_','w','i','n','d','o','w',0};
+static const WCHAR content_window_prop[] =
+    {'_','_','w','i','n','e','_','x','1','1','_','c','o','n','t','e','n','t','_','w','i','n','d','o','w',0};
 static const WCHAR clip_window_prop[] =
     {'_','_','w','i','n','e','_','x','1','1','_','c','l','i','p','_','w','i','n','d','o','w',0};
 static const WCHAR focus_time_prop[] =
@@ -188,7 +190,7 @@ struct x11drv_native_window
     struct x11drv_display_owner *creator;
     struct x11drv_native_window *ancestor;
     Display *display;
-    Window window, parent, private_parent;
+    Window window, content, parent, private_parent;
     Colormap colormap;
     LONG refs, destroyed;
     BOOL retired;
@@ -261,6 +263,11 @@ Window x11drv_native_window_read_drawable( const struct x11drv_native_window_rea
 {
     assert( read->window );
     return read->window->window;
+}
+
+Window x11drv_native_window_content( const struct x11drv_native_window *window )
+{
+    return window->content;
 }
 
 BOOL x11drv_native_window_read_ready( struct x11drv_native_window_read *read )
@@ -467,7 +474,7 @@ Window x11drv_native_window_parent( struct x11drv_native_window *window )
 void x11drv_native_window_publish( struct x11drv_native_window *window, Window xid, Colormap colormap )
 {
     pthread_mutex_lock( &native_window_mutex );
-    window->window = xid;
+    window->window = window->content = xid;
     window->colormap = colormap;
     window->errors.display = window->display;
     window->errors.callback = native_window_error;
@@ -2058,7 +2065,12 @@ static void window_set_config( struct x11drv_win_data *data, RECT rect, BOOL abo
         mask |= CWStackMode;
     }
 
-    if (mask & (CWWidth | CWHeight)) ++data->client_surface_native_revision;
+    if (mask & (CWWidth | CWHeight))
+    {
+        ++data->client_surface_native_revision;
+        if (data->content_window != data->whole_window)
+            XResizeWindow( data->display, data->content_window, changes.width, changes.height );
+    }
     data->pending_state.rect = *new_rect;
     data->pending_state.above = above;
     data->configure_serial = NextRequest( data->display );
@@ -3006,7 +3018,7 @@ void attach_client_window( struct x11drv_win_data *data, Window client_window )
     if (data->whole_window)
     {
         client_window_events_enable( data, client_window );
-        XReparentWindow( gdi_display, client_window, data->whole_window, data->rects.client.left - data->rects.visible.left,
+        XReparentWindow( gdi_display, client_window, data->content_window, data->rects.client.left - data->rects.visible.left,
                          data->rects.client.top - data->rects.visible.top );
         /* Native WSI may present through another X connection. Complete the
          * reparent before it can present, otherwise the later unmap/remap can
@@ -3080,7 +3092,7 @@ Window create_client_window( HWND hwnd, RECT client_rect, const XVisualInfo *vis
     native->private_parent = parent;
     XSync( gdi_display, False ); /* make sure whole_window is known from gdi_display */
     ret = data->client_window = XCreateWindow( gdi_display,
-                                               data->whole_window ? data->whole_window : parent,
+                                               data->whole_window ? data->content_window : parent,
                                                x, y, cx, cy, 0, visual->depth, InputOutput,
                                                visual->visual, CWBitGravity | CWWinGravity |
                                                CWBackingStore | CWColormap | CWBorderPixel, &attr );
@@ -3160,6 +3172,18 @@ static BOOL create_whole_window( struct x11drv_win_data *data, struct x11drv_nat
         goto done;
     }
     data->native_window = native_window;
+    /* Keep the drawable used by retained DCs stable across composition
+     * changes. Before redirection this child shares the native backing;
+     * DIRECT rendering needs no additional image or publication copy. */
+    attr.event_mask = ExposureMask;
+    attr.win_gravity = NorthWestGravity;
+    data->content_window = XCreateWindow( data->display, data->whole_window, 0, 0, cx, cy,
+                                           0, data->vis.depth, InputOutput, data->vis.visual,
+                                           CWColormap | CWBorderPixel | CWBackPixel | CWBitGravity |
+                                           CWWinGravity | CWEventMask, &attr );
+    native_window->content = data->content_window;
+    XSaveContext( data->display, data->content_window, winContext, (char *)data->hwnd );
+    XMapWindow( data->display, data->content_window );
     SetRect( &data->current_state.rect, pos.x, pos.y, pos.x + cx, pos.y + cy );
     data->pending_state.rect = data->current_state.rect;
     data->desired_state.rect = data->current_state.rect;
@@ -3174,6 +3198,7 @@ static BOOL create_whole_window( struct x11drv_win_data *data, struct x11drv_nat
 
     XSaveContext( data->display, data->whole_window, winContext, (char *)data->hwnd );
     NtUserSetProp( data->hwnd, whole_window_prop, (HANDLE)data->whole_window );
+    NtUserSetProp( data->hwnd, content_window_prop, (HANDLE)data->content_window );
 
     /* set the window text */
     if (!NtUserInternalGetWindowText( data->hwnd, text, ARRAY_SIZE( text ))) text[0] = 0;
@@ -3246,6 +3271,7 @@ static void destroy_whole_window( struct x11drv_win_data *data, BOOL already_des
         if (!already_destroyed) detach_client_window( data, data->client_window );
         else if (data->client_window) client_window_events_disable( data, data->client_window );
         XDeleteContext( data->display, data->whole_window, winContext );
+        XDeleteContext( data->display, data->content_window, winContext );
         if (!already_destroyed)
         {
             /* Logical disappearance and event detach precede deferred native
@@ -3258,7 +3284,7 @@ static void destroy_whole_window( struct x11drv_win_data *data, BOOL already_des
         }
     }
     data->native_window = NULL;
-    data->whole_window = data->client_window = 0;
+    data->whole_window = data->content_window = data->client_window = 0;
     data->whole_colormap = 0;
     data->managed = FALSE;
 
@@ -3282,6 +3308,7 @@ static void destroy_whole_window( struct x11drv_win_data *data, BOOL already_des
     /* Outlook stops processing messages after destroying a dialog, so we need an explicit flush */
     XFlush( data->display );
     NtUserRemoveProp( data->hwnd, whole_window_prop );
+    NtUserRemoveProp( data->hwnd, content_window_prop );
 
     /* It's possible that we are in a different thread, when called from
      * set_window_visual, and about to recreate the window. In this case
@@ -3473,9 +3500,10 @@ static BOOL create_desktop_win_data( Window win, HWND hwnd )
         return FALSE;
     }
     data->native_window = native_window;
-    data->whole_window = win;
+    data->whole_window = data->content_window = win;
     window_set_managed( data, TRUE );
     NtUserSetProp( data->hwnd, whole_window_prop, (HANDLE)win );
+    NtUserSetProp( data->hwnd, content_window_prop, (HANDLE)win );
     set_initial_wm_hints( display, win );
     if (is_desktop_fullscreen()) window_set_net_wm_state( data, (1 << NET_WM_STATE_FULLSCREEN) );
     release_win_data( data );
@@ -3859,7 +3887,7 @@ void X11DRV_GetDC( HDC hdc, HWND hwnd, HWND top, const RECT *win_rect,
 
     if ((data = get_win_data( top )))
     {
-        escape.drawable = data->whole_window;
+        escape.drawable = data->content_window;
         escape.native_window = x11drv_native_window_acquire( data->native_window );
         escape.visual = data->vis;
         /* special case: when repainting the root window, clip out top-level windows */
@@ -3868,7 +3896,8 @@ void X11DRV_GetDC( HDC hdc, HWND hwnd, HWND top, const RECT *win_rect,
     }
     else
     {
-        escape.drawable = X11DRV_get_whole_window( top );
+        escape.drawable = top == NtUserGetDesktopWindow() ? root_window :
+                          (Window)NtUserGetProp( top, content_window_prop );
         escape.visual = default_visual; /* FIXME: use the right visual for other process window */
     }
 

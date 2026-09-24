@@ -1759,7 +1759,7 @@ struct x11drv_window_surface
 {
     struct window_surface header;
     struct x11drv_native_window *native_window;
-    Window                window;
+    Window                window, shape_window;
     GC                    gc;
     struct x11drv_image  *image;
     BOOL                  shape_changed;
@@ -2148,7 +2148,7 @@ static BOOL x11drv_surface_flush( struct window_surface *window_surface, const R
     {
 #ifdef HAVE_LIBXSHAPE
         if (!shape_bits)
-            XShapeCombineMask( gdi_display, surface->window, ShapeBounding, 0, 0, None, ShapeSet );
+            XShapeCombineMask( gdi_display, surface->shape_window, ShapeBounding, 0, 0, None, ShapeSet );
         else
         {
             struct gdi_image_bits bits = {.ptr = (void *)shape_bits};
@@ -2157,7 +2157,7 @@ static BOOL x11drv_surface_flush( struct window_surface *window_surface, const R
 
             vis.depth = 1;
             shape = create_pixmap_from_image( 0, &vis, shape_info, &bits, DIB_RGB_COLORS );
-            XShapeCombineMask( gdi_display, surface->window, ShapeBounding, 0, 0, shape, ShapeSet );
+            XShapeCombineMask( gdi_display, surface->shape_window, ShapeBounding, 0, 0, shape, ShapeSet );
             XFreePixmap( gdi_display, shape );
         }
 #endif /* HAVE_LIBXSHAPE */
@@ -2206,7 +2206,8 @@ static const struct window_surface_funcs x11drv_surface_funcs =
 /***********************************************************************
  *           create_surface
  */
-static struct window_surface *create_surface( HWND hwnd, Window window, struct x11drv_native_window *native_window,
+static struct window_surface *create_surface( HWND hwnd, Window window, Window shape_window,
+                                              struct x11drv_native_window *native_window,
                                               const XVisualInfo *vis, const RECT *rect, BOOL use_alpha )
 {
     const XPixmapFormatValues *format = pixmap_formats[vis->depth];
@@ -2279,6 +2280,7 @@ static struct window_surface *create_surface( HWND hwnd, Window window, struct x
         surface->image = image;
         surface->byteswap = byteswap;
         surface->window = window;
+        surface->shape_window = shape_window;
         surface->gc = XCreateGC( gdi_display, window, 0, NULL );
         XSetSubwindowMode( gdi_display, surface->gc, IncludeInferiors );
     }
@@ -2316,7 +2318,7 @@ BOOL X11DRV_CreateWindowSurface( HWND hwnd, BOOL layered, const RECT *surface_re
     if ((previous = *surface) && previous->funcs == &x11drv_surface_funcs)
     {
         Window window = get_x11_surface(previous)->window;
-        if (data->whole_window == window && !enable_direct_drawing( data, layered )) goto done; /* use default surface */
+        if (data->content_window == window && !enable_direct_drawing( data, layered )) goto done; /* use default surface */
         /* re-create window surface is window has changed, which can happen when changing visual */
         TRACE( "re-creating hwnd %p surface with new window %lx\n", data->hwnd, data->whole_window );
     }
@@ -2337,7 +2339,7 @@ BOOL X11DRV_CreateWindowSurface( HWND hwnd, BOOL layered, const RECT *surface_re
     }
 
     if (previous) window_surface_release( previous );
-    *surface = create_surface( data->hwnd, data->whole_window, data->native_window, &data->vis, surface_rect,
+    *surface = create_surface( data->hwnd, data->content_window, data->whole_window, data->native_window, &data->vis, surface_rect,
                                layered ? data->use_alpha : FALSE );
 
 done:
