@@ -6577,7 +6577,7 @@ struct client_surface_owner_notifications *X11DRV_client_surface_backing_begin_u
 {
     const UINT no_geometry = SWP_NOSIZE | SWP_NOMOVE | SWP_NOCLIENTSIZE | SWP_NOCLIENTMOVE | SWP_NOZORDER;
     struct x11drv_win_data *data;
-    BOOL backing, activation;
+    BOOL backing, activation, defer_move;
     struct client_surface_compositor_job job =
     {
         .op = CLIENT_SURFACE_COMPOSITOR_BEGIN_UPDATE,
@@ -6604,6 +6604,13 @@ struct client_surface_owner_notifications *X11DRV_client_surface_backing_begin_u
         (swp_flags & (SWP_SHOWWINDOW | SWP_HIDEWINDOW | SWP_FRAMECHANGED | SWP_STATECHANGED)) ||
         data->is_fullscreen || (swp_flags & WINE_SWP_FULLSCREEN) ||
         memcmp( &data->rects, rects, sizeof(*rects) );
+    /* A position-only update can replay the latest committed Win32 rects.
+     * Keep operations whose flags carry native state synchronous. */
+    defer_move = rects && !data->is_fullscreen &&
+        (swp_flags & (SWP_NOSIZE | SWP_NOCLIENTSIZE | SWP_NOZORDER | SWP_NOACTIVATE)) ==
+                    (SWP_NOSIZE | SWP_NOCLIENTSIZE | SWP_NOZORDER | SWP_NOACTIVATE) &&
+        !(swp_flags & (SWP_SHOWWINDOW | SWP_HIDEWINDOW | SWP_FRAMECHANGED | SWP_STATECHANGED |
+                      WINE_SWP_FULLSCREEN));
     release_win_data( data );
     if (!backing) return NULL;
 
@@ -6613,7 +6620,7 @@ struct client_surface_owner_notifications *X11DRV_client_surface_backing_begin_u
      * replay. A new backing activation retains its synchronous native publication
      * boundary. Repeated enables can coalesce with a pending disable while
      * the native backing is still enabled. */
-    if (deferred && !job.u.update.invalidate_scene && !activation &&
+    if (deferred && (!job.u.update.invalidate_scene || defer_move) && !activation &&
         !(swp_flags & WINE_SWP_CLIENT_SURFACE_PUBLISH))
     {
         BOOL ret;
