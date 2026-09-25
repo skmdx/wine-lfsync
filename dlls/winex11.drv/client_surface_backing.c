@@ -258,6 +258,7 @@ struct client_surface_compositor_target
     UINT64 assembly_generation;
     UINT64 assembly_epoch;
     struct client_surface_scene_plan scene;
+    UINT64 binding_generation;
     struct client_surface_handoff_receipt *receipts;
     unsigned int received;
     unsigned int replay_member;
@@ -526,6 +527,17 @@ struct client_surface_compositor_job
     BOOL result;
     BOOL complete;
     BOOL async;
+    /* Actor-only continuation. Cursors are scalar keys: a handoff can close
+     * and release its binding between dispatcher slices. */
+    struct
+    {
+        unsigned int phase, index, count, needed, found, bound;
+        BOOL cursor_set;
+        process_id_t process;
+        UINT64 identity, generation;
+        struct client_surface_compositor_binding **members;
+        struct client_surface_handoff_receipt *receipts;
+    } scan;
     union
     {
         /* CREATE_POOL returns independently owned pending storage.
@@ -2054,6 +2066,7 @@ static void remove_client_surface_compositor_binding( struct client_surface_comp
     binding->pool->query_wait_bitmap[index / 64] &= ~((UINT64)1 << (index % 64));
     if (target)
     {
+        ++target->binding_generation;
         detach_client_surface_output_transform( target );
         finish_client_surface_compositor_assembly( target, TRUE );
         target->scene.valid = FALSE;
@@ -2187,6 +2200,11 @@ static BOOL register_client_surface_compositor_handoff(
     binding->mark = job->u.registration.mark;
     pool->refs++;
     rb_put( &client_surface_compositor_bindings, &key, &binding->registry_entry );
+    {
+        struct client_surface_compositor_target *target = find_client_surface_compositor_target( job->toplevel );
+
+        if (target) ++target->binding_generation;
+    }
     TRACE( "registered handoff hwnd %p identity %s producer %04x pool %s cookie %s\n",
            binding->window, wine_dbgstr_longlong( binding->identity ), binding->process,
            wine_dbgstr_longlong( pool->id ), wine_dbgstr_longlong( binding->cookie ) );
@@ -2240,18 +2258,50 @@ static int compare_client_surface_handoff_descs( const void *a, const void *b )
     return (left->handle > right->handle) - (left->handle < right->handle);
 }
 
-/* Only the actor touches the registry, including bindings retained outside
- * the visible scene. */
-static BOOL reuse_client_surface_compositor_handoffs( const struct client_surface_compositor_job *job )
+static struct client_surface_compositor_binding *next_client_surface_job_binding(
+    const struct client_surface_compositor_job *job )
+{
+    struct client_surface_binding_key key = {job->toplevel, job->scan.process, job->scan.identity};
+    struct rb_entry *entry = client_surface_compositor_bindings.root, *next = NULL;
+    struct client_surface_compositor_binding *binding;
+
+    if (!job->scan.cursor_set) return first_client_surface_compositor_binding( job->toplevel );
+    while (entry)
+    {
+        if (compare_client_surface_compositor_binding( &key, entry ) < 0)
+        {
+            next = entry;
+            entry = entry->left;
+        }
+        else entry = entry->right;
+    }
+    if (!next) return NULL;
+    binding = CONTAINING_RECORD( next, struct client_surface_compositor_binding, registry_entry );
+    return binding->toplevel == job->toplevel ? binding : NULL;
+}
+
+static void advance_client_surface_job_binding( struct client_surface_compositor_job *job,
+                                                const struct client_surface_compositor_binding *binding )
+{
+    job->scan.cursor_set = TRUE;
+    job->scan.process = binding->process;
+    job->scan.identity = binding->identity;
+}
+
+/* Return completion separately from the operation's result. A yielded head
+ * stays runnable and retains FIFO order; native waits still park it. */
+static BOOL reuse_client_surface_compositor_handoffs( struct client_surface_compositor_job *job,
+                                                      unsigned int *budget )
 {
     struct client_surface_compositor_binding *binding;
-    unsigned int i;
 
-    for (i = 0; i < job->u.reuse.count; ++i) job->u.reuse.reused[i] = FALSE;
-    for (i = 0; i < job->u.reuse.count; ++i)
+    while (job->scan.index < job->u.reuse.count && *budget)
     {
+        unsigned int i = job->scan.index++;
         const struct client_surface_handoff_desc *desc = &job->u.reuse.handoffs[i];
 
+        --*budget;
+        job->u.reuse.reused[i] = FALSE;
         binding = find_client_surface_compositor_binding( job->toplevel, desc->process, desc->surface );
         if (!binding || wine_server_user_handle( binding->window ) != desc->handle) continue;
         if (binding->cookie != desc->cookie)
@@ -2265,15 +2315,14 @@ static BOOL reuse_client_surface_compositor_handoffs( const struct client_surfac
         if ((job->u.reuse.reused[i] = client_surface_compositor_binding_is_live( binding )))
             binding->mark = job->u.reuse.mark;
     }
+    if (job->scan.index < job->u.reuse.count) return FALSE;
+    job->result = TRUE;
     return TRUE;
 }
 
-static void free_client_surface_scene_layouts( struct client_surface_scene_layout *layouts,
-                                               unsigned int count )
+static void free_client_surface_scene_layouts( struct client_surface_scene_layout *layouts )
 {
-    unsigned int i;
-
-    for (i = 0; i < count; ++i) client_surface_free_owned_array( layouts[i].clip );
+    /* Layouts and their immutable clips share one caller-built allocation. */
     client_surface_free_owned_array( layouts );
 }
 
@@ -2284,7 +2333,7 @@ static void free_client_surface_scene_plan( struct client_surface_compositor_tar
     target->scene.direct_owner = NULL;
     client_surface_free_owned_array( target->receipts );
     client_surface_free_owned_array( target->scene.members );
-    free_client_surface_scene_layouts( target->scene.layouts, target->scene.count );
+    free_client_surface_scene_layouts( target->scene.layouts );
     target->receipts = NULL;
     target->scene.members = NULL;
     target->scene.layouts = NULL;
@@ -2292,27 +2341,40 @@ static void free_client_surface_scene_plan( struct client_surface_compositor_tar
     target->scene.valid = FALSE;
 }
 
-static BOOL check_client_surface_compositor_scene( const struct client_surface_compositor_job *job )
+static BOOL check_client_surface_compositor_scene( struct client_surface_compositor_job *job,
+                                                   unsigned int *budget )
 {
     struct client_surface_compositor_target *target =
         find_client_surface_compositor_target( job->toplevel );
     struct client_surface_compositor_binding *binding;
-    unsigned int i, count = 0, found = 0, needed = 0, bound = 0;
 
-    for (i = 0; i < job->u.scene_check.count; ++i)
-    {
-        count += !!job->u.scene_check.handoffs[i].visible;
-        needed += !!(job->u.scene_check.handoffs[i].visible || job->u.scene_check.handoffs[i].producer_mapped);
-    }
+    job->result = FALSE;
     if (!target || !target->scene.valid || target->scene.strategy != OWNER_COMPOSITE ||
-        target->scene.epoch != job->u.scene_check.epoch ||
-        target->scene.count != count) return FALSE;
-    for (binding = first_client_surface_compositor_binding( job->toplevel ); binding;
-         binding = next_client_surface_compositor_binding( binding ))
+        target->scene.epoch != job->u.scene_check.epoch) return TRUE;
+    if (!job->scan.phase)
+    {
+        job->scan.generation = target->binding_generation;
+        job->scan.phase = 1;
+    }
+    if (job->scan.generation != target->binding_generation) return TRUE;
+    while (job->scan.index < job->u.scene_check.count && *budget)
+    {
+        const struct client_surface_handoff_desc *desc = &job->u.scene_check.handoffs[job->scan.index++];
+
+        --*budget;
+        job->scan.count += !!desc->visible;
+        job->scan.needed += !!(desc->visible || desc->producer_mapped);
+    }
+    if (job->scan.index < job->u.scene_check.count) return FALSE;
+    if (target->scene.count != job->scan.count) return TRUE;
+    binding = next_client_surface_job_binding( job );
+    while (binding && *budget)
     {
         const struct client_surface_handoff_desc *desc;
         unsigned int low = 0, high = job->u.scene_check.count;
 
+        --*budget;
+        advance_client_surface_job_binding( job, binding );
         /* The caller sorted this authoritative roster. Validate retained
          * hidden bindings too; a changed producer or retired cookie must not
          * survive merely because the visible scene is unchanged. */
@@ -2323,63 +2385,70 @@ static BOOL check_client_surface_compositor_scene( const struct client_surface_c
             if (job->u.scene_check.handoffs[mid].handle < wine_server_user_handle( binding->window )) low = mid + 1;
             else high = mid;
         }
-        if (low == job->u.scene_check.count) return FALSE;
+        if (low == job->u.scene_check.count) return TRUE;
         desc = &job->u.scene_check.handoffs[low];
         if (wine_server_user_handle( binding->window ) != desc->handle ||
             binding->process != desc->process || binding->identity != desc->surface ||
-            binding->cookie != desc->cookie || !client_surface_compositor_binding_is_live( binding )) return FALSE;
-        bound += !!(desc->visible || desc->producer_mapped);
-        if (!desc->visible) continue;
-        if (binding->scene_index >= target->scene.count ||
-            target->scene.members[binding->scene_index] != binding) return FALSE;
-        ++found;
+            binding->cookie != desc->cookie || !client_surface_compositor_binding_is_live( binding )) return TRUE;
+        job->scan.bound += !!(desc->visible || desc->producer_mapped);
+        if (desc->visible)
+        {
+            if (binding->scene_index >= target->scene.count ||
+                target->scene.members[binding->scene_index] != binding) return TRUE;
+            ++job->scan.found;
+        }
+        binding = next_client_surface_compositor_binding( binding );
     }
-    return found == count && bound == needed;
+    if (binding) return FALSE;
+    job->result = job->scan.found == job->scan.count && job->scan.bound == job->scan.needed;
+    return TRUE;
 }
 
 static BOOL install_client_surface_scene_plan( struct client_surface_compositor_target *target,
-                                               struct client_surface_compositor_job *job )
+                                               struct client_surface_compositor_job *job,
+                                               unsigned int *budget )
 {
-    struct client_surface_compositor_binding *binding, **members = NULL;
-    struct client_surface_handoff_receipt *receipts = NULL;
-    unsigned int count = job->u.scene_install.count, i;
+    struct client_surface_compositor_binding *binding;
+    unsigned int count = job->u.scene_install.count;
 
-    if (count)
+    job->result = FALSE;
+    if (job->scan.phase == 1)
     {
-        if (!(members = client_surface_alloc_owned_array( &target->memory, count, sizeof(*members) ))) return FALSE;
-        if (!(receipts = client_surface_alloc_owned_array( &target->memory, count, sizeof(*receipts) )))
+        if (count)
         {
-            client_surface_free_owned_array( members );
-            return FALSE;
+            if (!(job->scan.members = client_surface_alloc_owned_array( &target->memory, count,
+                                                                       sizeof(*job->scan.members) ))) return TRUE;
+            if (!(job->scan.receipts = client_surface_alloc_owned_array( &target->memory, count,
+                                                                        sizeof(*job->scan.receipts) ))) return TRUE;
         }
-        qsort( job->u.scene_install.layouts, count, sizeof(*job->u.scene_install.layouts), compare_client_surface_scene_layouts );
-        for (i = 0; i < count; ++i)
-        {
-            const struct client_surface_scene_layout *layout = &job->u.scene_install.layouts[i];
+        /* No old plan can observe partially assigned member indices. A
+         * closing handoff can still remove a binding while this job yields;
+         * its generation invalidates the borrowed pointers before adoption. */
+        finish_client_surface_compositor_assembly( target, TRUE );
+        free_client_surface_scene_plan( target );
+        job->scan.generation = target->binding_generation;
+        job->scan.phase = 2;
+    }
+    if (job->scan.generation != target->binding_generation) return TRUE;
+    while (job->scan.index < count && *budget)
+    {
+        unsigned int i = job->scan.index++;
+        const struct client_surface_scene_layout *layout = &job->u.scene_install.layouts[i];
 
-            /* Hidden producers keep their cached images without occupying
-             * a visible scene slot. */
-            binding = find_client_surface_compositor_binding( target->toplevel, layout->process, layout->identity );
-            if (!binding || binding->window != layout->window)
-            {
-                client_surface_free_owned_array( members );
-                client_surface_free_owned_array( receipts );
-                return FALSE;
-            }
-            members[i] = binding;
-        }
+        --*budget;
+        binding = find_client_surface_compositor_binding( target->toplevel, layout->process, layout->identity );
+        if (!binding || binding->window != layout->window) return TRUE;
+        job->scan.members[i] = binding;
+        binding->scene_index = i;
+        TRACE( "owner scene member hwnd %p epoch %s destination %s clip count %lu\n",
+               binding->window, wine_dbgstr_longlong( job->u.scene_install.epoch ),
+               wine_dbgstr_rect( &layout->geometry.monitor_rect ), (unsigned long)layout->clip->rdh.nCount );
     }
-    if (target->scene.valid && target->scene.epoch == job->u.scene_install.epoch && target->scene.count == count &&
-        (!count || !memcmp( members, target->scene.members, count * sizeof(*members) )))
-    {
-        client_surface_free_owned_array( receipts );
-        client_surface_free_owned_array( members );
-        return TRUE;
-    }
-    finish_client_surface_compositor_assembly( target, TRUE );
+    if (job->scan.index < count) return FALSE;
+    if (!client_surface_scene_snapshot_current( target->toplevel, job->u.scene_install.epoch )) return TRUE;
     update_client_surface_compositor_scene( target, job->u.scene_install.epoch );
-    free_client_surface_scene_plan( target );
-    target->scene.members = members;
+    target->scene.members = job->scan.members;
+    job->scan.members = NULL;
     target->scene.strategy = OWNER_COMPOSITE;
     target->scene.direct_identity = 0;
     target->scene.direct_drawable = None;
@@ -2390,35 +2459,30 @@ static BOOL install_client_surface_scene_plan( struct client_surface_compositor_
     target->scene.valid = TRUE;
     update_client_surface_notification_plan( target );
     target->quiescing = target->native_updates || target->deferred_update;
-    target->receipts = receipts;
+    target->receipts = job->scan.receipts;
+    job->scan.receipts = NULL;
     target->replay_member = 0;
     retry_client_surface_compositor_mailbox( target );
-    for (i = 0; i < count; ++i)
-    {
-        members[i]->scene_index = i;
-        TRACE( "owner scene member hwnd %p epoch %s destination %s clip count %lu\n",
-               members[i]->window, wine_dbgstr_longlong( target->scene.epoch ),
-               wine_dbgstr_rect( &target->scene.layouts[i].geometry.monitor_rect ),
-               (unsigned long)target->scene.layouts[i].clip->rdh.nCount );
-    }
+    job->result = TRUE;
     return TRUE;
 }
 
-static BOOL sweep_client_surface_compositor_handoffs( HWND toplevel, UINT64 mark,
-                                                       struct client_surface_compositor_job *job )
+static BOOL sweep_client_surface_compositor_handoffs( struct client_surface_compositor_job *job,
+                                                       UINT64 mark, unsigned int *budget )
 {
     struct client_surface_compositor_binding *binding, *next;
-    struct client_surface_compositor_target *target;
 
-    for (binding = first_client_surface_compositor_binding( toplevel ); binding; binding = next)
+    binding = next_client_surface_job_binding( job );
+    while (binding && *budget)
     {
+        --*budget;
+        advance_client_surface_job_binding( job, binding );
         next = next_client_surface_compositor_binding( binding );
         if (binding->mark != mark)
             remove_client_surface_compositor_binding( binding );
+        binding = next;
     }
-    if (job && (target = find_client_surface_compositor_target( toplevel )))
-        return install_client_surface_scene_plan( target, job );
-    return TRUE;
+    return !binding;
 }
 
 static void drain_client_surface_compositor_target(
@@ -2814,7 +2878,6 @@ static BOOL remove_client_surface_compositor_target( HWND toplevel )
     struct client_surface_compositor_target *target;
     unsigned int i;
 
-    sweep_client_surface_compositor_handoffs( toplevel, 0, 0 );
     if (!(target = find_client_surface_compositor_target( toplevel ))) return TRUE;
     drain_client_surface_compositor_target( target );
     free_client_surface_compositor_present_input( target );
@@ -2884,13 +2947,21 @@ static BOOL client_surface_direct_plan_current( const struct client_surface_comp
            get_client_surface_direct_scene( job->toplevel, job->u.direct_plan.scene_epoch, &current );
 }
 
-static BOOL install_client_surface_direct_plan( const struct client_surface_compositor_job *job )
+static BOOL install_client_surface_direct_plan( struct client_surface_compositor_job *job,
+                                                unsigned int *budget, BOOL *done )
 {
     struct client_surface_compositor_target *target = find_client_surface_compositor_target( job->toplevel );
     struct client_surface_scene current;
     UINT64 scene_id = job->u.direct_plan.scene_epoch;
     BOOL accepted = FALSE, allocated = FALSE;
 
+    if (job->scan.phase)
+    {
+        scene_id = job->scan.generation;
+        if (!target || !get_client_surface_direct_scene( job->toplevel, scene_id, &current )) goto done;
+        accepted = TRUE;
+        goto sweep;
+    }
     /* The shared candidate is only an early rejection hint. The prepare and
      * select requests authenticate the sole selected identity, owner process
      * and exact scene before changing the plan. No geometry or clip from a
@@ -2958,7 +3029,15 @@ static BOOL install_client_surface_direct_plan( const struct client_surface_comp
      * work without discarding a newer scene's assembly or mailbox. Keep its
      * output allocation until the host-success publication ACK. */
     quiesce_client_surface_compositor_target( target );
-    sweep_client_surface_compositor_handoffs( target->toplevel, 0, NULL );
+    target->scene.valid = FALSE;
+    job->scan.phase = 1;
+    job->scan.generation = scene_id;
+sweep:
+    if (!sweep_client_surface_compositor_handoffs( job, 0, budget ))
+    {
+        *done = FALSE;
+        return FALSE;
+    }
     update_client_surface_compositor_scene( target, scene_id );
     free_client_surface_scene_plan( target );
     target->scene = (struct client_surface_scene_plan){
@@ -5019,36 +5098,10 @@ static BOOL execute_client_surface_compositor_job( struct client_surface_composi
     }
     if (job->op == CLIENT_SURFACE_COMPOSITOR_REGISTER_HANDOFF)
         return register_client_surface_compositor_handoff( job );
-    if (job->op == CLIENT_SURFACE_COMPOSITOR_REUSE_HANDOFFS)
-        return reuse_client_surface_compositor_handoffs( job );
-    if (job->op == CLIENT_SURFACE_COMPOSITOR_CHECK_SCENE)
-        return check_client_surface_compositor_scene( job );
-    if (job->op == CLIENT_SURFACE_COMPOSITOR_CHECK_CACHE)
-    {
-        struct client_surface_compositor_binding *binding;
-        BOOL cached = FALSE;
-
-        /* Only completed owner images can support a repair. Keep this
-         * inventory on the actor, independent of the current layout
-         * and native output ownership. A positive hint still needs the
-         * complete scene, binding and image checks in the actual repair. */
-        for (binding = first_client_surface_compositor_binding( job->toplevel ); binding;
-             binding = next_client_surface_compositor_binding( binding ))
-            if (binding->latest_image.pixmap)
-            {
-                cached = TRUE;
-                break;
-            }
-        TRACE( "owner cache probe hwnd %p cached %u\n", job->toplevel, cached );
-        return cached;
-    }
     if (job->op == CLIENT_SURFACE_COMPOSITOR_REPAIR_OWNER)
         return repair_client_surface_compositor_owner( job->toplevel, FALSE );
     if (job->op == CLIENT_SURFACE_COMPOSITOR_RESOLVE_SOURCES)
         return repair_client_surface_compositor_owner( job->toplevel, TRUE );
-    if (job->op == CLIENT_SURFACE_COMPOSITOR_SWEEP_HANDOFFS)
-        return sweep_client_surface_compositor_handoffs( job->toplevel, job->u.scene_install.mark,
-                                                          job );
     if (job->op == CLIENT_SURFACE_COMPOSITOR_UPDATE_TARGET)
         return update_client_surface_compositor_target( job );
     if (job->op == CLIENT_SURFACE_COMPOSITOR_DROP_SEED)
@@ -5068,8 +5121,6 @@ static BOOL execute_client_surface_compositor_job( struct client_surface_composi
         return remove_client_surface_compositor_target( job->toplevel );
     if (job->op == CLIENT_SURFACE_COMPOSITOR_RETIRE_POOL)
         return retire_client_surface_compositor_pool( job->toplevel );
-    if (job->op == CLIENT_SURFACE_COMPOSITOR_DIRECT_PLAN)
-        return install_client_surface_direct_plan( job );
     if (job->op == CLIENT_SURFACE_COMPOSITOR_RENEW_DIRECT)
         return renew_client_surface_direct_plan( job );
     if (job->op == CLIENT_SURFACE_COMPOSITOR_DIRECT_COMPLETE)
@@ -5113,6 +5164,10 @@ static BOOL client_surface_compositor_job_ready( struct client_surface_composito
     BOOL drain = FALSE;
 
     *rejected = FALSE;
+    /* Authenticated DIRECT admission has already invalidated the old plan.
+     * Its continuation only retires bindings and rechecks the selected scene. */
+    if (job->op == CLIENT_SURFACE_COMPOSITOR_DIRECT_PLAN && job->scan.phase)
+        return !target || !target->copy_frame;
     if (job->op == CLIENT_SURFACE_COMPOSITOR_DIRECT_PLAN)
     {
         struct client_surface_window_query *query = &job->u.direct_plan.query;
@@ -5252,6 +5307,10 @@ static BOOL client_surface_compositor_job_ready( struct client_surface_composito
 
 static void release_client_surface_compositor_job_resources( struct client_surface_compositor_job *job )
 {
+    client_surface_free_owned_array( job->scan.members );
+    client_surface_free_owned_array( job->scan.receipts );
+    job->scan.members = NULL;
+    job->scan.receipts = NULL;
     /* Registration may fail validation, be cancelled before execution, or
      * reuse an existing pool. Only a newly created pool adopts the fd. The
      * section handle remains borrowed from the synchronous caller. */
@@ -5347,11 +5406,12 @@ static void ready_client_surface_compositor_queue( struct client_surface_composi
 /* Inspect only a FIFO head. A started Present keeps this exact job until its
  * completion or caller deadline, independently of the output's native lease. */
 static BOOL step_client_surface_compositor_job( struct client_surface_compositor_job *job,
-                                               BOOL *progressed )
+                                               BOOL *progressed, BOOL *runnable, unsigned int *budget )
 {
     struct client_surface_compositor_target *target = client_surface_compositor_job_target( job );
-    BOOL rejected;
+    BOOL rejected, done = TRUE;
 
+    *runnable = FALSE;
     if (job->op == CLIENT_SURFACE_COMPOSITOR_PRESENT && job->u.present.started)
     {
         if (!job->u.present.done && NtGetTickCount() - job->u.present.start >= 5000)
@@ -5368,8 +5428,61 @@ static BOOL step_client_surface_compositor_job( struct client_surface_compositor
     }
     if (!client_surface_compositor_job_ready( job, target, &rejected )) return FALSE;
     prepare_client_surface_notification( job );
-    job->result = !rejected && execute_client_surface_compositor_job( job );
+    job->result = FALSE;
+    if (!rejected)
+    {
+        switch (job->op)
+        {
+        case CLIENT_SURFACE_COMPOSITOR_REUSE_HANDOFFS:
+            done = reuse_client_surface_compositor_handoffs( job, budget );
+            break;
+        case CLIENT_SURFACE_COMPOSITOR_CHECK_SCENE:
+            done = check_client_surface_compositor_scene( job, budget );
+            break;
+        case CLIENT_SURFACE_COMPOSITOR_CHECK_CACHE:
+        {
+            struct client_surface_compositor_binding *binding = next_client_surface_job_binding( job );
+
+            while (binding && *budget)
+            {
+                --*budget;
+                advance_client_surface_job_binding( job, binding );
+                if ((job->result = !!binding->latest_image.pixmap)) break;
+                binding = next_client_surface_compositor_binding( binding );
+            }
+            done = job->result || !binding;
+            if (done) TRACE( "owner cache probe hwnd %p cached %u\n", job->toplevel, job->result );
+            break;
+        }
+        case CLIENT_SURFACE_COMPOSITOR_SWEEP_HANDOFFS:
+            if (!job->scan.phase)
+            {
+                if (!(done = sweep_client_surface_compositor_handoffs( job, job->u.scene_install.mark, budget ))) break;
+                job->scan.phase = 1;
+            }
+            if (target) done = install_client_surface_scene_plan( target, job, budget );
+            else job->result = TRUE;
+            break;
+        case CLIENT_SURFACE_COMPOSITOR_REMOVE_TARGET:
+            if ((done = sweep_client_surface_compositor_handoffs( job, 0, budget )))
+                job->result = remove_client_surface_compositor_target( job->toplevel );
+            break;
+        case CLIENT_SURFACE_COMPOSITOR_DIRECT_PLAN:
+            job->result = install_client_surface_direct_plan( job, budget, &done );
+            break;
+        default:
+            job->result = execute_client_surface_compositor_job( job );
+            break;
+        }
+    }
     *progressed = TRUE;
+    if (!done)
+    {
+        TRACE_(csperf)( "ticks=%llu event=compositor_job_yield hwnd=%p op=%u phase=%u index=%u\n",
+                       client_surface_perf_time(), job->toplevel, job->op, job->scan.phase, job->scan.index );
+        *runnable = TRUE;
+        return FALSE;
+    }
     if (job->op == CLIENT_SURFACE_COMPOSITOR_DIRECT_PLAN ||
         job->op == CLIENT_SURFACE_COMPOSITOR_RETIRE_POOL)
     {
@@ -5383,7 +5496,7 @@ static BOOL process_client_surface_compositor_jobs(void)
 {
     struct client_surface_compositor_queue *queue;
     struct client_surface_compositor_job *incoming, **tail = &incoming, *job;
-    unsigned int admitted = 0, scanned = 0, completed = 0, budget = 64;
+    unsigned int admitted = 0, scanned = 0, completed = 0, budget = 64, member_budget = 64;
     BOOL progressed = FALSE, more;
 
     /* Bound ingestion as well as execution. The next iteration resumes from
@@ -5419,9 +5532,9 @@ static BOOL process_client_surface_compositor_jobs(void)
         ready_client_surface_compositor_queue( queue );
     }
 
-    while (budget && !list_empty( &client_surface_compositor_ready ))
+    while (budget && member_budget && !list_empty( &client_surface_compositor_ready ))
     {
-        BOOL done, control;
+        BOOL done, control, runnable, control_runnable;
 
         queue = LIST_ENTRY( list_head( &client_surface_compositor_ready ), struct client_surface_compositor_queue, entry );
         list_remove( &queue->entry );
@@ -5431,12 +5544,12 @@ static BOOL process_client_surface_compositor_jobs(void)
         assert( job );
         --budget;
         ++scanned;
-        done = step_client_surface_compositor_job( job, &progressed );
+        done = step_client_surface_compositor_job( job, &progressed, &runnable, &member_budget );
         /* Preserve the old bypass contract: only these control operations
          * may pass a blocked normal head. Their own FIFO remains ordered. */
         if (!done && !control && queue->control_head)
         {
-            if (!budget)
+            if (!budget || !member_budget)
             {
                 ready_client_surface_compositor_queue( queue );
                 break;
@@ -5445,11 +5558,13 @@ static BOOL process_client_surface_compositor_jobs(void)
             job = queue->control_head;
             --budget;
             ++scanned;
-            done = step_client_surface_compositor_job( job, &progressed );
+            done = step_client_surface_compositor_job( job, &progressed, &control_runnable, &member_budget );
+            runnable |= control_runnable;
         }
         if (!done)
         {
-            list_add_tail( &client_surface_compositor_parked, &queue->entry );
+            if (runnable) ready_client_surface_compositor_queue( queue );
+            else list_add_tail( &client_surface_compositor_parked, &queue->entry );
             continue;
         }
         if (control)
@@ -5498,9 +5613,9 @@ static BOOL process_client_surface_compositor_jobs(void)
          * synchronous caller returns or the final notification frees itself. */
         release_client_surface_compositor_queue( queue );
     }
-    TRACE_(csperf)( "ticks=%llu event=compositor_queue_scan ingested=%u inspected=%u completed=%u more=%u runnable=%u\n",
+    TRACE_(csperf)( "ticks=%llu event=compositor_queue_scan ingested=%u inspected=%u completed=%u more=%u runnable=%u members=%u\n",
                    client_surface_perf_time(), admitted, scanned, completed, more,
-                   !list_empty( &client_surface_compositor_ready ) );
+                   !list_empty( &client_surface_compositor_ready ), 64 - member_budget );
     return progressed || more || !list_empty( &client_surface_compositor_ready );
 }
 
@@ -6693,6 +6808,8 @@ BOOL X11DRV_client_surface_refresh_handoffs( HWND toplevel )
     struct client_surface_scene scene;
     UINT count = 0, i, index;
     unsigned int layout_count = 0;
+    SIZE_T layout_bytes = 0;
+    char *clip;
     UINT64 scene_generation = 0;
     UINT64 mark;
 
@@ -6756,14 +6873,24 @@ BOOL X11DRV_client_surface_refresh_handoffs( HWND toplevel )
             return TRUE;
         }
     }
-    for (i = 0; i < count; ++i) layout_count += !!descs[i].visible;
-    if (layout_count && !(layouts = client_surface_alloc_owned_array( &queue->memory, layout_count, sizeof(*layouts) )))
+    for (i = 0; i < count; ++i)
+    {
+        DWORD size;
+
+        if (!members[i].visible) continue;
+        if (!(size = X11DRV_GetRegionDataSize( members[i].region )) ||
+            layout_bytes > ~(SIZE_T)0 - sizeof(*layouts) - size) goto failed;
+        layout_bytes += sizeof(*layouts) + size;
+        ++layout_count;
+    }
+    if (layout_count && !(layouts = client_surface_alloc_owned_array( &queue->memory, layout_bytes, 1 )))
     {
         layout_count = 0;
         goto failed;
     }
     /* Roster, selection, geometry and clips all come from the same reply.
      * The binding cache remains independent and includes hidden producers. */
+    clip = (char *)(layouts ? layouts + layout_count : NULL);
     for (i = 0, index = 0; i < count; ++i)
     {
         DWORD size;
@@ -6773,11 +6900,13 @@ BOOL X11DRV_client_surface_refresh_handoffs( HWND toplevel )
         layouts[index].process = members[i].process;
         layouts[index].identity = members[i].identity;
         layouts[index].geometry = members[i].target;
-        if (!(size = X11DRV_GetRegionDataSize( members[i].region )) ||
-            !(layouts[index].clip = client_surface_alloc_owned_array( &queue->memory, size, 1 )) ||
-            !X11DRV_FillRegionData( members[i].region, 0, layouts[index].clip, size )) goto failed;
+        size = X11DRV_GetRegionDataSize( members[i].region );
+        layouts[index].clip = (RGNDATA *)clip;
+        if (!X11DRV_FillRegionData( members[i].region, 0, layouts[index].clip, size )) goto failed;
+        clip += size;
         ++index;
     }
+    if (layout_count) qsort( layouts, layout_count, sizeof(*layouts), compare_client_surface_scene_layouts );
     if (!bind_client_surface_handoffs( toplevel, &queue->memory, descs, count, mark )) goto failed;
 
     if (!client_surface_scene_snapshot_current( toplevel, scene_generation )) goto failed;
@@ -6801,14 +6930,14 @@ BOOL X11DRV_client_surface_refresh_handoffs( HWND toplevel )
         layout_count = job.u.scene_install.count;
         if (!installed) goto failed;
     }
-    free_client_surface_scene_layouts( layouts, layout_count );
+    free_client_surface_scene_layouts( layouts );
     client_surface_free_owned_array( descs );
     client_surface_free_scene_snapshot( count, members );
     release_client_surface_compositor_queue( queue );
     return TRUE;
 
 failed:
-    free_client_surface_scene_layouts( layouts, layout_count );
+    free_client_surface_scene_layouts( layouts );
     client_surface_free_owned_array( descs );
     client_surface_free_scene_snapshot( count, members );
     release_client_surface_compositor_queue( queue );
