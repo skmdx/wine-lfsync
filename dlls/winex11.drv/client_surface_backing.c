@@ -6650,7 +6650,7 @@ done:
     return ret;
 }
 
-static BOOL refresh_client_surface_handoffs( HWND toplevel )
+BOOL X11DRV_client_surface_refresh_handoffs( HWND toplevel )
 {
     struct client_surface_compositor_queue *queue;
     struct client_surface_handoff_desc *descs = NULL;
@@ -6809,7 +6809,7 @@ BOOL X11DRV_RepairClientSurfaceOwner( HWND hwnd, BOOL resolve )
     /* The authoritative snapshot selects the exact bindings and layouts to
      * inspect. The actor owns their images and attestations; no channel state
      * is interpreted by the application thread as proof of a completed copy. */
-    return refresh_client_surface_handoffs( hwnd ) && submit_client_surface_compositor_job( &job );
+    return X11DRV_client_surface_refresh_handoffs( hwnd ) && submit_client_surface_compositor_job( &job );
 }
 
 void X11DRV_client_surface_backing_destroy( struct x11drv_win_data *data )
@@ -7002,7 +7002,7 @@ static NTSTATUS ensure_client_surface_backing_extent( struct x11drv_win_data *da
                 min( data->client_surface_backing_valid_height, window_height );
         }
         if (!update_client_surface_backing_target( data, window_width, window_height )) return STATUS_UNSUCCESSFUL;
-        refresh_client_surface_handoffs( data->hwnd );
+        X11DRV_client_surface_refresh_handoffs( data->hwnd );
         return STATUS_SUCCESS;
     }
 
@@ -7059,7 +7059,7 @@ static NTSTATUS ensure_client_surface_backing_extent( struct x11drv_win_data *da
                data->client_surface_backing, data->client_surface_backing_spare );
     /* Successful installation drained and detached every old native user. */
     if (old_pixmap || old_spare) client_surface_backing_free( old_pixmap, old_spare );
-    refresh_client_surface_handoffs( data->hwnd );
+    X11DRV_client_surface_refresh_handoffs( data->hwnd );
     if (snapshot && !invalidate)
     {
         data->client_surface_backing_valid = TRUE;

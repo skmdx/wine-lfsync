@@ -4327,6 +4327,8 @@ NTSTATUS X11DRV_UpdateClientSurfaceBacking( HWND hwnd, BOOL enable, BOOL prepare
         !memcmp( &data->rects, rects, sizeof(*rects) ))
     {
         TRACE( "win %p retains enabled staged backing\n", hwnd );
+        /* Native geometry can be unchanged while repair advanced the scene. */
+        X11DRV_client_surface_refresh_handoffs( hwnd );
         status = STATUS_SUCCESS;
         goto done;
     }

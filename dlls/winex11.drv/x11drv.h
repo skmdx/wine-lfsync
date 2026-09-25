@@ -262,6 +262,7 @@ extern BOOL X11DRV_WindowPosChanging( HWND hwnd, UINT swp_flags, BOOL shaped, co
 extern BOOL X11DRV_GetWindowStyleMasks( HWND hwnd, UINT style, UINT ex_style, UINT *style_mask, UINT *ex_style_mask );
 extern BOOL X11DRV_GetWindowStateUpdates( HWND hwnd, UINT *state_cmd, UINT *swp_flags, RECT *rect, HWND *foreground );
 extern BOOL X11DRV_RepairClientSurfaceOwner( HWND hwnd, BOOL resolve );
+extern BOOL X11DRV_client_surface_refresh_handoffs( HWND hwnd );
 extern BOOL X11DRV_ExposeClientSurface( HWND hwnd, UINT64 scene_generation );
 extern NTSTATUS X11DRV_UpdateClientSurfaceBacking( HWND hwnd, BOOL enable, BOOL prepare,
                                                   const struct window_rects *rects );
