@@ -1097,7 +1097,6 @@ static Bool stream_barrier_event( Display *display, XEvent *event, char *arg )
 BOOL x11drv_poll_stream_barrier( Display *display, struct x11drv_stream_barrier *barrier,
                                 struct x11drv_display_owner *owner )
 {
-    struct pollfd fd = { .fd = ConnectionNumber(display), .events = POLLIN };
     unsigned long processed;
     XEvent event;
 
@@ -1110,7 +1109,10 @@ BOOL x11drv_poll_stream_barrier( Display *display, struct x11drv_stream_barrier 
     XUnlockDisplay( display );
     if ((long)(processed - barrier->serial) < 0)
     {
-        if (poll( &fd, 1, 100 ) > 0) poll( NULL, 0, 1 );
+        /* Another reader can consume the socket response into Xlib after
+         * our check. Waiting on that shared fd would then miss the receipt.
+         * Yield before retrying the Xlib state, which remains the proof. */
+        poll( NULL, 0, 1 );
         return FALSE;
     }
     barrier->complete = TRUE;
