@@ -4317,6 +4317,19 @@ NTSTATUS X11DRV_UpdateClientSurfaceBacking( HWND hwnd, BOOL enable, BOOL prepare
     UINT64 geometry_scope;
 
     if (!(data = get_win_data( hwnd ))) return status;
+    /* A completed composition backing can receive another enable while its
+     * staged frame is still being copied. Reapplying the same state through
+     * WindowPosChanged would cancel that publication for no native change. */
+    if (enable && !prepare && data->client_surface_backing_enabled && data->client_surface_backing &&
+        data->client_surface_staged && !data->client_surface_pending_allocation &&
+        data->client_surface_backing_width == rects->visible.right - rects->visible.left &&
+        data->client_surface_backing_height == rects->visible.bottom - rects->visible.top &&
+        !memcmp( &data->rects, rects, sizeof(*rects) ))
+    {
+        TRACE( "win %p retains enabled staged backing\n", hwnd );
+        status = STATUS_SUCCESS;
+        goto done;
+    }
     /* A retained native client draws directly, so no GDI surface needs to
      * be created or retired. Geometry, staging and an existing output pool
      * still require the ordinary window update and its quiescing boundary.
