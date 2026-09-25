@@ -54,6 +54,7 @@ struct x11drv_client_surface
     VisualID source_visual;
     unsigned int source_depth;
     BOOL direct_snapshot;
+    BOOL snapshot_native; /* the cached snapshot uses the native source visual and extent */
     struct x11drv_client_snapshot *gpu_snapshot;
     struct x11drv_client_source_frame sources[CLIENT_SURFACE_SOURCE_FRAME_COUNT];
     struct x11drv_client_surface_retirement *handoff_retirement;

@@ -378,6 +378,7 @@ static BOOL apply_cpu_snapshot( void *context, struct client_surface *client, st
 
     x11drv_client_snapshot_release( surface->snapshot );
     surface->snapshot = x11drv_client_snapshot_share( context );
+    surface->snapshot_native = FALSE;
     x11drv_client_surface_set_gpu_snapshot( surface, NULL );
     if (present->handoff_control)
         present->handoff_source->source = x11drv_client_snapshot_pixmap( context );
@@ -421,7 +422,8 @@ static BOOL x11drv_client_surface_handoff_prepare(
     struct x11drv_client_snapshot *cached = surface->gpu_snapshot ? surface->gpu_snapshot : surface->snapshot;
     unsigned int index = present->handoff_index;
     BOOL ret = FALSE;
-    BOOL native = usexcomposite && !surface->direct_snapshot;
+    BOOL native = usexcomposite && !surface->direct_snapshot && !present->direct_snapshot &&
+                  (!present->replay || (surface->snapshot_native && !surface->gpu_snapshot));
     /* Native raw drawables use monitor pixels. Private GL/Vulkan snapshots
      * retain the rendered virtual extent; the owner scales their immutable
      * pixels to its monitor layout. Advertise the storage actually captured,
@@ -514,7 +516,7 @@ static BOOL x11drv_client_surface_handoff_capture( struct client_surface *client
     struct x11drv_client_surface *surface = impl_from_client_surface( client );
     struct x11drv_client_source_frame *frame = surface->sources + present->handoff_index;
 
-    if (present->replay || !usexcomposite || surface->direct_snapshot) return TRUE;
+    if (present->replay || !usexcomposite || surface->direct_snapshot || present->direct_snapshot) return TRUE;
     if (!frame->snapshot) return FALSE;
     if (!x11drv_client_snapshot_prepare_read( &frame->snapshot )) return FALSE;
     assert( !frame->gpu_copy );
@@ -545,7 +547,7 @@ static BOOL x11drv_client_surface_handoff_complete( struct client_surface *clien
 {
     struct x11drv_client_surface *surface = impl_from_client_surface( client );
     struct x11drv_client_source_frame *frame = &surface->sources[index];
-    BOOL native = usexcomposite && !surface->direct_snapshot;
+    BOOL native = usexcomposite && !surface->direct_snapshot && !(image->flags & CLIENT_SURFACE_HANDOFF_COPY_SOURCE);
     struct x11drv_client_snapshot *snapshot;
     SIZE size;
 
@@ -562,6 +564,8 @@ static BOOL x11drv_client_surface_handoff_complete( struct client_surface *clien
         }
         image->source = frame->pixmap;
         image->flags |= CLIENT_SURFACE_HANDOFF_COPY_SOURCE;
+        surface->snapshot_native = TRUE;
+        x11drv_client_surface_set_gpu_snapshot( surface, NULL );
         trace_snapshot_freeze( client, image, index );
         return TRUE;
     }

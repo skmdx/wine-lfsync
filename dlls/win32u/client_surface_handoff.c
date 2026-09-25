@@ -502,6 +502,8 @@ BOOL client_surface_freeze_frame_locked( struct client_surface *surface,
         }
         surface->composed_serial = present->serial;
         surface->completed_image_serial = present->serial;
+        if (!present->replay)
+            surface->direct_content_epoch = present->direct_snapshot ? present->target_epoch : 0;
         InterlockedExchange( &surface->content_valid, TRUE );
     }
     /* Source captures release references only. Their admitted backend

@@ -334,6 +334,9 @@ void client_surface_invalidate_source_locked( struct client_surface *surface,
     pthread_mutex_lock( &surface->present_lock );
     if (present->serial > surface->composed_serial)
     {
+        /* A retained private image survives a failed native write, but the
+         * mutable DIRECT attachment no longer supplies publication proof. */
+        surface->direct_content_epoch = 0;
         /* A later failed write cannot modify an independently owned completed
          * handoff image. Keep its serial and replay rights until a new image
          * is actually accepted; mutable native sources still invalidate. */
@@ -819,7 +822,7 @@ static BOOL client_surface_update_present_scene_internal_locked(
     RECT old_source_rect, new_source_rect;
     struct client_surface_scene scene;
     enum client_surface_target_update update;
-    BOOL changed, defer_direct, ready, scene_valid, preserve_native, preparing_candidate;
+    BOOL changed, defer_direct, ready, scene_valid, preserve_native, preparing_candidate, direct_image;
 
     client_surface_get_target( surface, &current );
     next = current;
@@ -873,15 +876,26 @@ static BOOL client_surface_update_present_scene_internal_locked(
     next.mode = !scene_valid && !preparing_candidate ? current.mode :
                 (scene.authoritative || scene.native_candidate == client_surface_get_identity( surface )) ? scene.mode :
                 CLIENT_SURFACE_PRESENTATION_COMPOSITED;
+    /* Keep an admitted sole native attachment while its resize renewal is
+     * pending. Detaching it discards the image needed by that renewal and
+     * makes the native parent check fail. The PREPARING scene still cannot
+     * authorize publication; the owner must validate the new geometry. */
+    if (preparing_candidate && surface->format && current.valid && current.mode == CLIENT_SURFACE_PRESENTATION_DIRECT &&
+        current.toplevel == next.toplevel)
+        next.mode = current.mode;
     /* Reparenting an already presented offscreen drawable may discard its
      * front buffer.  Keep the last STAGED/COMPOSITED image visible until an
      * actual producer present is ready to replace it.  Geometry owners still
      * update an established DIRECT target in place. */
+    /* A completed private copy can survive fallback detachment. An in-flight
+     * DIRECT image still needs its native attachment until capture completes. */
+    direct_image = current.mode == CLIENT_SURFACE_PRESENTATION_DIRECT && surface->content_valid &&
+        surface->completed_image_serial && surface->completed_image_serial == surface->composed_serial;
     defer_direct = !allow_direct_transition &&
                    ((next.mode == CLIENT_SURFACE_PRESENTATION_DIRECT &&
                      current.mode != CLIENT_SURFACE_PRESENTATION_DIRECT) ||
                     (scene_valid && scene.native_candidate == client_surface_get_identity( surface ) && scene.direct_candidate &&
-                     scene.mode != CLIENT_SURFACE_PRESENTATION_DIRECT));
+                     scene.mode != CLIENT_SURFACE_PRESENTATION_DIRECT && !direct_image));
     if (defer_direct) next.mode = current.mode;
     old_source_rect = surface->raw ? current.monitor_rect : current.virtual_rect;
     new_source_rect = surface->raw ? next.monitor_rect : next.virtual_rect;

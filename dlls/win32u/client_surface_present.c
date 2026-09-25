@@ -450,7 +450,7 @@ BOOL client_surface_end_present_internal( struct client_surface *surface,
     BOOL region_valid = TRUE, sync = !!present->scene.generation, wake = FALSE;
     BOOL authorized = present->scene.authoritative;
     BOOL begin_valid = TRUE, composition_retry = FALSE;
-    BOOL scene_retry = FALSE, source_valid = FALSE, direct = FALSE;
+    BOOL scene_retry = FALSE, source_valid = FALSE, direct = FALSE, direct_proof = FALSE;
     HDC hdc = 0;
 
     assert( present );
@@ -496,6 +496,10 @@ BOOL client_surface_end_present_internal( struct client_surface *surface,
          * target. Keep the same source/epoch checks without a DC, copy, fence
          * or per-frame server transaction on the generation-zero path. */
         direct = composed = TRUE;
+        /* A native Present can complete while renewal is still PREPARING.
+         * Replay may acknowledge it only on the exact unchanged attachment,
+         * never after a resize or a detach/reattach discarded that image. */
+        direct_proof = new_content || surface->direct_content_epoch == present->target_epoch;
         compose = FALSE;
     }
     if (compose && offscreen && !present->scene.valid) compose = FALSE;
@@ -598,6 +602,7 @@ BOOL client_surface_end_present_internal( struct client_surface *surface,
     if (source_valid)
     {
         surface->composed_serial = present->serial;
+        surface->direct_content_epoch = direct ? present->target_epoch : 0;
         InterlockedExchange( &surface->content_valid, TRUE );
     }
     if (composed && sync && !direct &&
@@ -607,7 +612,7 @@ BOOL client_surface_end_present_internal( struct client_surface *surface,
     composition_retry = sync && authorized && !composed && !scene_retry;
     pthread_mutex_unlock( &surface->present_lock );
 
-    if (direct && new_content && sync && present->scene.mode == CLIENT_SURFACE_PRESENTATION_DIRECT &&
+    if (direct && direct_proof && sync && present->scene.mode == CLIENT_SURFACE_PRESENTATION_DIRECT &&
         present->scene.authoritative && client_surface_scene_current( &present->scene ) &&
         surface->backend->complete_direct)
         surface->backend->complete_direct( surface, present );
@@ -768,14 +773,18 @@ static void prepare_client_surface_present_locked( struct client_surface *surfac
     present->target = !target.valid ? CLIENT_SURFACE_FRAME_TARGET_INVALID :
                       target.offscreen ? CLIENT_SURFACE_FRAME_TARGET_OFFSCREEN :
                       CLIENT_SURFACE_FRAME_TARGET_ONSCREEN;
+    present->direct_snapshot = !replay && surface->format && !present->scene.valid &&
+        present->target == CLIENT_SURFACE_FRAME_TARGET_ONSCREEN &&
+        client_surface_backend_has_cap( surface, CLIENT_SURFACE_BACKEND_OWNER_SCENE_PLAN );
+    if (present->direct_snapshot) client_surface_prepare_source_locked( surface, present );
     if (present->target == CLIENT_SURFACE_FRAME_TARGET_OFFSCREEN)
         client_surface_prepare_handoff_locked( surface, present );
     /* Native completion also belongs to frames submitted while the owner is
      * preparing its scene. The native drawable is usable independently of
      * that publication token, and its first completed image must be frozen. */
-    if (surface->target.valid && target.offscreen)
+    if (surface->target.valid && (target.offscreen || present->direct_snapshot))
     {
-        if (external_completion)
+        if (external_completion || present->direct_snapshot)
         {
             present->completion.kind = CLIENT_SURFACE_COMPLETION_EXACT;
             present->completion.external_result = TRUE;
@@ -983,7 +992,7 @@ static BOOL client_surface_capture_frame( struct client_surface *surface, struct
              client_surface_validate_size_locked( surface, present->capture.size.cx ?
                                                   &present->capture.size : expected_size ))
     {
-        if (!present->handoff_control && surface->target.offscreen &&
+        if (!present->handoff_control && (surface->target.offscreen || present->direct_snapshot) &&
             client_surface_backend_has_cap( surface, CLIENT_SURFACE_BACKEND_OWNER_SCENE_PLAN ))
             client_surface_prepare_source_locked( surface, present );
         captured = !!present->handoff_control;
@@ -1105,13 +1114,18 @@ BOOL client_surface_complete_present_locked( struct client_surface *surface,
         }
         pthread_mutex_unlock( &surface->present_lock );
     }
-    if (source_valid && present->handoff_control &&
+    /* A pending DIRECT snapshot must first let the geometry owner apply the
+     * selected plan. Replay then either acknowledges the retained attachment
+     * or hands the owned image to the newly installed composition target. */
+    if (source_valid && !present->direct_snapshot && present->handoff_control &&
         present->result != CLIENT_SURFACE_FRAME_SUPERSEDED)
     {
         handed_off = client_surface_publish_handoff_locked( surface, present, &frame );
         if (!handed_off && present->result != CLIENT_SURFACE_FRAME_SUPERSEDED)
             client_surface_abandon_handoff_locked( surface, present );
     }
+    if (source_valid && present->direct_snapshot)
+        client_surface_abandon_handoff_locked( surface, present );
     if (handed_off) completed = TRUE;
     if (completed && !handed_off && !source_valid && present->result != CLIENT_SURFACE_FRAME_SUPERSEDED)
     {

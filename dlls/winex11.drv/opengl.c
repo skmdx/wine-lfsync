@@ -1904,7 +1904,7 @@ static BOOL x11drv_surface_swap_blit( struct opengl_drawable *base, struct openg
     if (!client_surface_prepare_present( base->client, &present, use_oml || !usexcomposite,
                                          usexcomposite )) return FALSE;
     client_surface_begin_present( base->client );
-    if (usexcomposite && present.completion.kind == CLIENT_SURFACE_COMPLETION_EXACT &&
+    if (usexcomposite && !present.direct_snapshot && present.completion.kind == CLIENT_SURFACE_COMPLETION_EXACT &&
         !(completion = client_surface_alloc_scoped_metadata( &surface->memory, 1, sizeof(*completion) )))
     {
         client_surface_submit_present( base->client, &present );
@@ -1913,7 +1913,7 @@ static BOOL x11drv_surface_swap_blit( struct opengl_drawable *base, struct openg
         return FALSE;
     }
     if (blit && !blit_client_surface_output( base, &present, source, blit,
-                   !usexcomposite && present.completion.kind == CLIENT_SURFACE_COMPLETION_EXACT ))
+                   (!usexcomposite || present.direct_snapshot) && present.completion.kind == CLIENT_SURFACE_COMPLETION_EXACT ))
     {
         client_surface_free_scoped_metadata( &surface->memory, completion, sizeof(*completion) );
         client_surface_submit_present( base->client, &present );
@@ -1922,10 +1922,11 @@ static BOOL x11drv_surface_swap_blit( struct opengl_drawable *base, struct openg
     }
     /* A native offscreen target has an exact token even while the owner scene
      * is preparing. Capture the application's first image before any swap. */
-    if (!usexcomposite && present.completion.kind == CLIENT_SURFACE_COMPLETION_EXACT)
+    if ((!usexcomposite || present.direct_snapshot) && present.completion.kind == CLIENT_SURFACE_COMPLETION_EXACT)
     {
         submitted = completed = snapshot_client_surface( base, &present, 0,
                                                           base->doublebuffer ? GL_BACK : GL_FRONT );
+        if (submitted && present.direct_snapshot) pglXSwapBuffers( gdi_display, gl->drawable );
         /* The FBO owns front/back storage and the owner publishes the copied
          * source. A native swap on this hidden scratch window adds no pixels
          * and can leave glFinish waiting for an unviewable DRI3 presentation. */
@@ -2462,7 +2463,8 @@ static BOOL x11drv_egl_surface_present( struct opengl_drawable *base, GLuint fra
     if (!client_surface_prepare_present( base->client, &present,
                                          timestamp_completion || !usexcomposite || surface->direct_snapshot,
                                          TRUE )) return FALSE;
-    if (usexcomposite && !surface->direct_snapshot && present.completion.kind == CLIENT_SURFACE_COMPLETION_EXACT &&
+    if (usexcomposite && !surface->direct_snapshot && !present.direct_snapshot &&
+        present.completion.kind == CLIENT_SURFACE_COMPLETION_EXACT &&
         !funcs->p_eglGetNextFrameIdANDROID( egl->display, gl->base.surface, &frame_id ))
     {
         WARN( "Failed to allocate EGL presentation frame ID for %s\n",
@@ -2485,7 +2487,7 @@ static BOOL x11drv_egl_surface_present( struct opengl_drawable *base, GLuint fra
         return FALSE;
     }
     if (blit && !blit_client_surface_output( base, &present, source, blit,
-                   (!usexcomposite || surface->direct_snapshot) &&
+                   (!usexcomposite || surface->direct_snapshot || present.direct_snapshot) &&
                    present.completion.kind == CLIENT_SURFACE_COMPLETION_EXACT ))
     {
         client_surface_free_scoped_metadata( &surface->memory, completion, sizeof(*completion) );
@@ -2496,7 +2498,8 @@ static BOOL x11drv_egl_surface_present( struct opengl_drawable *base, GLuint fra
     /* The private native target has an exact completion even when PREPARING
      * still invalidates publication. Preserve its new image independently,
      * just as the GLX snapshot path does, before any native swap can lose it. */
-    if ((!usexcomposite || surface->direct_snapshot) && present.completion.kind == CLIENT_SURFACE_COMPLETION_EXACT)
+    if ((!usexcomposite || surface->direct_snapshot || present.direct_snapshot) &&
+        present.completion.kind == CLIENT_SURFACE_COMPLETION_EXACT)
     {
         enum client_surface_gpu_snapshot_result gpu = GPU_SNAPSHOT_UNSUPPORTED;
         BOOL copied;
@@ -2508,8 +2511,13 @@ static BOOL x11drv_egl_surface_present( struct opengl_drawable *base, GLuint fra
                                                     framebuffer ? GL_COLOR_ATTACHMENT0 : GL_BACK ));
 
         ret = copied;
+        if (ret && present.direct_snapshot)
+        {
+            if (framebuffer) ret = blit_client_surface_framebuffer( base, &present, framebuffer );
+            if (ret) ret = funcs->p_eglSwapBuffers( egl->display, gl->base.surface );
+        }
         client_surface_submit_present( base->client, &present );
-        if (copied && present.completion.wait)
+        if (ret && copied && present.completion.wait)
         {
             client_surface_defer_present( base->client, &present, expected_size );
             return TRUE;
