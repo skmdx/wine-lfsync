@@ -765,6 +765,7 @@ struct x11drv_win_data
     UINT        client_surface_opacity_valid : 1; /* desired opacity property is present */
     UINT        client_surface_backing_enabled : 1;
     UINT        client_surface_backing_valid : 1;
+    UINT        client_surface_restack : 1; /* deferred Win32 stacking needs native replay */
     UINT        client_surface_map_update; /* continuation awaiting a drawable native window */
     Window      embedder;       /* window id of embedder */
     Pixmap         icon_pixmap;

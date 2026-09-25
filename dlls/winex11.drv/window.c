@@ -4432,11 +4432,26 @@ NTSTATUS X11DRV_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_hint,
     owner_update = X11DRV_client_surface_backing_begin_update( hwnd, new_rects, swp_flags, &deferred );
     /* This exact target owns the deferred state reasons and its GUI wake.
      * No native preparation or STAGED result has run yet. */
-    if (deferred) return STATUS_PENDING;
+    if (deferred)
+    {
+        if (!(swp_flags & SWP_NOZORDER) && (data = get_win_data( hwnd )))
+        {
+            data->client_surface_restack = TRUE;
+            release_win_data( data );
+        }
+        return STATUS_PENDING;
+    }
     if (!(data = get_win_data( hwnd )))
     {
         if (owner_update) X11DRV_client_surface_backing_end_update( NULL, owner_update );
         return STATUS_SUCCESS;
+    }
+    /* The state replay normally suppresses z-order requests. Recompute from
+     * the latest server order after a deferred change, not its old sibling. */
+    if (data->client_surface_restack)
+    {
+        swp_flags &= ~SWP_NOZORDER;
+        data->client_surface_restack = FALSE;
     }
     geometry_scope = X11DRV_client_surface_geometry_begin( data );
     if (is_managed) window_set_managed( data, TRUE );

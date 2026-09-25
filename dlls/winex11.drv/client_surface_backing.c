@@ -6577,7 +6577,7 @@ struct client_surface_owner_notifications *X11DRV_client_surface_backing_begin_u
 {
     const UINT no_geometry = SWP_NOSIZE | SWP_NOMOVE | SWP_NOCLIENTSIZE | SWP_NOCLIENTMOVE | SWP_NOZORDER;
     struct x11drv_win_data *data;
-    BOOL backing, activation, defer_geometry;
+    BOOL backing, activation, defer_position;
     struct client_surface_compositor_job job =
     {
         .op = CLIENT_SURFACE_COMPOSITOR_BEGIN_UPDATE,
@@ -6604,10 +6604,9 @@ struct client_surface_owner_notifications *X11DRV_client_surface_backing_begin_u
         (swp_flags & (SWP_SHOWWINDOW | SWP_HIDEWINDOW | SWP_FRAMECHANGED | SWP_STATECHANGED)) ||
         data->is_fullscreen || (swp_flags & WINE_SWP_FULLSCREEN) ||
         memcmp( &data->rects, rects, sizeof(*rects) );
-    /* Position and size updates can replay the latest committed Win32 rects.
-     * Keep operations whose flags carry native state synchronous. */
-    defer_geometry = rects && !data->is_fullscreen &&
-        (swp_flags & (SWP_NOZORDER | SWP_NOACTIVATE)) == (SWP_NOZORDER | SWP_NOACTIVATE) &&
+    /* Position, size and stacking updates can replay the latest Win32 state.
+     * Keep activation and explicit native state transitions synchronous. */
+    defer_position = rects && !data->is_fullscreen && (swp_flags & SWP_NOACTIVATE) &&
         !(swp_flags & (SWP_SHOWWINDOW | SWP_HIDEWINDOW | SWP_FRAMECHANGED | SWP_STATECHANGED |
                       WINE_SWP_FULLSCREEN));
     release_win_data( data );
@@ -6619,7 +6618,7 @@ struct client_surface_owner_notifications *X11DRV_client_surface_backing_begin_u
      * replay. A new backing activation retains its synchronous native publication
      * boundary. Repeated enables can coalesce with a pending disable while
      * the native backing is still enabled. */
-    if (deferred && (!job.u.update.invalidate_scene || defer_geometry) && !activation &&
+    if (deferred && (!job.u.update.invalidate_scene || defer_position) && !activation &&
         !(swp_flags & WINE_SWP_CLIENT_SURFACE_PUBLISH))
     {
         BOOL ret;
