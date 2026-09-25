@@ -988,6 +988,7 @@ void wrap_glViewport( TEB *teb, GLint x, GLint y, GLsizei width, GLsizei height,
 BOOL wrap_wglSwapBuffers( TEB *teb, HDC hdc )
 {
     const struct opengl_funcs *funcs = get_dc_funcs( hdc );
+    struct opengl_context *ctx;
     BOOL ret;
 
     if (!funcs->p_wglSwapBuffers) return FALSE;
@@ -998,6 +999,15 @@ BOOL wrap_wglSwapBuffers( TEB *teb, HDC hdc )
     {
         /* default implementation: implicitly flush the context */
         flush_context( teb, funcs->p_glFlush );
+    }
+
+    /* The internal context exchanged the default FBO attachments. Rebind
+     * them and restore the application's logical buffer selections before
+     * another draw can reach the old back buffer, now the front buffer. */
+    if ((ctx = get_current_context( teb, NULL, NULL, NULL )))
+    {
+        pop_default_fbo( teb );
+        set_default_fbo_buffers( teb, ctx );
     }
 
     return ret;
