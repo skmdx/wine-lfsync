@@ -411,6 +411,7 @@ static void copy_cache_image( struct client_surface_cache_image *image )
             image->success = FALSE;
             if (!status)
             {
+                read->copy_error = worker->error;
                 release_content_seed( image );
                 x11drv_native_window_seed_end( read );
             }
