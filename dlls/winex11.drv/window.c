@@ -184,13 +184,24 @@ struct x11drv_native_window
 {
     struct client_surface_memory_scope memory;
     struct client_surface_native_work work;
+    struct client_surface_native_work content_release_work;
     struct x11drv_error_handler errors;
     struct x11drv_stream_barrier gdi_barrier, destroy_barrier;
+    struct x11drv_stream_barrier content_barrier;
     struct list desktop_entry;
     struct x11drv_display_owner *creator;
     struct x11drv_native_window *ancestor;
     Display *display;
     Window window, content, parent, private_parent;
+    unsigned int content_width, content_height;
+    unsigned int content_users;
+    unsigned long content_serial;
+    UINT64 content_bytes, content_release_bytes;
+    UINT64 content_epoch;
+    LONG content_error;
+    BOOL content_redirected;
+    BOOL content_naming, content_release_waiting;
+    BOOL content_resize_failed;
     Colormap colormap;
     LONG refs, destroyed;
     BOOL retired;
@@ -208,6 +219,12 @@ static int native_window_error( Display *display, XErrorEvent *event, void *arg 
     if (display == gdi_display && x11drv_stream_barrier_error( &window->gdi_barrier, event )) return 1;
     if (display != window->display) return 0;
     if (x11drv_stream_barrier_error( &window->destroy_barrier, event )) return 1;
+    if (x11drv_stream_barrier_error( &window->content_barrier, event )) return 1;
+    if (window->content_serial && event->serial == window->content_serial)
+    {
+        InterlockedExchange( &window->content_error, event->error_code );
+        return 1;
+    }
 
     if (window->window && event->error_code == BadWindow && event->resourceid == window->window &&
         (event->request_code == X_DestroyWindow || event->request_code == X_UnmapWindow ||
@@ -262,12 +279,187 @@ Window x11drv_native_window_read_init( struct x11drv_native_window_read *read,
 Window x11drv_native_window_read_drawable( const struct x11drv_native_window_read *read )
 {
     assert( read->window );
-    return read->window->window;
+    return read->content ? read->window->content : read->window->window;
+}
+
+Window x11drv_native_window_content_read_init( struct x11drv_native_window_read *read,
+                                              struct x11drv_native_window *window, UINT64 epoch )
+{
+    x11drv_native_window_read_init( read, window );
+    read->content = TRUE;
+    read->content_epoch = epoch;
+    return window->content;
 }
 
 Window x11drv_native_window_content( const struct x11drv_native_window *window )
 {
     return window->content;
+}
+
+static UINT64 native_content_capacity( unsigned int width, unsigned int height, unsigned int depth )
+{
+    /* Keep room for the active backing and one replacement while resize is
+     * processed. Named seed inputs carry their own independent reservations. */
+    return 2 * (UINT64)width * height * (depth > 16 ? 4 : depth > 8 ? 2 : 1);
+}
+
+NTSTATUS x11drv_native_window_prepare_content( struct x11drv_native_window *window,
+                                               unsigned int width, unsigned int height, unsigned int depth,
+                                               UINT64 *epoch )
+{
+#ifdef SONAME_LIBXCOMPOSITE
+    UINT64 bytes = native_content_capacity( width, height, depth );
+    NTSTATUS status = STATUS_SUCCESS;
+
+    if (!pXCompositeRedirectWindow || window->content == window->window) return STATUS_NOT_SUPPORTED;
+    pthread_mutex_lock( &native_window_mutex );
+    if (window->content_release_bytes) status = STATUS_PENDING;
+    else if (window->content_resize_failed) status = STATUS_NO_MEMORY;
+    else if (InterlockedCompareExchange( &window->content_error, 0, 0 )) status = STATUS_UNSUCCESSFUL;
+    else if (bytes > window->content_bytes &&
+             !client_surface_reserve_scoped_memory( &window->memory, CLIENT_SURFACE_MEMORY_OUTPUT,
+                                                   bytes - window->content_bytes )) status = STATUS_NO_MEMORY;
+    else
+    {
+        window->content_bytes = max( bytes, window->content_bytes );
+        ++window->content_users;
+        if (!window->content_redirected)
+        {
+            ++window->content_epoch;
+            XLockDisplay( window->display );
+            window->content_serial = XNextRequest( window->display );
+            pXCompositeRedirectWindow( window->display, window->content, CompositeRedirectAutomatic );
+            XUnlockDisplay( window->display );
+            window->content_redirected = TRUE;
+        }
+        *epoch = window->content_epoch;
+    }
+    pthread_mutex_unlock( &native_window_mutex );
+    return status;
+#else
+    return STATUS_NOT_SUPPORTED;
+#endif
+}
+
+static void release_native_content( struct client_surface_native_work *work )
+{
+    struct x11drv_native_window *window = CONTAINING_RECORD( work, struct x11drv_native_window, content_release_work );
+
+    x11drv_poll_stream_barrier( window->display, &window->content_barrier, window->creator );
+}
+
+static BOOL resize_native_content( struct x11drv_win_data *data, unsigned int width, unsigned int height )
+{
+    struct x11drv_native_window *window = data->native_window;
+    UINT64 bytes = native_content_capacity( width, height, data->vis.depth );
+    BOOL success = TRUE;
+
+    if (data->content_window == data->whole_window) return TRUE;
+    pthread_mutex_lock( &native_window_mutex );
+    if (window->content_width != width || window->content_height != height)
+    {
+        if (window->content_redirected && bytes > window->content_bytes &&
+            !client_surface_reserve_scoped_memory( &window->memory, CLIENT_SURFACE_MEMORY_OUTPUT,
+                                                  bytes - window->content_bytes )) success = FALSE;
+        else
+        {
+            if (window->content_redirected) window->content_bytes = max( bytes, window->content_bytes );
+            XResizeWindow( window->display, window->content, width, height );
+            window->content_width = width;
+            window->content_height = height;
+            ++data->client_surface_native_revision;
+        }
+    }
+    window->content_resize_failed = !success;
+    pthread_mutex_unlock( &native_window_mutex );
+    return success;
+}
+
+static void finish_native_content_release( struct client_surface_native_work *work )
+{
+    struct x11drv_native_window *window = CONTAINING_RECORD( work, struct x11drv_native_window, content_release_work );
+
+    if (!window->content_barrier.complete)
+    {
+        client_surface_submit_native_work( work );
+        return;
+    }
+    pthread_mutex_lock( &native_window_mutex );
+    if (window->content_naming)
+    {
+        window->content_release_waiting = TRUE;
+        pthread_mutex_unlock( &native_window_mutex );
+        return;
+    }
+    pthread_mutex_unlock( &native_window_mutex );
+    client_surface_release_scoped_memory( &window->memory, CLIENT_SURFACE_MEMORY_OUTPUT, window->content_release_bytes );
+    pthread_mutex_lock( &native_window_mutex );
+    window->content_release_bytes = 0;
+    window->content_barrier = (struct x11drv_stream_barrier){0};
+    pthread_mutex_unlock( &native_window_mutex );
+    x11drv_native_window_release( window );
+}
+
+void x11drv_native_window_release_content( struct x11drv_native_window *window, UINT64 epoch, BOOL reset )
+{
+#ifdef SONAME_LIBXCOMPOSITE
+    pthread_mutex_lock( &native_window_mutex );
+    if (!window->content_redirected || window->content_epoch != epoch)
+    {
+        pthread_mutex_unlock( &native_window_mutex );
+        return;
+    }
+    assert( window->content_users );
+    if (reset) window->content_users = 0;
+    else --window->content_users;
+    if (window->content_users)
+    {
+        pthread_mutex_unlock( &native_window_mutex );
+        return;
+    }
+    if (!InterlockedCompareExchange( &window->content_error, 0, 0 ))
+        pXCompositeUnredirectWindow( window->display, window->content, CompositeRedirectAutomatic );
+    window->content_redirected = FALSE;
+    window->content_release_bytes = window->content_bytes;
+    window->content_bytes = 0;
+    window->content_release_work.execute = release_native_content;
+    window->content_release_work.finished = finish_native_content_release;
+    x11drv_native_window_acquire( window );
+    x11drv_queue_stream_barrier( window->display, &window->content_barrier );
+    pthread_mutex_unlock( &native_window_mutex );
+    client_surface_submit_native_work( &window->content_release_work );
+#endif
+}
+
+NTSTATUS x11drv_native_window_seed_begin( struct x11drv_native_window_read *read )
+{
+    struct x11drv_native_window *window = read->window;
+    NTSTATUS status;
+
+    pthread_mutex_lock( &native_window_mutex );
+    if (!window->content_redirected || window->content_epoch != read->content_epoch) status = STATUS_CANCELLED;
+    else if (window->content_naming) status = STATUS_PENDING;
+    else
+    {
+        window->content_naming = TRUE;
+        status = STATUS_SUCCESS;
+    }
+    pthread_mutex_unlock( &native_window_mutex );
+    return status;
+}
+
+void x11drv_native_window_seed_end( struct x11drv_native_window_read *read )
+{
+    struct x11drv_native_window *window = read->window;
+    BOOL wake;
+
+    pthread_mutex_lock( &native_window_mutex );
+    assert( window->content_naming );
+    window->content_naming = FALSE;
+    wake = window->content_release_waiting;
+    window->content_release_waiting = FALSE;
+    pthread_mutex_unlock( &native_window_mutex );
+    if (wake) client_surface_submit_native_work( &window->content_release_work );
 }
 
 BOOL x11drv_native_window_read_ready( struct x11drv_native_window_read *read )
@@ -286,6 +478,8 @@ BOOL x11drv_native_window_read_ready( struct x11drv_native_window_read *read )
 
 BOOL x11drv_native_window_copy_ready( struct x11drv_native_window_read *read )
 {
+    LONG error;
+
     if (!x11drv_native_window_read_ready( read )) return FALSE;
     /* Pixel copies also depend on prior GDI commands. Geometry-only users
      * must not acquire a drawing obligation they cannot retire. */
@@ -294,6 +488,8 @@ BOOL x11drv_native_window_copy_ready( struct x11drv_native_window_read *read )
         if (!read->drawing.serial) x11drv_queue_stream_barrier( gdi_display, &read->drawing );
         if (!x11drv_poll_stream_barrier( gdi_display, &read->drawing, NULL )) return FALSE;
     }
+    if (read->content && (error = InterlockedCompareExchange( &read->window->content_error, 0, 0 )))
+        read->copy_error = error;
     return TRUE;
 }
 
@@ -414,6 +610,7 @@ static void free_native_window( struct client_surface_native_work *work )
     if (native_root == window) native_root = NULL; /* retain root_owned until another root is selected */
     list_remove( &window->desktop_entry );
     pthread_mutex_unlock( &native_window_mutex );
+    client_surface_release_scoped_memory( &window->memory, CLIENT_SURFACE_MEMORY_OUTPUT, window->content_bytes );
     client_surface_free_owned_metadata( &window->memory, window, sizeof(*window) );
     x11drv_return_release_capacity( 1, sizeof(*window) );
     TRACE_(csperf)( "event=native_window_return record=0x%lx bytes=%zu\n", identity, sizeof(*window) );
@@ -2023,6 +2220,12 @@ static void window_set_config( struct x11drv_win_data *data, RECT rect, BOOL abo
     data->desired_state.above = above;
     if (data->state_locks) return; /* win32 state is being updated, delay the change */
     if (!data->whole_window) return; /* no window, nothing to update */
+    changes.width = new_rect->right - new_rect->left;
+    changes.height = new_rect->bottom - new_rect->top;
+    if (changes.width <= 0 || changes.height <= 0) changes.width = changes.height = 1;
+    changes.width = min( changes.width, 65535 );
+    changes.height = min( changes.height, 65535 );
+    if (!resize_native_content( data, changes.width, changes.height )) return;
     if (EqualRect( old_rect, new_rect ) && (old_above || !above || data->managed)) return; /* rects are the same, no need to be raised, nothing to update */
     if (window_needs_config_change_delay( data ))
     {
@@ -2068,8 +2271,6 @@ static void window_set_config( struct x11drv_win_data *data, RECT rect, BOOL abo
     if (mask & (CWWidth | CWHeight))
     {
         ++data->client_surface_native_revision;
-        if (data->content_window != data->whole_window)
-            XResizeWindow( data->display, data->content_window, changes.width, changes.height );
     }
     data->pending_state.rect = *new_rect;
     data->pending_state.above = above;
@@ -3182,6 +3383,8 @@ static BOOL create_whole_window( struct x11drv_win_data *data, struct x11drv_nat
                                            CWColormap | CWBorderPixel | CWBackPixel | CWBitGravity |
                                            CWWinGravity | CWEventMask, &attr );
     native_window->content = data->content_window;
+    native_window->content_width = cx;
+    native_window->content_height = cy;
     XSaveContext( data->display, data->content_window, winContext, (char *)data->hwnd );
     XMapWindow( data->display, data->content_window );
     SetRect( &data->current_state.rect, pos.x, pos.y, pos.x + cx, pos.y + cy );

@@ -14,16 +14,16 @@
 #endif
 
 #include "config.h"
+#include "ntstatus.h"
 
 #include <assert.h>
 #include <fcntl.h>
-#include <X11/extensions/shape.h>
 
 #include "x11drv.h"
 #include "client_surface.h"
 #include "client_surface_cache.h"
 #include "client_surface_xcb.h"
-#include "xpresent.h"
+#include "xcomposite.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(x11drv);
 WINE_DECLARE_DEBUG_CHANNEL(csperf);
@@ -57,6 +57,8 @@ struct client_surface_cache_image
     struct client_surface_cache_image *copy_source;
     BOOL waiting;
     Pixmap pixmap, source;
+    Pixmap seed;
+    UINT64 seed_bytes;
     Window window;
     GC gc, transfer_gc, window_gc;
     unsigned int width, height, depth;
@@ -328,6 +330,53 @@ static BOOL prepare_window_copy_gc( struct client_surface_cache_image *image )
     return image->window_gc_ready;
 }
 
+static BOOL acquire_content_seed( struct client_surface_cache_image *image )
+{
+#ifdef SONAME_LIBXCOMPOSITE
+    struct cache_worker *worker = image->worker;
+    Display *display = worker->display;
+    Window root;
+    unsigned int width = 0, height = 0, border, depth = 0;
+    int x, y;
+    BOOL valid;
+
+    if (!client_surface_reserve_scoped_memory( &image->memory, CLIENT_SURFACE_MEMORY_OUTPUT, image->bytes ))
+        return FALSE;
+    image->seed_bytes = image->bytes;
+    image->seed = pXCompositeNameWindowPixmap( display, image->source );
+    XSync( display, False );
+    if (worker->error)
+    {
+        image->seed = 0;
+        return FALSE;
+    }
+    valid = XGetGeometry( display, image->seed, &root, &x, &y, &width, &height, &border, &depth );
+    /* Naming pins the old backing across unmap/resize. Only an admitted
+     * extent may become this request's input; scene validation is separate. */
+    valid = valid && width == image->copy_width && height == image->copy_height && depth == image->depth &&
+            (UINT64)width * height * (depth > 16 ? 4 : depth > 8 ? 2 : 1) <= image->seed_bytes;
+    TRACE_(csperf)( "ticks=%llu event=content_seed_acquire image=%p window=%lx pixmap=%lx width=%u height=%u bytes=%llu\n",
+                   cache_time(), image, image->source, image->seed, width, height, (unsigned long long)image->seed_bytes );
+    return valid;
+#else
+    return FALSE;
+#endif
+}
+
+static void release_content_seed( struct client_surface_cache_image *image )
+{
+    if (image->seed)
+    {
+        XFreePixmap( image->worker->display, image->seed );
+        XSync( image->worker->display, False );
+        TRACE_(csperf)( "ticks=%llu event=content_seed_release image=%p pixmap=%lx bytes=%llu\n",
+                       cache_time(), image, image->seed, (unsigned long long)image->seed_bytes );
+        image->seed = 0;
+    }
+    client_surface_release_scoped_memory( &image->memory, CLIENT_SURFACE_MEMORY_OUTPUT, image->seed_bytes );
+    image->seed_bytes = 0;
+}
+
 static void copy_cache_image( struct client_surface_cache_image *image )
 {
     struct cache_worker *worker = image->worker;
@@ -335,6 +384,7 @@ static void copy_cache_image( struct client_surface_cache_image *image )
     XGCValues values = {.graphics_exposures = False};
     Display *display = worker->display;
     GC gc;
+    Pixmap input;
 
     if (read && read->copy_serial) goto receipt;
     worker->error = 0;
@@ -343,6 +393,32 @@ static void copy_cache_image( struct client_surface_cache_image *image )
      * private transforms may continue to change the separate drawing GC. */
     if (read)
     {
+        NTSTATUS status;
+
+        if (read->copy_error)
+        {
+            image->success = FALSE;
+            goto done;
+        }
+        status = x11drv_native_window_seed_begin( read );
+        if (status == STATUS_PENDING)
+        {
+            image->waiting = TRUE;
+            return;
+        }
+        if (status || !acquire_content_seed( image ))
+        {
+            image->success = FALSE;
+            if (!status)
+            {
+                release_content_seed( image );
+                x11drv_native_window_seed_end( read );
+            }
+            goto done;
+        }
+        /* Only naming/extent validation shares the replacement reservation.
+         * The admitted alias is charged independently before the long copy. */
+        x11drv_native_window_seed_end( read );
         if (!prepare_window_copy_gc( image ))
         {
             image->success = FALSE;
@@ -362,7 +438,7 @@ static void copy_cache_image( struct client_surface_cache_image *image )
             XSetClipOrigin( display, gc, 0, 0 );
         }
     }
-    if (gc) XCopyArea( display, image->source, image->pixmap, gc,
+    if (gc) XCopyArea( display, read ? image->seed : image->source, image->pixmap, gc,
                       0, 0, image->copy_width, image->copy_height, 0, 0 );
     if (read) x11drv_native_window_read_end( read );
     else
@@ -377,10 +453,12 @@ receipt:
         if (image->waiting) return;
     }
 done:
-    TRACE_(csperf)( "ticks=%llu event=%s image=%p source=%lx destination=%lx "
+    input = read ? image->seed : image->source;
+    if (read) release_content_seed( image );
+    TRACE_(csperf)( "ticks=%llu event=%s image=%p source=%lx input=%lx destination=%lx "
                    "display=%p width=%u height=%u error=%d sync_calls=%u receipt=%lu copy_serial=%lu success=%u\n", cache_time(),
                    image->purpose == CLIENT_SURFACE_MEMORY_OUTPUT ? "output_pair_native_copy" : "cache_native_fallback",
-                   image, image->source, image->pixmap, display, image->copy_width,
+                   image, image->source, input, image->pixmap, display, image->copy_width,
                    image->copy_height, read ? read->copy_error : worker->error, !read,
                    read ? read->copy.serial : 0, read ? read->copy_serial : 0, image->success );
 }
@@ -671,68 +749,34 @@ void client_surface_submit_native_work( struct client_surface_native_work *work 
 static void execute_native_present( struct client_surface_native_work *work )
 {
     struct client_surface_native_present *present = CONTAINING_RECORD( work, struct client_surface_native_present, work );
-    struct client_surface_xcb_request request = {0};
     struct cache_worker *worker = native_worker;
+    XGCValues values = {.graphics_exposures = False, .subwindow_mode = IncludeInferiors};
     Display *display;
     GC gc;
+    Drawable source = present->committing ? present->pixmap : present->content;
+    Drawable destination = present->committing ? present->content : present->window;
     RECT full = {0, 0, present->width, present->height};
-    const RECT *rect = IsRectEmpty( &present->copy_rect ) ? &full : &present->copy_rect;
-    unsigned int xcb_gc = 0;
+    const RECT *rect = present->committing ? &present->commit_rect :
+                      IsRectEmpty( &present->copy_rect ) ? &full : &present->copy_rect;
 
     if (!open_cache_display( worker )) return;
     display = worker->display;
     worker->error = 0;
-#ifdef HAVE_LIBXSHAPE
-    if (present->update_shape)
-        XShapeCombineRectangles( display, present->window, ShapeBounding, 0, 0,
-                                 present->shape, present->shape_count, ShapeSet, Unsorted );
-#endif
-#ifdef SONAME_LIBXPRESENT
-    if (!present->copy)
-    {
-        if (client_surface_xcb_present( display, present->window, present->pixmap, present->serial, &request ))
-        {
-            TRACE_(csperf)( "ticks=%llu event=present window=%lx pixmap=%lx serial=%u\n",
-                           cache_time(), present->window, present->pixmap, present->serial );
-            present->success = client_surface_xcb_wait( display, &request );
-            TRACE( "validated X Present request %u serial %u success %u\n",
-                   request.cookies[0], present->serial, present->success );
-        }
-        else
-        {
-            pXPresentPixmap( display, present->window, present->pixmap, present->serial, None, None,
-                             0, 0, None, None, None, PresentOptionAsync | PresentOptionCopy, 0, 0, 0, NULL, 0 );
-            TRACE_(csperf)( "ticks=%llu event=present window=%lx pixmap=%lx serial=%u\n",
-                           cache_time(), present->window, present->pixmap, present->serial );
-            XSync( display, False );
-            present->success = !worker->error;
-        }
-        if (present->success) return;
-    }
-#endif
-    /* STAGED publication and the rejected-Present fallback have the same
-     * checked write boundary, on this worker's private connection. */
-    worker->error = 0;
-    present->copied = TRUE;
-    if (client_surface_xcb_copy( display, present->pixmap, present->window, &xcb_gc,
-                                0, rect, rect, &full, NULL, 1, FALSE, &request, TRUE ))
-    {
-        TRACE_(csperf)( "ticks=%llu event=publish_copy_submit window=%lx pixmap=%lx serial=%u generation=%llu epoch=%llu cookie=%u barrier=%u\n",
-                       cache_time(), present->window, present->pixmap, present->serial,
-                       (unsigned long long)present->generation, (unsigned long long)present->epoch,
-                       request.cookies[request.count - 1], request.barrier );
-        present->success = client_surface_xcb_wait( display, &request );
-        client_surface_xcb_free_gc( display, &xcb_gc );
-        return;
-    }
-    gc = XCreateGC( display, present->pixmap, 0, NULL );
+    /* Commit only the accepted SOURCE region. Publication reads the shared
+     * content at server execution, so a later GDI write cannot be replaced
+     * by the old private frame even if this request was stopped in native code. */
+    present->copied = !present->committing;
+    gc = XCreateGC( display, destination, GCGraphicsExposures | GCSubwindowMode, &values );
     if (gc)
     {
-        XSetGraphicsExposures( display, gc, False );
-        XCopyArea( display, present->pixmap, present->window, gc, rect->left, rect->top,
+        if (present->committing)
+            XSetClipRectangles( display, gc, 0, 0, present->shape, present->shape_count, Unsorted );
+        XCopyArea( display, source, destination, gc, rect->left, rect->top,
                    rect->right - rect->left, rect->bottom - rect->top, rect->left, rect->top );
-        TRACE_(csperf)( "ticks=%llu event=xlib_copy_request source=%lx destination=%lx width=%u height=%u clipped=0 route=present\n",
-                       cache_time(), present->pixmap, present->window, present->width, present->height );
+        TRACE_(csperf)( "ticks=%llu event=xlib_copy_request source=%lx destination=%lx width=%u height=%u clipped=%u route=%s\n",
+                       cache_time(), source, destination, rect->right - rect->left,
+                       rect->bottom - rect->top, present->committing,
+                       present->committing ? "source_commit" : "present" );
         XFreeGC( display, gc );
         XSync( display, False );
         present->success = !worker->error;
@@ -744,10 +788,22 @@ static void finish_native_present( struct client_surface_native_work *work )
     struct client_surface_native_present *present = CONTAINING_RECORD( work, struct client_surface_native_present, work );
     void (*wake)(void) = present->wake;
 
-    /* A checked reply proves receipt, not application of a Present. The
-     * actor releases the Window lane after Complete; workers remain free. */
+    /* The actor keeps the lane across the SOURCE commit and current-content
+     * publication, releasing it only after the final checked copy. */
     WriteRelease( &present->complete, TRUE );
     wake();
+}
+
+void client_surface_publish_native_present( struct client_surface_native_present *present )
+{
+    pthread_mutex_lock( &cache_mutex );
+    assert( present->queue && present->queue->head == present &&
+            present->committing && ReadAcquire( &present->complete ) && present->success );
+    present->committing = FALSE;
+    present->success = present->complete = FALSE;
+    queue_native_work( select_existing_worker( present_workers, present_worker_count, &next_present_worker ),
+                       &present->work );
+    pthread_mutex_unlock( &cache_mutex );
 }
 
 void client_surface_release_native_present( struct client_surface_native_present *present )

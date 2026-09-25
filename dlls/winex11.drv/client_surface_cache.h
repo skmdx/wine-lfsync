@@ -25,21 +25,22 @@ struct client_surface_native_present
     struct client_surface_native_work work;
     struct client_surface_native_present *next;
     struct client_surface_native_present_queue *queue;
-    Window window;
+    Window window, content;
     Pixmap pixmap;
     unsigned int width, height, serial;
     UINT64 generation, epoch;
     RECT copy_rect; /* empty for full-frame publication; otherwise a restore */
     XRectangle *shape;
     unsigned int shape_count;
-    BOOL update_shape;
+    RECT commit_rect;
+    BOOL committing;
     BOOL copy, copied, success, complete;
     void (*wake)(void);
 };
 void client_surface_submit_native_present( struct client_surface_native_present_queue *queue,
                                            struct client_surface_native_present *present );
-/* Release ordering only after the checked copy or Present Complete. Image
- * lifetime still extends through the independently observed Present Idle. */
+void client_surface_publish_native_present( struct client_surface_native_present *present );
+/* Release the native FIFO lane after the final checked copy. */
 void client_surface_release_native_present( struct client_surface_native_present *present );
 /* Cancel only requests still owned by the queues, never an executing head. */
 void client_surface_cancel_native_presents( struct client_surface_native_present_queue *queue );

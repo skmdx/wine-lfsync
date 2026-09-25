@@ -935,11 +935,21 @@ struct x11drv_native_window_read
     unsigned long copy_serial;
     int copy_error;
     BOOL copy_complete, copy_exposed;
+    BOOL content;
+    UINT64 content_epoch;
 };
 extern Window x11drv_native_window_read_init( struct x11drv_native_window_read *read,
                                               struct x11drv_native_window *window );
 extern Window x11drv_native_window_read_drawable( const struct x11drv_native_window_read *read );
+extern Window x11drv_native_window_content_read_init( struct x11drv_native_window_read *read,
+                                                      struct x11drv_native_window *window, UINT64 epoch );
 extern Window x11drv_native_window_content( const struct x11drv_native_window *window );
+extern NTSTATUS x11drv_native_window_prepare_content( struct x11drv_native_window *window,
+                                                      unsigned int width, unsigned int height, unsigned int depth,
+                                                      UINT64 *epoch );
+extern void x11drv_native_window_release_content( struct x11drv_native_window *window, UINT64 epoch, BOOL reset );
+extern NTSTATUS x11drv_native_window_seed_begin( struct x11drv_native_window_read *read );
+extern void x11drv_native_window_seed_end( struct x11drv_native_window_read *read );
 extern BOOL x11drv_native_window_read_ready( struct x11drv_native_window_read *read );
 extern BOOL x11drv_native_window_copy_ready( struct x11drv_native_window_read *read );
 extern void x11drv_native_window_read_begin( struct x11drv_native_window_read *read, Display *display );
