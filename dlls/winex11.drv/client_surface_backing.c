@@ -6183,8 +6183,7 @@ static NTSTATUS replace_client_surface_backing( struct x11drv_win_data *data,
             return STATUS_PENDING;
         }
         allocation->scene_wait = FALSE;
-        /* A cold pool owns a Window seed request. A fully covered live pool
-         * instead reads its completed OUTPUT without touching Window. */
+        /* Both replacement and snapshot own a canonical content seed. */
         release_client_surface_output_checkpoint( allocation );
         allocation->window_owner = x11drv_native_window_acquire( data->native_window );
         job.op = CLIENT_SURFACE_COMPOSITOR_COPY_POOL;

@@ -5861,7 +5861,7 @@ DECL_HANDLER(set_client_surface_state)
     struct window *win, *top;
     unsigned long long producer_sequence_before;
     unsigned int selected_caps_before;
-    int scene_change, was_pending, direct_before;
+    int scene_change, was_pending, direct_before, completed_claim = 0;
 
     reply->toplevel = 0;
     reply->wake = 0;
@@ -6044,13 +6044,16 @@ DECL_HANDLER(set_client_surface_state)
     if ((req->flags & CLIENT_SURFACE_STATE_CLAIM) && surface && surface->active &&
         req->scene_toplevel == top->handle && !(req->scene_generation & 1) &&
         req->producer_sequence == (producer_before ? producer_before->sequence : 0) &&
-        req->scene_generation <= top->client_surface_scene_generation &&
-        (!surface->claimed || select_client_surface_producer( win, &selected_owner ) != surface))
+        req->scene_generation <= top->client_surface_scene_generation)
     {
-        surface->claimed = 1;
-        surface->candidate_serial = 0;
-        if (!++client_surface_ref_sequence) ++client_surface_ref_sequence;
-        surface->sequence = client_surface_ref_sequence;
+        completed_claim = 1;
+        if (!surface->claimed || select_client_surface_producer( win, &selected_owner ) != surface)
+        {
+            surface->claimed = 1;
+            surface->candidate_serial = 0;
+            if (!++client_surface_ref_sequence) ++client_surface_ref_sequence;
+            surface->sequence = client_surface_ref_sequence;
+        }
     }
     selected_after = select_client_surface_scene_producer( win, &selected_owner );
     scene_change = selected_before != selected_after ||
@@ -6073,17 +6076,15 @@ DECL_HANDLER(set_client_surface_state)
          * producer authority, not the scene's chosen identity or native
          * target. Preserve that exact plan for its completion receipt. */
         update_client_surface_producer( win );
-        /* The same candidate may instead complete after owner preparation
-         * failed. Its first usable image is new work for that unpublished
-         * scene, even though the selected identity did not change. Resume
-         * owner admission from this completion, without restarting an active
-         * DIRECT plan or requiring the producer to draw another frame. */
-        if ((req->flags & CLIENT_SURFACE_STATE_CLAIM) &&
-            top->client_surface_transaction.phase == CLIENT_SURFACE_PHASE_IDLE &&
-            top->client_surface_ack_scene != top->client_surface_scene_generation &&
-            client_surface_scene_published( top ))
-            restart_client_surface_generation( top );
     }
+    /* A completed image can arrive after owner preparation failed, including
+     * from the already selected producer. Retry this unpublished idle scene
+     * without changing producer authority or restarting an active plan. */
+    if (completed_claim && selected_after == surface &&
+        top->client_surface_transaction.phase == CLIENT_SURFACE_PHASE_IDLE &&
+        top->client_surface_ack_scene != top->client_surface_scene_generation &&
+        client_surface_scene_published( top ))
+        restart_client_surface_generation( top );
     if (surface && !surface->active && !surface->cached)
     {
         complete_client_surface_generation( top, surface,

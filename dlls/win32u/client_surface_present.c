@@ -1049,13 +1049,18 @@ BOOL client_surface_complete_present_locked( struct client_surface *surface,
         client_surface_backend_has_cap( surface, CLIENT_SURFACE_BACKEND_GENERATION_HANDOFF ))
         completed = source_valid = client_surface_capture_frame( surface, present, expected_size, &frame );
     if ((completed || source_valid) && InterlockedCompareExchange( &surface->active, 0, 0 ) &&
-        !present->scene.authoritative)
+        (!present->scene.authoritative ||
+         (source_valid && present->handoff_control &&
+          !(__atomic_load_n( &present->handoff_channel->endpoints, __ATOMIC_ACQUIRE ) &
+            CLIENT_SURFACE_HANDOFF_ENDPOINT_CONSUMER))))
     {
         BOOL wake = FALSE;
         HWND hwnd;
         HWND toplevel = 0;
 
-        /* Registration only advertises lifetime. A surface becomes the
+        /* A completed frame without a consumer also retries failed owner
+         * preparation. A steady channel needs no extra server request.
+         * Registration only advertises lifetime. A surface becomes the
          * producer after a host presentation or independent source snapshot
          * has completed, so an
          * unused VkSurfaceKHR or drawable cannot take publication ownership
