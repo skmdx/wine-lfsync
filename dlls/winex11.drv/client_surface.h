@@ -51,6 +51,7 @@ struct x11drv_client_surface
     struct x11drv_client_snapshot *snapshot;
     BYTE *snapshot_pixels;
     SIZE_T snapshot_pixels_size;
+    struct client_surface_memory_scope snapshot_pixels_memory;
     VisualID source_visual;
     unsigned int source_depth;
     BOOL direct_snapshot;

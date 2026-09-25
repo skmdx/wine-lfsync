@@ -1809,14 +1809,25 @@ static BOOL snapshot_client_surface( struct opengl_drawable *base, struct client
     bytes = (SIZE_T)size.cx * size.cy * 4;
     if (surface->snapshot_pixels_size != bytes)
     {
-        if (!client_surface_reserve_scoped_memory( &surface->memory, CLIENT_SURFACE_MEMORY_STAGING, bytes )) return FALSE;
+        struct client_surface_memory_scope memory = {0};
+
+        if (!client_surface_memory_scope_init( &memory, base->client->hwnd, 0 )) return FALSE;
+        if (!client_surface_reserve_scoped_memory( &memory, CLIENT_SURFACE_MEMORY_STAGING, bytes ))
+        {
+            client_surface_memory_scope_destroy( &memory );
+            return FALSE;
+        }
         if (!(pixels = malloc( bytes )))
         {
-            client_surface_release_scoped_memory( &surface->memory, CLIENT_SURFACE_MEMORY_STAGING, bytes );
+            client_surface_release_scoped_memory( &memory, CLIENT_SURFACE_MEMORY_STAGING, bytes );
+            client_surface_memory_scope_destroy( &memory );
             return FALSE;
         }
         free( surface->snapshot_pixels );
-        client_surface_release_scoped_memory( &surface->memory, CLIENT_SURFACE_MEMORY_STAGING, surface->snapshot_pixels_size );
+        client_surface_release_scoped_memory( &surface->snapshot_pixels_memory, CLIENT_SURFACE_MEMORY_STAGING,
+                                             surface->snapshot_pixels_size );
+        client_surface_memory_scope_destroy( &surface->snapshot_pixels_memory );
+        surface->snapshot_pixels_memory = memory;
         surface->snapshot_pixels = pixels;
         surface->snapshot_pixels_size = bytes;
     }

@@ -150,7 +150,8 @@ void x11drv_client_surface_release_snapshot_staging( struct x11drv_client_surfac
     surface->snapshot_pixels = NULL;
     surface->snapshot_pixels_size = 0;
     x11drv_client_snapshot_release_staging( surface->snapshot );
-    client_surface_release_scoped_memory( &surface->memory, CLIENT_SURFACE_MEMORY_STAGING, bytes );
+    client_surface_release_scoped_memory( &surface->snapshot_pixels_memory, CLIENT_SURFACE_MEMORY_STAGING, bytes );
+    client_surface_memory_scope_destroy( &surface->snapshot_pixels_memory );
     if (bytes) TRACE( "released CPU snapshot staging for %s, bytes %s\n",
                       debugstr_client_surface( &surface->client ), wine_dbgstr_longlong( bytes ) );
 }
@@ -353,10 +354,12 @@ struct x11drv_client_snapshot *x11drv_client_surface_prepare_gpu_snapshot(
 {
     struct x11drv_client_surface *surface = impl_from_client_surface( client );
     struct x11drv_client_source_frame *frame = surface->sources + present->handoff_index;
+    struct client_surface_memory_scope memory = {0};
     struct x11drv_client_snapshot *snapshot;
     BOOL ret;
 
     assert( present->handoff_index < ARRAY_SIZE(surface->sources) && !present->capture.context );
+    if (!client_surface_memory_scope_init( &memory, client->hwnd, 0 )) return NULL;
     /* Transfer the slot's reference to this capture before any native work.
      * Completion applies it only after validating the original reservation;
      * cancellation releases it through the same capture owner. */
@@ -364,8 +367,9 @@ struct x11drv_client_snapshot *x11drv_client_surface_prepare_gpu_snapshot(
     snapshot = frame->snapshot;
     memset( frame, 0, sizeof(*frame) );
     pthread_mutex_unlock( &client->present_lock );
-    ret = x11drv_client_snapshot_prepare_storage( &snapshot, &surface->memory, present->handoff_source->width,
+    ret = x11drv_client_snapshot_prepare_storage( &snapshot, &memory, present->handoff_source->width,
                                                   present->handoff_source->height, default_visual.depth );
+    client_surface_memory_scope_destroy( &memory );
     present->capture.context = snapshot;
     present->capture.apply = apply_gpu_snapshot;
     present->capture.release = release_native_snapshot;
@@ -391,10 +395,12 @@ BOOL x11drv_client_surface_snapshot( struct client_surface *client, struct clien
                                      BOOL top_down, const struct x11drv_snapshot_format *format )
 {
     struct x11drv_client_surface *surface = impl_from_client_surface( client );
+    struct client_surface_memory_scope memory = {0};
     struct x11drv_client_snapshot *snapshot;
     BOOL ret;
 
     assert( !present->capture.context );
+    if (!client_surface_memory_scope_init( &memory, client->hwnd, 0 )) return FALSE;
     snapshot = NULL;
     pthread_mutex_lock( &client->present_lock );
     if (present->handoff_control)
@@ -405,7 +411,8 @@ BOOL x11drv_client_surface_snapshot( struct client_surface *client, struct clien
         memset( frame, 0, sizeof(*frame) );
     }
     pthread_mutex_unlock( &client->present_lock );
-    ret = x11drv_client_snapshot_upload( &snapshot, &surface->memory, pixels, width, height, top_down, format );
+    ret = x11drv_client_snapshot_upload( &snapshot, &memory, pixels, width, height, top_down, format );
+    client_surface_memory_scope_destroy( &memory );
     present->capture.context = snapshot;
     present->capture.apply = apply_cpu_snapshot;
     present->capture.release = release_native_snapshot;
@@ -418,7 +425,7 @@ static BOOL x11drv_client_surface_handoff_prepare(
 {
     struct x11drv_client_surface *surface = impl_from_client_surface( client );
     struct client_surface_memory_scope memory = {0};
-    const struct client_surface_memory_scope *owners = &surface->memory;
+    const struct client_surface_memory_scope *owners;
     struct x11drv_client_snapshot *cached = surface->gpu_snapshot ? surface->gpu_snapshot : surface->snapshot;
     unsigned int index = present->handoff_index;
     BOOL ret = FALSE;
@@ -440,7 +447,7 @@ static BOOL x11drv_client_surface_handoff_prepare(
         if (!client->content_valid || !cached) return FALSE;
         owners = x11drv_client_snapshot_memory( cached );
     }
-    else if (!client->format || !owners->domain)
+    else
     {
         if (!client_surface_memory_scope_init( &memory, client->hwnd, present->memory_domain )) return FALSE;
         owners = &memory;

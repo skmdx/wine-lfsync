@@ -748,6 +748,68 @@ static void destroy_framebuffer_surface_storage( struct opengl_drawable *drawabl
     drawable->read_fbo = drawable->draw_fbo = 0;
 }
 
+/* Reparenting does not transfer existing storage to another owner. A resize
+ * under a different owner must admit replacement storage to that owner before
+ * discarding the old allocation, including on a failed native allocation. */
+static void replace_framebuffer_attachments( struct opengl_drawable *drawable,
+                                             const struct wgl_pixel_format *desc, GLuint old, GLuint next )
+{
+    const struct opengl_funcs *funcs = &display_funcs;
+    unsigned int count = (drawable->doublebuffer ? 2 : 1) * (drawable->stereo ? 2 : 1), i;
+    GLenum attachment, type;
+    GLuint name;
+
+    for (i = 0; i < count + !!desc->pfd.cDepthBits; ++i)
+    {
+        attachment = i < count ? GL_COLOR_ATTACHMENT0 + i : GL_DEPTH_ATTACHMENT;
+        funcs->p_glBindFramebuffer( GL_FRAMEBUFFER, next );
+        funcs->p_glGetFramebufferAttachmentParameteriv( GL_FRAMEBUFFER, attachment, GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME, (GLint *)&name );
+        funcs->p_glGetFramebufferAttachmentParameteriv( GL_FRAMEBUFFER, attachment, GL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE, (GLint *)&type );
+        funcs->p_glBindFramebuffer( GL_FRAMEBUFFER, old );
+        destroy_framebuffer_attachment( drawable, old, attachment );
+        if (type == GL_RENDERBUFFER)
+            funcs->p_glFramebufferRenderbuffer( GL_FRAMEBUFFER, attachment, GL_RENDERBUFFER, name );
+        else
+            funcs->p_glFramebufferTexture( GL_FRAMEBUFFER, attachment, name, 0 );
+        if (attachment == GL_DEPTH_ATTACHMENT && desc->pfd.cStencilBits)
+            funcs->p_glFramebufferRenderbuffer( GL_FRAMEBUFFER, GL_STENCIL_ATTACHMENT, GL_RENDERBUFFER, name );
+    }
+    /* Preserve the FBO names already bound by application contexts. Only the
+     * complete new attachments change; deleting their temporary container
+     * does not delete those attachment objects. */
+    funcs->p_glDeleteFramebuffers( 1, &next );
+}
+
+static BOOL replace_framebuffer_surface_storage( struct framebuffer_surface *surface,
+                                                 struct client_surface_memory_scope *memory, SIZE size, UINT64 bytes )
+{
+    struct opengl_drawable *drawable = &surface->base;
+    struct wgl_pixel_format draw_desc = pixel_formats[drawable->format - 1], read_desc = draw_desc;
+    GLuint read_fbo, draw_fbo;
+
+    if (!client_surface_reserve_scoped_memory( memory, CLIENT_SURFACE_MEMORY_SOURCE, bytes )) return FALSE;
+    read_desc.samples = read_desc.sample_buffers = 0;
+    read_fbo = create_framebuffer( drawable, &read_desc, size );
+    draw_fbo = !draw_desc.sample_buffers ? read_fbo : create_framebuffer( drawable, &draw_desc, size );
+    if (!read_fbo || !draw_fbo)
+    {
+        if (draw_fbo && draw_fbo != read_fbo) destroy_framebuffer( drawable, &draw_desc, draw_fbo );
+        if (read_fbo) destroy_framebuffer( drawable, &read_desc, read_fbo );
+        client_surface_release_scoped_memory( memory, CLIENT_SURFACE_MEMORY_SOURCE, bytes );
+        return FALSE;
+    }
+    replace_framebuffer_attachments( drawable, &read_desc, drawable->read_fbo, read_fbo );
+    if (draw_fbo != read_fbo)
+        replace_framebuffer_attachments( drawable, &draw_desc, drawable->draw_fbo, draw_fbo );
+    client_surface_release_scoped_memory( &surface->memory, CLIENT_SURFACE_MEMORY_SOURCE, surface->storage_bytes );
+    client_surface_memory_scope_destroy( &surface->memory );
+    surface->memory = *memory;
+    memset( memory, 0, sizeof(*memory) );
+    surface->storage_bytes = bytes;
+    surface->storage_size = size;
+    return TRUE;
+}
+
 static void destroy_retired_framebuffer_surfaces(void)
 {
     struct list retired = LIST_INIT( retired );
@@ -904,12 +966,16 @@ static void framebuffer_surface_flush( struct opengl_drawable *drawable, UINT fl
     if ((flags & GL_FLUSH_UPDATED) && framebuffer_surface_needs_resize( drawable ))
     {
         struct wgl_pixel_format draw_desc = pixel_formats[drawable->format - 1], read_desc = draw_desc;
+        struct client_surface_memory_scope memory = {0};
         SIZE size = drawable->virtual_size;
         UINT64 bytes = framebuffer_surface_storage_size( surface, size );
 
         read_desc.samples = read_desc.sample_buffers = 0;
-        surface->storage_valid = reserve_framebuffer_surface_storage( surface, bytes );
-        if (surface->storage_valid)
+        surface->storage_valid = client_surface_memory_scope_init( &memory, drawable->client ? drawable->client->hwnd : NULL, 0 );
+        if (surface->storage_valid && memory.owner != surface->memory.owner)
+            surface->storage_valid = replace_framebuffer_surface_storage( surface, &memory, size, bytes );
+        else if (surface->storage_valid &&
+                 (surface->storage_valid = reserve_framebuffer_surface_storage( surface, bytes )))
         {
             /* On failure, some attachments may retain the old allocation.
              * Keep max(old,new) charged and reject presentation until every
@@ -926,6 +992,7 @@ static void framebuffer_surface_flush( struct opengl_drawable *drawable, UINT fl
                 surface->storage_size = size;
             }
         }
+        client_surface_memory_scope_destroy( &memory );
     }
 
     if (surface->target)
