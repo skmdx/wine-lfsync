@@ -4767,6 +4767,10 @@ static void arm_client_surface_compositor_work(void)
     struct client_surface_compositor_pool *pool;
 
     drain_client_surface_notification( client_surface_compositor_notify[0] );
+    /* A native callback can complete a parked head while the actor is busy.
+     * Draining its wake must be followed by rechecking that head, even when
+     * no poll was needed to resume the actor. Dispatch remains sliced. */
+    wake_client_surface_compositor_queues();
     for (pool = client_surface_compositor_pools; pool; pool = pool->next)
     {
         drain_client_surface_notification( pool->ready_fd );
