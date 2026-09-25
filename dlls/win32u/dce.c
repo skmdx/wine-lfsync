@@ -967,7 +967,6 @@ static HRGN get_window_visible_region( HWND hwnd, DWORD flags, HWND *top_win,
 static void update_visible_region( struct dce *dce )
 {
     struct window_surface *surface = NULL;
-    struct client_surface_scene scene;
     struct ratio dpi, raw_dpi = {0};
     DWORD flags = dce->flags, paint_flags;
     UINT scale_num = 1, scale_den = 1;
@@ -1005,9 +1004,7 @@ static void update_visible_region( struct dce *dce )
     /* Composited owners and foreign DCs share native GDI content. A private
      * DIB would hide foreign writes from an owner's retained DC. */
     if ((!(paint_flags & SET_WINPOS_PIXEL_FORMAT && user_driver->dc_funcs.pPutImage) || (flags & DCX_WINDOW)) &&
-        !(client_surface_get_toplevel_scene( top_win, &scene ) &&
-          (scene.mode == CLIENT_SURFACE_PRESENTATION_COMPOSITED ||
-           scene.mode == CLIENT_SURFACE_PRESENTATION_STAGED)))
+        !client_surface_needs_backing( top_win ))
     {
         win = get_win_ptr( top_win );
         if (win && win != WND_DESKTOP && win != WND_OTHER_PROCESS)

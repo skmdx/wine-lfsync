@@ -2379,8 +2379,7 @@ static BOOL expose_window_surface( HWND hwnd, UINT flags, const RECT *rect )
      * Repaint through the current DC instead of replaying those stale pixels. */
     if (!surface || surface == &dummy_surface ||
         scene.mode == CLIENT_SURFACE_PRESENTATION_DIRECT ||
-        scene.mode == CLIENT_SURFACE_PRESENTATION_COMPOSITED ||
-        scene.mode == CLIENT_SURFACE_PRESENTATION_STAGED)
+        client_surface_needs_backing( hwnd ))
     {
         NtUserRedrawWindow( hwnd, rect ? &exposed_rect : NULL, NULL, flags );
         if (surface) window_surface_release( surface );
