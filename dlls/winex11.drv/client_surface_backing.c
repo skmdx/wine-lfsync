@@ -1497,6 +1497,7 @@ static BOOL release_client_surface_output_allocation( const Pixmap pixmaps[2] )
 
 static void hide_client_surface_present_window( struct client_surface_compositor_target *target )
 {
+    target->present_window = 0;
     if (!target->content_redirected) return;
     x11drv_native_window_release_content( target->window_owner, target->content_epoch, TRUE );
     target->content_redirected = FALSE;
@@ -2542,11 +2543,14 @@ static void free_client_surface_compositor_present_input( struct client_surface_
 
 static BOOL create_client_surface_present_window( struct client_surface_compositor_target *target )
 {
-    if (x11drv_native_window_prepare_content( target->window_owner, target->window_width,
-                                              target->window_height, target->depth,
-                                              &target->content_epoch ) != STATUS_SUCCESS) return FALSE;
+    NTSTATUS status = x11drv_native_window_prepare_content( target->window_owner, target->window_width,
+                                                            target->window_height, target->depth,
+                                                            &target->content_epoch );
+
+    if (status && status != STATUS_NOT_SUPPORTED) return FALSE;
+    if (status == STATUS_NOT_SUPPORTED) target->content_epoch = 0;
     XSelectInput( client_surface_compositor_display, target->window, ExposureMask );
-    target->content_redirected = TRUE;
+    target->content_redirected = !status;
     target->present_window = target->window;
     TRACE_(csperf)( "ticks=%llu event=content_target window=%lx content=%lx epoch=%llu\n",
                    client_surface_perf_time(), target->window,
@@ -2648,7 +2652,7 @@ static BOOL update_client_surface_compositor_target( struct client_surface_compo
     target->depth = job->u.pool.depth;
     target->visual = job->u.pool.visual;
     target->quiescing = target->native_updates || target->deferred_update;
-    if (!target->content_redirected)
+    if (!target->present_window)
     {
         if (!create_client_surface_present_window( target )) goto failed;
     }
@@ -2822,8 +2826,11 @@ static BOOL process_client_surface_seed_requests(void)
             ++client_surface_seed_request_count;
             continue;
         }
-        if (status) goto failed;
-        allocation->content_owned = TRUE;
+        if (status && status != STATUS_NOT_SUPPORTED) goto failed;
+        allocation->content_owned = !status;
+        /* Without XComposite, use a checked read of the canonical content
+         * Window. Its coverage receipt must succeed before adoption. */
+        if (status == STATUS_NOT_SUPPORTED) allocation->content_epoch = 0;
         /* Seed capture owns a named backing through the checked copy.
          * Scene changes reject adoption without cancelling its native read. */
         allocation->seed_stage = 1;

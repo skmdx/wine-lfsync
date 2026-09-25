@@ -400,13 +400,13 @@ static void copy_cache_image( struct client_surface_cache_image *image )
             image->success = FALSE;
             goto done;
         }
-        status = x11drv_native_window_seed_begin( read );
+        status = read->content_epoch ? x11drv_native_window_seed_begin( read ) : STATUS_SUCCESS;
         if (status == STATUS_PENDING)
         {
             image->waiting = TRUE;
             return;
         }
-        if (status || !acquire_content_seed( image ))
+        if (status || (read->content_epoch && !acquire_content_seed( image )))
         {
             image->success = FALSE;
             if (!status)
@@ -419,7 +419,7 @@ static void copy_cache_image( struct client_surface_cache_image *image )
         }
         /* Only naming/extent validation shares the replacement reservation.
          * The admitted alias is charged independently before the long copy. */
-        x11drv_native_window_seed_end( read );
+        if (read->content_epoch) x11drv_native_window_seed_end( read );
         if (!prepare_window_copy_gc( image ))
         {
             image->success = FALSE;
@@ -439,7 +439,7 @@ static void copy_cache_image( struct client_surface_cache_image *image )
             XSetClipOrigin( display, gc, 0, 0 );
         }
     }
-    if (gc) XCopyArea( display, read ? image->seed : image->source, image->pixmap, gc,
+    if (gc) XCopyArea( display, image->seed ? image->seed : image->source, image->pixmap, gc,
                       0, 0, image->copy_width, image->copy_height, 0, 0 );
     if (read) x11drv_native_window_read_end( read );
     else
@@ -454,7 +454,7 @@ receipt:
         if (image->waiting) return;
     }
 done:
-    input = read ? image->seed : image->source;
+    input = image->seed ? image->seed : image->source;
     if (read) release_content_seed( image );
     TRACE_(csperf)( "ticks=%llu event=%s image=%p source=%lx input=%lx destination=%lx "
                    "display=%p width=%u height=%u error=%d sync_calls=%u receipt=%lu copy_serial=%lu success=%u\n", cache_time(),

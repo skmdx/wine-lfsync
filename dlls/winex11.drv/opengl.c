@@ -1926,7 +1926,13 @@ static BOOL x11drv_surface_swap_blit( struct opengl_drawable *base, struct openg
     {
         submitted = completed = snapshot_client_surface( base, &present, 0,
                                                           base->doublebuffer ? GL_BACK : GL_FRONT );
-        if (submitted && present.direct_snapshot) pglXSwapBuffers( gdi_display, gl->drawable );
+        if (submitted && present.direct_snapshot)
+        {
+            /* The private snapshot uses virtual pixels. The retained native
+             * attachment still needs the full monitor-sized image. */
+            if (blit) submitted = blit_client_surface_output( base, &present, source, blit, FALSE );
+            if (submitted) pglXSwapBuffers( gdi_display, gl->drawable );
+        }
         /* The FBO owns front/back storage and the owner publishes the copied
          * source. A native swap on this hidden scratch window adds no pixels
          * and can leave glFinish waiting for an unviewable DRI3 presentation. */
@@ -2513,7 +2519,8 @@ static BOOL x11drv_egl_surface_present( struct opengl_drawable *base, GLuint fra
         ret = copied;
         if (ret && present.direct_snapshot)
         {
-            if (framebuffer) ret = blit_client_surface_framebuffer( base, &present, framebuffer );
+            if (blit) ret = blit_client_surface_output( base, &present, source, blit, FALSE );
+            if (ret && framebuffer) ret = blit_client_surface_framebuffer( base, &present, framebuffer );
             if (ret) ret = funcs->p_eglSwapBuffers( egl->display, gl->base.surface );
         }
         client_surface_submit_present( base->client, &present );

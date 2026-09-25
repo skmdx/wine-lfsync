@@ -896,6 +896,13 @@ static BOOL client_surface_update_present_scene_internal_locked(
                      current.mode != CLIENT_SURFACE_PRESENTATION_DIRECT) ||
                     (scene_valid && scene.native_candidate == client_surface_get_identity( surface ) && scene.direct_candidate &&
                      scene.mode != CLIENT_SURFACE_PRESENTATION_DIRECT && !direct_image));
+    /* A new child can remove the sole-candidate flag while the parent's
+     * independent snapshot is still completing. Do not change that frame's
+     * native epoch before its captured image has been validated. */
+    if (surface->format && current.mode == CLIENT_SURFACE_PRESENTATION_DIRECT &&
+        next.mode != CLIENT_SURFACE_PRESENTATION_DIRECT && current.toplevel == next.toplevel &&
+        InterlockedCompareExchange( &surface->external_completion_count, 0, 0 ))
+        defer_direct = TRUE;
     if (defer_direct) next.mode = current.mode;
     old_source_rect = surface->raw ? current.monitor_rect : current.virtual_rect;
     new_source_rect = surface->raw ? next.monitor_rect : next.virtual_rect;
