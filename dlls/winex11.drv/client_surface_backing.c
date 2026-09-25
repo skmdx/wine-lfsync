@@ -104,7 +104,7 @@ struct client_surface_cache_copy
 
 struct client_surface_compositor_binding
 {
-    struct client_surface_compositor_binding *next, **prev;
+    struct rb_entry registry_entry;
     struct client_surface_memory_scope memory;
     struct client_surface_compositor_pool *pool;
     struct client_surface_handoff_channel *channel;
@@ -350,13 +350,76 @@ static struct client_surface_compositor_pool *client_surface_compositor_pools;
 static struct client_surface_compositor_pool *client_surface_compositor_next_pool;
 static unsigned int client_surface_compositor_pool_count;
 static UINT64 client_surface_compositor_pool_generation;
-static struct client_surface_compositor_binding *client_surface_compositor_bindings;
 static struct client_surface_compositor_target *client_surface_compositor_targets;
 static struct client_surface_compositor_target *client_surface_compositor_next_target;
 static unsigned int client_surface_compositor_target_count;
 static UINT64 client_surface_compositor_target_generation;
 static UINT64 client_surface_compositor_query_generation;
 static UINT64 client_surface_compositor_mark;
+
+struct client_surface_binding_key
+{
+    HWND toplevel;
+    process_id_t process;
+    UINT64 identity;
+};
+
+static int compare_client_surface_compositor_binding( const void *key, const struct rb_entry *entry )
+{
+    const struct client_surface_binding_key *lookup = key;
+    const struct client_surface_compositor_binding *binding =
+        CONTAINING_RECORD( entry, const struct client_surface_compositor_binding, registry_entry );
+    ULONG_PTR a = (ULONG_PTR)lookup->toplevel, b = (ULONG_PTR)binding->toplevel;
+
+    if (a != b) return (a > b) - (a < b);
+    if (lookup->process != binding->process) return (lookup->process > binding->process) -
+                                                  (lookup->process < binding->process);
+    return (lookup->identity > binding->identity) - (lookup->identity < binding->identity);
+}
+
+/* Bindings can precede their output target. Keep the actor-owned registry
+ * independent of target lifetime, with each owner's entries contiguous. */
+static struct rb_tree client_surface_compositor_bindings = {compare_client_surface_compositor_binding};
+
+static struct client_surface_compositor_binding *find_client_surface_compositor_binding(
+    HWND toplevel, process_id_t process, UINT64 identity )
+{
+    struct client_surface_binding_key key = {toplevel, process, identity};
+    struct rb_entry *entry = rb_get( &client_surface_compositor_bindings, &key );
+
+    return entry ? CONTAINING_RECORD( entry, struct client_surface_compositor_binding, registry_entry ) : NULL;
+}
+
+static struct client_surface_compositor_binding *first_client_surface_compositor_binding( HWND toplevel )
+{
+    struct rb_entry *entry = client_surface_compositor_bindings.root;
+    struct client_surface_compositor_binding *first = NULL;
+
+    while (entry)
+    {
+        struct client_surface_compositor_binding *binding =
+            CONTAINING_RECORD( entry, struct client_surface_compositor_binding, registry_entry );
+
+        if ((ULONG_PTR)binding->toplevel >= (ULONG_PTR)toplevel)
+        {
+            first = binding;
+            entry = entry->left;
+        }
+        else entry = entry->right;
+    }
+    return first && first->toplevel == toplevel ? first : NULL;
+}
+
+static struct client_surface_compositor_binding *next_client_surface_compositor_binding(
+    struct client_surface_compositor_binding *binding )
+{
+    struct rb_entry *entry = rb_next( &binding->registry_entry );
+    struct client_surface_compositor_binding *next;
+
+    if (!entry) return NULL;
+    next = CONTAINING_RECORD( entry, struct client_surface_compositor_binding, registry_entry );
+    return next->toplevel == binding->toplevel ? next : NULL;
+}
 
 struct client_surface_compositor_scan
 {
@@ -1986,8 +2049,7 @@ static void remove_client_surface_compositor_binding( struct client_surface_comp
     unsigned int index = binding->channel - binding->pool->shared->channels;
 
     assert( !target || !target->copy_frame );
-    *binding->prev = binding->next;
-    if (binding->next) binding->next->prev = binding->prev;
+    rb_remove( &client_surface_compositor_bindings, &binding->registry_entry );
     if (binding->pool->bindings[index] == binding) binding->pool->bindings[index] = NULL;
     binding->pool->query_wait_bitmap[index / 64] &= ~((UINT64)1 << (index % 64));
     if (target)
@@ -2082,7 +2144,8 @@ static BOOL client_surface_compositor_binding_is_live( const struct client_surfa
 static BOOL register_client_surface_compositor_handoff(
     struct client_surface_compositor_job *job )
 {
-    struct client_surface_compositor_binding **cursor, *binding;
+    struct client_surface_compositor_binding *binding;
+    struct client_surface_binding_key key = {job->toplevel, job->u.registration.process, job->u.registration.identity};
     struct client_surface_memory_scope memory = {0};
     struct client_surface_compositor_pool *pool;
     struct client_surface_handoff_channel *channel;
@@ -2099,12 +2162,8 @@ static BOOL register_client_surface_compositor_handoff(
         channel->toplevel != wine_server_user_handle( job->toplevel ) ||
         __atomic_load_n( &channel->closed, __ATOMIC_ACQUIRE )) goto done;
 
-    for (cursor = &client_surface_compositor_bindings; *cursor; cursor = &(*cursor)->next)
+    if ((binding = find_client_surface_compositor_binding( key.toplevel, key.process, key.identity )))
     {
-        binding = *cursor;
-        if (binding->toplevel != job->toplevel ||
-            binding->process != job->u.registration.process || binding->identity != job->u.registration.identity)
-            continue;
         if (binding->cookie == job->u.registration.cookie)
         {
             binding->mark = job->u.registration.mark;
@@ -2113,14 +2172,10 @@ static BOOL register_client_surface_compositor_handoff(
         }
         /* Keep the acquired pool alive if this was its last old binding. */
         remove_client_surface_compositor_binding( binding );
-        break;
     }
 
     if (!(binding = alloc_client_surface_compositor_metadata( job->toplevel, sizeof(*binding), &memory ))) goto done;
     binding->memory = memory;
-    binding->next = client_surface_compositor_bindings;
-    binding->prev = &client_surface_compositor_bindings;
-    if (binding->next) binding->next->prev = &binding->next;
     binding->pool = pool;
     binding->channel = channel;
     pool->bindings[channel - pool->shared->channels] = binding;
@@ -2131,7 +2186,7 @@ static BOOL register_client_surface_compositor_handoff(
     binding->cookie = job->u.registration.cookie;
     binding->mark = job->u.registration.mark;
     pool->refs++;
-    client_surface_compositor_bindings = binding;
+    rb_put( &client_surface_compositor_bindings, &key, &binding->registry_entry );
     TRACE( "registered handoff hwnd %p identity %s producer %04x pool %s cookie %s\n",
            binding->window, wine_dbgstr_longlong( binding->identity ), binding->process,
            wine_dbgstr_longlong( pool->id ), wine_dbgstr_longlong( binding->cookie ) );
@@ -2170,15 +2225,6 @@ static void update_client_surface_compositor_scene(
     target->scene.epoch = scene_epoch;
 }
 
-static int compare_client_surface_scene_members( const void *a, const void *b )
-{
-    const struct client_surface_compositor_binding *left = *(const struct client_surface_compositor_binding * const *)a;
-    const struct client_surface_compositor_binding *right = *(const struct client_surface_compositor_binding * const *)b;
-    user_handle_t l = wine_server_user_handle( left->window ), r = wine_server_user_handle( right->window );
-
-    return (l > r) - (l < r);
-}
-
 static int compare_client_surface_scene_layouts( const void *a, const void *b )
 {
     const struct client_surface_scene_layout *left = a, *right = b;
@@ -2194,55 +2240,31 @@ static int compare_client_surface_handoff_descs( const void *a, const void *b )
     return (left->handle > right->handle) - (left->handle < right->handle);
 }
 
-/* Only the owner thread touches these binding references. Build an index for
- * this job rather than borrowing pointers from an invalidated ScenePlan. */
+/* Only the actor touches the registry, including bindings retained outside
+ * the visible scene. */
 static BOOL reuse_client_surface_compositor_handoffs( const struct client_surface_compositor_job *job )
 {
-    struct client_surface_compositor_binding *binding, **members;
-    unsigned int count = 0, i = 0;
+    struct client_surface_compositor_binding *binding;
+    unsigned int i;
 
     for (i = 0; i < job->u.reuse.count; ++i) job->u.reuse.reused[i] = FALSE;
-    for (binding = client_surface_compositor_bindings; binding; binding = binding->next)
-        if (binding->toplevel == job->toplevel) ++count;
-    if (!count) return TRUE;
-    if (!(members = client_surface_alloc_owned_array( &job->queue->memory, count, sizeof(*members) ))) return FALSE;
-    i = 0;
-    for (binding = client_surface_compositor_bindings; binding; binding = binding->next)
-        if (binding->toplevel == job->toplevel) members[i++] = binding;
-    qsort( members, count, sizeof(*members), compare_client_surface_scene_members );
-
     for (i = 0; i < job->u.reuse.count; ++i)
     {
         const struct client_surface_handoff_desc *desc = &job->u.reuse.handoffs[i];
-        unsigned int low = 0, high = count;
 
-        while (low < high)
+        binding = find_client_surface_compositor_binding( job->toplevel, desc->process, desc->surface );
+        if (!binding || wine_server_user_handle( binding->window ) != desc->handle) continue;
+        if (binding->cookie != desc->cookie)
         {
-            unsigned int mid = low + (high - low) / 2;
-            if (wine_server_user_handle( members[mid]->window ) < desc->handle) low = mid + 1;
-            else high = mid;
+            /* A -> B -> A can leave the old consumer mapped although
+             * the server has retired its cookie. Pending source reads keep
+             * their endpoint through the existing retirement path. */
+            remove_client_surface_compositor_binding( binding );
+            continue;
         }
-        for (; low < count; ++low)
-        {
-            binding = members[low];
-            if (wine_server_user_handle( binding->window ) != desc->handle) break;
-            if (binding->process != desc->process || binding->identity != desc->surface) continue;
-            if (binding->cookie != desc->cookie)
-            {
-                /* A -> B -> A can leave the old consumer mapped although
-                 * the server has retired its cookie. Drop it before new
-                 * registration; pending source reads retain their endpoint
-                 * through the existing retirement path. */
-                remove_client_surface_compositor_binding( binding );
-                memmove( members + low, members + low + 1, (--count - low) * sizeof(*members) );
-                break;
-            }
-            if ((job->u.reuse.reused[i] = client_surface_compositor_binding_is_live( binding )))
-                binding->mark = job->u.reuse.mark;
-            break;
-        }
+        if ((job->u.reuse.reused[i] = client_surface_compositor_binding_is_live( binding )))
+            binding->mark = job->u.reuse.mark;
     }
-    client_surface_free_owned_array( members );
     return TRUE;
 }
 
@@ -2285,12 +2307,12 @@ static BOOL check_client_surface_compositor_scene( const struct client_surface_c
     if (!target || !target->scene.valid || target->scene.strategy != OWNER_COMPOSITE ||
         target->scene.epoch != job->u.scene_check.epoch ||
         target->scene.count != count) return FALSE;
-    for (binding = client_surface_compositor_bindings; binding; binding = binding->next)
+    for (binding = first_client_surface_compositor_binding( job->toplevel ); binding;
+         binding = next_client_surface_compositor_binding( binding ))
     {
         const struct client_surface_handoff_desc *desc;
         unsigned int low = 0, high = job->u.scene_check.count;
 
-        if (binding->toplevel != job->toplevel) continue;
         /* The caller sorted this authoritative roster. Validate retained
          * hidden bindings too; a changed producer or retired cookie must not
          * survive merely because the visible scene is unchanged. */
@@ -2320,39 +2342,31 @@ static BOOL install_client_surface_scene_plan( struct client_surface_compositor_
 {
     struct client_surface_compositor_binding *binding, **members = NULL;
     struct client_surface_handoff_receipt *receipts = NULL;
-    unsigned int count = job->u.scene_install.count, available = 0, i = 0, next = 0;
+    unsigned int count = job->u.scene_install.count, i;
 
-    for (binding = client_surface_compositor_bindings; binding; binding = binding->next)
-        if (binding->toplevel == target->toplevel) ++available;
-    if (count > available) return FALSE;
     if (count)
     {
-        if (!(members = client_surface_alloc_owned_array( &target->memory, available, sizeof(*members) ))) return FALSE;
+        if (!(members = client_surface_alloc_owned_array( &target->memory, count, sizeof(*members) ))) return FALSE;
         if (!(receipts = client_surface_alloc_owned_array( &target->memory, count, sizeof(*receipts) )))
         {
             client_surface_free_owned_array( members );
             return FALSE;
         }
-        for (binding = client_surface_compositor_bindings; binding; binding = binding->next)
-            if (binding->toplevel == target->toplevel) members[i++] = binding;
-        qsort( members, available, sizeof(*members), compare_client_surface_scene_members );
         qsort( job->u.scene_install.layouts, count, sizeof(*job->u.scene_install.layouts), compare_client_surface_scene_layouts );
         for (i = 0; i < count; ++i)
         {
-            /* The binding cache includes hidden producers. Select only the
-             * visible scene's layers from this sorted list; visibility does
-             * not discard their last completed images. */
-            while (next < available && wine_server_user_handle( members[next]->window ) <
-                                       wine_server_user_handle( job->u.scene_install.layouts[i].window )) ++next;
-            if (next == available || members[next]->window != job->u.scene_install.layouts[i].window ||
-                members[next]->process != job->u.scene_install.layouts[i].process ||
-                members[next]->identity != job->u.scene_install.layouts[i].identity)
+            const struct client_surface_scene_layout *layout = &job->u.scene_install.layouts[i];
+
+            /* Hidden producers keep their cached images without occupying
+             * a visible scene slot. */
+            binding = find_client_surface_compositor_binding( target->toplevel, layout->process, layout->identity );
+            if (!binding || binding->window != layout->window)
             {
                 client_surface_free_owned_array( members );
                 client_surface_free_owned_array( receipts );
                 return FALSE;
             }
-            members[i] = members[next++];
+            members[i] = binding;
         }
     }
     if (target->scene.valid && target->scene.epoch == job->u.scene_install.epoch && target->scene.count == count &&
@@ -2393,17 +2407,14 @@ static BOOL install_client_surface_scene_plan( struct client_surface_compositor_
 static BOOL sweep_client_surface_compositor_handoffs( HWND toplevel, UINT64 mark,
                                                        struct client_surface_compositor_job *job )
 {
-    struct client_surface_compositor_binding **cursor = &client_surface_compositor_bindings;
+    struct client_surface_compositor_binding *binding, *next;
     struct client_surface_compositor_target *target;
 
-    while (*cursor)
+    for (binding = first_client_surface_compositor_binding( toplevel ); binding; binding = next)
     {
-        struct client_surface_compositor_binding *binding = *cursor;
-
-        if (binding->toplevel == toplevel && binding->mark != mark)
+        next = next_client_surface_compositor_binding( binding );
+        if (binding->mark != mark)
             remove_client_surface_compositor_binding( binding );
-        else
-            cursor = &binding->next;
     }
     if (job && (target = find_client_surface_compositor_target( toplevel )))
         return install_client_surface_scene_plan( target, job );
@@ -5021,8 +5032,9 @@ static BOOL execute_client_surface_compositor_job( struct client_surface_composi
          * inventory on the actor, independent of the current layout
          * and native output ownership. A positive hint still needs the
          * complete scene, binding and image checks in the actual repair. */
-        for (binding = client_surface_compositor_bindings; binding; binding = binding->next)
-            if (binding->toplevel == job->toplevel && binding->latest_image.pixmap)
+        for (binding = first_client_surface_compositor_binding( job->toplevel ); binding;
+             binding = next_client_surface_compositor_binding( binding ))
+            if (binding->latest_image.pixmap)
             {
                 cached = TRUE;
                 break;
