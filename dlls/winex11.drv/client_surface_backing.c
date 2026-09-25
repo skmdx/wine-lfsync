@@ -122,6 +122,7 @@ struct client_surface_compositor_binding
     struct client_surface_handoff_slot latest_frame;
     UINT64 latest_control;
     UINT64 replay_epoch;
+    UINT64 replay_generation;
     unsigned int latest_index;
     struct client_surface_cache_copy cache_copy;
     BOOL retired;
@@ -147,11 +148,15 @@ static void trace_client_surface_source( const char *event,
 /* A queued native request is not a committed source checkpoint. Newer cache
  * reception may race an asynchronous copy, and must keep its replay dirty. */
 static void note_client_surface_source_copy( struct client_surface_compositor_binding *binding,
-                                             UINT64 epoch, UINT64 sequence )
+                                             UINT64 epoch, UINT64 sequence, UINT64 replay_generation )
 {
     binding->source_epoch = epoch;
     binding->source_sequence = sequence;
-    if (binding->latest_frame.source_sequence == sequence) binding->replay_epoch = epoch;
+    if (binding->latest_frame.source_sequence == sequence)
+    {
+        binding->replay_epoch = epoch;
+        binding->replay_generation = replay_generation;
+    }
 }
 
 struct client_surface_scene_layout
@@ -175,6 +180,24 @@ struct client_surface_scene_plan
     UINT64 epoch;
     BOOL valid;
 };
+
+struct client_surface_owner_repair
+{
+    struct client_surface_handoff_receipt *receipts;
+    UINT64 epoch, bindings, inventory, caches;
+    enum { OWNER_REPAIR_NEW, OWNER_REPAIR_COLLECTING, OWNER_REPAIR_COMPLETE } phase;
+    unsigned int index, count;
+    BOOL resolve, result;
+};
+
+static void reset_client_surface_owner_repair( struct client_surface_owner_repair *repair )
+{
+    client_surface_free_owned_array( repair->receipts );
+    memset( repair, 0, sizeof(*repair) );
+}
+
+static BOOL client_surface_cached_frame_matches_layout( const struct client_surface_compositor_binding *binding,
+                                                         const struct client_surface_scene_layout *layout );
 
 #define CLIENT_SURFACE_COMPOSITOR_FRAME_COUNT 3
 #define CLIENT_SURFACE_COMPOSITOR_MAX_INFLIGHT 2
@@ -259,6 +282,8 @@ struct client_surface_compositor_target
     UINT64 assembly_epoch;
     struct client_surface_scene_plan scene;
     UINT64 binding_generation;
+    UINT64 cache_generation, inventory_generation, replay_generation;
+    struct client_surface_owner_repair repair;
     struct client_surface_handoff_receipt *receipts;
     unsigned int received;
     unsigned int replay_member;
@@ -540,6 +565,7 @@ struct client_surface_compositor_job
     } scan;
     union
     {
+        struct client_surface_owner_repair repair;
         /* CREATE_POOL returns independently owned pending storage.
          * COPY_POOL admits an owned read of a completed OUTPUT rectangle.
          * REPLACE_POOL installs the checked owned copy.
@@ -700,6 +726,10 @@ static struct list client_surface_compositor_ready = LIST_INIT( client_surface_c
 static struct list client_surface_compositor_parked = LIST_INIT( client_surface_compositor_parked );
 static UINT64 client_surface_compositor_wake_serial;
 static UINT64 client_surface_compositor_sequence;
+/* Repair can start in cache completion, handoff replay or a queued job.
+ * All of those actor paths share this interval's receipt budget. */
+static unsigned int client_surface_compositor_repair_budget;
+static BOOL client_surface_compositor_repair_pending;
 static LONGLONG client_surface_compositor_domain;
 static UINT64 client_surface_native_update_serial;
 
@@ -2328,6 +2358,7 @@ static void free_client_surface_scene_layouts( struct client_surface_scene_layou
 
 static void free_client_surface_scene_plan( struct client_surface_compositor_target *target )
 {
+    reset_client_surface_owner_repair( &target->repair );
     detach_client_surface_output_transform( target );
     x11drv_native_window_release( target->scene.direct_owner );
     target->scene.direct_owner = NULL;
@@ -3265,6 +3296,16 @@ static void finish_client_surface_cache_copy( struct client_surface_compositor_b
     if (success && !binding->retired)
     {
         struct client_surface_cached_image previous = binding->latest_image;
+        struct client_surface_compositor_target *target = find_client_surface_compositor_target( binding->toplevel );
+        const struct client_surface_scene_layout *layout = NULL;
+        BOOL matched = FALSE;
+
+        if (target && target->scene.valid && binding->scene_index < target->scene.count &&
+            target->scene.members[binding->scene_index] == binding)
+        {
+            layout = &target->scene.layouts[binding->scene_index];
+            matched = client_surface_cached_frame_matches_layout( binding, layout );
+        }
 
         binding->latest_image = binding->spare_image;
         binding->spare_image = previous;
@@ -3272,6 +3313,16 @@ static void finish_client_surface_cache_copy( struct client_surface_compositor_b
         binding->latest_frame.source = binding->latest_image.pixmap;
         binding->latest_control = copy->control;
         binding->latest_index = copy->index;
+        if (target)
+        {
+            ++target->cache_generation;
+            /* Inventory receipts prove a usable cache, not a claim on its
+             * producer ring slot. Compatible newer images preserve that
+             * proof, so a continuously rendering producer cannot restart
+             * the whole collection on every completed frame. */
+            if (layout && matched != client_surface_cached_frame_matches_layout( binding, layout ))
+                ++target->inventory_generation;
+        }
     }
     release_client_surface_cached_source( binding, success && !binding->retired );
 }
@@ -3945,7 +3996,7 @@ static void apply_client_surface_owner_copies( struct client_surface_compositor_
         {
             struct client_surface_handoff_receipt *receipt = &target->receipts[binding->scene_index];
 
-            note_client_surface_source_copy( binding, copy->epoch, copy->sequence );
+            note_client_surface_source_copy( binding, copy->epoch, copy->sequence, target->replay_generation );
             if (!receipt->source_generation) ++target->received;
             *receipt = (struct client_surface_handoff_receipt){
                 .handle = wine_server_user_handle( binding->window ),
@@ -4070,7 +4121,7 @@ static void complete_client_surface_frame_copy( struct client_surface_compositor
         frame->revision = 0;
         return;
     }
-    note_client_surface_source_copy( binding, epoch, sequence );
+    note_client_surface_source_copy( binding, epoch, sequence, target->replay_generation );
     note_client_surface_compositor_damage( target, frame, damage );
     publish_client_surface_handoff_frame( target, frame, binding, damage );
 }
@@ -4277,71 +4328,111 @@ static BOOL client_surface_cached_frame_matches_layout( const struct client_surf
            (unsigned int)slot->damage.right <= slot->width && (unsigned int)slot->damage.bottom <= slot->height;
 }
 
-static BOOL repair_client_surface_compositor_owner( HWND toplevel, BOOL resolve )
+static BOOL repair_client_surface_compositor_owner( HWND toplevel, BOOL resolve,
+                                                     struct client_surface_owner_repair *repair )
 {
     struct client_surface_compositor_target *target = find_client_surface_compositor_target( toplevel );
-    struct client_surface_handoff_receipt *receipts;
     struct client_surface_scene current;
-    unsigned int i, count = 0;
+    unsigned int before = client_surface_compositor_repair_budget;
     BOOL accepted = FALSE;
 
     if (resolve && (!client_surface_get_toplevel_scene( toplevel, &current ) || !current.source_pending))
-        return TRUE;
-    if (!target || !target->scene.valid || !target->scene.count ||
-        !client_surface_scene_snapshot_current( toplevel, target->scene.epoch )) return FALSE;
-    if (!(receipts = client_surface_alloc_owned_array( &target->memory, target->scene.count, sizeof(*receipts) ))) return FALSE;
-    for (i = 0; i < target->scene.count; ++i)
     {
+        accepted = TRUE;
+        goto done;
+    }
+    if (!target || !target->scene.valid || !target->scene.count) goto done;
+    if (repair->phase && (repair->resolve != resolve || repair->epoch != target->scene.epoch ||
+                         repair->bindings != target->binding_generation || repair->inventory != target->inventory_generation ||
+                         (repair->phase == OWNER_REPAIR_COMPLETE && repair->caches != target->cache_generation)))
+        reset_client_surface_owner_repair( repair );
+    /* Like failed mailbox allocation, a failed automatic repair is retried
+     * on new scene/source input. Retaining its result avoids polling forever
+     * just because collecting a large rejected inventory required yields.
+     * Explicit GUI jobs have their own fresh continuation. */
+    if (repair->phase == OWNER_REPAIR_COMPLETE) return TRUE;
+    if (!client_surface_compositor_repair_budget) goto pending;
+    if (repair->phase == OWNER_REPAIR_NEW)
+    {
+        repair->phase = OWNER_REPAIR_COLLECTING;
+        repair->resolve = resolve;
+        repair->epoch = target->scene.epoch;
+        repair->bindings = target->binding_generation;
+        repair->inventory = target->inventory_generation;
+        if (!client_surface_scene_snapshot_current( toplevel, repair->epoch )) goto done;
+        if (!(repair->receipts = client_surface_alloc_owned_array( &target->memory, target->scene.count,
+                                                                  sizeof(*repair->receipts) ))) goto done;
+    }
+    while (repair->index < target->scene.count && client_surface_compositor_repair_budget)
+    {
+        unsigned int i = repair->index++;
         struct client_surface_compositor_binding *binding = target->scene.members[i];
 
+        --client_surface_compositor_repair_budget;
         if (!client_surface_compositor_binding_is_live( binding ) ||
             !client_surface_cached_frame_matches_layout( binding, &target->scene.layouts[i] ))
         {
             if (resolve) continue;
             goto done;
         }
-        receipts[count++] = (struct client_surface_handoff_receipt){
+        repair->receipts[repair->count++] = (struct client_surface_handoff_receipt){
             .handle = wine_server_user_handle( binding->window ), .process = binding->process,
             .surface = binding->identity, .cookie = binding->cookie,
             .source_generation = binding->latest_frame.source_sequence, .buffer_index = binding->latest_index,
         };
     }
+    if (repair->index < target->scene.count) goto pending;
     if (resolve)
     {
         SERVER_START_REQ( resolve_client_surface_scene_sources )
         {
             req->handle = wine_server_user_handle( toplevel );
-            req->scene_id = target->scene.epoch;
-            wine_server_add_data( req, receipts, count * sizeof(*receipts) );
+            req->scene_id = repair->epoch;
+            wine_server_add_data( req, repair->receipts, repair->count * sizeof(*repair->receipts) );
             if (!wine_server_call( req )) accepted = reply->accepted;
         }
         SERVER_END_REQ;
         TRACE( "owner scene sources hwnd %p scene %s images %u/%u accepted %u\n", toplevel,
-               wine_dbgstr_longlong( target->scene.epoch ), count, target->scene.count, accepted );
+               wine_dbgstr_longlong( repair->epoch ), repair->count, target->scene.count, accepted );
     }
     else
     {
         SERVER_START_REQ( request_client_surface_owner_repair )
         {
             req->handle = wine_server_user_handle( toplevel );
-            req->scene_id = target->scene.epoch;
-            wine_server_add_data( req, receipts, count * sizeof(*receipts) );
+            req->scene_id = repair->epoch;
+            wine_server_add_data( req, repair->receipts, repair->count * sizeof(*repair->receipts) );
             if (!wine_server_call( req )) accepted = reply->accepted;
         }
         SERVER_END_REQ;
         TRACE( "owner cache repair hwnd %p scene %s images %u accepted %u\n", toplevel,
-               wine_dbgstr_longlong( target->scene.epoch ), count, accepted );
+               wine_dbgstr_longlong( repair->epoch ), repair->count, accepted );
     }
     if (accepted)
     {
         /* A repair of an existing assembly can keep its scene ID. Backing
          * damage must nevertheless replay every retained image in that scene. */
         target->replay_member = 0;
-        for (i = 0; i < target->scene.count; ++i) target->scene.members[i]->replay_epoch = 0;
+        ++target->replay_generation;
     }
 done:
-    client_surface_free_owned_array( receipts );
-    return accepted;
+    client_surface_free_owned_array( repair->receipts );
+    repair->receipts = NULL;
+    repair->phase = OWNER_REPAIR_COMPLETE;
+    repair->result = accepted;
+    if (target) repair->caches = target->cache_generation;
+    TRACE_(csperf)( "ticks=%llu event=owner_repair_scan hwnd=%p resolve=%u inspected=%u index=%u receipts=%u complete=1 accepted=%u\n",
+                   client_surface_perf_time(), toplevel, resolve, before - client_surface_compositor_repair_budget,
+                   repair->index, repair->count, accepted );
+    return TRUE;
+
+pending:
+    client_surface_compositor_repair_pending = TRUE;
+    if (before != client_surface_compositor_repair_budget)
+        TRACE_(csperf)( "ticks=%llu event=owner_repair_scan hwnd=%p resolve=%u inspected=%u index=%u receipts=%u complete=0 accepted=0\n",
+                       client_surface_perf_time(), toplevel, resolve, before - client_surface_compositor_repair_budget,
+                       repair->index, repair->count );
+    return FALSE;
 }
 
 static BOOL compose_client_surface_cached_frame( struct client_surface_compositor_binding *binding )
@@ -4383,7 +4474,7 @@ static BOOL compose_client_surface_cached_frame( struct client_surface_composito
     /* Inventory resolution precedes the first copy, so the full assembly
      * cannot race its own pending decision or publish a stale cache proof. */
     if (current.source_pending &&
-        (!repair_client_surface_compositor_owner( binding->toplevel, TRUE ) ||
+        (!repair_client_surface_compositor_owner( binding->toplevel, TRUE, &target->repair ) || !target->repair.result ||
          !client_surface_get_toplevel_scene( binding->toplevel, &current ) || current.source_pending ||
          current.epoch != target->scene.epoch || current.mode == CLIENT_SURFACE_PRESENTATION_DIRECT))
         return FALSE;
@@ -4503,7 +4594,7 @@ retry:
          * wait for a current plan after repair changes the scene epoch. */
         if (current.mode == CLIENT_SURFACE_PRESENTATION_STAGED && !current.generation)
         {
-            repair_client_surface_compositor_owner( binding->toplevel, FALSE );
+            repair_client_surface_compositor_owner( binding->toplevel, FALSE, &target->repair );
             goto retry;
         }
         if (plan.generation && !previous_publish && !target->assembly_pending)
@@ -4552,7 +4643,7 @@ retry:
         if (copied)
         {
             if (!pending && !batch)
-                note_client_surface_source_copy( binding, plan.epoch, slot->source_sequence );
+                note_client_surface_source_copy( binding, plan.epoch, slot->source_sequence, target->replay_generation );
             frame->width = target->window_width;
             frame->height = target->window_height;
         }
@@ -4589,7 +4680,11 @@ release:
     /* A resized or otherwise incompatible image is still valid storage.
      * Metadata rejection leaves it returned; a real copy/import error
      * still retires the binding through the normal failure path. */
-    if (replay && (copied || dropped)) binding->replay_epoch = target->scene.epoch;
+    if (replay && (copied || dropped))
+    {
+        binding->replay_epoch = target->scene.epoch;
+        binding->replay_generation = target->replay_generation;
+    }
     if (!copied)
         trace_client_surface_source( "discard", binding, control, slot->source_sequence,
                                      target->window, frame ? frame->pixmap : 0, dropped );
@@ -4826,7 +4921,8 @@ static BOOL replay_client_surface_scene_sources( struct client_surface_composito
         struct client_surface_compositor_binding *binding = target->scene.members[target->replay_member];
 
         --*budget;
-        if (binding->latest_image.pixmap && binding->replay_epoch != target->scene.epoch)
+        if (binding->latest_image.pixmap && (binding->replay_epoch != target->scene.epoch ||
+                                           binding->replay_generation != target->replay_generation))
         {
             BOOL queued = compose_client_surface_cached_frame( binding );
 
@@ -4834,7 +4930,8 @@ static BOOL replay_client_surface_scene_sources( struct client_surface_composito
              * but commit their source checkpoint only with their real
              * reply. A newer source resets the scan above. */
             if (!queued && binding->latest_image.pixmap &&
-                binding->replay_epoch != target->scene.epoch) break;
+                (binding->replay_epoch != target->scene.epoch ||
+                 binding->replay_generation != target->replay_generation)) break;
         }
         ++target->replay_member;
         progressed = TRUE;
@@ -5098,10 +5195,6 @@ static BOOL execute_client_surface_compositor_job( struct client_surface_composi
     }
     if (job->op == CLIENT_SURFACE_COMPOSITOR_REGISTER_HANDOFF)
         return register_client_surface_compositor_handoff( job );
-    if (job->op == CLIENT_SURFACE_COMPOSITOR_REPAIR_OWNER)
-        return repair_client_surface_compositor_owner( job->toplevel, FALSE );
-    if (job->op == CLIENT_SURFACE_COMPOSITOR_RESOLVE_SOURCES)
-        return repair_client_surface_compositor_owner( job->toplevel, TRUE );
     if (job->op == CLIENT_SURFACE_COMPOSITOR_UPDATE_TARGET)
         return update_client_surface_compositor_target( job );
     if (job->op == CLIENT_SURFACE_COMPOSITOR_DROP_SEED)
@@ -5311,6 +5404,8 @@ static void release_client_surface_compositor_job_resources( struct client_surfa
     client_surface_free_owned_array( job->scan.receipts );
     job->scan.members = NULL;
     job->scan.receipts = NULL;
+    if (job->op == CLIENT_SURFACE_COMPOSITOR_REPAIR_OWNER || job->op == CLIENT_SURFACE_COMPOSITOR_RESOLVE_SOURCES)
+        reset_client_surface_owner_repair( &job->u.repair );
     /* Registration may fail validation, be cancelled before execution, or
      * reuse an existing pool. Only a newly created pool adopts the fd. The
      * section handle remains borrowed from the synchronous caller. */
@@ -5439,6 +5534,12 @@ static BOOL step_client_surface_compositor_job( struct client_surface_compositor
         case CLIENT_SURFACE_COMPOSITOR_CHECK_SCENE:
             done = check_client_surface_compositor_scene( job, budget );
             break;
+        case CLIENT_SURFACE_COMPOSITOR_REPAIR_OWNER:
+        case CLIENT_SURFACE_COMPOSITOR_RESOLVE_SOURCES:
+            done = repair_client_surface_compositor_owner( job->toplevel,
+                job->op == CLIENT_SURFACE_COMPOSITOR_RESOLVE_SOURCES, &job->u.repair );
+            job->result = job->u.repair.result;
+            break;
         case CLIENT_SURFACE_COMPOSITOR_CHECK_CACHE:
         {
             struct client_surface_compositor_binding *binding = next_client_surface_job_binding( job );
@@ -5496,6 +5597,7 @@ static BOOL process_client_surface_compositor_jobs(void)
 {
     struct client_surface_compositor_queue *queue;
     struct client_surface_compositor_job *incoming, **tail = &incoming, *job;
+    struct list yielded = LIST_INIT( yielded );
     unsigned int admitted = 0, scanned = 0, completed = 0, budget = 64, member_budget = 64;
     BOOL progressed = FALSE, more;
 
@@ -5563,7 +5665,9 @@ static BOOL process_client_surface_compositor_jobs(void)
         }
         if (!done)
         {
-            if (runnable) ready_client_surface_compositor_queue( queue );
+            /* This head exhausted its member/repair budget. Inspect other
+             * queues now, and resume it only in the next actor interval. */
+            if (runnable) list_add_tail( &yielded, &queue->entry );
             else list_add_tail( &client_surface_compositor_parked, &queue->entry );
             continue;
         }
@@ -5572,7 +5676,11 @@ static BOOL process_client_surface_compositor_jobs(void)
             if (!(queue->control_head = job->next)) queue->control_tail = &queue->control_head;
         }
         else if (!(queue->head = job->next)) queue->tail = &queue->head;
-        if (queue->head || queue->control_head) ready_client_surface_compositor_queue( queue );
+        if (queue->head || queue->control_head)
+        {
+            if (runnable) list_add_tail( &yielded, &queue->entry );
+            else ready_client_surface_compositor_queue( queue );
+        }
         ++completed;
         progressed = TRUE;
         release_client_surface_compositor_job_resources( job );
@@ -5613,6 +5721,7 @@ static BOOL process_client_surface_compositor_jobs(void)
          * synchronous caller returns or the final notification frees itself. */
         release_client_surface_compositor_queue( queue );
     }
+    list_move_tail( &client_surface_compositor_ready, &yielded );
     TRACE_(csperf)( "ticks=%llu event=compositor_queue_scan ingested=%u inspected=%u completed=%u more=%u runnable=%u members=%u\n",
                    client_surface_perf_time(), admitted, scanned, completed, more,
                    !list_empty( &client_surface_compositor_ready ), 64 - member_budget );
@@ -5788,6 +5897,8 @@ static void client_surface_compositor_thread( void *context )
         {
             BOOL progressed;
 
+            client_surface_compositor_repair_budget = 64;
+            client_surface_compositor_repair_pending = FALSE;
             process_client_surface_present_events();
             progressed = client_surface_complete_queries( CLIENT_SURFACE_COPY_BATCH_SIZE );
             if (progressed) ++client_surface_compositor_query_generation;
@@ -5801,6 +5912,10 @@ static void client_surface_compositor_thread( void *context )
             progressed |= process_client_surface_handoffs( &scan );
             progressed |= process_client_surface_compositor_targets( &scan );
             progressed |= notify_client_surface_output_allocations( &scan );
+            progressed |= client_surface_compositor_repair_pending;
+            TRACE_(csperf)( "ticks=%llu event=compositor_repair_slice inspected=%u pending=%u\n",
+                           client_surface_perf_time(), 64 - client_surface_compositor_repair_budget,
+                           client_surface_compositor_repair_pending );
             scan.progressed |= progressed;
         } while (scan.remaining || scan.handoff_remaining);
         /* Helpers acquiring output credit can consume events too. Count
