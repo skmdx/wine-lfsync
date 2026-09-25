@@ -903,7 +903,7 @@ static void flush_context( TEB *teb, void (*flush)(void) )
 {
     struct opengl_drawable *read, *draw;
     struct opengl_client_context *client;
-    struct opengl_context *ctx = get_current_context( teb, &read, &draw, &client );
+    struct opengl_context *ctx = get_current_context( teb, &draw, &read, &client );
     const struct opengl_funcs *funcs = teb->glTable;
     UINT flags = 0;
 
@@ -1124,6 +1124,8 @@ void set_current_fbo( TEB *teb, GLenum target, GLuint fbo )
     if (target == GL_FRAMEBUFFER) ctx->draw_fbo = ctx->read_fbo = fbo;
     if (target == GL_DRAW_FRAMEBUFFER) ctx->draw_fbo = fbo;
     if (target == GL_READ_FRAMEBUFFER) ctx->read_fbo = fbo;
+    /* A replacement default FBO has its own initial buffer selections. */
+    if (!fbo) set_default_fbo_buffers( teb, ctx );
 }
 
 GLuint get_default_fbo( TEB *teb, GLenum target )
