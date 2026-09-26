@@ -225,7 +225,12 @@ void init_memory(void)
 {
     host_page_mask = sysconf( _SC_PAGESIZE ) - 1;
     free_map_addr( 0x60000000, 0x1c000000 );
+#ifdef __aarch64__
+    /* Keep shared DLL addresses within the 39-bit address space of ARM64 kernels. */
+    free_map_addr( 0x6000000000, 0x1000000000 );
+#else
     free_map_addr( 0x600000000000, 0x100000000000 );
+#endif
 }
 
 static void ranges_dump( struct object *obj, int verbose )
