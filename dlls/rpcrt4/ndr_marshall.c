@@ -7016,7 +7016,11 @@ static unsigned char *WINAPI NdrContextHandleUnmarshall(
     {
         NDR_CCONTEXT *ccontext;
         if (pFormat[1] & HANDLE_PARAM_IS_VIA_PTR)
+#ifdef __arm64ec__
+            ccontext = (NDR_CCONTEXT *)ppMemory;
+#else
             ccontext = *(NDR_CCONTEXT **)ppMemory;
+#endif
         else
             ccontext = (NDR_CCONTEXT *)ppMemory;
         /* [out]-only or [ret] param */
