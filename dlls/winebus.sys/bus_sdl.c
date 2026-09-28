@@ -31,6 +31,8 @@
 #include <stdio.h>
 #include <unistd.h>
 #include <sys/types.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
 #include <dlfcn.h>
 #ifdef HAVE_SDL_H
 # include <SDL.h>
@@ -70,6 +72,13 @@ static struct list device_list = LIST_INIT(device_list);
 #define MAKE_FUNCPTR(f) static typeof(f) * p##f = NULL
 MAKE_FUNCPTR(SDL_GetError);
 MAKE_FUNCPTR(SDL_Init);
+MAKE_FUNCPTR(SDL_JoystickAttachVirtualEx);
+MAKE_FUNCPTR(SDL_JoystickDetachVirtual);
+MAKE_FUNCPTR(SDL_JoystickGetDeviceInstanceID);
+MAKE_FUNCPTR(SDL_JoystickSetVirtualAxis);
+MAKE_FUNCPTR(SDL_JoystickSetVirtualButton);
+MAKE_FUNCPTR(SDL_NumJoysticks);
+MAKE_FUNCPTR(SDL_JoystickUpdate);
 MAKE_FUNCPTR(SDL_JoystickClose);
 MAKE_FUNCPTR(SDL_JoystickEventState);
 MAKE_FUNCPTR(SDL_JoystickGetGUID);
@@ -925,6 +934,108 @@ static BOOL set_report_from_controller_event(struct sdl_device *impl, SDL_Event 
     return FALSE;
 }
 
+/* QTX1, little endian: sequence:u32, active hands:u32, SDL axes:6*i16,
+ * SDL buttons:u32. A complete state is sent every OpenXR frame to loopback. */
+static int quest_socket = -1;
+static SDL_Joystick *quest_joystick;
+static Uint32 quest_last_packet;
+
+static void quest_disconnect(void)
+{
+    SDL_JoystickID id;
+    int i;
+
+    if (!quest_joystick) return;
+    id = pSDL_JoystickInstanceID(quest_joystick);
+    for (i = 0; i < pSDL_NumJoysticks(); ++i)
+        if (pSDL_JoystickGetDeviceInstanceID(i) == id)
+        {
+            pSDL_JoystickDetachVirtual(i);
+            break;
+        }
+    pSDL_JoystickClose(quest_joystick);
+    quest_joystick = NULL;
+    TRACE("Quest Touch disconnected\n");
+}
+
+static void quest_init(void)
+{
+    struct sockaddr_in addr = {0};
+    const char *enabled = getenv("WINE_QUEST_TOUCH");
+
+    if (!enabled || strcmp(enabled, "1")) return;
+#define LOAD_QUEST(f) if (!(p##f = dlsym(sdl_handle, #f))) { ERR("Quest Touch requires %s\n", #f); return; }
+    LOAD_QUEST(SDL_JoystickAttachVirtualEx);
+    LOAD_QUEST(SDL_JoystickDetachVirtual);
+    LOAD_QUEST(SDL_JoystickGetDeviceInstanceID);
+    LOAD_QUEST(SDL_JoystickSetVirtualAxis);
+    LOAD_QUEST(SDL_JoystickSetVirtualButton);
+    LOAD_QUEST(SDL_NumJoysticks);
+    LOAD_QUEST(SDL_JoystickUpdate);
+#undef LOAD_QUEST
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = htons(33941);
+    quest_socket = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    if (quest_socket < 0 || bind(quest_socket, (struct sockaddr *)&addr, sizeof(addr)) < 0)
+    {
+        ERR("Cannot bind Quest Touch UDP 127.0.0.1:33941: %s\n", strerror(errno));
+        if (quest_socket >= 0) close(quest_socket);
+        quest_socket = -1;
+        return;
+    }
+    TRACE("Quest Touch listening on 127.0.0.1:33941\n");
+}
+
+static void quest_poll(void)
+{
+    unsigned char packet[29];
+    unsigned int buttons, i;
+    int index;
+    ssize_t len;
+    SDL_VirtualJoystickDesc desc = {0};
+
+    if (quest_socket < 0) return;
+    /* Bound each drain so an active sender cannot starve the HID event queue. */
+    for (i = 0; i < 64; ++i)
+    {
+        if ((len = recv(quest_socket, packet, sizeof(packet), 0)) < 0) break;
+        if (len != 28 || memcmp(packet, "QTX1", 4)) continue;
+        if (packet[8] & ~3 || packet[9] || packet[10] || packet[11]) continue;
+        if (!packet[8]) { quest_disconnect(); continue; }
+        quest_last_packet = pSDL_GetTicks();
+        if (!quest_joystick)
+        {
+            desc.version = SDL_VIRTUAL_JOYSTICK_DESC_VERSION;
+            desc.type = SDL_JOYSTICK_TYPE_GAMECONTROLLER;
+            desc.naxes = SDL_CONTROLLER_AXIS_MAX;
+            desc.nbuttons = 15;
+            desc.axis_mask = (1u << SDL_CONTROLLER_AXIS_MAX) - 1;
+            desc.button_mask = (1u << 15) - 1;
+            desc.name = "Quest Touch";
+            if ((index = pSDL_JoystickAttachVirtualEx(&desc)) < 0)
+            {
+                ERR("Cannot attach Quest Touch: %s\n", pSDL_GetError());
+                return;
+            }
+            if (!(quest_joystick = pSDL_JoystickOpen(index)))
+            {
+                pSDL_JoystickDetachVirtual(index);
+                return;
+            }
+            TRACE("Quest Touch attached, SDL instance %d\n", pSDL_JoystickInstanceID(quest_joystick));
+        }
+        for (unsigned int axis = 0; axis < SDL_CONTROLLER_AXIS_MAX; ++axis)
+            pSDL_JoystickSetVirtualAxis(quest_joystick, axis,
+                    (Sint16)(packet[12 + 2 * axis] | packet[13 + 2 * axis] << 8));
+        buttons = packet[24] | packet[25] << 8 | packet[26] << 16 | (unsigned int)packet[27] << 24;
+        for (unsigned int button = 0; button < 15; ++button)
+            pSDL_JoystickSetVirtualButton(quest_joystick, button, (buttons >> button) & 1);
+        pSDL_JoystickUpdate();
+    }
+    if (quest_joystick && (Uint32)(pSDL_GetTicks() - quest_last_packet) > 500) quest_disconnect();
+}
+
 static void sdl_add_device(unsigned int index)
 {
     struct device_desc desc =
@@ -1180,6 +1291,7 @@ NTSTATUS sdl_bus_init(void *args)
         }
     }
 
+    quest_init();
     return STATUS_SUCCESS;
 
 failed:
@@ -1191,19 +1303,23 @@ failed:
 NTSTATUS sdl_bus_wait(void *args)
 {
     struct bus_event *result = args;
-    SDL_Event event;
+    SDL_Event event = {0};
 
     /* cleanup previously returned event */
     bus_event_cleanup(result);
 
     do
     {
+        quest_poll();
         if (bus_event_queue_pop(&event_queue, result)) return STATUS_PENDING;
         if (pSDL_WaitEventTimeout(&event, 10) != 0) process_device_event(&event);
         else check_all_devices_effects_state();
     } while (event.type != quit_event);
 
     TRACE("SDL main loop exiting\n");
+    quest_disconnect();
+    if (quest_socket >= 0) close(quest_socket);
+    quest_socket = -1;
     bus_event_queue_destroy(&event_queue);
     dlclose(sdl_handle);
     sdl_handle = NULL;
