@@ -939,7 +939,6 @@ static BOOL set_report_from_controller_event(struct sdl_device *impl, SDL_Event 
 static int quest_socket = -1;
 static SDL_Joystick *quest_joystick;
 static Uint32 quest_last_packet;
-static BOOL quest_initial_report;
 
 static void quest_disconnect(void)
 {
@@ -956,7 +955,6 @@ static void quest_disconnect(void)
         }
     pSDL_JoystickClose(quest_joystick);
     quest_joystick = NULL;
-    quest_initial_report = FALSE;
     TRACE("Quest Touch disconnected\n");
 }
 
@@ -996,6 +994,7 @@ static void quest_poll(void)
     int index;
     ssize_t len;
     SDL_VirtualJoystickDesc desc = {0};
+    BOOL updated = FALSE;
 
     if (quest_socket < 0) return;
     /* Bound each drain so an active sender cannot starve the HID event queue. */
@@ -1034,9 +1033,10 @@ static void quest_poll(void)
         for (unsigned int button = 0; button < 15; ++button)
             pSDL_JoystickSetVirtualButton(quest_joystick, button, (buttons >> button) & 1);
         pSDL_JoystickUpdate();
+        updated = TRUE;
     }
     if (quest_joystick && (Uint32)(pSDL_GetTicks() - quest_last_packet) > 500) quest_disconnect();
-    if (quest_joystick && !quest_initial_report)
+    if (quest_joystick && updated)
     {
         static const unsigned int buttons[] = {
             SDL_CONTROLLER_BUTTON_A, SDL_CONTROLLER_BUTTON_B,
@@ -1052,8 +1052,9 @@ static void quest_poll(void)
         struct hid_device_state *state;
         int value, x, y;
 
-        /* SDL changes before PnP starts the HID device have been discarded.
-         * Publish the held state once the consumer is ready, on the bus thread. */
+        /* OpenXR sends complete samples. Publish each received sample through
+         * SDL's mapped state, including controls held before HID/XInput opens.
+         * SDL's change events alone cannot deliver that initial held state. */
         pthread_mutex_lock(&sdl_cs);
         impl = find_device_from_id(pSDL_JoystickInstanceID(quest_joystick));
         if (impl && impl->started && impl->sdl_controller)
@@ -1075,7 +1076,6 @@ static void quest_poll(void)
             hid_device_set_hatswitch_x(iface, 0, x);
             hid_device_set_hatswitch_y(iface, 0, y);
             bus_event_queue_input_report(&event_queue, iface, state->report_buf, state->report_len);
-            quest_initial_report = TRUE;
         }
         pthread_mutex_unlock(&sdl_cs);
     }
