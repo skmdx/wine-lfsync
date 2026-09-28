@@ -461,11 +461,11 @@ static void sdl_device_stop(struct unix_device *iface)
 {
     struct sdl_device *impl = impl_from_unix_device(iface);
 
+    pthread_mutex_lock(&sdl_cs);
     pSDL_JoystickClose(impl->sdl_joystick);
     if (impl->sdl_controller) pSDL_GameControllerClose(impl->sdl_controller);
     if (impl->sdl_haptic) pSDL_HapticClose(impl->sdl_haptic);
 
-    pthread_mutex_lock(&sdl_cs);
     impl->started = FALSE;
     list_remove(&impl->unix_device.entry);
     pthread_mutex_unlock(&sdl_cs);
@@ -939,6 +939,7 @@ static BOOL set_report_from_controller_event(struct sdl_device *impl, SDL_Event 
 static int quest_socket = -1;
 static SDL_Joystick *quest_joystick;
 static Uint32 quest_last_packet;
+static BOOL quest_initial_report;
 
 static void quest_disconnect(void)
 {
@@ -955,6 +956,7 @@ static void quest_disconnect(void)
         }
     pSDL_JoystickClose(quest_joystick);
     quest_joystick = NULL;
+    quest_initial_report = FALSE;
     TRACE("Quest Touch disconnected\n");
 }
 
@@ -1034,6 +1036,49 @@ static void quest_poll(void)
         pSDL_JoystickUpdate();
     }
     if (quest_joystick && (Uint32)(pSDL_GetTicks() - quest_last_packet) > 500) quest_disconnect();
+    if (quest_joystick && !quest_initial_report)
+    {
+        static const unsigned int buttons[] = {
+            SDL_CONTROLLER_BUTTON_A, SDL_CONTROLLER_BUTTON_B,
+            SDL_CONTROLLER_BUTTON_X, SDL_CONTROLLER_BUTTON_Y,
+            SDL_CONTROLLER_BUTTON_LEFTSHOULDER, SDL_CONTROLLER_BUTTON_RIGHTSHOULDER,
+            SDL_CONTROLLER_BUTTON_BACK, SDL_CONTROLLER_BUTTON_START,
+            SDL_CONTROLLER_BUTTON_LEFTSTICK, SDL_CONTROLLER_BUTTON_RIGHTSTICK,
+            SDL_CONTROLLER_BUTTON_DPAD_UP, SDL_CONTROLLER_BUTTON_DPAD_RIGHT,
+            SDL_CONTROLLER_BUTTON_DPAD_DOWN, SDL_CONTROLLER_BUTTON_DPAD_LEFT
+        };
+        struct sdl_device *impl;
+        struct unix_device *iface;
+        struct hid_device_state *state;
+        int value, x, y;
+
+        /* SDL changes before PnP starts the HID device have been discarded.
+         * Publish the held state once the consumer is ready, on the bus thread. */
+        pthread_mutex_lock(&sdl_cs);
+        impl = find_device_from_id(pSDL_JoystickInstanceID(quest_joystick));
+        if (impl && impl->started && impl->sdl_controller)
+        {
+            iface = &impl->unix_device;
+            state = &iface->hid_device_state;
+            for (i = 0; i < SDL_CONTROLLER_AXIS_MAX; ++i)
+            {
+                value = pSDL_GameControllerGetAxis(impl->sdl_controller, i);
+                if (i == SDL_CONTROLLER_AXIS_LEFTY || i == SDL_CONTROLLER_AXIS_RIGHTY) value = -value - 1;
+                hid_device_set_abs_axis(iface, i, value);
+            }
+            for (i = 0; i < ARRAY_SIZE(buttons); ++i)
+                hid_device_set_button(iface, i, pSDL_GameControllerGetButton(impl->sdl_controller, buttons[i]));
+            x = pSDL_GameControllerGetButton(impl->sdl_controller, SDL_CONTROLLER_BUTTON_DPAD_RIGHT)
+                - pSDL_GameControllerGetButton(impl->sdl_controller, SDL_CONTROLLER_BUTTON_DPAD_LEFT);
+            y = pSDL_GameControllerGetButton(impl->sdl_controller, SDL_CONTROLLER_BUTTON_DPAD_DOWN)
+                - pSDL_GameControllerGetButton(impl->sdl_controller, SDL_CONTROLLER_BUTTON_DPAD_UP);
+            hid_device_set_hatswitch_x(iface, 0, x);
+            hid_device_set_hatswitch_y(iface, 0, y);
+            bus_event_queue_input_report(&event_queue, iface, state->report_buf, state->report_len);
+            quest_initial_report = TRUE;
+        }
+        pthread_mutex_unlock(&sdl_cs);
+    }
 }
 
 static void sdl_add_device(unsigned int index)
