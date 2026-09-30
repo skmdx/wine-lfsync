@@ -201,7 +201,7 @@ static void x11drv_client_surface_detach( struct client_surface *client )
 
     if ((data = get_win_data( hwnd )))
     {
-        detach_client_window( data, client_window );
+        detach_client_window_binding( data, client_window );
         release_win_data( data );
     }
 }
@@ -302,6 +302,11 @@ static BOOL client_surface_update_offscreen( HWND hwnd, struct x11drv_client_sur
 #endif
     if ((data = get_win_data( hwnd )))
     {
+        if (ReadAcquire( &surface->client.closing ))
+        {
+            release_win_data( data );
+            return FALSE;
+        }
         if (offscreen) detach_client_window( data, surface->window );
         else attach_client_window( data, surface->window );
         release_win_data( data );
@@ -670,7 +675,7 @@ struct client_surface *X11DRV_CreateClientSurface( HWND hwnd, int format, BOOL r
     return &surface->client;
 
 failed:
-    if (surface) client_surface_release( &surface->client );
+    if (surface) client_surface_abort( &surface->client );
     else if (colormap != default_colormap) XFreeColormap( gdi_display, colormap );
     return NULL;
 }

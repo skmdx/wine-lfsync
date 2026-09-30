@@ -60,6 +60,7 @@ struct client_surface_owner
     struct list     entry;
     struct list     surfaces;
     struct process *process;
+    object_id_t window;
 };
 
 enum client_surface_destroy_state
@@ -77,11 +78,13 @@ struct client_surface_ref
     struct process *process; /* queue callback keeps this valid for a retired tombstone */
     struct client_surface_handoff_binding *handoff;
     UINT64         id;
+    object_id_t    window; /* bound window lifetime, independent of HWND reuse */
     unsigned long long generation;
     unsigned long long sequence;
     unsigned long long candidate_serial; /* uncompleted native preparation, zero when absent */
     unsigned int    active : 1;
     unsigned int    cached : 1;
+    unsigned int    closing : 1; /* registration is permanently sealed */
     unsigned int    claimed : 1; /* an active surface which completed a host present */
     unsigned int    scene_publication : 1; /* renderer supports owner scene publication */
     unsigned int    direct_presentation : 1; /* renderer can attach its native source directly */
@@ -1435,6 +1438,7 @@ static struct client_surface_owner *get_client_surface_owner( struct window *win
         if (owner->process == process) return owner;
     if (!create || !(owner = mem_alloc( sizeof(*owner) ))) return NULL;
     owner->process = (struct process *)grab_object( process );
+    owner->window = get_shared_object_locator( win->shared ).id;
     list_init( &owner->surfaces );
     list_add_tail( &win->client_surface_owners, &owner->entry );
     return owner;
@@ -1456,19 +1460,27 @@ static struct client_surface_ref *get_client_surface_ref( struct client_surface_
     struct client_surface_ref *surface;
 
     if (!owner) return NULL;
-    if ((surface = find_indexed_client_surface_ref( owner->process, id )) && surface->owner == owner)
+    surface = find_indexed_client_surface_ref( owner->process, id );
+    if (create && surface && surface->closing)
+    {
+        set_error( STATUS_INVALID_PARAMETER );
+        return NULL;
+    }
+    if (surface && surface->owner == owner)
         return surface;
     if (!create) return NULL;
     /* Only a server-issued, unbound reservation may start registration.
      * Retired records remain indexed only while a channel or notification
      * owns them; they can never be rebound to another window lifetime. */
-    if (!surface || surface->owner || surface->handoff || surface->notification_pending ||
+    if (!surface || (surface->window && surface->window != owner->window) ||
+        surface->owner || surface->handoff || surface->notification_pending ||
         surface->destroy_state != CLIENT_SURFACE_DESTROY_NONE)
     {
         set_error( STATUS_INVALID_PARAMETER );
         return NULL;
     }
     surface->owner = owner;
+    surface->window = owner->window;
     list_add_tail( &owner->surfaces, &surface->entry );
     return surface;
 }
@@ -5787,6 +5799,19 @@ DECL_HANDLER(set_window_present_rect)
 DECL_HANDLER(allocate_client_surface)
 {
     struct client_surface_ref *surface;
+    struct window *win = NULL;
+    object_id_t window = 0;
+
+    if (req->handle)
+    {
+        if (!(win = get_window( req->handle ))) return;
+        window = get_shared_object_locator( win->shared ).id;
+    }
+    if (req->window && req->window != window)
+    {
+        set_error( STATUS_INVALID_HANDLE );
+        return;
+    }
 
     if (client_surface_id == ~(UINT64)0)
     {
@@ -5798,8 +5823,11 @@ DECL_HANDLER(allocate_client_surface)
     list_init( &surface->entry );
     surface->process = current->process;
     surface->id = ++client_surface_id;
+    surface->window = window;
     insert_client_surface_ref_index( surface );
     reply->surface = surface->id;
+    reply->window = window;
+    reply->owner_thread = win && win->thread && win->thread->process == current->process ? win->thread->id : 0;
 }
 
 DECL_HANDLER(release_client_surface)
@@ -5875,6 +5903,19 @@ DECL_HANDLER(set_client_surface_state)
     reply->mode = CLIENT_SURFACE_PRESENTATION_INVALID;
     reply->active = 0;
     reply->cached = 0;
+    if (req->flags & CLIENT_SURFACE_STATE_CLOSE)
+    {
+        surface = find_indexed_client_surface_ref( current->process, req->surface );
+        if (!surface)
+        {
+            set_error( STATUS_INVALID_PARAMETER );
+            return;
+        }
+        surface->closing = 1;
+        /* Also seal a reservation whose renderer has not registered yet.
+         * Its owned token is returned by release_client_surface later. */
+        if (!surface->owner) return;
+    }
     if (!(win = get_window( req->handle ))) return;
     top = get_toplevel_window( win );
     was_pending = top->client_surface_dirty;

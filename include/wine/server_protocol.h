@@ -6335,12 +6335,16 @@ struct alpc_create_port_reply
 struct allocate_client_surface_request
 {
     struct request_header __header;
-    char __pad_12[4];
+    user_handle_t handle;
+    object_id_t window;
 };
 struct allocate_client_surface_reply
 {
     struct reply_header __header;
     unsigned __int64 surface;
+    object_id_t window;
+    thread_id_t owner_thread;
+    char __pad_28[4];
 };
 
 
@@ -6492,6 +6496,7 @@ struct set_client_surface_state_reply
 #define CLIENT_SURFACE_STATE_NATIVE_CANDIDATE    0x1000000
 #define CLIENT_SURFACE_STATE_CANCEL_CANDIDATE    0x2000000
 #define CLIENT_SURFACE_STATE_PUBLISH_RESUME      0x4000000
+#define CLIENT_SURFACE_STATE_CLOSE               0x8000000
 
 #define CLIENT_SURFACE_PUBLISH_COPY   1
 #define CLIENT_SURFACE_PUBLISH_EXPOSE 2
@@ -7783,6 +7788,6 @@ union generic_reply
     struct set_queue_paint_blocked_reply set_queue_paint_blocked_reply;
 };
 
-#define SERVER_PROTOCOL_VERSION 1031
+#define SERVER_PROTOCOL_VERSION 1033
 
 #endif /* __WINE_WINE_SERVER_PROTOCOL_H */

@@ -2280,6 +2280,7 @@ static LRESULT handle_internal_message( HWND hwnd, UINT msg, WPARAM wparam, LPAR
         detach_client_surface_identity( ((UINT64)(UINT32)wparam << 32) | (UINT32)lparam );
         return 0;
     case WM_WINE_UPDATEWINDOWSTATE:
+        client_surface_drain_mailbox();
         if (wparam == WINE_UPDATE_CLIENT_SURFACE_BACKING)
             return update_window_client_surface_backing( hwnd );
         else if (wparam == WINE_PUBLISH_CLIENT_SURFACES)

@@ -58,6 +58,7 @@ typedef struct tagWND
     UINT               dwExStyle;     /* Extended style (from CreateWindowEx) */
     UINT               helpContext;   /* Help context ID */
     UINT               flags;         /* Misc. flags (see below) */
+    BOOL               client_surfaces_closed; /* no surface may bind after destroy begins */
     HMENU              hSysMenu;      /* window's copy of System Menu */
     HICON              hIcon;         /* window's icon */
     HICON              hIconSmall;    /* window's small icon */
@@ -136,11 +137,16 @@ struct user_thread_info
     struct opengl_thread_data    *opengl_data;            /* OpenGL private thread data */
     struct client_surface_completion_domain *completion_domain; /* current native completion domain */
     UINT64                        client_surface_domain; /* synchronous native execution identity */
+    struct client_surface_mailbox *client_surface_mailbox;
     struct list                   known_pointers;         /* list of known pointers */
     struct list                   window_paints;          /* this thread's BeginPaint obligations */
 };
 
 extern struct user_thread_info *get_user_thread_info(void);
+extern BOOL client_surface_init_thread(void);
+extern void client_surface_drain_mailbox(void);
+extern void client_surface_close_thread(void);
+extern void client_surface_release_thread(void);
 
 struct hook_extra_info
 {

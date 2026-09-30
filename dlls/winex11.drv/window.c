@@ -191,6 +191,7 @@ struct x11drv_native_window
     struct list desktop_entry;
     struct x11drv_display_owner *creator;
     struct x11drv_native_window *ancestor;
+    struct x11drv_native_window *host_parent; /* actual attachment, held through child destruction */
     Display *display;
     Window window, content, parent, private_parent;
     unsigned int content_width, content_height;
@@ -598,6 +599,7 @@ static void free_native_window( struct client_surface_native_work *work )
 {
     struct x11drv_native_window *window = CONTAINING_RECORD( work, struct x11drv_native_window, work );
     struct x11drv_native_window *ancestor = window->ancestor;
+    struct x11drv_native_window *host_parent = window->host_parent;
     struct x11drv_display_owner *creator = window->creator;
     ULONG_PTR identity = (ULONG_PTR)window;
 
@@ -615,6 +617,7 @@ static void free_native_window( struct client_surface_native_work *work )
     x11drv_return_release_capacity( 1, sizeof(*window) );
     TRACE_(csperf)( "event=native_window_return record=0x%lx bytes=%zu\n", identity, sizeof(*window) );
     x11drv_native_window_release( ancestor );
+    x11drv_native_window_release( host_parent );
     if (creator) x11drv_display_owner_release( creator );
 }
 
@@ -3184,7 +3187,7 @@ static void client_window_events_disable( struct x11drv_win_data *data, Window c
  */
 void detach_client_window( struct x11drv_win_data *data, Window client_window )
 {
-    char *parent;
+    struct x11drv_native_window *native;
 
     if (data->client_window != client_window || !client_window) return;
 
@@ -3192,15 +3195,24 @@ void detach_client_window( struct x11drv_win_data *data, Window client_window )
 
     if (data->whole_window)
     {
-        if (XFindContext( gdi_display, client_window, client_parent_context, &parent ))
+        if (XFindContext( gdi_display, client_window, client_parent_context, (char **)&native ))
         {
             ERR( "missing offscreen parent for client window %lx\n", client_window );
             return;
         }
         client_window_events_disable( data, client_window );
-        XReparentWindow( gdi_display, client_window, (Window)parent, 0, 0 );
+        XReparentWindow( gdi_display, client_window, native->private_parent, 0, 0 );
     }
 
+    data->client_window = 0;
+}
+
+/* Closing changes only the GUI binding. Outstanding submissions retain the
+ * child and its exact host parent; native retirement destroys them in order. */
+void detach_client_window_binding( struct x11drv_win_data *data, Window client_window )
+{
+    if (!client_window || data->client_window != client_window) return;
+    XDeleteContext( data->display, client_window, winContext );
     data->client_window = 0;
 }
 
@@ -3210,6 +3222,8 @@ void detach_client_window( struct x11drv_win_data *data, Window client_window )
  */
 void attach_client_window( struct x11drv_win_data *data, Window client_window )
 {
+    struct x11drv_native_window *native, *previous;
+
     if (data->client_window == client_window || !client_window) return;
 
     TRACE( "%p/%lx attaching client window %lx\n", data->hwnd, data->whole_window, client_window );
@@ -3218,6 +3232,9 @@ void attach_client_window( struct x11drv_win_data *data, Window client_window )
 
     if (data->whole_window)
     {
+        if (XFindContext( gdi_display, client_window, client_parent_context, (char **)&native )) return;
+        previous = native->host_parent;
+        native->host_parent = x11drv_native_window_acquire( data->native_window );
         client_window_events_enable( data, client_window );
         XReparentWindow( gdi_display, client_window, data->content_window, data->rects.client.left - data->rects.visible.left,
                          data->rects.client.top - data->rects.visible.top );
@@ -3225,6 +3242,7 @@ void attach_client_window( struct x11drv_win_data *data, Window client_window )
          * reparent before it can present, otherwise the later unmap/remap can
          * discard that first image. Unchanged attachments return above. */
         XSync( gdi_display, False );
+        x11drv_native_window_release( previous );
     }
 
     data->client_window = client_window;
@@ -3236,17 +3254,13 @@ void attach_client_window( struct x11drv_win_data *data, Window client_window )
  */
 void destroy_client_window( HWND hwnd, struct x11drv_native_window *window )
 {
-    struct x11drv_win_data *data;
     Window client_window = window->window;
 
     TRACE( "%p destroying client window %lx\n", hwnd, client_window );
 
-    if ((data = get_win_data( hwnd )))
-    {
-        detach_client_window( data, client_window );
-        release_win_data( data );
-    }
-
+    /* The surface detach has already cleared its binding.
+     * Creation rollback has no published binding. Native retirement must
+     * never look up a possibly reused HWND to repeat that GUI operation. */
     if (client_window) XDeleteContext( gdi_display, client_window, client_parent_context );
     /* Outstanding DIRECT observations retain the physical Window and its
      * private ancestor after the producer detaches its logical ownership. */
@@ -3273,6 +3287,7 @@ Window create_client_window( HWND hwnd, RECT client_rect, const XVisualInfo *vis
     if (!client_surface_prepare_native_work() ||
         !(native = x11drv_native_window_alloc( gdi_display, NULL, hwnd, FALSE ))) goto done;
     *owner = native;
+    native->host_parent = x11drv_native_window_acquire( data->native_window );
     detach_client_window( data, data->client_window );
 
     attr.colormap = colormap;
@@ -3297,7 +3312,7 @@ Window create_client_window( HWND hwnd, RECT client_rect, const XVisualInfo *vis
                                                x, y, cx, cy, 0, visual->depth, InputOutput,
                                                visual->visual, CWBitGravity | CWWinGravity |
                                                CWBackingStore | CWColormap | CWBorderPixel, &attr );
-    if (ret && XSaveContext( gdi_display, ret, client_parent_context, (char *)parent ))
+    if (ret && XSaveContext( gdi_display, ret, client_parent_context, (char *)native ))
     {
         XDestroyWindow( gdi_display, ret );
         data->client_window = ret = 0;

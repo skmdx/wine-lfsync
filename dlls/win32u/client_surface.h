@@ -26,6 +26,10 @@ extern struct client_surface_completion_job *client_surface_reserve_completion_d
     struct client_surface *surface, UINT64 domain );
 extern BOOL client_surface_activate_completion( struct client_surface_completion_job *job );
 extern void client_surface_completion_destroy( struct client_surface *surface );
+extern BOOL client_surface_prepare_retirement( struct client_surface *surface );
+extern void client_surface_queue_retirement( struct client_surface *surface );
+extern void client_surface_retire_resources( struct client_surface *surface );
+#define CLIENT_SURFACE_REF_CLOSED 0x40000000
 extern struct client_surface *client_surface_alloc( UINT size );
 extern void client_surface_handoff_destroy( struct client_surface *surface );
 extern BOOL client_surface_handoff_has_source( const struct client_surface *surface );

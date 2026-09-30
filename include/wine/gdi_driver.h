@@ -220,7 +220,7 @@ struct gdi_dc_funcs
 };
 
 /* increment this when changing driver tables or shared driver-facing structures */
-#define WINE_GDI_DRIVER_VERSION 152
+#define WINE_GDI_DRIVER_VERSION 153
 
 #define GDI_PRIORITY_NULL_DRV        0  /* null driver */
 #define GDI_PRIORITY_FONT_DRV      100  /* any font driver */
@@ -508,10 +508,19 @@ struct client_surface
 {
     const struct client_surface_backend *backend;
     struct list                        entry;          /* entry in win32u managed list */
+    struct list                        cache_entry;    /* subset of registered surfaces */
+    struct list                        close_entry;    /* embedded mailbox notification */
+    struct client_surface_mailbox      *mailbox;        /* owned local GUI lifetime, or NULL */
+    enum { CLIENT_SURFACE_NEW, CLIENT_SURFACE_REGISTERED, CLIENT_SURFACE_CACHED,
+           CLIENT_SURFACE_CLAIMED, CLIENT_SURFACE_CLOSING, CLIENT_SURFACE_DETACHED } lifecycle;
     DECLSPEC_ALIGN(8) UINT64            identity;       /* server-issued surface lifetime, atomic */
+    UINT64                             window_lifetime; /* server-authenticated window incarnation */
+    UINT64                             close_identity; /* immutable token owned by the close node */
+    DWORD                              owner_thread;   /* local GUI owner, zero for foreign HWND */
     struct client_surface             *identity_next; /* process-local identity hash chain */
     struct client_surface             *toplevel_next; /* driver-ready top-level hash chain */
     HWND                               indexed_toplevel;
+    BOOL                               indexed;        /* backend creation completed; registry lock */
     pthread_mutex_t                    present_lock;   /* serializes driver operations for this surface */
     pthread_mutex_t                    completion_lock; /* protects host completion state */
     pthread_cond_t                     completion_cond; /* completion-mode and target handoff */
@@ -519,6 +528,7 @@ struct client_surface
      * admission counts, independently of native presentation locks. */
     struct client_surface_completion_queue *completion_queue;
     LONG                               ref;            /* reference count */
+    LONG                               closing;        /* new native admission is closed */
     HWND                               hwnd;           /* window the surface was created for */
     int                                format;         /* pixel format of the surface */
     LONG                               updated;        /* has been moved / resized / reparented */
@@ -564,6 +574,7 @@ W32KAPI void *client_surface_create( UINT size, const struct client_surface_back
 W32KAPI BOOL client_surface_update( struct client_surface *surface );
 W32KAPI void client_surface_add_ref( struct client_surface *surface );
 W32KAPI void client_surface_release( struct client_surface *surface );
+W32KAPI void client_surface_abort( struct client_surface *surface );
 /* Timed conditions pair this initializer with the monotonic/relative wait. */
 W32KAPI int client_surface_cond_init( pthread_cond_t *cond );
 W32KAPI int client_surface_cond_timedwait( pthread_cond_t *cond, pthread_mutex_t *mutex, DWORD timeout );

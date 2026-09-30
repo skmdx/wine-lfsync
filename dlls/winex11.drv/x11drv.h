@@ -871,6 +871,7 @@ extern void make_window_embedded( struct x11drv_win_data *data );
 extern Window create_client_window( HWND hwnd, RECT client_rect, const XVisualInfo *visual, Colormap colormap,
                                      struct x11drv_native_window **owner );
 extern void detach_client_window( struct x11drv_win_data *data, Window client_window );
+extern void detach_client_window_binding( struct x11drv_win_data *data, Window client_window );
 extern void attach_client_window( struct x11drv_win_data *data, Window client_window );
 extern void destroy_client_window( HWND hwnd, struct x11drv_native_window *window );
 extern BOOL set_window_visual( struct x11drv_win_data *data, const XVisualInfo *vis, BOOL use_alpha );

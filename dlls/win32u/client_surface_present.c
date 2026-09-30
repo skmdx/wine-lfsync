@@ -873,6 +873,13 @@ prepare:
     locked = start ? client_surface_perf_time() : 0;
     pending_before = start ? InterlockedCompareExchange( &surface->external_completion_count, 0, 0 ) : 0;
     client_surface_wait_present_locked( surface, external_completion );
+    if (ReadAcquire( &surface->closing ))
+    {
+        client_surface_unlock_present( surface );
+        client_surface_cancel_completion( job );
+        RtlSetLastWin32Error( ERROR_INVALID_WINDOW_HANDLE );
+        return FALSE;
+    }
     ready = start ? client_surface_perf_time() : 0;
     pending_after = start ? InterlockedCompareExchange( &surface->external_completion_count, 0, 0 ) : 0;
     client_surface_prepare_present_locked( surface, present, external_completion, 0 );
@@ -1053,6 +1060,7 @@ BOOL client_surface_complete_present_locked( struct client_surface *surface,
            (int)present->capture.size.cx, (int)present->capture.size.cy, submitted, external_completed, present->target );
 
     completed = client_surface_finish_host_completion( surface, present, submitted, external_completed, timeout );
+    if (ReadAcquire( &surface->closing )) completed = FALSE;
     if (present->result != CLIENT_SURFACE_FRAME_PENDING) completed = FALSE;
     if (completed && present->completion.kind != CLIENT_SURFACE_COMPLETION_NONE &&
         client_surface_backend_has_cap( surface, CLIENT_SURFACE_BACKEND_GENERATION_HANDOFF ))

@@ -3552,11 +3552,15 @@ static void dump_alpc_create_port_reply( const struct alpc_create_port_reply *re
 
 static void dump_allocate_client_surface_request( const struct allocate_client_surface_request *req )
 {
+    fprintf( stderr, " handle=%08x", req->handle );
+    dump_uint64( ", window=", &req->window );
 }
 
 static void dump_allocate_client_surface_reply( const struct allocate_client_surface_reply *req )
 {
     dump_uint64( " surface=", &req->surface );
+    dump_uint64( ", window=", &req->window );
+    fprintf( stderr, ", owner_thread=%04x", req->owner_thread );
 }
 
 static void dump_release_client_surface_request( const struct release_client_surface_request *req )

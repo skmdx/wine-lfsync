@@ -28,6 +28,7 @@ static void macdrv_client_surface_destroy(struct client_surface *client)
     TRACE("%s\n", debugstr_client_surface(client));
 
     if (surface->metal_swapchain) macdrv_destroy_swapchain(surface->metal_swapchain);
+    if (surface->cocoa_view) macdrv_dispose_view(surface->cocoa_view);
 }
 
 static void macdrv_client_surface_detach(struct client_surface *client)
@@ -47,7 +48,6 @@ static void macdrv_client_surface_detach(struct client_surface *client)
             release_win_data(data);
         }
 
-        macdrv_dispose_view(surface->cocoa_view);
     }
 }
 
@@ -62,6 +62,11 @@ static BOOL macdrv_client_surface_update(struct client_surface *client,
     TRACE("%s\n", debugstr_client_surface(client));
 
     if (!(data = get_win_data(toplevel))) return FALSE;
+    if (ReadAcquire(&client->closing))
+    {
+        release_win_data(data);
+        return FALSE;
+    }
     macdrv_set_view_frame(surface->cocoa_view, cgrect_from_rect(target->monitor_rect));
     macdrv_set_view_superview(surface->cocoa_view, toplevel == hwnd ? NULL : data->client_view, data->cocoa_window, NULL, NULL);
     release_win_data(data);
@@ -112,7 +117,7 @@ struct client_surface *macdrv_CreateClientSurface(HWND hwnd, int pixel_format, B
         return NULL;
     if (!(surface->cocoa_view = macdrv_create_view(cgrect_from_rect(surface->client.target.monitor_rect))))
     {
-        client_surface_release(&surface->client);
+        client_surface_abort(&surface->client);
         return NULL;
     }
     macdrv_set_view_hidden(surface->cocoa_view, TRUE);

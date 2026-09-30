@@ -2144,6 +2144,7 @@ static struct opengl_drawable *get_window_unused_drawable( HWND hwnd, int format
                 use_window_client_surface( client, TRUE );
                 drawable->client_registered = TRUE;
             }
+            else use_window_client_surface( client, FALSE );
             client_surface_release( client );
         }
     }

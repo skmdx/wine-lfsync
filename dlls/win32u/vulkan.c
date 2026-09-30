@@ -3379,6 +3379,13 @@ reservation_failed:
          * and block on a later one while we wait to reacquire this one. */
         client_surface_wait_present_locked( present_surfaces[i], external_completion );
         present_surfaces[surface_locked_count++] = present_surfaces[i];
+        if (ReadAcquire( &present_surfaces[i]->closing ))
+        {
+            while (surface_locked_count)
+                client_surface_unlock_present( present_surfaces[--surface_locked_count] );
+            res = VK_ERROR_SURFACE_LOST_KHR;
+            goto reservation_failed;
+        }
     }
     for (uint32_t i = 0; i < present_info->swapchainCount; i++)
     {

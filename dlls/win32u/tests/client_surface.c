@@ -7607,6 +7607,63 @@ static void test_owner_exit_and_destroy( char **argv )
     run_child( argv, "destroy_race", hwnd, 10 );
 }
 
+static unsigned int allocate_window_surface( HWND hwnd, UINT64 *window, UINT64 *surface )
+{
+    struct __server_request_info info = {0};
+    unsigned int status;
+
+    info.u.req.allocate_client_surface_request.__header.req = REQ_allocate_client_surface;
+    info.u.req.allocate_client_surface_request.handle = wine_server_user_handle( hwnd );
+    info.u.req.allocate_client_surface_request.window = *window;
+    status = p_wine_server_call( &info );
+    if (!status)
+    {
+        *window = info.u.reply.allocate_client_surface_reply.window;
+        *surface = info.u.reply.allocate_client_surface_reply.surface;
+        ok( info.u.reply.allocate_client_surface_reply.owner_thread == GetCurrentThreadId(),
+            "wrong local owner thread %#x\n", info.u.reply.allocate_client_surface_reply.owner_thread );
+    }
+    return status;
+}
+
+static void test_surface_window_lifetime(void)
+{
+    HWND hwnd = CreateWindowW( L"static", L"surface lifetime", WS_POPUP, 0, 0, 32, 32,
+                               NULL, NULL, NULL, NULL );
+    HWND other = CreateWindowW( L"static", L"other lifetime", WS_POPUP, 0, 0, 32, 32,
+                                NULL, NULL, NULL, NULL );
+    UINT64 window = 0, first = 0, second = 0, rejected = 0, previous;
+    struct surface_state state;
+    unsigned int status;
+
+    ok( hwnd && other, "failed to create lifetime windows\n" );
+    status = allocate_window_surface( hwnd, &window, &first );
+    ok( !status && window && first, "initial binding status %#x\n", status );
+    previous = window;
+    status = allocate_window_surface( hwnd, &window, &second );
+    ok( !status && window == previous && second != first, "renewal status %#x\n", status );
+    status = allocate_window_surface( other, &window, &rejected );
+    ok( status == STATUS_INVALID_HANDLE && !rejected, "cross-lifetime renewal status %#x\n", status );
+    status = set_surface_state( other, first, CLIENT_SURFACE_STATE_REGISTER, 0, &state );
+    ok( status == STATUS_INVALID_PARAMETER, "cross-window registration status %#x\n", status );
+    status = set_surface_state( hwnd, first, CLIENT_SURFACE_STATE_CLOSE | CLIENT_SURFACE_STATE_UNREGISTER |
+                               CLIENT_SURFACE_STATE_UNCACHE, 0, &state );
+    ok( !status, "closing an unregistered reservation status %#x\n", status );
+    status = set_surface_state( hwnd, first, CLIENT_SURFACE_STATE_REGISTER, 0, &state );
+    ok( status == STATUS_INVALID_PARAMETER, "closed reservation registered late: %#x\n", status );
+    status = set_surface_state( hwnd, second, CLIENT_SURFACE_STATE_REGISTER, 0, &state );
+    ok( !status && state.active == 1, "bound registration status %#x active %u\n", status, state.active );
+    status = set_surface_state( hwnd, second, CLIENT_SURFACE_STATE_UNREGISTER, 0, &state );
+    ok( !status, "bound unregister status %#x\n", status );
+    DestroyWindow( hwnd );
+    status = allocate_window_surface( hwnd, &window, &rejected );
+    ok( !!status && !rejected, "destroyed lifetime renewal status %#x\n", status );
+    status = set_surface_state( other, first, CLIENT_SURFACE_STATE_REGISTER, 0, &state );
+    ok( status == STATUS_INVALID_PARAMETER, "destroyed reservation rebound: %#x\n", status );
+    ok( !release_surface( first ), "failed to release unregistered reservation\n" );
+    DestroyWindow( other );
+}
+
 struct focused_test_case
 {
     const char *name;
@@ -7618,6 +7675,7 @@ static BOOL run_focused_test_case( const char *name, char **argv )
 {
     static const struct focused_test_case cases[] =
     {
+        {"surface-window-lifetime", "surface renewal bound to an exact window", test_surface_window_lifetime},
         {"completion-provenance", "client surface completion result provenance",
          test_completion_result_provenance},
         {"presentation-modes", "client surface presentation modes", test_presentation_modes},
@@ -7892,6 +7950,7 @@ START_TEST(client_surface)
     }
 
     GetDesktopWindow();
+    test_surface_window_lifetime();
     trace( "testing full handoff pool and reuse\n" );
     test_handoff_pool_boundary();
     trace( "testing server-issued surface lifetimes\n" );
