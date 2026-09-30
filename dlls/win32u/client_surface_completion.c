@@ -268,6 +268,9 @@ static struct client_surface_completion_result client_surface_poll_present_compl
             result = surface->backend->completion->wait( surface, timeout );
         }
     }
+    client_surface_get_target( surface, &target );
+    if (ReadAcquire( &surface->closing ) || !target.valid || present->target_epoch != target.epoch)
+        result.status = CLIENT_SURFACE_COMPLETION_FAILED;
     end = begin ? client_surface_perf_time() : 0;
     assert( result.worker != CLIENT_SURFACE_COMPLETION_WORKER_RETIRE ||
             result.status == CLIENT_SURFACE_COMPLETION_FAILED );
@@ -593,12 +596,16 @@ static void finish_deferred_present( struct client_surface *surface, struct clie
     UINT64 control = present->handoff_control;
     unsigned long long begin = TRACE_ON(csperf) ? client_surface_perf_time() : 0;
     unsigned long long completed, released;
+    BOOL adopted;
 
     TRACE( "event=completion_finish surface=%p serial=%s status=%u worker=%u polled=%u\n",
            surface, wine_dbgstr_longlong( present->serial ), result.status, result.worker, polled );
-    if (!client_surface_complete_present( surface, present, TRUE,
-             result.status == CLIENT_SURFACE_COMPLETION_SIGNALED, expected_size, 0 ) &&
-        present->result == CLIENT_SURFACE_FRAME_PENDING)
+    adopted = client_surface_complete_present( surface, present, TRUE,
+                  result.status == CLIENT_SURFACE_COMPLETION_SIGNALED, expected_size, 0 );
+    TRACE( "event=present_adoption surface=%p serial=%s adopted=%u result=%u elapsed=%u\n",
+           surface, wine_dbgstr_longlong( present->serial ), adopted, present->result,
+           NtGetTickCount() - present->submission_time );
+    if (!adopted && present->result == CLIENT_SURFACE_FRAME_PENDING)
         WARN( "deferred client-surface composition did not complete for %s\n",
               debugstr_client_surface( surface ) );
     completed = begin ? client_surface_perf_time() : 0;
@@ -635,18 +642,22 @@ static struct client_surface_completion_result poll_completion_job( struct clien
      * the same single readiness probe as the synchronous wait contract. */
     result = client_surface_poll_present_completion( surface, &job->present,
                 min( remaining, (DWORD)CLIENT_SURFACE_COMPLETION_POLL_TIMEOUT_MS ) );
-    if (result.status != CLIENT_SURFACE_COMPLETION_PENDING) return result;
+    if (result.status == CLIENT_SURFACE_COMPLETION_FAILED) return result;
     now = NtGetTickCount();
     elapsed = now - job->wait_started;
-    if (elapsed >= job->wait_timeout)
+    if (client_surface_present_expired( &job->present ) ||
+        (elapsed >= job->wait_timeout &&
+         (job->wait_timeout || result.status == CLIENT_SURFACE_COMPLETION_PENDING)))
     {
         TRACE_(csperf)( "ticks=%llu event=completion_timeout identity=%s serial=%s elapsed=%u timeout=%u poll_elapsed=%u\n",
                        client_surface_perf_time(), wine_dbgstr_longlong( client_surface_get_identity( surface ) ),
                        wine_dbgstr_longlong( job->present.serial ), elapsed, job->wait_timeout, now - poll_start );
         WARN( "timed out waiting for presentation completion for %s serial %s\n",
               debugstr_client_surface( surface ), wine_dbgstr_longlong( job->present.serial ) );
-        return client_surface_completion_result( CLIENT_SURFACE_COMPLETION_FAILED );
+        result.status = CLIENT_SURFACE_COMPLETION_FAILED;
+        return result;
     }
+    if (result.status != CLIENT_SURFACE_COMPLETION_PENDING) return result;
     job->poll_due = now;
     if (now == poll_start)
     {
@@ -776,8 +787,9 @@ static struct client_surface_completion_job *claim_completion_head_locked( struc
         assert( !worker->executing && domain );
         worker->executing = TRUE;
         worker->domain = domain;
-        TRACE( "event=completion_execute domain=%s slot=%u\n", wine_dbgstr_longlong( domain->id ),
-               (unsigned int)(worker - completion_workers) );
+        TRACE( "event=completion_execute domain=%s slot=%u retirement=%u references=%u\n",
+               wine_dbgstr_longlong( domain->id ), (unsigned int)(worker - completion_workers),
+               job->retirement, domain->references );
     }
     return job;
 }

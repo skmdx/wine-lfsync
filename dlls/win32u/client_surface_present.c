@@ -459,7 +459,8 @@ BOOL client_surface_end_present_internal( struct client_surface *surface,
      * the process-wide registry lock is neither needed for lifetime nor for
      * target validation on the per-frame path. */
     pthread_mutex_lock( &surface->present_lock );
-    if (present->target == CLIENT_SURFACE_FRAME_TARGET_INVALID ||
+    if (ReadAcquire( &surface->closing ) || client_surface_present_expired( present ) ||
+        present->target == CLIENT_SURFACE_FRAME_TARGET_INVALID ||
         present->target_epoch != surface->target.epoch ||
         present->scene.toplevel != surface->target.toplevel)
     {
@@ -599,6 +600,11 @@ BOOL client_surface_end_present_internal( struct client_surface *surface,
         scene_retry = TRUE;
     }
     if (hdc) NtUserReleaseDC( hwnd, hdc );
+    if (ReadAcquire( &surface->closing ) || client_surface_present_expired( present ))
+    {
+        present->result = CLIENT_SURFACE_FRAME_COMPLETION_FAILED;
+        source_valid = composed = direct_proof = FALSE;
+    }
     if (source_valid)
     {
         surface->composed_serial = present->serial;
@@ -958,10 +964,20 @@ void client_surface_submit_present( struct client_surface *surface,
     client_surface_unlock_present( surface );
 }
 
+BOOL client_surface_present_expired( const struct client_surface_frame *present )
+{
+    /* A retained completed image can be replayed indefinitely. The submission
+     * deadline rejects new completion/capture results; it cannot end native
+     * use or release the execution lease of a callback which has not returned. */
+    return !present->replay && present->completion.kind != CLIENT_SURFACE_COMPLETION_NONE &&
+           NtGetTickCount() - present->submission_time >= CLIENT_SURFACE_PRESENT_TIMEOUT;
+}
+
 static BOOL client_surface_capture_current_locked( struct client_surface *surface,
                                                    struct client_surface_frame *present )
 {
-    return surface->hwnd && surface->target.valid && present->target_epoch == surface->target.epoch &&
+    return !ReadAcquire( &surface->closing ) && !client_surface_present_expired( present ) &&
+           surface->hwnd && surface->target.valid && present->target_epoch == surface->target.epoch &&
            present->serial > surface->composed_serial && client_surface_handoff_valid( surface, present );
 }
 
@@ -1060,7 +1076,7 @@ BOOL client_surface_complete_present_locked( struct client_surface *surface,
            (int)present->capture.size.cx, (int)present->capture.size.cy, submitted, external_completed, present->target );
 
     completed = client_surface_finish_host_completion( surface, present, submitted, external_completed, timeout );
-    if (ReadAcquire( &surface->closing )) completed = FALSE;
+    if (ReadAcquire( &surface->closing ) || client_surface_present_expired( present )) completed = FALSE;
     if (present->result != CLIENT_SURFACE_FRAME_PENDING) completed = FALSE;
     if (completed && present->completion.kind != CLIENT_SURFACE_COMPLETION_NONE &&
         client_surface_backend_has_cap( surface, CLIENT_SURFACE_BACKEND_GENERATION_HANDOFF ))
@@ -1093,7 +1109,8 @@ BOOL client_surface_complete_present_locked( struct client_surface *surface,
          * scene. The server checks the original top-level and the selected
          * producer's sequence on this HWND. Completion on a sibling or owner
          * preparation must not reject an independently completed image. */
-        if (hwnd && (source_valid || present->target != CLIENT_SURFACE_FRAME_TARGET_INVALID) &&
+        if (hwnd && !client_surface_present_expired( present ) &&
+            (source_valid || present->target != CLIENT_SURFACE_FRAME_TARGET_INVALID) &&
             surface->target.valid && present->target_epoch == surface->target.epoch &&
             present->scene.toplevel == surface->target.toplevel &&
             client_surface_validate_size_locked( surface, expected_size ))

@@ -435,7 +435,8 @@ static BOOL source_capture_current( struct client_surface *surface, struct clien
 {
     struct client_surface_source *source = surface->handoff->sources + present->handoff_index;
 
-    return surface->handoff->channel &&
+    return !ReadAcquire( &surface->closing ) && !client_surface_present_expired( present ) &&
+           surface->handoff->channel &&
            !__atomic_load_n( &surface->handoff->channel->closed, __ATOMIC_ACQUIRE ) &&
            present->handoff_control && present->result == CLIENT_SURFACE_FRAME_PENDING &&
            surface->hwnd && surface->target.valid && present->target_epoch == surface->target.epoch &&
@@ -481,6 +482,7 @@ BOOL client_surface_freeze_frame_locked( struct client_surface *surface,
     }
     if (valid && surface->backend->handoff_complete)
         valid = surface->backend->handoff_complete( surface, source, present->handoff_index );
+    if (valid) valid = source_capture_current( surface, present );
     if (valid)
         valid = source->source && source->width && source->height && (source->flags & CLIENT_SURFACE_HANDOFF_COPY_SOURCE);
     if (valid)
@@ -580,7 +582,8 @@ BOOL client_surface_publish_handoff_locked( struct client_surface *surface,
                wine_dbgstr_longlong( frame->surface_id ), wine_dbgstr_longlong( frame->frame_id ) );
         valid = FALSE;
     }
-    if (valid) valid = !__atomic_load_n( &channel->closed, __ATOMIC_ACQUIRE );
+    if (valid) valid = !__atomic_load_n( &channel->closed, __ATOMIC_ACQUIRE ) &&
+                      !ReadAcquire( &surface->closing ) && !client_surface_present_expired( present );
     if (valid)
     {
         /* completion_lock is the single publication domain, including callers

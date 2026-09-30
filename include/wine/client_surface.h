@@ -152,7 +152,10 @@ static inline struct client_surface_completion_result client_surface_completion_
 /* A poll consumes neither the token nor its image on PENDING. A zero timeout
  * tests the current boundary once. Native queries may still take longer than
  * the supplied wait budget. RETIRE is terminal: the caller must not execute
- * another completion callback on this worker. */
+ * another completion callback on this worker. Success is revalidated against
+ * the original submission deadline after return and capture. Expiry rejects
+ * adoption, not native ownership: releases and worker-slot reuse wait for
+ * real native return and, for RETIRE, actual thread exit. */
 typedef struct client_surface_completion_result (*client_surface_completion_wait_func)( void *context, DWORD timeout );
 typedef void (*client_surface_completion_release_func)( void *context );
 struct client_surface_completion
