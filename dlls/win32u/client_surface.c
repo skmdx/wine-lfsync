@@ -597,6 +597,7 @@ void client_surface_retire_resources( struct client_surface *surface )
 static void client_surface_destroy( struct client_surface *surface )
 {
     assert( !surface->indexed && !surface->identity );
+    TRACE( "freeing %s\n", debugstr_client_surface( surface ) );
     client_surface_completion_destroy( surface );
     release_client_surface_mailbox( surface->mailbox );
     pthread_cond_destroy( &surface->completion_cond );
@@ -628,6 +629,8 @@ static void close_client_surface_locked( struct client_surface *surface )
 
 static void detach_owned_client_surface( struct client_surface *surface, BOOL gui )
 {
+    TRACE( "closing %s, identity %s, gui %u\n", debugstr_client_surface( surface ),
+           wine_dbgstr_longlong( surface->close_identity ), gui );
     client_surface_detach_binding( surface, gui );
     pthread_mutex_lock( &registry_lock );
     surface->lifecycle = CLIENT_SURFACE_DETACHED;
@@ -770,6 +773,7 @@ void detach_client_surface_identity( UINT64 identity )
         break;
     }
     pthread_mutex_unlock( &registry_lock );
+    TRACE( "identity %s, found %u\n", wine_dbgstr_longlong( identity ), !!found );
     if (found) finish_client_surface_close( found );
 }
 
@@ -1507,8 +1511,8 @@ void *client_surface_create( UINT size, const struct client_surface_backend *bac
     InterlockedCompareExchange( &client_surface_process_id,
                                 HandleToULong( NtCurrentTeb()->ClientId.UniqueProcess ), 0 );
 
-    TRACE( "created %s, format %d, raw %u, toplevel %p, virtual_rect %s, monitor_rect %s\n", debugstr_client_surface( surface ),
-           format, raw, toplevel, wine_dbgstr_rect( &surface->target.virtual_rect ),
+    TRACE( "created %s, identity %s, format %d, raw %u, toplevel %p, virtual_rect %s, monitor_rect %s\n", debugstr_client_surface( surface ),
+           wine_dbgstr_longlong( surface->identity ), format, raw, toplevel, wine_dbgstr_rect( &surface->target.virtual_rect ),
            wine_dbgstr_rect( &surface->target.monitor_rect ) );
     return surface;
 
@@ -2126,7 +2130,8 @@ struct client_surface *get_unused_client_surface( HWND hwnd, int format, BOOL ra
         }
         if (reusable)
         {
-            TRACE( "Reusing surface %s\n", debugstr_client_surface( surface ) );
+            TRACE( "Reusing surface %s, identity %s\n", debugstr_client_surface( surface ),
+                   wine_dbgstr_longlong( client_surface_get_identity( surface ) ) );
             return surface; /* checkout reference becomes renderer ownership */
         }
         if (close) finish_client_surface_close( surface );

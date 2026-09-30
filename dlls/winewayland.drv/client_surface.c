@@ -41,6 +41,8 @@ static void wayland_client_surface_detach(struct client_surface *client)
     struct wayland_client_surface *surface = impl_from_client_surface(client);
     struct wayland_win_data *data;
 
+    TRACE("%s\n", debugstr_client_surface(client));
+
     if ((data = wayland_win_data_get(client->hwnd)))
     {
         if (data->client_surface == surface) data->client_surface = NULL;

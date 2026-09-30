@@ -1001,10 +1001,11 @@ static void update_visible_region( struct dce *dce )
     if (dce->clip_rgn) NtGdiCombineRgn( vis_rgn, vis_rgn, dce->clip_rgn,
                                         (flags & DCX_INTERSECTRGN) ? RGN_AND : RGN_DIFF );
 
-    /* Composited owners and foreign DCs share native GDI content. A private
-     * DIB would hide foreign writes from an owner's retained DC. */
+    /* Composited owners and foreign DCs share native GDI content when the
+     * driver supports native image writes. Other drivers still need their
+     * window surface to upload GDI content. */
     if ((!(paint_flags & SET_WINPOS_PIXEL_FORMAT && user_driver->dc_funcs.pPutImage) || (flags & DCX_WINDOW)) &&
-        !client_surface_needs_backing( top_win ))
+        (!user_driver->dc_funcs.pPutImage || !client_surface_needs_backing( top_win )))
     {
         win = get_win_ptr( top_win );
         if (win && win != WND_DESKTOP && win != WND_OTHER_PROCESS)
