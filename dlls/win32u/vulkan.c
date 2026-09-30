@@ -2768,6 +2768,8 @@ static VkResult snapshot_vulkan_present( struct vulkan_queue *queue, VkPresentIn
     source.ready_fence = pending->fence;
     if (count) present_info->pNext = &source;
     res = device->p_vkQueuePresentKHR( queue->host.queue, present_info );
+    TRACE( "event=vulkan_native_present queue=%p result=%d waits=%u\n",
+           queue, res, present_info->waitSemaphoreCount );
     present_info->pNext = source.pNext;
     if (!submitted) goto done;
 
@@ -3311,6 +3313,7 @@ reserve_completions:
         for (index = 0; index < present_info->swapchainCount; ++index)
             if (swapchain_from_handle( client_swapchains[index] ) == swapchain) break;
         assert( index < present_info->swapchainCount );
+        if (ReadAcquire( &swapchain->surface->client->closing )) continue;
         if (!reservations[index].required &&
             !client_surface_needs_completion_reservation( swapchain->surface->client )) continue;
         /* Reserve every batch member's completion owner before any native
@@ -3322,6 +3325,7 @@ reserve_completions:
             admission = client_surface_reserve_completion_domain( swapchain->surface->client,
                 impl_from_vulkan_device( device )->completion_domain_base + (queue - device->queues),
                 &reservations[index].job );
+            if (admission.reason == CLIENT_SURFACE_STALE_OR_CLOSED) continue;
             if (admission.reason != CLIENT_SURFACE_ACCEPTED) goto admission_failed;
         }
         if (!start_swapchain_retirement_thread( impl_from_vulkan_device( device ) ))
@@ -3343,6 +3347,7 @@ reserve_completions:
         {
             admission = (struct client_surface_admission){ client_surface_activate_completion( reservations[i].job ),
                                                            CLIENT_SURFACE_CAPACITY_NONE };
+            if (admission.reason == CLIENT_SURFACE_STALE_OR_CLOSED) continue;
             if (admission.reason != CLIENT_SURFACE_ACCEPTED) goto admission_failed;
         }
     have_snapshots = reserve_more = FALSE;
@@ -3380,18 +3385,22 @@ reserve_completions:
          * and block on a later one while we wait to reacquire this one. */
         client_surface_wait_present_locked( present_surfaces[i], external_completion );
         present_surfaces[surface_locked_count++] = present_surfaces[i];
-        if (ReadAcquire( &present_surfaces[i]->closing ))
-        {
-            while (surface_locked_count)
-                client_surface_unlock_present( present_surfaces[--surface_locked_count] );
-            res = VK_ERROR_SURFACE_LOST_KHR;
-            goto reservation_failed;
-        }
     }
     for (uint32_t i = 0; i < present_info->swapchainCount; i++)
     {
         struct swapchain *swapchain = swapchain_from_handle( client_swapchains[i] );
 
+        /* Closing the Win32 publication endpoint does not destroy this
+         * swapchain's native surface. Submit its acquired image and guest
+         * waits normally, without reserving capture/publication resources.
+         * OUT_OF_DATE is an enqueued result, not a pre-submit refusal. */
+        if (ReadAcquire( &swapchain->surface->client->closing ))
+        {
+            memset( &presents[i], 0, sizeof(presents[i]) );
+            if (use_internal_present_wait) present_ids[i] = 0;
+            TRACE( "event=vulkan_closed_present swapchain=%p\n", swapchain );
+            continue;
+        }
         client_surface_prepare_present_locked( swapchain->surface->client, &presents[i],
                                                (use_internal_present_wait && present_ids[i]) || swapchain_needs_snapshot( swapchain ),
                                                impl_from_vulkan_device( device )->completion_domain_base );
@@ -3464,7 +3473,11 @@ reserve_completions:
     if (have_snapshots)
         res = snapshot_vulkan_present( queue, present_info, client_swapchains, presents, reservations );
     else
+    {
         res = device->p_vkQueuePresentKHR( queue->host.queue, present_info );
+        TRACE( "event=vulkan_native_present queue=%p result=%d waits=%u\n",
+               queue, res, present_info->waitSemaphoreCount );
+    }
     if (res == VK_ERROR_OUT_OF_HOST_MEMORY || res == VK_ERROR_OUT_OF_DEVICE_MEMORY ||
         res == VK_ERROR_DEVICE_LOST)
         for (uint32_t i = 0; i < present_info->swapchainCount; ++i) present_info->pResults[i] = res;

@@ -1271,7 +1271,10 @@ BOOL client_surface_try_complete_present( struct client_surface *surface, struct
                                          BOOL completed, const SIZE *expected_size,
                                          struct client_surface_present_result *result )
 {
-    client_surface_lock_present( surface );
+    /* A multi-surface producer may hold this mutex while waiting for another
+     * completion in our execution domain. Return the domain to the executor
+     * instead of blocking the worker which must make that completion ready. */
+    if (pthread_mutex_trylock( &surface->completion_lock )) return FALSE;
     /* A completed native wait does not authorize adoption during a target
      * mutation. Leave its image and FIFO owned, without occupying a worker.
      * Failed/cancelled work only returns ownership and cannot publish. */
