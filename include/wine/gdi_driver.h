@@ -220,7 +220,7 @@ struct gdi_dc_funcs
 };
 
 /* increment this when changing driver tables or shared driver-facing structures */
-#define WINE_GDI_DRIVER_VERSION 154
+#define WINE_GDI_DRIVER_VERSION 155
 
 #define GDI_PRIORITY_NULL_DRV        0  /* null driver */
 #define GDI_PRIORITY_FONT_DRV      100  /* any font driver */
@@ -341,6 +341,9 @@ struct client_surface_backend
      * flush requires host completion before returning, defer_visible keeps a scene generation staged */
     BOOL (*present)( struct client_surface *surface, const struct client_surface_scene *scene,
                      HDC hdc, HRGN surface_region, BOOL flush, BOOL defer_visible );
+    /* GENERATION_HANDOFF requires every handoff operation. Reserve retirement
+     * ownership before creating a mapping or advertising an endpoint. */
+    BOOL (*handoff_reserve)( struct client_surface *surface, const struct client_surface_frame *frame );
     /* Prepare producer-private storage. This does not publish a frame. */
     BOOL (*handoff_prepare)( struct client_surface *surface,
                              struct client_surface_source *source, const struct client_surface_frame *frame );
@@ -358,6 +361,14 @@ struct client_surface_backend
     void (*handoff_retire)( struct client_surface *surface, const struct client_surface_handoff_lease *lease );
     const struct client_surface_completion_ops *completion;
 };
+
+static inline BOOL client_surface_backend_valid( const struct client_surface_backend *backend )
+{
+    if (backend->completion && (!backend->completion->prepare || !backend->completion->wait)) return FALSE;
+    if (!(backend->caps & CLIENT_SURFACE_BACKEND_GENERATION_HANDOFF)) return TRUE;
+    return backend->handoff_reserve && backend->handoff_prepare && backend->handoff_capture &&
+           backend->handoff_complete && backend->handoff_serialize && backend->handoff_retire;
+}
 
 struct client_surface_scene
 {

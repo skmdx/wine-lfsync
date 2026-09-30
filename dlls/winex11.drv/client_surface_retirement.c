@@ -264,19 +264,7 @@ void x11drv_client_surface_retire_handoff( struct client_surface *client,
     struct x11drv_client_surface_retirement *retirement = surface->handoff_retirement;
     unsigned int i;
 
-    if (!retirement)
-    {
-        /* Preparation failed before any source could be submitted. */
-        struct x11drv_client_surface_retirement empty =
-        {
-            .view = lease->view, .channel = lease->channel,
-            .identity = lease->channel->identity, .cookie = lease->cookie,
-            .ready_fd = lease->ready_fd,
-        };
-        BOOL ready = retire_source_mapping( &empty );
-        assert( ready );
-        return;
-    }
+    assert( retirement && !retirement->view );
     retirement->view = lease->view;
     retirement->channel = lease->channel;
     retirement->identity = lease->channel->identity;

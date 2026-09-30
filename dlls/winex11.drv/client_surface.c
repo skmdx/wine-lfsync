@@ -425,6 +425,26 @@ BOOL x11drv_client_surface_snapshot( struct client_surface *client, struct clien
     return ret;
 }
 
+static BOOL x11drv_client_surface_handoff_reserve( struct client_surface *client,
+                                                  const struct client_surface_frame *present )
+{
+    struct x11drv_client_surface *surface = impl_from_client_surface( client );
+    struct client_surface_memory_scope memory = {0};
+    struct x11drv_client_snapshot *cached = surface->gpu_snapshot ? surface->gpu_snapshot : surface->snapshot;
+    BOOL ret;
+
+    if (surface->handoff_retirement) return TRUE;
+    if (present->replay)
+    {
+        if (!client->content_valid || !cached) return FALSE;
+        return x11drv_client_surface_prepare_retirement( surface, x11drv_client_snapshot_memory( cached ) );
+    }
+    if (!client_surface_memory_scope_init( &memory, client->hwnd, present->memory_domain )) return FALSE;
+    ret = x11drv_client_surface_prepare_retirement( surface, &memory );
+    client_surface_memory_scope_destroy( &memory );
+    return ret;
+}
+
 static BOOL x11drv_client_surface_handoff_prepare(
     struct client_surface *client, struct client_surface_source *image, const struct client_surface_frame *present )
 {
@@ -457,7 +477,7 @@ static BOOL x11drv_client_surface_handoff_prepare(
         if (!client_surface_memory_scope_init( &memory, client->hwnd, present->memory_domain )) return FALSE;
         owners = &memory;
     }
-    if (!x11drv_client_surface_prepare_retirement( surface, owners )) goto done;
+    assert( surface->handoff_retirement );
     width = source.right - source.left;
     height = source.bottom - source.top;
     if (native)
@@ -627,6 +647,7 @@ static const struct client_surface_backend x11drv_client_surface_backend =
     .prepare_direct = X11DRV_client_surface_prepare_direct,
     .complete_direct = X11DRV_client_surface_complete_direct,
     .update = x11drv_client_surface_update,
+    .handoff_reserve = x11drv_client_surface_handoff_reserve,
     .handoff_prepare = x11drv_client_surface_handoff_prepare,
     .handoff_capture = x11drv_client_surface_handoff_capture,
     .handoff_complete = x11drv_client_surface_handoff_complete,
@@ -654,6 +675,7 @@ struct client_surface *X11DRV_CreateClientSurface( HWND hwnd, int format, BOOL r
     Colormap colormap;
     RECT rect;
 
+    if (!client_surface_backend_valid( backend )) return NULL;
     if (format && !visual_from_pixel_format( format, &visual )) return NULL;
 
     /* All conversion and clipping, including extension fallbacks, is done on

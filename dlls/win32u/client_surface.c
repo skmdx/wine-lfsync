@@ -1462,8 +1462,7 @@ void *client_surface_create( UINT size, const struct client_surface_backend *bac
 
     if (size < sizeof(*surface)) return NULL;
     if (!backend) backend = &default_client_surface_backend;
-    if (backend->completion &&
-        (!backend->completion->prepare || !backend->completion->wait)) return NULL;
+    if (!client_surface_backend_valid( backend )) return NULL;
     if (!(surface = client_surface_alloc( size ))) return NULL;
     if (!client_surface_completion_init( surface ))
     {

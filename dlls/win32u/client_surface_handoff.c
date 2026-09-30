@@ -69,7 +69,7 @@ struct client_surface *client_surface_alloc( UINT size )
 
 void client_surface_handoff_destroy( struct client_surface *surface )
 {
-    assert( !surface->handoff->waiters );
+    assert( !surface->handoff->waiters && !surface->handoff->view && surface->handoff->ready_fd == -1 );
 }
 
 static unsigned long long client_surface_perf_time(void)
@@ -125,9 +125,7 @@ static void client_surface_handoff_wake_release( struct client_surface_handoff_s
 /* The caller holds present_lock through both backend retirement and detachment. */
 void client_surface_release_handoff( struct client_surface *surface )
 {
-    struct client_surface_handoff_channel *channel;
-    DWORD start = NtGetTickCount();
-    unsigned int index;
+    struct client_surface_handoff_lease lease;
 
     if (!surface->handoff->view) return;
     /* Exact WSI completions may finish on a worker after a target update has
@@ -144,52 +142,12 @@ void client_surface_release_handoff( struct client_surface *surface )
         surface->handoff->release_pending = TRUE;
         return;
     }
-    if (surface->backend->handoff_retire)
+    lease = (struct client_surface_handoff_lease)
     {
-        struct client_surface_handoff_lease lease =
-        {
-            .view = surface->handoff->view, .channel = surface->handoff->channel,
-            .cookie = surface->handoff->cookie, .ready_fd = surface->handoff->ready_fd,
-        };
-
-        surface->backend->handoff_retire( surface, &lease );
-        goto detached;
-    }
-    channel = surface->handoff->channel;
-    __atomic_store_n( &channel->closed, 1, __ATOMIC_RELEASE );
-    index = channel - surface->handoff->shared->channels;
-    __atomic_fetch_or( &surface->handoff->shared->ready_bitmap[index / 64],
-                       (UINT64)1 << (index % 64), __ATOMIC_RELEASE );
-    client_surface_handoff_wake_ready( surface );
-    while ((__atomic_load_n( &channel->endpoints, __ATOMIC_ACQUIRE ) &
-            CLIENT_SURFACE_HANDOFF_ENDPOINT_CONSUMER) &&
-           __atomic_load_n( &channel->consumer_sequence, __ATOMIC_ACQUIRE ) !=
-           __atomic_load_n( &channel->producer_sequence, __ATOMIC_ACQUIRE ))
-    {
-        LONG sequence;
-
-        if (NtGetTickCount() - start >= CLIENT_SURFACE_PRESENT_TIMEOUT)
-        {
-            surface->handoff->release_pending = TRUE;
-            return;
-        }
-        __atomic_store_n( &surface->handoff->shared->release_parked, 1, __ATOMIC_RELEASE );
-        sequence = __atomic_load_n( &surface->handoff->shared->release_sequence, __ATOMIC_ACQUIRE );
-        client_surface_handoff_wait_sequence( &surface->handoff->shared->release_sequence, sequence, 10 );
-    }
-    SERVER_START_REQ( release_client_surface_handoff )
-    {
-        req->handle = 0;
-        req->producer = 0;
-        req->surface = client_surface_get_identity( surface );
-        req->cookie = surface->handoff->cookie;
-        req->owner = 0;
-        wine_server_call( req );
-    }
-    SERVER_END_REQ;
-    NtUnmapViewOfSection( NtCurrentProcess(), surface->handoff->view );
-    if (surface->handoff->ready_fd >= 0) close( surface->handoff->ready_fd );
-detached:
+        .view = surface->handoff->view, .channel = surface->handoff->channel,
+        .cookie = surface->handoff->cookie, .ready_fd = surface->handoff->ready_fd,
+    };
+    surface->backend->handoff_retire( surface, &lease );
     surface->handoff->ready_fd = -1;
     surface->handoff->view = NULL;
     surface->handoff->view_size = 0;
@@ -200,7 +158,7 @@ detached:
     surface->handoff->release_pending = FALSE;
 }
 
-static BOOL map_client_surface_handoff( struct client_surface *surface )
+static BOOL map_client_surface_handoff( struct client_surface *surface, const struct client_surface_frame *present )
 {
     struct client_surface_handoff_shared *shared;
     struct client_surface_handoff_channel *channel;
@@ -220,6 +178,7 @@ static BOOL map_client_surface_handoff( struct client_surface *surface )
         client_surface_release_handoff( surface );
         if (surface->handoff->view) return FALSE;
     }
+    if (!surface->backend->handoff_reserve( surface, present )) return FALSE;
     SERVER_START_REQ( get_client_surface_handoff )
     {
         req->handle = wine_server_user_handle( surface->hwnd );
@@ -376,8 +335,7 @@ static BOOL prepare_client_surface_handoff_locked( struct client_surface *surfac
         (present->mode != CLIENT_SURFACE_PRESENTATION_COMPOSITED &&
          (present->mode != CLIENT_SURFACE_PRESENTATION_STAGED || !present->scene.generation)) ||
         !present->scene.valid)) ||
-        !client_surface_backend_has_cap( surface, CLIENT_SURFACE_BACKEND_GENERATION_HANDOFF ) ||
-        !surface->backend->handoff_prepare)
+        !client_surface_backend_has_cap( surface, CLIENT_SURFACE_BACKEND_GENERATION_HANDOFF ))
     {
         TRACE( "handoff unavailable identity %s target %u mode %u generation %s valid %u cap %u prepare %p\n",
                wine_dbgstr_longlong( client_surface_get_identity( surface ) ), present->target, present->mode,
@@ -386,7 +344,7 @@ static BOOL prepare_client_surface_handoff_locked( struct client_surface *surfac
                surface->backend->handoff_prepare );
         return FALSE;
     }
-    if (!map_client_surface_handoff( surface )) return FALSE;
+    if (!map_client_surface_handoff( surface, present )) return FALSE;
     /* A visible source may publish before the asynchronous owner binds.
      * Cached replay needs the same retained READY path as a new capture:
      * endpoint registration alone will not request another replay. Hidden
@@ -459,7 +417,7 @@ BOOL client_surface_freeze_frame_locked( struct client_surface *surface,
     valid = source_capture_current( surface, present );
     if (valid && present->capture.size.cx)
         valid = source->width == present->capture.size.cx && source->height == present->capture.size.cy;
-    if (valid && surface->backend->handoff_capture)
+    if (valid)
         valid = surface->backend->handoff_capture( surface, present, &capture );
     if (valid && capture.read)
     {
@@ -480,7 +438,7 @@ BOOL client_surface_freeze_frame_locked( struct client_surface *surface,
         }
         if (valid && capture.apply) valid = capture.apply( capture.context, surface, present );
     }
-    if (valid && surface->backend->handoff_complete)
+    if (valid)
         valid = surface->backend->handoff_complete( surface, source, present->handoff_index );
     if (valid) valid = source_capture_current( surface, present );
     if (valid)
