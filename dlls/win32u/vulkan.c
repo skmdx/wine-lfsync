@@ -3586,8 +3586,6 @@ reserve_completions:
 
         {
             struct client_surface_present_result completed;
-            BOOL wait_skipped = use_internal_present_wait && !present_ids[i] &&
-                                presents[i].completion.kind == CLIENT_SURFACE_COMPLETION_NONE;
             DWORD elapsed = NtGetTickCount() - presents[i].submission_time;
             DWORD remaining = elapsed < CLIENT_SURFACE_PRESENT_TIMEOUT ?
                               CLIENT_SURFACE_PRESENT_TIMEOUT - elapsed : 0;
@@ -3597,19 +3595,11 @@ reserve_completions:
                                                          use_internal_present_wait && present_ids[i] ? 0 : remaining );
             if (completed.owner == CLIENT_SURFACE_PRESENT_CALLER && !completed.image_complete && compose)
             {
-                /* The window changed after the post-present check, or the
-                 * native completion source failed.  Preserve the staged
-                 * generation for a correctly completed frame. */
-                WARN( "Swapchain size %dx%d changed or did not complete before composition\n",
-                      swapchain->extents.width, swapchain->extents.height );
-                /* Retirement can close admission after this native Present
-                 * succeeded. Do not publish an uncompleted frame or turn that
-                 * internal wait restriction into an application Present error. */
-                if (presents[i].result == CLIENT_SURFACE_FRAME_PENDING && !wait_skipped)
-                {
-                    if (present_info->pResults) present_info->pResults[i] = VK_SUBOPTIMAL_KHR;
-                    if (!res) res = VK_SUBOPTIMAL_KHR;
-                }
+                /* Publication can lose its scene or window after the native
+                 * result and Win32 geometry have been checked. That internal
+                 * cancellation does not change the accepted queue operation. */
+                TRACE( "event=vulkan_publication_cancelled swapchain=%p result=%d frame=%u\n",
+                       swapchain, present_info->pResults[i], presents[i].result );
             }
         }
         if (snapshot_submitted)
