@@ -199,10 +199,10 @@ static void opengl_drawable_flush( struct opengl_drawable *drawable, int interva
 {
     if (!is_client_surface_window( drawable->client, 0 )) return;
 
-    /* Explicit storage must observe foreign-owner geometry before the next
-     * GL command. Updating only at SwapBuffers discards a one-frame repaint
-     * into the old FBO, then resizes (and clears) it after presentation. */
-    if (drawable->read_fbo) client_surface_update( drawable->client );
+    /* Both native drawables and explicit storage must observe foreign-owner
+     * geometry before the next GL command. Resizing only at SwapBuffers loses
+     * the part of a one-frame repaint outside the old drawable extent. */
+    client_surface_update( drawable->client );
     if (client_surface_get_size( drawable->client, &drawable->virtual_size, &drawable->monitor_size ))
         flags |= GL_FLUSH_UPDATED;
     if (framebuffer_surface_needs_resize( drawable )) flags |= GL_FLUSH_UPDATED;
