@@ -810,15 +810,15 @@ void WAYLAND_UpdateLayeredWindow(HWND hwnd, BYTE alpha, UINT flags)
 
 void set_client_surface(HWND hwnd, struct wayland_client_surface *new_client)
 {
-    HWND toplevel = new_client->client.target.toplevel;
-    RECT rect = new_client->client.target.monitor_rect;
+    struct client_surface_target target;
     struct wayland_client_surface *old_client;
     struct wayland_win_data *data;
     BOOL visible = FALSE;
 
+    client_surface_get_target(&new_client->client, &target);
     /* ownership is shared with the callers, the last caller to release
      * its reference will also destroy it and clear our pointer. */
-    if(toplevel) visible = NtUserIsWindowVisible(hwnd);
+    if(target.toplevel) visible = NtUserIsWindowVisible(hwnd);
     if (!(data = wayland_win_data_get(hwnd))) return;
 
     if (new_client != data->client_surface)
@@ -828,8 +828,8 @@ void set_client_surface(HWND hwnd, struct wayland_client_surface *new_client)
 
         if ((data->client_surface = new_client))
         {
-            if (toplevel && visible)
-                wayland_client_surface_attach(new_client, toplevel, &rect);
+            if (target.toplevel && visible)
+                wayland_client_surface_attach(new_client, target.toplevel, &target.monitor_rect);
             else
                 wayland_client_surface_attach(new_client, NULL, NULL);
         }

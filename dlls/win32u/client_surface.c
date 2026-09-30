@@ -180,8 +180,15 @@ static BOOL client_surface_window_current( const struct client_surface *surface 
     return !status && lock.id == surface->window_lifetime;
 }
 
+struct client_surface_target_store
+{
+    pthread_mutex_t mutex; /* Leaf: only copy payload while held. */
+    struct client_surface_target target;
+};
+
 static BOOL insert_client_surface_index( struct client_surface *surface )
 {
+    struct client_surface_target target;
     WND *win = NULL;
 
     if (surface->owner_thread)
@@ -203,10 +210,11 @@ static BOOL insert_client_surface_index( struct client_surface *surface )
     list_add_tail( &client_surfaces, &surface->entry );
     surface->indexed = TRUE;
     insert_client_surface_identity_locked( surface );
-    surface->indexed_toplevel = surface->target.toplevel;
-    if (surface->target.toplevel)
+    client_surface_get_target( surface, &target );
+    surface->indexed_toplevel = target.toplevel;
+    if (target.toplevel)
     {
-        unsigned int bucket = client_surface_index_hash( (UINT_PTR)surface->target.toplevel );
+        unsigned int bucket = client_surface_index_hash( (UINT_PTR)target.toplevel );
         surface->toplevel_next = client_surface_toplevel_index[bucket];
         client_surface_toplevel_index[bucket] = surface;
     }
@@ -276,6 +284,8 @@ static void remove_client_surface_index_locked( struct client_surface *surface )
 static void publish_client_surface_target( struct client_surface *surface,
                                            const struct client_surface_target *target, BOOL preserve_native )
 {
+    struct client_surface_target_store *store = surface->target_store;
+    struct client_surface_target next = *target;
     unsigned int bucket;
 
     pthread_mutex_lock( &registry_lock );
@@ -285,17 +295,11 @@ static void publish_client_surface_target( struct client_surface *surface,
         remove_client_surface_chain( &client_surface_toplevel_index[bucket], surface, FALSE );
     }
 
-    InterlockedIncrement64( &surface->target.seq );
-    if (!preserve_native) ++surface->target.epoch;
-    surface->target.toplevel = target->toplevel;
-    surface->target.virtual_rect = target->virtual_rect;
-    surface->target.monitor_rect = target->monitor_rect;
-    surface->target.dpi_num = target->dpi_num;
-    surface->target.dpi_den = target->dpi_den;
-    surface->target.mode = target->mode;
-    surface->target.offscreen = target->offscreen;
-    surface->target.valid = target->valid;
-    InterlockedIncrement64( &surface->target.seq );
+    pthread_mutex_lock( &store->mutex );
+    next.seq = store->target.seq + 2;
+    next.epoch = store->target.epoch + !preserve_native;
+    store->target = next;
+    pthread_mutex_unlock( &store->mutex );
 
     surface->indexed_toplevel = surface->indexed ? target->toplevel : NULL;
     surface->toplevel_next = NULL;
@@ -307,14 +311,14 @@ static void publish_client_surface_target( struct client_surface *surface,
     }
     pthread_mutex_unlock( &registry_lock );
     TRACE( "event=target identity=%s sequence=%s epoch=%s preserved=%u toplevel=%p "
-           "position=%d,%d size=%dx%d mode=%u valid=%u\n",
+           "position=%d,%d size=%dx%d mode=%u valid=%u surface=%p\n",
            wine_dbgstr_longlong( client_surface_get_identity( surface ) ),
-           wine_dbgstr_longlong( surface->target.seq ), wine_dbgstr_longlong( surface->target.epoch ),
-           preserve_native, surface->target.toplevel, (int)surface->target.virtual_rect.left,
-           (int)surface->target.virtual_rect.top,
-           (int)(surface->target.virtual_rect.right - surface->target.virtual_rect.left),
-           (int)(surface->target.virtual_rect.bottom - surface->target.virtual_rect.top),
-           surface->target.mode, surface->target.valid );
+           wine_dbgstr_longlong( next.seq ), wine_dbgstr_longlong( next.epoch ),
+           preserve_native, next.toplevel, (int)next.virtual_rect.left,
+           (int)next.virtual_rect.top,
+           (int)(next.virtual_rect.right - next.virtual_rect.left),
+           (int)(next.virtual_rect.bottom - next.virtual_rect.top),
+           next.mode, next.valid, surface );
 }
 
 #define MAX_UNUSED_CLIENT_SURFACES 64
@@ -322,11 +326,16 @@ static void publish_client_surface_target( struct client_surface *surface,
 
 static UINT64 get_client_surface_cache_cost( const struct client_surface *surface )
 {
-    const RECT *rect = surface->raw ? &surface->target.monitor_rect : &surface->target.virtual_rect;
-    LONGLONG signed_width = (LONGLONG)rect->right - rect->left;
-    LONGLONG signed_height = (LONGLONG)rect->bottom - rect->top;
-    UINT64 width = max( (LONGLONG)0, signed_width );
-    UINT64 height = max( (LONGLONG)0, signed_height );
+    struct client_surface_target target;
+    const RECT *rect = surface->raw ? &target.monitor_rect : &target.virtual_rect;
+    LONGLONG signed_width, signed_height;
+    UINT64 width, height;
+
+    client_surface_get_target( surface, &target );
+    signed_width = (LONGLONG)rect->right - rect->left;
+    signed_height = (LONGLONG)rect->bottom - rect->top;
+    width = max( (LONGLONG)0, signed_width );
+    height = max( (LONGLONG)0, signed_height );
 
     /* The cached native window retains at least one 32-bpp image.  Cap the
      * estimate above the total budget; exact accounting beyond that point is
@@ -603,6 +612,7 @@ static void client_surface_destroy( struct client_surface *surface )
     pthread_cond_destroy( &surface->completion_cond );
     pthread_mutex_destroy( &surface->completion_lock );
     pthread_mutex_destroy( &surface->present_lock );
+    pthread_mutex_destroy( &surface->target_store->mutex );
     free( surface );
 }
 
@@ -816,16 +826,11 @@ BOOL get_client_surface_rects( HWND toplevel, HWND hwnd,
 void client_surface_get_target( const struct client_surface *surface,
                                 struct client_surface_target *target )
 {
-    LONG64 seq;
+    struct client_surface_target_store *store = surface->target_store;
 
-    do
-    {
-        while ((seq = ReadNoFence64( &surface->target.seq )) & 1) YieldProcessor();
-        __SHARED_READ_FENCE;
-        *target = surface->target;
-        __SHARED_READ_FENCE;
-    } while (seq != ReadNoFence64( &surface->target.seq ));
-    target->seq = seq;
+    pthread_mutex_lock( &store->mutex );
+    *target = store->target;
+    pthread_mutex_unlock( &store->mutex );
 }
 
 void client_surface_get_geometry( const struct client_surface *surface,
@@ -1094,6 +1099,12 @@ static BOOL client_surface_update_present_scene_internal_locked(
            wine_dbgstr_rect( &next.virtual_rect ), wine_dbgstr_rect( &next.monitor_rect ) );
     ready = client_surface_backend_update( surface, &next, &update );
     if (ReadAcquire( &surface->closing )) return FALSE;
+    /* The owned target operation pins native lifetime, but the server scene
+     * can change while its callback runs. Do not publish that obsolete next
+     * geometry as usable. Invalidate the old epoch and let the caller resample. */
+    if (ready && ((scene_valid && !client_surface_scene_current( &scene )) ||
+                  (preparing_candidate && !client_surface_scene_snapshot_current( next.toplevel, scene.epoch ))))
+        ready = FALSE;
 
     if (!ready)
     {
@@ -1118,8 +1129,8 @@ static BOOL client_surface_update_present_scene_internal_locked(
         next.virtual_rect.bottom - next.virtual_rect.top == current.virtual_rect.bottom - current.virtual_rect.top &&
         next.monitor_rect.right - next.monitor_rect.left == current.monitor_rect.right - current.monitor_rect.left &&
         next.monitor_rect.bottom - next.monitor_rect.top == current.monitor_rect.bottom - current.monitor_rect.top;
-    /* Publish only after the native mutation. Geometry readers retain their
-     * seqlock, while completed frames validate the independent native epoch. */
+    /* Publish only after the native mutation. Geometry readers copy under
+     * the leaf mutex; completed frames validate the independent native epoch. */
     if (changed || next.mode != current.mode || next.offscreen != current.offscreen ||
         next.valid != current.valid || update == CLIENT_SURFACE_TARGET_UPDATE_CHANGED)
     {
@@ -1366,6 +1377,7 @@ void update_client_surfaces( HWND hwnd )
 
     for (i = 0; i < update_count; ++i)
     {
+        struct client_surface_target target;
         RECT monitor_rect, new_monitor_rect;
         HWND surface_hwnd, toplevel, new_toplevel;
         BOOL visible;
@@ -1380,11 +1392,13 @@ void update_client_surfaces( HWND hwnd )
             client_surface_unlock_target( surface );
             continue;
         }
-        monitor_rect = surface->target.monitor_rect;
-        toplevel = surface->target.toplevel;
+        client_surface_get_target( surface, &target );
+        monitor_rect = target.monitor_rect;
+        toplevel = target.toplevel;
         client_surface_update_present_locked( surface );
-        new_monitor_rect = surface->target.monitor_rect;
-        new_toplevel = surface->target.toplevel;
+        client_surface_get_target( surface, &target );
+        new_monitor_rect = target.monitor_rect;
+        new_toplevel = target.toplevel;
         visible = NtUserIsWindowVisible( surface_hwnd );
         pthread_mutex_unlock( &surface->present_lock );
         client_surface_unlock_target( surface );
@@ -1459,13 +1473,24 @@ void *client_surface_create( UINT size, const struct client_surface_backend *bac
     HWND toplevel = NtUserGetAncestor( hwnd, GA_ROOT );
     struct client_surface *surface;
     struct client_surface_mailbox *mailbox;
+    struct client_surface_target target = { .toplevel = toplevel };
+    SIZE_T offset = ((SIZE_T)size + __alignof__(struct client_surface_target_store) - 1) &
+                    ~((SIZE_T)__alignof__(struct client_surface_target_store) - 1);
 
     if (size < sizeof(*surface)) return NULL;
     if (!backend) backend = &default_client_surface_backend;
     if (!client_surface_backend_valid( backend )) return NULL;
-    if (!(surface = client_surface_alloc( size ))) return NULL;
+    if (offset > ~0u - sizeof(struct client_surface_target_store)) return NULL;
+    if (!(surface = client_surface_alloc( offset + sizeof(struct client_surface_target_store) ))) return NULL;
+    surface->target_store = (void *)((char *)surface + offset);
+    if (pthread_mutex_init( &surface->target_store->mutex, NULL ))
+    {
+        free( surface );
+        return NULL;
+    }
     if (!client_surface_completion_init( surface ))
     {
+        pthread_mutex_destroy( &surface->target_store->mutex );
         free( surface );
         return NULL;
     }
@@ -1501,9 +1526,10 @@ void *client_surface_create( UINT size, const struct client_surface_backend *bac
     surface->format = format;
     surface->raw = raw;
     surface->cacheable = TRUE;
-    surface->target.toplevel = toplevel;
-    if (!get_client_surface_rects( toplevel, hwnd, &surface->target ))
-        surface->target.virtual_rect = surface->target.monitor_rect = (RECT){0};
+    if (!get_client_surface_rects( toplevel, hwnd, &target ))
+        target.virtual_rect = target.monitor_rect = (RECT){0};
+    /* No reader can see the unpublished allocation yet. */
+    surface->target_store->target = target;
     list_init( &surface->entry );
     list_init( &surface->cache_entry );
     list_init( &surface->close_entry );
@@ -1511,8 +1537,8 @@ void *client_surface_create( UINT size, const struct client_surface_backend *bac
                                 HandleToULong( NtCurrentTeb()->ClientId.UniqueProcess ), 0 );
 
     TRACE( "created %s, identity %s, format %d, raw %u, toplevel %p, virtual_rect %s, monitor_rect %s\n", debugstr_client_surface( surface ),
-           wine_dbgstr_longlong( surface->identity ), format, raw, toplevel, wine_dbgstr_rect( &surface->target.virtual_rect ),
-           wine_dbgstr_rect( &surface->target.monitor_rect ) );
+           wine_dbgstr_longlong( surface->identity ), format, raw, toplevel, wine_dbgstr_rect( &target.virtual_rect ),
+           wine_dbgstr_rect( &target.monitor_rect ) );
     return surface;
 
 failed_identity:
@@ -1524,6 +1550,7 @@ failed_completion_lock:
     pthread_mutex_destroy( &surface->present_lock );
 failed_present_lock:
     client_surface_completion_destroy( surface );
+    pthread_mutex_destroy( &surface->target_store->mutex );
     free( surface );
     return NULL;
 }
@@ -1929,14 +1956,16 @@ BOOL client_surface_end_prepare( const struct client_surface_scene *scene )
 
 BOOL client_surface_update( struct client_surface *surface )
 {
+    struct client_surface_target target;
     struct client_surface_scene scene;
     BOOL scene_valid, ret = FALSE;
 
     client_surface_lock_target( surface );
     pthread_mutex_lock( &surface->present_lock );
+    client_surface_get_target( surface, &target );
     scene_valid = client_surface_get_scene( surface, &scene );
-    if (scene_valid && surface->target.valid &&
-        surface->target.toplevel == scene.toplevel &&
+    if (scene_valid && target.valid &&
+        target.toplevel == scene.toplevel &&
         surface->target_scene_epoch == scene.epoch &&
         surface->target_scene_mode == scene.mode)
         ret = TRUE;
@@ -1945,9 +1974,10 @@ BOOL client_surface_update( struct client_surface *surface )
         /* GL storage and flush paths need current geometry without selecting
          * or attaching a DIRECT target before a real native presentation. */
         ret = client_surface_update_present_scene_internal_locked( surface, NULL, FALSE );
+        client_surface_get_target( surface, &target );
         scene_valid = client_surface_get_scene( surface, &scene );
-        ret = ret && scene_valid && surface->target.valid &&
-              surface->target.toplevel == scene.toplevel &&
+        ret = ret && scene_valid && target.valid &&
+              target.toplevel == scene.toplevel &&
               surface->target_scene_epoch == scene.epoch &&
               surface->target_scene_mode == scene.mode;
     }

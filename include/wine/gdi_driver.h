@@ -220,7 +220,7 @@ struct gdi_dc_funcs
 };
 
 /* increment this when changing driver tables or shared driver-facing structures */
-#define WINE_GDI_DRIVER_VERSION 155
+#define WINE_GDI_DRIVER_VERSION 156
 
 #define GDI_PRIORITY_NULL_DRV        0  /* null driver */
 #define GDI_PRIORITY_FONT_DRV      100  /* any font driver */
@@ -543,7 +543,7 @@ struct client_surface
     HWND                               hwnd;           /* window the surface was created for */
     int                                format;         /* pixel format of the surface */
     LONG                               updated;        /* has been moved / resized / reparented */
-    struct client_surface_target       target;         /* driver-ready native target snapshot */
+    struct client_surface_target_store *target_store;  /* private geometry snapshot and leaf mutex */
     LONG                               active;         /* registered as active with the Wine server */
     LONG                               content_valid;  /* complete content exists at the current size */
     LONG                               direct_ready;   /* backend-local DIRECT eligibility advertised to server */
@@ -583,6 +583,11 @@ static inline BOOL client_surface_backend_has_cap( const struct client_surface *
 W32KAPI void *client_surface_create( UINT size, const struct client_surface_backend *backend,
                                     HWND hwnd, int format, BOOL raw );
 W32KAPI BOOL client_surface_update( struct client_surface *surface );
+/* Copies geometry under a leaf mutex, including when the caller owns present
+ * or completion state. A snapshot grants no native-use lease: revalidate the
+ * lifetime and epoch when admitting work or accepting its result. */
+W32KAPI void client_surface_get_target( const struct client_surface *surface,
+                                       struct client_surface_target *target );
 W32KAPI void client_surface_add_ref( struct client_surface *surface );
 W32KAPI void client_surface_release( struct client_surface *surface );
 W32KAPI void client_surface_abort( struct client_surface *surface );

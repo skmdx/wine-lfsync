@@ -110,12 +110,14 @@ struct macdrv_client_surface *impl_from_client_surface(struct client_surface *cl
 
 struct client_surface *macdrv_CreateClientSurface(HWND hwnd, int pixel_format, BOOL raw)
 {
+    struct client_surface_target target;
     struct macdrv_client_surface *surface;
 
     if (!(surface = client_surface_create(sizeof(*surface), &macdrv_client_surface_backend,
                                           hwnd, pixel_format, raw)))
         return NULL;
-    if (!(surface->cocoa_view = macdrv_create_view(cgrect_from_rect(surface->client.target.monitor_rect))))
+    client_surface_get_target(&surface->client, &target);
+    if (!(surface->cocoa_view = macdrv_create_view(cgrect_from_rect(target.monitor_rect))))
     {
         client_surface_abort(&surface->client);
         return NULL;

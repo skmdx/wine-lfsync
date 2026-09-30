@@ -391,13 +391,15 @@ void client_surface_abandon_handoff_locked( struct client_surface *surface,
 
 static BOOL source_capture_current( struct client_surface *surface, struct client_surface_frame *present )
 {
+    struct client_surface_target target;
     struct client_surface_source *source = surface->handoff->sources + present->handoff_index;
 
+    client_surface_get_target( surface, &target );
     return !ReadAcquire( &surface->closing ) && !client_surface_present_expired( present ) &&
            surface->handoff->channel &&
            !__atomic_load_n( &surface->handoff->channel->closed, __ATOMIC_ACQUIRE ) &&
            present->handoff_control && present->result == CLIENT_SURFACE_FRAME_PENDING &&
-           surface->hwnd && surface->target.valid && present->target_epoch == surface->target.epoch &&
+           surface->hwnd && target.valid && present->target_epoch == target.epoch &&
            (surface->active || surface->server_cached) &&
            __atomic_load_n( &source->reservation, __ATOMIC_ACQUIRE ) == present->handoff_control &&
            (present->serial > surface->composed_serial ||
@@ -502,6 +504,7 @@ BOOL client_surface_publish_handoff_locked( struct client_surface *surface,
                                             struct client_surface_frame *present,
                                             const struct client_surface_completed_frame *frame )
 {
+    struct client_surface_target target;
     struct client_surface_handoff_channel *channel = surface->handoff->channel;
     struct client_surface_source *source = surface->handoff->sources + present->handoff_index;
     struct client_surface_handoff_slot *slot;
@@ -512,6 +515,7 @@ BOOL client_surface_publish_handoff_locked( struct client_surface *surface,
 
     if (!present->handoff_control || !channel || !frame->image) return FALSE;
     pthread_mutex_lock( &surface->present_lock );
+    client_surface_get_target( surface, &target );
     produced = __atomic_load_n( &channel->producer_sequence, __ATOMIC_RELAXED );
     consumed = __atomic_load_n( &channel->consumer_sequence, __ATOMIC_ACQUIRE );
     valid = !__atomic_load_n( &channel->closed, __ATOMIC_ACQUIRE ) &&
@@ -520,9 +524,9 @@ BOOL client_surface_publish_handoff_locked( struct client_surface *surface,
             frame->target_epoch == present->target_epoch && frame->image == source->source &&
             frame->visual == source->source_visual && frame->size.cx == source->width &&
             frame->size.cy == source->height && frame->flags == source->flags &&
-            (frame->flags & CLIENT_SURFACE_HANDOFF_COPY_SOURCE) && surface->hwnd && surface->target.valid &&
+            (frame->flags & CLIENT_SURFACE_HANDOFF_COPY_SOURCE) && surface->hwnd && target.valid &&
             __atomic_load_n( &source->reservation, __ATOMIC_ACQUIRE ) == present->handoff_control &&
-            present->serial >= surface->composed_serial && present->target_epoch == surface->target.epoch &&
+            present->serial >= surface->composed_serial && present->target_epoch == target.epoch &&
             client_surface_backend_has_cap( surface, CLIENT_SURFACE_BACKEND_OWNER_SCENE_PLAN );
     /* A hidden producer without a consumer keeps its latest completed source
      * private instead of filling the ring with images no owner can consume.

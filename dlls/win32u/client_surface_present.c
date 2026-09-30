@@ -32,7 +32,7 @@ static unsigned long long client_surface_perf_time(void)
 }
 
 static BOOL get_cached_client_surface_region( struct client_surface *surface, HWND hwnd,
-                                              const RECT *monitor_rect,
+                                              const struct client_surface_target *target,
                                               const struct client_surface_frame *present,
                                               HRGN *region );
 
@@ -370,12 +370,12 @@ done:
  * Keep the derived region on the surface so steady-state presents avoid a
  * server round trip, heap allocation, and O(occluders) region reconstruction. */
 static BOOL get_cached_client_surface_region( struct client_surface *surface, HWND hwnd,
-                                              const RECT *monitor_rect,
+                                              const struct client_surface_target *target,
                                               const struct client_surface_frame *present,
                                               HRGN *region )
 {
     struct client_surface_clip_snapshot snapshot = {0};
-    struct ratio raw_dpi = {surface->target.dpi_num, surface->target.dpi_den};
+    struct ratio raw_dpi = {target->dpi_num, target->dpi_den};
     HRGN new_region = 0;
     BOOL valid;
 
@@ -383,14 +383,14 @@ static BOOL get_cached_client_surface_region( struct client_surface *surface, HW
 
     if (surface->clip_region_valid &&
         surface->clip_scene_epoch == present->scene.epoch &&
-        surface->clip_target_seq == surface->target.seq)
+        surface->clip_target_seq == target->seq)
     {
         *region = surface->clip_region;
         return TRUE;
     }
 
-    valid = get_client_surface_clip_snapshot( hwnd, &raw_dpi, monitor_rect, present, &snapshot );
-    if (valid) valid = get_client_surface_region( monitor_rect, &snapshot, NULL, &new_region );
+    valid = get_client_surface_clip_snapshot( hwnd, &raw_dpi, &target->monitor_rect, present, &snapshot );
+    if (valid) valid = get_client_surface_region( &target->monitor_rect, &snapshot, NULL, &new_region );
     release_client_surface_clip_snapshot( &snapshot );
     if (!valid)
     {
@@ -400,7 +400,7 @@ static BOOL get_cached_client_surface_region( struct client_surface *surface, HW
 
     if (surface->clip_region) NtGdiDeleteObjectApp( surface->clip_region );
     surface->clip_scene_epoch = present->scene.epoch;
-    surface->clip_target_seq = surface->target.seq;
+    surface->clip_target_seq = target->seq;
     surface->clip_region = new_region;
     surface->clip_region_valid = TRUE;
     *region = new_region;
@@ -408,16 +408,17 @@ static BOOL get_cached_client_surface_region( struct client_surface *surface, HW
 }
 
 static BOOL client_surface_validate_size_locked( struct client_surface *surface,
+                                                 const struct client_surface_target *target,
                                                  const SIZE *expected_size )
 {
     if (expected_size &&
-        (surface->target.virtual_rect.right - surface->target.virtual_rect.left != expected_size->cx ||
-         surface->target.virtual_rect.bottom - surface->target.virtual_rect.top != expected_size->cy))
+        (target->virtual_rect.right - target->virtual_rect.left != expected_size->cx ||
+         target->virtual_rect.bottom - target->virtual_rect.top != expected_size->cy))
     {
         WARN( "not composing %s size %dx%d for expected frame %dx%d\n",
               debugstr_client_surface( surface ),
-              surface->target.virtual_rect.right - surface->target.virtual_rect.left,
-              surface->target.virtual_rect.bottom - surface->target.virtual_rect.top,
+              target->virtual_rect.right - target->virtual_rect.left,
+              target->virtual_rect.bottom - target->virtual_rect.top,
               (int)expected_size->cx, (int)expected_size->cy );
         return FALSE;
     }
@@ -443,8 +444,8 @@ BOOL client_surface_end_present_internal( struct client_surface *surface,
                                           const SIZE *expected_size, BOOL new_content,
                                           struct client_surface_frame *present )
 {
+    struct client_surface_target target;
     HWND hwnd = 0, toplevel = 0;
-    RECT monitor_rect = {0};
     HRGN surface_region = 0;
     BOOL commit = FALSE, compose = FALSE, composed = FALSE, copied = FALSE, offscreen = FALSE;
     BOOL region_valid = TRUE, sync = !!present->scene.generation, wake = FALSE;
@@ -459,10 +460,11 @@ BOOL client_surface_end_present_internal( struct client_surface *surface,
      * the process-wide registry lock is neither needed for lifetime nor for
      * target validation on the per-frame path. */
     pthread_mutex_lock( &surface->present_lock );
+    client_surface_get_target( surface, &target );
     if (ReadAcquire( &surface->closing ) || client_surface_present_expired( present ) ||
         present->target == CLIENT_SURFACE_FRAME_TARGET_INVALID ||
-        present->target_epoch != surface->target.epoch ||
-        present->scene.toplevel != surface->target.toplevel)
+        present->target_epoch != target.epoch ||
+        present->scene.toplevel != target.toplevel)
     {
         TRACE( "discarding %s presentation across target state change\n",
                debugstr_client_surface( surface ) );
@@ -475,16 +477,15 @@ BOOL client_surface_end_present_internal( struct client_surface *surface,
                wine_dbgstr_longlong( surface->composed_serial ) );
     }
     else if ((hwnd = surface->hwnd) &&
-             surface->target.valid &&
+             target.valid &&
              (InterlockedCompareExchange( &surface->active, 0, 0 ) ||
               InterlockedCompareExchange( &surface->server_cached, 0, 0 )))
     {
         if (sync) TRACE( "client surface %p starts composition epoch commit\n", hwnd );
         if (new_content || InterlockedCompareExchange( &surface->content_valid, 0, 0 ))
         {
-            compose = client_surface_validate_size_locked( surface, expected_size );
-            monitor_rect = surface->target.monitor_rect;
-            offscreen = surface->target.offscreen;
+            compose = client_surface_validate_size_locked( surface, &target, expected_size );
+            offscreen = target.offscreen;
         }
         else
             TRACE( "not recomposing incomplete cached content for %s\n",
@@ -543,7 +544,7 @@ BOOL client_surface_end_present_internal( struct client_surface *surface,
      * conversion and DCE refresh remain outside surfaces_lock. */
     if (compose && offscreen)
     {
-        region_valid = get_cached_client_surface_region( surface, hwnd, &monitor_rect,
+        region_valid = get_cached_client_surface_region( surface, hwnd, &target,
                                                          present, &surface_region );
         if (!region_valid)
         {
@@ -691,6 +692,7 @@ static void prepare_client_surface_present_locked( struct client_surface *surfac
                                                     UINT64 memory_domain )
 {
     struct client_surface_target target;
+    BOOL native_valid;
     unsigned int retry;
 
     /* The caller has established submission readiness while acquiring this
@@ -727,9 +729,10 @@ static void prepare_client_surface_present_locked( struct client_surface *surfac
             NtUserPostMessage( toplevel, WM_WINE_UPDATEWINDOWSTATE, 0, 0 );
         client_surface_get_scene( surface, &present->scene );
     }
+    client_surface_get_target( surface, &target );
     for (retry = 0; retry < 2 && surface->hwnd &&
-         (!present->scene.valid || !surface->target.valid ||
-          surface->target.toplevel != present->scene.toplevel ||
+         (!present->scene.valid || !target.valid ||
+          target.toplevel != present->scene.toplevel ||
           surface->target_scene_epoch != present->scene.epoch ||
           surface->target_scene_mode != present->scene.mode ||
           (!replay && present->scene.native_candidate == client_surface_get_identity( surface ) &&
@@ -744,6 +747,7 @@ static void prepare_client_surface_present_locked( struct client_surface *surfac
         else
             client_surface_update_present_scene_locked( surface, NULL, !replay );
         client_surface_get_scene( surface, &present->scene );
+        client_surface_get_target( surface, &target );
     }
     /* PREPARING can consume one geometry resample before the owner admits
      * DIRECT in the next. Admission and native attachment are separate
@@ -758,8 +762,9 @@ static void prepare_client_surface_present_locked( struct client_surface *surfac
     {
         client_surface_update_present_scene_locked( surface, &present->scene, TRUE );
         client_surface_get_scene( surface, &present->scene );
+        client_surface_get_target( surface, &target );
     }
-    client_surface_get_target( surface, &target );
+    native_valid = target.valid;
     /* Only client_surface_update_present_locked() may mark a server scene as
      * applied: it does so after validating the exact scene around the native
      * update.  A resize can advance the seqlock between the caller's sample
@@ -788,7 +793,7 @@ static void prepare_client_surface_present_locked( struct client_surface *surfac
     /* Native completion also belongs to frames submitted while the owner is
      * preparing its scene. The native drawable is usable independently of
      * that publication token, and its first completed image must be frozen. */
-    if (surface->target.valid && (target.offscreen || present->direct_snapshot))
+    if (native_valid && (target.offscreen || present->direct_snapshot))
     {
         if (external_completion || present->direct_snapshot)
         {
@@ -979,22 +984,25 @@ BOOL client_surface_present_expired( const struct client_surface_frame *present 
 }
 
 static BOOL client_surface_capture_current_locked( struct client_surface *surface,
+                                                   const struct client_surface_target *target,
                                                    struct client_surface_frame *present )
 {
     return !ReadAcquire( &surface->closing ) && !client_surface_present_expired( present ) &&
-           surface->hwnd && surface->target.valid && present->target_epoch == surface->target.epoch &&
+           surface->hwnd && target->valid && present->target_epoch == target->epoch &&
            present->serial > surface->composed_serial && client_surface_handoff_valid( surface, present );
 }
 
 static BOOL client_surface_capture_frame( struct client_surface *surface, struct client_surface_frame *present,
                                           const SIZE *expected_size, struct client_surface_completed_frame *frame )
 {
+    struct client_surface_target target;
     BOOL readable = TRUE, captured = FALSE;
 
     if (present->capture.read)
     {
         pthread_mutex_lock( &surface->present_lock );
-        readable = client_surface_capture_current_locked( surface, present ) &&
+        client_surface_get_target( surface, &target );
+        readable = client_surface_capture_current_locked( surface, &target, present ) &&
                    (surface->active || surface->server_cached);
         pthread_mutex_unlock( &surface->present_lock );
         if (readable)
@@ -1013,14 +1021,15 @@ static BOOL client_surface_capture_frame( struct client_surface *surface, struct
      * can replace their handoff while they sleep; it alone owns the mutable
      * native source when the wait returns. Capture never consumes the fence. */
     pthread_mutex_lock( &surface->present_lock );
-    if (!client_surface_capture_current_locked( surface, present ))
+    client_surface_get_target( surface, &target );
+    if (!client_surface_capture_current_locked( surface, &target, present ))
         present->result = CLIENT_SURFACE_FRAME_SUPERSEDED;
     else if (readable && (surface->active || surface->server_cached) &&
              (!present->capture.apply || present->capture.apply( present->capture.context, surface, present )) &&
-             client_surface_validate_size_locked( surface, present->capture.size.cx ?
+             client_surface_validate_size_locked( surface, &target, present->capture.size.cx ?
                                                   &present->capture.size : expected_size ))
     {
-        if (!present->handoff_control && (surface->target.offscreen || present->direct_snapshot) &&
+        if (!present->handoff_control && (target.offscreen || present->direct_snapshot) &&
             client_surface_backend_has_cap( surface, CLIENT_SURFACE_BACKEND_OWNER_SCENE_PLAN ))
             client_surface_prepare_source_locked( surface, present );
         captured = !!present->handoff_control;
@@ -1095,6 +1104,7 @@ struct client_surface_present_result client_surface_complete_present_locked( str
           !(__atomic_load_n( &present->handoff_channel->endpoints, __ATOMIC_ACQUIRE ) &
             CLIENT_SURFACE_HANDOFF_ENDPOINT_CONSUMER))))
     {
+        struct client_surface_target target;
         BOOL wake = FALSE;
         HWND hwnd;
         HWND toplevel = 0;
@@ -1109,6 +1119,7 @@ struct client_surface_present_result client_surface_complete_present_locked( str
          * server transition with unregister/reuse; otherwise the latter can
          * renew the token between the active test and this request. */
         pthread_mutex_lock( &surface->present_lock );
+        client_surface_get_target( surface, &target );
         hwnd = surface->hwnd;
         if (!InterlockedCompareExchange( &surface->active, 0, 0 )) hwnd = NULL;
         /* PREPARING can prevent scene publication while an independent
@@ -1119,9 +1130,9 @@ struct client_surface_present_result client_surface_complete_present_locked( str
          * preparation must not reject an independently completed image. */
         if (hwnd && !client_surface_present_expired( present ) &&
             (source_valid || present->target != CLIENT_SURFACE_FRAME_TARGET_INVALID) &&
-            surface->target.valid && present->target_epoch == surface->target.epoch &&
-            present->scene.toplevel == surface->target.toplevel &&
-            client_surface_validate_size_locked( surface, expected_size ))
+            target.valid && present->target_epoch == target.epoch &&
+            present->scene.toplevel == target.toplevel &&
+            client_surface_validate_size_locked( surface, &target, expected_size ))
         {
             SERVER_START_REQ( set_client_surface_state )
             {

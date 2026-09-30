@@ -82,11 +82,13 @@ static BOOL wayland_client_surface_present(struct client_surface *client,
                                            HDC hdc, HRGN surface_region, BOOL flush, BOOL defer_visible)
 {
     struct wayland_client_surface *surface = impl_from_client_surface(client);
-    HWND hwnd = client->hwnd, toplevel = client->target.toplevel;
+    struct client_surface_target target;
+    HWND hwnd = client->hwnd;
     struct wayland_surface *wayland_surface;
     struct wayland_win_data *data;
 
-    if (!(data = wayland_win_data_get(toplevel))) return FALSE;
+    client_surface_get_target(client, &target);
+    if (!(data = wayland_win_data_get(target.toplevel))) return FALSE;
 
     if ((wayland_surface = data->wayland_surface))
     {

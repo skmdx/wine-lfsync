@@ -259,9 +259,9 @@ static int client_surface_redirect_error( Display *display, XErrorEvent *event, 
 #endif
 
 static BOOL client_surface_update_offscreen( HWND hwnd, struct x11drv_client_surface *surface,
-                                             struct client_surface_target *target )
+                                             struct client_surface_target *target, BOOL old_offscreen )
 {
-    BOOL offscreen, old_offscreen = surface->client.target.offscreen;
+    BOOL offscreen;
     struct x11drv_win_data *data;
 
     if (target->mode != CLIENT_SURFACE_PRESENTATION_DIRECT)
@@ -318,17 +318,19 @@ static BOOL x11drv_client_surface_update( struct client_surface *client,
                                           struct client_surface_target *target,
                                           enum client_surface_target_update *update )
 {
+    struct client_surface_target current;
     struct x11drv_client_surface *surface = impl_from_client_surface( client );
     HWND hwnd = client->hwnd;
     unsigned int mask;
 
+    client_surface_get_target( client, &current );
     mask = client_surface_update_geometry( hwnd, surface, target );
-    if (!client_surface_update_offscreen( hwnd, surface, target )) return FALSE;
+    if (!client_surface_update_offscreen( hwnd, surface, target, current.offscreen )) return FALSE;
     if (mask & (CWWidth | CWHeight)) *update = CLIENT_SURFACE_TARGET_UPDATE_CHANGED;
     /* update_offscreen returns without redirecting or attaching an existing
      * offscreen window. Moving that window preserves its image; resizing it
      * does not. The core also requires unchanged ownership, extent and DPI. */
-    else if (client->target.offscreen && target->offscreen && client->target.mode == target->mode)
+    else if (current.offscreen && target->offscreen && current.mode == target->mode)
         *update = CLIENT_SURFACE_TARGET_UPDATE_PRESERVED;
     return TRUE;
 }
@@ -448,6 +450,7 @@ static BOOL x11drv_client_surface_handoff_reserve( struct client_surface *client
 static BOOL x11drv_client_surface_handoff_prepare(
     struct client_surface *client, struct client_surface_source *image, const struct client_surface_frame *present )
 {
+    struct client_surface_target target;
     struct x11drv_client_surface *surface = impl_from_client_surface( client );
     struct client_surface_memory_scope memory = {0};
     const struct client_surface_memory_scope *owners;
@@ -460,9 +463,11 @@ static BOOL x11drv_client_surface_handoff_prepare(
      * retain the rendered virtual extent; the owner scales their immutable
      * pixels to its monitor layout. Advertise the storage actually captured,
      * including when PREPARING delayed this reservation until after capture. */
-    RECT source = native && client->raw ? client->target.monitor_rect : client->target.virtual_rect;
+    RECT source;
     unsigned int width, height;
 
+    client_surface_get_target( client, &target );
+    source = native && client->raw ? target.monitor_rect : target.virtual_rect;
     if (source.right <= source.left || source.bottom <= source.top) return FALSE;
     if (present->replay)
     {
@@ -519,13 +524,16 @@ done:
 
 static BOOL x11drv_client_surface_handoff_serialize( struct client_surface *client )
 {
+    struct client_surface_target target;
     struct x11drv_client_surface *surface = impl_from_client_surface( client );
 
     /* A host Present completion does not retain an old mutable X window's
      * pixels. Freeze it before permitting another offscreen native swap.
      * Independent snapshots instead wait for one writable source in the
      * common code; filling their storage does not require a full drain. */
-    return usexcomposite && !surface->direct_snapshot && client->target.offscreen;
+    if (!usexcomposite || surface->direct_snapshot) return FALSE;
+    client_surface_get_target( client, &target );
+    return target.offscreen;
 }
 
 static BOOL apply_native_snapshot( void *context, struct client_surface *client, struct client_surface_frame *present )
@@ -669,6 +677,7 @@ struct x11drv_client_surface *impl_from_client_surface( struct client_surface *c
 
 struct client_surface *X11DRV_CreateClientSurface( HWND hwnd, int format, BOOL raw )
 {
+    struct client_surface_target target;
     struct x11drv_client_surface *surface;
     const struct client_surface_backend *backend = &x11drv_client_surface_backend;
     XVisualInfo visual = default_visual;
@@ -689,7 +698,8 @@ struct client_surface *X11DRV_CreateClientSurface( HWND hwnd, int format, BOOL r
     surface->source_visual = visual.visualid;
     surface->source_depth = visual.depth;
     if (!x11drv_client_surface_completion_init( surface )) goto failed;
-    rect = raw ? surface->client.target.monitor_rect : surface->client.target.virtual_rect;
+    client_surface_get_target( &surface->client, &target );
+    rect = raw ? target.monitor_rect : target.virtual_rect;
     if (!(surface->window = create_client_window( hwnd, rect, &visual, colormap, &surface->native_window ))) goto failed;
     TRACE( "Created %s for client window %lx, owner compositor %u\n",
            debugstr_client_surface( &surface->client ), surface->window,
