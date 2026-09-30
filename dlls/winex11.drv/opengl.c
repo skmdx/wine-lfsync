@@ -1316,7 +1316,7 @@ static BOOL prepare_opengl_present( struct client_surface *client, struct client
     /* Preserve WGL's pre-submit error mapping at the guest boundary. Capacity
      * and executor refusal remain distinguishable inside the surface API. */
     error = admission.reason == CLIENT_SURFACE_STALE_OR_CLOSED ? ERROR_INVALID_WINDOW_HANDLE : ERROR_NOT_ENOUGH_MEMORY;
-    TRACE( "event=wgl_admission reason=%u scope=%u error=%lu\n", admission.reason, admission.scope, error );
+    TRACE( "event=wgl_admission reason=%u scope=%u error=%u\n", admission.reason, admission.scope, error );
     RtlSetLastWin32Error( error );
     return FALSE;
 }
