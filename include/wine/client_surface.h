@@ -131,6 +131,50 @@ enum client_surface_completion_status
     CLIENT_SURFACE_COMPLETION_FAILED,
 };
 
+enum client_surface_admission_reason
+{
+    CLIENT_SURFACE_ACCEPTED,
+    CLIENT_SURFACE_CAPACITY_LIMIT,
+    CLIENT_SURFACE_EXECUTOR_UNAVAILABLE,
+    CLIENT_SURFACE_OUT_OF_MEMORY,
+    CLIENT_SURFACE_STALE_OR_CLOSED,
+};
+
+enum client_surface_capacity_scope
+{
+    CLIENT_SURFACE_CAPACITY_NONE,
+    CLIENT_SURFACE_CAPACITY_GLOBAL,
+    CLIENT_SURFACE_CAPACITY_SURFACE,
+};
+
+struct client_surface_admission
+{
+    enum client_surface_admission_reason reason;
+    enum client_surface_capacity_scope scope;
+};
+
+enum client_surface_present_owner
+{
+    CLIENT_SURFACE_PRESENT_CALLER,
+    CLIENT_SURFACE_PRESENT_EXECUTOR,
+};
+
+/* Producer handoff is not owner publication. The owner validates and commits
+ * its scene separately; none of these results acknowledges that commit. */
+enum client_surface_handoff_result
+{
+    CLIENT_SURFACE_HANDOFF_NOT_QUEUED,
+    CLIENT_SURFACE_HANDOFF_QUEUED,
+};
+
+struct client_surface_present_result
+{
+    enum client_surface_present_owner owner;
+    enum client_surface_completion_status completion;
+    BOOL image_complete;
+    enum client_surface_handoff_result handoff;
+};
+
 enum client_surface_completion_worker_disposition
 {
     CLIENT_SURFACE_COMPLETION_WORKER_REUSE,

@@ -861,19 +861,23 @@ void client_surface_cancel_prepare_locked( struct client_surface *surface,
     pthread_mutex_unlock( &surface->present_lock );
 }
 
-BOOL client_surface_prepare_present( struct client_surface *surface,
+struct client_surface_admission client_surface_prepare_present( struct client_surface *surface,
                                      struct client_surface_frame *present,
                                      BOOL external_completion, BOOL asynchronous )
 {
     struct client_surface_completion_job *job = NULL;
+    struct client_surface_admission result = { CLIENT_SURFACE_ACCEPTED, CLIENT_SURFACE_CAPACITY_NONE };
     unsigned long long start = TRACE_ON(csperf) ? client_surface_perf_time() : 0;
     unsigned long long scene, locked, ready;
     LONG pending_before, pending_after;
 
     client_surface_prepare_scene( surface );
     scene = start ? client_surface_perf_time() : 0;
-    if (asynchronous && client_surface_needs_completion_reservation( surface ) &&
-        !(job = client_surface_reserve_completion( surface ))) goto failed;
+    if (asynchronous && client_surface_needs_completion_reservation( surface ))
+    {
+        result = client_surface_reserve_completion( surface, &job );
+        if (result.reason != CLIENT_SURFACE_ACCEPTED) goto done;
+    }
 prepare:
     client_surface_lock_present( surface );
     locked = start ? client_surface_perf_time() : 0;
@@ -882,9 +886,9 @@ prepare:
     if (ReadAcquire( &surface->closing ))
     {
         client_surface_unlock_present( surface );
-        client_surface_cancel_completion( job );
-        RtlSetLastWin32Error( ERROR_INVALID_WINDOW_HANDLE );
-        return FALSE;
+        client_surface_cancel_completion( &job );
+        result.reason = CLIENT_SURFACE_STALE_OR_CLOSED;
+        goto done;
     }
     ready = start ? client_surface_perf_time() : 0;
     pending_after = start ? InterlockedCompareExchange( &surface->external_completion_count, 0, 0 ) : 0;
@@ -896,7 +900,8 @@ prepare:
          * outside every surface lock before preparing that target again. */
         client_surface_cancel_prepare_locked( surface, present );
         client_surface_unlock_present( surface );
-        if (!(job = client_surface_reserve_completion( surface ))) goto failed;
+        result = client_surface_reserve_completion( surface, &job );
+        if (result.reason != CLIENT_SURFACE_ACCEPTED) goto done;
         goto prepare;
     }
     present->completion_job = job;
@@ -904,10 +909,10 @@ prepare:
                    "pending_before=%d pending_after=%d\n", client_surface_perf_time(),
                    wine_dbgstr_longlong( client_surface_get_identity( surface ) ), start, scene, locked, ready,
                    pending_before, pending_after );
-    return TRUE;
-failed:
-    RtlSetLastWin32Error( ERROR_NOT_ENOUGH_MEMORY );
-    return FALSE;
+done:
+    TRACE( "event=present_admission surface=%p reason=%u scope=%u ticket=%p\n",
+           surface, result.reason, result.scope, job );
+    return result;
 }
 
 static void client_surface_begin_present_locked( struct client_surface *surface )
@@ -1062,12 +1067,14 @@ static BOOL client_surface_finish_host_completion( struct client_surface *surfac
     return completed;
 }
 
-BOOL client_surface_complete_present_locked( struct client_surface *surface,
+struct client_surface_present_result client_surface_complete_present_locked( struct client_surface *surface,
                                              struct client_surface_frame *present,
                                              BOOL submitted, BOOL external_completed,
                                              const SIZE *expected_size, DWORD timeout )
 {
     struct client_surface_completed_frame frame = {0};
+    struct client_surface_present_result result = { .owner = CLIENT_SURFACE_PRESENT_CALLER };
+    enum client_surface_completion_kind kind = present->completion.kind;
     BOOL handed_off = FALSE, source_valid = FALSE;
     BOOL completed;
 
@@ -1076,6 +1083,7 @@ BOOL client_surface_complete_present_locked( struct client_surface *surface,
            (int)present->capture.size.cx, (int)present->capture.size.cy, submitted, external_completed, present->target );
 
     completed = client_surface_finish_host_completion( surface, present, submitted, external_completed, timeout );
+    result.completion = completed ? CLIENT_SURFACE_COMPLETION_SIGNALED : CLIENT_SURFACE_COMPLETION_FAILED;
     if (ReadAcquire( &surface->closing ) || client_surface_present_expired( present )) completed = FALSE;
     if (present->result != CLIENT_SURFACE_FRAME_PENDING) completed = FALSE;
     if (completed && present->completion.kind != CLIENT_SURFACE_COMPLETION_NONE &&
@@ -1191,7 +1199,12 @@ BOOL client_surface_complete_present_locked( struct client_surface *surface,
         pthread_mutex_unlock( &surface->present_lock );
         if (wake) pthread_cond_broadcast( &surface->completion_cond );
     }
-    return completed;
+    result.image_complete = completed || source_valid;
+    result.handoff = handed_off ? CLIENT_SURFACE_HANDOFF_QUEUED : CLIENT_SURFACE_HANDOFF_NOT_QUEUED;
+    TRACE( "event=present_result surface=%p serial=%s owner=%u completion=%u image=%u handoff=%u frame=%u kind=%u mode=%u\n",
+           surface, wine_dbgstr_longlong( present->serial ), result.owner, result.completion,
+           result.image_complete, result.handoff, present->result, kind, present->mode );
+    return result;
 }
 
 static struct client_surface_completion_result wait_deferred_driver_completion( void *context, DWORD timeout )
@@ -1206,13 +1219,13 @@ static void release_deferred_driver_completion( void *context )
     client_surface_release( context );
 }
 
-BOOL client_surface_complete_present( struct client_surface *surface,
+struct client_surface_present_result client_surface_complete_present( struct client_surface *surface,
                                       struct client_surface_frame *present,
                                       BOOL submitted, BOOL external_completed,
                                       const SIZE *expected_size, DWORD timeout )
 {
     struct client_surface_completion_job *job;
-    BOOL ret;
+    struct client_surface_present_result ret;
 
     /* An armed driver monitor has exclusive ownership through
      * completion_lock.  Transfer that ownership to the same bounded queue as
@@ -1223,8 +1236,9 @@ BOOL client_surface_complete_present( struct client_surface *surface,
         client_surface_add_ref( surface );
         client_surface_set_present_completion( present, wait_deferred_driver_completion,
                                                release_deferred_driver_completion, surface );
-        client_surface_defer_present( surface, present, expected_size );
-        return TRUE;
+        client_surface_enqueue_prepared_present( surface, present, expected_size );
+        return (struct client_surface_present_result){ .owner = CLIENT_SURFACE_PRESENT_EXECUTOR,
+                                                       .completion = CLIENT_SURFACE_COMPLETION_PENDING };
     }
 
     job = present->completion_job;
@@ -1233,7 +1247,7 @@ BOOL client_surface_complete_present( struct client_surface *surface,
     ret = client_surface_complete_present_locked( surface, present, submitted,
                                                   external_completed, expected_size, timeout );
     client_surface_unlock_present( surface );
-    client_surface_cancel_completion( job );
+    client_surface_cancel_completion( &job );
     return ret;
 }
 
@@ -1244,7 +1258,7 @@ void client_surface_present( struct client_surface *surface )
     /* Compatibility path for drivers whose presentation callback already
      * supplies a host completion boundary.  It still participates in target
      * token validation and per-surface submission serialization. */
-    if (!client_surface_prepare_present( surface, &present, TRUE, FALSE )) return;
+    if (client_surface_prepare_present( surface, &present, TRUE, FALSE ).reason != CLIENT_SURFACE_ACCEPTED) return;
     client_surface_begin_present( surface );
     client_surface_submit_present( surface, &present );
     client_surface_complete_present( surface, &present, TRUE, TRUE, NULL, 0 );

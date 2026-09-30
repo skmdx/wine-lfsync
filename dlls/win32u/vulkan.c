@@ -3209,6 +3209,7 @@ static VkResult win32u_vkQueuePresentKHR( VkQueue client_queue, const VkPresentI
     struct client_surface *present_surfaces_buffer[16], **present_surfaces = present_surfaces_buffer;
     struct client_surface_frame presents_buffer[16], *presents = presents_buffer;
     struct vulkan_present_reservation reservations_buffer[16] = {{0}}, *reservations = reservations_buffer;
+    struct client_surface_admission admission;
     VkResult results_buffer[16], *results = results_buffer;
     uint64_t present_ids_buffer[16], *present_ids = present_ids_buffer;
     VkPresentIdKHR present_id_info = {VK_STRUCTURE_TYPE_PRESENT_ID_KHR};
@@ -3316,10 +3317,13 @@ reserve_completions:
          * acceptance. Admission and allocation cannot fall back to a wait on
          * the submitting thread after its guest semaphore has been consumed. */
         res = VK_ERROR_OUT_OF_HOST_MEMORY;
-        if (!reservations[index].job &&
-            !(reservations[index].job = client_surface_reserve_completion_domain( swapchain->surface->client,
-                impl_from_vulkan_device( device )->completion_domain_base + (queue - device->queues) )))
-            goto reservation_failed;
+        if (!reservations[index].job)
+        {
+            admission = client_surface_reserve_completion_domain( swapchain->surface->client,
+                impl_from_vulkan_device( device )->completion_domain_base + (queue - device->queues),
+                &reservations[index].job );
+            if (admission.reason != CLIENT_SURFACE_ACCEPTED) goto admission_failed;
+        }
         if (!start_swapchain_retirement_thread( impl_from_vulkan_device( device ) ))
             goto reservation_failed;
         if (!swapchain_needs_snapshot( swapchain ) && use_internal_present_wait && present_ids[index] &&
@@ -3329,19 +3333,17 @@ reserve_completions:
             goto reservation_failed;
         if (!swapchain_needs_snapshot( swapchain ) || reservations[index].snapshot ||
             !(res = acquire_snapshot_reservation( device, swapchain, &reservations[index].snapshot ))) continue;
-reservation_failed:
-        if (present_info->pResults)
-            for (uint32_t j = 0; j < present_info->swapchainCount; ++j) present_info->pResults[j] = res;
-        goto done;
+        goto reservation_failed;
     }
     /* Storage and source preparation do not pin native execution slots. Take
      * every required lease only after the batch's storage reservations, still
      * outside surface locks and before any application wait is consumed. */
     for (uint32_t i = 0; i < present_info->swapchainCount; ++i)
-        if (reservations[i].job && !client_surface_activate_completion( reservations[i].job ))
+        if (reservations[i].job)
         {
-            res = VK_ERROR_OUT_OF_HOST_MEMORY;
-            goto reservation_failed;
+            admission = (struct client_surface_admission){ client_surface_activate_completion( reservations[i].job ),
+                                                           CLIENT_SURFACE_CAPACITY_NONE };
+            if (admission.reason != CLIENT_SURFACE_ACCEPTED) goto admission_failed;
         }
     have_snapshots = reserve_more = FALSE;
 
@@ -3530,8 +3532,7 @@ reservation_failed:
 
         if (compose && snapshot_submitted)
         {
-            client_surface_defer_reserved_present( reservations[i].job, &presents[i], &expected_size );
-            reservations[i].job = NULL;
+            client_surface_enqueue_present( &reservations[i].job, &presents[i], &expected_size );
             continue;
         }
         if (compose && presents[i].completion.kind == CLIENT_SURFACE_COMPLETION_SHARED)
@@ -3542,8 +3543,7 @@ reservation_failed:
             retain_swapchain_completion( swapchain );
             client_surface_set_present_completion( &presents[i], wait_vulkan_driver_completion,
                                                    release_vulkan_driver_completion, swapchain );
-            client_surface_defer_reserved_present( reservations[i].job, &presents[i], &expected_size );
-            reservations[i].job = NULL;
+            client_surface_enqueue_present( &reservations[i].job, &presents[i], &expected_size );
             continue;
         }
         if (compose && presents[i].completion.kind == CLIENT_SURFACE_COMPLETION_EXACT &&
@@ -3559,13 +3559,12 @@ reservation_failed:
             client_surface_set_present_completion( &presents[i], wait_vulkan_present_completion,
                                                    release_vulkan_present_completion, completion );
             reservations[i].completion = NULL;
-            client_surface_defer_reserved_present( reservations[i].job, &presents[i], &expected_size );
-            reservations[i].job = NULL;
+            client_surface_enqueue_present( &reservations[i].job, &presents[i], &expected_size );
             continue;
         }
 
         {
-            BOOL completed;
+            struct client_surface_present_result completed;
             BOOL wait_skipped = use_internal_present_wait && !present_ids[i] &&
                                 presents[i].completion.kind == CLIENT_SURFACE_COMPLETION_NONE;
             DWORD elapsed = NtGetTickCount() - presents[i].submission_time;
@@ -3575,7 +3574,7 @@ reservation_failed:
             completed = client_surface_complete_present( surface->client, &presents[i], compose,
                                                          FALSE, &expected_size,
                                                          use_internal_present_wait && present_ids[i] ? 0 : remaining );
-            if (!completed && compose)
+            if (completed.owner == CLIENT_SURFACE_PRESENT_CALLER && !completed.image_complete && compose)
             {
                 /* The window changed after the post-present check, or the
                  * native completion source failed.  Preserve the staged
@@ -3599,10 +3598,19 @@ reservation_failed:
         }
     }
 
+    goto done;
+admission_failed:
+    /* Preserve the guest pre-submit refusal mapping. The reason stays
+     * internal and no application synchronization is consumed. */
+    res = VK_ERROR_OUT_OF_HOST_MEMORY;
+    TRACE( "event=vulkan_admission reason=%u scope=%u result=%d\n", admission.reason, admission.scope, res );
+reservation_failed:
+    if (present_info->pResults)
+        for (uint32_t j = 0; j < present_info->swapchainCount; ++j) present_info->pResults[j] = res;
 done:
     for (uint32_t i = 0; i < reservation_count; ++i)
     {
-        client_surface_cancel_completion( reservations[i].job );
+        client_surface_cancel_completion( &reservations[i].job );
         if (reservations[i].completion)
             client_surface_free_scoped_metadata( &swapchain_from_handle( client_swapchains[i] )->memory,
                                                   reservations[i].completion, sizeof(*reservations[i].completion) );

@@ -220,7 +220,7 @@ struct gdi_dc_funcs
 };
 
 /* increment this when changing driver tables or shared driver-facing structures */
-#define WINE_GDI_DRIVER_VERSION 153
+#define WINE_GDI_DRIVER_VERSION 154
 
 #define GDI_PRIORITY_NULL_DRV        0  /* null driver */
 #define GDI_PRIORITY_FONT_DRV      100  /* any font driver */
@@ -581,7 +581,7 @@ W32KAPI int client_surface_cond_timedwait( pthread_cond_t *cond, pthread_mutex_t
 W32KAPI void client_surface_present( struct client_surface *surface );
 /* Success holds submission ordering until begin_present. Failure leaves no
  * lock or reservation owned by the caller and has not submitted native work. */
-W32KAPI BOOL client_surface_prepare_present( struct client_surface *surface,
+W32KAPI struct client_surface_admission client_surface_prepare_present( struct client_surface *surface,
                                               struct client_surface_frame *present,
                                               BOOL external_completion, BOOL asynchronous );
 W32KAPI void client_surface_begin_present( struct client_surface *surface );
@@ -589,7 +589,7 @@ W32KAPI void client_surface_submit_present( struct client_surface *surface,
                                              struct client_surface_frame *present );
 W32KAPI void client_surface_submit_present_locked( struct client_surface *surface,
                                                     struct client_surface_frame *present );
-W32KAPI BOOL client_surface_complete_present( struct client_surface *surface,
+W32KAPI struct client_surface_present_result client_surface_complete_present( struct client_surface *surface,
                                               struct client_surface_frame *present,
                                               BOOL submitted, BOOL external_completed,
                                               const SIZE *expected_size, DWORD timeout );
@@ -600,12 +600,14 @@ W32KAPI void client_surface_set_present_completion( struct client_surface_frame 
                                                      client_surface_completion_wait_func wait,
                                                      client_surface_completion_release_func release,
                                                      void *context );
-W32KAPI void client_surface_defer_present( struct client_surface *surface,
+W32KAPI void client_surface_enqueue_prepared_present( struct client_surface *surface,
                                            struct client_surface_frame *present,
                                            const SIZE *expected_size );
 /* Reserve before any native submission and outside every surface/native lock.
- * Cancellation returns an unused reservation; defer transfers frame ownership. */
-W32KAPI struct client_surface_completion_job *client_surface_reserve_completion( struct client_surface *surface );
+ * Only ACCEPTED returns a ticket. Cancel and enqueue consume and clear that
+ * ticket; enqueue transfers ownership without promising completion/publication. */
+W32KAPI struct client_surface_admission client_surface_reserve_completion( struct client_surface *surface,
+                                                                         struct client_surface_completion_job **ticket );
 /* Native source I/O may share transport within this execution domain. Keys
  * are process-local, never reused, and do not identify an image or its owner.
  * Synchronous callers have a distinct domain from asynchronous completion. */
@@ -613,8 +615,8 @@ W32KAPI BOOL client_surface_get_execution_domain( UINT64 *domain );
 /* Reserve stable keys for a native executor whose lifetime is independent
  * of the submitting thread. This reserves identity, not worker capacity. */
 W32KAPI UINT64 client_surface_allocate_completion_domains( unsigned int count );
-W32KAPI void client_surface_cancel_completion( struct client_surface_completion_job *job );
-W32KAPI void client_surface_defer_reserved_present( struct client_surface_completion_job *job,
+W32KAPI void client_surface_cancel_completion( struct client_surface_completion_job **ticket );
+W32KAPI void client_surface_enqueue_present( struct client_surface_completion_job **ticket,
                                                    struct client_surface_frame *present,
                                                    const SIZE *expected_size );
 W32KAPI void client_surface_lock_present( struct client_surface *surface );
@@ -622,7 +624,7 @@ W32KAPI void client_surface_unlock_present( struct client_surface *surface );
 W32KAPI void client_surface_prepare_present_locked( struct client_surface *surface,
                                                     struct client_surface_frame *present,
                                                     BOOL external_completion, UINT64 memory_domain );
-W32KAPI BOOL client_surface_complete_present_locked( struct client_surface *surface,
+W32KAPI struct client_surface_present_result client_surface_complete_present_locked( struct client_surface *surface,
                                                      struct client_surface_frame *present,
                                                      BOOL submitted, BOOL external_completed,
                                                      const SIZE *expected_size, DWORD timeout );
