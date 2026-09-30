@@ -7306,6 +7306,12 @@ static NTSTATUS ensure_client_surface_backing_extent( struct x11drv_win_data *da
         width = max( width, client_surface_backing_extent( data->client_surface_backing_width * 9 / 8 ) );
     if (!shrink && height > data->client_surface_backing_height)
         height = max( height, client_surface_backing_extent( data->client_surface_backing_height * 9 / 8 ) );
+    if (!shrink && width <= data->client_surface_backing_width && height <= data->client_surface_backing_height)
+    {
+        /* A new checkpoint still obeys the capacity shrink delay. */
+        width = data->client_surface_backing_width;
+        height = data->client_surface_backing_height;
+    }
     /* CREATE has no content identity. A resumed COPY instead retains its
      * exact source and scene; the matching check above precedes consumption. */
     if ((status = prepare_client_surface_output_allocation( data, width, height, *force, &allocation )) != STATUS_SUCCESS)
