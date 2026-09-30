@@ -220,7 +220,7 @@ struct gdi_dc_funcs
 };
 
 /* increment this when changing driver tables or shared driver-facing structures */
-#define WINE_GDI_DRIVER_VERSION 156
+#define WINE_GDI_DRIVER_VERSION 157
 
 #define GDI_PRIORITY_NULL_DRV        0  /* null driver */
 #define GDI_PRIORITY_FONT_DRV      100  /* any font driver */
@@ -600,11 +600,11 @@ W32KAPI void client_surface_present( struct client_surface *surface );
 W32KAPI struct client_surface_admission client_surface_prepare_present( struct client_surface *surface,
                                               struct client_surface_frame *present,
                                               BOOL external_completion, BOOL asynchronous );
-W32KAPI void client_surface_begin_present( struct client_surface *surface );
+/* Each batch member owns one native use until submit_present registers its
+ * completion. State locks are released before entering the native driver. */
+W32KAPI void client_surface_begin_present( struct client_surface *surface, unsigned int count );
 W32KAPI void client_surface_submit_present( struct client_surface *surface,
                                              struct client_surface_frame *present );
-W32KAPI void client_surface_submit_present_locked( struct client_surface *surface,
-                                                    struct client_surface_frame *present );
 W32KAPI struct client_surface_present_result client_surface_complete_present( struct client_surface *surface,
                                               struct client_surface_frame *present,
                                               BOOL submitted, BOOL external_completed,

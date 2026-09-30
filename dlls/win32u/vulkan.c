@@ -3347,10 +3347,9 @@ reserve_completions:
         }
     have_snapshots = reserve_more = FALSE;
 
-    /* Completion ordering is per client surface.  Acquire locks in a stable
-     * order across queues; exact external IDs release them after submission,
-     * while fallback monitors keep them through composition so events cannot
-     * be stolen. */
+    /* Prepare in stable surface order. Native-use ownership replaces these
+     * state locks before entering the host driver; shared monitors retain
+     * their separate completion ownership through capture. */
     if (present_info->swapchainCount > 1)
         qsort( present_surfaces, present_info->swapchainCount,
                sizeof(*present_surfaces), compare_client_surface_ptrs );
@@ -3452,6 +3451,16 @@ reserve_completions:
         }
     }
 
+    for (uint32_t i = 0; i < surface_locked_count; ++i)
+    {
+        unsigned int count = 0;
+
+        for (uint32_t j = 0; j < present_info->swapchainCount; ++j)
+            if (swapchain_from_handle( client_swapchains[j] )->surface->client == present_surfaces[i]) ++count;
+        client_surface_begin_present( present_surfaces[i], count );
+    }
+    surface_locked_count = 0;
+
     if (have_snapshots)
         res = snapshot_vulkan_present( queue, present_info, client_swapchains, presents, reservations );
     else
@@ -3460,14 +3469,15 @@ reserve_completions:
         res == VK_ERROR_DEVICE_LOST)
         for (uint32_t i = 0; i < present_info->swapchainCount; ++i) present_info->pResults[i] = res;
 
-    /* Allocate producer serials before releasing either ordering domain.
+    /* Allocate producer serials before returning each native use or the
+     * swapchain ordering domain.
      * This records host submission order even when another queue targets the
      * same client surface through a different swapchain. */
     for (uint32_t i = 0; i < present_info->swapchainCount; i++)
     {
         struct swapchain *swapchain = swapchain_from_handle( client_swapchains[i] );
 
-        client_surface_submit_present_locked( swapchain->surface->client, &presents[i] );
+        client_surface_submit_present( swapchain->surface->client, &presents[i] );
         if ((present_info->pResults ? present_info->pResults[i] : res) >= VK_SUCCESS)
         {
             if (regions && regions->swapchainCount == present_info->swapchainCount)
@@ -3478,8 +3488,6 @@ reserve_completions:
     }
     while (locked_count)
         pthread_mutex_unlock( &present_swapchains[--locked_count]->present_lock );
-    while (surface_locked_count)
-        client_surface_unlock_present( present_surfaces[--surface_locked_count] );
 
     for (uint32_t i = 0; i < present_info->swapchainCount; ++i)
     {

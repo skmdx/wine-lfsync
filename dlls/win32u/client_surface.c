@@ -184,7 +184,32 @@ struct client_surface_target_store
 {
     pthread_mutex_t mutex; /* Leaf: only copy payload while held. */
     struct client_surface_target target;
+    LONG updating; /* Owned native operation; independent of the published snapshot. */
 };
+
+BOOL client_surface_target_is_updating( const struct client_surface *surface )
+{
+    return ReadAcquire( &surface->target_store->updating );
+}
+
+static void begin_client_surface_target_operation( struct client_surface *surface )
+{
+    assert( !surface->native_present_count && !client_surface_target_is_updating( surface ) );
+    ++surface->native_present_count;
+    WriteRelease( &surface->target_store->updating, TRUE );
+    pthread_mutex_unlock( &surface->present_lock );
+    pthread_mutex_unlock( &surface->completion_lock );
+}
+
+static void end_client_surface_target_operation( struct client_surface *surface )
+{
+    pthread_mutex_lock( &surface->completion_lock );
+    pthread_mutex_lock( &surface->present_lock );
+    assert( surface->native_present_count == 1 && client_surface_target_is_updating( surface ) );
+    --surface->native_present_count;
+    WriteRelease( &surface->target_store->updating, FALSE );
+    pthread_cond_broadcast( &surface->completion_cond );
+}
 
 static BOOL insert_client_surface_index( struct client_surface *surface )
 {
@@ -1030,7 +1055,10 @@ static BOOL client_surface_update_present_scene_internal_locked(
         /* The owner selects from the final COMPOSING snapshot. Its admission
          * changes the strategy but not the immutable scene. Resample before
          * touching native geometry; never retag a PREPARING snapshot. */
-        if (surface->backend->prepare_direct( surface, &scene )) return FALSE;
+        begin_client_surface_target_operation( surface );
+        ready = surface->backend->prepare_direct( surface, &scene );
+        end_client_surface_target_operation( surface );
+        if (ready || ReadAcquire( &surface->closing )) return FALSE;
     }
     /* PREPARING has an immutable layout but no publication token yet. An
      * actual producer which cannot admit DIRECT must still preserve its new
@@ -1097,7 +1125,9 @@ static BOOL client_surface_update_present_scene_internal_locked(
     TRACE( "updating %s, toplevel %p, virtual_rect %s, monitor_rect %s\n",
            debugstr_client_surface( surface ), next.toplevel,
            wine_dbgstr_rect( &next.virtual_rect ), wine_dbgstr_rect( &next.monitor_rect ) );
+    begin_client_surface_target_operation( surface );
     ready = client_surface_backend_update( surface, &next, &update );
+    end_client_surface_target_operation( surface );
     if (ReadAcquire( &surface->closing )) return FALSE;
     /* The owned target operation pins native lifetime, but the server scene
      * can change while its callback runs. Do not publish that obsolete next

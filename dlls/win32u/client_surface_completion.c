@@ -59,9 +59,10 @@ struct client_surface_completion_job
     UINT64 domain;
     struct client_surface_frame present;
     struct client_surface_completion_result result;
+    struct client_surface_completion_result native_result;
     SIZE expected_size;
     DWORD wait_started, wait_timeout, poll_due, poll_delay;
-    BOOL has_expected_size, deferred, allocated, reserved, pending, done, retirement;
+    BOOL has_expected_size, deferred, allocated, reserved, pending, done, retirement, native_complete;
 };
 
 /* The scheduler owns all transitions under completion_executor_lock. Queued
@@ -592,7 +593,7 @@ BOOL client_surface_prepare_retirement( struct client_surface *surface )
     return !!domain;
 }
 
-static void finish_deferred_present( struct client_surface *surface, struct client_surface_frame *present,
+static BOOL finish_deferred_present( struct client_surface *surface, struct client_surface_frame *present,
                                      const SIZE *expected_size, struct client_surface_completion_result result,
                                      BOOL polled )
 {
@@ -603,10 +604,10 @@ static void finish_deferred_present( struct client_surface *surface, struct clie
     unsigned long long completed, released;
     struct client_surface_present_result outcome;
 
+    if (!client_surface_try_complete_present( surface, present,
+          result.status == CLIENT_SURFACE_COMPLETION_SIGNALED, expected_size, &outcome )) return FALSE;
     TRACE( "event=completion_finish surface=%p serial=%s status=%u worker=%u polled=%u\n",
            surface, wine_dbgstr_longlong( present->serial ), result.status, result.worker, polled );
-    outcome = client_surface_complete_present( surface, present, TRUE,
-                  result.status == CLIENT_SURFACE_COMPLETION_SIGNALED, expected_size, 0 );
     TRACE( "event=present_adoption surface=%p serial=%s owner=%u completion=%u image=%u handoff=%u result=%u elapsed=%u\n",
            surface, wine_dbgstr_longlong( present->serial ), outcome.owner, outcome.completion,
            outcome.image_complete, outcome.handoff, present->result,
@@ -628,6 +629,7 @@ static void finish_deferred_present( struct client_surface *surface, struct clie
                    wine_dbgstr_longlong( client_surface_get_identity( surface ) ),
                    wine_dbgstr_longlong( present->serial ), wine_dbgstr_longlong( control ),
                    begin, completed, result.status, result.worker, polled );
+    return TRUE;
 }
 
 static struct client_surface_completion_result poll_completion_job( struct client_surface *surface,
@@ -689,7 +691,7 @@ static enum client_surface_completion_worker_disposition execute_completion_job(
     BOOL allocated = job->allocated;
 
     info->completion_domain = domain;
-    if (poll) result = poll_completion_job( surface, job );
+    if (poll) result = job->native_complete ? job->native_result : poll_completion_job( surface, job );
     else TRACE( "cancelling completion without polling %s serial %s\n",
                 debugstr_client_surface( surface ), wine_dbgstr_longlong( job->present.serial ) );
     if (worker && result.status != CLIENT_SURFACE_COMPLETION_PENDING)
@@ -698,9 +700,20 @@ static enum client_surface_completion_worker_disposition execute_completion_job(
         worker->finishing = TRUE;
         pthread_mutex_unlock( &completion_executor_lock );
     }
-    if (result.status != CLIENT_SURFACE_COMPLETION_PENDING && job->deferred)
-        finish_deferred_present( surface, &job->present,
-                                 job->has_expected_size ? &job->expected_size : NULL, result, poll );
+    if (result.status != CLIENT_SURFACE_COMPLETION_PENDING && job->deferred &&
+        !finish_deferred_present( surface, &job->present,
+                                  job->has_expected_size ? &job->expected_size : NULL, result, poll ))
+    {
+        job->native_result = result;
+        /* A RETIRE disposition belongs to the thread returning from the
+         * native wait. Its domain stays blocked until that thread exits;
+         * the later adoption-only attempt must not retire its new worker. */
+        job->native_result.worker = CLIENT_SURFACE_COMPLETION_WORKER_REUSE;
+        job->native_complete = TRUE;
+        job->poll_due = NtGetTickCount() + job->poll_delay;
+        job->poll_delay = min( job->poll_delay * 2, (DWORD)4 );
+        result.status = CLIENT_SURFACE_COMPLETION_PENDING;
+    }
 
     pthread_mutex_lock( &completion_executor_lock );
     assert( surface->completion_queue->in_progress && completion_head( surface ) == job );

@@ -461,7 +461,8 @@ BOOL client_surface_end_present_internal( struct client_surface *surface,
      * target validation on the per-frame path. */
     pthread_mutex_lock( &surface->present_lock );
     client_surface_get_target( surface, &target );
-    if (ReadAcquire( &surface->closing ) || client_surface_present_expired( present ) ||
+    if (ReadAcquire( &surface->closing ) || client_surface_target_is_updating( surface ) ||
+        client_surface_present_expired( present ) ||
         present->target == CLIENT_SURFACE_FRAME_TARGET_INVALID ||
         present->target_epoch != target.epoch ||
         present->scene.toplevel != target.toplevel)
@@ -695,9 +696,9 @@ static void prepare_client_surface_present_locked( struct client_surface *surfac
     BOOL native_valid;
     unsigned int retry;
 
-    /* The caller has established submission readiness while acquiring this
-     * mutex.  Do not release it here: a multi-surface caller may since have
-     * acquired later mutexes in the global surface order. */
+    /* Readiness was established in global surface order. A native target
+     * operation publishes its exclusive use before dropping state locks;
+     * another batch waits for that use before acquiring any later surface. */
     assert( !surface->native_present_count );
     if (external_completion)
     {
@@ -920,18 +921,19 @@ done:
     return result;
 }
 
-static void client_surface_begin_present_locked( struct client_surface *surface )
+static void client_surface_begin_present_locked( struct client_surface *surface, unsigned int count )
 {
     /* Native preparation borrows the handoff before a submitted completion
      * owns it. Protect that interval from retirement by an older callback. */
     pthread_mutex_lock( &surface->present_lock );
-    surface->native_present_count++;
+    assert( count );
+    surface->native_present_count += count;
     pthread_mutex_unlock( &surface->present_lock );
 }
 
-void client_surface_begin_present( struct client_surface *surface )
+void client_surface_begin_present( struct client_surface *surface, unsigned int count )
 {
-    client_surface_begin_present_locked( surface );
+    client_surface_begin_present_locked( surface, count );
     client_surface_unlock_present( surface );
 }
 
@@ -944,7 +946,7 @@ static void client_surface_register_completion_locked( struct client_surface *su
         surface->driver_completion_count++;
 }
 
-void client_surface_submit_present_locked( struct client_surface *surface,
+static void client_surface_submit_present_locked( struct client_surface *surface,
                                            struct client_surface_frame *present )
 {
     /* Submission serials, unlike preparation serials, preserve the native
@@ -987,7 +989,8 @@ static BOOL client_surface_capture_current_locked( struct client_surface *surfac
                                                    const struct client_surface_target *target,
                                                    struct client_surface_frame *present )
 {
-    return !ReadAcquire( &surface->closing ) && !client_surface_present_expired( present ) &&
+    return !ReadAcquire( &surface->closing ) && !client_surface_target_is_updating( surface ) &&
+           !client_surface_present_expired( present ) &&
            surface->hwnd && target->valid && present->target_epoch == target->epoch &&
            present->serial > surface->composed_serial && client_surface_handoff_valid( surface, present );
 }
@@ -1255,11 +1258,33 @@ struct client_surface_present_result client_surface_complete_present( struct cli
     job = present->completion_job;
     present->completion_job = NULL;
     client_surface_lock_present( surface );
+    while (client_surface_target_is_updating( surface ))
+        pthread_cond_wait( &surface->completion_cond, &surface->completion_lock );
     ret = client_surface_complete_present_locked( surface, present, submitted,
                                                   external_completed, expected_size, timeout );
     client_surface_unlock_present( surface );
     client_surface_cancel_completion( &job );
     return ret;
+}
+
+BOOL client_surface_try_complete_present( struct client_surface *surface, struct client_surface_frame *present,
+                                         BOOL completed, const SIZE *expected_size,
+                                         struct client_surface_present_result *result )
+{
+    client_surface_lock_present( surface );
+    /* A completed native wait does not authorize adoption during a target
+     * mutation. Leave its image and FIFO owned, without occupying a worker.
+     * Failed/cancelled work only returns ownership and cannot publish. */
+    if (completed && client_surface_target_is_updating( surface ))
+    {
+        TRACE( "event=target_adoption_deferred surface=%p serial=%s\n",
+               surface, wine_dbgstr_longlong( present->serial ) );
+        pthread_mutex_unlock( &surface->completion_lock );
+        return FALSE;
+    }
+    *result = client_surface_complete_present_locked( surface, present, TRUE, completed, expected_size, 0 );
+    client_surface_unlock_present( surface );
+    return TRUE;
 }
 
 void client_surface_present( struct client_surface *surface )
@@ -1270,7 +1295,7 @@ void client_surface_present( struct client_surface *surface )
      * supplies a host completion boundary.  It still participates in target
      * token validation and per-surface submission serialization. */
     if (client_surface_prepare_present( surface, &present, TRUE, FALSE ).reason != CLIENT_SURFACE_ACCEPTED) return;
-    client_surface_begin_present( surface );
+    client_surface_begin_present( surface, 1 );
     client_surface_submit_present( surface, &present );
     client_surface_complete_present( surface, &present, TRUE, TRUE, NULL, 0 );
 }

@@ -1350,7 +1350,7 @@ static void x11drv_surface_flush( struct opengl_drawable *base, UINT flags )
     if (!(flags & GL_FLUSH_PRESENT)) return;
 
     if (!prepare_opengl_present( base->client, &present, TRUE, FALSE )) return;
-    client_surface_begin_present( base->client );
+    client_surface_begin_present( base->client, 1 );
     /* Native completion remains required while PREPARING blocks publication. */
     if (present.completion.kind == CLIENT_SURFACE_COMPLETION_EXACT)
     {
@@ -1930,7 +1930,7 @@ static BOOL x11drv_surface_swap_blit( struct opengl_drawable *base, struct openg
     use_oml = ctx && gl->completion;
     if (!prepare_opengl_present( base->client, &present, use_oml || !usexcomposite,
                                          usexcomposite )) return FALSE;
-    client_surface_begin_present( base->client );
+    client_surface_begin_present( base->client, 1 );
     if (usexcomposite && !present.direct_snapshot && present.completion.kind == CLIENT_SURFACE_COMPLETION_EXACT &&
         !(completion = client_surface_alloc_scoped_metadata( &surface->memory, 1, sizeof(*completion) )))
     {
@@ -2325,7 +2325,7 @@ static void x11drv_egl_surface_flush( struct opengl_drawable *base, UINT flags )
     if (!(flags & GL_FLUSH_PRESENT)) return;
 
     if (!prepare_opengl_present( base->client, &present, TRUE, FALSE )) return;
-    client_surface_begin_present( base->client );
+    client_surface_begin_present( base->client, 1 );
     /* Native completion remains required while PREPARING blocks publication. */
     if (present.completion.kind == CLIENT_SURFACE_COMPLETION_EXACT)
     {
@@ -2499,7 +2499,7 @@ static BOOL x11drv_egl_surface_present( struct opengl_drawable *base, GLuint fra
               debugstr_opengl_drawable( base ) );
         frame_id = 0;
     }
-    client_surface_begin_present( base->client );
+    client_surface_begin_present( base->client, 1 );
     if (frame_id && !(completion = client_surface_alloc_scoped_metadata( &surface->memory, 1, sizeof(*completion) )))
     {
         client_surface_submit_present( base->client, &present );
