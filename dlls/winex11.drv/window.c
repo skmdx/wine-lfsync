@@ -347,7 +347,7 @@ static void prepare_native_content( struct client_surface_native_work *work )
             .display = display, .callback = native_window_error, .arg = window};
         X11DRV_register_error_handler( &window->content_errors );
         XSelectInput( display, window->window, ExposureMask );
-        TRACE_(csperf)( "event=native_content_open record=%p display=%p window=%lx\n", window, display, window->window );
+        trace_window_response( "native_content_open", 0, display, window->window, 0, 0, NULL, TRUE );
     }
     if (!window->content_prepare_barrier.serial)
     {
@@ -381,9 +381,9 @@ static void finish_native_content_prepare( struct client_surface_native_work *wo
         return;
     }
     pthread_mutex_lock( &native_window_mutex );
-    TRACE_(csperf)( "event=native_content_prepare_return record=%p display=%p window=%lx epoch=%llu error=%ld\n",
-                   window, window->content_display, window->window, (unsigned long long)window->content_epoch,
-                   (long)InterlockedCompareExchange( &window->content_error, 0, 0 ) );
+    trace_window_response( "native_content_prepare_return", 0, window->content_display, window->window,
+                           window->content_serial, window->content_prepare_barrier.serial, NULL,
+                           !InterlockedCompareExchange( &window->content_error, 0, 0 ) );
     window->content_preparing = FALSE;
     window->content_fd = window->content_display ? ConnectionNumber( window->content_display ) : -1;
     window->content_event_pending = TRUE;
@@ -419,8 +419,7 @@ static void read_native_content_events( struct client_surface_native_work *work 
     window->content_event_pending |= count == 128;
     pthread_mutex_unlock( &native_window_mutex );
     if (!IsRectEmpty( &exposed ))
-        TRACE_(csperf)( "event=native_expose_read record=%p display=%p window=%lx count=%u rect=%s\n",
-                       window, window->content_display, window->window, count, wine_dbgstr_rect( &exposed ) );
+        trace_window_response( "native_expose_read", 0, window->content_display, window->window, 0, 0, &exposed, TRUE );
 }
 
 static void finish_native_content_events( struct client_surface_native_work *work )
@@ -825,8 +824,7 @@ static void destroy_native_window( struct client_surface_native_work *work )
     {
         XCloseDisplay( window->content_display );
         X11DRV_unregister_error_handler( &window->content_errors );
-        TRACE_(csperf)( "event=native_content_close record=%p display=%p window=%lx\n",
-                       window, window->content_display, window->window );
+        trace_window_response( "native_content_close", 0, window->content_display, window->window, 0, 0, NULL, TRUE );
     }
     x11drv_display_owner_unregister_error_handler( window->creator, &window->errors );
     TRACE_(csperf)( "event=native_window_destroy_return record=%p display=%p window=%lx lost=%d\n",
