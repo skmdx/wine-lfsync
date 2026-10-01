@@ -403,6 +403,10 @@ static void read_native_content_events( struct client_surface_native_work *work 
     unsigned int count = 0;
     XEvent event;
 
+    /* The release barrier also consumes events on this connection. Keep
+     * the availability check and removal atomic with respect to that reader,
+     * otherwise it can take the last event before XNextEvent and strand us. */
+    XLockDisplay( window->content_display );
     while (count < 128 && XPending( window->content_display ))
     {
         XNextEvent( window->content_display, &event );
@@ -414,6 +418,7 @@ static void read_native_content_events( struct client_surface_native_work *work 
             add_bounds_rect( &exposed, &rect );
         }
     }
+    XUnlockDisplay( window->content_display );
     pthread_mutex_lock( &native_window_mutex );
     add_bounds_rect( &window->content_expose, &exposed );
     window->content_event_pending |= count == 128;
