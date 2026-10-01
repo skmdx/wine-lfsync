@@ -26,6 +26,8 @@
 
 #include "config.h"
 #include <assert.h>
+#include <fcntl.h>
+#include <poll.h>
 
 #include <stdarg.h>
 #include <stdlib.h>
@@ -186,14 +188,17 @@ struct x11drv_native_window
     struct client_surface_native_work work;
     struct client_surface_native_work content_prepare_work;
     struct client_surface_native_work content_release_work;
-    struct x11drv_error_handler errors;
+    struct client_surface_native_work content_event_work;
+    struct x11drv_error_handler errors, content_errors;
     struct x11drv_stream_barrier gdi_barrier, destroy_barrier;
-    struct x11drv_stream_barrier content_prepare_barrier, content_barrier;
+    struct x11drv_stream_barrier content_geometry_barrier, content_prepare_barrier, content_barrier;
     struct list desktop_entry;
     struct x11drv_display_owner *creator;
     struct x11drv_native_window *ancestor;
     struct x11drv_native_window *host_parent; /* actual attachment, held through child destruction */
-    Display *display;
+    Display *display, *content_display;
+    int content_fd;
+    RECT content_expose;
     Window window, content, parent, private_parent;
     unsigned int content_width, content_height;
     unsigned int content_users;
@@ -203,6 +208,7 @@ struct x11drv_native_window
     LONG content_error;
     BOOL content_redirected;
     BOOL content_preparing, content_releasing;
+    BOOL content_prepare_redirect, content_event_active, content_event_pending;
     void (*content_wake)(void);
     BOOL content_naming, content_release_waiting;
     BOOL content_resize_failed;
@@ -221,15 +227,22 @@ static int native_window_error( Display *display, XErrorEvent *event, void *arg 
     struct x11drv_native_window *window = arg;
 
     if (display == gdi_display && x11drv_stream_barrier_error( &window->gdi_barrier, event )) return 1;
-    if (display != window->display) return 0;
-    if (x11drv_stream_barrier_error( &window->destroy_barrier, event )) return 1;
-    if (x11drv_stream_barrier_error( &window->content_prepare_barrier, event )) return 1;
-    if (x11drv_stream_barrier_error( &window->content_barrier, event )) return 1;
-    if (window->content_serial && event->serial == window->content_serial)
+    if (display == window->display)
     {
-        InterlockedExchange( &window->content_error, event->error_code );
-        return 1;
+        if (x11drv_stream_barrier_error( &window->destroy_barrier, event )) return 1;
+        if (x11drv_stream_barrier_error( &window->content_geometry_barrier, event )) return 1;
     }
+    else if (display == window->content_display)
+    {
+        if (x11drv_stream_barrier_error( &window->content_prepare_barrier, event )) return 1;
+        if (x11drv_stream_barrier_error( &window->content_barrier, event )) return 1;
+        if (window->content_serial && event->serial == window->content_serial)
+        {
+            InterlockedExchange( &window->content_error, event->error_code );
+            return 1;
+        }
+    }
+    else return 0;
 
     if (window->window && event->error_code == BadWindow && event->resourceid == window->window &&
         (event->request_code == X_DestroyWindow || event->request_code == X_UnmapWindow ||
@@ -310,19 +323,50 @@ static UINT64 native_content_capacity( unsigned int width, unsigned int height, 
 
 static void prepare_native_content( struct client_surface_native_work *work )
 {
-#ifdef SONAME_LIBXCOMPOSITE
     struct x11drv_native_window *window = CONTAINING_RECORD( work, struct x11drv_native_window, content_prepare_work );
+    Display *display;
 
+    /* The Window must exist before another connection selects or redirects
+     * it. This receipt belongs to the creator; all later I/O is private. */
+    if (!window->content_geometry_barrier.complete)
+    {
+        if (!window->content_geometry_barrier.serial)
+            x11drv_queue_stream_barrier( window->display, &window->content_geometry_barrier );
+        if (!x11drv_poll_stream_barrier( window->display, &window->content_geometry_barrier, window->creator )) return;
+    }
+    if (!(display = window->content_display))
+    {
+        if (!(display = XOpenDisplay( DisplayString( window->display ) ))) goto failed;
+        if (fcntl( ConnectionNumber( display ), F_SETFD, FD_CLOEXEC ) == -1)
+        {
+            XCloseDisplay( display );
+            goto failed;
+        }
+        window->content_display = display;
+        window->content_errors = (struct x11drv_error_handler){
+            .display = display, .callback = native_window_error, .arg = window};
+        X11DRV_register_error_handler( &window->content_errors );
+        XSelectInput( display, window->window, ExposureMask );
+        TRACE_(csperf)( "event=native_content_open record=%p display=%p window=%lx\n", window, display, window->window );
+    }
     if (!window->content_prepare_barrier.serial)
     {
-        XLockDisplay( window->display );
-        window->content_serial = XNextRequest( window->display );
-        pXCompositeRedirectWindow( window->display, window->content, CompositeRedirectAutomatic );
-        x11drv_queue_stream_barrier( window->display, &window->content_prepare_barrier );
-        XUnlockDisplay( window->display );
-    }
-    x11drv_poll_stream_barrier( window->display, &window->content_prepare_barrier, window->creator );
+#ifdef SONAME_LIBXCOMPOSITE
+        if (window->content_prepare_redirect)
+        {
+            XLockDisplay( display );
+            window->content_serial = XNextRequest( display );
+            pXCompositeRedirectWindow( display, window->content, CompositeRedirectAutomatic );
+            XUnlockDisplay( display );
+        }
 #endif
+        x11drv_queue_stream_barrier( display, &window->content_prepare_barrier );
+    }
+    x11drv_poll_stream_barrier( display, &window->content_prepare_barrier, NULL );
+    return;
+failed:
+    InterlockedExchange( &window->content_error, BadAlloc );
+    window->content_prepare_barrier.complete = TRUE;
 }
 
 static void finish_native_content_prepare( struct client_surface_native_work *work )
@@ -337,7 +381,13 @@ static void finish_native_content_prepare( struct client_surface_native_work *wo
         return;
     }
     pthread_mutex_lock( &native_window_mutex );
+    TRACE_(csperf)( "event=native_content_prepare_return record=%p display=%p window=%lx epoch=%llu error=%ld\n",
+                   window, window->content_display, window->window, (unsigned long long)window->content_epoch,
+                   (long)InterlockedCompareExchange( &window->content_error, 0, 0 ) );
     window->content_preparing = FALSE;
+    window->content_fd = window->content_display ? ConnectionNumber( window->content_display ) : -1;
+    window->content_event_pending = TRUE;
+    window->content_geometry_barrier = (struct x11drv_stream_barrier){0};
     window->content_prepare_barrier = (struct x11drv_stream_barrier){0};
     release = window->content_releasing;
     pthread_mutex_unlock( &native_window_mutex );
@@ -346,14 +396,108 @@ static void finish_native_content_prepare( struct client_surface_native_work *wo
     wake();
 }
 
-BOOL x11drv_native_window_content_ready( struct x11drv_native_window *window )
+static void read_native_content_events( struct client_surface_native_work *work )
 {
-    BOOL ready;
+    struct x11drv_native_window *window = CONTAINING_RECORD( work, struct x11drv_native_window, content_event_work );
+    RECT exposed = {0};
+    unsigned int count = 0;
+    XEvent event;
+
+    while (count < 128 && XPending( window->content_display ))
+    {
+        XNextEvent( window->content_display, &event );
+        ++count;
+        if (event.type == Expose && event.xexpose.window == window->window)
+        {
+            RECT rect = {event.xexpose.x, event.xexpose.y,
+                         event.xexpose.x + event.xexpose.width, event.xexpose.y + event.xexpose.height};
+            add_bounds_rect( &exposed, &rect );
+        }
+    }
+    pthread_mutex_lock( &native_window_mutex );
+    add_bounds_rect( &window->content_expose, &exposed );
+    window->content_event_pending |= count == 128;
+    pthread_mutex_unlock( &native_window_mutex );
+    if (!IsRectEmpty( &exposed ))
+        TRACE_(csperf)( "event=native_expose_read record=%p display=%p window=%lx count=%u rect=%s\n",
+                       window, window->content_display, window->window, count, wine_dbgstr_rect( &exposed ) );
+}
+
+static void finish_native_content_events( struct client_surface_native_work *work )
+{
+    struct x11drv_native_window *window = CONTAINING_RECORD( work, struct x11drv_native_window, content_event_work );
+    void (*wake)(void) = window->content_wake;
 
     pthread_mutex_lock( &native_window_mutex );
-    ready = !window->content_preparing && !window->content_releasing;
+    window->content_event_active = FALSE;
     pthread_mutex_unlock( &native_window_mutex );
-    return ready;
+    x11drv_native_window_release( window );
+    wake();
+}
+
+void x11drv_native_window_select_expose( struct x11drv_native_window *window, void (*wake)(void) )
+{
+    BOOL prepare = FALSE;
+
+    pthread_mutex_lock( &native_window_mutex );
+    window->content_event_pending = TRUE;
+    /* Without redirection this connection still owns Expose selection. */
+    if (window->content_fd == -1 && !window->content_preparing &&
+        !InterlockedCompareExchange( &window->content_error, 0, 0 ))
+    {
+        window->content_wake = wake;
+        window->content_prepare_work.execute = prepare_native_content;
+        window->content_prepare_work.finished = finish_native_content_prepare;
+        window->content_preparing = prepare = TRUE;
+        window->content_prepare_redirect = FALSE;
+        x11drv_native_window_acquire( window );
+    }
+    pthread_mutex_unlock( &native_window_mutex );
+    if (prepare) client_surface_submit_native_work( &window->content_prepare_work );
+}
+
+int x11drv_native_window_expose_fd( struct x11drv_native_window *window )
+{
+    int fd;
+
+    pthread_mutex_lock( &native_window_mutex );
+    fd = window->content_preparing || window->content_event_active ? -1 : window->content_fd;
+    pthread_mutex_unlock( &native_window_mutex );
+    return fd;
+}
+
+BOOL x11drv_native_window_take_expose( struct x11drv_native_window *window, RECT *rect )
+{
+    struct pollfd input;
+    BOOL read = FALSE;
+
+    pthread_mutex_lock( &native_window_mutex );
+    *rect = window->content_expose;
+    SetRectEmpty( &window->content_expose );
+    input = (struct pollfd){window->content_fd, POLLIN, 0};
+    if (!window->content_preparing && !window->content_event_active && input.fd != -1 &&
+        (window->content_event_pending || poll( &input, 1, 0 ) > 0))
+    {
+        window->content_event_work.execute = read_native_content_events;
+        window->content_event_work.finished = finish_native_content_events;
+        window->content_event_pending = FALSE;
+        window->content_event_active = read = TRUE;
+        x11drv_native_window_acquire( window );
+    }
+    pthread_mutex_unlock( &native_window_mutex );
+    if (read) client_surface_submit_native_work( &window->content_event_work );
+    return !IsRectEmpty( rect );
+}
+
+NTSTATUS x11drv_native_window_content_status( struct x11drv_native_window *window )
+{
+    NTSTATUS status;
+
+    pthread_mutex_lock( &native_window_mutex );
+    status = window->content_preparing || window->content_releasing ? STATUS_PENDING :
+             InterlockedCompareExchange( &window->content_error, 0, 0 ) ? STATUS_UNSUCCESSFUL : STATUS_SUCCESS;
+    pthread_mutex_unlock( &native_window_mutex );
+    return status;
 }
 
 NTSTATUS x11drv_native_window_prepare_content( struct x11drv_native_window *window,
@@ -388,6 +532,7 @@ NTSTATUS x11drv_native_window_prepare_content( struct x11drv_native_window *wind
             window->content_prepare_work.execute = prepare_native_content;
             window->content_prepare_work.finished = finish_native_content_prepare;
             window->content_preparing = prepare = TRUE;
+            window->content_prepare_redirect = TRUE;
             x11drv_native_window_acquire( window );
             window->content_redirected = TRUE;
         }
@@ -406,13 +551,18 @@ static void release_native_content( struct client_surface_native_work *work )
 #ifdef SONAME_LIBXCOMPOSITE
     struct x11drv_native_window *window = CONTAINING_RECORD( work, struct x11drv_native_window, content_release_work );
 
+    if (!window->content_display)
+    {
+        window->content_barrier.complete = TRUE;
+        return;
+    }
     if (!window->content_barrier.serial)
     {
         if (!InterlockedCompareExchange( &window->content_error, 0, 0 ))
-            pXCompositeUnredirectWindow( window->display, window->content, CompositeRedirectAutomatic );
-        x11drv_queue_stream_barrier( window->display, &window->content_barrier );
+            pXCompositeUnredirectWindow( window->content_display, window->content, CompositeRedirectAutomatic );
+        x11drv_queue_stream_barrier( window->content_display, &window->content_barrier );
     }
-    x11drv_poll_stream_barrier( window->display, &window->content_barrier, window->creator );
+    x11drv_poll_stream_barrier( window->content_display, &window->content_barrier, NULL );
 #endif
 }
 
@@ -471,6 +621,7 @@ static void finish_native_content_release( struct client_surface_native_work *wo
     client_surface_release_scoped_memory( &window->memory, CLIENT_SURFACE_MEMORY_OUTPUT, window->content_release_bytes );
     window->content_release_bytes = 0;
     window->content_releasing = FALSE;
+    window->content_event_pending = TRUE;
     window->content_barrier = (struct x11drv_stream_barrier){0};
     pthread_mutex_unlock( &native_window_mutex );
     x11drv_native_window_release( window );
@@ -546,7 +697,7 @@ BOOL x11drv_native_window_read_ready( struct x11drv_native_window_read *read )
 
     /* The creator-stream marker must follow Redirect/Unredirect, including
      * when the worker issuing that request has not acquired Display yet. */
-    if (!x11drv_native_window_content_ready( window )) return FALSE;
+    if (x11drv_native_window_content_status( window ) == STATUS_PENDING) return FALSE;
     /* Geometry must reach the server before a private query or copy.
      * Later scene changes still invalidate adoption of the owned result. */
     if (!read->geometry.complete)
@@ -670,6 +821,13 @@ static void destroy_native_window( struct client_surface_native_work *work )
         x11drv_queue_stream_barrier( window->display, &window->destroy_barrier );
     }
     if (!x11drv_poll_stream_barrier( window->display, &window->destroy_barrier, window->creator )) return;
+    if (window->content_display)
+    {
+        XCloseDisplay( window->content_display );
+        X11DRV_unregister_error_handler( &window->content_errors );
+        TRACE_(csperf)( "event=native_content_close record=%p display=%p window=%lx\n",
+                       window, window->content_display, window->window );
+    }
     x11drv_display_owner_unregister_error_handler( window->creator, &window->errors );
     TRACE_(csperf)( "event=native_window_destroy_return record=%p display=%p window=%lx lost=%d\n",
                    window, window->display, window->window, window->destroyed );
@@ -716,6 +874,7 @@ struct x11drv_native_window *x11drv_native_window_alloc( Display *display,
     window->memory = memory;
     window->refs = 1;
     window->display = display;
+    window->content_fd = -1;
     window->work.execute = destroy_native_window;
     window->work.finished = free_native_window;
     list_init( &window->desktop_entry );

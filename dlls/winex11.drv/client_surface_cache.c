@@ -756,16 +756,18 @@ static void execute_native_present( struct client_surface_native_work *work )
     Display *display;
     GC gc;
     Drawable source = present->committing ? present->pixmap : present->content;
+    NTSTATUS status = x11drv_native_window_content_status( present->window_owner );
     Drawable destination = present->committing ? present->content : present->window;
     RECT full = {0, 0, present->width, present->height};
     const RECT *rect = present->committing ? &present->commit_rect :
                       IsRectEmpty( &present->copy_rect ) ? &full : &present->copy_rect;
 
-    if ((present->waiting = !x11drv_native_window_content_ready( present->window_owner )))
+    if ((present->waiting = status == STATUS_PENDING))
     {
         poll( NULL, 0, 1 );
         return;
     }
+    if (status) return;
     if (!open_cache_display( worker )) return;
     display = worker->display;
     worker->error = 0;

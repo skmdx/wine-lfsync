@@ -342,7 +342,6 @@ static BOOL client_surface_compositor_frame_writable( const struct client_surfac
 }
 
 static pthread_mutex_t client_surface_compositor_mutex = PTHREAD_MUTEX_INITIALIZER;
-static Display *client_surface_compositor_display;
 static BOOL client_surface_compositor_started;
 static int client_surface_compositor_notify[2] = {-1, -1};
 static struct client_surface_compositor_pool *client_surface_compositor_pools;
@@ -679,10 +678,11 @@ enum client_surface_compositor_capacity_kind
     CLIENT_SURFACE_COMPOSITOR_CAPACITY_COUNT,
 };
 
+#define CLIENT_SURFACE_COMPOSITOR_MAX_QUEUES 2048
 static const struct { unsigned int count; SIZE_T bytes; } client_surface_compositor_limits[] =
 {
     [CLIENT_SURFACE_COMPOSITOR_REQUEST_CAPACITY] = {1024, 256 * 1024},
-    [CLIENT_SURFACE_COMPOSITOR_QUEUE_CAPACITY] = {2048, 1024 * 1024},
+    [CLIENT_SURFACE_COMPOSITOR_QUEUE_CAPACITY] = {CLIENT_SURFACE_COMPOSITOR_MAX_QUEUES, 1024 * 1024},
     [CLIENT_SURFACE_COMPOSITOR_RELEASE_CAPACITY] = {4096, 1024 * 1024},
 };
 #define CLIENT_SURFACE_COMPOSITOR_REQUESTS_PER_TARGET 64
@@ -895,19 +895,6 @@ static void flush_client_surface_compositor_mailbox(
     struct client_surface_compositor_target *target );
 
 
-static BOOL client_surface_compositor_open(void)
-{
-    Display *display;
-
-    if (client_surface_compositor_display) return TRUE;
-    if (!(display = XOpenDisplay( DisplayString( gdi_display ) ))) return FALSE;
-    fcntl( ConnectionNumber( display ), F_SETFD, FD_CLOEXEC );
-
-
-    client_surface_compositor_display = display;
-    TRACE( "client-surface compositor connection opened\n" );
-    return TRUE;
-}
 
 /* Capacity is reserved before allocation and returned after the real free.
  * Reserved release nodes compete only when their resources are constructed,
@@ -1484,33 +1471,6 @@ static void complete_client_surface_compositor_frame(
     }
 }
 
-static void process_client_surface_present_events(void)
-{
-    Display *display = client_surface_compositor_display;
-    unsigned int budget = 128;
-
-    /* Drain every event so the pre-poll queue check cannot spin on events
-     * other than Expose. */
-    if (!display) return;
-    while (budget-- && XPending( display ))
-    {
-        XEvent event;
-        struct client_surface_compositor_target *target = NULL;
-
-        XNextEvent( display, &event );
-        if (event.type == Expose)
-        {
-            RECT rect = {event.xexpose.x, event.xexpose.y,
-                         event.xexpose.x + event.xexpose.width, event.xexpose.y + event.xexpose.height};
-
-            for (target = client_surface_compositor_targets; target; target = target->next)
-                if (target->present_window == event.xexpose.window) break;
-            if (target && target->scene.valid && target->scene.strategy == OWNER_COMPOSITE)
-                add_bounds_rect( &target->restore_rect, &rect );
-            continue;
-        }
-    }
-}
 
 static struct client_surface_compositor_frame *acquire_client_surface_compositor_frame(
     struct client_surface_compositor_target *target, Pixmap requested )
@@ -1533,6 +1493,15 @@ static unsigned int count_client_surface_compositor_frames(
 
     for (i = 0; i < ARRAY_SIZE(target->frames); ++i) count += !!target->frames[i].serial;
     return count;
+}
+
+static void process_client_surface_present_events( struct client_surface_compositor_target *target )
+{
+    RECT rect;
+
+    if (target->present_window && x11drv_native_window_take_expose( target->window_owner, &rect ) &&
+        target->scene.valid && target->scene.strategy == OWNER_COMPOSITE)
+        add_bounds_rect( &target->restore_rect, &rect );
 }
 
 static BOOL process_client_surface_native_present( struct client_surface_compositor_target *target )
@@ -1785,7 +1754,7 @@ static struct client_surface_compositor_frame *get_client_surface_compositor_fra
 {
     unsigned int i;
 
-    process_client_surface_present_events();
+    process_client_surface_present_events( target );
     /* A reserved scene's complete image owns its publication ticket until
      * submission. New source images remain in the independent owner cache. */
     if (target->mailbox_pending && target->mailbox_publish_generation) return NULL;
@@ -1916,7 +1885,7 @@ static struct client_surface_compositor_frame *acquire_client_surface_compositor
 {
     unsigned int i;
 
-    process_client_surface_present_events();
+    process_client_surface_present_events( target );
     for (i = 0; i < ARRAY_SIZE(target->frames); ++i)
     {
         unsigned int index = (target->next_frame + i) % ARRAY_SIZE(target->frames);
@@ -2490,7 +2459,7 @@ static BOOL create_client_surface_present_window( struct client_surface_composit
 
     if (status && status != STATUS_NOT_SUPPORTED) return FALSE;
     if (status == STATUS_NOT_SUPPORTED) target->content_epoch = 0;
-    XSelectInput( client_surface_compositor_display, target->window, ExposureMask );
+    x11drv_native_window_select_expose( target->window_owner, wake_client_surface_compositor );
     target->content_redirected = !status;
     target->present_window = target->window;
     TRACE_(csperf)( "ticks=%llu event=content_target window=%lx content=%lx epoch=%llu\n",
@@ -2833,7 +2802,7 @@ static BOOL replace_client_surface_compositor_pool( struct client_surface_compos
     /* Completed empty storage becomes an output pool only after checked
      * checkpoint copies and installation. The GUI keeps the old pair until
      * this job succeeds; failure leaves its pending publication intact. */
-    if (!client_surface_compositor_open() || !install_client_surface_output_checkpoint( job ))
+    if (!install_client_surface_output_checkpoint( job ))
     {
         free_client_surface_pending_allocation( job->u.pool.allocation );
         job->u.pool.allocation = NULL;
@@ -3025,7 +2994,7 @@ sweep:
     };
     hide_client_surface_present_window( target );
     job->scan.phase = 2;
-    if (!x11drv_native_window_content_ready( target->window_owner )) *done = FALSE;
+    if (x11drv_native_window_content_status( target->window_owner ) == STATUS_PENDING) *done = FALSE;
     update_client_surface_notification_plan( target );
     SetRectEmpty( &target->restore_rect );
     TRACE( "owner DIRECT_ATTACH hwnd %p scene %s identity %s drawable %#lx\n",
@@ -4635,19 +4604,18 @@ static void arm_client_surface_compositor_work(void)
 
 static void wait_client_surface_compositor_work( const struct client_surface_compositor_scan *scan )
 {
-    struct pollfd waiters[CLIENT_SURFACE_HANDOFF_MAX_POOLS_PER_CONSUMER + 2];
+    struct pollfd waiters[CLIENT_SURFACE_HANDOFF_MAX_POOLS_PER_CONSUMER + CLIENT_SURFACE_COMPOSITOR_MAX_QUEUES + 1];
     struct client_surface_compositor_pool *pool;
+    struct client_surface_compositor_target *target;
     unsigned int count = 0;
     DWORD elapsed;
     int ret, timeout = scan->timeout;
 
-    /* A complete quiet traversal follows arming. A later publisher leaves
-     * its notification unread. Xlib may also have buffered replies while
-     * handling sources or events: check the oldest barrier after its final
-     * read, without scanning every target or draining any notification. */
+    /* A quiet traversal consumed owned Expose rectangles and scheduled any
+     * native readers. Their completion wakes us even for Xlib-buffered input;
+     * the actor only polls file descriptors, never Xlib state. */
     assert( !scan->remaining && scan->generation == client_surface_compositor_target_generation );
     assert( !scan->handoff_remaining && scan->pool_generation == client_surface_compositor_pool_generation );
-    if (client_surface_compositor_display && XPending( client_surface_compositor_display )) return;
     pthread_mutex_lock( &client_surface_compositor_mutex );
     if (client_surface_compositor_head)
     {
@@ -4656,8 +4624,14 @@ static void wait_client_surface_compositor_work( const struct client_surface_com
     }
     pthread_mutex_unlock( &client_surface_compositor_mutex );
     waiters[count++] = (struct pollfd){client_surface_compositor_notify[0], POLLIN, 0};
-    if (client_surface_compositor_display)
-        waiters[count++] = (struct pollfd){ConnectionNumber( client_surface_compositor_display ), POLLIN, 0};
+    for (target = client_surface_compositor_targets; target; target = target->next)
+        if (target->present_window)
+        {
+            int fd = x11drv_native_window_expose_fd( target->window_owner );
+
+            assert( count < ARRAY_SIZE(waiters) );
+            if (fd != -1) waiters[count++] = (struct pollfd){fd, POLLIN, 0};
+        }
     for (pool = client_surface_compositor_pools; pool; pool = pool->next)
     {
         assert( count < ARRAY_SIZE(waiters) );
@@ -4703,7 +4677,7 @@ static BOOL client_surface_compositor_update_ready( struct client_surface_compos
     const struct client_surface_compositor_queue *queue = target->notifications->queue;
     unsigned int i;
 
-    if (target->native_updates || !x11drv_native_window_content_ready( target->window_owner )) return FALSE;
+    if (target->native_updates || x11drv_native_window_content_status( target->window_owner ) == STATUS_PENDING) return FALSE;
     /* A state notification can also follow a topology change. Do not wait
      * for unissued output from the server's invalidated scene before
      * allowing the GUI to adopt its replacement. Executing requests retain
@@ -4880,7 +4854,6 @@ static BOOL execute_client_surface_compositor_job( struct client_surface_composi
         return renew_client_surface_direct_plan( job );
     if (job->op == CLIENT_SURFACE_COMPOSITOR_DIRECT_COMPLETE)
         return complete_client_surface_direct_plan( job );
-    if (!client_surface_compositor_open()) return FALSE;
     switch (job->op)
     {
     case CLIENT_SURFACE_COMPOSITOR_FREE_POOL:
@@ -4922,7 +4895,8 @@ static BOOL client_surface_compositor_job_ready( struct client_surface_composito
     /* Authenticated DIRECT admission has already invalidated the old plan.
      * Its continuation only retires bindings and rechecks the selected scene. */
     if (job->op == CLIENT_SURFACE_COMPOSITOR_DIRECT_PLAN && job->scan.phase)
-        return job->scan.phase != 2 || !target || x11drv_native_window_content_ready( target->window_owner );
+        return job->scan.phase != 2 || !target ||
+               x11drv_native_window_content_status( target->window_owner ) != STATUS_PENDING;
     if (job->op == CLIENT_SURFACE_COMPOSITOR_DIRECT_PLAN)
     {
         struct client_surface_window_query *query = &job->u.direct_plan.query;
@@ -5515,6 +5489,7 @@ static BOOL process_client_surface_compositor_targets( struct client_surface_com
                 progressed |= target->update_notified;
             }
         }
+        process_client_surface_present_events( target );
         progressed |= process_client_surface_native_present( target );
         progressed |= process_client_surface_compositor_restore( target );
         progressed |= replay_client_surface_scene_sources( target, &budget );
@@ -5580,7 +5555,6 @@ static void client_surface_compositor_thread( void *context )
 
             client_surface_compositor_repair_budget = 64;
             client_surface_compositor_repair_pending = FALSE;
-            process_client_surface_present_events();
             progressed = client_surface_complete_queries( CLIENT_SURFACE_COPY_BATCH_SIZE );
             if (progressed) ++client_surface_compositor_query_generation;
             progressed |= client_surface_complete_cache( CLIENT_SURFACE_COPY_BATCH_SIZE );
