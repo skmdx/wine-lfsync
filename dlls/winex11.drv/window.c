@@ -189,9 +189,11 @@ struct x11drv_native_window
     struct client_surface_native_work content_prepare_work;
     struct client_surface_native_work content_release_work;
     struct client_surface_native_work content_event_work;
+    struct client_surface_native_work content_remap_work;
     struct x11drv_error_handler errors, content_errors;
     struct x11drv_stream_barrier gdi_barrier, destroy_barrier;
     struct x11drv_stream_barrier content_geometry_barrier, content_prepare_barrier, content_barrier;
+    struct x11drv_stream_barrier content_remap_barrier;
     struct list desktop_entry;
     struct x11drv_display_owner *creator;
     struct x11drv_native_window *ancestor;
@@ -205,6 +207,10 @@ struct x11drv_native_window
     unsigned long content_serial;
     UINT64 content_bytes, content_release_bytes;
     UINT64 content_epoch;
+    UINT64 content_remap_bytes;
+    unsigned long content_remap_serial, content_remap_end;
+    BOOL content_remap_preparing, content_remap_releasing, content_remap_unmapped;
+    LONG content_remap_error;
     LONG content_error;
     BOOL content_redirected;
     BOOL content_preparing, content_releasing;
@@ -236,6 +242,13 @@ static int native_window_error( Display *display, XErrorEvent *event, void *arg 
     {
         if (x11drv_stream_barrier_error( &window->content_prepare_barrier, event )) return 1;
         if (x11drv_stream_barrier_error( &window->content_barrier, event )) return 1;
+        if (x11drv_stream_barrier_error( &window->content_remap_barrier, event )) return 1;
+        if (window->content_remap_serial && event->serial >= window->content_remap_serial &&
+            event->serial < window->content_remap_end)
+        {
+            InterlockedExchange( &window->content_remap_error, event->error_code );
+            return 1;
+        }
         if (window->content_serial && event->serial == window->content_serial)
         {
             InterlockedExchange( &window->content_error, event->error_code );
@@ -346,7 +359,7 @@ static void prepare_native_content( struct client_surface_native_work *work )
         window->content_errors = (struct x11drv_error_handler){
             .display = display, .callback = native_window_error, .arg = window};
         X11DRV_register_error_handler( &window->content_errors );
-        XSelectInput( display, window->window, ExposureMask );
+        XSelectInput( display, window->window, ExposureMask | StructureNotifyMask );
         trace_window_response( "native_content_open", 0, display, window->window, 0, 0, NULL, TRUE );
     }
     if (!window->content_prepare_barrier.serial)
@@ -396,13 +409,109 @@ static void finish_native_content_prepare( struct client_surface_native_work *wo
     wake();
 }
 
+static void preserve_native_content( struct client_surface_native_work *work )
+{
+    struct x11drv_native_window *window = CONTAINING_RECORD( work, struct x11drv_native_window, content_remap_work );
+    Display *display = window->content_display;
+
+    if (!window->content_remap_barrier.serial)
+    {
+        XLockDisplay( display );
+        window->content_remap_serial = XNextRequest( display );
+        if (window->content_remap_releasing) XSetWindowBackground( display, window->content, 0 );
+#ifdef SONAME_LIBXCOMPOSITE
+        else
+        {
+            Pixmap pixmap = pXCompositeNameWindowPixmap( display, window->content );
+
+            /* Unmapping the ancestor unrealizes this child and discards its
+             * redirected storage. The background keeps the old storage alive
+             * and initializes the new storage as part of mapping, before any
+             * subsequent retained-DC write. Do not copy an old output back
+             * after mapping: that would overwrite those newer GDI writes. */
+            XSetWindowBackgroundPixmap( display, window->content, pixmap );
+            XFreePixmap( display, pixmap );
+        }
+#endif
+        window->content_remap_end = XNextRequest( display );
+        x11drv_queue_stream_barrier( display, &window->content_remap_barrier );
+        XUnlockDisplay( display );
+    }
+    x11drv_poll_stream_barrier( display, &window->content_remap_barrier, NULL );
+}
+
+static void finish_native_content_preserve( struct client_surface_native_work *work )
+{
+    struct x11drv_native_window *window = CONTAINING_RECORD( work, struct x11drv_native_window, content_remap_work );
+    void (*wake)(void) = window->content_wake;
+
+    if (!window->content_remap_barrier.complete)
+    {
+        client_surface_submit_native_work( work );
+        return;
+    }
+    pthread_mutex_lock( &native_window_mutex );
+    if (window->content_remap_releasing)
+    {
+        client_surface_release_scoped_memory( &window->memory, CLIENT_SURFACE_MEMORY_OUTPUT,
+                                              window->content_remap_bytes );
+        window->content_remap_bytes = 0;
+        window->content_remap_releasing = FALSE;
+    }
+    window->content_remap_preparing = FALSE;
+    trace_window_response( window->content_remap_bytes ? "native_content_preserve_return" :
+                           "native_content_preserve_release", 0, window->content_display, window->window,
+                           window->content_remap_serial, window->content_remap_barrier.serial, NULL,
+                           !InterlockedCompareExchange( &window->content_remap_error, 0, 0 ) );
+    pthread_mutex_unlock( &native_window_mutex );
+    x11drv_native_window_release( window );
+    wake();
+}
+
+NTSTATUS x11drv_native_window_preserve_content( struct x11drv_native_window *window )
+{
+    NTSTATUS status = STATUS_SUCCESS;
+    BOOL prepare = FALSE;
+
+    pthread_mutex_lock( &native_window_mutex );
+    if (window->content_remap_preparing || window->content_remap_releasing) status = STATUS_PENDING;
+    else if (InterlockedCompareExchange( &window->content_error, 0, 0 ) ||
+             InterlockedCompareExchange( &window->content_remap_error, 0, 0 )) status = STATUS_UNSUCCESSFUL;
+    else if (!window->content_remap_bytes && window->content_redirected)
+    {
+        if (!client_surface_reserve_scoped_memory( &window->memory, CLIENT_SURFACE_MEMORY_OUTPUT,
+                                                   window->content_bytes )) status = STATUS_NO_MEMORY;
+        else
+        {
+            window->content_remap_bytes = window->content_bytes;
+            window->content_remap_work.execute = preserve_native_content;
+            window->content_remap_work.finished = finish_native_content_preserve;
+            window->content_remap_barrier = (struct x11drv_stream_barrier){0};
+            window->content_remap_unmapped = FALSE;
+            window->content_remap_preparing = prepare = TRUE;
+            x11drv_native_window_acquire( window );
+            status = STATUS_PENDING;
+        }
+    }
+    pthread_mutex_unlock( &native_window_mutex );
+    if (prepare) client_surface_submit_native_work( &window->content_remap_work );
+    return status;
+}
+
 static void read_native_content_events( struct client_surface_native_work *work )
 {
     struct x11drv_native_window *window = CONTAINING_RECORD( work, struct x11drv_native_window, content_event_work );
     RECT exposed = {0};
     unsigned int count = 0;
+    unsigned long remap_serial;
+    BOOL unmapped, mapped = FALSE, release = FALSE;
     XEvent event;
 
+    pthread_mutex_lock( &native_window_mutex );
+    remap_serial = window->content_remap_bytes && !window->content_remap_preparing &&
+                   !window->content_remap_releasing && !window->content_releasing ? window->content_remap_end : 0;
+    unmapped = window->content_remap_unmapped;
+    pthread_mutex_unlock( &native_window_mutex );
     /* The release barrier also consumes events on this connection. Keep
      * the availability check and removal atomic with respect to that reader,
      * otherwise it can take the last event before XNextEvent and strand us. */
@@ -411,6 +520,11 @@ static void read_native_content_events( struct client_surface_native_work *work 
     {
         XNextEvent( window->content_display, &event );
         ++count;
+        if (remap_serial && event.xany.serial >= remap_serial && event.xany.window == window->window)
+        {
+            if (event.type == UnmapNotify) unmapped = TRUE;
+            else if (event.type == MapNotify && unmapped) mapped = TRUE;
+        }
         if (event.type == Expose && event.xexpose.window == window->window)
         {
             RECT rect = {event.xexpose.x, event.xexpose.y,
@@ -420,9 +534,20 @@ static void read_native_content_events( struct client_surface_native_work *work 
     }
     XUnlockDisplay( window->content_display );
     pthread_mutex_lock( &native_window_mutex );
+    if (remap_serial && !window->content_releasing)
+    {
+        window->content_remap_unmapped = unmapped;
+        if (mapped)
+        {
+            window->content_remap_releasing = release = TRUE;
+            window->content_remap_barrier = (struct x11drv_stream_barrier){0};
+            x11drv_native_window_acquire( window );
+        }
+    }
     add_bounds_rect( &window->content_expose, &exposed );
     window->content_event_pending |= count == 128;
     pthread_mutex_unlock( &native_window_mutex );
+    if (release) client_surface_submit_native_work( &window->content_remap_work );
     if (!IsRectEmpty( &exposed ))
         trace_window_response( "native_expose_read", 0, window->content_display, window->window, 0, 0, &exposed, TRUE );
 }
@@ -554,6 +679,12 @@ static void release_native_content( struct client_surface_native_work *work )
 {
 #ifdef SONAME_LIBXCOMPOSITE
     struct x11drv_native_window *window = CONTAINING_RECORD( work, struct x11drv_native_window, content_release_work );
+    BOOL pending;
+
+    pthread_mutex_lock( &native_window_mutex );
+    pending = window->content_remap_preparing || window->content_remap_releasing;
+    pthread_mutex_unlock( &native_window_mutex );
+    if (pending) return;
 
     if (!window->content_display)
     {
@@ -562,6 +693,9 @@ static void release_native_content( struct client_surface_native_work *work )
     }
     if (!window->content_barrier.serial)
     {
+        /* Cancellation may retire the target before it ever remaps. Drop
+         * the background reference on this same receipt as Unredirect. */
+        if (window->content_remap_bytes) XSetWindowBackground( window->content_display, window->content, 0 );
         if (!InterlockedCompareExchange( &window->content_error, 0, 0 ))
             pXCompositeUnredirectWindow( window->content_display, window->content, CompositeRedirectAutomatic );
         x11drv_queue_stream_barrier( window->content_display, &window->content_barrier );
@@ -624,6 +758,9 @@ static void finish_native_content_release( struct client_surface_native_work *wo
     }
     client_surface_release_scoped_memory( &window->memory, CLIENT_SURFACE_MEMORY_OUTPUT, window->content_release_bytes );
     window->content_release_bytes = 0;
+    client_surface_release_scoped_memory( &window->memory, CLIENT_SURFACE_MEMORY_OUTPUT,
+                                          window->content_remap_bytes );
+    window->content_remap_bytes = 0;
     window->content_releasing = FALSE;
     window->content_event_pending = TRUE;
     window->content_barrier = (struct x11drv_stream_barrier){0};
@@ -853,7 +990,8 @@ static void free_native_window( struct client_surface_native_work *work )
     if (native_root == window) native_root = NULL; /* retain root_owned until another root is selected */
     list_remove( &window->desktop_entry );
     pthread_mutex_unlock( &native_window_mutex );
-    client_surface_release_scoped_memory( &window->memory, CLIENT_SURFACE_MEMORY_OUTPUT, window->content_bytes );
+    client_surface_release_scoped_memory( &window->memory, CLIENT_SURFACE_MEMORY_OUTPUT,
+                                          window->content_bytes + window->content_remap_bytes );
     client_surface_free_owned_metadata( &window->memory, window, sizeof(*window) );
     x11drv_return_release_capacity( 1, sizeof(*window) );
     TRACE_(csperf)( "event=native_window_return record=0x%lx bytes=%zu\n", identity, sizeof(*window) );
@@ -4657,7 +4795,6 @@ NTSTATUS X11DRV_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_hint,
     BOOL enable_client_surface_backing = !!(swp_flags & WINE_SWP_CLIENT_SURFACE_BACKING_ENABLE);
     BOOL disable_client_surface_backing = !!(swp_flags & WINE_SWP_CLIENT_SURFACE_BACKING_DISABLE);
     struct client_surface_owner_notifications *owner_update;
-    BOOL deferred;
     NTSTATUS status = STATUS_SUCCESS;
     UINT64 geometry_scope;
 
@@ -4686,10 +4823,10 @@ NTSTATUS X11DRV_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_hint,
                 NtUserPostMessage( toplevel, WM_WINE_UPDATEWINDOWSTATE, WINE_UPDATE_CLIENT_SURFACE_HANDOFFS, 0 );
         }
     }
-    owner_update = X11DRV_client_surface_backing_begin_update( hwnd, new_rects, swp_flags, &deferred );
+    owner_update = X11DRV_client_surface_backing_begin_update( hwnd, new_rects, swp_flags, is_managed, &status );
     /* This exact target owns the deferred state reasons and its GUI wake.
      * No native preparation or STAGED result has run yet. */
-    if (deferred)
+    if (status == STATUS_PENDING)
     {
         if ((data = get_win_data( hwnd )))
         {
@@ -4703,6 +4840,7 @@ NTSTATUS X11DRV_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_hint,
         }
         return STATUS_PENDING;
     }
+    if (status) return status;
     if (!(data = get_win_data( hwnd )))
     {
         if (owner_update) X11DRV_client_surface_backing_end_update( NULL, owner_update );
@@ -5016,11 +5154,11 @@ void X11DRV_SetWindowIcons( HWND hwnd, HICON icon, const ICONINFO *ii, HICON ico
 void X11DRV_SetWindowRgn( HWND hwnd, HRGN hrgn, BOOL redraw )
 {
     struct x11drv_win_data *data;
-    BOOL deferred;
+    NTSTATUS status;
     struct client_surface_owner_notifications *owner_update =
-        X11DRV_client_surface_backing_begin_update( hwnd, NULL, 0, &deferred );
+        X11DRV_client_surface_backing_begin_update( hwnd, NULL, 0, FALSE, &status );
 
-    if (deferred) return;
+    if (status) return;
 
     if ((data = get_win_data( hwnd )))
     {

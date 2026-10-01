@@ -830,7 +830,7 @@ extern void X11DRV_client_surface_backing_cancel_allocation( struct x11drv_win_d
 extern BOOL X11DRV_client_surface_bind_producers( HWND toplevel );
 struct client_surface_owner_notifications;
 extern struct client_surface_owner_notifications *X11DRV_client_surface_backing_begin_update(
-    HWND hwnd, const struct window_rects *rects, UINT swp_flags, BOOL *deferred );
+    HWND hwnd, const struct window_rects *rects, UINT swp_flags, BOOL managed, NTSTATUS *status );
 extern UINT X11DRV_client_surface_backing_resume_update( HWND hwnd, UINT64 serial,
                                                          struct client_surface_owner_notifications **notifications );
 extern void X11DRV_client_surface_backing_finish_deferred_update( HWND hwnd, UINT64 serial,
@@ -950,6 +950,7 @@ extern Window x11drv_native_window_read_drawable( const struct x11drv_native_win
 extern Window x11drv_native_window_content_read_init( struct x11drv_native_window_read *read,
                                                       struct x11drv_native_window *window, UINT64 epoch );
 extern Window x11drv_native_window_content( const struct x11drv_native_window *window );
+extern NTSTATUS x11drv_native_window_preserve_content( struct x11drv_native_window *window );
 extern NTSTATUS x11drv_native_window_prepare_content( struct x11drv_native_window *window,
                                                       unsigned int width, unsigned int height, unsigned int depth,
                                                       UINT64 *epoch, void (*wake)(void) );

@@ -268,6 +268,8 @@ struct client_surface_compositor_target
     UINT64 deferred_update;
     BOOL update_notified;
     BOOL update_resumed;
+    BOOL preserve_content;
+    NTSTATUS preserve_status;
     UINT deferred_update_types;
     struct client_surface_compositor_mailbox *mailbox;
     DWORD shrink_start;
@@ -631,7 +633,8 @@ struct client_surface_compositor_job
             struct client_surface_owner_notifications *notifications;
             UINT64 mark;
             unsigned int count;
-            BOOL invalidate_scene, deferred;
+            BOOL invalidate_scene, preserve_content;
+            NTSTATUS status;
             UINT types;
         } update;
     } u;
@@ -4707,8 +4710,11 @@ static BOOL client_surface_compositor_update_ready( struct client_surface_compos
         pthread_mutex_unlock( &client_surface_compositor_mutex );
         if (incoming) return FALSE;
     }
-    return (!queue->head || (until && queue->head->sequence >= until->sequence)) &&
-           (!queue->control_head || (until && queue->control_head->sequence >= until->sequence));
+    if ((queue->head && (!until || queue->head->sequence < until->sequence)) ||
+        (queue->control_head && (!until || queue->control_head->sequence < until->sequence))) return FALSE;
+    if (target->preserve_content)
+        target->preserve_status = x11drv_native_window_preserve_content( target->window_owner );
+    return !target->preserve_content || target->preserve_status != STATUS_PENDING;
 }
 
 /* The existing geometry observation owns this continuation and its release
@@ -4804,6 +4810,7 @@ static BOOL execute_client_surface_compositor_job( struct client_surface_composi
         if (job->op == CLIENT_SURFACE_COMPOSITOR_TRY_BEGIN_UPDATE)
         {
             quiesce_client_surface_compositor_target( target );
+            target->preserve_content |= job->u.update.preserve_content;
             if (!client_surface_compositor_update_ready( target, job ))
             {
                 if (!target->deferred_update)
@@ -4812,10 +4819,21 @@ static BOOL execute_client_surface_compositor_job( struct client_surface_composi
                     target->deferred_update = client_surface_native_update_serial;
                 }
                 target->deferred_update_types |= job->u.update.types;
-                job->u.update.deferred = TRUE;
+                job->u.update.status = STATUS_PENDING;
                 TRACE( "deferring native state update %s for %p\n",
                        wine_dbgstr_longlong( target->deferred_update ), target->toplevel );
                 return FALSE;
+            }
+            if (target->preserve_content)
+            {
+                job->u.update.status = target->preserve_status;
+                target->preserve_content = FALSE;
+                if (job->u.update.status)
+                {
+                    target->deferred_update_types &= ~job->u.update.types;
+                    target->quiescing = target->native_updates || target->deferred_update;
+                    return FALSE;
+                }
             }
         }
         if (job->op != CLIENT_SURFACE_COMPOSITOR_END_UPDATE)
@@ -5639,7 +5657,7 @@ static void enqueue_client_surface_compositor_job( struct client_surface_composi
     if (job->op == CLIENT_SURFACE_COMPOSITOR_PRESENT)
         job->u.present.started = job->u.present.done = FALSE;
     if (job->op == CLIENT_SURFACE_COMPOSITOR_TRY_BEGIN_UPDATE)
-        job->u.update.deferred = FALSE;
+        job->u.update.status = STATUS_SUCCESS;
     *client_surface_compositor_tail = job;
     client_surface_compositor_tail = &job->next;
     wake_client_surface_compositor();
@@ -6238,7 +6256,7 @@ static void remove_client_surface_backing_target( HWND toplevel )
 }
 
 struct client_surface_owner_notifications *X11DRV_client_surface_backing_begin_update(
-    HWND hwnd, const struct window_rects *rects, UINT swp_flags, BOOL *deferred )
+    HWND hwnd, const struct window_rects *rects, UINT swp_flags, BOOL managed, NTSTATUS *status )
 {
     const UINT no_geometry = SWP_NOSIZE | SWP_NOMOVE | SWP_NOCLIENTSIZE | SWP_NOCLIENTMOVE | SWP_NOZORDER;
     struct x11drv_win_data *data;
@@ -6258,9 +6276,11 @@ struct client_surface_owner_notifications *X11DRV_client_surface_backing_begin_u
         },
     };
 
-    if (deferred) *deferred = FALSE;
+    *status = STATUS_SUCCESS;
     if (!(data = get_win_data( hwnd ))) return NULL;
     backing = !!data->client_surface_backing;
+    job.u.update.preserve_content = managed && !data->managed &&
+        data->desired_state.wm_state != WithdrawnState;
     /* A state-only refresh does not change the plan's placement or clip.
      * The server roster/epoch check continues
      * to invalidate topology and producer changes. Be conservative for
@@ -6276,7 +6296,7 @@ struct client_surface_owner_notifications *X11DRV_client_surface_backing_begin_u
      * wake and update reasons until the native receipt arrives; publication
      * is acknowledged only by the normal generation-checked replay. */
     backing = submit_client_surface_compositor_job( &job );
-    *deferred = job.u.update.deferred;
+    *status = job.u.update.status;
     return backing ? job.u.update.notifications : NULL;
 }
 
