@@ -952,7 +952,8 @@ extern Window x11drv_native_window_content_read_init( struct x11drv_native_windo
 extern Window x11drv_native_window_content( const struct x11drv_native_window *window );
 extern NTSTATUS x11drv_native_window_prepare_content( struct x11drv_native_window *window,
                                                       unsigned int width, unsigned int height, unsigned int depth,
-                                                      UINT64 *epoch );
+                                                      UINT64 *epoch, void (*wake)(void) );
+extern BOOL x11drv_native_window_content_ready( struct x11drv_native_window *window );
 extern void x11drv_native_window_release_content( struct x11drv_native_window *window, UINT64 epoch, BOOL reset );
 extern NTSTATUS x11drv_native_window_seed_begin( struct x11drv_native_window_read *read );
 extern void x11drv_native_window_seed_end( struct x11drv_native_window_read *read );

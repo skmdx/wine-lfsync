@@ -184,10 +184,11 @@ struct x11drv_native_window
 {
     struct client_surface_memory_scope memory;
     struct client_surface_native_work work;
+    struct client_surface_native_work content_prepare_work;
     struct client_surface_native_work content_release_work;
     struct x11drv_error_handler errors;
     struct x11drv_stream_barrier gdi_barrier, destroy_barrier;
-    struct x11drv_stream_barrier content_barrier;
+    struct x11drv_stream_barrier content_prepare_barrier, content_barrier;
     struct list desktop_entry;
     struct x11drv_display_owner *creator;
     struct x11drv_native_window *ancestor;
@@ -201,6 +202,8 @@ struct x11drv_native_window
     UINT64 content_epoch;
     LONG content_error;
     BOOL content_redirected;
+    BOOL content_preparing, content_releasing;
+    void (*content_wake)(void);
     BOOL content_naming, content_release_waiting;
     BOOL content_resize_failed;
     Colormap colormap;
@@ -220,6 +223,7 @@ static int native_window_error( Display *display, XErrorEvent *event, void *arg 
     if (display == gdi_display && x11drv_stream_barrier_error( &window->gdi_barrier, event )) return 1;
     if (display != window->display) return 0;
     if (x11drv_stream_barrier_error( &window->destroy_barrier, event )) return 1;
+    if (x11drv_stream_barrier_error( &window->content_prepare_barrier, event )) return 1;
     if (x11drv_stream_barrier_error( &window->content_barrier, event )) return 1;
     if (window->content_serial && event->serial == window->content_serial)
     {
@@ -304,17 +308,67 @@ static UINT64 native_content_capacity( unsigned int width, unsigned int height, 
     return 2 * (UINT64)width * height * (depth > 16 ? 4 : depth > 8 ? 2 : 1);
 }
 
+static void prepare_native_content( struct client_surface_native_work *work )
+{
+#ifdef SONAME_LIBXCOMPOSITE
+    struct x11drv_native_window *window = CONTAINING_RECORD( work, struct x11drv_native_window, content_prepare_work );
+
+    if (!window->content_prepare_barrier.serial)
+    {
+        XLockDisplay( window->display );
+        window->content_serial = XNextRequest( window->display );
+        pXCompositeRedirectWindow( window->display, window->content, CompositeRedirectAutomatic );
+        x11drv_queue_stream_barrier( window->display, &window->content_prepare_barrier );
+        XUnlockDisplay( window->display );
+    }
+    x11drv_poll_stream_barrier( window->display, &window->content_prepare_barrier, window->creator );
+#endif
+}
+
+static void finish_native_content_prepare( struct client_surface_native_work *work )
+{
+    struct x11drv_native_window *window = CONTAINING_RECORD( work, struct x11drv_native_window, content_prepare_work );
+    void (*wake)(void) = window->content_wake;
+    BOOL release;
+
+    if (!window->content_prepare_barrier.complete)
+    {
+        client_surface_submit_native_work( work );
+        return;
+    }
+    pthread_mutex_lock( &native_window_mutex );
+    window->content_preparing = FALSE;
+    window->content_prepare_barrier = (struct x11drv_stream_barrier){0};
+    release = window->content_releasing;
+    pthread_mutex_unlock( &native_window_mutex );
+    if (release) client_surface_submit_native_work( &window->content_release_work );
+    x11drv_native_window_release( window );
+    wake();
+}
+
+BOOL x11drv_native_window_content_ready( struct x11drv_native_window *window )
+{
+    BOOL ready;
+
+    pthread_mutex_lock( &native_window_mutex );
+    ready = !window->content_preparing && !window->content_releasing;
+    pthread_mutex_unlock( &native_window_mutex );
+    return ready;
+}
+
 NTSTATUS x11drv_native_window_prepare_content( struct x11drv_native_window *window,
                                                unsigned int width, unsigned int height, unsigned int depth,
-                                               UINT64 *epoch )
+                                               UINT64 *epoch, void (*wake)(void) )
 {
 #ifdef SONAME_LIBXCOMPOSITE
     UINT64 bytes = native_content_capacity( width, height, depth );
     NTSTATUS status = STATUS_SUCCESS;
+    BOOL prepare = FALSE;
 
     if (!pXCompositeRedirectWindow || window->content == window->window) return STATUS_NOT_SUPPORTED;
     pthread_mutex_lock( &native_window_mutex );
-    if (window->content_release_bytes) status = STATUS_PENDING;
+    bytes = max( bytes, native_content_capacity( window->content_width, window->content_height, depth ) );
+    if (window->content_releasing) status = STATUS_PENDING;
     else if (window->content_resize_failed) status = STATUS_NO_MEMORY;
     else if (InterlockedCompareExchange( &window->content_error, 0, 0 )) status = STATUS_UNSUCCESSFUL;
     else if (bytes > window->content_bytes &&
@@ -322,20 +376,25 @@ NTSTATUS x11drv_native_window_prepare_content( struct x11drv_native_window *wind
                                                    bytes - window->content_bytes )) status = STATUS_NO_MEMORY;
     else
     {
+        /* Admission owns the lease immediately. Cancellation may drop its
+         * last user before Redirect returns; release then follows this work
+         * instead of freeing the Window or overtaking the native request. */
         window->content_bytes = max( bytes, window->content_bytes );
         ++window->content_users;
         if (!window->content_redirected)
         {
             ++window->content_epoch;
-            XLockDisplay( window->display );
-            window->content_serial = XNextRequest( window->display );
-            pXCompositeRedirectWindow( window->display, window->content, CompositeRedirectAutomatic );
-            XUnlockDisplay( window->display );
+            window->content_wake = wake;
+            window->content_prepare_work.execute = prepare_native_content;
+            window->content_prepare_work.finished = finish_native_content_prepare;
+            window->content_preparing = prepare = TRUE;
+            x11drv_native_window_acquire( window );
             window->content_redirected = TRUE;
         }
         *epoch = window->content_epoch;
     }
     pthread_mutex_unlock( &native_window_mutex );
+    if (prepare) client_surface_submit_native_work( &window->content_prepare_work );
     return status;
 #else
     return STATUS_NOT_SUPPORTED;
@@ -344,41 +403,58 @@ NTSTATUS x11drv_native_window_prepare_content( struct x11drv_native_window *wind
 
 static void release_native_content( struct client_surface_native_work *work )
 {
+#ifdef SONAME_LIBXCOMPOSITE
     struct x11drv_native_window *window = CONTAINING_RECORD( work, struct x11drv_native_window, content_release_work );
 
+    if (!window->content_barrier.serial)
+    {
+        if (!InterlockedCompareExchange( &window->content_error, 0, 0 ))
+            pXCompositeUnredirectWindow( window->display, window->content, CompositeRedirectAutomatic );
+        x11drv_queue_stream_barrier( window->display, &window->content_barrier );
+    }
     x11drv_poll_stream_barrier( window->display, &window->content_barrier, window->creator );
+#endif
 }
 
 static BOOL resize_native_content( struct x11drv_win_data *data, unsigned int width, unsigned int height )
 {
     struct x11drv_native_window *window = data->native_window;
     UINT64 bytes = native_content_capacity( width, height, data->vis.depth );
-    BOOL success = TRUE;
+    BOOL success = TRUE, resize = FALSE;
 
     if (data->content_window == data->whole_window) return TRUE;
     pthread_mutex_lock( &native_window_mutex );
     if (window->content_width != width || window->content_height != height)
     {
-        if (window->content_redirected && bytes > window->content_bytes &&
+        UINT64 *reserved = window->content_releasing ? &window->content_release_bytes : &window->content_bytes;
+
+        /* An accepted Unredirect is not yet a receipt. A concurrent resize
+         * still owns any larger redirected backing until that receipt. */
+        if ((window->content_redirected || window->content_releasing) && bytes > *reserved &&
             !client_surface_reserve_scoped_memory( &window->memory, CLIENT_SURFACE_MEMORY_OUTPUT,
-                                                  bytes - window->content_bytes )) success = FALSE;
+                                                  bytes - *reserved )) success = FALSE;
         else
         {
-            if (window->content_redirected) window->content_bytes = max( bytes, window->content_bytes );
-            XResizeWindow( window->display, window->content, width, height );
+            if (window->content_redirected || window->content_releasing) *reserved = max( bytes, *reserved );
+            resize = TRUE;
             window->content_width = width;
             window->content_height = height;
-            ++data->client_surface_native_revision;
         }
     }
     window->content_resize_failed = !success;
     pthread_mutex_unlock( &native_window_mutex );
+    if (resize)
+    {
+        XResizeWindow( window->display, window->content, width, height );
+        ++data->client_surface_native_revision;
+    }
     return success;
 }
 
 static void finish_native_content_release( struct client_surface_native_work *work )
 {
     struct x11drv_native_window *window = CONTAINING_RECORD( work, struct x11drv_native_window, content_release_work );
+    void (*wake)(void) = window->content_wake;
 
     if (!window->content_barrier.complete)
     {
@@ -392,18 +468,20 @@ static void finish_native_content_release( struct client_surface_native_work *wo
         pthread_mutex_unlock( &native_window_mutex );
         return;
     }
-    pthread_mutex_unlock( &native_window_mutex );
     client_surface_release_scoped_memory( &window->memory, CLIENT_SURFACE_MEMORY_OUTPUT, window->content_release_bytes );
-    pthread_mutex_lock( &native_window_mutex );
     window->content_release_bytes = 0;
+    window->content_releasing = FALSE;
     window->content_barrier = (struct x11drv_stream_barrier){0};
     pthread_mutex_unlock( &native_window_mutex );
     x11drv_native_window_release( window );
+    wake();
 }
 
 void x11drv_native_window_release_content( struct x11drv_native_window *window, UINT64 epoch, BOOL reset )
 {
 #ifdef SONAME_LIBXCOMPOSITE
+    BOOL release;
+
     pthread_mutex_lock( &native_window_mutex );
     if (!window->content_redirected || window->content_epoch != epoch)
     {
@@ -418,17 +496,16 @@ void x11drv_native_window_release_content( struct x11drv_native_window *window, 
         pthread_mutex_unlock( &native_window_mutex );
         return;
     }
-    if (!InterlockedCompareExchange( &window->content_error, 0, 0 ))
-        pXCompositeUnredirectWindow( window->display, window->content, CompositeRedirectAutomatic );
     window->content_redirected = FALSE;
+    window->content_releasing = TRUE;
     window->content_release_bytes = window->content_bytes;
     window->content_bytes = 0;
     window->content_release_work.execute = release_native_content;
     window->content_release_work.finished = finish_native_content_release;
     x11drv_native_window_acquire( window );
-    x11drv_queue_stream_barrier( window->display, &window->content_barrier );
+    release = !window->content_preparing;
     pthread_mutex_unlock( &native_window_mutex );
-    client_surface_submit_native_work( &window->content_release_work );
+    if (release) client_surface_submit_native_work( &window->content_release_work );
 #endif
 }
 
@@ -467,6 +544,9 @@ BOOL x11drv_native_window_read_ready( struct x11drv_native_window_read *read )
 {
     struct x11drv_native_window *window = read->window;
 
+    /* The creator-stream marker must follow Redirect/Unredirect, including
+     * when the worker issuing that request has not acquired Display yet. */
+    if (!x11drv_native_window_content_ready( window )) return FALSE;
     /* Geometry must reach the server before a private query or copy.
      * Later scene changes still invalidate adoption of the owned result. */
     if (!read->geometry.complete)

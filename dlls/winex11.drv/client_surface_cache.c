@@ -18,6 +18,7 @@
 
 #include <assert.h>
 #include <fcntl.h>
+#include <poll.h>
 
 #include "x11drv.h"
 #include "client_surface.h"
@@ -760,6 +761,11 @@ static void execute_native_present( struct client_surface_native_work *work )
     const RECT *rect = present->committing ? &present->commit_rect :
                       IsRectEmpty( &present->copy_rect ) ? &full : &present->copy_rect;
 
+    if ((present->waiting = !x11drv_native_window_content_ready( present->window_owner )))
+    {
+        poll( NULL, 0, 1 );
+        return;
+    }
     if (!open_cache_display( worker )) return;
     display = worker->display;
     worker->error = 0;
@@ -789,6 +795,13 @@ static void finish_native_present( struct client_surface_native_work *work )
     struct client_surface_native_present *present = CONTAINING_RECORD( work, struct client_surface_native_present, work );
     void (*wake)(void) = present->wake;
 
+    if (present->waiting)
+    {
+        pthread_mutex_lock( &cache_mutex );
+        queue_native_work( select_existing_worker( present_workers, present_worker_count, &next_present_worker ), work );
+        pthread_mutex_unlock( &cache_mutex );
+        return;
+    }
     /* The actor keeps the lane across the SOURCE commit and current-content
      * publication, releasing it only after the final checked copy. */
     WriteRelease( &present->complete, TRUE );

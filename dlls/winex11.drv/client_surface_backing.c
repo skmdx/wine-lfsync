@@ -1623,6 +1623,7 @@ static BOOL submit_client_surface_present( struct client_surface_compositor_targ
     frame->publish_pending = !!publish_generation;
     frame->request_pending = TRUE;
     frame->native_present = (struct client_surface_native_present){
+        .window_owner = target->window_owner,
         .window = target->present_window, .content = x11drv_native_window_content( target->window_owner ),
         .pixmap = frame->pixmap, .serial = serial,
         .width = target->window_width, .height = target->window_height, .copy = TRUE,
@@ -2476,7 +2477,7 @@ static BOOL create_client_surface_present_window( struct client_surface_composit
 {
     NTSTATUS status = x11drv_native_window_prepare_content( target->window_owner, target->window_width,
                                                             target->window_height, target->depth,
-                                                            &target->content_epoch );
+                                                            &target->content_epoch, wake_client_surface_compositor );
 
     if (status && status != STATUS_NOT_SUPPORTED) return FALSE;
     if (status == STATUS_NOT_SUPPORTED) target->content_epoch = 0;
@@ -2748,7 +2749,8 @@ static BOOL process_client_surface_seed_requests(void)
         target = find_client_surface_compositor_target( allocation->release.toplevel );
         if (abandoned || !client_surface_seed_current( allocation, target )) goto failed;
         status = x11drv_native_window_prepare_content( allocation->window_owner,
-            allocation->window_width, allocation->window_height, allocation->depth, &allocation->content_epoch );
+            allocation->window_width, allocation->window_height, allocation->depth, &allocation->content_epoch,
+            wake_client_surface_compositor );
         if (status == STATUS_PENDING)
         {
             list_add_tail( &client_surface_seed_requests, &allocation->seed_entry );
@@ -2923,6 +2925,7 @@ static BOOL install_client_surface_direct_plan( struct client_surface_compositor
         scene_id = job->scan.generation;
         if (!target || !get_client_surface_direct_scene( job->toplevel, scene_id, &current )) goto done;
         accepted = TRUE;
+        if (job->scan.phase == 2) goto done;
         goto sweep;
     }
     /* The shared candidate is only an early rejection hint. The prepare and
@@ -3009,6 +3012,8 @@ sweep:
         .direct_owner = x11drv_native_window_acquire( job->u.direct_plan.source_owner ),
     };
     hide_client_surface_present_window( target );
+    job->scan.phase = 2;
+    if (!x11drv_native_window_content_ready( target->window_owner )) *done = FALSE;
     update_client_surface_notification_plan( target );
     SetRectEmpty( &target->restore_rect );
     TRACE( "owner DIRECT_ATTACH hwnd %p scene %s identity %s drawable %#lx\n",
@@ -4686,7 +4691,7 @@ static BOOL client_surface_compositor_update_ready( struct client_surface_compos
     const struct client_surface_compositor_queue *queue = target->notifications->queue;
     unsigned int i;
 
-    if (target->native_updates) return FALSE;
+    if (target->native_updates || !x11drv_native_window_content_ready( target->window_owner )) return FALSE;
     /* A state notification can also follow a topology change. Do not wait
      * for unissued output from the server's invalidated scene before
      * allowing the GUI to adopt its replacement. Executing requests retain
@@ -4905,7 +4910,7 @@ static BOOL client_surface_compositor_job_ready( struct client_surface_composito
     /* Authenticated DIRECT admission has already invalidated the old plan.
      * Its continuation only retires bindings and rechecks the selected scene. */
     if (job->op == CLIENT_SURFACE_COMPOSITOR_DIRECT_PLAN && job->scan.phase)
-        return TRUE;
+        return job->scan.phase != 2 || !target || x11drv_native_window_content_ready( target->window_owner );
     if (job->op == CLIENT_SURFACE_COMPOSITOR_DIRECT_PLAN)
     {
         struct client_surface_window_query *query = &job->u.direct_plan.query;

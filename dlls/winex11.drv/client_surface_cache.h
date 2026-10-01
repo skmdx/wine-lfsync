@@ -25,6 +25,7 @@ struct client_surface_native_present
     struct client_surface_native_work work;
     struct client_surface_native_present *next;
     struct client_surface_native_present_queue *queue;
+    struct x11drv_native_window *window_owner; /* retained by the admitted frame */
     Window window, content;
     Pixmap pixmap;
     unsigned int width, height, serial;
@@ -33,7 +34,7 @@ struct client_surface_native_present
     XRectangle *shape;
     unsigned int shape_count;
     RECT commit_rect;
-    BOOL committing;
+    BOOL committing, waiting;
     BOOL copy, copied, success, complete;
     void (*wake)(void);
 };
