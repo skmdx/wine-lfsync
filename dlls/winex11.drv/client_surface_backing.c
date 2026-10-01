@@ -1499,8 +1499,7 @@ static void process_client_surface_present_events( struct client_surface_composi
 {
     RECT rect;
 
-    if (target->present_window && x11drv_native_window_take_expose( target->window_owner, &rect ) &&
-        target->scene.valid && target->scene.strategy == OWNER_COMPOSITE)
+    if (target->present_window && x11drv_native_window_take_expose( target->window_owner, &rect ))
         add_bounds_rect( &target->restore_rect, &rect );
 }
 
@@ -2506,7 +2505,7 @@ static BOOL update_client_surface_compositor_target( struct client_surface_compo
         target->window_height != job->u.pool.window_height || target->depth != job->u.pool.depth || target->visual != job->u.pool.visual)
     {
         target->scene.valid = FALSE;
-        SetRectEmpty( &target->restore_rect );
+        if (target->window != job->u.pool.destination) SetRectEmpty( &target->restore_rect );
     }
     if (target->assembly_pending &&
         (target->window != job->u.pool.destination || target->backing != job->u.pool.pixmaps[0] ||
@@ -3085,8 +3084,15 @@ static BOOL complete_client_surface_direct_plan( const struct client_surface_com
 
 static BOOL client_surface_compositor_restore_ready( const struct client_surface_compositor_target *target )
 {
+    struct client_surface_scene scene;
     unsigned int i;
 
+    /* Expose is an obligation on this Window, even when its owned delivery
+     * races a scene transaction. Keep it until the new plan can restore it. */
+    if (target->quiescing || !target->scene.valid || target->scene.strategy != OWNER_COMPOSITE ||
+        !client_surface_get_toplevel_scene( target->toplevel, &scene ) ||
+        !target->published || target->published_width < target->window_width ||
+        target->published_height < target->window_height) return FALSE;
     for (i = 0; i < ARRAY_SIZE(target->frames); ++i)
         if (target->frames[i].serial &&
             (target->frames[i].request_pending || !target->frames[i].complete ||
@@ -3097,13 +3103,8 @@ static BOOL client_surface_compositor_restore_ready( const struct client_surface
 static BOOL restore_client_surface_compositor_pixels( struct client_surface_compositor_target *target )
 {
     RECT rect = target->restore_rect;
-    struct client_surface_scene scene;
 
-    SetRectEmpty( &target->restore_rect );
     if (IsRectEmpty( &rect )) return TRUE;
-    if (!client_surface_get_toplevel_scene( target->toplevel, &scene )) return FALSE;
-    if (!target->published || target->published_width < target->window_width ||
-        target->published_height < target->window_height) return FALSE;
     TRACE( "restoring target %p window %#lx from published pixmap %#lx rect %s\n",
            target->toplevel, target->window, target->published, wine_dbgstr_rect( &rect ) );
     {
@@ -3113,7 +3114,11 @@ static BOOL restore_client_surface_compositor_pixels( struct client_surface_comp
          * actor-side XSync, and later publications join the same Window FIFO. */
         for (i = 0; i < ARRAY_SIZE(target->frames); ++i)
             if (target->frames[i].pixmap == target->published)
-                return submit_client_surface_present( target, &target->frames[i], 0, 0, &rect, NULL, NULL, NULL );
+            {
+                if (!submit_client_surface_present( target, &target->frames[i], 0, 0, &rect, NULL, NULL, NULL )) return FALSE;
+                SetRectEmpty( &target->restore_rect );
+                return TRUE;
+            }
         return FALSE;
     }
 }
@@ -3122,8 +3127,11 @@ static BOOL process_client_surface_compositor_restore( struct client_surface_com
 {
     if (IsRectEmpty( &target->restore_rect ) || !client_surface_compositor_restore_ready( target )) return FALSE;
     if (!restore_client_surface_compositor_pixels( target ))
+    {
         NtUserPostMessage( target->toplevel, WM_WINE_UPDATEWINDOWSTATE,
                            WINE_UPDATE_CLIENT_SURFACE_HANDOFFS, 0 );
+        return FALSE;
+    }
     return TRUE;
 }
 
