@@ -690,15 +690,20 @@ static BOOL steal_cache_work( struct cache_worker *worker )
         if (from == worker) continue;
         for (cursor = &from->head; (work = *cursor); cursor = &work->next)
         {
-            struct client_surface_cache_image *image;
+            struct client_surface_cache_image *image = NULL;
 
-            if (work->execute != execute_cache_image) continue;
-            image = CONTAINING_RECORD( work, struct client_surface_cache_image, work );
-            if (image->started || image->operation == CACHE_RELEASE) continue;
+            if (work->execute == execute_cache_image)
+            {
+                image = CONTAINING_RECORD( work, struct client_surface_cache_image, work );
+                if (image->started || image->operation == CACHE_RELEASE) continue;
+            }
             if (!(*cursor = work->next)) from->tail = cursor;
             --from->pending;
-            image->worker = worker;
-            if (image->operation == CACHE_CREATE) image->owner = worker;
+            if (image)
+            {
+                image->worker = worker;
+                if (image->operation == CACHE_CREATE) image->owner = worker;
+            }
             queue_native_work( worker, work );
             return TRUE;
         }
@@ -715,6 +720,10 @@ static void cache_worker_thread( void *context )
     for (;;)
     {
         pthread_mutex_lock( &cache_mutex );
+        /* A queue of admission retries can stay nonempty without making
+         * native progress. Service peers even then: generic owned work may
+         * have been placed behind a stalled call during its last retry. */
+        if (worker->cache) steal_cache_work( worker );
         while (!worker->head)
         {
             /* Only cache executors steal work. Present has its own lanes,
@@ -810,9 +819,12 @@ BOOL client_surface_prepare_native_work(void)
 
 void client_surface_submit_native_work( struct client_surface_native_work *work )
 {
+    unsigned int i;
+
     pthread_mutex_lock( &cache_mutex );
     assert( worker_count );
     queue_native_work( select_existing_cache_worker(), work );
+    for (i = 0; i < worker_count; ++i) pthread_cond_signal( &cache_workers[i].cond );
     pthread_mutex_unlock( &cache_mutex );
 }
 
