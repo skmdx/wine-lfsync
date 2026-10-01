@@ -2380,6 +2380,7 @@ DECL_HANDLER(complete_client_surface_handoffs)
     reply->accepted = 0;
     if (!(win = get_window( req->handle ))) return;
     top = get_toplevel_window( win );
+    if (win != top) return;
     if (!top->thread || top->thread->process != current->process)
     {
         set_error( STATUS_ACCESS_DENIED );
@@ -2469,6 +2470,7 @@ DECL_HANDLER(cancel_client_surface_handoffs)
 
     if (!win) return;
     top = get_toplevel_window( win );
+    if (win != top) return;
     if (!top->thread || top->thread->process != current->process)
     {
         set_error( STATUS_ACCESS_DENIED );
@@ -2492,6 +2494,7 @@ DECL_HANDLER(publish_client_surface_handoff)
     reply->accepted = 0;
     if (!(win = get_window( req->handle ))) return;
     top = get_toplevel_window( win );
+    if (win != top) return;
     if (!top->thread || top->thread->process != current->process)
     {
         set_error( STATUS_ACCESS_DENIED );
@@ -5919,6 +5922,8 @@ DECL_HANDLER(set_client_surface_state)
     if (!(win = get_window( req->handle ))) return;
     top = get_toplevel_window( win );
     was_pending = top->client_surface_dirty;
+    if (win != top && (req->flags & (CLIENT_SURFACE_STATE_PUBLISH_BEGIN |
+                                    CLIENT_SURFACE_STATE_PUBLISH_COMMIT))) return;
     if (req->flags & CLIENT_SURFACE_STATE_PUBLISH_RESUME)
     {
         if (req->flags != CLIENT_SURFACE_STATE_PUBLISH_RESUME || req->surface || win != top)

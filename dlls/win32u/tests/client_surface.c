@@ -3819,6 +3819,101 @@ static void check_staged_handoff_exposure( HWND hwnd, const struct client_surfac
     }
 }
 
+static void test_handoff_owner_binding(void)
+{
+    const UINT64 identity = allocate_surface();
+    struct handoff_binding producer = {0}, owner = {0};
+    struct client_surface_handoff_receipt receipt;
+    struct surface_state state, before, child_state;
+    struct __server_request_info info = {0};
+    HWND hwnd = create_test_window( FALSE ), old_top = create_test_window( FALSE );
+    unsigned int status;
+    BOOL accepted = FALSE;
+
+    ok( hwnd && old_top, "failed to create owner windows\n" );
+    if (!hwnd || !old_top) goto done;
+    SetParent( old_top, hwnd );
+    ok( GetAncestor( old_top, GA_ROOT ) == hwnd, "old top was not reparented\n" );
+    status = set_surface_state( hwnd, identity,
+        CLIENT_SURFACE_STATE_REGISTER | CLIENT_SURFACE_STATE_SCENE_PUBLICATION, 0, NULL );
+    ok( !status, "owner registration status %#x\n", status );
+    claim_surface_state( hwnd, identity, NULL );
+    status = get_surface_handoff( hwnd, 0, identity, FALSE, &producer );
+    ok( !status, "producer bind status %#x\n", status );
+    if (status) goto done;
+    status = get_surface_handoff( hwnd, GetCurrentProcessId(), identity, TRUE, &owner );
+    ok( !status, "owner bind status %#x\n", status );
+    if (status) goto done;
+    set_scene_placement( hwnd, 0, 0, 0, SWP_SHOWWINDOW );
+    status = set_surface_state( hwnd, 0, CLIENT_SURFACE_STATE_STAGED, 0, &state );
+    ok( !status && state.staged && state.pending == 1,
+        "owner fixture status %#x staged %u pending %u\n", status, state.staged, state.pending );
+    if (status || !state.staged || state.pending != 1) goto done;
+    receipt = (struct client_surface_handoff_receipt){
+        .handle = wine_server_user_handle( hwnd ), .process = GetCurrentProcessId(),
+        .surface = identity, .cookie = producer.cookie, .source_generation = 1, .buffer_index = 0,
+    };
+
+    /* Equal scalar generations must not turn a child HWND into an owner.
+     * Continue from the actual parent state so old implementations report
+     * each independent routing failure without cascading fixture failures. */
+    before = state;
+    info.u.req.cancel_client_surface_handoffs_request.__header.req = REQ_cancel_client_surface_handoffs;
+    info.u.req.cancel_client_surface_handoffs_request.handle = wine_server_user_handle( old_top );
+    info.u.req.cancel_client_surface_handoffs_request.generation = state.generation;
+    info.u.req.cancel_client_surface_handoffs_request.scene_generation = state.scene_generation;
+    status = p_wine_server_call( &info );
+    ok( !status, "old owner cancellation status %#x\n", status );
+    set_surface_state( hwnd, 0, 0, 0, &state );
+    ok( state.generation == before.generation && state.scene_generation == before.scene_generation,
+        "child HWND cancelled the new owner's assembly\n" );
+
+    status = complete_surface_handoffs( old_top, state.generation, state.scene_generation, &receipt, 1, &accepted );
+    ok( !status && !accepted, "child HWND reserved owner publication: status %#x accepted %u\n", status, accepted );
+    if (!accepted)
+    {
+        status = complete_surface_handoffs( hwnd, state.generation, state.scene_generation, &receipt, 1, &accepted );
+        ok( !status && accepted, "current owner receipt rejected: status %#x\n", status );
+        if (status || !accepted) goto done;
+    }
+    status = publish_native_surface( old_top, state.generation, state.scene_generation, TRUE, &accepted );
+    ok( !status && !accepted, "child HWND completed owner publication: status %#x accepted %u\n", status, accepted );
+    if (!accepted)
+    {
+        status = publish_native_surface( hwnd, state.generation, state.scene_generation, TRUE, &accepted );
+        ok( !status && accepted, "current native completion rejected: status %#x\n", status );
+        if (status || !accepted) goto done;
+    }
+    status = set_surface_state( old_top, 0, CLIENT_SURFACE_STATE_PUBLISH_BEGIN, 0, &child_state );
+    ok( !status && !child_state.publish, "child HWND began owner exposure: status %#x action %u\n",
+        status, child_state.publish );
+    if (!child_state.publish)
+    {
+        status = set_surface_state( hwnd, 0, CLIENT_SURFACE_STATE_PUBLISH_BEGIN, 0, &child_state );
+        ok( !status && child_state.publish == CLIENT_SURFACE_PUBLISH_EXPOSE,
+            "current owner exposure status %#x action %u\n", status, child_state.publish );
+        if (status || child_state.publish != CLIENT_SURFACE_PUBLISH_EXPOSE) goto done;
+    }
+    status = set_surface_state_scene( old_top, 0, CLIENT_SURFACE_STATE_PUBLISH_COMMIT,
+                                      state.generation, state.scene_generation, &child_state );
+    ok( !status && !child_state.publish, "child HWND committed owner exposure: status %#x action %u\n",
+        status, child_state.publish );
+    if (!child_state.publish)
+    {
+        status = set_surface_state_scene( hwnd, 0, CLIENT_SURFACE_STATE_PUBLISH_COMMIT,
+                                          state.generation, state.scene_generation, &child_state );
+        ok( !status && child_state.publish, "current owner commit rejected: status %#x\n", status );
+    }
+done:
+    if (hwnd) set_surface_state( hwnd, identity, CLIENT_SURFACE_STATE_UNREGISTER, 0, NULL );
+    if (producer.cookie) release_surface_handoff( hwnd, 0, identity, producer.cookie, FALSE );
+    if (owner.cookie) release_surface_handoff( hwnd, GetCurrentProcessId(), identity, owner.cookie, TRUE );
+    if (producer.mapping) CloseHandle( producer.mapping );
+    if (owner.mapping) CloseHandle( owner.mapping );
+    if (old_top) DestroyWindow( old_top );
+    if (hwnd) DestroyWindow( hwnd );
+}
+
 static void test_handoff_receipts(void)
 {
     const UINT64 identity = allocate_surface();
@@ -7710,6 +7805,7 @@ static BOOL run_focused_test_case( const char *name, char **argv )
          test_handoff_consumer_pool_limit},
         {"handoff-cold-visibility", "initial handoff visibility and lifetime", test_handoff_cold_visibility},
         {"handoff-receipts", "source-independent assembly receipts", test_handoff_receipts},
+        {"handoff-owner-binding", "owner requests after reparent", test_handoff_owner_binding},
         {"child-visibility-sources", "retained hidden source and legacy placement", test_child_visibility_sources},
         {"notification-filter", "client surface notification filter bypass",
          test_notification_identity_aba},
@@ -7961,6 +8057,7 @@ START_TEST(client_surface)
     test_handoff_storage();
     test_handoff_cold_visibility();
     test_handoff_receipts();
+    test_handoff_owner_binding();
     test_child_visibility_sources();
     test_handoff_lost_recovery();
     test_handoff_recovery_owner_wake();
