@@ -6577,25 +6577,25 @@ struct client_surface_owner_notifications *X11DRV_client_surface_backing_begin_u
 {
     const UINT no_geometry = SWP_NOSIZE | SWP_NOMOVE | SWP_NOCLIENTSIZE | SWP_NOCLIENTMOVE | SWP_NOZORDER;
     struct x11drv_win_data *data;
-    BOOL backing, activation, defer_position;
+    BOOL backing;
     struct client_surface_compositor_job job =
     {
-        .op = CLIENT_SURFACE_COMPOSITOR_BEGIN_UPDATE,
+        .op = CLIENT_SURFACE_COMPOSITOR_TRY_BEGIN_UPDATE,
         .toplevel = hwnd,
         .u.update =
         {
             .types = X11DRV_CLIENT_SURFACE_UPDATE_STATE |
                 ((swp_flags & (WINE_SWP_CLIENT_SURFACE_BACKING_ENABLE | WINE_SWP_CLIENT_SURFACE_BACKING_DISABLE))
                  ? X11DRV_CLIENT_SURFACE_UPDATE_BACKING : 0) |
-                ((swp_flags & WINE_SWP_CLIENT_SURFACE_PREPARE) ? X11DRV_CLIENT_SURFACE_UPDATE_PREPARE : 0),
+                ((swp_flags & WINE_SWP_CLIENT_SURFACE_PREPARE) ? X11DRV_CLIENT_SURFACE_UPDATE_PREPARE : 0) |
+                ((swp_flags & WINE_SWP_CLIENT_SURFACE_PUBLISH) ? X11DRV_CLIENT_SURFACE_UPDATE_PUBLISH : 0) |
+                (!rects ? X11DRV_CLIENT_SURFACE_UPDATE_REGION : 0),
         },
     };
 
     if (deferred) *deferred = FALSE;
     if (!(data = get_win_data( hwnd ))) return NULL;
     backing = !!data->client_surface_backing;
-    activation = (swp_flags & WINE_SWP_CLIENT_SURFACE_BACKING_ENABLE) &&
-                 !data->client_surface_backing_enabled;
     /* A state-only refresh does not change the plan's placement or clip.
      * The server roster/epoch check continues
      * to invalidate topology and producer changes. Be conservative for
@@ -6604,36 +6604,15 @@ struct client_surface_owner_notifications *X11DRV_client_surface_backing_begin_u
         (swp_flags & (SWP_SHOWWINDOW | SWP_HIDEWINDOW | SWP_FRAMECHANGED | SWP_STATECHANGED)) ||
         data->is_fullscreen || (swp_flags & WINE_SWP_FULLSCREEN) ||
         memcmp( &data->rects, rects, sizeof(*rects) );
-    /* Position, size and stacking updates can replay the latest Win32 state.
-     * Keep activation and explicit native state transitions synchronous. */
-    defer_position = rects && !data->is_fullscreen && (swp_flags & SWP_NOACTIVATE) &&
-        !(swp_flags & (SWP_SHOWWINDOW | SWP_HIDEWINDOW | SWP_FRAMECHANGED | SWP_STATECHANGED |
-                      WINE_SWP_FULLSCREEN));
     release_win_data( data );
     if (!backing) return NULL;
 
-    /* Plain state notifications can be coalesced and reapplied from current
-     * server state, including backing and preparation. A deferred prepare
-     * returns STATUS_PENDING to win32u, which must not acknowledge it before
-     * replay. A new backing activation retains its synchronous native publication
-     * boundary. Repeated enables can coalesce with a pending disable while
-     * the native backing is still enabled. */
-    if (deferred && (!job.u.update.invalidate_scene || defer_position) && !activation &&
-        !(swp_flags & WINE_SWP_CLIENT_SURFACE_PUBLISH))
-    {
-        BOOL ret;
-
-        job.op = CLIENT_SURFACE_COMPOSITOR_TRY_BEGIN_UPDATE;
-        ret = submit_client_surface_compositor_job( &job );
-        *deferred = job.u.update.deferred;
-        return ret ? job.u.update.notifications : NULL;
-    }
-
-    /* A pending native receipt can leave this target quiescing indefinitely.
-     * Do not hold the process-wide window-data lock while it drains. Keep
-     * only the handle across the wait; the caller must look up its data again.
-     * Destroying the window also removes its compositor target. */
-    return submit_client_surface_compositor_job( &job ) ? job.u.update.notifications : NULL;
+    /* Every caller can replay from current Win32 state. The actor owns the
+     * wake and update reasons until the native receipt arrives; publication
+     * is acknowledged only by the normal generation-checked replay. */
+    backing = submit_client_surface_compositor_job( &job );
+    *deferred = job.u.update.deferred;
+    return backing ? job.u.update.notifications : NULL;
 }
 
 UINT X11DRV_client_surface_backing_resume_update( HWND hwnd, UINT64 serial,

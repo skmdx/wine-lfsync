@@ -765,7 +765,8 @@ struct x11drv_win_data
     UINT        client_surface_opacity_valid : 1; /* desired opacity property is present */
     UINT        client_surface_backing_enabled : 1;
     UINT        client_surface_backing_valid : 1;
-    UINT        client_surface_restack : 1; /* deferred Win32 stacking needs native replay */
+    UINT        client_surface_update_pending : 1;
+    UINT        client_surface_update_flags; /* coalesced native update reasons */
     UINT        client_surface_map_update; /* continuation awaiting a drawable native window */
     Window      embedder;       /* window id of embedder */
     Pixmap         icon_pixmap;
@@ -837,6 +838,8 @@ extern void X11DRV_client_surface_backing_finish_deferred_update( HWND hwnd, UIN
 #define X11DRV_CLIENT_SURFACE_UPDATE_STATE   1
 #define X11DRV_CLIENT_SURFACE_UPDATE_BACKING 2
 #define X11DRV_CLIENT_SURFACE_UPDATE_PREPARE 4
+#define X11DRV_CLIENT_SURFACE_UPDATE_PUBLISH 8
+#define X11DRV_CLIENT_SURFACE_UPDATE_REGION  16
 extern void X11DRV_client_surface_backing_end_update( struct x11drv_win_data *data,
                                                       struct client_surface_owner_notifications *notifications );
 extern NTSTATUS X11DRV_client_surface_backing_snapshot( struct x11drv_win_data *data, BOOL invalidate );

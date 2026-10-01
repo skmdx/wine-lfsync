@@ -4449,9 +4449,14 @@ NTSTATUS X11DRV_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_hint,
      * No native preparation or STAGED result has run yet. */
     if (deferred)
     {
-        if (!(swp_flags & SWP_NOZORDER) && (data = get_win_data( hwnd )))
+        if ((data = get_win_data( hwnd )))
         {
-            data->client_surface_restack = TRUE;
+            if (!data->client_surface_update_pending)
+                data->client_surface_update_flags = SWP_NOACTIVATE | SWP_NOZORDER;
+            data->client_surface_update_pending = TRUE;
+            data->client_surface_update_flags &= swp_flags | ~(SWP_NOACTIVATE | SWP_NOZORDER);
+            data->client_surface_update_flags |= swp_flags &
+                (SWP_FRAMECHANGED | SWP_STATECHANGED | SWP_SHOWWINDOW | SWP_HIDEWINDOW);
             release_win_data( data );
         }
         return STATUS_PENDING;
@@ -4461,12 +4466,22 @@ NTSTATUS X11DRV_WindowPosChanged( HWND hwnd, HWND insert_after, HWND owner_hint,
         if (owner_update) X11DRV_client_surface_backing_end_update( NULL, owner_update );
         return STATUS_SUCCESS;
     }
-    /* The state replay normally suppresses z-order requests. Recompute from
-     * the latest server order after a deferred change, not its old sibling. */
-    if (data->client_surface_restack)
+    /* Replay reasons, not borrowed geometry or an old sibling/activation
+     * target. Visibility and foreground ownership may have changed again. */
+    if (data->client_surface_update_pending)
     {
-        swp_flags &= ~SWP_NOZORDER;
-        data->client_surface_restack = FALSE;
+        UINT flags = data->client_surface_update_flags;
+
+        swp_flags &= flags | ~(SWP_NOACTIVATE | SWP_NOZORDER);
+        swp_flags |= flags & (SWP_FRAMECHANGED | SWP_STATECHANGED);
+        if (flags & (SWP_SHOWWINDOW | SWP_HIDEWINDOW))
+        {
+            swp_flags &= ~(SWP_SHOWWINDOW | SWP_HIDEWINDOW);
+            swp_flags |= win32_visible ? SWP_SHOWWINDOW : SWP_HIDEWINDOW;
+        }
+        activate = !(swp_flags & SWP_NOACTIVATE) && hwnd == NtUserGetForegroundWindow();
+        data->client_surface_update_pending = FALSE;
+        data->client_surface_update_flags = 0;
     }
     geometry_scope = X11DRV_client_surface_geometry_begin( data );
     if (is_managed) window_set_managed( data, TRUE );
@@ -4759,8 +4774,11 @@ void X11DRV_SetWindowIcons( HWND hwnd, HICON icon, const ICONINFO *ii, HICON ico
 void X11DRV_SetWindowRgn( HWND hwnd, HRGN hrgn, BOOL redraw )
 {
     struct x11drv_win_data *data;
+    BOOL deferred;
     struct client_surface_owner_notifications *owner_update =
-        X11DRV_client_surface_backing_begin_update( hwnd, NULL, 0, NULL );
+        X11DRV_client_surface_backing_begin_update( hwnd, NULL, 0, &deferred );
+
+    if (deferred) return;
 
     if ((data = get_win_data( hwnd )))
     {
@@ -4928,6 +4946,10 @@ LRESULT X11DRV_WindowMessage( HWND hwnd, UINT msg, WPARAM wp, LPARAM lp )
                 send_message( hwnd, WM_WINE_UPDATEWINDOWSTATE, WINE_UPDATE_CLIENT_SURFACE_BACKING, 0 );
             if (types & X11DRV_CLIENT_SURFACE_UPDATE_PREPARE)
                 send_message( hwnd, WM_WINE_UPDATEWINDOWSTATE, WINE_PREPARE_CLIENT_SURFACES, 0 );
+            if (types & X11DRV_CLIENT_SURFACE_UPDATE_REGION)
+                X11DRV_SetWindowRgn( hwnd, (HRGN)1, FALSE );
+            if (types & X11DRV_CLIENT_SURFACE_UPDATE_PUBLISH)
+                send_message( hwnd, WM_WINE_UPDATEWINDOWSTATE, WINE_PUBLISH_CLIENT_SURFACES, 0 );
             send_message( hwnd, WM_WINE_UPDATEWINDOWSTATE, WINE_UPDATE_CLIENT_SURFACE_HANDOFFS, 0 );
             X11DRV_client_surface_backing_finish_deferred_update( hwnd, serial, notifications );
         }
