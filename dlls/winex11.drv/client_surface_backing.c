@@ -95,6 +95,7 @@ struct client_surface_compositor_binding
     struct rb_entry registry_entry;
     struct client_surface_memory_scope memory;
     struct client_surface_compositor_pool *pool;
+    struct client_surface_compositor_queue *queue;
     struct client_surface_handoff_channel *channel;
     struct client_surface_source_cache sources[CLIENT_SURFACE_HANDOFF_RING_SIZE];
     HWND toplevel;
@@ -656,12 +657,18 @@ struct client_surface_compositor_queue
     struct client_surface_compositor_job *head, **tail, *control_head, **control_tail;
     HWND toplevel;
     unsigned int refs, incoming, requests;
-    /* Native update barriers and removal already have synchronous callers.
+    /* Native update barriers already have synchronous callers.
      * Serialize their storage within the admitted queue, independently of
      * ordinary request pressure. Release notifications never use this slot. */
     struct client_surface_compositor_request barrier;
     pthread_cond_t barrier_available;
     BOOL barrier_in_use;
+    /* Removal is admitted with the queue, including before a target exists.
+     * Coalesced removals retire intervening admissions after the FIFO marker
+     * completes; later incarnations must not revive those old requests. */
+    struct client_surface_compositor_job remove;
+    UINT64 remove_through, retired_through;
+    BOOL remove_queued;
 };
 
 enum client_surface_compositor_capacity_kind
@@ -717,14 +724,14 @@ struct client_surface_owner_notifications
     struct client_surface_memory_scope memory;
     HWND toplevel;
     UINT64 refs;
-    struct client_surface_compositor_job end, finish, direct, remove;
+    struct client_surface_compositor_job end, finish, direct;
     struct client_surface_native_work native_end;
     struct x11drv_native_window_read end_read;
     Display *end_display;
     unsigned int native_ends, native_batch;
     BOOL native_end_active;
     unsigned int pending_ends;
-    BOOL end_queued, finish_queued, direct_queued, direct_pending, remove_queued;
+    BOOL end_queued, finish_queued, direct_queued, direct_pending;
     UINT64 finish_serial;
     struct client_surface_direct_completion direct_plan, direct_proof;
 };
@@ -1064,7 +1071,7 @@ static void release_client_surface_compositor_queue( struct client_surface_compo
     if ((unused = !--queue->refs))
     {
         assert( !queue->head && !queue->control_head && !queue->incoming && !queue->requests && !queue->barrier_in_use &&
-                !queue->target && list_empty( &queue->entry ) );
+                !queue->target && !queue->remove_queued && list_empty( &queue->entry ) );
         rb_remove( &client_surface_compositor_queues, &queue->registry_entry );
     }
     pthread_mutex_unlock( &client_surface_compositor_mutex );
@@ -1080,7 +1087,7 @@ static struct client_surface_compositor_target *alloc_client_surface_compositor_
     if (!(target = alloc_client_surface_compositor_metadata( toplevel, sizeof(*target), &memory ))) return NULL;
     target->memory = memory;
     target->toplevel = toplevel;
-    if (!x11drv_reserve_release_capacity( 5, sizeof(*notifications) ))
+    if (!x11drv_reserve_release_capacity( 4, sizeof(*notifications) ))
     {
         client_surface_free_owned_metadata( &target->memory, target, sizeof(*target) );
         return NULL;
@@ -1091,7 +1098,7 @@ static struct client_surface_compositor_target *alloc_client_surface_compositor_
     {
         client_surface_memory_scope_destroy( &memory );
         client_surface_free_owned_metadata( &target->memory, target, sizeof(*target) );
-        release_client_surface_compositor_capacity( CLIENT_SURFACE_COMPOSITOR_RELEASE_CAPACITY, 5, sizeof(*notifications), NULL );
+        release_client_surface_compositor_capacity( CLIENT_SURFACE_COMPOSITOR_RELEASE_CAPACITY, 4, sizeof(*notifications), NULL );
         return NULL;
     }
     notifications->memory = memory;
@@ -1109,9 +1116,6 @@ static struct client_surface_compositor_target *alloc_client_surface_compositor_
         .notifications = notifications, .queue = notifications->queue, .async = TRUE};
     notifications->direct = (struct client_surface_compositor_job){
         .op = CLIENT_SURFACE_COMPOSITOR_DIRECT_COMPLETE, .toplevel = toplevel,
-        .notifications = notifications, .queue = notifications->queue, .async = TRUE};
-    notifications->remove = (struct client_surface_compositor_job){
-        .op = CLIENT_SURFACE_COMPOSITOR_REMOVE_TARGET, .toplevel = toplevel,
         .notifications = notifications, .queue = notifications->queue, .async = TRUE};
     target->notifications = notifications;
     notifications->queue->target = target;
@@ -1138,7 +1142,7 @@ static void free_client_surface_compositor_target( struct client_surface_composi
     if (unused)
     {
         release_client_surface_compositor_queue( notifications->queue );
-        free_client_surface_compositor_release( &notifications->memory, notifications, 5, sizeof(*notifications) );
+        free_client_surface_compositor_release( &notifications->memory, notifications, 4, sizeof(*notifications) );
     }
     assert( !target->native_presents.head );
     x11drv_native_window_release( target->window_owner );
@@ -2041,6 +2045,8 @@ static void remove_client_surface_compositor_binding( struct client_surface_comp
      * it cannot resume at the old consumer sequence without those images. */
     __atomic_store_n( &binding->channel->closed, 1, __ATOMIC_RELEASE );
     binding->retired = TRUE;
+    release_client_surface_compositor_queue( binding->queue );
+    binding->queue = NULL;
     TRACE_(csperf)( "ticks=%llu event=cache_detach identity=%s cookie=%s query_pending=%u native_pending=%u token=%s "
                    "consumed=%s produced=%s endpoints=%u\n", client_surface_perf_time(),
                    wine_dbgstr_longlong( binding->identity ), wine_dbgstr_longlong( binding->cookie ),
@@ -2153,6 +2159,9 @@ static BOOL register_client_surface_compositor_handoff(
 
     if (!(binding = alloc_client_surface_compositor_metadata( job->toplevel, sizeof(*binding), &memory ))) goto done;
     binding->memory = memory;
+    /* A targetless binding still needs an admitted removal slot. */
+    binding->queue = get_client_surface_compositor_queue( job->toplevel );
+    assert( binding->queue == job->queue );
     binding->pool = pool;
     binding->channel = channel;
     pool->bindings[channel - pool->shared->channels] = binding;
@@ -2847,7 +2856,10 @@ static BOOL remove_client_surface_compositor_target( HWND toplevel )
     struct client_surface_compositor_target *target;
     unsigned int i;
 
-    if (!(target = find_client_surface_compositor_target( toplevel ))) return TRUE;
+    target = find_client_surface_compositor_target( toplevel );
+    TRACE_(csperf)( "ticks=%llu event=target_remove hwnd=%p target=%p\n",
+                   client_surface_perf_time(), toplevel, target );
+    if (!target) return TRUE;
     drain_client_surface_compositor_target( target );
     free_client_surface_compositor_present_input( target );
     for (i = 0; i < ARRAY_SIZE(target->frames); ++i)
@@ -5107,8 +5119,6 @@ static void finish_client_surface_notification( struct client_surface_compositor
         notifications->finish_serial = 0;
         --notifications->refs;
     }
-    else if (job->op == CLIENT_SURFACE_COMPOSITOR_REMOVE_TARGET)
-        --notifications->refs;
     else
     {
         assert( job->op == CLIENT_SURFACE_COMPOSITOR_DIRECT_COMPLETE );
@@ -5124,7 +5134,7 @@ static void finish_client_surface_notification( struct client_surface_compositor
     if (unused)
     {
         release_client_surface_compositor_queue( notifications->queue );
-        free_client_surface_compositor_release( &notifications->memory, notifications, 5, sizeof(*notifications) );
+        free_client_surface_compositor_release( &notifications->memory, notifications, 4, sizeof(*notifications) );
     }
 }
 
@@ -5171,7 +5181,21 @@ static BOOL step_client_surface_compositor_job( struct client_surface_compositor
         }
         return job->u.present.done;
     }
-    if (!client_surface_compositor_job_ready( job, target, &rejected )) return FALSE;
+    rejected = job->sequence <= job->queue->retired_through && !job->notifications &&
+               job->op != CLIENT_SURFACE_COMPOSITOR_REMOVE_TARGET &&
+               job->op != CLIENT_SURFACE_COMPOSITOR_FREE_POOL &&
+               job->op != CLIENT_SURFACE_COMPOSITOR_DROP_SEED;
+    if (rejected)
+    {
+        /* A query started before the removal marker still owns its request
+         * until native completion. Reject adoption, never that ownership. */
+        if (job->op == CLIENT_SURFACE_COMPOSITOR_DIRECT_PLAN && job->u.direct_plan.query.started &&
+            !ReadAcquire( &job->u.direct_plan.query.complete )) return FALSE;
+        TRACE_(csperf)( "ticks=%llu event=retired_job_reject hwnd=%p op=%u sequence=%llu through=%llu\n",
+                       client_surface_perf_time(), job->toplevel, job->op,
+                       (unsigned long long)job->sequence, (unsigned long long)job->queue->retired_through );
+    }
+    else if (!client_surface_compositor_job_ready( job, target, &rejected )) return FALSE;
     prepare_client_surface_notification( job );
     job->result = FALSE;
     if (!rejected)
@@ -5215,7 +5239,6 @@ static BOOL step_client_surface_compositor_job( struct client_surface_compositor
             else job->result = TRUE;
             break;
         case CLIENT_SURFACE_COMPOSITOR_REMOVE_TARGET:
-            if (job->notifications && !target) break;
             if ((done = sweep_client_surface_compositor_handoffs( job, 0, budget )))
                 job->result = remove_client_surface_compositor_target( job->toplevel );
             break;
@@ -5338,6 +5361,13 @@ static BOOL process_client_surface_compositor_jobs(void)
         if (job->async)
         {
             if (job->notifications) finish_client_surface_notification( job );
+            else if (job->op == CLIENT_SURFACE_COMPOSITOR_REMOVE_TARGET)
+            {
+                pthread_mutex_lock( &client_surface_compositor_mutex );
+                queue->retired_through = queue->remove_through;
+                queue->remove_queued = FALSE;
+                pthread_mutex_unlock( &client_surface_compositor_mutex );
+            }
             else if (job->op == CLIENT_SURFACE_COMPOSITOR_PRESENT)
             {
                 struct client_surface_output_allocation *allocation = job->u.present.allocation;
@@ -5666,8 +5696,7 @@ static struct client_surface_compositor_request *alloc_client_surface_compositor
     struct client_surface_memory_scope memory = {0};
     BOOL barrier = job->op == CLIENT_SURFACE_COMPOSITOR_BEGIN_UPDATE ||
                    job->op == CLIENT_SURFACE_COMPOSITOR_TRY_BEGIN_UPDATE ||
-                   job->op == CLIENT_SURFACE_COMPOSITOR_CHECK_UPDATE ||
-                   job->op == CLIENT_SURFACE_COMPOSITOR_REMOVE_TARGET;
+                   job->op == CLIENT_SURFACE_COMPOSITOR_CHECK_UPDATE;
 
     pthread_mutex_lock( &client_surface_compositor_mutex );
     if (barrier)
@@ -6200,30 +6229,30 @@ static BOOL update_client_surface_backing_target( struct x11drv_win_data *data,
 
 static void remove_client_surface_backing_target( HWND toplevel )
 {
-    struct client_surface_owner_notifications *notifications;
-    BOOL started;
-    struct client_surface_compositor_job job =
-    {
-        .op = CLIENT_SURFACE_COMPOSITOR_REMOVE_TARGET,
-        .toplevel = toplevel,
-    };
+    struct client_surface_compositor_queue *queue;
+    struct rb_entry *entry;
 
-    /* A plan can exist without output pixmaps, but an ordinary window's
-     * destruction must not start a previously unused compositor. */
+    /* Every target, binding and admitted request retains its queue. No
+     * registry entry means there is no actor ownership to retire. */
     pthread_mutex_lock( &client_surface_compositor_mutex );
-    started = client_surface_compositor_started;
-    for (notifications = client_surface_owner_notifications; notifications; notifications = notifications->next)
-        if (notifications->toplevel == toplevel) break;
-    if (notifications && !notifications->remove_queued)
+    if (client_surface_compositor_started && (entry = rb_get( &client_surface_compositor_queues, toplevel )))
     {
-        /* Destruction holds win_data_mutex. Return once the owned request
-         * is accepted; native completion retains the target and its images. */
-        notifications->remove_queued = TRUE;
-        ++notifications->refs;
-        enqueue_client_surface_compositor_job( &notifications->remove );
+        queue = CONTAINING_RECORD( entry, struct client_surface_compositor_queue, registry_entry );
+        if (!queue->remove_queued)
+        {
+            queue->remove = (struct client_surface_compositor_job){
+                .op = CLIENT_SURFACE_COMPOSITOR_REMOVE_TARGET, .toplevel = toplevel,
+                .queue = queue, .async = TRUE};
+            queue->remove_queued = TRUE;
+            enqueue_client_surface_compositor_job( &queue->remove );
+        }
+        else ++client_surface_compositor_sequence;
+        queue->remove_through = client_surface_compositor_sequence;
+        TRACE_(csperf)( "ticks=%llu event=target_remove_admit hwnd=%p sequence=%llu through=%llu\n",
+                       client_surface_perf_time(), toplevel, (unsigned long long)queue->remove.sequence,
+                       (unsigned long long)queue->remove_through );
     }
     pthread_mutex_unlock( &client_surface_compositor_mutex );
-    if (started && !notifications) submit_client_surface_compositor_job( &job );
 }
 
 struct client_surface_owner_notifications *X11DRV_client_surface_backing_begin_update(
