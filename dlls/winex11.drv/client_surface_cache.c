@@ -622,6 +622,10 @@ static void execute_cache_image( struct client_surface_native_work *work )
     case CACHE_RELEASE: destroy_cache_image( image ); break;
     default: assert( 0 );
     }
+    /* Waiting for content admission alone has not attached any resource to
+     * this executor. A later retry must remain movable until a native copy
+     * actually owns its GC/seed and receipt on this connection. */
+    if (image->waiting && !image->gc && !image->window_gc && !image->seed) image->started = FALSE;
     /* Xlib GC handles belong to the executing connection. Their retirement
      * precedes completion, so the next write can use another worker without
      * touching this connection or retaining an unaccounted native object. */
@@ -645,7 +649,11 @@ static void finish_cache_image( struct client_surface_native_work *work )
     pthread_mutex_lock( &cache_mutex );
     if (image->waiting)
     {
+        unsigned int i;
+
         queue_native_work( worker, work );
+        if (!image->started)
+            for (i = 0; i < worker_count; ++i) pthread_cond_signal( &cache_workers[i].cond );
         pthread_mutex_unlock( &cache_mutex );
         return;
     }
