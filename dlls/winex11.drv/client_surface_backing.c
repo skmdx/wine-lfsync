@@ -34,7 +34,6 @@
 #include "x11drv.h"
 #include "client_surface.h"
 #include "xcomposite.h"
-#include "client_surface_xcb.h"
 #include "client_surface_query.h"
 #include "client_surface_cache.h"
 #include "wine/server.h"
@@ -78,16 +77,7 @@ struct client_surface_cached_image
 {
     struct client_surface_cache_image *storage;
     Pixmap pixmap;
-    unsigned int xcb_gc;
     unsigned int width, height, depth;
-};
-
-struct client_surface_compositor_reply
-{
-    struct list entry;
-    struct client_surface_xcb_request *requests;
-    unsigned int count;
-    void (*complete)( struct client_surface_compositor_reply *reply, BOOL success );
 };
 
 struct client_surface_cache_copy
@@ -95,8 +85,6 @@ struct client_surface_cache_copy
     struct client_surface_geometry_query query;
     BOOL query_pending;
     BOOL native_pending;
-    struct client_surface_compositor_reply reply;
-    struct client_surface_xcb_request request;
     struct client_surface_handoff_slot frame;
     UINT64 control, started;
     unsigned int index;
@@ -130,8 +118,7 @@ struct client_surface_compositor_binding
 
 static BOOL client_surface_cache_read_pending( const struct client_surface_compositor_binding *binding )
 {
-    return binding->cache_copy.query_pending || binding->cache_copy.native_pending ||
-           binding->cache_copy.reply.requests;
+    return binding->cache_copy.query_pending || binding->cache_copy.native_pending;
 }
 
 static void trace_client_surface_source( const char *event,
@@ -220,7 +207,6 @@ struct client_surface_compositor_frame
     Pixmap pixmap;
     struct client_surface_cache_image *image; /* borrowed from the installed pair/mailbox */
     struct rb_entry pixmap_entry;
-    GC gc;
     UINT64 revision;
     uint32_t serial;
     uint32_t last_complete_serial;
@@ -234,19 +220,6 @@ struct client_surface_compositor_frame
     BOOL publish_pending;
     BOOL request_pending;
     struct client_surface_native_present native_present;
-    unsigned int xcb_gc;
-    struct client_surface_compositor_binding *copy_binding;
-    struct client_surface_cache_image *copy_image;
-    unsigned int copy_index;
-    UINT64 copy_control;
-    UINT64 copy_sequence;
-    UINT64 copy_epoch;
-    BOOL copy_replay;
-    RECT copy_damage;
-    struct client_surface_xcb_request copy_request;
-    struct client_surface_compositor_reply reply;
-    struct client_surface_compositor_target *reply_target;
-    struct client_surface_copy_batch *reply_batch;
 };
 
 struct client_surface_compositor_target
@@ -263,7 +236,6 @@ struct client_surface_compositor_target
     struct x11drv_native_window *window_owner;
     struct client_surface_native_present_queue native_presents;
     struct client_surface_compositor_frame frames[CLIENT_SURFACE_COMPOSITOR_FRAME_COUNT];
-    struct client_surface_compositor_frame *copy_frame;
     struct client_surface_output_transform *transform;
     Pixmap backing;
     Pixmap latest;
@@ -349,7 +321,7 @@ static struct rb_tree client_surface_compositor_pixmaps = {compare_client_surfac
 static void set_client_surface_compositor_pixmap( struct client_surface_compositor_frame *frame, Pixmap pixmap,
                                                  struct client_surface_cache_image *image )
 {
-    assert( !frame->reply_target && !frame->serial );
+    assert( !frame->serial );
     if (frame->pixmap) rb_remove( &client_surface_compositor_pixmaps, &frame->pixmap_entry );
     frame->pixmap = pixmap;
     frame->image = image;
@@ -813,7 +785,6 @@ static struct client_surface_output_allocation *client_surface_output_allocation
 struct client_surface_owner_copy
 {
     struct client_surface_compositor_binding *binding;
-    struct client_surface_cache_image *image;
     unsigned int buffer_index;
     UINT64 control, generation, epoch;
     UINT64 sequence;
@@ -828,46 +799,13 @@ struct client_surface_copy_batch
     struct client_surface_owner_copy copies[CLIENT_SURFACE_COPY_BATCH_SIZE];
     unsigned int count;
     int error;
-    BOOL asynchronous;
     UINT64 revision;
-    struct client_surface_xcb_request requests[CLIENT_SURFACE_COPY_BATCH_SIZE];
 };
 
 static struct client_surface_copy_batch client_surface_copy_batch;
-static struct client_surface_copy_batch client_surface_pending_batches[64];
-static unsigned int client_surface_pending_batch_count;
-static struct list client_surface_compositor_replies = LIST_INIT( client_surface_compositor_replies );
 
-static void complete_client_surface_output_reply( struct client_surface_compositor_reply *reply, BOOL success );
 static BOOL replay_client_surface_scene_sources( struct client_surface_compositor_target *target,
                                                  unsigned int *budget );
-
-static void queue_client_surface_reply( struct client_surface_compositor_reply *reply,
-                                        struct client_surface_xcb_request *requests, unsigned int count,
-                                        void (*complete)( struct client_surface_compositor_reply *, BOOL ) )
-{
-    assert( !reply->requests && count );
-    reply->requests = requests;
-    reply->count = count;
-    reply->complete = complete;
-    list_add_tail( &client_surface_compositor_replies, &reply->entry );
-}
-
-/* Every checked group ends in a GetInputFocus barrier on this actor's sole
- * connection. Keep that submission order so a later poll cannot buffer an
- * earlier reply behind an already inspected target before the actor sleeps.
- * The frame's existing native-use lifetime owns this intrusive notification. */
-static void queue_client_surface_compositor_reply( struct client_surface_compositor_target *target,
-                                                   struct client_surface_compositor_frame *frame,
-                                                   struct client_surface_copy_batch *batch )
-{
-    assert( !frame->reply_target && !frame->request_pending );
-    frame->reply_target = target;
-    frame->reply_batch = batch;
-    queue_client_surface_reply( &frame->reply,
-        batch ? batch->requests : &frame->copy_request,
-        batch ? batch->count : 1, complete_client_surface_output_reply );
-}
 
 static void flush_client_surface_copy_batch(void);
 
@@ -949,13 +887,6 @@ static void wake_client_surface_compositor_queues(void)
 static void flush_client_surface_compositor_mailbox(
     struct client_surface_compositor_target *target );
 
-static int client_surface_compositor_error( Display *display, XErrorEvent *event, void *arg )
-{
-    int *error = arg;
-
-    *error = event->error_code;
-    return 1;
-}
 
 static BOOL client_surface_compositor_open(void)
 {
@@ -1717,7 +1648,7 @@ static void flush_client_surface_compositor_mailbox(
 {
     struct client_surface_compositor_frame *frame;
 
-    if (target->quiescing || target->copy_frame || !target->mailbox_pending ||
+    if (target->quiescing || !target->mailbox_pending ||
         count_client_surface_compositor_frames( target ) >= CLIENT_SURFACE_COMPOSITOR_MAX_INFLIGHT)
         return;
     frame = &target->frames[target->mailbox_frame];
@@ -1836,7 +1767,7 @@ static void free_client_surface_compositor_mailbox( struct client_surface_compos
     struct client_surface_compositor_mailbox *mailbox = target->mailbox;
 
     if (!mailbox) return;
-    assert( !frame->serial && !frame->copy_binding );
+    assert( !frame->serial );
     target->mailbox = NULL;
     set_client_surface_compositor_pixmap( frame, 0, NULL );
     TRACE_(csperf)( "ticks=%llu event=output_mailbox_detach mailbox=%p image=%p window=%lx pending=%u\n",
@@ -2094,7 +2025,6 @@ static void remove_client_surface_compositor_binding( struct client_surface_comp
     struct client_surface_compositor_target *target = find_client_surface_compositor_target( binding->toplevel );
     unsigned int index = binding->channel - binding->pool->shared->channels;
 
-    assert( !target || !target->copy_frame );
     rb_remove( &client_surface_compositor_bindings, &binding->registry_entry );
     if (binding->pool->bindings[index] == binding) binding->pool->bindings[index] = NULL;
     binding->pool->query_wait_bitmap[index / 64] &= ~((UINT64)1 << (index % 64));
@@ -2110,13 +2040,12 @@ static void remove_client_surface_compositor_binding( struct client_surface_comp
      * it cannot resume at the old consumer sequence without those images. */
     __atomic_store_n( &binding->channel->closed, 1, __ATOMIC_RELEASE );
     binding->retired = TRUE;
-    TRACE_(csperf)( "ticks=%llu event=cache_detach identity=%s cookie=%s pending=%u query_pending=%u native_pending=%u token=%s barrier=%u "
+    TRACE_(csperf)( "ticks=%llu event=cache_detach identity=%s cookie=%s query_pending=%u native_pending=%u token=%s "
                    "consumed=%s produced=%s endpoints=%u\n", client_surface_perf_time(),
                    wine_dbgstr_longlong( binding->identity ), wine_dbgstr_longlong( binding->cookie ),
-                   !!binding->cache_copy.reply.requests, binding->cache_copy.query_pending,
+                   binding->cache_copy.query_pending,
                    binding->cache_copy.native_pending,
                    wine_dbgstr_longlong( binding->cache_copy.control ),
-                   binding->cache_copy.request.barrier,
                    wine_dbgstr_longlong( __atomic_load_n( &binding->channel->consumer_sequence, __ATOMIC_ACQUIRE ) ),
                    wine_dbgstr_longlong( __atomic_load_n( &binding->channel->producer_sequence, __ATOMIC_ACQUIRE ) ),
                    __atomic_load_n( &binding->channel->endpoints, __ATOMIC_ACQUIRE ) );
@@ -2525,7 +2454,6 @@ static void drain_client_surface_compositor_target(
 {
     unsigned int i;
 
-    assert( !target->copy_frame );
 
     /* The scheduler reaches this boundary only after Complete and Idle.
      * A timeout must never manufacture permission to reuse a pixmap. */
@@ -2632,8 +2560,6 @@ static BOOL update_client_surface_compositor_target( struct client_surface_compo
         free_client_surface_compositor_mailbox( target );
         for (i = 0; i < ARRAY_SIZE(target->frames); ++i)
         {
-            client_surface_xcb_free_gc( client_surface_compositor_display, &target->frames[i].xcb_gc );
-            if (target->frames[i].gc) XFreeGC( client_surface_compositor_display, target->frames[i].gc );
             if (i < 2) set_client_surface_compositor_pixmap( &target->frames[i], 0, NULL );
         }
         memset( target->frames, 0, sizeof(target->frames) );
@@ -2699,7 +2625,7 @@ static struct client_surface_compositor_frame *client_surface_output_checkpoint_
         if (frame->pixmap != source || !frame->image) continue;
         /* A partial assembly is not a completed checkpoint, even before its
          * next native request is queued. Admission never waits for it. */
-        if (target->copy_frame == frame || client_surface_cache_write_pending( frame->image ) ||
+        if (client_surface_cache_write_pending( frame->image ) ||
             (target->assembly_pending && target->assembly_frame == i) ||
             (client_surface_copy_batch.count && client_surface_copy_batch.frame == frame))
         {
@@ -2924,8 +2850,6 @@ static BOOL remove_client_surface_compositor_target( HWND toplevel )
     free_client_surface_compositor_present_input( target );
     for (i = 0; i < ARRAY_SIZE(target->frames); ++i)
     {
-        client_surface_xcb_free_gc( client_surface_compositor_display, &target->frames[i].xcb_gc );
-        if (target->frames[i].gc) XFreeGC( client_surface_compositor_display, target->frames[i].gc );
         if (i < 2) set_client_surface_compositor_pixmap( &target->frames[i], 0, NULL );
     }
     free_client_surface_compositor_mailbox( target );
@@ -2961,8 +2885,6 @@ static BOOL retire_client_surface_compositor_pool( HWND toplevel )
     drain_client_surface_compositor_target( target );
     for (i = 0; i < ARRAY_SIZE(target->frames); ++i)
     {
-        client_surface_xcb_free_gc( client_surface_compositor_display, &target->frames[i].xcb_gc );
-        if (target->frames[i].gc) XFreeGC( client_surface_compositor_display, target->frames[i].gc );
         if (i < 2) set_client_surface_compositor_pixmap( &target->frames[i], 0, NULL );
     }
     free_client_surface_compositor_mailbox( target );
@@ -3111,7 +3033,7 @@ static BOOL renew_client_surface_direct_plan( const struct client_surface_compos
      * retired can renew without preserving a composition checkpoint. */
     if (!target || !target->scene.valid || target->scene.strategy != DIRECT_ATTACH ||
         !target->scene.direct_drawable || target->window != job->u.direct_renew.destination ||
-        target->copy_frame || target->native_updates || target->deferred_update || target->seed_serial) return FALSE;
+        target->native_updates || target->deferred_update || target->seed_serial) return FALSE;
     for (i = 0; i < ARRAY_SIZE(target->frames); ++i)
         if (target->frames[i].pixmap) return FALSE;
     client_surface_get_toplevel_scene( job->toplevel, &current );
@@ -3179,7 +3101,6 @@ static BOOL client_surface_compositor_restore_ready( const struct client_surface
 {
     unsigned int i;
 
-    if (target->copy_frame) return FALSE;
     for (i = 0; i < ARRAY_SIZE(target->frames); ++i)
         if (target->frames[i].serial &&
             (target->frames[i].request_pending || !target->frames[i].complete ||
@@ -3365,13 +3286,6 @@ static void complete_client_surface_cache_read( struct client_surface_compositor
         replay_client_surface_scene_sources( target, &budget );
 }
 
-static void complete_client_surface_cache_reply( struct client_surface_compositor_reply *reply, BOOL success )
-{
-    struct client_surface_compositor_binding *binding =
-        CONTAINING_RECORD( reply, struct client_surface_compositor_binding, cache_copy.reply );
-
-    complete_client_surface_cache_read( binding, success, TRUE );
-}
 
 static void start_client_surface_cache_copy( struct client_surface_compositor_binding *binding,
                                              unsigned int depth );
@@ -3394,7 +3308,6 @@ static void complete_client_surface_cache_creation( void *context, BOOL success 
         return;
     }
     image->pixmap = client_surface_cache_pixmap( image->storage );
-    image->xcb_gc = client_surface_cache_gc( image->storage );
     start_client_surface_cache_copy( binding, image->depth );
 }
 
@@ -3414,7 +3327,6 @@ static void start_client_surface_cache_copy( struct client_surface_compositor_bi
     struct client_surface_cached_image *image = &binding->spare_image;
     struct client_surface_cache_copy *copy = &binding->cache_copy;
     struct client_surface_handoff_slot frame = copy->frame;
-    Display *display;
     Pixmap source = frame.source;
     UINT64 control = copy->control;
 
@@ -3444,27 +3356,6 @@ static void start_client_surface_cache_copy( struct client_surface_compositor_bi
     }
     /* Keep the last complete cache intact until the new full image and its
      * error check succeed. Neither buffer borrows a producer XID. */
-    /* Cache creation may complete before an output job opens the connection. */
-    if (!client_surface_compositor_open()) goto done;
-    display = client_surface_compositor_display;
-    if (client_surface_xcb_available( display ))
-    {
-        RECT rect = {0, 0, frame.width, frame.height};
-        XRectangle clip = {0, 0, frame.width, frame.height};
-
-        if (client_surface_xcb_copy( display, source, image->pixmap, &image->xcb_gc,
-                                    0, NULL, &rect, &rect, &clip, 1, FALSE, &copy->request, TRUE ))
-        {
-            queue_client_surface_reply( &copy->reply, &copy->request, 1, complete_client_surface_cache_reply );
-            TRACE_(csperf)( "ticks=%llu event=cache_pending identity=%s cookie=%s token=%s sequence=%s "
-                           "window=0 pixmap=%lx success=1 source=%lx display=%p request=%u barrier=%u\n",
-                           client_surface_perf_time(), wine_dbgstr_longlong( binding->identity ),
-                           wine_dbgstr_longlong( binding->cookie ), wine_dbgstr_longlong( control ),
-                           wine_dbgstr_longlong( frame.source_sequence ), image->pixmap, source, display,
-                           copy->request.cookies[copy->request.count - 1], copy->request.barrier );
-            return;
-        }
-    }
     copy->native_pending = TRUE;
     client_surface_cache_copy( image->storage, source, complete_client_surface_cache_fallback, binding );
     TRACE_(csperf)( "ticks=%llu event=cache_image_pending identity=%s cookie=%s token=%s image=%p operation=2\n",
@@ -3591,19 +3482,6 @@ static BOOL get_client_surface_compositor_catchup(
     return TRUE;
 }
 
-static void discard_client_surface_compositor_gc( struct client_surface_compositor_frame *frame )
-{
-    Display *display = client_surface_compositor_display;
-    int error = 0;
-
-    client_surface_xcb_free_gc( display, &frame->xcb_gc );
-    if (!frame->gc) return;
-    X11DRV_expect_error( display, client_surface_compositor_error, &error );
-    XFreeGC( display, frame->gc );
-    XSync( display, False );
-    X11DRV_check_error();
-    frame->gc = NULL;
-}
 
 /* Owner-local placement of an immutable completed image. Source damage may
  * become a full copy for scene replay without changing the cached frame. */
@@ -3632,7 +3510,7 @@ static struct client_surface_output_transform *alloc_client_surface_output_trans
     const struct client_surface_handoff_slot *slot = &binding->latest_frame;
     SIZE_T count = plan->clip->rdh.nCount;
 
-    assert( !target->transform && !target->copy_frame );
+    assert( !target->transform );
     if (count > (~(SIZE_T)0 - sizeof(*transform)) / sizeof(XRectangle) ||
         (needs_catchup && (!latest || !latest->image || !latest->revision ||
                           client_surface_cache_write_pending( latest->image )))) return NULL;
@@ -3688,14 +3566,14 @@ static void free_client_surface_output_transforms( struct client_surface_output_
 static BOOL submit_client_surface_output_transform( struct client_surface_compositor_target *target,
     struct client_surface_compositor_binding *binding, struct client_surface_compositor_frame *frame,
     const struct client_surface_composition_plan *plan, const RECT *damage,
-    const RECT *catchup, BOOL needs_catchup, BOOL clipped )
+    const RECT *catchup, BOOL needs_catchup, BOOL clipped, BOOL native )
 {
     struct client_surface_output_transform *transform;
 
     assert( !plan->generation && (plan->steady || plan->publication_generation) );
     assert( !plan->publication_generation || frame->pixmap != target->backing );
     if (!(transform = alloc_client_surface_output_transform( target, binding, frame, plan, damage,
-                                                             catchup, needs_catchup, clipped, FALSE ))) return FALSE;
+                                                             catchup, needs_catchup, clipped, native ))) return FALSE;
     if (!client_surface_cache_transform_output( frame->image, &transform->native, 1,
                                                 complete_client_surface_output_transform, transform ))
     {
@@ -3718,22 +3596,17 @@ static BOOL submit_client_surface_output_transform( struct client_surface_compos
 static BOOL copy_client_surface_handoff_to_frame(
     struct client_surface_compositor_target *target,
     struct client_surface_compositor_binding *binding,
-    struct client_surface_compositor_frame *frame, Pixmap source, unsigned int source_depth,
+    struct client_surface_compositor_frame *frame, unsigned int source_depth,
     const struct client_surface_handoff_slot *slot,
-    const struct client_surface_composition_plan *plan, const RECT *damage,
-    BOOL batch, BOOL *pending )
+    const struct client_surface_composition_plan *plan, const RECT *damage, BOOL batch )
 {
-    Display *display = client_surface_compositor_display;
     const XRectangle *clips = (const XRectangle *)plan->clip->Buffer;
     unsigned int clip_count = plan->clip->rdh.nCount;
     RECT catchup = {0};
-    UINT64 revision = batch && !client_surface_copy_batch.asynchronous ?
-                      client_surface_copy_batch.revision : frame->revision;
-    BOOL clipped, incoming_full, needs_catchup, native, overlay_copied = TRUE;
+    UINT64 revision = batch ? client_surface_copy_batch.revision : frame->revision;
+    BOOL clipped, incoming_full, needs_catchup, native;
     unsigned int destination_width = plan->destination.right - plan->destination.left;
     unsigned int destination_height = plan->destination.bottom - plan->destination.top;
-    int error = 0;
-    GC gc;
 
     if (!client_surface_compositor_frame_writable( frame )) return FALSE;
     if (!target->latest || !get_client_surface_compositor_catchup( target, frame, &catchup ))
@@ -3747,23 +3620,6 @@ static BOOL copy_client_surface_handoff_to_frame(
                     revision != target->revision && !IsRectEmpty( &catchup );
     native = source_depth == target->depth && slot->source_visual == target->visual &&
              slot->width == destination_width && slot->height == destination_height;
-
-    if (batch && client_surface_copy_batch.asynchronous)
-    {
-        BOOL copied;
-
-        assert( native );
-        copied = client_surface_xcb_copy( display, source, frame->pixmap, &frame->xcb_gc,
-            needs_catchup ? target->latest : 0, &catchup,
-            &plan->source_damage, &plan->destination, clips, clip_count, clipped,
-            &client_surface_copy_batch.requests[client_surface_copy_batch.count - 1], FALSE );
-        /* Subsequent members append to this private image in request order;
-         * another checkpoint copy would overwrite their earlier neighbors.
-         * A full source replaces the checkpoint just as catchup does.
-         * The revision is invalidated if any request in the batch fails. */
-        if (copied && (needs_catchup || incoming_full)) frame->revision = target->revision;
-        return copied;
-    }
 
     TRACE_(csperf)( "ticks=%llu event=copy_route native=%u full=%u transaction=%u steady=%u assembly=%u "
                    "mailbox=%u ticket=%u latest=%u published=%u inflight=%u\n",
@@ -3785,95 +3641,11 @@ static BOOL copy_client_surface_handoff_to_frame(
         }
         else client_surface_copy_batch.transform = transform;
         client_surface_copy_batch.tail = transform;
-        /* Only the checked completion may make this revision real. Following
-         * members use the planned revision to avoid overwriting earlier ones. */
         if (needs_catchup || incoming_full) client_surface_copy_batch.revision = target->revision;
         return TRUE;
     }
-    if (!plan->generation && !native)
-    {
-        *pending = submit_client_surface_output_transform( target, binding, frame, plan, damage,
-                                                           &catchup, needs_catchup, clipped );
-        return *pending;
-    }
-    if (!plan->generation && native &&
-        !target->assembly_pending && !target->mailbox_pending &&
-        frame->pixmap != target->latest && frame->pixmap != target->published &&
-        client_surface_xcb_copy( display, source, frame->pixmap, &frame->xcb_gc,
-                                 needs_catchup ? target->latest : 0, &catchup,
-                                 &plan->source_damage, &plan->destination, clips, clip_count, clipped,
-                                 &frame->copy_request, TRUE ))
-    {
-        queue_client_surface_compositor_reply( target, frame, NULL );
-        *pending = TRUE;
-        return TRUE;
-    }
-
-    X11DRV_expect_error( display, client_surface_compositor_error, &error );
-    if (!(gc = frame->gc)) gc = frame->gc = XCreateGC( display, frame->pixmap, 0, NULL );
-    if (gc)
-    {
-        /* Clip belongs to this copy's immutable scene member. Reset it before
-         * copying the owner checkpoint into a reused output frame. */
-        XSetClipMask( display, gc, None );
-        XSetClipOrigin( display, gc, 0, 0 );
-        if (needs_catchup)
-        {
-            XCopyArea( display, target->latest, frame->pixmap, gc,
-                       catchup.left, catchup.top,
-                       catchup.right - catchup.left, catchup.bottom - catchup.top,
-                       catchup.left, catchup.top );
-            TRACE_(csperf)( "ticks=%llu event=xlib_copy_request source=%lx destination=%lx width=%u height=%u clipped=0 route=checkpoint\n",
-                           client_surface_perf_time(), target->latest, frame->pixmap,
-                           catchup.right - catchup.left, catchup.bottom - catchup.top );
-        }
-        if (clip_count)
-        {
-            if (clipped)
-                XSetClipRectangles( display, gc, plan->destination.left,
-                                    plan->destination.top, (XRectangle *)clips, clip_count, YXBanded );
-            if (overlay_copied && native)
-            {
-                XCopyArea( display, source, frame->pixmap, gc,
-                           plan->source_damage.left, plan->source_damage.top,
-                           plan->source_damage.right - plan->source_damage.left,
-                           plan->source_damage.bottom - plan->source_damage.top,
-                           plan->destination.left + plan->source_damage.left,
-                           plan->destination.top + plan->source_damage.top );
-                TRACE_(csperf)( "ticks=%llu event=xlib_copy_request source=%lx destination=%lx width=%u height=%u clipped=%u route=overlay\n",
-                               client_surface_perf_time(), source, frame->pixmap,
-                               plan->source_damage.right - plan->source_damage.left,
-                               plan->source_damage.bottom - plan->source_damage.top, clipped );
-            }
-            else if (overlay_copied)
-            {
-                overlay_copied = X11DRV_XRender_CopyClientSurface(
-                    display, source, slot->source_visual, frame->pixmap, target->visual,
-                    slot->width, slot->height, &plan->destination,
-                    clipped ? clips : NULL, clipped ? clip_count : 0, 0, 0 );
-                if (!overlay_copied)
-                    overlay_copied = client_surface_copy_image(
-                        display, &target->memory, source, frame->pixmap, gc, slot->source_visual, target->visual,
-                        slot->width, slot->height, &plan->destination );
-            }
-        }
-    }
-    XSync( display, False );
-    X11DRV_check_error();
-    TRACE_(csperf)( "ticks=%llu event=xlib_output_checked destination=%lx copied=%u error=%d sync_calls=1\n",
-                   client_surface_perf_time(), frame->pixmap, !!gc && overlay_copied, error );
-    if (!gc || error || !overlay_copied)
-    {
-        /* A native sequence may have copied only part of this private
-         * image. Its old journal revision cannot describe those bytes. */
-        frame->revision = 0;
-        discard_client_surface_compositor_gc( frame );
-        return FALSE;
-    }
-    /* A successful full source also consumes the checkpoint. Later partial
-     * or empty members must preserve its pixels in this private assembly. */
-    if (needs_catchup || incoming_full) frame->revision = target->revision;
-    return TRUE;
+    return submit_client_surface_output_transform( target, binding, frame, plan, damage,
+                                                    &catchup, needs_catchup, clipped, native );
 }
 
 static BOOL complete_client_surface_handoff_generation( struct client_surface_compositor_target *target,
@@ -3980,7 +3752,7 @@ done:
 
 static void apply_client_surface_owner_copies( struct client_surface_compositor_target *target,
     struct client_surface_compositor_frame *frame, const struct client_surface_owner_copy *copies,
-    unsigned int count, BOOL success, BOOL asynchronous )
+    unsigned int count, BOOL success )
 {
     unsigned int i;
     UINT64 generation, epoch;
@@ -3997,9 +3769,7 @@ static void apply_client_surface_owner_copies( struct client_surface_compositor_
         const struct client_surface_owner_copy *copy = &copies[i];
         struct client_surface_compositor_binding *binding = copy->binding;
 
-        trace_client_surface_source( copy->replay ?
-                                     (asynchronous ? "replay_copy_async" : "replay_copy_sync") :
-                                     (asynchronous ? "copy_async" : "copy_sync"),
+        trace_client_surface_source( copy->replay ? "replay_copy_async" : "copy_async",
                                      binding, copy->control, copy->sequence,
                                      target->window, frame->pixmap, success && assembly_valid );
         if (success && assembly_valid)
@@ -4023,9 +3793,9 @@ static void apply_client_surface_owner_copies( struct client_surface_compositor_
             binding->replay_epoch = 0;
         }
     }
-    TRACE( "owner copy batch %u sources, success %u, generation %s epoch %s pixmap %#lx async %u\n",
+    TRACE( "owner copy batch %u sources, success %u, generation %s epoch %s pixmap %#lx\n",
            count, success, wine_dbgstr_longlong( generation ), wine_dbgstr_longlong( epoch ),
-           frame->pixmap, asynchronous );
+           frame->pixmap );
     if (!success)
     {
         invalidate_client_surface_compositor_assembly( target );
@@ -4035,16 +3805,6 @@ static void apply_client_surface_owner_copies( struct client_surface_compositor_
         publish_client_surface_handoff_assembly( target, frame, generation, epoch );
 }
 
-static void complete_client_surface_copy_batch( struct client_surface_copy_batch *batch, BOOL success )
-{
-    unsigned int i, count = batch->count;
-
-    batch->count = 0;
-    for (i = 0; i < count; ++i) client_surface_cache_release( batch->copies[i].image );
-    if (!success) discard_client_surface_compositor_gc( batch->frame );
-    apply_client_surface_owner_copies( batch->target, batch->frame, batch->copies, count,
-                                       success, batch->asynchronous );
-}
 
 static void flush_client_surface_copy_batch(void)
 {
@@ -4053,25 +3813,10 @@ static void flush_client_surface_copy_batch(void)
     unsigned int i;
 
     if (!client_surface_copy_batch.count) return;
-    if (client_surface_copy_batch.asynchronous)
-    {
-        for (i = 0; i < ARRAY_SIZE(client_surface_pending_batches); ++i)
-            if (!client_surface_pending_batches[i].count) break;
-        assert( i < ARRAY_SIZE(client_surface_pending_batches) );
-        client_surface_xcb_flush( client_surface_compositor_display,
-            &client_surface_copy_batch.requests[client_surface_copy_batch.count - 1] );
-        client_surface_pending_batches[i] = client_surface_copy_batch;
-        ++client_surface_pending_batch_count;
-        client_surface_copy_batch.target->copy_frame = client_surface_copy_batch.frame;
-        queue_client_surface_compositor_reply( client_surface_copy_batch.target,
-            client_surface_copy_batch.frame, &client_surface_pending_batches[i] );
-        client_surface_copy_batch.count = 0;
-        return;
-    }
     transform = batch->transform;
     if (!batch->error)
     {
-        assert( transform && !batch->target->transform && !batch->target->copy_frame );
+        assert( transform && !batch->target->transform );
         transform->frame_revision = batch->revision;
         if (client_surface_cache_transform_output( batch->frame->image, &transform->native, batch->count,
                                                    complete_client_surface_output_transform_batch, transform ))
@@ -4105,7 +3850,7 @@ static void flush_client_surface_copy_batch(void)
         free_client_surface_output_transforms( transform );
         i = batch->count;
         batch->count = 0;
-        apply_client_surface_owner_copies( batch->target, batch->frame, batch->copies, i, FALSE, TRUE );
+        apply_client_surface_owner_copies( batch->target, batch->frame, batch->copies, i, FALSE );
     }
     batch->transform = batch->tail = NULL;
 }
@@ -4234,7 +3979,7 @@ static void complete_client_surface_output_transform_batch( void *context, BOOL 
                   binding->identity == member->identity && binding->cookie == member->cookie &&
                   client_surface_compositor_binding_is_live( binding ) &&
                   (binding->source_epoch != member->epoch || binding->source_sequence <= member->sequence);
-        copies[count] = (struct client_surface_owner_copy){binding, NULL, member->buffer_index,
+        copies[count] = (struct client_surface_owner_copy){binding, member->buffer_index,
             member->control, member->generation, member->epoch, member->sequence, member->replay};
     }
     TRACE_(csperf)( "ticks=%llu event=output_transform_batch_complete transform=%p hwnd=%p window=%lx "
@@ -4253,68 +3998,10 @@ static void complete_client_surface_output_transform_batch( void *context, BOOL 
     }
     free_client_surface_output_transforms( transform );
     client_surface_cache_release( image );
-    if (current) apply_client_surface_owner_copies( target, frame, copies, count, success, TRUE );
+    if (current) apply_client_surface_owner_copies( target, frame, copies, count, success );
 }
 
-static void complete_client_surface_output_reply( struct client_surface_compositor_reply *reply, BOOL success )
-{
-    struct client_surface_compositor_frame *frame =
-        CONTAINING_RECORD( reply, struct client_surface_compositor_frame, reply );
-    struct client_surface_compositor_target *target = frame->reply_target;
-    struct client_surface_copy_batch *batch = frame->reply_batch;
-    struct client_surface_compositor_binding *binding;
-    UINT64 control;
 
-    frame->reply_target = NULL;
-    frame->reply_batch = NULL;
-    assert( !frame->request_pending );
-    assert( target->copy_frame == frame );
-    target->copy_frame = NULL;
-    if (batch)
-    {
-        --client_surface_pending_batch_count;
-        complete_client_surface_copy_batch( batch, success && !batch->error );
-        return;
-    }
-    binding = frame->copy_binding;
-    assert( binding );
-    control = frame->copy_control;
-    frame->copy_binding = NULL;
-    client_surface_cache_release( frame->copy_image );
-    frame->copy_image = NULL;
-    TRACE( "validated owner copy request %u pixmap %#lx success %u\n",
-           frame->copy_request.cookies[0], frame->pixmap, success );
-    trace_client_surface_source( frame->copy_replay ? "replay_copy_async" : "copy_async",
-                                 binding, control, frame->copy_sequence,
-                                 target->window, frame->pixmap, success );
-    if (!success) discard_client_surface_compositor_gc( frame );
-    complete_client_surface_frame_copy( target, frame, binding, frame->copy_epoch,
-                                        frame->copy_sequence, &frame->copy_damage, success );
-}
-
-static BOOL process_client_surface_compositor_replies(void)
-{
-    struct client_surface_compositor_reply *reply;
-    unsigned int inspected = 0, completed = 0;
-    BOOL success;
-
-    while (inspected < 64 && !list_empty( &client_surface_compositor_replies ))
-    {
-        reply = LIST_ENTRY( list_head( &client_surface_compositor_replies ),
-                            struct client_surface_compositor_reply, entry );
-        ++inspected;
-        if (!client_surface_xcb_poll_batch( client_surface_compositor_display, reply->requests,
-                                            reply->count, &success )) break;
-        ++completed;
-        /* Completion may requeue the same node or release its owning object. */
-        list_remove( &reply->entry );
-        reply->requests = NULL;
-        reply->complete( reply, success );
-    }
-    TRACE_(csperf)( "ticks=%llu event=compositor_reply_scan inspected=%u completed=%u pending=%u\n",
-                   client_surface_perf_time(), inspected, completed, !list_empty( &client_surface_compositor_replies ) );
-    return !!completed;
-}
 
 /* Use the same immutable source predicate for composition and native owner
  * repair. Backend capability and consumed channel sequences are not cache proof. */
@@ -4452,17 +4139,16 @@ static BOOL compose_client_surface_cached_frame( struct client_surface_composito
     struct client_surface_scene current;
     const struct client_surface_scene_layout *layout;
     struct client_surface_compositor_target *target;
-    struct client_surface_compositor_frame *frame = NULL, *previous_publish = NULL;
+    struct client_surface_compositor_frame *frame = NULL;
     UINT64 control;
     unsigned int buffer_index;
     Pixmap source = 0;
     RECT damage;
     unsigned int destination_width, destination_height, source_depth = 0;
-    BOOL composed = FALSE, copied = FALSE, dropped = TRUE, batch, pending = FALSE, asynchronous, replay;
+    BOOL copied = FALSE, dropped = TRUE, batch, replay;
 
     target = find_client_surface_compositor_target( binding->toplevel );
-    if (!target || target->copy_frame || target->transform || target->quiescing || !target->scene.valid) return FALSE;
-    if (client_surface_pending_batch_count == ARRAY_SIZE(client_surface_pending_batches)) return FALSE;
+    if (!target || target->transform || target->quiescing || !target->scene.valid) return FALSE;
     if (!binding->latest_image.pixmap) return FALSE;
     /* From here onwards only owner storage is read. The producer has already
      * received its slot, and may overwrite or destroy it during publication. */
@@ -4516,8 +4202,7 @@ static BOOL compose_client_surface_cached_frame( struct client_surface_composito
          client_surface_copy_batch.copies[0].generation != plan.generation ||
          client_surface_copy_batch.copies[0].epoch != plan.epoch))
         flush_client_surface_copy_batch();
-    if (target->copy_frame || target->transform ||
-        client_surface_pending_batch_count == ARRAY_SIZE(client_surface_pending_batches)) goto retry;
+    if (target->transform) goto retry;
     if (target->scene.epoch != plan.epoch || binding->scene_index >= target->scene.count ||
         target->scene.members[binding->scene_index] != binding ||
         (binding->source_epoch == plan.epoch && slot->source_sequence < binding->source_sequence))
@@ -4563,10 +4248,11 @@ static BOOL compose_client_surface_cached_frame( struct client_surface_composito
             damage.bottom = plan.destination.top +
                 ((UINT64)plan.source_damage.bottom * destination_height + slot->height - 1) / slot->height;
         }
-        if (plan.generation)
-            previous_publish = find_client_surface_pending_publication(
-                target, plan.generation, plan.epoch );
-        if (!previous_publish && target->assembly_pending &&
+        /* The reserved assembly already owns publication. Retain newer
+         * SOURCE in its cache until that receipt advances the scene. */
+        if (plan.generation && find_client_surface_pending_publication( target, plan.generation, plan.epoch ))
+            goto retry;
+        if (target->assembly_pending &&
             (target->assembly_generation != plan.generation ||
              target->assembly_epoch != plan.epoch))
             finish_client_surface_compositor_assembly( target, TRUE );
@@ -4579,7 +4265,7 @@ static BOOL compose_client_surface_cached_frame( struct client_surface_composito
         if (!plan.generation && (target->mailbox_pending ||
             count_client_surface_compositor_frames( target ) >= CLIENT_SURFACE_COMPOSITOR_MAX_INFLIGHT))
             goto retry;
-        if (!plan.generation || previous_publish)
+        if (!plan.generation)
             frame = get_client_surface_compositor_frame( target, !plan.steady );
         else if (target->assembly_pending &&
                  target->assembly_generation == plan.generation &&
@@ -4607,7 +4293,7 @@ retry:
             repair_client_surface_compositor_owner( binding->toplevel, FALSE, &target->repair );
             goto retry;
         }
-        if (plan.generation && !previous_publish && !target->assembly_pending)
+        if (plan.generation && !target->assembly_pending)
         {
             target->assembly_pending = TRUE;
             target->assembly_generation = plan.generation;
@@ -4618,72 +4304,37 @@ retry:
         /* Every participant is copied into one private assembly frame. Its
          * receipt survives the source release, allowing the producer to make
          * progress while other participants are still completing. */
-        batch = plan.generation && !previous_publish;
+        batch = !!plan.generation;
         if (batch)
         {
-            asynchronous = source_depth == target->depth && slot->source_visual == target->visual &&
-                           slot->width == destination_width && slot->height == destination_height &&
-                           client_surface_xcb_available( client_surface_compositor_display );
-            if (client_surface_copy_batch.count &&
-                client_surface_copy_batch.asynchronous != asynchronous)
-            {
-                flush_client_surface_copy_batch();
-                if (target->copy_frame || target->transform) goto retry;
-            }
             if (!client_surface_copy_batch.count)
             {
                 client_surface_copy_batch.target = target;
                 client_surface_copy_batch.frame = frame;
                 client_surface_copy_batch.error = 0;
-                client_surface_copy_batch.asynchronous = asynchronous;
                 client_surface_copy_batch.revision = frame->revision;
                 client_surface_copy_batch.transform = client_surface_copy_batch.tail = NULL;
             }
             assert( client_surface_copy_batch.frame == frame );
             client_surface_copy_batch.copies[client_surface_copy_batch.count++] =
-                (struct client_surface_owner_copy){binding, asynchronous ?
-                                                   client_surface_cache_acquire( binding->latest_image.storage ) : NULL,
+                (struct client_surface_owner_copy){binding,
                                                    buffer_index, control, plan.generation, plan.epoch,
                                                    slot->source_sequence, replay};
-            client_surface_copy_batch.requests[client_surface_copy_batch.count - 1] =
-                (struct client_surface_xcb_request){0};
         }
-        copied = copy_client_surface_handoff_to_frame( target, binding, frame, source, source_depth,
-                                                       slot, &plan, &damage, batch, &pending );
+        copied = copy_client_surface_handoff_to_frame( target, binding, frame, source_depth,
+                                                       slot, &plan, &damage, batch );
         if (copied)
         {
-            if (!pending && !batch)
-                note_client_surface_source_copy( binding, plan.epoch, slot->source_sequence, target->replay_generation );
             frame->width = target->window_width;
             frame->height = target->window_height;
         }
-        if (pending)
-        {
-            if (target->transform) return TRUE;
-            target->copy_frame = frame;
-            frame->copy_binding = binding;
-            frame->copy_image = client_surface_cache_acquire( binding->latest_image.storage );
-            frame->copy_index = buffer_index;
-            frame->copy_control = control;
-            frame->copy_sequence = slot->source_sequence;
-            frame->copy_epoch = plan.epoch;
-            frame->copy_replay = replay;
-            frame->copy_damage = damage;
-            return TRUE;
-        }
+        if (!batch && copied) return TRUE;
         if (batch)
         {
             if (!copied) client_surface_copy_batch.error = 1;
             if (!copied || client_surface_copy_batch.count == CLIENT_SURFACE_COPY_BATCH_SIZE)
                 flush_client_surface_copy_batch();
             return copied;
-        }
-        else if (copied)
-        {
-            trace_client_surface_source( replay ? "replay_copy_sync" : "copy_sync", binding, control, slot->source_sequence,
-                                         target->window, frame->pixmap, TRUE );
-            note_client_surface_compositor_damage( target, frame, &damage );
-            composed = publish_client_surface_handoff_frame( target, frame, binding, &damage );
         }
     }
 release:
@@ -4699,11 +4350,11 @@ release:
         trace_client_surface_source( "discard", binding, control, slot->source_sequence,
                                      target->window, frame ? frame->pixmap : 0, dropped );
     if (!copied && !dropped) flush_client_surface_copy_batch();
-    if (!copied && !dropped && plan.generation && !previous_publish && target &&
+    if (!copied && !dropped && plan.generation && target &&
         target->assembly_pending && target->assembly_generation == plan.generation &&
         target->assembly_epoch == plan.epoch)
         finish_client_surface_compositor_assembly( target, TRUE );
-    return composed;
+    return FALSE;
 }
 
 static BOOL client_surface_handoff_matches_cache( const struct client_surface_compositor_binding *binding,
@@ -4884,18 +4535,8 @@ static BOOL process_client_surface_handoffs( struct client_surface_compositor_sc
             }
             if (!__atomic_load_n( &channel->closed, __ATOMIC_ACQUIRE )) continue;
             flush_client_surface_copy_batch();
-            /* A checked copy retains the binding and owner cache until
-             * its reply arrives, including after producer death. */
-            {
-                struct client_surface_compositor_target *target =
-                    find_client_surface_compositor_target( binding->toplevel );
-
-                if (target && target->copy_frame)
-                {
-                    __atomic_fetch_or( &pool->shared->ready_bitmap[word], (UINT64)1 << bit, __ATOMIC_RELEASE );
-                    continue;
-                }
-            }
+            /* Native copies own their images and scalar adoption identity.
+             * Retiring this binding cannot invalidate those native inputs. */
             __atomic_fetch_and( &pool->shared->ready_bitmap[word], ~((UINT64)1 << bit), __ATOMIC_ACQ_REL );
             remove_client_surface_compositor_binding( binding );
             progressed = TRUE;
@@ -4925,7 +4566,7 @@ static BOOL replay_client_surface_scene_sources( struct client_surface_composito
 
     /* Scene replay reads owner-local images. It never claims a returned
      * producer slot or depends on the producer retaining its previous XID. */
-    if (!target->scene.valid || target->quiescing || target->copy_frame || target->transform) return FALSE;
+    if (!target->scene.valid || target->quiescing || target->transform) return FALSE;
     while (target->replay_member < target->scene.count && *budget)
     {
         struct client_surface_compositor_binding *binding = target->scene.members[target->replay_member];
@@ -4945,7 +4586,7 @@ static BOOL replay_client_surface_scene_sources( struct client_surface_composito
         }
         ++target->replay_member;
         progressed = TRUE;
-        if (target->copy_frame || target->transform) break;
+        if (target->transform) break;
     }
     flush_client_surface_copy_batch();
     return progressed;
@@ -4990,11 +4631,6 @@ static void wait_client_surface_compositor_work( const struct client_surface_com
     assert( !scan->remaining && scan->generation == client_surface_compositor_target_generation );
     assert( !scan->handoff_remaining && scan->pool_generation == client_surface_compositor_pool_generation );
     if (client_surface_compositor_display && XPending( client_surface_compositor_display )) return;
-    if (process_client_surface_compositor_replies())
-    {
-        wake_client_surface_compositor_queues();
-        return;
-    }
     pthread_mutex_lock( &client_surface_compositor_mutex );
     if (client_surface_compositor_head)
     {
@@ -5033,7 +4669,6 @@ static void quiesce_client_surface_compositor_target( struct client_surface_comp
 {
     target->quiescing = TRUE;
     detach_client_surface_output_transform( target );
-    if (target->copy_frame) return;
     finish_client_surface_compositor_assembly( target, TRUE );
     if (target->mailbox_pending && target->mailbox_publish_generation)
         publish_client_surface_handoff_generation( target->toplevel,
@@ -5051,7 +4686,7 @@ static BOOL client_surface_compositor_update_ready( struct client_surface_compos
     const struct client_surface_compositor_queue *queue = target->notifications->queue;
     unsigned int i;
 
-    if (target->copy_frame || target->native_updates) return FALSE;
+    if (target->native_updates) return FALSE;
     /* A state notification can also follow a topology change. Do not wait
      * for unissued output from the server's invalidated scene before
      * allowing the GUI to adopt its replacement. Executing requests retain
@@ -5270,7 +4905,7 @@ static BOOL client_surface_compositor_job_ready( struct client_surface_composito
     /* Authenticated DIRECT admission has already invalidated the old plan.
      * Its continuation only retires bindings and rechecks the selected scene. */
     if (job->op == CLIENT_SURFACE_COMPOSITOR_DIRECT_PLAN && job->scan.phase)
-        return !target || !target->copy_frame;
+        return TRUE;
     if (job->op == CLIENT_SURFACE_COMPOSITOR_DIRECT_PLAN)
     {
         struct client_surface_window_query *query = &job->u.direct_plan.query;
@@ -5322,7 +4957,6 @@ static BOOL client_surface_compositor_job_ready( struct client_surface_composito
          * exact scene RPC accepts. Other native barriers remain independent. */
         target->quiescing = TRUE;
         detach_client_surface_output_transform( target );
-        if (target->copy_frame) return FALSE;
         for (i = 0; i < ARRAY_SIZE(target->frames); ++i)
             if (target->frames[i].serial) return FALSE;
         return TRUE;
@@ -5366,7 +5000,6 @@ static BOOL client_surface_compositor_job_ready( struct client_surface_composito
     }
     /* Preserve the scene, binding and frame referenced by the request. Only
      * this target waits; jobs for independent targets remain eligible. */
-    if (target->copy_frame) return FALSE;
     if (job->op == CLIENT_SURFACE_COMPOSITOR_REMOVE_TARGET ||
         job->op == CLIENT_SURFACE_COMPOSITOR_BEGIN_UPDATE ||
         job->op == CLIENT_SURFACE_COMPOSITOR_REPLACE_POOL) drain = TRUE;
@@ -5916,7 +5549,6 @@ static void client_surface_compositor_thread( void *context )
             progressed = client_surface_complete_queries( CLIENT_SURFACE_COPY_BATCH_SIZE );
             if (progressed) ++client_surface_compositor_query_generation;
             progressed |= client_surface_complete_cache( CLIENT_SURFACE_COPY_BATCH_SIZE );
-            progressed |= process_client_surface_compositor_replies();
             if (progressed) wake_client_surface_compositor_queues();
             progressed |= process_client_surface_compositor_jobs();
             progressed |= process_client_surface_seed_requests();
