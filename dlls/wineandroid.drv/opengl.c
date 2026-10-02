@@ -70,7 +70,7 @@ static EGLConfig egl_config_for_format(int format)
 static void android_drawable_destroy( struct opengl_drawable *base )
 {
     struct gl_drawable *gl = impl_from_opengl_drawable( base );
-    release_ioctl_window( gl->window );
+    if (gl->window) release_ioctl_window( gl->window );
 }
 
 void update_gl_drawable( HWND hwnd )
@@ -108,13 +108,19 @@ static BOOL android_surface_create( struct client_surface *client, int format, s
 
         if (!(gl = opengl_drawable_create( sizeof(*gl), &android_drawable_funcs, format, client ))) return FALSE;
         gl->window = get_client_window( client->hwnd );
+        if (!gl->window) goto failed;
 
         if (!has_client_surface( client->hwnd )) gl->base.surface = funcs->p_eglCreatePbufferSurface( egl->display, config, attribs );
         else gl->base.surface = funcs->p_eglCreateWindowSurface( egl->display, config, gl->window, NULL );
+        if (!gl->base.surface) goto failed;
 
         TRACE( "Created drawable %s with client window %p\n", debugstr_opengl_drawable( &gl->base ), gl->window );
         *drawable = &gl->base;
         return TRUE;
+
+failed:
+        opengl_drawable_release( &gl->base );
+        return FALSE;
     }
 }
 

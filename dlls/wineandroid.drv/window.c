@@ -1199,7 +1199,7 @@ ANativeWindow *get_client_window( HWND hwnd )
 
     if (!(data = get_win_data( hwnd ))) return NULL;
     if (!data->client) data->client = create_ioctl_window( hwnd, TRUE );
-    client = grab_ioctl_window( data->client );
+    client = data->client ? grab_ioctl_window( data->client ) : NULL;
     release_win_data( data );
 
     return client;
