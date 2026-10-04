@@ -734,7 +734,7 @@ struct client_surface_owner_notifications
     Display *end_display;
     unsigned int native_ends, native_batch;
     unsigned int pending_ends;
-    BOOL end_queued, finish_queued, direct_queued, direct_pending;
+    BOOL finish_queued, direct_queued, direct_pending;
     UINT64 finish_serial;
     struct client_surface_direct_completion direct_plan, direct_proof;
 };
@@ -5100,6 +5100,16 @@ static void release_client_surface_compositor_job_resources( struct client_surfa
     }
 }
 
+static void queue_client_surface_end_locked( struct client_surface_owner_notifications *notifications,
+                                             unsigned int count )
+{
+    BOOL idle = !notifications->pending_ends && !notifications->end.u.update.count;
+
+    assert( count && notifications->refs >= count && count <= ~0u - notifications->pending_ends );
+    notifications->pending_ends += count;
+    if (idle) enqueue_client_surface_compositor_job( &notifications->end );
+}
+
 static void prepare_client_surface_notification( struct client_surface_compositor_job *job )
 {
     struct client_surface_owner_notifications *notifications = job->notifications;
@@ -5134,8 +5144,8 @@ static void finish_client_surface_notification( struct client_surface_compositor
     {
         assert( notifications->refs >= job->u.update.count );
         notifications->refs -= job->u.update.count;
+        job->u.update.count = 0;
         if (notifications->pending_ends) enqueue_client_surface_compositor_job( job );
-        else notifications->end_queued = FALSE;
     }
     else if (job->op == CLIENT_SURFACE_COMPOSITOR_FINISH_UPDATE)
     {
@@ -5824,13 +5834,8 @@ static void post_client_surface_compositor_job( struct client_surface_compositor
     pthread_mutex_lock( &client_surface_compositor_mutex );
     if (job->op == CLIENT_SURFACE_COMPOSITOR_END_UPDATE)
     {
-        assert( notifications && notifications->refs && notifications->pending_ends < ~0u );
-        ++notifications->pending_ends;
-        if (!notifications->end_queued)
-        {
-            notifications->end_queued = TRUE;
-            enqueue_client_surface_compositor_job( &notifications->end );
-        }
+        assert( notifications );
+        queue_client_surface_end_locked( notifications, 1 );
     }
     else if (job->op == CLIENT_SURFACE_COMPOSITOR_FINISH_UPDATE)
     {
@@ -6368,9 +6373,7 @@ static void finish_client_surface_native_end( struct client_surface_native_work 
         return;
     }
     pthread_mutex_lock( &client_surface_compositor_mutex );
-    assert( notifications->refs >= notifications->native_batch );
-    assert( notifications->native_batch <= ~0u - notifications->pending_ends );
-    notifications->pending_ends += notifications->native_batch;
+    queue_client_surface_end_locked( notifications, notifications->native_batch );
     TRACE_(csperf)( "ticks=%llu event=native_end_receipt notifications=%p count=%u serial=%lu\n",
                    client_surface_perf_time(), notifications, notifications->native_batch,
                    notifications->end_read.geometry.serial );
@@ -6387,11 +6390,6 @@ static void finish_client_surface_native_end( struct client_surface_native_work 
     else
     {
         notifications->end_display = NULL;
-    }
-    if (!notifications->end_queued)
-    {
-        notifications->end_queued = TRUE;
-        enqueue_client_surface_compositor_job( &notifications->end );
     }
     pthread_mutex_unlock( &client_surface_compositor_mutex );
     /* With no next batch the actor may immediately free this object. */

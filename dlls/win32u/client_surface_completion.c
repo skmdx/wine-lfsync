@@ -62,7 +62,7 @@ struct client_surface_completion_job
     struct client_surface_completion_result native_result;
     SIZE expected_size;
     DWORD wait_started, wait_timeout, poll_due, poll_delay;
-    BOOL has_expected_size, deferred, allocated, reserved, pending, done, retirement, native_complete;
+    BOOL has_expected_size, deferred, allocated, reserved, pending, retirement;
 };
 
 /* The scheduler owns all transitions under completion_executor_lock. Queued
@@ -691,7 +691,8 @@ static enum client_surface_completion_worker_disposition execute_completion_job(
     BOOL allocated = job->allocated;
 
     info->completion_domain = domain;
-    if (poll) result = job->native_complete ? job->native_result : poll_completion_job( surface, job );
+    if (poll) result = job->native_result.status != CLIENT_SURFACE_COMPLETION_PENDING ?
+                      job->native_result : poll_completion_job( surface, job );
     else TRACE( "cancelling completion without polling %s serial %s\n",
                 debugstr_client_surface( surface ), wine_dbgstr_longlong( job->present.serial ) );
     if (worker && result.status != CLIENT_SURFACE_COMPLETION_PENDING)
@@ -709,7 +710,6 @@ static enum client_surface_completion_worker_disposition execute_completion_job(
          * native wait. Its domain stays blocked until that thread exits;
          * the later adoption-only attempt must not retire its new worker. */
         job->native_result.worker = CLIENT_SURFACE_COMPLETION_WORKER_REUSE;
-        job->native_complete = TRUE;
         job->poll_due = NtGetTickCount() + job->poll_delay;
         job->poll_delay = min( job->poll_delay * 2, (DWORD)4 );
         result.status = CLIENT_SURFACE_COMPLETION_PENDING;
@@ -724,7 +724,6 @@ static enum client_surface_completion_worker_disposition execute_completion_job(
     if (result.status != CLIENT_SURFACE_COMPLETION_PENDING)
     {
         list_remove( &job->entry );
-        job->done = TRUE;
         if (job->retirement)
         {
             assert( domain->retirements && completion_retirement_count );
@@ -735,8 +734,8 @@ static enum client_surface_completion_worker_disposition execute_completion_job(
     }
     queue_ready_surface_locked( surface );
     pthread_mutex_unlock( &completion_executor_lock );
-    /* A stack owner can return as soon as done is published. Never access a
-     * stack job after unlocking, including in traces. Each queued job pins
+    /* A stack owner can return once the terminal result is published. Never
+     * access a stack job after unlocking, including in traces. Each queued job pins
      * its surface independently of the worker and the native callback refs. */
     if (result.status != CLIENT_SURFACE_COMPLETION_PENDING)
     {
@@ -979,7 +978,7 @@ static void complete_inline_job( struct client_surface *surface, struct client_s
     for (;;)
     {
         pthread_mutex_lock( &completion_executor_lock );
-        if (own->done)
+        if (own->result.status != CLIENT_SURFACE_COMPLETION_PENDING)
         {
             pthread_mutex_unlock( &completion_executor_lock );
             break;
