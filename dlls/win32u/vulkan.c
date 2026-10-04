@@ -3322,9 +3322,7 @@ reserve_completions:
         res = VK_ERROR_OUT_OF_HOST_MEMORY;
         if (!reservations[index].job)
         {
-            admission = client_surface_reserve_completion_domain( swapchain->surface->client,
-                impl_from_vulkan_device( device )->completion_domain_base + (queue - device->queues),
-                &reservations[index].job );
+            admission = client_surface_reserve_completion_storage( swapchain->surface->client, &reservations[index].job );
             if (admission.reason == CLIENT_SURFACE_STALE_OR_CLOSED) continue;
             if (admission.reason != CLIENT_SURFACE_ACCEPTED) goto admission_failed;
         }
@@ -3345,7 +3343,8 @@ reserve_completions:
     for (uint32_t i = 0; i < present_info->swapchainCount; ++i)
         if (reservations[i].job)
         {
-            admission = (struct client_surface_admission){ client_surface_activate_completion( reservations[i].job ),
+            admission = (struct client_surface_admission){ client_surface_activate_completion( reservations[i].job,
+                impl_from_vulkan_device( device )->completion_domain_base + (queue - device->queues) ),
                                                            CLIENT_SURFACE_CAPACITY_NONE };
             if (admission.reason == CLIENT_SURFACE_STALE_OR_CLOSED) continue;
             if (admission.reason != CLIENT_SURFACE_ACCEPTED) goto admission_failed;
