@@ -26,6 +26,7 @@
 #include "ntuser_private.h"
 #include "wine/debug.h"
 #include "wine/rbtree.h"
+#include "wine/unixlib.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(win);
 WINE_DECLARE_DEBUG_CHANNEL(csperf);
@@ -106,10 +107,10 @@ struct client_surface_completion_domain
 struct client_surface_completion_worker
 {
     HANDLE thread;
+    struct ntdll_thread *native_thread;
     /* A callback owns the slot through capture and final release. PENDING
      * returns the slot, but not the job's domain or surface FIFO position.
-     * A contaminated thread retains its domain until its Wine thread handle
-     * is signalled. This does not join native pthread TLS destructors. */
+     * A contaminated thread retains its domain through native thread teardown. */
     struct client_surface_completion_domain *domain;
     BOOL finishing;
     enum
@@ -396,6 +397,10 @@ static void reap_completion_workers(void)
         pthread_mutex_unlock( &completion_executor_lock );
         if (!thread) continue;
         status = NtWaitForSingleObject( thread, FALSE, &timeout );
+        /* The Wine handle can signal before native TLS destructors finish.
+         * REAPING excludes other joiners; neither a new producer nor another
+         * worker may reuse this slot or domain until the native join returns. */
+        if (!status) status = ntdll_join_thread( worker->native_thread );
         pthread_mutex_lock( &completion_executor_lock );
         if (!status)
         {
@@ -409,6 +414,7 @@ static void reap_completion_workers(void)
                 free_completion_domain_locked( domain );
             }
             worker->thread = NULL;
+            worker->native_thread = NULL;
             worker->state = COMPLETION_WORKER_FREE;
         }
         else worker->state = COMPLETION_WORKER_EXITING;
@@ -462,7 +468,7 @@ static enum client_surface_admission_reason acquire_completion_domain_locked( st
 
 /* Include creation reservations and still-exiting threads in the four slots.
  * A callback's RETIRE is not evidence that its native thread has exited. No
- * replacement can reuse that slot until its thread handle is signalled. */
+ * replacement can reuse that slot until the native thread has been joined. */
 enum client_surface_admission_reason client_surface_activate_completion( struct client_surface_completion_job *job )
 {
     struct client_surface_completion_worker *worker = NULL;
@@ -470,6 +476,7 @@ enum client_surface_admission_reason client_surface_activate_completion( struct 
     unsigned int i, running = 0, domains;
     NTSTATUS status;
     HANDLE thread;
+    struct ntdll_thread *native_thread;
     enum client_surface_admission_reason reason;
 
     assert( job->reserved );
@@ -514,13 +521,13 @@ unlock:
     pthread_mutex_unlock( &completion_executor_lock );
     if (!worker) goto done;
 
-    /* PsCreateSystemThread invokes this Unix entry directly, including for a
+    /* The system thread invokes this Unix entry directly, including for a
      * Windows process whose machine differs from the host. Creation itself
      * must not hold the executor lock or a native presentation lock. */
-    status = PsCreateSystemThread( &thread, THREAD_ALL_ACCESS, NULL, 0, NULL,
-                                  client_surface_completion_thread, worker );
+    status = ntdll_create_joinable_thread( &thread, &native_thread, client_surface_completion_thread, worker );
     pthread_mutex_lock( &completion_executor_lock );
     worker->thread = status ? NULL : thread;
+    worker->native_thread = native_thread;
     worker->state = status ? COMPLETION_WORKER_FREE : COMPLETION_WORKER_RUNNING;
     /* Publishing the clean worker and assigning the ticket are atomic. An
      * unrelated caller cannot take the sole idle worker between our capacity
@@ -544,6 +551,7 @@ BOOL client_surface_prepare_retirement( struct client_surface *surface )
     unsigned int i, running, starting;
     NTSTATUS status;
     HANDLE thread;
+    struct ntdll_thread *native_thread;
 
     job->surface = surface;
     /* Cleanup ownership is dormant metadata, not a native execution ticket.
@@ -575,10 +583,10 @@ BOOL client_surface_prepare_retirement( struct client_surface *surface )
             }
         pthread_mutex_unlock( &completion_executor_lock );
         if (!worker) return FALSE;
-        status = PsCreateSystemThread( &thread, THREAD_ALL_ACCESS, NULL, 0, NULL,
-                                      client_surface_completion_thread, worker );
+        status = ntdll_create_joinable_thread( &thread, &native_thread, client_surface_completion_thread, worker );
         pthread_mutex_lock( &completion_executor_lock );
         worker->thread = status ? NULL : thread;
+        worker->native_thread = native_thread;
         worker->state = status ? COMPLETION_WORKER_FREE : COMPLETION_WORKER_RUNNING;
         pthread_cond_broadcast( &completion_executor_cond );
         if (status)
@@ -859,7 +867,7 @@ static void cancel_worker_completion_jobs( struct client_surface_completion_work
             pthread_cond_wait( &completion_executor_cond, &completion_executor_lock );
         if (!worker->domain->references)
         {
-            /* Keep ownership until the reaper observes the signalled handle.
+            /* Keep ownership until the reaper has joined the native thread.
              * Dormant cleanup jobs may only run on a clean thread then. */
             pthread_mutex_unlock( &completion_executor_lock );
             return;

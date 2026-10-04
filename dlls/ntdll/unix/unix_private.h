@@ -110,6 +110,7 @@ struct thread_data
     DWORD        tid;               /* thread id */
     BOOL         allow_writes;      /* ThreadAllowWrites flags */
     BOOL         suspend;           /* suspend on startup */
+    BOOL         joinable;          /* native lifetime belongs to an explicit joiner */
     unsigned int lockfree_spin;     /* adaptive lock-free wait spin count */
     int          lockfree_spin_streak; /* positive hits or negative maximum-spin misses */
     pthread_mutex_t *uninterrupted_mutexes[8]; /* mutexes held across unlocked server calls */

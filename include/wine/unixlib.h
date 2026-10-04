@@ -47,6 +47,13 @@ NTSYSAPI const WCHAR *ntdll_get_data_dir(void);
 NTSYSAPI NTSTATUS ntdll_get_dos_file_name( const char *unix_name, WCHAR **dos, UINT disposition );
 NTSYSAPI NTSTATUS ntdll_get_unix_file_name( const WCHAR *dos, char **unix_name, UINT disposition );
 
+struct ntdll_thread;
+/* The caller owns the native thread and must join it exactly once, outside
+ * locks needed by its callbacks or native TLS destructors. */
+NTSYSAPI NTSTATUS ntdll_create_joinable_thread( HANDLE *handle, struct ntdll_thread **thread,
+                                              void (*start)(void *), void *param );
+NTSYSAPI NTSTATUS ntdll_join_thread( struct ntdll_thread *thread );
+
 /* exception handling */
 
 #include <setjmp.h>

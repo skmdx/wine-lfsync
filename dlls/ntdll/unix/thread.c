@@ -1323,7 +1323,7 @@ static NTSTATUS create_server_thread( HANDLE *handle, struct thread_data **data_
 /***********************************************************************
  *           spawn_thread
  */
-static NTSTATUS spawn_thread( struct thread_data *data )
+static NTSTATUS spawn_thread( struct thread_data *data, pthread_t *thread )
 {
     sigset_t sigset;
     pthread_t pthread_id;
@@ -1341,6 +1341,7 @@ static NTSTATUS spawn_thread( struct thread_data *data )
         InterlockedDecrement( &nb_threads );
         status = STATUS_NO_MEMORY;
     }
+    else if (thread) *thread = pthread_id;
     pthread_attr_destroy( &attr );
     pthread_sigmask( SIG_SETMASK, &sigset, NULL );
     return status;
@@ -1470,7 +1471,7 @@ NTSTATUS WINAPI NtCreateThreadEx( HANDLE *handle, ACCESS_MASK access, OBJECT_ATT
         wow_teb->SkipLoaderInit = teb->SkipLoaderInit;
     }
 
-    status = spawn_thread( data );
+    status = spawn_thread( data, NULL );
 
 done:
     if (status)
@@ -1498,7 +1499,7 @@ NTSTATUS WINAPI PsCreateSystemThread( HANDLE *handle, ACCESS_MASK access, OBJECT
     if ((status = create_server_thread( handle, &data, access, attr, start, param, flags, TRUE )))
         return status;
 
-    if ((status = spawn_thread( data )))
+    if ((status = spawn_thread( data, NULL )))
     {
         NtClose( *handle );
         virtual_free_thread_data( data );
@@ -1507,6 +1508,53 @@ NTSTATUS WINAPI PsCreateSystemThread( HANDLE *handle, ACCESS_MASK access, OBJECT
 
     if (id) *id = make_client_id( pid, data->tid );
     return status;
+}
+
+struct ntdll_thread
+{
+    struct thread_data *data;
+    pthread_t id;
+};
+
+NTSTATUS ntdll_create_joinable_thread( HANDLE *handle, struct ntdll_thread **thread,
+                                      void (*start)(void *), void *param )
+{
+    struct ntdll_thread *native;
+    NTSTATUS status;
+
+    *thread = NULL;
+    if (!(native = malloc( sizeof(*native) ))) return STATUS_NO_MEMORY;
+    if ((status = create_server_thread( handle, &native->data, THREAD_ALL_ACCESS, NULL,
+                                       start, param, THREAD_CREATE_FLAGS_BYPASS_PROCESS_FREEZE, TRUE )))
+    {
+        free( native );
+        return status;
+    }
+    native->data->joinable = TRUE;
+    if ((status = spawn_thread( native->data, &native->id )))
+    {
+        close( native->data->request_fd );
+        NtClose( *handle );
+        virtual_free_thread_data( native->data );
+        free( native );
+        return status;
+    }
+    *thread = native;
+    return STATUS_SUCCESS;
+}
+
+NTSTATUS ntdll_join_thread( struct ntdll_thread *thread )
+{
+    int ret = pthread_join( thread->id, NULL );
+
+    if (ret)
+    {
+        ERR( "Failed to join native system thread: %s\n", strerror( ret ) );
+        return STATUS_UNSUCCESSFUL;
+    }
+    virtual_free_thread_data( thread->data );
+    free( thread );
+    return STATUS_SUCCESS;
 }
 
 
@@ -1554,7 +1602,8 @@ static DECLSPEC_NORETURN void exit_thread( int status )
 
     if (InterlockedDecrement( &nb_threads ) <= 0) exit_process( status );
 
-    if ((data = InterlockedExchangePointer( &prev_data, get_thread_data() )))
+    if (!get_thread_data()->joinable &&
+        (data = InterlockedExchangePointer( &prev_data, get_thread_data() )))
     {
         if (data->pthread_id)
         {
