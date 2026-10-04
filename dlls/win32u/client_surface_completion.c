@@ -946,9 +946,9 @@ static void queue_completion_job_locked( struct client_surface *surface,
                    wine_dbgstr_longlong( client_surface_get_identity( surface ) ),
                    wine_dbgstr_longlong( job->present.serial ), wine_dbgstr_longlong( job->present.handoff_control ),
                    wine_dbgstr_longlong( job->present.target_epoch ), job->deferred, !job->allocated, empty );
-    TRACE( "event=completion_enqueue surface=%p serial=%s completion=%p capture=%p deferred=%u inline=%u\n",
+    TRACE( "event=completion_enqueue surface=%p serial=%s completion=%p capture=%p deferred=%u inline=%u retirement=%u\n",
            surface, wine_dbgstr_longlong( job->present.serial ), job->present.completion.context,
-           job->present.capture.context, job->deferred, !job->allocated );
+           job->present.capture.context, job->deferred, !job->allocated, job->retirement );
     pthread_cond_broadcast( &completion_executor_cond );
 }
 
