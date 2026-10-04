@@ -609,9 +609,8 @@ W32KAPI struct client_surface_present_result client_surface_complete_present( st
                                               struct client_surface_frame *present,
                                               BOOL submitted, BOOL external_completed,
                                               const SIZE *expected_size, DWORD timeout );
-W32KAPI struct client_surface_completion_result client_surface_wait_present_completion( struct client_surface *surface,
-                                                      const struct client_surface_frame *present,
-                                                      DWORD timeout );
+W32KAPI struct client_surface_completion_result client_surface_probe_shared_completion( struct client_surface *surface,
+                                                      const struct client_surface_frame *present );
 W32KAPI void client_surface_set_present_completion( struct client_surface_frame *present,
                                                      client_surface_completion_wait_func wait,
                                                      client_surface_completion_release_func release,

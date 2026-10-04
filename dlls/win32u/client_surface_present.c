@@ -1095,8 +1095,11 @@ static BOOL client_surface_finish_host_completion( struct client_surface *surfac
         if (client_surface_completion_result_is_external( &present->completion ))
             completed = external_completed;
         else if (present->completion.kind == CLIENT_SURFACE_COMPLETION_SHARED)
-            completed = client_surface_wait_present_completion( surface, present, timeout ).status ==
+        {
+            assert( !timeout );
+            completed = client_surface_probe_shared_completion( surface, present ).status ==
                         CLIENT_SURFACE_COMPLETION_SIGNALED;
+        }
         else
             completed = FALSE;
     }
