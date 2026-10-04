@@ -261,7 +261,6 @@ struct client_surface_compositor_target
     unsigned int received;
     unsigned int replay_member;
     BOOL mailbox_pending;
-    BOOL assembly_pending;
     BOOL quiescing;
     unsigned int native_updates;
     UINT64 seed_serial;
@@ -764,7 +763,7 @@ struct client_surface_output_allocation
     UINT geometry_update;
     UINT64 geometry_scope, geometry_revision;
     unsigned int seed_stage;
-    BOOL seed, seed_target, scene_wait, stale;
+    BOOL seed_target, scene_wait;
     struct list seed_entry;
     struct client_surface_scene scene;
     Pixmap source, published;
@@ -1163,7 +1162,7 @@ static void release_client_surface_output_checkpoint( struct client_surface_outp
 static void free_client_surface_pending_allocation( struct client_surface_output_allocation *allocation )
 {
     assert( !allocation->pending );
-    if (allocation->seed && !allocation->release.async)
+    if (allocation->checkpoint && !allocation->release.async)
     {
         /* The actor drops its scalar adoption identity before freeing this
          * admitted record. GUI cancellation never looks up an actor target. */
@@ -1766,7 +1765,7 @@ static struct client_surface_compositor_frame *get_client_surface_compositor_fra
             target->frames[index].pixmap == target->published ||
             (preserve_backing && target->frames[index].pixmap == target->backing) ||
             (target->mailbox_pending && index == target->mailbox_frame) ||
-            (target->assembly_pending && index == target->assembly_frame) ||
+            (target->assembly_generation && index == target->assembly_frame) ||
             !client_surface_compositor_frame_writable( &target->frames[index] )) continue;
         target->next_frame = (index + 1) % ARRAY_SIZE(target->frames);
         return &target->frames[index];
@@ -1813,7 +1812,7 @@ static void finish_client_surface_compositor_assembly(
 {
     struct client_surface_compositor_frame *frame;
 
-    if (!target->assembly_pending) return;
+    if (!target->assembly_generation) return;
     frame = &target->frames[target->assembly_frame];
     target->received = 0;
     if (target->receipts) memset( target->receipts, 0, target->scene.count * sizeof(*target->receipts) );
@@ -1837,7 +1836,6 @@ static void finish_client_surface_compositor_assembly(
                wine_dbgstr_longlong( target->assembly_generation ),
                wine_dbgstr_longlong( target->assembly_epoch ), frame->pixmap );
     }
-    target->assembly_pending = FALSE;
     target->assembly_generation = 0;
     target->assembly_epoch = 0;
     target->assembly_frame = 0;
@@ -1847,7 +1845,7 @@ static void invalidate_client_surface_compositor_assembly( struct client_surface
 {
     unsigned int i;
 
-    if (!target->assembly_pending) return;
+    if (!target->assembly_generation) return;
     /* Earlier chunks only proved regions of this private image. Its next
      * catchup may replace them, so replay all members after detaching even
      * when this scene's epoch survives the cancelled transaction. */
@@ -1866,7 +1864,7 @@ static void invalidate_client_surface_compositor_assembly( struct client_surface
 static void abort_client_surface_output_transform_assembly( struct client_surface_compositor_target *target,
                                                             struct client_surface_output_transform *transform )
 {
-    if (!transform->generation || target->transform != transform || !target->assembly_pending ||
+    if (!transform->generation || target->transform != transform || !target->assembly_generation ||
         target->assembly_generation != transform->generation || target->assembly_epoch != transform->epoch ||
         target->scene.epoch != transform->epoch ||
         target->frames[target->assembly_frame].image != transform->image) return;
@@ -2506,7 +2504,7 @@ static BOOL update_client_surface_compositor_target( struct client_surface_compo
         target->scene.valid = FALSE;
         if (window_changed) SetRectEmpty( &target->restore_rect );
     }
-    if (target->assembly_pending &&
+    if (target->assembly_generation &&
         (window_changed || backing_changed || extent_changed || format_changed))
         finish_client_surface_compositor_assembly( target, TRUE );
     if ((target->window && window_changed) ||
@@ -2600,7 +2598,7 @@ static struct client_surface_compositor_frame *client_surface_output_checkpoint_
         /* A partial assembly is not a completed checkpoint, even before its
          * next native request is queued. Admission never waits for it. */
         if (client_surface_cache_write_pending( frame->image ) ||
-            (target->assembly_pending && target->assembly_frame == i) ||
+            (target->assembly_generation && target->assembly_frame == i) ||
             (client_surface_copy_batch.count && client_surface_copy_batch.frame == frame))
         {
             *busy = TRUE;
@@ -2653,7 +2651,7 @@ static void queue_client_surface_seed( struct client_surface_output_allocation *
     allocation->source = job->u.pool.source;
     allocation->copy_width = job->u.pool.preserve_width;
     allocation->copy_height = job->u.pool.preserve_height;
-    allocation->checkpoint = allocation->seed = TRUE;
+    allocation->checkpoint = TRUE;
     allocation->seed_target = !!target;
     if (target)
     {
@@ -2752,7 +2750,6 @@ static BOOL process_client_surface_seed_requests(void)
         progressed = TRUE;
         continue;
 failed:
-        allocation->stale = !abandoned;
         client_surface_output_allocation_complete( allocation, FALSE );
         progressed = TRUE;
     }
@@ -2766,7 +2763,7 @@ static BOOL install_client_surface_output_checkpoint( struct client_surface_comp
     struct client_surface_compositor_target *target = find_client_surface_compositor_target( job->toplevel );
     BOOL current;
 
-    assert( allocation->checkpoint && allocation->seed && !allocation->pending && !allocation->failed );
+    assert( allocation->checkpoint && !allocation->pending && !allocation->failed );
     current = allocation->seed_stage == 2 && client_surface_seed_current( allocation, target ) &&
               job->u.pool.source == allocation->source && job->u.pool.destination == allocation->window &&
               job->u.pool.width == allocation->width && job->u.pool.height == allocation->height &&
@@ -3614,7 +3611,7 @@ static BOOL copy_client_surface_handoff_to_frame(
     TRACE_(csperf)( "ticks=%llu event=copy_route native=%u full=%u transaction=%u steady=%u assembly=%u "
                    "mailbox=%u ticket=%u latest=%u published=%u inflight=%u\n",
                    client_surface_perf_time(), native, incoming_full, !!plan->generation,
-                   plan->steady, target->assembly_pending, target->mailbox_pending,
+                   plan->steady, !!target->assembly_generation, target->mailbox_pending,
                    !!target->mailbox_publish_generation, frame->pixmap == target->latest,
                    frame->pixmap == target->published, !!frame->serial );
     if (batch)
@@ -3703,7 +3700,7 @@ static BOOL client_surface_handoff_generation_assembled(
     struct client_surface_compositor_frame *frame, UINT64 generation, UINT64 epoch )
 {
     return target->scene.valid && target->scene.epoch == epoch && target->scene.count &&
-           target->assembly_pending && target->assembly_generation == generation &&
+           target->assembly_generation && target->assembly_generation == generation &&
            target->assembly_epoch == epoch && target->assembly_frame == frame - target->frames &&
            target->received == target->scene.count;
 }
@@ -3751,7 +3748,7 @@ static void apply_client_surface_owner_copies( struct client_surface_compositor_
     if (!count) return;
     generation = copies[0].generation;
     epoch = copies[0].epoch;
-    assembly_valid = target->assembly_pending && target->scene.valid &&
+    assembly_valid = target->assembly_generation && target->scene.valid &&
         target->assembly_generation == generation && target->assembly_epoch == epoch &&
         target->scene.epoch == epoch && target->assembly_frame == frame - target->frames;
     for (i = 0; i < count; ++i)
@@ -3947,7 +3944,7 @@ static void complete_client_surface_output_transform_batch( void *context, BOOL 
                   !target->quiescing && target->revision == transform->revision &&
                   target->window_width == transform->width && target->window_height == transform->height &&
                   target->visual == transform->native.destination_visual && target->scene.valid &&
-                  target->scene.epoch == transform->epoch && target->assembly_pending &&
+                  target->scene.epoch == transform->epoch && target->assembly_generation &&
                   target->assembly_generation == transform->generation &&
                   target->assembly_epoch == transform->epoch && target->assembly_frame == frame - target->frames &&
                   client_surface_get_toplevel_scene( target->toplevel, &scene ) &&
@@ -4242,7 +4239,7 @@ static BOOL compose_client_surface_cached_frame( struct client_surface_composito
          * SOURCE in its cache until that receipt advances the scene. */
         if (plan.generation && find_client_surface_pending_publication( target, plan.generation, plan.epoch ))
             goto retry;
-        if (target->assembly_pending &&
+        if (target->assembly_generation &&
             (target->assembly_generation != plan.generation ||
              target->assembly_epoch != plan.epoch))
             finish_client_surface_compositor_assembly( target, TRUE );
@@ -4257,7 +4254,7 @@ static BOOL compose_client_surface_cached_frame( struct client_surface_composito
             goto retry;
         if (!plan.generation)
             frame = get_client_surface_compositor_frame( target, !plan.steady );
-        else if (target->assembly_pending &&
+        else if (target->assembly_generation &&
                  target->assembly_generation == plan.generation &&
                  target->assembly_epoch == plan.epoch)
             frame = &target->frames[target->assembly_frame];
@@ -4283,9 +4280,8 @@ retry:
             repair_client_surface_compositor_owner( binding->toplevel, FALSE, &target->repair );
             goto retry;
         }
-        if (plan.generation && !target->assembly_pending)
+        if (plan.generation && !target->assembly_generation)
         {
-            target->assembly_pending = TRUE;
             target->assembly_generation = plan.generation;
             target->assembly_epoch = plan.epoch;
             target->assembly_frame = frame - target->frames;
@@ -4341,7 +4337,7 @@ release:
                                      target->window, frame ? frame->pixmap : 0, dropped );
     if (!copied && !dropped) flush_client_surface_copy_batch();
     if (!copied && !dropped && plan.generation && target &&
-        target->assembly_pending && target->assembly_generation == plan.generation &&
+        target->assembly_generation && target->assembly_generation == plan.generation &&
         target->assembly_epoch == plan.epoch)
         finish_client_surface_compositor_assembly( target, TRUE );
     return FALSE;
@@ -4374,7 +4370,7 @@ static BOOL coalesce_client_surface_handoffs( struct client_surface_compositor_b
     UINT64 previous = *consumed;
 
     assert( !client_surface_cache_read_pending( binding ) && produced != *consumed );
-    if (!target || target->quiescing || target->assembly_pending || !target->scene.valid ||
+    if (!target || target->quiescing || target->assembly_generation || !target->scene.valid ||
         binding->scene_index >= target->scene.count || target->scene.members[binding->scene_index] != binding ||
         !client_surface_cached_frame_matches_layout( binding, &target->scene.layouts[binding->scene_index] ) ||
         !client_surface_get_toplevel_scene( binding->toplevel, &scene ) || scene.epoch != target->scene.epoch ||
@@ -5514,7 +5510,7 @@ static BOOL process_client_surface_compositor_targets( struct client_surface_com
         progressed |= replay_client_surface_scene_sources( target, &budget );
         flush_client_surface_compositor_mailbox( target );
         now = NtGetTickCount();
-        if (target->shrink_start && !target->native_updates && !target->assembly_pending)
+        if (target->shrink_start && !target->native_updates && !target->assembly_generation)
         {
             elapsed = now - target->shrink_start;
             if (elapsed >= 2000)
@@ -6833,7 +6829,7 @@ static BOOL client_surface_output_checkpoint_matches( struct x11drv_win_data *da
                                                        struct client_surface_output_allocation *allocation,
                                                        unsigned int window_width, unsigned int window_height )
 {
-    if (allocation->seed)
+    if (allocation->checkpoint)
         return allocation->source == data->client_surface_backing && allocation->window_owner == data->native_window &&
                allocation->window == data->whole_window && allocation->window_width == window_width &&
                allocation->window_height == window_height &&
