@@ -643,7 +643,6 @@ struct client_surface_compositor_job
 struct client_surface_compositor_request
 {
     struct client_surface_compositor_job job;
-    struct client_surface_memory_scope memory;
     pthread_cond_t completed;
 };
 
@@ -659,10 +658,8 @@ struct client_surface_compositor_queue
     struct client_surface_compositor_job *head, **tail, *control_head, **control_tail;
     HWND toplevel;
     unsigned int refs, incoming, requests;
-    /* Native update barriers already have synchronous callers.
-     * Serialize their storage within the admitted queue, independently of
-     * ordinary request pressure. Release notifications never use this slot. */
-    struct client_surface_compositor_request barrier;
+    /* One barrier per admitted queue bypasses ordinary request pressure.
+     * Its synchronous caller owns the storage until the actor completes it. */
     pthread_cond_t barrier_available;
     BOOL barrier_in_use;
     /* Removal is admitted with the queue, including before a target exists.
@@ -989,7 +986,6 @@ static void *alloc_client_surface_compositor_metadata( HWND toplevel, SIZE_T siz
 static void free_client_surface_compositor_queue( struct client_surface_compositor_queue *queue )
 {
     pthread_cond_destroy( &queue->barrier_available );
-    pthread_cond_destroy( &queue->barrier.completed );
     client_surface_free_owned_metadata( &queue->memory, queue, sizeof(*queue) );
     release_client_surface_compositor_capacity( CLIENT_SURFACE_COMPOSITOR_QUEUE_CAPACITY, 1, sizeof(*queue), NULL );
 }
@@ -1029,12 +1025,7 @@ static struct client_surface_compositor_queue *get_client_surface_compositor_que
             return NULL;
         }
         created->memory = memory;
-        if (pthread_cond_init( &created->barrier.completed, NULL )) goto failed;
-        if (pthread_cond_init( &created->barrier_available, NULL ))
-        {
-            pthread_cond_destroy( &created->barrier.completed );
-            goto failed;
-        }
+        if (pthread_cond_init( &created->barrier_available, NULL )) goto failed;
         created->toplevel = toplevel;
         created->refs = 1;
         created->tail = &created->head;
@@ -2478,6 +2469,7 @@ static BOOL update_client_surface_compositor_target( struct client_surface_compo
     struct client_surface_compositor_target *target;
     struct client_surface_output_allocation *allocation = NULL;
     BOOL same_pool, checkpoint, created = FALSE;
+    BOOL window_changed, extent_changed, format_changed, backing_changed, image_size_changed;
 
     if (!(target = find_client_surface_compositor_target( job->toplevel )))
     {
@@ -2500,31 +2492,32 @@ static BOOL update_client_surface_compositor_target( struct client_surface_compo
         if (!allocation) goto failed;
     }
     if (created) register_client_surface_compositor_target( target );
-    if (target->window != job->u.pool.destination || target->window_width != job->u.pool.window_width ||
-        target->window_height != job->u.pool.window_height || !same_pool)
+    window_changed = target->window != job->u.pool.destination;
+    extent_changed = target->window_width != job->u.pool.window_width ||
+                     target->window_height != job->u.pool.window_height;
+    format_changed = target->depth != job->u.pool.depth || target->visual != job->u.pool.visual;
+    backing_changed = target->backing != job->u.pool.pixmaps[0];
+    image_size_changed = target->width != job->u.pool.width || target->height != job->u.pool.height;
+    if (window_changed || extent_changed || !same_pool)
         quiesce_client_surface_compositor_target( target );
-    checkpoint = !same_pool || target->backing != job->u.pool.pixmaps[0];
-    if (target->window != job->u.pool.destination || target->window_width != job->u.pool.window_width ||
-        target->window_height != job->u.pool.window_height || target->depth != job->u.pool.depth || target->visual != job->u.pool.visual)
+    checkpoint = !same_pool || backing_changed;
+    if (window_changed || extent_changed || format_changed)
     {
         target->scene.valid = FALSE;
-        if (target->window != job->u.pool.destination) SetRectEmpty( &target->restore_rect );
+        if (window_changed) SetRectEmpty( &target->restore_rect );
     }
     if (target->assembly_pending &&
-        (target->window != job->u.pool.destination || target->backing != job->u.pool.pixmaps[0] ||
-         target->window_width != job->u.pool.window_width || target->window_height != job->u.pool.window_height ||
-         target->depth != job->u.pool.depth || target->visual != job->u.pool.visual))
+        (window_changed || backing_changed || extent_changed || format_changed))
         finish_client_surface_compositor_assembly( target, TRUE );
-    if ((target->window && target->window != job->u.pool.destination) ||
+    if ((target->window && window_changed) ||
         (target->frames[0].pixmap && !same_pool))
         drain_client_surface_compositor_target( target );
     /* Selection belongs to the native window, not its replaceable images.
      * Keep it across pool replacement and an acknowledged DIRECT plan. */
-    if (target->window && target->window != job->u.pool.destination)
+    if (target->window && window_changed)
         free_client_surface_compositor_present_input( target );
     if (target->mailbox && target->mailbox->pending &&
-        (target->window != job->u.pool.destination || target->width != job->u.pool.width ||
-         target->height != job->u.pool.height || target->depth != job->u.pool.depth))
+        (window_changed || image_size_changed || target->depth != job->u.pool.depth))
         free_client_surface_compositor_mailbox( target );
     retry_client_surface_compositor_mailbox( target );
     if (target->window_owner != job->u.pool.window_owner)
@@ -5689,15 +5682,16 @@ static BOOL queue_client_surface_compositor_job( struct client_surface_composito
     return TRUE;
 }
 
-static struct client_surface_compositor_request *alloc_client_surface_compositor_request(
-    const struct client_surface_compositor_job *job, struct client_surface_compositor_queue *queue )
+static BOOL submit_client_surface_compositor_request( struct client_surface_compositor_request *request )
 {
-    struct client_surface_compositor_request *request;
-    struct client_surface_memory_scope memory = {0};
+    struct client_surface_compositor_job *job = &request->job;
+    struct client_surface_compositor_queue *queue;
+    BOOL ret = FALSE;
     BOOL barrier = job->op == CLIENT_SURFACE_COMPOSITOR_BEGIN_UPDATE ||
                    job->op == CLIENT_SURFACE_COMPOSITOR_TRY_BEGIN_UPDATE ||
                    job->op == CLIENT_SURFACE_COMPOSITOR_CHECK_UPDATE;
 
+    if (!(queue = get_client_surface_compositor_queue( job->toplevel ))) goto failed;
     pthread_mutex_lock( &client_surface_compositor_mutex );
     if (barrier)
     {
@@ -5709,7 +5703,6 @@ static struct client_surface_compositor_request *alloc_client_surface_compositor
         while (queue->barrier_in_use)
             pthread_cond_wait( &queue->barrier_available, &client_surface_compositor_mutex );
         queue->barrier_in_use = TRUE;
-        request = &queue->barrier;
         pthread_mutex_unlock( &client_surface_compositor_mutex );
     }
     else
@@ -5718,34 +5711,33 @@ static struct client_surface_compositor_request *alloc_client_surface_compositor
                                                                      1, sizeof(*request), queue );
 
         pthread_mutex_unlock( &client_surface_compositor_mutex );
-        if (!accepted) return NULL;
-        client_surface_memory_scope_copy( &memory, &queue->memory, TRUE );
-        if (!(request = client_surface_alloc_scoped_metadata( &memory, 1, sizeof(*request) )))
+        if (!accepted) goto release_queue;
+        /* Stack storage has the same admission lifetime as a heap request.
+         * The retained queue owns the accounting scope through its return. */
+        if (!client_surface_reserve_scoped_metadata( &queue->memory, sizeof(*request) ))
         {
-            client_surface_memory_scope_destroy( &memory );
             release_client_surface_compositor_capacity( CLIENT_SURFACE_COMPOSITOR_REQUEST_CAPACITY,
                                                         1, sizeof(*request), queue );
-            return NULL;
-        }
-        request->memory = memory;
-        if (pthread_cond_init( &request->completed, NULL ))
-        {
-            client_surface_free_owned_metadata( &request->memory, request, sizeof(*request) );
-            release_client_surface_compositor_capacity( CLIENT_SURFACE_COMPOSITOR_REQUEST_CAPACITY,
-                                                        1, sizeof(*request), queue );
-            return NULL;
+            goto release_queue;
         }
     }
-    request->job = *job;
-    request->job.queue = queue;
-    request->job.async = FALSE;
-    return request;
-}
-
-static void free_client_surface_compositor_request( struct client_surface_compositor_request *request,
-                                                    struct client_surface_compositor_queue *queue )
-{
-    if (request == &queue->barrier)
+    request->completed = (pthread_cond_t)PTHREAD_COND_INITIALIZER;
+    job->queue = queue;
+    job->async = FALSE;
+    memset( &job->scan, 0, sizeof(job->scan) );
+    pthread_mutex_lock( &client_surface_compositor_mutex );
+    if (queue_client_surface_compositor_job( job ))
+    {
+        /* The caller retains this request and every borrowed payload until
+         * the actor unlinks it and returns all of its resource ownership. */
+        while (!job->complete)
+            pthread_cond_wait( &request->completed, &client_surface_compositor_mutex );
+        ret = job->result;
+    }
+    pthread_mutex_unlock( &client_surface_compositor_mutex );
+    if (!job->complete) release_client_surface_compositor_job_resources( job );
+    pthread_cond_destroy( &request->completed );
+    if (barrier)
     {
         pthread_mutex_lock( &client_surface_compositor_mutex );
         assert( queue->barrier_in_use );
@@ -5755,42 +5747,15 @@ static void free_client_surface_compositor_request( struct client_surface_compos
     }
     else
     {
-        pthread_cond_destroy( &request->completed );
-        client_surface_free_owned_metadata( &request->memory, request, sizeof(*request) );
+        client_surface_release_scoped_metadata( &queue->memory, sizeof(*request) );
         release_client_surface_compositor_capacity( CLIENT_SURFACE_COMPOSITOR_REQUEST_CAPACITY,
                                                     1, sizeof(*request), queue );
     }
-}
-
-static BOOL submit_client_surface_compositor_job( struct client_surface_compositor_job *job )
-{
-    struct client_surface_compositor_queue *queue;
-    struct client_surface_compositor_request *request;
-    BOOL ret = FALSE;
-
-    if (!(queue = get_client_surface_compositor_queue( job->toplevel ))) goto failed;
-    if (!(request = alloc_client_surface_compositor_request( job, queue )))
-    {
-        release_client_surface_compositor_queue( queue );
-        goto failed;
-    }
-    pthread_mutex_lock( &client_surface_compositor_mutex );
-    if (queue_client_surface_compositor_job( &request->job ))
-    {
-        while (!request->job.complete)
-            pthread_cond_wait( &request->completed,
-                               &client_surface_compositor_mutex );
-        ret = request->job.result;
-    }
-    pthread_mutex_unlock( &client_surface_compositor_mutex );
-    if (!request->job.complete) release_client_surface_compositor_job_resources( &request->job );
-    job->u = request->job.u;
-    job->result = request->job.result;
-    job->complete = request->job.complete;
-    free_client_surface_compositor_request( request, queue );
     release_client_surface_compositor_queue( queue );
     return ret;
 
+release_queue:
+    release_client_surface_compositor_queue( queue );
 failed:
     release_client_surface_compositor_job_resources( job );
     return FALSE;
@@ -5868,8 +5833,8 @@ BOOL X11DRV_client_surface_prepare_direct( struct client_surface *surface,
 {
     struct x11drv_win_data *data;
     BOOL accepted;
-    struct client_surface_compositor_job job =
-    {
+    struct client_surface_compositor_request request =
+    { .job = {
         .op = CLIENT_SURFACE_COMPOSITOR_DIRECT_PLAN,
         .toplevel = scene->toplevel,
         .u.direct_plan =
@@ -5879,20 +5844,20 @@ BOOL X11DRV_client_surface_prepare_direct( struct client_surface *surface,
             .source = impl_from_client_surface( surface )->window,
             .source_owner = impl_from_client_surface( surface )->native_window,
         },
-    };
+    } };
 
     if ((scene->generation && scene->generation != scene->epoch) ||
         !(data = get_win_data( scene->toplevel ))) return FALSE;
-    job.u.direct_plan.destination = data->whole_window;
-    job.u.direct_plan.window_owner = x11drv_native_window_acquire( data->native_window );
+    request.job.u.direct_plan.destination = data->whole_window;
+    request.job.u.direct_plan.window_owner = x11drv_native_window_acquire( data->native_window );
     release_win_data( data );
-    if (!job.u.direct_plan.window_owner) return FALSE;
+    if (!request.job.u.direct_plan.window_owner) return FALSE;
     /* The producer retains its drawable while this scalar plan is admitted.
      * Native attach follows on this thread inside the existing target update. */
-    accepted = submit_client_surface_compositor_job( &job );
-    x11drv_native_window_release( job.u.direct_plan.window_owner );
+    accepted = submit_client_surface_compositor_request( &request );
+    x11drv_native_window_release( request.job.u.direct_plan.window_owner );
     TRACE( "DIRECT plan request hwnd %p scene %s identity %s accepted %u\n",
-           scene->toplevel, wine_dbgstr_longlong( scene->epoch ), wine_dbgstr_longlong( job.u.direct_plan.identity ), accepted );
+           scene->toplevel, wine_dbgstr_longlong( scene->epoch ), wine_dbgstr_longlong( request.job.u.direct_plan.identity ), accepted );
     return accepted;
 }
 
@@ -6035,12 +6000,12 @@ static NTSTATUS prepare_client_surface_output_allocation( struct x11drv_win_data
                                                           struct client_surface_output_allocation **result )
 {
     struct client_surface_output_allocation *allocation = data->client_surface_pending_allocation;
-    struct client_surface_compositor_job job =
-    {
+    struct client_surface_compositor_request request =
+    { .job = {
         .op = CLIENT_SURFACE_COMPOSITOR_CREATE_POOL,
         .toplevel = data->hwnd,
         .u.pool = {.width = width, .height = height, .depth = data->vis.depth},
-    };
+    } };
     NTSTATUS status;
 
     if (allocation && (allocation->width != width || allocation->height != height || allocation->depth != data->vis.depth))
@@ -6050,10 +6015,10 @@ static NTSTATUS prepare_client_surface_output_allocation( struct x11drv_win_data
     }
     if (!allocation)
     {
-        if (!submit_client_surface_compositor_job( &job )) return STATUS_UNSUCCESSFUL;
-        data->client_surface_pending_allocation = job.u.pool.allocation;
-        job.u.pool.allocation->force = force;
-        data->client_surface_allocation_serial = job.u.pool.allocation->serial;
+        if (!submit_client_surface_compositor_request( &request )) return STATUS_UNSUCCESSFUL;
+        data->client_surface_pending_allocation = request.job.u.pool.allocation;
+        request.job.u.pool.allocation->force = force;
+        data->client_surface_allocation_serial = request.job.u.pool.allocation->serial;
         data->client_surface_allocation_update = WINE_UPDATE_CLIENT_SURFACE_BACKING;
         return STATUS_PENDING;
     }
@@ -6075,8 +6040,8 @@ static NTSTATUS replace_client_surface_backing( struct x11drv_win_data *data,
                                             unsigned int preserve_width, unsigned int preserve_height,
                                             Pixmap *first, Pixmap *second )
 {
-    struct client_surface_compositor_job job =
-    {
+    struct client_surface_compositor_request request =
+    { .job = {
         .op = CLIENT_SURFACE_COMPOSITOR_REPLACE_POOL,
         .toplevel = data->hwnd,
         .u.pool =
@@ -6097,7 +6062,7 @@ static NTSTATUS replace_client_surface_backing( struct x11drv_win_data *data,
             .valid_height = preserve_width >= window_width && preserve_height >= window_height ? window_height : 0,
             .visual = data->vis.visualid,
         },
-    };
+    } };
 
     if (snapshot && (width < window_width || height < window_height))
     {
@@ -6111,7 +6076,7 @@ static NTSTATUS replace_client_surface_backing( struct x11drv_win_data *data,
             free_client_surface_pending_allocation( allocation );
             return STATUS_UNSUCCESSFUL;
         }
-        if (!client_surface_capture_scene_state( data->hwnd, &job.u.pool.scene ))
+        if (!client_surface_capture_scene_state( data->hwnd, &request.job.u.pool.scene ))
         {
             /* The GUI must finish its current scene transaction before an
              * input can be identified. Reuse this storage and notification. */
@@ -6129,35 +6094,35 @@ static NTSTATUS replace_client_surface_backing( struct x11drv_win_data *data,
         /* Both replacement and snapshot own a canonical content seed. */
         release_client_surface_output_checkpoint( allocation );
         allocation->window_owner = x11drv_native_window_acquire( data->native_window );
-        job.op = CLIENT_SURFACE_COMPOSITOR_COPY_POOL;
-        if (submit_client_surface_compositor_job( &job ))
+        request.job.op = CLIENT_SURFACE_COMPOSITOR_COPY_POOL;
+        if (submit_client_surface_compositor_request( &request ))
         {
             data->client_surface_pending_allocation = allocation;
             data->client_surface_allocation_update = WINE_UPDATE_CLIENT_SURFACE_BACKING;
             return STATUS_PENDING;
         }
-        if (job.u.pool.invalid_source)
+        if (request.job.u.pool.invalid_source)
         {
             data->client_surface_backing_valid = FALSE;
             data->client_surface_backing_valid_width = data->client_surface_backing_valid_height = 0;
         }
         free_client_surface_pending_allocation( allocation );
-        return job.u.pool.stale ? STATUS_RETRY : STATUS_UNSUCCESSFUL;
+        return request.job.u.pool.stale ? STATUS_RETRY : STATUS_UNSUCCESSFUL;
     }
-    if (!submit_client_surface_compositor_job( &job ))
+    if (!submit_client_surface_compositor_request( &request ))
     {
         /* A refusal before execution leaves the completed allocation here.
          * The actor clears this pointer when it consumes that ownership. */
-        if (job.u.pool.allocation) free_client_surface_pending_allocation( job.u.pool.allocation );
-        if (job.u.pool.invalid_source)
+        if (request.job.u.pool.allocation) free_client_surface_pending_allocation( request.job.u.pool.allocation );
+        if (request.job.u.pool.invalid_source)
         {
             data->client_surface_backing_valid = FALSE;
             data->client_surface_backing_valid_width = data->client_surface_backing_valid_height = 0;
         }
-        return job.u.pool.stale ? STATUS_RETRY : STATUS_UNSUCCESSFUL;
+        return request.job.u.pool.stale ? STATUS_RETRY : STATUS_UNSUCCESSFUL;
     }
-    *first = job.u.pool.pixmaps[0];
-    *second = job.u.pool.pixmaps[1];
+    *first = request.job.u.pool.pixmaps[0];
+    *second = request.job.u.pool.pixmaps[1];
     return STATUS_SUCCESS;
 }
 
@@ -6179,8 +6144,8 @@ static BOOL client_surface_backing_present( HWND toplevel, Window window, Pixmap
                                             unsigned int width, unsigned int height,
                                             struct client_surface_output_allocation *allocation )
 {
-    struct client_surface_compositor_job job =
-    {
+    struct client_surface_compositor_request request =
+    { .job = {
         .op = CLIENT_SURFACE_COMPOSITOR_ADMIT_PRESENT,
         .toplevel = toplevel,
         .u.present =
@@ -6191,18 +6156,16 @@ static BOOL client_surface_backing_present( HWND toplevel, Window window, Pixmap
             .width = width,
             .height = height,
         },
-    };
+    } };
 
-    return submit_client_surface_compositor_job( &job );
+    return submit_client_surface_compositor_request( &request );
 }
 
 static BOOL update_client_surface_backing_target( struct x11drv_win_data *data,
                                                    unsigned int window_width, unsigned int window_height )
 {
-    struct client_surface_compositor_job job;
-
-    job = (struct client_surface_compositor_job)
-    {
+    struct client_surface_compositor_request request =
+    { .job = {
         .op = CLIENT_SURFACE_COMPOSITOR_UPDATE_TARGET,
         .toplevel = data->hwnd,
         .u.pool =
@@ -6222,9 +6185,9 @@ static BOOL update_client_surface_backing_target( struct x11drv_win_data *data,
             .visual = data->vis.visualid,
             .shrink_start = data->client_surface_backing_shrink_start,
         },
-    };
+    } };
 
-    return submit_client_surface_compositor_job( &job );
+    return submit_client_surface_compositor_request( &request );
 }
 
 static void remove_client_surface_backing_target( HWND toplevel )
@@ -6261,8 +6224,8 @@ struct client_surface_owner_notifications *X11DRV_client_surface_backing_begin_u
     const UINT no_geometry = SWP_NOSIZE | SWP_NOMOVE | SWP_NOCLIENTSIZE | SWP_NOCLIENTMOVE | SWP_NOZORDER;
     struct x11drv_win_data *data;
     BOOL backing;
-    struct client_surface_compositor_job job =
-    {
+    struct client_surface_compositor_request request =
+    { .job = {
         .op = CLIENT_SURFACE_COMPOSITOR_TRY_BEGIN_UPDATE,
         .toplevel = hwnd,
         .u.update =
@@ -6274,18 +6237,18 @@ struct client_surface_owner_notifications *X11DRV_client_surface_backing_begin_u
                 ((swp_flags & WINE_SWP_CLIENT_SURFACE_PUBLISH) ? X11DRV_CLIENT_SURFACE_UPDATE_PUBLISH : 0) |
                 (!rects ? X11DRV_CLIENT_SURFACE_UPDATE_REGION : 0),
         },
-    };
+    } };
 
     *status = STATUS_SUCCESS;
     if (!(data = get_win_data( hwnd ))) return NULL;
     backing = !!data->client_surface_backing;
-    job.u.update.preserve_content = managed && !data->managed &&
+    request.job.u.update.preserve_content = managed && !data->managed &&
         data->desired_state.wm_state != WithdrawnState;
     /* A state-only refresh does not change the plan's placement or clip.
      * The server roster/epoch check continues
      * to invalidate topology and producer changes. Be conservative for
      * fullscreen mappings, shape, frame and actual native geometry changes. */
-    job.u.update.invalidate_scene = !rects || (swp_flags & no_geometry) != no_geometry ||
+    request.job.u.update.invalidate_scene = !rects || (swp_flags & no_geometry) != no_geometry ||
         (swp_flags & (SWP_SHOWWINDOW | SWP_HIDEWINDOW | SWP_FRAMECHANGED | SWP_STATECHANGED)) ||
         data->is_fullscreen || (swp_flags & WINE_SWP_FULLSCREEN) ||
         memcmp( &data->rects, rects, sizeof(*rects) );
@@ -6295,28 +6258,28 @@ struct client_surface_owner_notifications *X11DRV_client_surface_backing_begin_u
     /* Every caller can replay from current Win32 state. The actor owns the
      * wake and update reasons until the native receipt arrives; publication
      * is acknowledged only by the normal generation-checked replay. */
-    backing = submit_client_surface_compositor_job( &job );
-    *status = job.u.update.status;
-    return backing ? job.u.update.notifications : NULL;
+    backing = submit_client_surface_compositor_request( &request );
+    *status = request.job.u.update.status;
+    return backing ? request.job.u.update.notifications : NULL;
 }
 
 UINT X11DRV_client_surface_backing_resume_update( HWND hwnd, UINT64 serial,
                                                  struct client_surface_owner_notifications **notifications )
 {
-    struct client_surface_compositor_job job =
-    {
+    struct client_surface_compositor_request request =
+    { .job = {
         .op = CLIENT_SURFACE_COMPOSITOR_CHECK_UPDATE,
         .toplevel = hwnd,
         .u.update =
         {
             .mark = serial,
         },
-    };
+    } };
 
     *notifications = NULL;
-    if (!submit_client_surface_compositor_job( &job )) return 0;
-    *notifications = job.u.update.notifications;
-    return job.u.update.types;
+    if (!submit_client_surface_compositor_request( &request )) return 0;
+    *notifications = request.job.u.update.notifications;
+    return request.job.u.update.types;
 }
 
 void X11DRV_client_surface_backing_finish_deferred_update( HWND hwnd, UINT64 serial,
@@ -6445,8 +6408,8 @@ static BOOL register_client_surface_handoff( HWND toplevel,
                                              const struct client_surface_handoff_desc *desc,
                                              UINT64 mark )
 {
-    struct client_surface_compositor_job job =
-    {
+    struct client_surface_compositor_request request =
+    { .job = {
         .op = CLIENT_SURFACE_COMPOSITOR_REGISTER_HANDOFF,
         .toplevel = toplevel,
         .u.registration =
@@ -6458,7 +6421,7 @@ static BOOL register_client_surface_handoff( HWND toplevel,
             .window = wine_server_ptr_handle( desc->handle ),
             .ready_fd = -1,
         },
-    };
+    } };
     HANDLE event = NULL;
     BOOL ret = FALSE;
     NTSTATUS status;
@@ -6473,11 +6436,11 @@ static BOOL register_client_surface_handoff( HWND toplevel,
         status = wine_server_call( req );
         if (!status)
         {
-            job.u.registration.mapping = wine_server_ptr_handle( reply->mapping );
-            job.u.registration.view_size = reply->size;
-            job.u.registration.offset = reply->offset;
-            job.u.registration.mapping_id = reply->mapping_id;
-            job.u.registration.cookie = reply->cookie;
+            request.job.u.registration.mapping = wine_server_ptr_handle( reply->mapping );
+            request.job.u.registration.view_size = reply->size;
+            request.job.u.registration.offset = reply->offset;
+            request.job.u.registration.mapping_id = reply->mapping_id;
+            request.job.u.registration.cookie = reply->cookie;
         }
     }
     SERVER_END_REQ;
@@ -6487,7 +6450,7 @@ static BOOL register_client_surface_handoff( HWND toplevel,
         req->handle = desc->handle;
         req->producer = desc->process;
         req->surface = desc->surface;
-        req->cookie = job.u.registration.cookie;
+        req->cookie = request.job.u.registration.cookie;
         req->owner = 1;
         status = wine_server_call( req );
         if (!status) event = wine_server_ptr_handle( reply->event );
@@ -6495,21 +6458,21 @@ static BOOL register_client_surface_handoff( HWND toplevel,
     SERVER_END_REQ;
     if (!status)
     {
-        status = wine_server_handle_to_fd( event, FILE_READ_DATA, &job.u.registration.ready_fd, NULL );
+        status = wine_server_handle_to_fd( event, FILE_READ_DATA, &request.job.u.registration.ready_fd, NULL );
         NtClose( event );
     }
     if (status) goto release;
-    ret = submit_client_surface_compositor_job( &job );
+    ret = submit_client_surface_compositor_request( &request );
 
 release:
-    NtClose( job.u.registration.mapping );
+    NtClose( request.job.u.registration.mapping );
     if (ret) return TRUE;
     SERVER_START_REQ( release_client_surface_handoff )
     {
         req->handle = wine_server_user_handle( toplevel );
         req->producer = desc->process;
         req->surface = desc->surface;
-        req->cookie = job.u.registration.cookie;
+        req->cookie = request.job.u.registration.cookie;
         req->owner = 1;
         wine_server_call( req );
     }
@@ -6521,8 +6484,8 @@ static BOOL bind_client_surface_handoffs( HWND toplevel, const struct client_sur
                                           struct client_surface_handoff_desc *descs,
                                           UINT count, UINT64 mark )
 {
-    struct client_surface_compositor_job job =
-    {
+    struct client_surface_compositor_request request =
+    { .job = {
         .op = CLIENT_SURFACE_COMPOSITOR_REUSE_HANDOFFS,
         .toplevel = toplevel,
         .u.reuse =
@@ -6531,14 +6494,14 @@ static BOOL bind_client_surface_handoffs( HWND toplevel, const struct client_sur
             .count = count,
             .mark = mark,
         },
-    };
+    } };
     BOOL *reused, ret = FALSE;
     UINT i;
 
     if (!count) return TRUE;
     if (!(reused = client_surface_alloc_owned_array( memory, count, sizeof(*reused) ))) return FALSE;
-    job.u.reuse.reused = reused;
-    if (!submit_client_surface_compositor_job( &job )) goto done;
+    request.job.u.reuse.reused = reused;
+    if (!submit_client_surface_compositor_request( &request )) goto done;
     for (i = 0; i < count; ++i)
         /* A live producer can have unread frames or a capture already
          * waiting for storage. Hiding it does not cancel that obligation.
@@ -6639,8 +6602,8 @@ BOOL X11DRV_client_surface_refresh_handoffs( HWND toplevel )
     }
     if (count) qsort( descs, count, sizeof(*descs), compare_client_surface_handoff_descs );
     {
-        struct client_surface_compositor_job job =
-        {
+        struct client_surface_compositor_request request =
+        { .job = {
             .op = CLIENT_SURFACE_COMPOSITOR_CHECK_SCENE,
             .toplevel = toplevel,
             .u.scene_check =
@@ -6649,13 +6612,13 @@ BOOL X11DRV_client_surface_refresh_handoffs( HWND toplevel )
                 .handoffs = descs,
                 .count = count,
             },
-        };
+        } };
 
         /* Backing ensure, snapshot and end-update can refresh the same plan
          * repeatedly. Its geometry and native clips are immutable at this
          * epoch. Reuse only a still-valid plan with the same live bindings;
          * native geometry and target changes keep their invalidation rules. */
-        if (submit_client_surface_compositor_job( &job ))
+        if (submit_client_surface_compositor_request( &request ))
         {
             if (!client_surface_scene_snapshot_current( toplevel, scene_generation )) goto failed;
             client_surface_free_owned_array( descs );
@@ -6702,8 +6665,8 @@ BOOL X11DRV_client_surface_refresh_handoffs( HWND toplevel )
 
     if (!client_surface_scene_snapshot_current( toplevel, scene_generation )) goto failed;
     {
-        struct client_surface_compositor_job job =
-        {
+        struct client_surface_compositor_request request =
+        { .job = {
             .op = CLIENT_SURFACE_COMPOSITOR_SWEEP_HANDOFFS,
             .toplevel = toplevel,
             .u.scene_install =
@@ -6713,12 +6676,12 @@ BOOL X11DRV_client_surface_refresh_handoffs( HWND toplevel )
                 .layouts = layouts,
                 .count = layout_count,
             },
-        };
+        } };
         BOOL installed;
 
-        installed = submit_client_surface_compositor_job( &job );
-        layouts = job.u.scene_install.layouts;
-        layout_count = job.u.scene_install.count;
+        installed = submit_client_surface_compositor_request( &request );
+        layouts = request.job.u.scene_install.layouts;
+        layout_count = request.job.u.scene_install.count;
         if (!installed) goto failed;
     }
     free_client_surface_scene_layouts( layouts );
@@ -6744,11 +6707,11 @@ static unsigned int client_surface_backing_extent( int size )
 
 BOOL X11DRV_RepairClientSurfaceOwner( HWND hwnd, BOOL resolve )
 {
-    struct client_surface_compositor_job job =
-    {
+    struct client_surface_compositor_request request =
+    { .job = {
         .op = resolve ? CLIENT_SURFACE_COMPOSITOR_RESOLVE_SOURCES : CLIENT_SURFACE_COMPOSITOR_REPAIR_OWNER,
         .toplevel = hwnd,
-    };
+    } };
 
     if (!resolve)
     {
@@ -6756,14 +6719,14 @@ BOOL X11DRV_RepairClientSurfaceOwner( HWND hwnd, BOOL resolve )
          * build a scene or provision channels merely to discover that no
          * completed owner image exists. Source-resolution must still bind
          * and inspect channels, including newly completed producer images. */
-        job.op = CLIENT_SURFACE_COMPOSITOR_CHECK_CACHE;
-        if (!submit_client_surface_compositor_job( &job )) return FALSE;
-        job.op = CLIENT_SURFACE_COMPOSITOR_REPAIR_OWNER;
+        request.job.op = CLIENT_SURFACE_COMPOSITOR_CHECK_CACHE;
+        if (!submit_client_surface_compositor_request( &request )) return FALSE;
+        request.job.op = CLIENT_SURFACE_COMPOSITOR_REPAIR_OWNER;
     }
     /* The authoritative snapshot selects the exact bindings and layouts to
      * inspect. The actor owns their images and attestations; no channel state
      * is interpreted by the application thread as proof of a completed copy. */
-    return X11DRV_client_surface_refresh_handoffs( hwnd ) && submit_client_surface_compositor_job( &job );
+    return X11DRV_client_surface_refresh_handoffs( hwnd ) && submit_client_surface_compositor_request( &request );
 }
 
 void X11DRV_client_surface_backing_destroy( struct x11drv_win_data *data )
@@ -6788,14 +6751,14 @@ void X11DRV_client_surface_backing_destroy( struct x11drv_win_data *data )
 
 BOOL X11DRV_client_surface_backing_retire( struct x11drv_win_data *data )
 {
-    struct client_surface_compositor_job job =
-    {
+    struct client_surface_compositor_request request =
+    { .job = {
         .op = CLIENT_SURFACE_COMPOSITOR_RETIRE_POOL,
         .toplevel = data->hwnd,
-    };
+    } };
 
     X11DRV_client_surface_backing_cancel_requests( data );
-    if (!submit_client_surface_compositor_job( &job )) return FALSE;
+    if (!submit_client_surface_compositor_request( &request )) return FALSE;
     /* The old pair is now detached after Complete/Idle and the scene ACK.
      * Freeing it neither changes the native target nor starts another scene. */
     client_surface_backing_free( data->client_surface_backing, data->client_surface_backing_spare );
@@ -6827,8 +6790,8 @@ NTSTATUS X11DRV_client_surface_prepare_owner( struct x11drv_win_data *data )
         !scene.valid && scene.direct_candidate && scene.epoch && !(scene.epoch & 1) &&
         !NtUserGetWindowRelative( data->hwnd, GW_CHILD ))
     {
-        struct client_surface_compositor_job job =
-        {
+        struct client_surface_compositor_request request =
+        { .job = {
             .op = CLIENT_SURFACE_COMPOSITOR_RENEW_DIRECT,
             .toplevel = data->hwnd,
             .u.direct_renew =
@@ -6842,12 +6805,12 @@ NTSTATUS X11DRV_client_surface_prepare_owner( struct x11drv_win_data *data )
                 .window_width = data->rects.visible.right - data->rects.visible.left,
                 .window_height = data->rects.visible.bottom - data->rects.visible.top,
             },
-        };
+        } };
 
         status = query_client_surface_extent( data, WINE_PREPARE_CLIENT_SURFACES, &width, &height );
         if (status) return status;
-        job.u.direct_renew.query = &data->client_surface_pending_geometry->geometry_query;
-        if (submit_client_surface_compositor_job( &job ))
+        request.job.u.direct_renew.query = &data->client_surface_pending_geometry->geometry_query;
+        if (submit_client_surface_compositor_request( &request ))
         {
             X11DRV_client_surface_backing_cancel_allocation( data );
             X11DRV_client_surface_backing_cancel_geometry( data, 0 );
@@ -7034,8 +6997,8 @@ static NTSTATUS query_client_surface_extent( struct x11drv_win_data *data, UINT 
 {
     struct client_surface_output_allocation **slot = &data->client_surface_pending_geometry;
     struct client_surface_output_allocation *allocation = *slot;
-    struct client_surface_compositor_job job =
-    {
+    struct client_surface_compositor_request request =
+    { .job = {
         .op = CLIENT_SURFACE_COMPOSITOR_QUERY_WINDOW,
         .toplevel = data->hwnd,
         .u.pool = {.window_owner = data->native_window, .source = data->client_surface_backing,
@@ -7046,7 +7009,7 @@ static NTSTATUS query_client_surface_extent( struct x11drv_win_data *data, UINT 
                                      data->rects.client.top - data->rects.visible.top,
                                      data->rects.client.right - data->rects.visible.left,
                                      data->rects.client.bottom - data->rects.visible.top}},
-    };
+    } };
     NTSTATUS status;
 
     /* A generic refresh cannot consume the only wake or observation of
@@ -7075,12 +7038,12 @@ static NTSTATUS query_client_surface_extent( struct x11drv_win_data *data, UINT 
     if (!allocation || allocation->scene_wait)
     {
         if (!data->native_window) return STATUS_UNSUCCESSFUL;
-        client_surface_capture_scene_state( data->hwnd, &job.u.pool.scene );
-        job.u.pool.allocation = allocation;
-        if (!submit_client_surface_compositor_job( &job )) return STATUS_UNSUCCESSFUL;
-        *slot = job.u.pool.allocation;
-        job.u.pool.allocation->geometry_scope = data->client_surface_geometry_scope;
-        job.u.pool.allocation->geometry_revision = data->client_surface_native_revision;
+        client_surface_capture_scene_state( data->hwnd, &request.job.u.pool.scene );
+        request.job.u.pool.allocation = allocation;
+        if (!submit_client_surface_compositor_request( &request )) return STATUS_UNSUCCESSFUL;
+        *slot = request.job.u.pool.allocation;
+        request.job.u.pool.allocation->geometry_scope = data->client_surface_geometry_scope;
+        request.job.u.pool.allocation->geometry_revision = data->client_surface_native_revision;
         return STATUS_PENDING;
     }
     TRACE_(csperf)( "ticks=%llu event=geometry_query_adopt request=%p serial=%llu status=0 epoch=%llu\n",

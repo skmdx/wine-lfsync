@@ -352,6 +352,8 @@ extern HWND get_taskman_window(void);
 extern BOOL is_client_surface_window( struct client_surface *surface, HWND hwnd );
 extern BOOL client_surface_update( struct client_surface *surface );
 extern void client_surface_wait_present_locked( struct client_surface *surface, BOOL external_completion );
+extern BOOL client_surface_try_lock_present( struct client_surface *surface, BOOL external_completion );
+extern void client_surface_unlock_present_batch( struct client_surface **surfaces, unsigned int count );
 extern BOOL client_surface_get_size( struct client_surface *surface, SIZE *virtual_size, SIZE *monitor_size );
 extern void use_window_client_surface( struct client_surface *surface, BOOL use );
 extern struct client_surface *get_unused_client_surface( HWND hwnd, int format, BOOL raw );

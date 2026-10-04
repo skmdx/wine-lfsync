@@ -644,12 +644,54 @@ void client_surface_lock_present( struct client_surface *surface )
     pthread_mutex_lock( &surface->completion_lock );
 }
 
-void client_surface_unlock_present( struct client_surface *surface )
+static void client_surface_present_unlocked( struct client_surface *surface )
 {
-    pthread_mutex_unlock( &surface->completion_lock );
     client_surface_apply_pending_update( surface );
     if (InterlockedCompareExchange( &surface->external_completion_count, 0, 0 )) return;
     client_surface_resume_recompose( surface );
+}
+
+void client_surface_unlock_present( struct client_surface *surface )
+{
+    pthread_mutex_unlock( &surface->completion_lock );
+    client_surface_present_unlocked( surface );
+}
+
+void client_surface_unlock_present_batch( struct client_surface **surfaces, unsigned int count )
+{
+    unsigned int i;
+
+    /* Pending target updates may wait for completion. Return every lock
+     * before running them, just as before waiting for a batch member. */
+    for (i = 0; i < count; ++i) pthread_mutex_unlock( &surfaces[i]->completion_lock );
+    for (i = 0; i < count; ++i) client_surface_present_unlocked( surfaces[i] );
+}
+
+static BOOL client_surface_present_busy_locked( struct client_surface *surface, BOOL external_completion )
+{
+    return InterlockedCompareExchange( &surface->target_update_waiters, 0, 0 ) ||
+           surface->native_present_count ||
+           (external_completion ? surface->driver_completion_count || surface->driver_completion_waiters ||
+                                  (surface->backend->handoff_serialize &&
+                                   surface->backend->handoff_serialize( surface ) &&
+                                   InterlockedCompareExchange( &surface->external_completion_count, 0, 0 )) :
+                                  InterlockedCompareExchange( &surface->external_completion_count, 0, 0 ));
+}
+
+BOOL client_surface_try_lock_present( struct client_surface *surface, BOOL external_completion )
+{
+    if (pthread_mutex_trylock( &surface->completion_lock )) return FALSE;
+    if (surface->backend->handoff_serialize && surface->backend->handoff_serialize( surface ))
+        external_completion = FALSE;
+    if (client_surface_present_busy_locked( surface, external_completion ) ||
+        (external_completion && InterlockedCompareExchange( &surface->external_completion_count, 0, 0 ) &&
+         !client_surface_handoff_write_available( surface )))
+    {
+        pthread_mutex_unlock( &surface->completion_lock );
+        return FALSE;
+    }
+    client_surface_handoff_retire_closed( surface );
+    return TRUE;
 }
 
 void client_surface_wait_present_locked( struct client_surface *surface, BOOL external_completion )
@@ -666,13 +708,7 @@ void client_surface_wait_present_locked( struct client_surface *surface, BOOL ex
      * native call before another producer reacquires this mutex. */
     for (;;)
     {
-        while (InterlockedCompareExchange( &surface->target_update_waiters, 0, 0 ) ||
-               surface->native_present_count ||
-               (external_completion ? surface->driver_completion_count || surface->driver_completion_waiters ||
-                                      (surface->backend->handoff_serialize &&
-                                       surface->backend->handoff_serialize( surface ) &&
-                                       InterlockedCompareExchange( &surface->external_completion_count, 0, 0 )) :
-                                      InterlockedCompareExchange( &surface->external_completion_count, 0, 0 )))
+        while (client_surface_present_busy_locked( surface, external_completion ))
             pthread_cond_wait( &surface->completion_cond, &surface->completion_lock );
         if (!external_completion || !InterlockedCompareExchange( &surface->external_completion_count, 0, 0 ) ||
             client_surface_handoff_write_available( surface )) break;

@@ -3358,6 +3358,7 @@ reserve_completions:
     if (present_info->swapchainCount > 1)
         qsort( present_surfaces, present_info->swapchainCount,
                sizeof(*present_surfaces), compare_client_surface_ptrs );
+lock_surfaces:
     for (uint32_t i = 0; i < present_info->swapchainCount; i++)
     {
         BOOL external_completion = TRUE;
@@ -3379,11 +3380,21 @@ reserve_completions:
             for (uint32_t j = 0; j < present_info->swapchainCount; ++j)
                 if (swapchain_from_handle( client_swapchains[j] )->surface->client == present_surfaces[i])
                     present_ids[j] = 0;
-        client_surface_lock_present( present_surfaces[i] );
-        /* A completion wait releases its mutex.  Wait before taking any
-         * later surface locks, otherwise another queue can take this mutex
-         * and block on a later one while we wait to reacquire this one. */
-        client_surface_wait_present_locked( present_surfaces[i], external_completion );
+        if (!client_surface_try_lock_present( present_surfaces[i], external_completion ))
+        {
+            struct client_surface *surface = present_surfaces[i];
+
+            /* Capture can reacquire an earlier surface mutex while owning
+             * the execution domain needed by this member's queued frames.
+             * Wait with no other surface locked, then reserve the entire
+             * batch again; readiness observed before a wait is not a lease. */
+            client_surface_unlock_present_batch( present_surfaces, surface_locked_count );
+            surface_locked_count = 0;
+            client_surface_lock_present( surface );
+            client_surface_wait_present_locked( surface, external_completion );
+            client_surface_unlock_present( surface );
+            goto lock_surfaces;
+        }
         present_surfaces[surface_locked_count++] = present_surfaces[i];
     }
     for (uint32_t i = 0; i < present_info->swapchainCount; i++)
@@ -3423,8 +3434,8 @@ reserve_completions:
 
             client_surface_cancel_prepare_locked( surface, &presents[i] );
         }
-        while (surface_locked_count)
-            client_surface_unlock_present( present_surfaces[--surface_locked_count] );
+        client_surface_unlock_present_batch( present_surfaces, surface_locked_count );
+        surface_locked_count = 0;
         goto reserve_completions;
     }
 
