@@ -100,7 +100,6 @@ struct client_surface_completion_domain
     UINT64 id;
     unsigned int references;
     unsigned int retirements; /* dormant cleanup owners, not native execution leases */
-    BOOL executing;
     struct client_surface_completion_worker *worker, *retiring;
 };
 
@@ -112,7 +111,7 @@ struct client_surface_completion_worker
      * A contaminated thread retains its domain until actual thread exit. */
     struct client_surface_completion_domain *domain;
     UINT64 retired_domain;
-    BOOL executing, finishing, retiring;
+    BOOL finishing, retiring;
     enum
     {
         COMPLETION_WORKER_FREE,
@@ -137,7 +136,7 @@ static struct rb_tree completion_domains = {completion_domain_compare};
 
 static void free_completion_domain_locked( struct client_surface_completion_domain *domain )
 {
-    assert( !domain->references && !domain->executing && !domain->retiring );
+    assert( !domain->references && !domain->worker && !domain->retiring );
     if (domain->retirements) return;
     rb_remove( &completion_domains, &domain->entry );
     --completion_domain_count;
@@ -223,7 +222,7 @@ void client_surface_completion_destroy( struct client_surface *surface )
         assert( domain->retirements && completion_retirement_count );
         --domain->retirements;
         --completion_retirement_count;
-        if (!domain->references && !domain->executing && !domain->retiring)
+        if (!domain->references && !domain->worker && !domain->retiring)
             free_completion_domain_locked( domain );
         pthread_cond_broadcast( &completion_executor_cond );
         pthread_mutex_unlock( &completion_executor_lock );
@@ -368,12 +367,18 @@ static BOOL completion_domain_retiring_locked( UINT64 id )
     return FALSE;
 }
 
+static BOOL completion_worker_executing_locked( const struct client_surface_completion_worker *worker )
+{
+    return worker->domain && worker->domain->worker == worker;
+}
+
 static struct client_surface_completion_worker *idle_completion_worker_locked(void)
 {
     unsigned int i;
 
     for (i = 0; i < ARRAY_SIZE(completion_workers); ++i)
-        if (completion_workers[i].state == COMPLETION_WORKER_RUNNING && !completion_workers[i].executing)
+        if (completion_workers[i].state == COMPLETION_WORKER_RUNNING &&
+            !completion_worker_executing_locked( &completion_workers[i] ))
             return &completion_workers[i];
     return NULL;
 }
@@ -749,7 +754,7 @@ static enum client_surface_completion_worker_disposition execute_completion_job(
     pthread_mutex_lock( &completion_executor_lock );
     if (worker)
     {
-        assert( worker->executing && worker->domain == domain && domain->references );
+        assert( completion_worker_executing_locked( worker ) && worker->domain == domain && domain->references );
         if (owner_thread && result.worker == CLIENT_SURFACE_COMPLETION_WORKER_RETIRE)
         {
             worker->state = COMPLETION_WORKER_EXITING;
@@ -757,14 +762,12 @@ static enum client_surface_completion_worker_disposition execute_completion_job(
             worker->retired_domain = domain->id;
             domain->retiring = worker;
         }
-        worker->executing = FALSE;
         worker->finishing = FALSE;
         if (!domain->retiring) worker->domain = NULL;
     }
     if (domain)
     {
-        assert( domain->executing );
-        domain->executing = FALSE;
+        assert( domain->worker == worker );
         domain->worker = NULL;
         if (result.status != CLIENT_SURFACE_COMPLETION_PENDING) release_completion_domain_locked( domain );
     }
@@ -784,6 +787,8 @@ static struct client_surface_completion_job *claim_completion_head_locked( struc
     assert( !surface->completion_queue->in_progress );
     assert( !list_empty( &surface->completion_queue->jobs ) );
     assert( !list_empty( &surface->completion_queue->ready_entry ) );
+    assert( !domain || (worker && !domain->worker) );
+    assert( !worker || (domain && !completion_worker_executing_locked( worker )) );
     list_remove( &surface->completion_queue->ready_entry );
     list_init( &surface->completion_queue->ready_entry );
     surface->completion_queue->in_progress = TRUE;
@@ -795,15 +800,12 @@ static struct client_surface_completion_job *claim_completion_head_locked( struc
             ++domain->references;
             ++completion_execution_count;
         }
-        assert( !domain->executing && domain->references );
+        assert( domain->references );
         assert( !domain->retiring || domain->retiring == worker );
-        domain->executing = TRUE;
         domain->worker = worker;
     }
     if (worker)
     {
-        assert( !worker->executing && domain );
-        worker->executing = TRUE;
         worker->domain = domain;
         TRACE( "event=completion_execute domain=%s slot=%u retirement=%u references=%u\n",
                wine_dbgstr_longlong( domain->id ), (unsigned int)(worker - completion_workers),
@@ -823,7 +825,7 @@ static struct client_surface *next_completion_surface_locked(
         struct client_surface_completion_job *job = completion_head( surface );
         struct client_surface_completion_domain *domain = job->execution_domain;
 
-        if (!domain || domain->executing || worker->executing) continue;
+        if (!domain || domain->worker || completion_worker_executing_locked( worker )) continue;
         if (cancel && job->retirement) continue;
         if (!cancel && completion_domain_retiring_locked( domain->id )) continue;
         if (cancel ? domain != worker->domain : !!domain->retiring) continue;
@@ -987,7 +989,7 @@ static void complete_inline_job( struct client_surface *surface, struct client_s
         worker = job->execution_domain ? idle_completion_worker_locked() : NULL;
         now = NtGetTickCount();
         if (!surface->completion_queue->in_progress &&
-            (!job->execution_domain || (worker && !job->execution_domain->executing && !job->execution_domain->retiring)) &&
+            (!job->execution_domain || (worker && !job->execution_domain->worker && !job->execution_domain->retiring)) &&
             (!reusable || !job->pending || (INT)(now - job->poll_due) >= 0))
         {
             job = claim_completion_head_locked( surface, worker );
