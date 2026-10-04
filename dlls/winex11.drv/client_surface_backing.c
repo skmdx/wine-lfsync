@@ -223,6 +223,13 @@ struct client_surface_compositor_frame
     struct client_surface_native_present native_present;
 };
 
+enum client_surface_update_phase
+{
+    CLIENT_SURFACE_UPDATE_UNPOSTED,
+    CLIENT_SURFACE_UPDATE_POSTED,
+    CLIENT_SURFACE_UPDATE_CONSUMED,
+};
+
 struct client_surface_compositor_target
 {
     struct client_surface_compositor_target *next, **prev;
@@ -265,10 +272,8 @@ struct client_surface_compositor_target
     unsigned int native_updates;
     UINT64 seed_serial;
     UINT64 deferred_update;
-    BOOL update_notified;
-    BOOL update_resumed;
+    enum client_surface_update_phase update_phase;
     BOOL preserve_content;
-    NTSTATUS preserve_status;
     UINT deferred_update_types;
     struct client_surface_compositor_mailbox *mailbox;
     DWORD shrink_start;
@@ -728,7 +733,6 @@ struct client_surface_owner_notifications
     struct x11drv_native_window_read end_read;
     Display *end_display;
     unsigned int native_ends, native_batch;
-    BOOL native_end_active;
     unsigned int pending_ends;
     BOOL end_queued, finish_queued, direct_queued, direct_pending;
     UINT64 finish_serial;
@@ -4701,13 +4705,13 @@ static void quiesce_client_surface_compositor_target( struct client_surface_comp
 static struct client_surface_compositor_target *client_surface_compositor_job_target(
     const struct client_surface_compositor_job *job );
 
-static BOOL client_surface_compositor_update_ready( struct client_surface_compositor_target *target,
-                                                    const struct client_surface_compositor_job *until )
+static NTSTATUS client_surface_compositor_update_ready( struct client_surface_compositor_target *target,
+                                                        const struct client_surface_compositor_job *until )
 {
     const struct client_surface_compositor_queue *queue = target->notifications->queue;
     unsigned int i;
 
-    if (target->native_updates || x11drv_native_window_content_status( target->window_owner ) == STATUS_PENDING) return FALSE;
+    if (target->native_updates || x11drv_native_window_content_status( target->window_owner ) == STATUS_PENDING) return STATUS_PENDING;
     /* A state notification can also follow a topology change. Do not wait
      * for unissued output from the server's invalidated scene before
      * allowing the GUI to adopt its replacement. Executing requests retain
@@ -4719,7 +4723,7 @@ static BOOL client_surface_compositor_update_ready( struct client_surface_compos
         process_client_surface_native_present( target );
     }
     for (i = 0; i < ARRAY_SIZE(target->frames); ++i)
-        if (target->frames[i].serial) return FALSE;
+        if (target->frames[i].serial) return STATUS_PENDING;
     if (!until)
     {
         BOOL incoming;
@@ -4727,13 +4731,11 @@ static BOOL client_surface_compositor_update_ready( struct client_surface_compos
         pthread_mutex_lock( &client_surface_compositor_mutex );
         incoming = !!queue->incoming;
         pthread_mutex_unlock( &client_surface_compositor_mutex );
-        if (incoming) return FALSE;
+        if (incoming) return STATUS_PENDING;
     }
     if ((queue->head && (!until || queue->head->sequence < until->sequence)) ||
-        (queue->control_head && (!until || queue->control_head->sequence < until->sequence))) return FALSE;
-    if (target->preserve_content)
-        target->preserve_status = x11drv_native_window_preserve_content( target->window_owner );
-    return !target->preserve_content || target->preserve_status != STATUS_PENDING;
+        (queue->control_head && (!until || queue->control_head->sequence < until->sequence))) return STATUS_PENDING;
+    return target->preserve_content ? x11drv_native_window_preserve_content( target->window_owner ) : STATUS_SUCCESS;
 }
 
 /* The existing geometry observation owns this continuation and its release
@@ -4802,11 +4804,12 @@ static BOOL execute_client_surface_compositor_job( struct client_surface_composi
         if (job->op == CLIENT_SURFACE_COMPOSITOR_CHECK_UPDATE ||
             job->op == CLIENT_SURFACE_COMPOSITOR_FINISH_UPDATE)
         {
-            if (target->deferred_update != job->u.update.mark || !target->update_notified) return FALSE;
+            if (target->deferred_update != job->u.update.mark ||
+                target->update_phase == CLIENT_SURFACE_UPDATE_UNPOSTED) return FALSE;
             if (job->op == CLIENT_SURFACE_COMPOSITOR_CHECK_UPDATE)
             {
-                if (target->update_resumed) return FALSE;
-                target->update_resumed = TRUE;
+                if (target->update_phase == CLIENT_SURFACE_UPDATE_CONSUMED) return FALSE;
+                target->update_phase = CLIENT_SURFACE_UPDATE_CONSUMED;
                 job->u.update.types = target->deferred_update_types | X11DRV_CLIENT_SURFACE_UPDATE_STATE;
                 target->deferred_update_types = 0;
                 job->u.update.notifications = target->notifications;
@@ -4820,17 +4823,19 @@ static BOOL execute_client_surface_compositor_job( struct client_surface_composi
             else
             {
                 if (!target->deferred_update_types) target->deferred_update = 0;
-                target->update_notified = FALSE;
-                target->update_resumed = FALSE;
+                target->update_phase = CLIENT_SURFACE_UPDATE_UNPOSTED;
                 target->quiescing = target->native_updates || target->deferred_update;
             }
             return TRUE;
         }
         if (job->op == CLIENT_SURFACE_COMPOSITOR_TRY_BEGIN_UPDATE)
         {
+            NTSTATUS status;
+
             quiesce_client_surface_compositor_target( target );
             target->preserve_content |= job->u.update.preserve_content;
-            if (!client_surface_compositor_update_ready( target, job ))
+            status = client_surface_compositor_update_ready( target, job );
+            if (status == STATUS_PENDING)
             {
                 if (!target->deferred_update)
                 {
@@ -4845,7 +4850,7 @@ static BOOL execute_client_surface_compositor_job( struct client_surface_composi
             }
             if (target->preserve_content)
             {
-                job->u.update.status = target->preserve_status;
+                job->u.update.status = status;
                 target->preserve_content = FALSE;
                 if (job->u.update.status)
                 {
@@ -5519,19 +5524,21 @@ static BOOL process_client_surface_compositor_targets( struct client_surface_com
         client_surface_compositor_next_target = target->next ? target->next : client_surface_compositor_targets;
         --scan->remaining;
         ++inspected;
-        if (target->deferred_update && !target->update_notified)
+        if (target->deferred_update && target->update_phase == CLIENT_SURFACE_UPDATE_UNPOSTED)
         {
             quiesce_client_surface_compositor_target( target );
-            if (client_surface_compositor_update_ready( target, NULL ))
+            if (client_surface_compositor_update_ready( target, NULL ) != STATUS_PENDING)
             {
                 /* Keep this exact target quiescent until the GUI consumes
                  * the token; a delayed notification cannot resume another. */
-                target->update_notified = NtUserPostMessage( target->toplevel, WM_X11DRV_CLIENT_SURFACE_UPDATE,
-                                                            (UINT)target->deferred_update,
-                                                            (UINT)(target->deferred_update >> 32) );
-                if (!target->update_notified)
+                if (NtUserPostMessage( target->toplevel, WM_X11DRV_CLIENT_SURFACE_UPDATE,
+                                       (UINT)target->deferred_update, (UINT)(target->deferred_update >> 32) ))
+                {
+                    target->update_phase = CLIENT_SURFACE_UPDATE_POSTED;
+                    progressed = TRUE;
+                }
+                else
                     WARN( "failed to notify deferred native update for %p\n", target->toplevel );
-                progressed |= target->update_notified;
             }
         }
         process_client_surface_present_events( target );
@@ -6379,7 +6386,6 @@ static void finish_client_surface_native_end( struct client_surface_native_work 
     }
     else
     {
-        notifications->native_end_active = FALSE;
         notifications->end_display = NULL;
     }
     if (!notifications->end_queued)
@@ -6400,11 +6406,10 @@ static void queue_client_surface_native_end( struct x11drv_win_data *data,
 
     pthread_mutex_lock( &client_surface_compositor_mutex );
     assert( notifications->refs && notifications->native_ends < ~0u );
+    start = !notifications->native_ends && !notifications->native_batch;
     ++notifications->native_ends;
-    start = !notifications->native_end_active;
     if (start)
     {
-        notifications->native_end_active = TRUE;
         notifications->end_display = data->display;
         x11drv_native_window_read_init( &notifications->end_read, data->native_window );
         notifications->native_end.execute = execute_client_surface_native_end;
