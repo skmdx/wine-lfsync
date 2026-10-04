@@ -71,7 +71,7 @@ struct client_surface_completion_queue
     struct list jobs;
     struct list ready_entry;
     unsigned int reservations;
-    struct client_surface_completion_job retirement;
+    struct client_surface_completion_domain *retirement_domain;
 };
 
 #define CLIENT_SURFACE_MAX_DEFERRED_PRESENTS 64
@@ -235,9 +235,9 @@ void client_surface_completion_destroy( struct client_surface *surface )
     assert( list_empty( &queue->jobs ) );
     assert( list_empty( &queue->ready_entry ) );
     assert( !queue->reservations );
-    if (queue->retirement.execution_domain)
+    if (queue->retirement_domain)
     {
-        struct client_surface_completion_domain *domain = queue->retirement.execution_domain;
+        struct client_surface_completion_domain *domain = queue->retirement_domain;
         pthread_mutex_lock( &completion_executor_lock );
         assert( domain->retirements );
         --domain->retirements;
@@ -549,7 +549,6 @@ done:
 
 BOOL client_surface_prepare_retirement( struct client_surface *surface )
 {
-    struct client_surface_completion_job *job = &surface->completion_queue->retirement;
     struct client_surface_completion_domain *domain;
     struct client_surface_completion_worker *worker;
     unsigned int i, running, starting;
@@ -557,7 +556,6 @@ BOOL client_surface_prepare_retirement( struct client_surface *surface )
     HANDLE thread;
     struct ntdll_thread *native_thread;
 
-    job->surface = surface;
     /* Cleanup ownership is dormant metadata, not a native execution ticket.
      * Concurrent surface creation must not consume the four execution slots
      * or fail because those slots are currently finishing other surfaces. */
@@ -609,7 +607,7 @@ BOOL client_surface_prepare_retirement( struct client_surface *surface )
     }
     if (domain)
     {
-        job->execution_domain = domain;
+        surface->completion_queue->retirement_domain = domain;
         ++domain->retirements;
     }
     pthread_mutex_unlock( &completion_executor_lock );
@@ -663,11 +661,6 @@ static struct client_surface_completion_result poll_completion_job( struct clien
     DWORD remaining = elapsed < CLIENT_SURFACE_PRESENT_TIMEOUT ? CLIENT_SURFACE_PRESENT_TIMEOUT - elapsed : 0;
     DWORD poll_start = now;
 
-    if (job == &surface->completion_queue->retirement)
-    {
-        client_surface_retire_resources( surface );
-        return client_surface_completion_result( CLIENT_SURFACE_COMPLETION_SIGNALED );
-    }
     /* One native poll per turn, without renewing the submission deadline. */
     result = client_surface_poll_present_completion( surface, &job->present,
                 min( remaining, (DWORD)CLIENT_SURFACE_COMPLETION_POLL_TIMEOUT_MS ) );
@@ -708,7 +701,6 @@ static enum client_surface_completion_worker_disposition execute_completion_job(
     struct client_surface_completion_domain *domain = job->execution_domain;
     struct user_thread_info *info = get_user_thread_info();
     struct client_surface_completion_domain *previous_domain = info->completion_domain;
-    BOOL allocated = job != &surface->completion_queue->retirement;
 
     assert( worker && domain );
     info->completion_domain = domain;
@@ -722,7 +714,7 @@ static enum client_surface_completion_worker_disposition execute_completion_job(
         worker->finishing = TRUE;
         pthread_mutex_unlock( &completion_executor_lock );
     }
-    if (result.status != CLIENT_SURFACE_COMPLETION_PENDING && allocated &&
+    if (result.status != CLIENT_SURFACE_COMPLETION_PENDING &&
         !finish_deferred_present( surface, &job->present,
                                   job->has_expected_size ? &job->expected_size : NULL, result, poll ))
     {
@@ -739,22 +731,14 @@ static enum client_surface_completion_worker_disposition execute_completion_job(
     assert( list_empty( &surface->completion_queue->ready_entry ) && completion_head( surface ) == job );
     job->pending = result.status == CLIENT_SURFACE_COMPLETION_PENDING;
     if (result.status != CLIENT_SURFACE_COMPLETION_PENDING)
-    {
         list_remove( &job->entry );
-        if (!allocated)
-        {
-            assert( domain->retirements );
-            --domain->retirements;
-            job->execution_domain = NULL;
-        }
-    }
     queue_ready_surface_locked( surface );
     pthread_mutex_unlock( &completion_executor_lock );
     /* Each queued job pins its surface independently of the worker and the
      * native callback refs. Only this worker can dispose of the dequeued job. */
     if (result.status != CLIENT_SURFACE_COMPLETION_PENDING)
     {
-        if (allocated) free( job );
+        free( job );
         client_surface_release( surface );
     }
     info->completion_domain = previous_domain;
@@ -769,41 +753,67 @@ static enum client_surface_completion_worker_disposition execute_completion_job(
     if (worker->state == COMPLETION_WORKER_RUNNING)
         worker->domain = NULL;
     if (result.status != CLIENT_SURFACE_COMPLETION_PENDING) release_completion_domain_locked( domain );
-    if (allocated && result.status != CLIENT_SURFACE_COMPLETION_PENDING)
+    if (result.status != CLIENT_SURFACE_COMPLETION_PENDING)
         InterlockedDecrement( &client_surface_deferred_present_count );
     pthread_cond_broadcast( &completion_executor_cond );
     pthread_mutex_unlock( &completion_executor_lock );
     return result.worker;
 }
 
-static struct client_surface_completion_job *claim_completion_head_locked( struct client_surface *surface,
-                                                                          struct client_surface_completion_worker *worker )
+static struct client_surface_completion_job *claim_completion_surface_locked( struct client_surface *surface,
+                                                                             struct client_surface_completion_worker *worker )
 {
-    struct client_surface_completion_job *job = completion_head( surface );
-    struct client_surface_completion_domain *domain = job->execution_domain;
-    struct client_surface_completion_worker *owner = domain ? completion_domain_owner_locked( domain ) : NULL;
+    struct client_surface_completion_queue *queue = surface->completion_queue;
+    struct client_surface_completion_job *job = list_empty( &queue->jobs ) ? NULL : completion_head( surface );
+    struct client_surface_completion_domain *domain = job ? job->execution_domain : queue->retirement_domain;
+    struct client_surface_completion_worker *owner = completion_domain_owner_locked( domain );
 
-    assert( !list_empty( &surface->completion_queue->jobs ) );
-    assert( !list_empty( &surface->completion_queue->ready_entry ) );
-    assert( !domain || (worker && (!owner || owner == worker)) );
-    assert( !worker || (domain && (!worker->domain ||
-            (worker->domain == domain && worker->state != COMPLETION_WORKER_RUNNING))) );
-    list_remove( &surface->completion_queue->ready_entry );
-    list_init( &surface->completion_queue->ready_entry );
-    if (domain)
+    assert( !list_empty( &queue->ready_entry ) );
+    assert( !owner || owner == worker );
+    assert( !worker->domain || (worker->domain == domain && worker->state != COMPLETION_WORKER_RUNNING) );
+    list_remove( &queue->ready_entry );
+    list_init( &queue->ready_entry );
+    if (!job)
     {
-        if (job == &surface->completion_queue->retirement)
-            ++domain->references;
-        assert( domain->references );
+        assert( ReadAcquire( &surface->ref ) == (CLIENT_SURFACE_REF_CLOSED | 1) && !queue->reservations );
+        assert( domain->retirements && worker->state == COMPLETION_WORKER_RUNNING );
+        ++domain->references;
+        worker->finishing = TRUE;
     }
-    if (worker)
-    {
-        worker->domain = domain;
-        TRACE( "event=completion_execute domain=%s slot=%u retirement=%u references=%u\n",
-               wine_dbgstr_longlong( domain->id ), (unsigned int)(worker - completion_workers),
-               job == &surface->completion_queue->retirement, domain->references );
-    }
+    assert( domain->references );
+    worker->domain = domain;
+    TRACE( "event=completion_execute domain=%s slot=%u retirement=%u references=%u\n",
+           wine_dbgstr_longlong( domain->id ), (unsigned int)(worker - completion_workers), !job, domain->references );
     return job;
+}
+
+static void execute_surface_retirement( struct client_surface *surface,
+                                        struct client_surface_completion_worker *worker )
+{
+    struct client_surface_completion_domain *domain = worker->domain;
+    struct user_thread_info *info = get_user_thread_info();
+    struct client_surface_completion_domain *previous_domain = info->completion_domain;
+
+    TRACE( "event=completion_cleanup_begin surface=%p domain=%s\n", surface, wine_dbgstr_longlong( domain->id ) );
+    info->completion_domain = domain;
+    client_surface_retire_resources( surface );
+    pthread_mutex_lock( &completion_executor_lock );
+    assert( surface->completion_queue->retirement_domain == domain && domain->retirements );
+    assert( list_empty( &surface->completion_queue->jobs ) && list_empty( &surface->completion_queue->ready_entry ) );
+    surface->completion_queue->retirement_domain = NULL;
+    --domain->retirements;
+    pthread_mutex_unlock( &completion_executor_lock );
+    /* The active reference and worker lease survive the last surface release. */
+    client_surface_release( surface );
+    info->completion_domain = previous_domain;
+    pthread_mutex_lock( &completion_executor_lock );
+    assert( worker->domain == domain && worker->finishing && worker->state == COMPLETION_WORKER_RUNNING );
+    worker->domain = NULL;
+    worker->finishing = FALSE;
+    release_completion_domain_locked( domain );
+    TRACE( "event=completion_cleanup_end slot=%u\n", (unsigned int)(worker - completion_workers) );
+    pthread_cond_broadcast( &completion_executor_cond );
+    pthread_mutex_unlock( &completion_executor_lock );
 }
 
 static struct client_surface *next_completion_surface_locked(
@@ -814,17 +824,16 @@ static struct client_surface *next_completion_surface_locked(
     LIST_FOR_EACH_ENTRY( queue, &completion_ready_surfaces, struct client_surface_completion_queue, ready_entry )
     {
         struct client_surface *surface = queue->surface;
-        struct client_surface_completion_job *job = completion_head( surface );
-        struct client_surface_completion_domain *domain = job->execution_domain;
+        struct client_surface_completion_job *job = list_empty( &queue->jobs ) ? NULL : completion_head( surface );
+        struct client_surface_completion_domain *domain = job ? job->execution_domain : queue->retirement_domain;
 
-        if (!domain) continue;
         if (cancel)
         {
-            if (job == &queue->retirement || domain != worker->domain) continue;
+            if (!job || domain != worker->domain) continue;
             assert( completion_domain_owner_locked( domain ) == worker && worker->state != COMPLETION_WORKER_RUNNING );
         }
         else if (completion_domain_owner_locked( domain ) || worker->domain) continue;
-        if (cancel || !job->pending || (INT)(now - job->poll_due) >= 0) return surface;
+        if (cancel || !job || !job->pending || (INT)(now - job->poll_due) >= 0) return surface;
         *delay = min( *delay, job->poll_due - now );
     }
     return NULL;
@@ -852,7 +861,7 @@ static void cancel_worker_completion_jobs( struct client_surface_completion_work
             pthread_mutex_unlock( &completion_executor_lock );
             return;
         }
-        job = claim_completion_head_locked( surface, worker );
+        job = claim_completion_surface_locked( surface, worker );
         pthread_mutex_unlock( &completion_executor_lock );
         execute_completion_job( surface, job, worker, FALSE );
     }
@@ -906,9 +915,11 @@ static void client_surface_completion_thread( void *context )
                 pthread_mutex_lock( &completion_executor_lock );
             }
         }
-        job = claim_completion_head_locked( surface, worker );
+        job = claim_completion_surface_locked( surface, worker );
         pthread_mutex_unlock( &completion_executor_lock );
-        disposition = execute_completion_job( surface, job, worker, TRUE );
+        disposition = CLIENT_SURFACE_COMPLETION_WORKER_REUSE;
+        if (job) disposition = execute_completion_job( surface, job, worker, TRUE );
+        else execute_surface_retirement( surface, worker );
         idle_started = NtGetTickCount();
         if (disposition == CLIENT_SURFACE_COMPLETION_WORKER_RETIRE)
         {
@@ -927,20 +938,18 @@ static void queue_completion_job_locked( struct client_surface *surface,
                                          struct client_surface_completion_job *job )
 {
     BOOL empty = list_empty( &surface->completion_queue->jobs );
-    BOOL retirement = job == &surface->completion_queue->retirement;
 
+    assert( job->execution_domain );
     list_add_tail( &surface->completion_queue->jobs, &job->entry );
     if (empty) queue_ready_surface_locked( surface );
     TRACE_(csperf)( "ticks=%llu event=completion_queue identity=%s serial=%s control=%s target_epoch=%s "
-                   "deferred=%u inline=%u head=%u\n", client_surface_perf_time(),
+                   "head=%u\n", client_surface_perf_time(),
                    wine_dbgstr_longlong( client_surface_get_identity( surface ) ),
                    wine_dbgstr_longlong( job->present.serial ), wine_dbgstr_longlong( job->present.handoff_control ),
-                   wine_dbgstr_longlong( job->present.target_epoch ),
-                   !!job->execution_domain && !retirement, !job->execution_domain, empty );
-    TRACE( "event=completion_enqueue surface=%p serial=%s completion=%p capture=%p deferred=%u inline=%u retirement=%u\n",
+                   wine_dbgstr_longlong( job->present.target_epoch ), empty );
+    TRACE( "event=completion_enqueue surface=%p serial=%s completion=%p capture=%p\n",
            surface, wine_dbgstr_longlong( job->present.serial ), job->present.completion.context,
-           job->present.capture.context, !!job->execution_domain && !retirement,
-           !job->execution_domain, retirement );
+           job->present.capture.context );
     pthread_cond_broadcast( &completion_executor_cond );
 }
 
@@ -951,33 +960,38 @@ void client_surface_queue_retirement( struct client_surface *surface )
     assert( ReadAcquire( &surface->ref ) == (CLIENT_SURFACE_REF_CLOSED | 1) );
     pthread_mutex_lock( &completion_executor_lock );
     assert( list_empty( &queue->jobs ) && !queue->reservations && list_empty( &queue->ready_entry ) );
-    assert( queue->retirement.execution_domain );
-    queue_completion_job_locked( surface, &queue->retirement );
+    assert( queue->retirement_domain );
+    list_add_tail( &completion_ready_surfaces, &queue->ready_entry );
+    TRACE( "event=completion_cleanup_queue surface=%p\n", surface );
+    pthread_cond_broadcast( &completion_executor_cond );
     pthread_mutex_unlock( &completion_executor_lock );
 }
 
-/* The synchronous SHARED caller owns only its FIFO probe. Async frames and
- * native cleanup remain on their admitted executor, through final release. */
+/* Monitor admission excludes later submissions. Drain preceding final releases
+ * without scheduling a job or borrowing their execution domain. */
 struct client_surface_completion_result client_surface_probe_shared_completion(
     struct client_surface *surface, const struct client_surface_frame *present )
 {
-    struct client_surface_completion_job probe = { .present = *present };
+    struct client_surface_completion_queue *queue = surface->completion_queue;
     struct client_surface_completion_result result;
     struct user_thread_info *info = get_user_thread_info();
     struct client_surface_completion_domain *previous_domain = info->completion_domain;
 
     assert( present->completion.kind == CLIENT_SURFACE_COMPLETION_SHARED );
     assert( !client_surface_completion_result_is_external( &present->completion ) );
+    assert( surface->driver_completion_count == 1 && ReadAcquire( &surface->external_completion_count ) == 1 );
     /* The caller holds completion_lock and its exclusive monitor admission.
      * Earlier tokens have drained, but their final releases may still own the
-     * FIFO head. Keep our node charged while waiting; workers never execute
-     * it because it has no execution domain. */
+     * FIFO head. Charge the probe like the former stack node, independently
+     * of any unused heap ticket still owned by the caller. */
     client_surface_add_ref( surface );
     pthread_mutex_lock( &completion_executor_lock );
-    queue_completion_job_locked( surface, &probe );
-    while (list_empty( &surface->completion_queue->ready_entry ) || completion_head( surface ) != &probe)
+    ++queue->reservations;
+    TRACE( "event=completion_probe_begin surface=%p serial=%s reservations=%u\n",
+           surface, wine_dbgstr_longlong( present->serial ), queue->reservations );
+    while (!list_empty( &queue->jobs ))
         pthread_cond_wait( &completion_executor_cond, &completion_executor_lock );
-    claim_completion_head_locked( surface, NULL );
+    assert( list_empty( &queue->ready_entry ) );
     pthread_mutex_unlock( &completion_executor_lock );
 
     info->completion_domain = NULL;
@@ -987,10 +1001,11 @@ struct client_surface_completion_result client_surface_probe_shared_completion(
         result.status = CLIENT_SURFACE_COMPLETION_FAILED;
 
     pthread_mutex_lock( &completion_executor_lock );
-    assert( list_empty( &surface->completion_queue->ready_entry ) && completion_head( surface ) == &probe );
-    list_remove( &probe.entry );
-    assert( list_empty( &surface->completion_queue->jobs ) );
-    queue_ready_surface_locked( surface );
+    assert( list_empty( &queue->jobs ) && list_empty( &queue->ready_entry ) && queue->reservations );
+    --queue->reservations;
+    TRACE( "event=completion_probe_end surface=%p serial=%s reservations=%u status=%u\n",
+           surface, wine_dbgstr_longlong( present->serial ), queue->reservations, result.status );
+    pthread_cond_broadcast( &completion_executor_cond );
     pthread_mutex_unlock( &completion_executor_lock );
     client_surface_release( surface );
     return result;
@@ -1002,7 +1017,7 @@ static BOOL completion_queue_has_room_locked( struct client_surface *surface )
     unsigned int count = surface->completion_queue->reservations;
 
     /* Include unsubmitted reservations and the head through final releases.
-     * Synchronous stack nodes cannot allocate more retained heap work under pressure. */
+     * A synchronous probe also reserves occupancy without a heap ticket. */
     if (count >= CLIENT_SURFACE_MAX_DEFERRED_PRESENTS) return FALSE;
     LIST_FOR_EACH( entry, &surface->completion_queue->jobs )
         if (++count >= CLIENT_SURFACE_MAX_DEFERRED_PRESENTS) return FALSE;
