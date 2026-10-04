@@ -742,6 +742,17 @@ static struct client_surface_owner_notifications *client_surface_owner_notificat
  * links are protected by compositor_mutex. The actor drops its independently
  * owned native images after draining their users; each image keeps its own
  * work node and accounting until native destruction actually completes. */
+enum client_surface_output_phase
+{
+    CLIENT_SURFACE_OUTPUT_PAIR_CREATE,
+    CLIENT_SURFACE_OUTPUT_PAIR_SCENE_WAIT,
+    CLIENT_SURFACE_OUTPUT_PAIR_CHECKPOINT,
+    CLIENT_SURFACE_OUTPUT_WINDOW_SCENE_WAIT,
+    CLIENT_SURFACE_OUTPUT_WINDOW_QUERY,
+    CLIENT_SURFACE_OUTPUT_WINDOW_COPY_WAIT,
+    CLIENT_SURFACE_OUTPUT_WINDOW_PRESENT,
+};
+
 struct client_surface_output_allocation
 {
     struct client_surface_compositor_job release;
@@ -759,18 +770,17 @@ struct client_surface_output_allocation
     BOOL content_owned;
     UINT64 content_epoch;
     struct client_surface_window_query geometry_query;
-    BOOL geometry, publication;
+    enum client_surface_output_phase phase;
     UINT geometry_update;
     UINT64 geometry_scope, geometry_revision;
-    unsigned int seed_stage;
-    BOOL seed_target, scene_wait;
+    BOOL seed_target;
     struct list seed_entry;
     struct client_surface_scene scene;
     Pixmap source, published;
     Window window;
     UINT64 source_revision;
     unsigned int window_width, window_height, copy_width, copy_height;
-    BOOL checkpoint, copy_wait, force;
+    BOOL force;
     /* The GUI owns the pending pointer. The callbacks retain this object
      * until both native operations finish, even after the GUI abandons it.
      * These three fields use compositor_mutex; no callback touches win_data. */
@@ -778,6 +788,26 @@ struct client_surface_output_allocation
     BOOL failed, abandoned;
     struct list notification_entry;
 };
+
+static BOOL client_surface_output_is_window( const struct client_surface_output_allocation *allocation )
+{
+    switch (allocation->phase)
+    {
+    case CLIENT_SURFACE_OUTPUT_WINDOW_SCENE_WAIT:
+    case CLIENT_SURFACE_OUTPUT_WINDOW_QUERY:
+    case CLIENT_SURFACE_OUTPUT_WINDOW_COPY_WAIT:
+    case CLIENT_SURFACE_OUTPUT_WINDOW_PRESENT:
+        return TRUE;
+    default:
+        return FALSE;
+    }
+}
+
+static BOOL client_surface_output_waits_scene( const struct client_surface_output_allocation *allocation )
+{
+    return allocation->phase == CLIENT_SURFACE_OUTPUT_PAIR_SCENE_WAIT ||
+           allocation->phase == CLIENT_SURFACE_OUTPUT_WINDOW_SCENE_WAIT;
+}
 
 static UINT64 client_surface_output_allocation_serial;
 static struct list client_surface_seed_requests = LIST_INIT( client_surface_seed_requests );
@@ -1162,7 +1192,7 @@ static void release_client_surface_output_checkpoint( struct client_surface_outp
 static void free_client_surface_pending_allocation( struct client_surface_output_allocation *allocation )
 {
     assert( !allocation->pending );
-    if (allocation->checkpoint && !allocation->release.async)
+    if (allocation->phase == CLIENT_SURFACE_OUTPUT_PAIR_CHECKPOINT && !allocation->release.async)
     {
         /* The actor drops its scalar adoption identity before freeing this
          * admitted record. GUI cancellation never looks up an actor target. */
@@ -1194,7 +1224,7 @@ static void client_surface_output_allocation_complete( void *context, BOOL succe
     assert( allocation->pending );
     if (!--allocation->pending)
     {
-        if (!allocation->failed && !allocation->geometry)
+        if (!allocation->failed && !client_surface_output_is_window( allocation ))
         {
             allocation->pixmaps[0] = client_surface_cache_pixmap( allocation->images[0] );
             allocation->pixmaps[1] = client_surface_cache_pixmap( allocation->images[1] );
@@ -1207,9 +1237,9 @@ static void client_surface_output_allocation_complete( void *context, BOOL succe
         }
     }
     TRACE_(csperf)( "ticks=%llu event=%s request=%p serial=%llu pending=%u failed=%u abandoned=%u\n",
-                   client_surface_perf_time(), allocation->publication ? "output_publication_complete" :
-                   allocation->geometry ? "geometry_query_complete" :
-                   allocation->checkpoint ? "output_pair_copy_complete" : "output_pair_create_complete",
+                   client_surface_perf_time(), allocation->phase == CLIENT_SURFACE_OUTPUT_WINDOW_PRESENT ? "output_publication_complete" :
+                   client_surface_output_is_window( allocation ) ? "geometry_query_complete" :
+                   allocation->phase == CLIENT_SURFACE_OUTPUT_PAIR_CHECKPOINT ? "output_pair_copy_complete" : "output_pair_create_complete",
                    allocation, (unsigned long long)allocation->serial, allocation->pending,
                    allocation->failed, allocation->abandoned );
     pthread_mutex_unlock( &client_surface_compositor_mutex );
@@ -1219,7 +1249,7 @@ static void client_surface_output_allocation_complete( void *context, BOOL succe
 }
 
 static struct client_surface_output_allocation *alloc_client_surface_output_request(
-    struct client_surface_compositor_job *job )
+    struct client_surface_compositor_job *job, enum client_surface_output_phase phase )
 {
     struct client_surface_memory_scope memory = {0};
     struct client_surface_output_allocation *allocation;
@@ -1231,6 +1261,7 @@ static struct client_surface_output_allocation *alloc_client_surface_output_requ
         return NULL;
     }
     allocation->memory = memory;
+    allocation->phase = phase;
     list_init( &allocation->notification_entry );
     list_init( &allocation->seed_entry );
     allocation->release.queue = get_client_surface_compositor_queue( job->toplevel );
@@ -1318,18 +1349,17 @@ static BOOL create_client_surface_window_query( struct client_surface_compositor
 
     if (!allocation)
     {
-        if (!(allocation = alloc_client_surface_output_request( job ))) return FALSE;
-        allocation->geometry = TRUE;
+        if (!(allocation = alloc_client_surface_output_request( job, CLIENT_SURFACE_OUTPUT_WINDOW_QUERY ))) return FALSE;
         allocation->window_owner = x11drv_native_window_acquire( job->u.pool.window_owner );
         allocation->window = job->u.pool.destination;
         allocation->source = job->u.pool.source;
         allocation->geometry_update = job->u.pool.geometry_update;
         job->u.pool.allocation = allocation;
     }
-    assert( allocation->geometry && !allocation->pending && list_empty( &allocation->notification_entry ) );
+    assert( client_surface_output_is_window( allocation ) && !allocation->pending && list_empty( &allocation->notification_entry ) );
     allocation->scene = job->u.pool.scene;
-    allocation->scene_wait = !allocation->scene.epoch;
-    if (allocation->scene_wait)
+    allocation->phase = allocation->scene.epoch ? CLIENT_SURFACE_OUTPUT_WINDOW_QUERY : CLIENT_SURFACE_OUTPUT_WINDOW_SCENE_WAIT;
+    if (allocation->phase == CLIENT_SURFACE_OUTPUT_WINDOW_SCENE_WAIT)
     {
         /* Odd GUI epochs cannot identify native input. Admit the bounded
          * continuation now, then start its query after the scene wake. */
@@ -1362,7 +1392,7 @@ static BOOL create_client_surface_window_query( struct client_surface_compositor
 
 static BOOL create_client_surface_output_allocation( struct client_surface_compositor_job *job )
 {
-    struct client_surface_output_allocation *allocation = alloc_client_surface_output_request( job );
+    struct client_surface_output_allocation *allocation = alloc_client_surface_output_request( job, CLIENT_SURFACE_OUTPUT_PAIR_CREATE );
 
     if (!allocation) return FALSE;
     allocation->bytes = 2 * client_surface_pixmap_bytes( allocation->width, allocation->height, allocation->depth );
@@ -2627,14 +2657,13 @@ static void client_surface_output_seed_complete( void *context, BOOL success )
     pthread_mutex_lock( &client_surface_compositor_mutex );
     abandoned = allocation->abandoned;
     pthread_mutex_unlock( &client_surface_compositor_mutex );
-    if (success && !abandoned && allocation->seed_stage == 1)
+    if (success && !abandoned)
     {
         /* The content seed already includes committed SOURCEs and subsequent
          * GDI writes. An old OUTPUT intersection must not overwrite it. */
-        allocation->seed_stage = 2;
         client_surface_cache_copy_output( allocation->images[1], allocation->images[0],
             allocation->window_width, allocation->window_height,
-            client_surface_output_seed_complete, allocation );
+            client_surface_output_allocation_complete, allocation );
         return;
     }
     client_surface_output_allocation_complete( allocation, success );
@@ -2651,7 +2680,7 @@ static void queue_client_surface_seed( struct client_surface_output_allocation *
     allocation->source = job->u.pool.source;
     allocation->copy_width = job->u.pool.preserve_width;
     allocation->copy_height = job->u.pool.preserve_height;
-    allocation->checkpoint = TRUE;
+    allocation->phase = CLIENT_SURFACE_OUTPUT_PAIR_CHECKPOINT;
     allocation->seed_target = !!target;
     if (target)
     {
@@ -2676,7 +2705,8 @@ static BOOL copy_client_surface_compositor_pool( struct client_surface_composito
     struct client_surface_output_allocation *allocation = job->u.pool.allocation;
     struct client_surface_compositor_target *target = find_client_surface_compositor_target( job->toplevel );
 
-    assert( allocation && !allocation->checkpoint && !allocation->pending && !allocation->failed );
+    assert( allocation && allocation->phase == CLIENT_SURFACE_OUTPUT_PAIR_CREATE &&
+            !allocation->pending && !allocation->failed );
     if (!allocation->window_owner || !job->u.pool.window_width || !job->u.pool.window_height ||
         job->u.pool.window_width > allocation->width || job->u.pool.window_height > allocation->height ||
         !client_surface_output_checkpoint_scene_current( &job->u.pool.scene ))
@@ -2735,7 +2765,6 @@ static BOOL process_client_surface_seed_requests(void)
         if (status == STATUS_NOT_SUPPORTED) allocation->content_epoch = 0;
         /* Seed capture owns a named backing through the checked copy.
          * Scene changes reject adoption without cancelling its native read. */
-        allocation->seed_stage = 1;
         window = x11drv_native_window_content_read_init( &allocation->seed_read, allocation->window_owner,
                                                         allocation->content_epoch );
         TRACE_(csperf)( "ticks=%llu event=%s request=%p serial=%llu hwnd=%p window=%lx content=%lx source=%lx source_image=%p first=%lx second=%lx width=%u height=%u preserve_width=%u preserve_height=%u\n",
@@ -2763,8 +2792,9 @@ static BOOL install_client_surface_output_checkpoint( struct client_surface_comp
     struct client_surface_compositor_target *target = find_client_surface_compositor_target( job->toplevel );
     BOOL current;
 
-    assert( allocation->checkpoint && !allocation->pending && !allocation->failed );
-    current = allocation->seed_stage == 2 && client_surface_seed_current( allocation, target ) &&
+    assert( allocation->phase == CLIENT_SURFACE_OUTPUT_PAIR_CHECKPOINT && !allocation->pending && !allocation->failed );
+    /* Only the second copy completes a successful, un-abandoned seed. */
+    current = !allocation->abandoned && client_surface_seed_current( allocation, target ) &&
               job->u.pool.source == allocation->source && job->u.pool.destination == allocation->window &&
               job->u.pool.width == allocation->width && job->u.pool.height == allocation->height &&
               job->u.pool.depth == allocation->depth &&
@@ -4718,7 +4748,8 @@ static BOOL admit_client_surface_publication( struct client_surface_compositor_j
 
     if (!target || target->window_owner != allocation->window_owner || target->window != allocation->window ||
         !client_surface_output_checkpoint_scene_current( &allocation->scene )) return FALSE;
-    assert( allocation->geometry && !allocation->publication && !allocation->pending &&
+    assert( (allocation->phase == CLIENT_SURFACE_OUTPUT_WINDOW_QUERY ||
+             allocation->phase == CLIENT_SURFACE_OUTPUT_WINDOW_COPY_WAIT) && !allocation->pending &&
             !allocation->source_image && list_empty( &allocation->notification_entry ) );
     allocation->source = job->u.present.source;
     frame = client_surface_output_checkpoint_frame( target, allocation->source, &busy );
@@ -4728,20 +4759,19 @@ static BOOL admit_client_surface_publication( struct client_surface_compositor_j
          * Reuse the checkpoint wake instead of pinning that mutable input or
          * making the GUI wait behind its native writer. */
         pthread_mutex_lock( &client_surface_compositor_mutex );
-        allocation->copy_wait = TRUE;
+        allocation->phase = CLIENT_SURFACE_OUTPUT_WINDOW_COPY_WAIT;
         list_add_tail( &client_surface_output_notifications, &allocation->notification_entry );
         ++client_surface_output_notification_count;
         pthread_mutex_unlock( &client_surface_compositor_mutex );
         return TRUE;
     }
     if (!frame) return FALSE;
-    allocation->copy_wait = FALSE;
     allocation->source_image = client_surface_cache_acquire( frame->image );
     allocation->release.op = CLIENT_SURFACE_COMPOSITOR_PRESENT;
     allocation->release.u.present = job->u.present;
     allocation->release.async = TRUE;
     pthread_mutex_lock( &client_surface_compositor_mutex );
-    allocation->publication = TRUE;
+    allocation->phase = CLIENT_SURFACE_OUTPUT_WINDOW_PRESENT;
     allocation->pending = 1;
     enqueue_client_surface_compositor_job( &allocation->release );
     pthread_mutex_unlock( &client_surface_compositor_mutex );
@@ -5425,13 +5455,13 @@ static BOOL notify_client_surface_output_allocations( struct client_surface_comp
          * with respect to its GUI receiver and cancellation. No native call
          * or window-data lookup runs while this metadata lock is held. */
         posted = TRUE;
-        if (allocation->scene_wait)
+        if (client_surface_output_waits_scene( allocation ))
         {
             struct client_surface_scene scene;
 
             posted = client_surface_capture_scene_state( allocation->release.toplevel, &scene );
         }
-        if (allocation->copy_wait)
+        if (allocation->phase == CLIENT_SURFACE_OUTPUT_WINDOW_COPY_WAIT)
         {
             struct client_surface_compositor_target *target =
                 find_client_surface_compositor_target( allocation->release.toplevel );
@@ -5893,9 +5923,10 @@ static void cancel_client_surface_output_request( struct client_surface_output_a
         --client_surface_output_notification_count;
     }
     TRACE_(csperf)( "ticks=%llu event=%s request=%p serial=%llu pending=%u checkpoint=%u waiting=%u\n",
-                   client_surface_perf_time(), allocation->geometry ? "geometry_query_cancel" : "output_pair_create_cancel",
+                   client_surface_perf_time(), client_surface_output_is_window( allocation ) ? "geometry_query_cancel" : "output_pair_create_cancel",
                    allocation, (unsigned long long)allocation->serial, allocation->pending,
-                   allocation->checkpoint, allocation->copy_wait );
+                   allocation->phase == CLIENT_SURFACE_OUTPUT_PAIR_CHECKPOINT,
+                   allocation->phase == CLIENT_SURFACE_OUTPUT_WINDOW_COPY_WAIT );
     pthread_mutex_unlock( &client_surface_compositor_mutex );
     if (!pending) free_client_surface_pending_allocation( allocation );
 }
@@ -5956,7 +5987,7 @@ NTSTATUS X11DRV_client_surface_backing_staged( struct x11drv_win_data *data )
     /* STAGED changes the authoritative server epoch, not native geometry.
      * Only this callback's completed observation can cross that boundary. */
     if (allocation && allocation->geometry_scope == data->client_surface_geometry_scope &&
-        !allocation->pending && !allocation->scene_wait && !allocation->failed)
+        !allocation->pending && !client_surface_output_waits_scene( allocation ) && !allocation->failed)
         client_surface_capture_scene_state( data->hwnd, &allocation->scene );
     return X11DRV_client_surface_backing_ensure( data );
 }
@@ -6065,7 +6096,7 @@ static NTSTATUS replace_client_surface_backing( struct x11drv_win_data *data,
         free_client_surface_pending_allocation( allocation );
         return STATUS_UNSUCCESSFUL;
     }
-    if (!allocation->checkpoint)
+    if (allocation->phase != CLIENT_SURFACE_OUTPUT_PAIR_CHECKPOINT)
     {
         if (!data->native_window)
         {
@@ -6076,7 +6107,7 @@ static NTSTATUS replace_client_surface_backing( struct x11drv_win_data *data,
         {
             /* The GUI must finish its current scene transaction before an
              * input can be identified. Reuse this storage and notification. */
-            allocation->scene_wait = TRUE;
+            allocation->phase = CLIENT_SURFACE_OUTPUT_PAIR_SCENE_WAIT;
             pthread_mutex_lock( &client_surface_compositor_mutex );
             list_add_tail( &client_surface_output_notifications, &allocation->notification_entry );
             ++client_surface_output_notification_count;
@@ -6086,7 +6117,7 @@ static NTSTATUS replace_client_surface_backing( struct x11drv_win_data *data,
             wake_client_surface_compositor();
             return STATUS_PENDING;
         }
-        allocation->scene_wait = FALSE;
+        allocation->phase = CLIENT_SURFACE_OUTPUT_PAIR_CREATE;
         /* Both replacement and snapshot own a canonical content seed. */
         release_client_surface_output_checkpoint( allocation );
         allocation->window_owner = x11drv_native_window_acquire( data->native_window );
@@ -6829,7 +6860,7 @@ static BOOL client_surface_output_checkpoint_matches( struct x11drv_win_data *da
                                                        struct client_surface_output_allocation *allocation,
                                                        unsigned int window_width, unsigned int window_height )
 {
-    if (allocation->checkpoint)
+    if (allocation->phase == CLIENT_SURFACE_OUTPUT_PAIR_CHECKPOINT)
         return allocation->source == data->client_surface_backing && allocation->window_owner == data->native_window &&
                allocation->window == data->whole_window && allocation->window_width == window_width &&
                allocation->window_height == window_height &&
@@ -6865,7 +6896,8 @@ static NTSTATUS ensure_client_surface_backing_extent( struct x11drv_win_data *da
     TRACE_(csperf)( "event=backing_extent hwnd=%p native=%ux%u capacity=%ux%u desired=%s\n",
                    data->hwnd, window_width, window_height, width, height, wine_dbgstr_rect( &data->rects.visible ) );
     allocation = data->client_surface_pending_allocation;
-    if (allocation && (allocation->checkpoint || allocation->copy_wait) &&
+    if (allocation && (allocation->phase == CLIENT_SURFACE_OUTPUT_PAIR_CHECKPOINT ||
+                       allocation->phase == CLIENT_SURFACE_OUTPUT_WINDOW_COPY_WAIT) &&
         !client_surface_output_checkpoint_matches( data, allocation, window_width, window_height ))
     {
         X11DRV_client_surface_backing_cancel_allocation( data );
@@ -7016,7 +7048,7 @@ static NTSTATUS query_client_surface_extent( struct x11drv_win_data *data, UINT 
     if (allocation && (allocation->window_owner != data->native_window || allocation->window != data->whole_window ||
         allocation->source != data->client_surface_backing ||
         allocation->geometry_revision != data->client_surface_native_revision ||
-        (!allocation->scene_wait && !client_surface_output_checkpoint_scene_current( &allocation->scene ))))
+        (!client_surface_output_waits_scene( allocation ) && !client_surface_output_checkpoint_scene_current( &allocation->scene ))))
     {
         cancel_client_surface_geometry_request( slot, 0 );
         allocation = NULL;
@@ -7031,7 +7063,7 @@ static NTSTATUS query_client_surface_extent( struct x11drv_win_data *data, UINT 
         pthread_mutex_unlock( &client_surface_compositor_mutex );
         if (status) return status;
     }
-    if (!allocation || allocation->scene_wait)
+    if (!allocation || allocation->phase == CLIENT_SURFACE_OUTPUT_WINDOW_SCENE_WAIT)
     {
         if (!data->native_window) return STATUS_UNSUCCESSFUL;
         client_surface_capture_scene_state( data->hwnd, &request.job.u.pool.scene );
@@ -7111,7 +7143,7 @@ NTSTATUS X11DRV_client_surface_backing_publish( struct x11drv_win_data *data )
     status = query_client_surface_extent( data, WINE_PUBLISH_CLIENT_SURFACES, &window_width, &window_height );
     if (status) goto done;
     allocation = data->client_surface_pending_geometry;
-    if (allocation->publication) goto published;
+    if (allocation->phase == CLIENT_SURFACE_OUTPUT_WINDOW_PRESENT) goto published;
     /* This reservation owns one observation through capacity changes and
      * target installation. A deferred allocation resumes PUBLISH, not an
      * unrelated backing update which would consume another observation. */
