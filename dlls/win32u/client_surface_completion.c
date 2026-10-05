@@ -59,8 +59,8 @@ struct client_surface_completion_job
     struct client_surface_frame present;
     enum client_surface_completion_status native_status;
     SIZE expected_size;
-    DWORD poll_due, poll_delay;
-    BOOL has_expected_size, pending;
+    DWORD poll_due, poll_delay; /* A zero delay marks a job that has not run yet. */
+    BOOL has_expected_size;
 };
 
 /* The scheduler owns all transitions under completion_executor_lock. Queued
@@ -704,6 +704,7 @@ static enum client_surface_completion_worker_disposition execute_completion_job(
 
     assert( worker && domain );
     info->completion_domain = domain;
+    if (!job->poll_delay) job->poll_delay = 1;
     if (poll) result = job->native_status != CLIENT_SURFACE_COMPLETION_PENDING ?
                       client_surface_completion_result( job->native_status ) : poll_completion_job( surface, job );
     else TRACE( "cancelling completion without polling %s serial %s\n",
@@ -729,7 +730,6 @@ static enum client_surface_completion_worker_disposition execute_completion_job(
 
     pthread_mutex_lock( &completion_executor_lock );
     assert( list_empty( &surface->completion_queue->ready_entry ) && completion_head( surface ) == job );
-    job->pending = result.status == CLIENT_SURFACE_COMPLETION_PENDING;
     if (result.status != CLIENT_SURFACE_COMPLETION_PENDING)
         list_remove( &job->entry );
     queue_ready_surface_locked( surface );
@@ -833,7 +833,7 @@ static struct client_surface *next_completion_surface_locked(
             assert( completion_domain_owner_locked( domain ) == worker && worker->state != COMPLETION_WORKER_RUNNING );
         }
         else if (completion_domain_owner_locked( domain ) || worker->domain) continue;
-        if (cancel || !job || !job->pending || (INT)(now - job->poll_due) >= 0) return surface;
+        if (cancel || !job || !job->poll_delay || (INT)(now - job->poll_due) >= 0) return surface;
         *delay = min( *delay, job->poll_due - now );
     }
     return NULL;
@@ -1131,7 +1131,6 @@ void client_surface_enqueue_present( struct client_surface_completion_job **tick
     job->present = *present;
     job->has_expected_size = !!expected_size;
     if (expected_size) job->expected_size = *expected_size;
-    job->poll_delay = 1;
     TRACE( "event=present_result surface=%p serial=%s owner=%u completion=%u image=0 handoff=%u frame=%u kind=%u mode=%u\n",
            surface, wine_dbgstr_longlong( present->serial ), CLIENT_SURFACE_PRESENT_EXECUTOR,
            CLIENT_SURFACE_COMPLETION_PENDING, CLIENT_SURFACE_HANDOFF_NOT_QUEUED, present->result,
