@@ -1058,7 +1058,7 @@ static BOOL client_surface_update_present_scene_internal_locked(
         begin_client_surface_target_operation( surface );
         ready = surface->backend->prepare_direct( surface, &scene );
         end_client_surface_target_operation( surface );
-        if (ready || ReadAcquire( &surface->closing )) return FALSE;
+        if (ready || ReadAcquire( &surface->closing ) || !client_surface_scene_current( &scene )) return FALSE;
     }
     /* PREPARING has an immutable layout but no publication token yet. An
      * actual producer which cannot admit DIRECT must still preserve its new
