@@ -5535,7 +5535,7 @@ static void get_client_surface_scene_geometry( struct window *win, struct window
 }
 
 static int collect_client_surface_scene_snapshot( struct window *win, struct window *top,
-                                                  unsigned char *data, unsigned int max_size,
+                                                  int include_clips, unsigned char *data, unsigned int max_size,
                                                   unsigned int *total, unsigned int *count )
 {
     struct client_surface_owner *owner;
@@ -5557,7 +5557,7 @@ static int collect_client_surface_scene_snapshot( struct window *win, struct win
         if (win == top && !top->client_surface_transaction.staged &&
             !top->client_surface_native_barrier && client_surface_direct_candidate( top ))
             layer.flags |= CLIENT_SURFACE_SCENE_DIRECT_CANDIDATE;
-        if (layer.producer.visible && !(layer.flags & CLIENT_SURFACE_SCENE_PRESENT_RECT))
+        if (include_clips && layer.producer.visible && !(layer.flags & CLIENT_SURFACE_SCENE_PRESENT_RECT))
         {
             if (!(visible = get_visible_region( win, get_client_surface_scene_clip_flags( win ) ))) return 0;
             /* A parent DC may draw outside its own window shape. An image
@@ -5590,7 +5590,7 @@ static int collect_client_surface_scene_snapshot( struct window *win, struct win
         /* The native monitor transform belongs to the owner target. Keep the
          * exact occluders here; the owner intersects them with the transformed
          * source extent without querying mutable window geometry again. */
-        if (layer.producer.visible && !collect_client_surface_clips( win, top, layer.raw_dpi,
+        if (include_clips && layer.producer.visible && !collect_client_surface_clips( win, top, layer.raw_dpi,
                 NULL, clips, clip_max, &layer.clip_count )) return 0;
         if (layer.clip_count > (UINT_MAX - clip_offset) / sizeof(*clips))
         {
@@ -5609,7 +5609,7 @@ static int collect_client_surface_scene_snapshot( struct window *win, struct win
         ++*count;
     }
     LIST_FOR_EACH_ENTRY( child, &win->children, struct window, entry )
-        if (!collect_client_surface_scene_snapshot( child, top, data, max_size, total, count )) return 0;
+        if (!collect_client_surface_scene_snapshot( child, top, include_clips, data, max_size, total, count )) return 0;
     return 1;
 }
 
@@ -5632,7 +5632,7 @@ DECL_HANDLER(get_client_surface_scene_snapshot)
         return;
     }
     if (max_size && !(data = mem_alloc( max_size ))) return;
-    if (!collect_client_surface_scene_snapshot( top, top, data, max_size, &total, &count )) goto failed;
+    if (!collect_client_surface_scene_snapshot( top, top, req->include_clips, data, max_size, &total, &count )) goto failed;
     reply->total_size = total;
     reply->count = count;
     if (total > max_size)

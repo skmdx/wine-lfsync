@@ -222,7 +222,7 @@ void client_surface_free_scene_snapshot( UINT count, struct client_surface_scene
 }
 
 BOOL client_surface_get_scene_snapshot( HWND toplevel, const struct client_surface_memory_scope *memory,
-                                        UINT64 *scene_id, UINT *count,
+                                        BOOL include_clips, UINT64 *scene_id, UINT *count,
                                         struct client_surface_scene_member **members )
 {
     struct client_surface_scene_member *result = NULL;
@@ -250,6 +250,7 @@ BOOL client_surface_get_scene_snapshot( HWND toplevel, const struct client_surfa
         SERVER_START_REQ( get_client_surface_scene_snapshot )
         {
             req->handle = wine_server_user_handle( toplevel );
+            req->include_clips = include_clips;
             req->scene_id = id;
             wine_server_set_reply( req, data, size );
             status = wine_server_call( req );
@@ -338,7 +339,7 @@ BOOL client_surface_get_scene_snapshot( HWND toplevel, const struct client_surfa
         snapshot.windows = (struct client_surface_clip_window *)cursor;
         snapshot.count = layer->clip_count;
         cursor += layer->clip_count * sizeof(*snapshot.windows);
-        if (!result[i].visible) continue;
+        if (!include_clips || !result[i].visible) continue;
         if (!get_client_surface_region( &target->monitor_rect, &snapshot, memory, &result[i].region )) goto done;
         if (!result[i].region && !(result[i].region = NtGdiCreateRectRgn( 0, 0,
             target->monitor_rect.right - target->monitor_rect.left,

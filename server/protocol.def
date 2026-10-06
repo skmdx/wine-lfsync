@@ -4626,6 +4626,7 @@ enum inproc_sync_type
  * An undersized reply reports total_size and returns no partial snapshot. */
 @REQ(get_client_surface_scene_snapshot)
     user_handle_t handle;
+    int include_clips;              /* native layout needs clips; transport binding does not */
     unsigned __int64 scene_id;
 @REPLY
     unsigned __int64 scene_id;

@@ -661,7 +661,7 @@ struct client_surface_scene_member
     HRGN region;
 };
 W32KAPI BOOL client_surface_get_scene_snapshot( HWND toplevel, const struct client_surface_memory_scope *memory,
-                                                UINT64 *scene_id, UINT *count,
+                                                BOOL include_clips, UINT64 *scene_id, UINT *count,
                                                 struct client_surface_scene_member **members );
 W32KAPI BOOL client_surface_scene_snapshot_current( HWND toplevel, UINT64 scene_id );
 W32KAPI void client_surface_free_scene_snapshot( UINT count, struct client_surface_scene_member *members );

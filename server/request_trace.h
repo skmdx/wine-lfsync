@@ -3750,6 +3750,7 @@ static void dump_publish_client_surface_handoff_reply( const struct publish_clie
 static void dump_get_client_surface_scene_snapshot_request( const struct get_client_surface_scene_snapshot_request *req )
 {
     fprintf( stderr, " handle=%08x", req->handle );
+    fprintf( stderr, ", include_clips=%d", req->include_clips );
     dump_uint64( ", scene_id=", &req->scene_id );
 }
 

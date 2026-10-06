@@ -6555,7 +6555,7 @@ BOOL X11DRV_client_surface_bind_producers( HWND toplevel )
 
     if (!mark) mark = InterlockedIncrement64( (LONG64 *)&client_surface_compositor_mark );
     if (!(queue = get_client_surface_compositor_queue( toplevel ))) return FALSE;
-    if (!client_surface_get_scene_snapshot( toplevel, &queue->memory, &scene, &count, &members )) goto done;
+    if (!client_surface_get_scene_snapshot( toplevel, &queue->memory, FALSE, &scene, &count, &members )) goto done;
     if (count && !(descs = client_surface_alloc_owned_array( &queue->memory, count, sizeof(*descs) ))) goto done;
     for (i = 0; i < count; ++i)
     {
@@ -6608,7 +6608,7 @@ BOOL X11DRV_client_surface_refresh_handoffs( HWND toplevel )
     mark = InterlockedIncrement64( (LONG64 *)&client_surface_compositor_mark );
     if (!mark) mark = InterlockedIncrement64( (LONG64 *)&client_surface_compositor_mark );
     if (!(queue = get_client_surface_compositor_queue( toplevel ))) return FALSE;
-    if (!client_surface_get_scene_snapshot( toplevel, &queue->memory, &scene_generation, &count, &members )) goto failed;
+    if (!client_surface_get_scene_snapshot( toplevel, &queue->memory, TRUE, &scene_generation, &count, &members )) goto failed;
     if (count == 1 && members[0].direct_candidate &&
         client_surface_get_toplevel_scene( toplevel, &scene ) &&
         scene.epoch == scene_generation && scene.mode == CLIENT_SURFACE_PRESENTATION_DIRECT)

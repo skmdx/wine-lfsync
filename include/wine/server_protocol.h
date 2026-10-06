@@ -6652,6 +6652,8 @@ struct get_client_surface_scene_snapshot_request
 {
     struct request_header __header;
     user_handle_t handle;
+    int include_clips;
+    char __pad_20[4];
     unsigned __int64 scene_id;
 };
 struct get_client_surface_scene_snapshot_reply
@@ -7788,6 +7790,6 @@ union generic_reply
     struct set_queue_paint_blocked_reply set_queue_paint_blocked_reply;
 };
 
-#define SERVER_PROTOCOL_VERSION 1033
+#define SERVER_PROTOCOL_VERSION 1034
 
 #endif /* __WINE_WINE_SERVER_PROTOCOL_H */
