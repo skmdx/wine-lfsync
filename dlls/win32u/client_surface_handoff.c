@@ -352,7 +352,10 @@ static BOOL prepare_client_surface_handoff_locked( struct client_surface *surfac
     if (!acquire_client_surface_handoff( surface, independent ? NULL : &present->scene,
                                         &token, &present->handoff_index ))
     {
-        client_surface_release_handoff( surface );
+        /* Yielding to a target writer or exhausting the source slots does
+         * not revoke already published images. The owner may still be
+         * binding this channel; keep its READY frames until they are read.
+         * Target detachment and channel closure own transport retirement. */
         return FALSE;
     }
     source = surface->handoff->sources + present->handoff_index;

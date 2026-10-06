@@ -1310,6 +1310,9 @@ BOOL client_surface_try_complete_present( struct client_surface *surface, struct
                                          BOOL completed, const SIZE *expected_size,
                                          struct client_surface_present_result *result )
 {
+    struct client_surface_target target;
+    BOOL source_pending = FALSE;
+
     /* A multi-surface producer may hold this mutex while waiting for another
      * completion in our execution domain. Return the domain to the executor
      * instead of blocking the worker which must make that completion ready. */
@@ -1320,6 +1323,27 @@ BOOL client_surface_try_complete_present( struct client_surface *surface, struct
     if (completed && client_surface_target_is_updating( surface ))
     {
         TRACE( "event=target_adoption_deferred surface=%p serial=%s\n",
+               surface, wine_dbgstr_longlong( present->serial ) );
+        pthread_mutex_unlock( &surface->completion_lock );
+        return FALSE;
+    }
+    if (completed && present->result == CLIENT_SURFACE_FRAME_PENDING && !present->handoff_control &&
+        client_surface_backend_has_cap( surface, CLIENT_SURFACE_BACKEND_OWNER_SCENE_PLAN ))
+    {
+        pthread_mutex_lock( &surface->present_lock );
+        client_surface_get_target( surface, &target );
+        source_pending = (target.offscreen || present->direct_snapshot) &&
+            (surface->active || surface->server_cached) &&
+            client_surface_capture_current_locked( surface, &target, present ) &&
+            !client_surface_handoff_write_available( surface );
+        pthread_mutex_unlock( &surface->present_lock );
+    }
+    if (source_pending)
+    {
+        /* A shared native completion has no private SOURCE reservation yet.
+         * Keep its FIFO ownership while the owner drains published slots,
+         * allowing target writers to run between adoption attempts. */
+        TRACE( "event=source_adoption_deferred surface=%p serial=%s\n",
                surface, wine_dbgstr_longlong( present->serial ) );
         pthread_mutex_unlock( &surface->completion_lock );
         return FALSE;
