@@ -4823,11 +4823,15 @@ static NTSTATUS update_window_state_flags( HWND hwnd, UINT driver_flags )
     valid_rects[0] = valid_rects[1] = new_rects.client;
 
     surface = get_window_surface( hwnd, swp_flags, FALSE, &new_rects, &surface_rect );
-    /* A deferred DIRECT transition may run after the client's first Present.
-     * Its image has replaced the old GDI client pixels; copying those pixels
-     * into the newly attached native client window would erase that frame. */
+    /* A deferred surface update may run after the client's first Present.
+     * DIRECT and a sole source with a completed image have replaced the old
+     * GDI client pixels. The owner may publish concurrently with this update;
+     * copying those pixels back would erase its frame. */
     if (!surface && client_surface_get_toplevel_scene( hwnd, &scene ) &&
-        scene.mode == CLIENT_SURFACE_PRESENTATION_DIRECT) preserve_bits = FALSE;
+        (scene.mode == CLIENT_SURFACE_PRESENTATION_DIRECT ||
+         (scene.mode == CLIENT_SURFACE_PRESENTATION_COMPOSITED &&
+          scene.native_candidate && scene.producer_sequence)))
+        preserve_bits = FALSE;
     apply_window_pos( hwnd, 0, swp_flags, surface, &new_rects, preserve_bits ? valid_rects : NULL, &status );
     if (surface) window_surface_release( surface );
 

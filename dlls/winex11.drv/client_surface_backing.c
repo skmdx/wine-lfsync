@@ -6030,6 +6030,12 @@ UINT X11DRV_client_surface_backing_pool_ready( HWND hwnd, UINT64 serial )
             update = allocation->geometry_update;
         pthread_mutex_unlock( &client_surface_compositor_mutex );
     }
+    /* PREPARE can retain a pool for a DIRECT candidate while the server's
+     * backing flag is clear. Its ordinary geometry refresh must continue
+     * that update, not reinterpret completion as a request to destroy it. */
+    if (update == WINE_UPDATE_CLIENT_SURFACE_BACKING &&
+        !data->client_surface_backing_enabled && data->client_surface_backing)
+        update = WINE_UPDATE_CLIENT_SURFACE_HANDOFFS;
     release_win_data( data );
     return update;
 }
