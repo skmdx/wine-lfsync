@@ -1061,7 +1061,10 @@ static BOOL x11drv_surface_create( struct client_surface *client, int format, st
          * armed before the native swap, rather than inventing OML evidence. */
         gl->completion = completion;
     }
-    gl->base.needs_framebuffer = !usexcomposite;
+    /* Unviewable GLX windows still pace native swaps to the host refresh.
+     * Keep application front/back buffers independently, so an offscreen
+     * Present can capture its image without submitting an invisible swap. */
+    gl->base.needs_framebuffer = !usexcomposite || !NtUserIsWindowVisible( client->hwnd );
     if (!(gl->drawable = pglXCreateWindow( gdi_display, fmt->fbconfig, surface->window, NULL )))
     {
         opengl_drawable_release( &gl->base );
@@ -1920,7 +1923,7 @@ static BOOL x11drv_surface_swap_blit( struct opengl_drawable *base, struct openg
     GLXContext ctx = NtCurrentTeb()->glReserved2;
     struct gl_drawable *gl = impl_from_opengl_drawable( base );
     struct client_surface_frame present;
-    BOOL completed = FALSE, submitted = TRUE, use_oml;
+    BOOL completed = FALSE, submitted = TRUE, use_oml, snapshot;
     INT64 target_sbc = 0;
     SIZE size = source ? source->virtual_size : base->virtual_size;
     const SIZE *expected_size = source ? &size : NULL;
@@ -1930,8 +1933,10 @@ static BOOL x11drv_surface_swap_blit( struct opengl_drawable *base, struct openg
     use_oml = ctx && gl->completion;
     if (!prepare_opengl_present( base->client, &present, use_oml || !usexcomposite,
                                          usexcomposite )) return FALSE;
+    snapshot = !usexcomposite || present.direct_snapshot ||
+               (blit && present.target == CLIENT_SURFACE_FRAME_TARGET_OFFSCREEN);
     client_surface_begin_present( base->client, 1 );
-    if (usexcomposite && !present.direct_snapshot && present.completion.kind == CLIENT_SURFACE_COMPLETION_EXACT &&
+    if (!snapshot && present.completion.kind == CLIENT_SURFACE_COMPLETION_EXACT &&
         !(completion = client_surface_alloc_scoped_metadata( &surface->memory, 1, sizeof(*completion) )))
     {
         client_surface_submit_present( base->client, &present );
@@ -1940,7 +1945,7 @@ static BOOL x11drv_surface_swap_blit( struct opengl_drawable *base, struct openg
         return FALSE;
     }
     if (blit && !blit_client_surface_output( base, &present, source, blit,
-                   (!usexcomposite || present.direct_snapshot) && present.completion.kind == CLIENT_SURFACE_COMPLETION_EXACT ))
+                   snapshot && present.completion.kind == CLIENT_SURFACE_COMPLETION_EXACT ))
     {
         client_surface_free_scoped_metadata( &surface->memory, completion, sizeof(*completion) );
         client_surface_submit_present( base->client, &present );
@@ -1949,7 +1954,7 @@ static BOOL x11drv_surface_swap_blit( struct opengl_drawable *base, struct openg
     }
     /* A native offscreen target has an exact token even while the owner scene
      * is preparing. Capture the application's first image before any swap. */
-    if ((!usexcomposite || present.direct_snapshot) && present.completion.kind == CLIENT_SURFACE_COMPLETION_EXACT)
+    if (snapshot && present.completion.kind == CLIENT_SURFACE_COMPLETION_EXACT)
     {
         submitted = completed = snapshot_client_surface( base, &present, 0,
                                                           base->doublebuffer ? GL_BACK : GL_FRONT );
