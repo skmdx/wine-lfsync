@@ -113,7 +113,7 @@ static void trace_client_surface_memory( const char *event, enum client_surface_
     NtQueryPerformanceCounter( &counter, NULL );
     TRACE_(csperf)( "ticks=%llu event=%s class=%u bytes=%llu accepted=%u source=%llu staging=%llu output=%llu total=%llu "
                    "metadata=%llu purpose=%u source_available=%llu staging_available=%llu output_available=%llu metadata_available=%llu "
-                   "owner=%llu domain=%llu owner_source_available=%llu domain_source_available=%llu\n",
+                   "owner=%llu domain=%llu owner_source_available=%llu domain_source_available=%llu scope=%p\n",
                    (unsigned long long)counter.QuadPart, event, type, (unsigned long long)bytes, accepted,
                    (unsigned long long)image_memory[CLIENT_SURFACE_MEMORY_SOURCE],
                    (unsigned long long)image_memory[CLIENT_SURFACE_MEMORY_STAGING],
@@ -126,7 +126,7 @@ static void trace_client_surface_memory( const char *event, enum client_surface_
                    (unsigned long long)image_memory_available( CLIENT_SURFACE_MEMORY_STAGING, TRUE ),
                    (unsigned long long)(owner ? owner->id : 0), (unsigned long long)(domain ? domain->id : 0),
                    (unsigned long long)account_memory_available( owner, CLIENT_SURFACE_MEMORY_SOURCE ),
-                   (unsigned long long)account_memory_available( domain, CLIENT_SURFACE_MEMORY_SOURCE ) );
+                   (unsigned long long)account_memory_available( domain, CLIENT_SURFACE_MEMORY_SOURCE ), scope );
 }
 
 static BOOL reserve_image_memory( struct client_surface_memory_scope *scope,

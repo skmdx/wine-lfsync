@@ -296,8 +296,8 @@ static void create_cache_image( struct client_surface_cache_image *image )
     XSync( display, False );
     image->success = image->pixmap && image->transfer_gc && !worker->error;
     TRACE_(csperf)( "ticks=%llu event=cache_native_alloc image=%p pixmap=%lx display=%p error=%d "
-                   "sync_calls=1 success=%u worker=%u\n", cache_time(), image, image->pixmap, display,
-                   worker->error, image->success, (unsigned int)(worker - cache_workers) );
+                   "sync_calls=1 success=%u worker=%u scope=%p\n", cache_time(), image, image->pixmap, display,
+                   worker->error, image->success, (unsigned int)(worker - cache_workers), &image->memory );
     if ((image->acquired = image->success))
     {
         image->xcb_gc = XGContextFromGC( image->transfer_gc );
@@ -555,10 +555,10 @@ static void create_output_image( struct client_surface_cache_image *image )
     XSync( display, False );
     image->success = image->pixmap && !worker->error;
     TRACE_(csperf)( "ticks=%llu event=%s image=%p window=%lx pixmap=%lx display=%p "
-                   "width=%u height=%u depth=%u sync_calls=1 error=%d success=%u\n",
+                   "width=%u height=%u depth=%u sync_calls=1 error=%d success=%u scope=%p\n",
                    cache_time(), image->kind == CACHE_IMAGE_OUTPUT_PAIR ? "output_pair_native_alloc" : "output_mailbox_alloc",
                    image, image->window, image->pixmap, display, image->width, image->height,
-                   image->depth, worker->error, image->success );
+                   image->depth, worker->error, image->success, &image->memory );
     if ((image->acquired = image->success))
         x11drv_client_surface_trace_image( "acquire", cache_image_kind( image ), display, image->pixmap, image->bytes );
 }
@@ -577,8 +577,8 @@ static void destroy_cache_image( struct client_surface_cache_image *image )
     if (image->pixmap) XFreePixmap( display, image->pixmap );
     if (image->transfer_gc || image->pixmap) XSync( display, False );
     TRACE_(csperf)( "ticks=%llu event=cache_native_free image=%p pixmap=%lx display=%p error=%d "
-                   "owner_display=%p kind=%s\n", cache_time(), image, image->pixmap, display, worker->error,
-                   display, cache_image_kind( image ) );
+                   "owner_display=%p kind=%s scope=%p\n", cache_time(), image, image->pixmap, display, worker->error,
+                   display, cache_image_kind( image ), &image->memory );
     if (image->acquired)
         x11drv_client_surface_trace_image( "free", cache_image_kind( image ), display, image->pixmap, image->bytes );
     client_surface_release_scoped_memory( &image->memory, image->purpose, image->bytes );
