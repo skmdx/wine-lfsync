@@ -571,13 +571,14 @@ BOOL client_surface_publish_handoff_locked( struct client_surface *surface,
         ready_time = TRACE_ON(csperf) ? client_surface_perf_time() : 0;
         __atomic_store_n( &channel->producer_sequence, produced + 1, __ATOMIC_RELEASE );
         TRACE_(csperf)( "ticks=%llu event=ready identity=%s cookie=%s token=%s sequence=%s target_epoch=%s "
-                       "image=%s width=%u height=%u flags=%x damage=%s damage_base=%s\n",
+                       "image=%s width=%u height=%u flags=%x damage=%s damage_base=%s reservation=%s index=%u\n",
                        ready_time, wine_dbgstr_longlong( client_surface_get_identity( surface ) ),
                        wine_dbgstr_longlong( surface->handoff->cookie ),
                        wine_dbgstr_longlong( produced + 1 ), wine_dbgstr_longlong( frame->frame_id ),
                        wine_dbgstr_longlong( frame->target_epoch ), wine_dbgstr_longlong( frame->image ),
                        frame->size.cx, frame->size.cy, slot->flags, wine_dbgstr_rect( &slot->damage ),
-                       wine_dbgstr_longlong( slot->damage_base_sequence ) );
+                       wine_dbgstr_longlong( slot->damage_base_sequence ),
+                       wine_dbgstr_longlong( present->handoff_control ), present->handoff_index );
         surface->composed_serial = present->serial;
         InterlockedExchange( &surface->content_valid, TRUE );
     }
