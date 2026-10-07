@@ -261,7 +261,7 @@ static struct thread_input *create_thread_input( struct desktop *desktop )
 static struct msg_queue *create_msg_queue( struct thread *thread, struct thread_input *input )
 {
     struct thread_input *new_input = NULL;
-    struct msg_queue *queue;
+    struct msg_queue *queue = NULL;
     struct desktop *desktop;
     int i;
 
@@ -269,7 +269,7 @@ static struct msg_queue *create_msg_queue( struct thread *thread, struct thread_
 
     if (!input)
     {
-        if (!(new_input = create_thread_input( desktop ))) return NULL;
+        if (!(new_input = create_thread_input( desktop ))) goto done;
         input = new_input;
     }
 
@@ -277,6 +277,7 @@ static struct msg_queue *create_msg_queue( struct thread *thread, struct thread_
     {
         queue->fd              = NULL;
         queue->sync            = NULL;
+        queue->shared          = NULL;
         queue->paint_count     = 0;
         queue->paint_blocked   = 0;
         queue->hotkey_count    = 0;
@@ -296,11 +297,7 @@ static struct msg_queue *create_msg_queue( struct thread *thread, struct thread_
         for (i = 0; i < NB_MSG_KINDS; i++) list_init( &queue->msg_list[i] );
 
         if (!(queue->sync = create_internal_sync( 1, 0 ))) goto error;
-        if (!(queue->shared = alloc_shared_object( sizeof(*queue->shared) )))
-        {
-            release_object( queue );
-            return NULL;
-        }
+        if (!(queue->shared = alloc_shared_object( sizeof(*queue->shared) ))) goto error;
 
         SHARED_WRITE_BEGIN( queue->shared, queue_shm_t )
         {
@@ -320,13 +317,15 @@ static struct msg_queue *create_msg_queue( struct thread *thread, struct thread_
             retry_process_client_surface_destroys( thread->process );
     }
 
+done:
     if (new_input) release_object( new_input );
     release_object( desktop );
     return queue;
 
 error:
     release_object( queue );
-    return NULL;
+    queue = NULL;
+    goto done;
 }
 
 static int remove_client_surface_notifications( struct msg_queue *queue );

@@ -1453,6 +1453,7 @@ static UINT get_scene_snapshot_data( HWND top, UINT64 id, void *data, UINT size,
 
     info.u.req.get_client_surface_scene_snapshot_request.__header.req = REQ_get_client_surface_scene_snapshot;
     info.u.req.get_client_surface_scene_snapshot_request.handle = wine_server_user_handle( top );
+    info.u.req.get_client_surface_scene_snapshot_request.include_clips = TRUE;
     info.u.req.get_client_surface_scene_snapshot_request.scene_id = id;
     wine_server_set_reply( &info, data, size );
     status = p_wine_server_call( &info );
