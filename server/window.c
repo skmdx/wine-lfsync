@@ -4281,8 +4281,8 @@ DECL_HANDLER(retire_window_paints)
             found = 1;
             release_window_paint( paint, 1 );
         }
-    /* Destruction of all target windows also retires the batch. A delayed or
-     * duplicate notification cannot act on another writer's later paints. */
+    /* Destroyed target windows retain their receipts until native retirement.
+     * A duplicate notification cannot act on another writer's later paints. */
     if (!found) set_error( STATUS_INVALID_PARAMETER );
 }
 
