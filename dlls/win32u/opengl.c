@@ -2583,7 +2583,9 @@ static BOOL context_sync_drawables( struct opengl_context *context, HDC draw_hdc
         if (old_draw) opengl_drawable_release( old_draw );
         if (old_read) opengl_drawable_release( old_read );
 
-        if (rebound)
+        /* An explicit MakeCurrent must observe geometry changes even when
+         * the same context and drawable remain bound. */
+        if (rebound || draw_hdc)
         {
             opengl_drawable_flush( context->read, context->read->interval, 0 );
             opengl_drawable_flush( context->draw, context->draw->interval, 0 );
