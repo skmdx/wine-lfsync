@@ -4795,6 +4795,34 @@ UINT WINAPI NtUserArrangeIconicWindows( HWND parent )
     return count;
 }
 
+static BOOL copy_native_window_surface( HWND hwnd, struct window_surface *surface,
+                                        const struct window_rects *rects )
+{
+    HDC source, dest;
+    HBITMAP bitmap;
+    BOOL ret = FALSE;
+
+    /* The window still uses its native drawable. Read it before installing the
+     * new CPU surface and invalidating the DCEs; afterwards they read the new,
+     * initially empty bitmap instead of the retained GDI background. */
+    if (!(source = NtUserGetDCEx( hwnd, 0, DCX_CACHE | DCX_WINDOW ))) return FALSE;
+    if ((dest = NtGdiCreateCompatibleDC( source )))
+    {
+        if ((bitmap = NtGdiSelectBitmap( dest, surface->color_bitmap )))
+        {
+            ret = NtGdiBitBlt( dest, 0, 0, surface->rect.right - surface->rect.left,
+                               surface->rect.bottom - surface->rect.top, source,
+                               rects->visible.left - rects->window.left + surface->rect.left,
+                               rects->visible.top - rects->window.top + surface->rect.top,
+                               SRCCOPY, 0, 0 );
+            NtGdiSelectBitmap( dest, bitmap );
+        }
+        NtGdiDeleteObjectApp( dest );
+    }
+    NtUserReleaseDC( hwnd, source );
+    return ret;
+}
+
 /*******************************************************************
  *           update_window_state
  *
@@ -4809,8 +4837,9 @@ static NTSTATUS update_window_state_flags( HWND hwnd, UINT driver_flags )
     struct window_surface *surface;
     struct client_surface_scene scene;
     struct window_rects new_rects;
-    BOOL preserve_bits = TRUE;
+    BOOL preserve_bits = TRUE, native_surface;
     NTSTATUS status;
+    WND *win;
 
     if (!is_current_thread_window( hwnd ))
     {
@@ -4818,11 +4847,23 @@ static NTSTATUS update_window_state_flags( HWND hwnd, UINT driver_flags )
         return STATUS_UNSUCCESSFUL;
     }
 
+    if (!(win = get_win_ptr( hwnd )) || win == WND_DESKTOP || win == WND_OTHER_PROCESS)
+        return STATUS_UNSUCCESSFUL;
+    native_surface = !win->surface;
+    release_win_ptr( win );
+
     context = set_thread_dpi_awareness_context( get_window_dpi_awareness_context( hwnd ));
     get_window_rects( hwnd, COORDS_PARENT, &new_rects, get_thread_dpi() );
     valid_rects[0] = valid_rects[1] = new_rects.client;
 
     surface = get_window_surface( hwnd, swp_flags, FALSE, &new_rects, &surface_rect );
+    if (native_surface && surface && surface != &dummy_surface && !surface->alpha_mask &&
+        !copy_native_window_surface( hwnd, surface, &new_rects ))
+    {
+        window_surface_release( surface );
+        set_thread_dpi_awareness_context( context );
+        return STATUS_UNSUCCESSFUL;
+    }
     /* A deferred surface update may run after the client's first Present.
      * DIRECT and a sole source with a completed image have replaced the old
      * GDI client pixels. The owner may publish concurrently with this update;
