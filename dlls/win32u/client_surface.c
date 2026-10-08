@@ -1129,12 +1129,31 @@ static BOOL client_surface_update_present_scene_internal_locked(
     ready = client_surface_backend_update( surface, &next, &update );
     end_client_surface_target_operation( surface );
     if (ReadAcquire( &surface->closing )) return FALSE;
+    /* Preserve only an established offscreen native lifetime. */
+    preserve_native = ready && update == CLIENT_SURFACE_TARGET_UPDATE_PRESERVED && current.valid &&
+        current.offscreen && next.offscreen && next.mode == current.mode &&
+        next.toplevel == current.toplevel && next.dpi_num == current.dpi_num && next.dpi_den == current.dpi_den &&
+        next.virtual_rect.right - next.virtual_rect.left == current.virtual_rect.right - current.virtual_rect.left &&
+        next.virtual_rect.bottom - next.virtual_rect.top == current.virtual_rect.bottom - current.virtual_rect.top &&
+        next.monitor_rect.right - next.monitor_rect.left == current.monitor_rect.right - current.monitor_rect.left &&
+        next.monitor_rect.bottom - next.monitor_rect.top == current.monitor_rect.bottom - current.monitor_rect.top;
     /* The owned target operation pins native lifetime, but the server scene
      * can change while its callback runs. Do not publish that obsolete next
-     * geometry as usable. Invalidate the old epoch and let the caller resample. */
+     * geometry as usable. Retire a changed native epoch and let the caller resample. */
     if (ready && ((scene_valid && !client_surface_scene_current( &scene )) ||
                   (preparing_candidate && !client_surface_scene_snapshot_current( next.toplevel, scene.epoch ))))
+    {
+        /* A scene race does not destroy an unchanged offscreen drawable.
+         * Keep its pending first frame, but require a fresh scene before
+         * publishing it. No previous completed image may exist to replay. */
+        if (preserve_native)
+        {
+            surface->target_scene_epoch = 0;
+            surface->target_scene_mode = CLIENT_SURFACE_PRESENTATION_INVALID;
+            return FALSE;
+        }
         ready = FALSE;
+    }
 
     if (!ready)
     {
@@ -1149,16 +1168,6 @@ static BOOL client_surface_update_present_scene_internal_locked(
     }
 
     next.valid = TRUE;
-    /* A backend may preserve an established offscreen target across position
-     * changes. Size, DPI, mode, ownership and validity still delimit native
-     * lifetimes even if the new snapshot later returns to the old values. */
-    preserve_native = update == CLIENT_SURFACE_TARGET_UPDATE_PRESERVED && current.valid &&
-        current.offscreen && next.offscreen && next.mode == current.mode &&
-        next.toplevel == current.toplevel && next.dpi_num == current.dpi_num && next.dpi_den == current.dpi_den &&
-        next.virtual_rect.right - next.virtual_rect.left == current.virtual_rect.right - current.virtual_rect.left &&
-        next.virtual_rect.bottom - next.virtual_rect.top == current.virtual_rect.bottom - current.virtual_rect.top &&
-        next.monitor_rect.right - next.monitor_rect.left == current.monitor_rect.right - current.monitor_rect.left &&
-        next.monitor_rect.bottom - next.monitor_rect.top == current.monitor_rect.bottom - current.monitor_rect.top;
     /* Publish only after the native mutation. Geometry readers copy under
      * the leaf mutex; completed frames validate the independent native epoch. */
     if (changed || next.mode != current.mode || next.offscreen != current.offscreen ||

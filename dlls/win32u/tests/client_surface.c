@@ -4049,6 +4049,8 @@ static void test_handoff_cold_visibility(void)
     struct client_surface_handoff_shared *shared;
     struct client_surface_handoff_slot descriptors[3];
     struct scene_snapshot snapshot;
+    struct native_barrier_state barrier;
+    struct shared_surface_state before;
     const struct client_surface_scene_layer *layer;
     struct __server_request_info info = {0};
     HWND top = create_test_window( FALSE ), other = create_test_window( FALSE ), child = NULL;
@@ -4086,10 +4088,20 @@ static void test_handoff_cold_visibility(void)
 
     status = get_surface_handoff_visibility( child, identity, producer.cookie, &visible );
     ok( status == STATUS_INVALID_PARAMETER && !visible, "unclaimed visibility status %#x\n", status );
+    ok( read_shared_surface_state( child, &before ), "failed to read prior producer\n" );
+    status = set_native_barrier( top, 0x255, TRUE, &barrier );
+    ok( !status && (barrier.scene_generation & 1), "cold claim barrier status %#x\n", status );
     status = claim_surface_state( child, identity, NULL );
     ok( !status, "cold claim status %#x\n", status );
     status = get_surface_handoff_visibility( child, identity, producer.cookie, &visible );
     ok( !status && !visible, "hidden ancestor visibility status %#x visible %u\n", status, visible );
+    status = set_surface_state_source( child, alternate, CLIENT_SURFACE_STATE_CLAIM, 0,
+                                      barrier.scene_generation, top, before.producer_sequence, 0, NULL );
+    ok( !status, "stale odd-scene claim status %#x\n", status );
+    status = get_surface_handoff_visibility( child, identity, producer.cookie, &visible );
+    ok( !status && !visible, "stale completion replaced the claimed producer, status %#x\n", status );
+    status = set_native_barrier( top, 0x255, FALSE, &barrier );
+    ok( !status && !(barrier.scene_generation & 1), "cold claim barrier END status %#x\n", status );
     status = get_scene_snapshot( top, 0, sizeof(snapshot.data), &snapshot );
     layer = status ? NULL : find_scene_layer( &snapshot, child );
     ok( layer && layer->producer.producer_mapped && !layer->producer.visible && !layer->producer.cookie,

@@ -6087,8 +6087,12 @@ DECL_HANDLER(set_client_surface_state)
     if ((req->flags & CLIENT_SURFACE_STATE_CANCEL_CANDIDATE) && surface && !surface->claimed &&
         req->generation == surface->candidate_serial)
         surface->candidate_serial = 0;
+    /* A completed native image may have been submitted while geometry was
+     * changing. Claiming its producer is independent of publishing a scene;
+     * the producer sequence still prevents an older completion from replacing
+     * another producer. Geometry publication keeps its exact even-epoch check. */
     if ((req->flags & CLIENT_SURFACE_STATE_CLAIM) && surface && surface->active &&
-        req->scene_toplevel == top->handle && !(req->scene_generation & 1) &&
+        req->scene_toplevel == top->handle &&
         req->producer_sequence == (producer_before ? producer_before->sequence : 0) &&
         req->scene_generation <= top->client_surface_scene_generation)
     {
