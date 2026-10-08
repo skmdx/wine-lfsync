@@ -389,7 +389,13 @@ static BOOL apply_cpu_snapshot( void *context, struct client_surface *client, st
     surface->snapshot_native = FALSE;
     x11drv_client_surface_set_gpu_snapshot( surface, NULL );
     if (present->handoff_control)
+    {
         present->handoff_source->source = x11drv_client_snapshot_pixmap( context );
+        present->handoff_source->source_visual = default_visual.visualid;
+        present->handoff_source->width = present->capture.size.cx;
+        present->handoff_source->height = present->capture.size.cy;
+        present->handoff_source->flags |= CLIENT_SURFACE_HANDOFF_COPY_SOURCE;
+    }
     return TRUE;
 }
 
@@ -455,6 +461,7 @@ static BOOL x11drv_client_surface_handoff_prepare(
     unsigned int index = present->handoff_index;
     BOOL ret = FALSE;
     BOOL native = usexcomposite && !surface->direct_snapshot && !present->direct_snapshot &&
+                  !present->capture.size.cx &&
                   (!present->replay || (surface->snapshot_native && !surface->gpu_snapshot));
     /* Native raw drawables use monitor pixels. Private GL/Vulkan snapshots
      * retain the rendered virtual extent; the owner scales their immutable
@@ -553,7 +560,9 @@ static BOOL x11drv_client_surface_handoff_capture( struct client_surface *client
     struct x11drv_client_surface *surface = impl_from_client_surface( client );
     struct x11drv_client_source_frame *frame = surface->sources + present->handoff_index;
 
-    if (present->replay || !usexcomposite || surface->direct_snapshot || present->direct_snapshot) return TRUE;
+    /* A private GL capture may replace the native source reserved before the
+     * swap. Never overwrite that completed image by rereading the window. */
+    if (present->replay || (present->handoff_source->flags & CLIENT_SURFACE_HANDOFF_COPY_SOURCE)) return TRUE;
     if (!frame->snapshot) return FALSE;
     if (!x11drv_client_snapshot_prepare_read( &frame->snapshot )) return FALSE;
     assert( !frame->gpu_copy );
