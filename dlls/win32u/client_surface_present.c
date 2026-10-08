@@ -665,8 +665,8 @@ static BOOL client_surface_present_busy_locked( struct client_surface *surface, 
     return InterlockedCompareExchange( &surface->target_update_waiters, 0, 0 ) ||
            surface->native_present_count ||
            (external_completion ? surface->driver_completion_count || surface->driver_completion_waiters ||
-                                  (surface->backend->handoff_serialize &&
-                                   surface->backend->handoff_serialize( surface ) &&
+                                  (surface->backend->handoff &&
+                                   surface->backend->handoff->serialize( surface ) &&
                                    InterlockedCompareExchange( &surface->external_completion_count, 0, 0 )) :
                                   InterlockedCompareExchange( &surface->external_completion_count, 0, 0 ));
 }
@@ -674,7 +674,7 @@ static BOOL client_surface_present_busy_locked( struct client_surface *surface, 
 BOOL client_surface_try_lock_present( struct client_surface *surface, BOOL external_completion )
 {
     if (pthread_mutex_trylock( &surface->completion_lock )) return FALSE;
-    if (surface->backend->handoff_serialize && surface->backend->handoff_serialize( surface ))
+    if (surface->backend->handoff && surface->backend->handoff->serialize( surface ))
         external_completion = FALSE;
     if (client_surface_present_busy_locked( surface, external_completion ) ||
         (external_completion && InterlockedCompareExchange( &surface->external_completion_count, 0, 0 ) &&
@@ -689,7 +689,7 @@ BOOL client_surface_try_lock_present( struct client_surface *surface, BOOL exter
 
 void client_surface_wait_present_locked( struct client_surface *surface, BOOL external_completion )
 {
-    if (surface->backend->handoff_serialize && surface->backend->handoff_serialize( surface ))
+    if (surface->backend->handoff && surface->backend->handoff->serialize( surface ))
         external_completion = FALSE;
     /* Exact IDs may overlap each other, but a shared driver monitor has no
      * per-frame identity.  Drain exact work before arming that monitor, and
@@ -1131,7 +1131,7 @@ struct client_surface_present_result client_surface_complete_present_locked( str
     if (ReadAcquire( &surface->closing ) || client_surface_present_expired( present )) completed = FALSE;
     if (present->result != CLIENT_SURFACE_FRAME_PENDING) completed = FALSE;
     if (completed && present->completion.kind != CLIENT_SURFACE_COMPLETION_NONE &&
-        client_surface_backend_has_cap( surface, CLIENT_SURFACE_BACKEND_GENERATION_HANDOFF ))
+        surface->backend->handoff)
         completed = source_valid = client_surface_capture_frame( surface, present, expected_size, &frame );
     if ((completed || source_valid) && InterlockedCompareExchange( &surface->active, 0, 0 ) &&
         (!present->scene.authoritative ||

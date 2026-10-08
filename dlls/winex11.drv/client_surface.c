@@ -635,12 +635,21 @@ static BOOL x11drv_client_surface_handoff_complete( struct client_surface *clien
     return TRUE;
 }
 
+static const struct client_surface_handoff_ops x11drv_client_surface_handoff_ops =
+{
+    .reserve = x11drv_client_surface_handoff_reserve,
+    .prepare = x11drv_client_surface_handoff_prepare,
+    .capture = x11drv_client_surface_handoff_capture,
+    .complete = x11drv_client_surface_handoff_complete,
+    .serialize = x11drv_client_surface_handoff_serialize,
+    .retire = x11drv_client_surface_retire_handoff,
+};
+
 static const struct client_surface_backend x11drv_client_surface_backend =
 {
     .caps = CLIENT_SURFACE_BACKEND_SCENE_PUBLICATION |
             CLIENT_SURFACE_BACKEND_READ_ONLY_DC |
             CLIENT_SURFACE_BACKEND_DIRECT_PRESENTATION |
-            CLIENT_SURFACE_BACKEND_GENERATION_HANDOFF |
             CLIENT_SURFACE_BACKEND_OWNER_COMPOSITOR |
             CLIENT_SURFACE_BACKEND_OWNER_SCENE_PLAN,
     .destroy = x11drv_client_surface_destroy,
@@ -649,12 +658,7 @@ static const struct client_surface_backend x11drv_client_surface_backend =
     .prepare_direct = X11DRV_client_surface_prepare_direct,
     .complete_direct = X11DRV_client_surface_complete_direct,
     .update = x11drv_client_surface_update,
-    .handoff_reserve = x11drv_client_surface_handoff_reserve,
-    .handoff_prepare = x11drv_client_surface_handoff_prepare,
-    .handoff_capture = x11drv_client_surface_handoff_capture,
-    .handoff_complete = x11drv_client_surface_handoff_complete,
-    .handoff_serialize = x11drv_client_surface_handoff_serialize,
-    .handoff_retire = x11drv_client_surface_retire_handoff,
+    .handoff = &x11drv_client_surface_handoff_ops,
     .completion = &x11drv_client_surface_completion_ops,
 };
 

@@ -139,7 +139,7 @@ void client_surface_release_handoff( struct client_surface *surface )
         .view = surface->handoff->view, .channel = surface->handoff->channel,
         .cookie = surface->handoff->cookie, .ready_fd = surface->handoff->ready_fd,
     };
-    surface->backend->handoff_retire( surface, &lease );
+    surface->backend->handoff->retire( surface, &lease );
     surface->handoff->ready_fd = -1;
     surface->handoff->view = NULL;
     surface->handoff->view_size = 0;
@@ -170,7 +170,7 @@ static BOOL map_client_surface_handoff( struct client_surface *surface, const st
         client_surface_release_handoff( surface );
         if (surface->handoff->view) return FALSE;
     }
-    if (!surface->backend->handoff_reserve( surface, present )) return FALSE;
+    if (!surface->backend->handoff->reserve( surface, present )) return FALSE;
     SERVER_START_REQ( get_client_surface_handoff )
     {
         req->handle = wine_server_user_handle( surface->hwnd );
@@ -327,13 +327,12 @@ static BOOL prepare_client_surface_handoff_locked( struct client_surface *surfac
         (present->mode != CLIENT_SURFACE_PRESENTATION_COMPOSITED &&
          (present->mode != CLIENT_SURFACE_PRESENTATION_STAGED || !present->scene.generation)) ||
         !present->scene.valid)) ||
-        !client_surface_backend_has_cap( surface, CLIENT_SURFACE_BACKEND_GENERATION_HANDOFF ))
+        !surface->backend->handoff)
     {
-        TRACE( "handoff unavailable identity %s target %u mode %u generation %s valid %u cap %u prepare %p\n",
+        TRACE( "handoff unavailable identity %s target %u mode %u generation %s valid %u ops %p\n",
                wine_dbgstr_longlong( client_surface_get_identity( surface ) ), present->target, present->mode,
                wine_dbgstr_longlong( present->scene.generation ), present->scene.valid,
-               client_surface_backend_has_cap( surface, CLIENT_SURFACE_BACKEND_GENERATION_HANDOFF ),
-               surface->backend->handoff_prepare );
+               surface->backend->handoff );
         return FALSE;
     }
     if (!map_client_surface_handoff( surface, present )) return FALSE;
@@ -354,7 +353,7 @@ static BOOL prepare_client_surface_handoff_locked( struct client_surface *surfac
     source->target_epoch = present->target_epoch;
     source->source = source->source_visual = 0;
     source->width = source->height = source->flags = 0;
-    if (!surface->backend->handoff_prepare( surface, source, present ))
+    if (!surface->backend->handoff->prepare( surface, source, present ))
     {
         UINT64 expected = token;
         __atomic_compare_exchange_n( &source->reservation, &expected, 0, 0,
@@ -415,7 +414,7 @@ BOOL client_surface_freeze_frame_locked( struct client_surface *surface,
     if (valid && present->capture.size.cx)
         valid = source->width == present->capture.size.cx && source->height == present->capture.size.cy;
     if (valid)
-        valid = surface->backend->handoff_capture( surface, present, &capture );
+        valid = surface->backend->handoff->capture( surface, present, &capture );
     if (valid && capture.read)
     {
         /* Cached replay has no host completion token of its own. Retain the
@@ -436,7 +435,7 @@ BOOL client_surface_freeze_frame_locked( struct client_surface *surface,
         if (valid && capture.apply) valid = capture.apply( capture.context, surface, present );
     }
     if (valid)
-        valid = surface->backend->handoff_complete( surface, source, present->handoff_index );
+        valid = surface->backend->handoff->complete( surface, source, present->handoff_index );
     if (valid) valid = source_capture_current( surface, present );
     if (valid)
         valid = source->source && source->width && source->height && (source->flags & CLIENT_SURFACE_HANDOFF_COPY_SOURCE);

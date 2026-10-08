@@ -220,7 +220,7 @@ struct gdi_dc_funcs
 };
 
 /* increment this when changing driver tables or shared driver-facing structures */
-#define WINE_GDI_DRIVER_VERSION 157
+#define WINE_GDI_DRIVER_VERSION 158
 
 #define GDI_PRIORITY_NULL_DRV        0  /* null driver */
 #define GDI_PRIORITY_FONT_DRV      100  /* any font driver */
@@ -293,7 +293,6 @@ enum client_surface_backend_caps
     /* present() only queries the supplied DC; all drawing uses private state. */
     CLIENT_SURFACE_BACKEND_READ_ONLY_DC = 0x04,
     CLIENT_SURFACE_BACKEND_DIRECT_PRESENTATION = 0x08,
-    CLIENT_SURFACE_BACKEND_GENERATION_HANDOFF = 0x10,
     /* Offscreen presentation is owner-only; present() must never write an
      * owner native target when generation handoff is unavailable. */
     CLIENT_SURFACE_BACKEND_OWNER_COMPOSITOR = 0x20,
@@ -321,6 +320,29 @@ struct client_surface_handoff_lease
     int ready_fd;
 };
 
+/* A non-NULL handoff interface advertises generation handoff and requires all
+ * operations. Backends without this protocol leave the interface NULL. */
+struct client_surface_handoff_ops
+{
+    /* Reserve retirement ownership before creating a mapping or advertising an endpoint. */
+    BOOL (*reserve)( struct client_surface *surface, const struct client_surface_frame *frame );
+    /* Prepare producer-private storage. This does not publish a frame. */
+    BOOL (*prepare)( struct client_surface *surface,
+                     struct client_surface_source *source, const struct client_surface_frame *frame );
+    /* Transfer a prepared source operation to this capture. Read owns its
+     * storage without surface locks; apply and release only change references.
+     * The core retains native submission order and revalidates before apply. */
+    BOOL (*capture)( struct client_surface *surface, struct client_surface_frame *frame,
+                     struct client_surface_capture *capture );
+    /* Freeze a completed native drawable into independent producer storage. */
+    BOOL (*complete)( struct client_surface *surface,
+                      struct client_surface_source *source, unsigned int index );
+    BOOL (*serialize)( struct client_surface *surface );
+    /* Take ownership of the mapped handoff, its notification fd and source
+     * storage. Retire them after readers finish, without retaining surface. */
+    void (*retire)( struct client_surface *surface, const struct client_surface_handoff_lease *lease );
+};
+
 struct client_surface_backend
 {
     unsigned int caps;
@@ -341,33 +363,16 @@ struct client_surface_backend
      * flush requires host completion before returning, defer_visible keeps a scene generation staged */
     BOOL (*present)( struct client_surface *surface, const struct client_surface_scene *scene,
                      HDC hdc, HRGN surface_region, BOOL flush, BOOL defer_visible );
-    /* GENERATION_HANDOFF requires every handoff operation. Reserve retirement
-     * ownership before creating a mapping or advertising an endpoint. */
-    BOOL (*handoff_reserve)( struct client_surface *surface, const struct client_surface_frame *frame );
-    /* Prepare producer-private storage. This does not publish a frame. */
-    BOOL (*handoff_prepare)( struct client_surface *surface,
-                             struct client_surface_source *source, const struct client_surface_frame *frame );
-    /* Transfer a prepared source operation to this capture. Read owns its
-     * storage without surface locks; apply and release only change references.
-     * The core retains native submission order and revalidates before apply. */
-    BOOL (*handoff_capture)( struct client_surface *surface, struct client_surface_frame *frame,
-                             struct client_surface_capture *capture );
-    /* Freeze a completed native drawable into independent producer storage. */
-    BOOL (*handoff_complete)( struct client_surface *surface,
-                              struct client_surface_source *source, unsigned int index );
-    BOOL (*handoff_serialize)( struct client_surface *surface );
-    /* Take ownership of the mapped handoff, its notification fd and source
-     * storage. Retire them after readers finish, without retaining surface. */
-    void (*handoff_retire)( struct client_surface *surface, const struct client_surface_handoff_lease *lease );
+    const struct client_surface_handoff_ops *handoff;
     const struct client_surface_completion_ops *completion;
 };
 
 static inline BOOL client_surface_backend_valid( const struct client_surface_backend *backend )
 {
     if (backend->completion && (!backend->completion->prepare || !backend->completion->wait)) return FALSE;
-    if (!(backend->caps & CLIENT_SURFACE_BACKEND_GENERATION_HANDOFF)) return TRUE;
-    return backend->handoff_reserve && backend->handoff_prepare && backend->handoff_capture &&
-           backend->handoff_complete && backend->handoff_serialize && backend->handoff_retire;
+    if (!backend->handoff) return TRUE;
+    return backend->handoff->reserve && backend->handoff->prepare && backend->handoff->capture &&
+           backend->handoff->complete && backend->handoff->serialize && backend->handoff->retire;
 }
 
 struct client_surface_scene
