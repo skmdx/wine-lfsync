@@ -162,6 +162,11 @@ void x11drv_client_surface_release_source_frame( struct x11drv_client_source_fra
 void x11drv_client_surface_set_gpu_snapshot( struct x11drv_client_surface *surface,
                                             struct x11drv_client_snapshot *snapshot )
 {
+    if (!snapshot)
+    {
+        x11drv_client_snapshot_release( surface->gpu_spare );
+        surface->gpu_spare = NULL;
+    }
     if (surface->gpu_snapshot == snapshot) return;
     x11drv_client_snapshot_release( surface->gpu_snapshot );
     surface->gpu_snapshot = snapshot ? x11drv_client_snapshot_share( snapshot ) : NULL;
@@ -369,6 +374,15 @@ struct x11drv_client_snapshot *x11drv_client_surface_prepare_gpu_snapshot(
      * cancellation releases it through the same capture owner. */
     pthread_mutex_lock( &client->present_lock );
     snapshot = frame->snapshot;
+    if (snapshot && snapshot == surface->gpu_snapshot)
+    {
+        /* The returned slot still holds the last completed replay image.
+         * Rotate it out until a later completion replaces that image instead
+         * of allocating and discarding storage on every capture. Preparation
+         * still checks all readers, the GPU fence and the allocation domain. */
+        snapshot = surface->gpu_spare;
+        surface->gpu_spare = frame->snapshot;
+    }
     memset( frame, 0, sizeof(*frame) );
     pthread_mutex_unlock( &client->present_lock );
     ret = x11drv_client_snapshot_prepare_storage( &snapshot, &memory, present->handoff_source->width,
