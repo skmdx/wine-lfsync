@@ -2107,7 +2107,7 @@ static struct opengl_drawable *get_window_unused_drawable( HWND hwnd, int format
         release_win_ptr( win );
     }
 
-    if (drawable && drawable->format != format)
+    if (drawable && (drawable->format != format || !is_client_surface_window( drawable->client, hwnd )))
     {
         opengl_drawable_release( drawable );
         drawable = NULL;

@@ -738,17 +738,10 @@ static void trim_unused_client_surfaces(void)
     }
 }
 
-void detach_client_surfaces( HWND hwnd )
+void invalidate_client_surfaces( HWND hwnd )
 {
     struct client_surface *surface, *next;
     struct list closing = LIST_INIT(closing);
-    WND *win = get_win_ptr( hwnd );
-
-    if (win && win != WND_OTHER_PROCESS && win != WND_DESKTOP)
-    {
-        win->client_surfaces_closed = TRUE;
-        release_win_ptr( win );
-    }
 
     pthread_mutex_lock( &registry_lock );
     LIST_FOR_EACH_ENTRY_SAFE( surface, next, &client_surfaces, struct client_surface, entry )
@@ -767,6 +760,18 @@ void detach_client_surfaces( HWND hwnd )
     /* Evictions accepted before window destruction are no longer in the
      * registry. Consume their GUI bindings before the driver frees win_data. */
     client_surface_drain_mailbox();
+}
+
+void detach_client_surfaces( HWND hwnd )
+{
+    WND *win = get_win_ptr( hwnd );
+
+    if (win && win != WND_OTHER_PROCESS && win != WND_DESKTOP)
+    {
+        win->client_surfaces_closed = TRUE;
+        release_win_ptr( win );
+    }
+    invalidate_client_surfaces( hwnd );
 }
 
 void detach_client_surface_identity( UINT64 identity )
@@ -1932,7 +1937,7 @@ BOOL is_client_surface_window( struct client_surface *surface, HWND hwnd )
 {
     HWND surface_hwnd;
 
-    if (!surface) return FALSE;
+    if (!surface || InterlockedCompareExchange( &surface->closing, 0, 0 )) return FALSE;
     surface_hwnd = InterlockedCompareExchangePointer( (void **)&surface->hwnd, NULL, NULL );
     return hwnd ? surface_hwnd == hwnd : !!surface_hwnd;
 }
