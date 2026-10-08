@@ -15050,6 +15050,20 @@ START_TEST(win)
         ok(SetForegroundWindow(hwndMain), "SetForegroundWindow failed\n");
     }
 
+    if (argc == 3 && !strcmp( argv[2], "activateapp" ))
+    {
+        unsigned int iteration;
+
+        for (iteration = 0; iteration < 20; ++iteration)
+        {
+            winetest_push_context( "iteration %u", iteration );
+            test_activateapp( hwndMain );
+            winetest_pop_context();
+        }
+        DestroyWindow( hwndMain );
+        return;
+    }
+
     if (argc == 3 && !strcmp( argv[2], "click_route" ))
     {
         POINT saved;

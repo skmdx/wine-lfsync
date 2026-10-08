@@ -2216,6 +2216,24 @@ static LRESULT handle_internal_message( HWND hwnd, UINT msg, WPARAM wparam, LPAR
         HWND prev;
 
         if (!wparam && NtUserGetForegroundWindow() == hwnd) return 0;
+        if (wparam && lparam)  /* asynchronous native activation */
+        {
+            struct object_lock lock = OBJECT_LOCK_INIT;
+            const input_shm_t *input_shm;
+            BOOL foreground = FALSE;
+            NTSTATUS status;
+
+            /* A newer foreground handoff may precede delivery of this message.
+             * The foreground queue can have no active window yet. */
+            while ((status = get_shared_input( GetCurrentThreadId(), &lock, &input_shm )) == STATUS_PENDING)
+                foreground = input_shm->foreground;
+            if (status || !foreground)
+            {
+                TRACE( "Ignoring superseded native activation of %p\n", hwnd );
+                return 0;
+            }
+            lparam = 0;
+        }
         if (!set_active_window( (HWND)wparam, &prev, FALSE, TRUE, lparam )) return 0;
         return (LRESULT)prev;
     }

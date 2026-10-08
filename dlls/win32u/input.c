@@ -2364,7 +2364,7 @@ BOOL set_foreground_window( HWND hwnd, BOOL mouse, BOOL internal )
             ret = set_active_window( 0, NULL, mouse, TRUE, new_thread_id );
 
         if (send_msg_new)  /* new window belongs to other thread */
-            NtUserMessageCall( hwnd, WM_WINE_SETACTIVEWINDOW, (WPARAM)hwnd, 0,
+            NtUserMessageCall( hwnd, WM_WINE_SETACTIVEWINDOW, (WPARAM)hwnd, internal,
                                0, NtUserSendNotifyMessage, FALSE );
         else  /* new window belongs to us */
             ret = set_active_window( hwnd, NULL, mouse, TRUE, 0 );
