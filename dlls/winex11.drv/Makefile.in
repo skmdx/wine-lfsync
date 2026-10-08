@@ -13,6 +13,9 @@ SOURCES = \
 	client_surface_backing.c \
 	client_surface_cache.c \
 	client_surface_completion.c \
+	client_surface_composition.c \
+	client_surface_compositor.c \
+	client_surface_output.c \
 	client_surface_query.c \
 	client_surface_retirement.c \
 	client_surface_snapshot.c \
