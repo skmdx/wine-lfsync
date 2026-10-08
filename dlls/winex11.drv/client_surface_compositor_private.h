@@ -302,7 +302,6 @@ struct client_surface_owner_notifications
 };
 
 extern void reset_client_surface_owner_repair( struct client_surface_owner_repair *repair );
-extern UINT64 client_surface_pixmap_bytes( unsigned int width, unsigned int height, unsigned int depth );
 extern void set_client_surface_compositor_pixmap( struct client_surface_compositor_frame *frame, Pixmap pixmap,
                                                  struct client_surface_cache_image *image );
 extern BOOL client_surface_compositor_frame_writable( const struct client_surface_compositor_frame *frame );

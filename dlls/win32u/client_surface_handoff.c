@@ -72,14 +72,6 @@ void client_surface_handoff_destroy( struct client_surface *surface )
     assert( !surface->handoff->waiters && !surface->handoff->view && surface->handoff->ready_fd == -1 );
 }
 
-static unsigned long long client_surface_perf_time(void)
-{
-    LARGE_INTEGER counter;
-
-    NtQueryPerformanceCounter( &counter, NULL );
-    return counter.QuadPart;
-}
-
 static void client_surface_handoff_wake_ready( struct client_surface *surface )
 {
     struct client_surface_handoff_shared *shared = surface->handoff->shared;

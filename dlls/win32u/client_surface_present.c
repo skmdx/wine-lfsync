@@ -23,14 +23,6 @@
 WINE_DEFAULT_DEBUG_CHANNEL(win);
 WINE_DECLARE_DEBUG_CHANNEL(csperf);
 
-static unsigned long long client_surface_perf_time(void)
-{
-    LARGE_INTEGER counter;
-
-    NtQueryPerformanceCounter( &counter, NULL );
-    return counter.QuadPart;
-}
-
 static BOOL get_cached_client_surface_region( struct client_surface *surface, HWND hwnd,
                                               const struct client_surface_target *target,
                                               const struct client_surface_frame *present,

@@ -36,14 +36,6 @@
 WINE_DEFAULT_DEBUG_CHANNEL(x11drv);
 WINE_DECLARE_DEBUG_CHANNEL(csperf);
 
-unsigned long long client_surface_perf_time(void)
-{
-    LARGE_INTEGER counter;
-
-    NtQueryPerformanceCounter( &counter, NULL );
-    return counter.QuadPart;
-}
-
 pthread_mutex_t client_surface_compositor_mutex = PTHREAD_MUTEX_INITIALIZER;
 static BOOL client_surface_compositor_started;
 static int client_surface_compositor_notify[2] = {-1, -1};

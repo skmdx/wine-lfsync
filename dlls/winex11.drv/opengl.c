@@ -50,14 +50,6 @@ WINE_DEFAULT_DEBUG_CHANNEL(wgl);
 WINE_DECLARE_DEBUG_CHANNEL(winediag);
 WINE_DECLARE_DEBUG_CHANNEL(csperf);
 
-static unsigned long long client_surface_perf_time(void)
-{
-    LARGE_INTEGER counter;
-
-    NtQueryPerformanceCounter( &counter, NULL );
-    return counter.QuadPart;
-}
-
 #include "wine/opengl_driver.h"
 
 typedef struct __GLXcontextRec *GLXContext;

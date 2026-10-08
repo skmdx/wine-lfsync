@@ -591,6 +591,16 @@ W32KAPI void client_surface_get_target( const struct client_surface *surface,
 W32KAPI void client_surface_add_ref( struct client_surface *surface );
 W32KAPI void client_surface_release( struct client_surface *surface );
 W32KAPI void client_surface_abort( struct client_surface *surface );
+/* Performance-counter ticks for trace timestamps and durations. Timeout
+ * deadlines use their own monotonic or relative clock. */
+static inline unsigned long long client_surface_perf_time(void)
+{
+    LARGE_INTEGER counter;
+
+    NtQueryPerformanceCounter( &counter, NULL );
+    return counter.QuadPart;
+}
+
 /* Timed conditions pair this initializer with the monotonic/relative wait. */
 W32KAPI int client_surface_cond_init( pthread_cond_t *cond );
 W32KAPI int client_surface_cond_timedwait( pthread_cond_t *cond, pthread_mutex_t *mutex, DWORD timeout );

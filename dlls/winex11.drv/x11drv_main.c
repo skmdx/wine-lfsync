@@ -346,6 +346,32 @@ void X11DRV_unregister_error_handler( struct x11drv_error_handler *handler )
     pthread_mutex_unlock( &error_handlers_mutex );
 }
 
+static int private_display_error( Display *display, XErrorEvent *event, void *arg )
+{
+    int *error = arg;
+
+    *error = event->error_code;
+    return TRUE;
+}
+
+BOOL x11drv_open_private_display( Display **display, struct x11drv_error_handler *handler, int *error )
+{
+    if (*display) return TRUE;
+    if (!(*display = XOpenDisplay( DisplayString( gdi_display ) ))) return FALSE;
+    handler->display = *display;
+    handler->callback = private_display_error;
+    handler->arg = error;
+    X11DRV_register_error_handler( handler );
+    if (fcntl( ConnectionNumber( *display ), F_SETFD, FD_CLOEXEC ) == -1)
+    {
+        XCloseDisplay( *display );
+        X11DRV_unregister_error_handler( handler );
+        *display = NULL;
+        return FALSE;
+    }
+    return TRUE;
+}
+
 /***********************************************************************
  *		error_handler
  */

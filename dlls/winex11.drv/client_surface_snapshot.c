@@ -16,7 +16,6 @@
 #include "config.h"
 
 #include <assert.h>
-#include <fcntl.h>
 
 #include "client_surface.h"
 #include "xcomposite.h"
@@ -134,14 +133,6 @@ static void snapshot_retirement_thread( void *context )
     x11drv_client_surface_retire_resource( &connection->retirement );
 }
 
-static int snapshot_error( Display *display, XErrorEvent *event, void *arg )
-{
-    struct snapshot_connection *connection = arg;
-
-    connection->error = event->error_code;
-    return TRUE;
-}
-
 static struct snapshot_connection *snapshot_connection_acquire( UINT64 domain,
                                                                 const struct client_surface_memory_scope *owners )
 {
@@ -233,18 +224,8 @@ static BOOL snapshot_connection_open( struct snapshot_connection *connection )
         connection->retirement.thread = thread;
         pthread_mutex_unlock( &snapshot_connections_lock );
     }
-    if (!(connection->display = XOpenDisplay( DisplayString( gdi_display ) ))) return FALSE;
-    connection->errors.display = connection->display;
-    connection->errors.callback = snapshot_error;
-    connection->errors.arg = connection;
-    X11DRV_register_error_handler( &connection->errors );
-    if (fcntl( ConnectionNumber( connection->display ), F_SETFD, FD_CLOEXEC ) == -1)
-    {
-        XCloseDisplay( connection->display );
-        X11DRV_unregister_error_handler( &connection->errors );
-        connection->display = NULL;
+    if (!x11drv_open_private_display( &connection->display, &connection->errors, &connection->error ))
         return FALSE;
-    }
     TRACE( "opened snapshot connection %p domain %s\n", connection->display,
            wine_dbgstr_longlong( connection->domain ) );
     return TRUE;
@@ -376,7 +357,7 @@ static struct x11drv_client_snapshot *snapshot_alloc( const struct client_surfac
 {
     struct x11drv_client_snapshot *snapshot;
     struct client_surface_memory_scope memory = {0};
-    UINT64 bytes = (UINT64)width * height * (depth > 16 ? 4 : depth > 8 ? 2 : 1);
+    UINT64 bytes = client_surface_pixmap_bytes( width, height, depth );
 
     client_surface_memory_scope_copy( &memory, owners, TRUE );
     if (!(snapshot = client_surface_alloc_scoped_metadata( &memory, 1, sizeof(*snapshot) )))

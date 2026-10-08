@@ -30,12 +30,9 @@ WINE_DECLARE_DEBUG_CHANNEL(csperf);
 void x11drv_client_surface_trace_image( const char *event, const char *kind,
                                        Display *display, Pixmap pixmap, UINT64 bytes )
 {
-    LARGE_INTEGER ticks;
-
     if (!TRACE_ON(csperf) || !kind || !pixmap || !bytes) return;
-    NtQueryPerformanceCounter( &ticks, NULL );
     TRACE_(csperf)( "ticks=%llu event=image_%s kind=%s display=%p pixmap=%lx bytes=%llu\n",
-                   (unsigned long long)ticks.QuadPart, event, kind, display, pixmap,
+                   client_surface_perf_time(), event, kind, display, pixmap,
                    (unsigned long long)bytes );
 }
 
@@ -572,11 +569,8 @@ static void trace_snapshot_freeze( struct client_surface *client, const struct c
 {
     if (TRACE_ON(csperf))
     {
-        LARGE_INTEGER ticks;
-
-        NtQueryPerformanceCounter( &ticks, NULL );
         TRACE_(csperf)( "ticks=%llu event=snapshot_freeze identity=%s reservation=%s index=%u pixmap=%lx\n",
-                       (unsigned long long)ticks.QuadPart,
+                       client_surface_perf_time(),
                        wine_dbgstr_longlong( __atomic_load_n( &client->identity, __ATOMIC_ACQUIRE ) ),
                        wine_dbgstr_longlong( image->reservation ), index, (Pixmap)image->source );
     }

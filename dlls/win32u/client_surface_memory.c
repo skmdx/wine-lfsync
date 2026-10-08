@@ -88,13 +88,10 @@ static UINT64 account_memory_available( struct client_surface_memory_account *ac
 
 static void trace_memory_account( const char *event, const struct client_surface_memory_account *account )
 {
-    LARGE_INTEGER counter;
-
     if (!TRACE_ON(csperf) || !account) return;
-    NtQueryPerformanceCounter( &counter, NULL );
     TRACE_(csperf)( "ticks=%llu event=%s account=%llu kind=%u key=%llu limit=%llu references=%u "
                    "source=%llu staging=%llu output=%llu metadata=%llu\n",
-                   (unsigned long long)counter.QuadPart, event, (unsigned long long)account->id, account->kind,
+                   client_surface_perf_time(), event, (unsigned long long)account->id, account->kind,
                    (unsigned long long)account->key, (unsigned long long)account->limit, account->refs,
                    (unsigned long long)account->used[CLIENT_SURFACE_MEMORY_SOURCE],
                    (unsigned long long)account->used[CLIENT_SURFACE_MEMORY_STAGING],
@@ -107,14 +104,12 @@ static void trace_client_surface_memory( const char *event, enum client_surface_
                                          const struct client_surface_memory_scope *scope )
 {
     struct client_surface_memory_account *owner = scope ? scope->owner : NULL, *domain = scope ? scope->domain : NULL;
-    LARGE_INTEGER counter;
 
     if (!TRACE_ON(csperf)) return;
-    NtQueryPerformanceCounter( &counter, NULL );
     TRACE_(csperf)( "ticks=%llu event=%s class=%u bytes=%llu accepted=%u source=%llu staging=%llu output=%llu total=%llu "
                    "metadata=%llu purpose=%u source_available=%llu staging_available=%llu output_available=%llu metadata_available=%llu "
                    "owner=%llu domain=%llu owner_source_available=%llu domain_source_available=%llu scope=%p\n",
-                   (unsigned long long)counter.QuadPart, event, type, (unsigned long long)bytes, accepted,
+                   client_surface_perf_time(), event, type, (unsigned long long)bytes, accepted,
                    (unsigned long long)image_memory[CLIENT_SURFACE_MEMORY_SOURCE],
                    (unsigned long long)image_memory[CLIENT_SURFACE_MEMORY_STAGING],
                    (unsigned long long)image_memory[CLIENT_SURFACE_MEMORY_OUTPUT],

@@ -31,14 +31,6 @@
 WINE_DEFAULT_DEBUG_CHANNEL(win);
 WINE_DECLARE_DEBUG_CHANNEL(csperf);
 
-static unsigned long long client_surface_perf_time(void)
-{
-    LARGE_INTEGER counter;
-
-    NtQueryPerformanceCounter( &counter, NULL );
-    return counter.QuadPart;
-}
-
 static void trace_client_surface_worker( const char *event, unsigned int slot, BOOL retire )
 {
 #ifdef __linux__

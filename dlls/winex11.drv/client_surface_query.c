@@ -16,7 +16,6 @@
 #include "config.h"
 
 #include <assert.h>
-#include <fcntl.h>
 
 #include "x11drv.h"
 #include "client_surface_query.h"
@@ -45,40 +44,6 @@ struct client_surface_query_worker
 
 static struct client_surface_query_worker query_workers[4];
 
-static unsigned long long query_time(void)
-{
-    LARGE_INTEGER counter;
-
-    NtQueryPerformanceCounter( &counter, NULL );
-    return counter.QuadPart;
-}
-
-static int query_error( Display *display, XErrorEvent *event, void *arg )
-{
-    struct client_surface_query_worker *worker = arg;
-
-    worker->error = event->error_code;
-    return TRUE;
-}
-
-static BOOL open_query_display( struct client_surface_query_worker *worker )
-{
-    if (worker->display) return TRUE;
-    if (!(worker->display = XOpenDisplay( DisplayString( gdi_display ) ))) return FALSE;
-    worker->errors.display = worker->display;
-    worker->errors.callback = query_error;
-    worker->errors.arg = worker;
-    X11DRV_register_error_handler( &worker->errors );
-    if (fcntl( ConnectionNumber( worker->display ), F_SETFD, FD_CLOEXEC ) == -1)
-    {
-        XCloseDisplay( worker->display );
-        X11DRV_unregister_error_handler( &worker->errors );
-        worker->display = NULL;
-        return FALSE;
-    }
-    return TRUE;
-}
-
 static void execute_geometry_query( struct client_surface_query_worker *worker,
                                     struct client_surface_geometry_query *query )
 {
@@ -88,7 +53,7 @@ static void execute_geometry_query( struct client_surface_query_worker *worker,
     BOOL ret;
 
     query->success = FALSE;
-    if (!open_query_display( worker )) return;
+    if (!x11drv_open_private_display( &worker->display, &worker->errors, &worker->error )) return;
     /* The private error sink avoids X11DRV_expect_error's process-wide lock.
      * Only this worker uses the connection, including its final error drain. */
     XLockDisplay( worker->display );
@@ -99,7 +64,7 @@ static void execute_geometry_query( struct client_surface_query_worker *worker,
     query->success = ret && !worker->error && query->width >= query->min_width &&
                      query->height >= query->min_height;
     TRACE_(csperf)( "ticks=%llu event=source_geometry query=%p pixmap=%lx display=%p result=%u error=%d "
-                   "geometry_calls=1 sync_calls=1 worker=%u\n", query_time(), query, query->pixmap,
+                   "geometry_calls=1 sync_calls=1 worker=%u\n", client_surface_perf_time(), query, query->pixmap,
                    worker->display, ret, worker->error, (unsigned int)(worker - query_workers) );
     XUnlockDisplay( worker->display );
 }
@@ -168,7 +133,7 @@ enum client_surface_query_status client_surface_query_geometry(
     pthread_cond_signal( &query_cond );
 done:
     TRACE_(csperf)( "ticks=%llu event=source_query_admission query=%p pixmap=%lx status=%u count=%u queued=%u "
-                   "running=%u workers=%u\n", query_time(), query, query->pixmap, result, query_count,
+                   "running=%u workers=%u\n", client_surface_perf_time(), query, query->pixmap, result, query_count,
                    queued_count, running_count, worker_count );
     pthread_mutex_unlock( &query_mutex );
     return result;
@@ -191,7 +156,7 @@ BOOL client_surface_complete_queries( unsigned int budget )
         assert( query_count );
         --query_count;
         TRACE_(csperf)( "ticks=%llu event=source_query_return query=%p pixmap=%lx count=%u queued=%u running=%u workers=%u\n",
-                       query_time(), query, query->pixmap, query_count, queued_count, running_count, worker_count );
+                       client_surface_perf_time(), query, query->pixmap, query_count, queued_count, running_count, worker_count );
         pthread_mutex_unlock( &query_mutex );
         query->complete( query );
         progressed = TRUE;

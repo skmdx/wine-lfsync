@@ -43,16 +43,14 @@ struct x11drv_client_surface_retirement
 static void trace_source_retirement( const char *event, HWND hwnd,
                                      const struct x11drv_client_surface_retirement *retirement )
 {
-    LARGE_INTEGER ticks;
     unsigned long tid = 0;
 
     if (!TRACE_ON(csperf) || !retirement->identity || !retirement->cookie) return;
 #ifdef __linux__
     tid = syscall( SYS_gettid );
 #endif
-    NtQueryPerformanceCounter( &ticks, NULL );
     TRACE_(csperf)( "ticks=%llu event=%s hwnd=%p retirement=%p identity=%s cookie=%s "
-                   "native_pid=%lu native_tid=%lu\n", (unsigned long long)ticks.QuadPart,
+                   "native_pid=%lu native_tid=%lu\n", client_surface_perf_time(),
                    event, hwnd, retirement, wine_dbgstr_longlong( retirement->identity ),
                    wine_dbgstr_longlong( retirement->cookie ), (unsigned long)getpid(), tid );
 }

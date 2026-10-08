@@ -102,10 +102,6 @@ void reset_client_surface_owner_repair( struct client_surface_owner_repair *repa
     memset( repair, 0, sizeof(*repair) );
 }
 
-UINT64 client_surface_pixmap_bytes( unsigned int width, unsigned int height, unsigned int depth )
-{
-    return (UINT64)width * height * (depth > 16 ? 4 : depth > 8 ? 2 : 1);
-}
 static struct client_surface_compositor_pool *client_surface_compositor_pools;
 static struct client_surface_compositor_pool *client_surface_compositor_next_pool;
 static unsigned int client_surface_compositor_pool_count;

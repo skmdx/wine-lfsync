@@ -18,6 +18,14 @@ struct x11drv_client_surface;
 struct x11drv_client_surface_retirement;
 struct x11drv_client_snapshot;
 
+/* Native Pixmap storage accounting; XImage upload staging uses its actual
+ * bytes_per_line instead, including server-selected scanline padding. */
+static inline UINT64 client_surface_pixmap_bytes( unsigned int width, unsigned int height,
+                                                 unsigned int depth )
+{
+    return (UINT64)width * height * (depth > 16 ? 4 : depth > 8 ? 2 : 1);
+}
+
 struct x11drv_client_surface_completion
 {
     XID damage;

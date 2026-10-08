@@ -279,7 +279,6 @@ struct client_surface_output_allocation
     struct list notification_entry;
 };
 
-extern unsigned long long client_surface_perf_time(void);
 extern BOOL client_surface_output_waits_scene( const struct client_surface_output_allocation *allocation );
 extern struct client_surface_compositor_queue *get_client_surface_compositor_queue( HWND toplevel );
 extern void release_client_surface_compositor_queue( struct client_surface_compositor_queue *queue );

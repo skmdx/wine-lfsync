@@ -970,6 +970,11 @@ extern void x11drv_native_window_read_finish( struct x11drv_native_window_read *
 
 extern void X11DRV_register_error_handler( struct x11drv_error_handler *handler );
 extern void X11DRV_unregister_error_handler( struct x11drv_error_handler *handler );
+/* The caller serializes this private connection and retains its error sink
+ * through XCloseDisplay, then unregisters it. Failure leaves *display NULL
+ * and no registered sink; an existing connection is left untouched. */
+extern BOOL x11drv_open_private_display( Display **display, struct x11drv_error_handler *handler,
+                                         int *error );
 extern void x11drv_display_owner_register_error_handler( struct x11drv_display_owner *owner,
                                                         struct x11drv_error_handler *handler );
 extern void x11drv_display_owner_unregister_error_handler( struct x11drv_display_owner *owner,

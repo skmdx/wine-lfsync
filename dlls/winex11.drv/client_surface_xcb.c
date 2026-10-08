@@ -52,14 +52,6 @@ static typeof(xcb_query_tree_reply) *pxcb_query_tree_reply;
 static pthread_once_t client_surface_xcb_once = PTHREAD_ONCE_INIT;
 static BOOL client_surface_xcb_initialized;
 
-static unsigned long long client_surface_xcb_perf_time(void)
-{
-    LARGE_INTEGER counter;
-
-    NtQueryPerformanceCounter( &counter, NULL );
-    return counter.QuadPart;
-}
-
 static void client_surface_xcb_init(void)
 {
     void *xlib = NULL, *xcb = NULL, *present = NULL;
@@ -150,7 +142,7 @@ BOOL client_surface_xcb_check_direct( Display *display, Window owner, Window dra
             drawable_geometry->width == rect->right - rect->left &&
             drawable_geometry->height == rect->bottom - rect->top;
     TRACE_(csperf)( "ticks=%llu event=direct_native_query owner=%lx drawable=%lx requests=5 valid=%u\n",
-                   client_surface_xcb_perf_time(), owner, drawable, valid );
+                   client_surface_perf_time(), owner, drawable, valid );
     free( owner_attributes );
     free( owner_geometry );
     free( drawable_attributes );
@@ -166,7 +158,7 @@ void client_surface_xcb_flush( Display *display, struct client_surface_xcb_reque
     request->barrier = pxcb_get_input_focus( connection ).sequence;
     pxcb_flush( connection );
     TRACE_(csperf)( "ticks=%llu event=xcb_barrier display=%p barrier=%u\n",
-                   client_surface_xcb_perf_time(), display, request->barrier );
+                   client_surface_perf_time(), display, request->barrier );
 }
 
 BOOL client_surface_xcb_present( Display *display, Window window, Pixmap pixmap,
@@ -220,7 +212,7 @@ BOOL client_surface_xcb_copy( Display *display, Pixmap source, Pixmap destinatio
             catchup->bottom - catchup->top ).sequence;
         TRACE_(csperf)( "ticks=%llu event=xcb_copy_request display=%p cookie=%u source=%x destination=%x "
                        "width=%u height=%u checkpoint=1 clipped=0\n",
-                       client_surface_xcb_perf_time(), display, request->cookies[request->count - 1],
+                       client_surface_perf_time(), display, request->cookies[request->count - 1],
                        (unsigned int)checkpoint, (unsigned int)destination,
                        catchup->right - catchup->left, catchup->bottom - catchup->top );
     }
@@ -236,7 +228,7 @@ BOOL client_surface_xcb_copy( Display *display, Pixmap source, Pixmap destinatio
             damage->right - damage->left, damage->bottom - damage->top ).sequence;
         TRACE_(csperf)( "ticks=%llu event=xcb_copy_request display=%p cookie=%u source=%x destination=%x "
                        "width=%u height=%u checkpoint=0 clipped=%u\n",
-                       client_surface_xcb_perf_time(), display, request->cookies[request->count - 1],
+                       client_surface_perf_time(), display, request->cookies[request->count - 1],
                        (unsigned int)source, (unsigned int)destination,
                        damage->right - damage->left, damage->bottom - damage->top, clipped );
     }
@@ -254,7 +246,7 @@ void client_surface_xcb_free_gc_async( Display *display, unsigned int gc,
     request->count = 1;
     request->cookies[0] = pxcb_free_gc_checked( connection, gc ).sequence;
     TRACE_(csperf)( "ticks=%llu event=xcb_free_gc_request display=%p cookie=%u gc=%u\n",
-                   client_surface_xcb_perf_time(), display, request->cookies[0], gc );
+                   client_surface_perf_time(), display, request->cookies[0], gc );
     client_surface_xcb_flush( display, request );
 }
 
@@ -292,7 +284,7 @@ static BOOL check_client_surface_xcb_requests( Display *display, struct client_s
     else if (!pxcb_poll_for_reply( connection, requests[count - 1].barrier, &reply, &error )) return FALSE;
     *success = reply && !error;
     TRACE_(csperf)( "ticks=%llu event=xcb_barrier_reply display=%p barrier=%u success=%u\n",
-                   client_surface_xcb_perf_time(), display, requests[count - 1].barrier, *success );
+                   client_surface_perf_time(), display, requests[count - 1].barrier, *success );
     free( reply );
     free( error );
     /* A later reply has arrived: request_check cannot need another sync.
@@ -307,7 +299,7 @@ static BOOL check_client_surface_xcb_requests( Display *display, struct client_s
 
             error = pxcb_request_check( connection, cookie );
             TRACE_(csperf)( "ticks=%llu event=xcb_checked display=%p cookie=%u error=%u\n",
-                           client_surface_xcb_perf_time(), display, cookie.sequence, error ? error->error_code : 0 );
+                           client_surface_perf_time(), display, cookie.sequence, error ? error->error_code : 0 );
             if (error)
             {
                 WARN( "owner request %u failed with X error %u opcode %u:%u\n",
