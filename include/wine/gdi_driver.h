@@ -675,6 +675,7 @@ W32KAPI BOOL client_surface_end_publish( HWND hwnd, UINT64 generation, UINT64 sc
 W32KAPI NTSTATUS client_surface_begin_prepare( HWND hwnd, struct client_surface_scene *scene );
 W32KAPI BOOL client_surface_end_prepare( const struct client_surface_scene *scene );
 W32KAPI void update_client_surfaces( HWND hwnd );
+W32KAPI void invalidate_client_surfaces( HWND hwnd );
 W32KAPI void detach_client_surfaces( HWND hwnd );
 
 static inline const char *debugstr_client_surface( struct client_surface *surface )

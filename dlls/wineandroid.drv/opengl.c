@@ -94,8 +94,8 @@ static BOOL android_surface_create( struct client_surface *client, int format, s
         FIXME( "Updating drawable %s, multiple surfaces not implemented\n", debugstr_opengl_drawable( *drawable ) );
 
         gl = impl_from_opengl_drawable( *drawable );
-        funcs->p_eglGetConfigAttrib( egl->display, egl_config_for_format(format), EGL_NATIVE_VISUAL_ID, &pf );
-        gl->window->perform( gl->window, NATIVE_WINDOW_SET_BUFFERS_FORMAT, pf );
+        if (!funcs->p_eglGetConfigAttrib( egl->display, egl_config_for_format(format), EGL_NATIVE_VISUAL_ID, &pf ) ||
+            gl->window->perform( gl->window, NATIVE_WINDOW_SET_BUFFERS_FORMAT, pf )) return FALSE;
         gl->base.format = format;
 
         TRACE( "Updated drawable %s\n", debugstr_opengl_drawable( *drawable ) );
@@ -105,13 +105,19 @@ static BOOL android_surface_create( struct client_surface *client, int format, s
     {
         static const int attribs[] = { EGL_WIDTH, 1, EGL_HEIGHT, 1, EGL_NONE };
         EGLConfig config = egl_config_for_format( format );
+        EGLint native_format;
 
         if (!(gl = opengl_drawable_create( sizeof(*gl), &android_drawable_funcs, format, client ))) return FALSE;
         gl->window = get_client_window( client->hwnd );
         if (!gl->window) goto failed;
 
         if (!has_client_surface( client->hwnd )) gl->base.surface = funcs->p_eglCreatePbufferSurface( egl->display, config, attribs );
-        else gl->base.surface = funcs->p_eglCreateWindowSurface( egl->display, config, gl->window, NULL );
+        else
+        {
+            if (!funcs->p_eglGetConfigAttrib( egl->display, config, EGL_NATIVE_VISUAL_ID, &native_format ) ||
+                gl->window->perform( gl->window, NATIVE_WINDOW_SET_BUFFERS_FORMAT, native_format )) goto failed;
+            gl->base.surface = funcs->p_eglCreateWindowSurface( egl->display, config, gl->window, NULL );
+        }
         if (!gl->base.surface) goto failed;
 
         TRACE( "Created drawable %s with client window %p\n", debugstr_opengl_drawable( &gl->base ), gl->window );

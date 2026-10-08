@@ -890,6 +890,9 @@ static int perform_ioctl( JNIEnv* env, void *data, DWORD in_size, DWORD out_size
     case NATIVE_WINDOW_SET_BUFFER_COUNT:
         ret = parent->perform( parent, res->operation, (size_t)res->args[0] );
         break;
+    case NATIVE_WINDOW_SET_USAGE64:
+        ret = parent->perform( parent, res->operation, res->args[0] | ((uint64_t)res->args[1] << 32) );
+        break;
     case NATIVE_WINDOW_SET_BUFFERS_DIMENSIONS:
     case NATIVE_WINDOW_SET_BUFFERS_USER_DIMENSIONS:
         ret = parent->perform( parent, res->operation, res->args[0], res->args[1] );
@@ -1633,6 +1636,14 @@ static int perform( ANativeWindow *window, int operation, ... )
         perf.args[0] = timestamp;
         perf.args[1] = timestamp >> 32;
         TRACE( "hwnd %p %s arg %08x%08x\n", win->hwnd, names[operation], perf.args[1], perf.args[0] );
+        break;
+    }
+    case NATIVE_WINDOW_SET_USAGE64:
+    {
+        uint64_t usage = va_arg( args, uint64_t );
+        perf.args[0] = usage;
+        perf.args[1] = usage >> 32;
+        TRACE( "hwnd %p SET_USAGE64 arg %08x%08x\n", win->hwnd, perf.args[1], perf.args[0] );
         break;
     }
     case NATIVE_WINDOW_LOCK:

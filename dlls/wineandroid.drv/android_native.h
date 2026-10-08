@@ -98,7 +98,8 @@ enum native_window_perform
     NATIVE_WINDOW_API_CONNECT                 = 13,
     NATIVE_WINDOW_API_DISCONNECT              = 14,
     NATIVE_WINDOW_SET_BUFFERS_USER_DIMENSIONS = 15,
-    NATIVE_WINDOW_SET_POST_TRANSFORM_CROP     = 16
+    NATIVE_WINDOW_SET_POST_TRANSFORM_CROP     = 16,
+    NATIVE_WINDOW_SET_USAGE64                 = 30
 };
 
 enum native_window_api
