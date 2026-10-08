@@ -580,19 +580,6 @@ BOOL process_client_surface_native_present( struct client_surface_compositor_tar
         struct client_surface_native_present *present = &frame->native_present;
 
         if (!frame->request_pending || !ReadAcquire( &present->complete )) continue;
-        if (present->committing && present->success)
-        {
-            /* The checked SOURCE commit precedes final publication admission.
-             * Keep the native lane and frame lease across both stages. */
-            TRACE_(csperf)( "ticks=%llu event=native_commit_receipt window=%lx pixmap=%lx serial=%u success=1\n",
-                           client_surface_perf_time(), present->content, present->pixmap, present->serial );
-            TRACE_(csperf)( "ticks=%llu event=native_present_admit window=%lx pixmap=%lx serial=%u copy=1 generation=%llu epoch=%llu\n",
-                           client_surface_perf_time(), present->window, present->content, present->serial,
-                           (unsigned long long)present->generation, (unsigned long long)present->epoch );
-            client_surface_publish_native_present( present );
-            progressed = TRUE;
-            continue;
-        }
         frame->request_pending = FALSE;
         if (present->copied || !present->success)
         {

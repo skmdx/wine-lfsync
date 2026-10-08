@@ -40,7 +40,6 @@ struct client_surface_native_present
 };
 void client_surface_submit_native_present( struct client_surface_native_present_queue *queue,
                                            struct client_surface_native_present *present );
-void client_surface_publish_native_present( struct client_surface_native_present *present );
 /* Release the native FIFO lane after the final checked copy. */
 void client_surface_release_native_present( struct client_surface_native_present *present );
 /* Cancel only requests still owned by the queues, never an executing head. */
