@@ -1502,6 +1502,12 @@ static void dump_accept_hardware_message_request( const struct accept_hardware_m
     fprintf( stderr, " hw_id=%08x", req->hw_id );
 }
 
+static void dump_set_hardware_message_window_request( const struct set_hardware_message_window_request *req )
+{
+    fprintf( stderr, " hw_id=%08x", req->hw_id );
+    fprintf( stderr, ", win=%08x", req->win );
+}
+
 static void dump_get_message_reply_request( const struct get_message_reply_request *req )
 {
     fprintf( stderr, " cancel=%d", req->cancel );
@@ -3964,6 +3970,7 @@ static const dump_func req_dumpers[REQ_NB_REQUESTS] =
     (dump_func)dump_get_message_request,
     (dump_func)dump_reply_message_request,
     (dump_func)dump_accept_hardware_message_request,
+    (dump_func)dump_set_hardware_message_window_request,
     (dump_func)dump_get_message_reply_request,
     (dump_func)dump_set_win_timer_request,
     (dump_func)dump_kill_win_timer_request,
@@ -4300,6 +4307,7 @@ static const dump_func reply_dumpers[REQ_NB_REQUESTS] =
     NULL,
     (dump_func)dump_send_hardware_message_reply,
     (dump_func)dump_get_message_reply,
+    NULL,
     NULL,
     NULL,
     (dump_func)dump_get_message_reply_reply,
@@ -4640,6 +4648,7 @@ static const char * const req_names[REQ_NB_REQUESTS] =
     "get_message",
     "reply_message",
     "accept_hardware_message",
+    "set_hardware_message_window",
     "get_message_reply",
     "set_win_timer",
     "kill_win_timer",

@@ -3579,6 +3579,35 @@ DECL_HANDLER(accept_hardware_message)
 }
 
 
+/* retarget a mouse message without changing its input source or key state */
+DECL_HANDLER(set_hardware_message_window)
+{
+    struct msg_queue *queue = current->queue;
+    struct thread *thread;
+    struct message *msg;
+
+    if (!queue || !(thread = get_window_thread( req->win )))
+    {
+        set_error( STATUS_ACCESS_DENIED );
+        return;
+    }
+    set_error( STATUS_ACCESS_DENIED );
+    if (thread->queue && thread->queue->input == queue->input)
+    {
+        LIST_FOR_EACH_ENTRY( msg, &queue->input->msg_list, struct message, entry )
+        {
+            if (msg->unique_id != req->hw_id) continue;
+            if (!(get_hardware_msg_bit( msg->msg ) & QS_MOUSE)) break;
+            msg->win = req->win;
+            set_queue_bits( thread->queue, get_hardware_msg_bit( msg->msg ));
+            clear_error();
+            break;
+        }
+    }
+    release_object( thread );
+}
+
+
 /* retrieve the reply for the last message sent */
 DECL_HANDLER(get_message_reply)
 {

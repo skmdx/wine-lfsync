@@ -3301,6 +3301,20 @@ struct accept_hardware_message_reply
 
 
 
+struct set_hardware_message_window_request
+{
+    struct request_header __header;
+    unsigned int    hw_id;
+    user_handle_t   win;
+    char __pad_20[4];
+};
+struct set_hardware_message_window_reply
+{
+    struct reply_header __header;
+};
+
+
+
 struct get_message_reply_request
 {
     struct request_header __header;
@@ -6899,6 +6913,7 @@ enum request
     REQ_get_message,
     REQ_reply_message,
     REQ_accept_hardware_message,
+    REQ_set_hardware_message_window,
     REQ_get_message_reply,
     REQ_set_win_timer,
     REQ_kill_win_timer,
@@ -7240,6 +7255,7 @@ union generic_request
     struct get_message_request get_message_request;
     struct reply_message_request reply_message_request;
     struct accept_hardware_message_request accept_hardware_message_request;
+    struct set_hardware_message_window_request set_hardware_message_window_request;
     struct get_message_reply_request get_message_reply_request;
     struct set_win_timer_request set_win_timer_request;
     struct kill_win_timer_request kill_win_timer_request;
@@ -7579,6 +7595,7 @@ union generic_reply
     struct get_message_reply get_message_reply;
     struct reply_message_reply reply_message_reply;
     struct accept_hardware_message_reply accept_hardware_message_reply;
+    struct set_hardware_message_window_reply set_hardware_message_window_reply;
     struct get_message_reply_reply get_message_reply_reply;
     struct set_win_timer_reply set_win_timer_reply;
     struct kill_win_timer_reply kill_win_timer_reply;
@@ -7790,6 +7807,6 @@ union generic_reply
     struct set_queue_paint_blocked_reply set_queue_paint_blocked_reply;
 };
 
-#define SERVER_PROTOCOL_VERSION 1034
+#define SERVER_PROTOCOL_VERSION 1035
 
 #endif /* __WINE_WINE_SERVER_PROTOCOL_H */

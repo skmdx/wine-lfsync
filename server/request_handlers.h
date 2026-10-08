@@ -132,6 +132,7 @@ DECL_HANDLER(send_hardware_message);
 DECL_HANDLER(get_message);
 DECL_HANDLER(reply_message);
 DECL_HANDLER(accept_hardware_message);
+DECL_HANDLER(set_hardware_message_window);
 DECL_HANDLER(get_message_reply);
 DECL_HANDLER(set_win_timer);
 DECL_HANDLER(kill_win_timer);
@@ -470,6 +471,7 @@ static const req_handler req_handlers[REQ_NB_REQUESTS] =
     (req_handler)req_get_message,
     (req_handler)req_reply_message,
     (req_handler)req_accept_hardware_message,
+    (req_handler)req_set_hardware_message_window,
     (req_handler)req_get_message_reply,
     (req_handler)req_set_win_timer,
     (req_handler)req_kill_win_timer,
@@ -1445,6 +1447,9 @@ C_ASSERT( offsetof(struct reply_message_request, result) == 16 );
 C_ASSERT( sizeof(struct reply_message_request) == 24 );
 C_ASSERT( offsetof(struct accept_hardware_message_request, hw_id) == 12 );
 C_ASSERT( sizeof(struct accept_hardware_message_request) == 16 );
+C_ASSERT( offsetof(struct set_hardware_message_window_request, hw_id) == 12 );
+C_ASSERT( offsetof(struct set_hardware_message_window_request, win) == 16 );
+C_ASSERT( sizeof(struct set_hardware_message_window_request) == 24 );
 C_ASSERT( offsetof(struct get_message_reply_request, cancel) == 12 );
 C_ASSERT( sizeof(struct get_message_reply_request) == 16 );
 C_ASSERT( offsetof(struct get_message_reply_reply, result) == 8 );

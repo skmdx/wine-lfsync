@@ -560,7 +560,7 @@ BOOL WINAPI ImeProcessKey( HIMC himc, UINT vkey, LPARAM lparam, BYTE *state )
     if (!is_ime_hkl( GetKeyboardLayout( 0 ) )) return FALSE;
 
     if (!(ctx = ImmLockIMC( himc ))) return FALSE;
-    ret = TRUE; /* TODO: should be ctx->fOpen */
+    ret = ctx->fOpen;
     switch (LOWORD(vkey))
     {
         case VK_SHIFT:

@@ -21471,6 +21471,12 @@ START_TEST(msg)
 
     start_foreground_window_thread();
 
+    if (argc == 3 && !strcmp( test_argv[2], "mouse_tracking" ))
+    {
+        test_TrackMouseEvent();
+        goto done;
+    }
+
     if (argc == 3 && !strcmp( test_argv[2], "desktop_paint" ))
     {
         run_in_temp_desktop(test_swp_paint_regions);

@@ -4391,12 +4391,12 @@ static void test_SendInput_mouse_messages(void)
 
     mouse_event( MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0 );
     wait_messages( 5, FALSE );
-    set_mouse_message_window( button_down_hwnd_todo, hwnd );
-    ok_seq( button_down_hwnd_todo );
+    set_mouse_message_window( button_down_hwnd, hwnd );
+    ok_seq( button_down_hwnd );
     mouse_event( MOUSEEVENTF_LEFTUP, 0, 0, 0, 0 );
     wait_messages( 5, FALSE );
-    set_mouse_message_window( button_up_hwnd_todo, hwnd );
-    ok_seq( button_up_hwnd_todo );
+    set_mouse_message_window( button_up_hwnd, hwnd );
+    ok_seq( button_up_hwnd );
 
     ok_ret( 1, DestroyWindow( other ) );
     wait_messages( 0, FALSE );

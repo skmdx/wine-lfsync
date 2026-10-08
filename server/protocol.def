@@ -2541,6 +2541,13 @@ enum message_type
 @END
 
 
+/* Retarget a mouse message within the same thread input */
+@REQ(set_hardware_message_window)
+    unsigned int    hw_id;     /* id of the hardware message */
+    user_handle_t   win;       /* new destination */
+@END
+
+
 /* Retrieve the reply for the last message sent */
 @REQ(get_message_reply)
     int             cancel;    /* cancel message if not ready? */

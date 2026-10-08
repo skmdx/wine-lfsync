@@ -2661,13 +2661,33 @@ static BOOL process_mouse_message( MSG *msg, UINT hw_id, ULONG_PTR extra_info, H
         HWND orig = msg->hwnd;
 
         msg->hwnd = window_from_point( msg->hwnd, msg->pt, &hittest, TRUE );
-        if (!msg->hwnd) /* As a heuristic, try the next window if it's the owner of orig */
+        if (!msg->hwnd)
         {
-            HWND next = get_window_relative( orig, GW_HWNDNEXT );
+            HWND next = orig;
 
-            if (next && get_window_relative( orig, GW_OWNER ) == next &&
-                is_current_thread_window( next ))
-                msg->hwnd = window_from_point( next, msg->pt, &hittest, TRUE );
+            /* HTTRANSPARENT can cross threads only when their input is attached.
+             * Keep the original hardware message so hooks and input source survive. */
+            while ((next = get_window_relative( next, GW_HWNDNEXT )))
+            {
+                HWND target = window_from_point( next, msg->pt, &hittest, TRUE );
+                BOOL redirected;
+
+                if (!target) continue;
+                if (is_current_thread_window( target ))
+                {
+                    msg->hwnd = target;
+                    break;
+                }
+                SERVER_START_REQ( set_hardware_message_window )
+                {
+                    req->hw_id = hw_id;
+                    req->win = wine_server_user_handle( target );
+                    redirected = !wine_server_call( req );
+                }
+                SERVER_END_REQ;
+                if (redirected) return FALSE;
+                break;
+            }
         }
     }
 
