@@ -208,6 +208,10 @@ static BOOL wayland_pbuffer_create(HDC hdc, int format, BOOL largest, GLenum tex
           hdc, format, largest, texture_format, texture_target, max_level, *width, *height, surface);
 
     if (!(gl = opengl_drawable_create(sizeof(*gl), &wayland_pbuffer_funcs, format, NULL))) return FALSE;
+    /* The surrogate is an EGL window, whose render buffer is the back buffer. */
+    opengl_drawable_map_buffer(&gl->base, GL_FRONT_LEFT, GL_BACK_LEFT);
+    opengl_drawable_map_buffer(&gl->base, GL_FRONT, GL_BACK);
+    opengl_drawable_map_buffer(&gl->base, GL_FRONT_AND_BACK, GL_BACK);
     /* Wayland EGL doesn't support pixmap or pbuffer, create a dummy window surface to act as the target render surface. */
     if (!(gl->surface = wl_compositor_create_surface(process_wayland.wl_compositor))) goto err;
     if (!(gl->window = wl_egl_window_create(gl->surface, *width, *height))) goto err;

@@ -1205,6 +1205,21 @@ static UINT egldrv_init_pixel_formats( UINT *onscreen_count )
     }
     count = j;
 
+    /* Legacy ChoosePixelFormat breaks equal buffer-size ties by enumeration
+     * order. Prefer ordinary RGB8 over RGB10_A2 without hiding HDR formats. */
+    for (i = 0, j = 0; i < count; i++)
+    {
+        EGLint red, green, blue;
+        EGLConfig config = configs[i];
+
+        funcs->p_eglGetConfigAttrib( egl->display, config, EGL_RED_SIZE, &red );
+        funcs->p_eglGetConfigAttrib( egl->display, config, EGL_GREEN_SIZE, &green );
+        funcs->p_eglGetConfigAttrib( egl->display, config, EGL_BLUE_SIZE, &blue );
+        if (red != 8 || green != 8 || blue != 8) continue;
+        memmove( configs + j + 1, configs + j, (i - j) * sizeof(*configs) );
+        configs[j++] = config;
+    }
+
     if (TRACE_ON(wgl)) for (i = 0; i < count; i++)
     {
         EGLint id, type, visual_id, native, color, r, g, b, a, d, s;
