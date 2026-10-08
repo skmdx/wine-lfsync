@@ -889,6 +889,8 @@ void client_surface_release_native_present( struct client_surface_native_present
     pthread_mutex_unlock( &cache_mutex );
     client_surface_free_owned_array( present->shape );
     present->shape = NULL;
+    client_surface_cache_release( present->source_image );
+    present->source_image = NULL;
 }
 
 void client_surface_submit_native_present( struct client_surface_native_present_queue *queue,

@@ -566,7 +566,7 @@ static BOOL client_surface_compositor_job_ready( struct client_surface_composito
         pthread_mutex_unlock( &client_surface_compositor_mutex );
         if (abandoned || !target || target->window_owner != allocation->window_owner ||
             !(frame = get_client_surface_compositor_pixmap( target, allocation->source )) ||
-            frame->image != allocation->source_image ||
+            client_surface_compositor_frame_image( frame ) != allocation->source_image ||
             !client_surface_output_checkpoint_scene_current( &allocation->scene ))
         {
             *rejected = TRUE;

@@ -42,10 +42,26 @@ static int compare_client_surface_compositor_pixmap( const void *key, const stru
 
 static struct rb_tree client_surface_compositor_pixmaps = {compare_client_surface_compositor_pixmap};
 
+struct client_surface_cache_image *client_surface_compositor_frame_image(
+    const struct client_surface_compositor_frame *frame )
+{
+    return frame->retained_image ? frame->retained_image : frame->image;
+}
+
+void retain_client_surface_frame_image( struct client_surface_compositor_frame *frame,
+                                       struct client_surface_cache_image *image )
+{
+    if (image) client_surface_cache_acquire( image );
+    client_surface_cache_release( frame->retained_image );
+    if (frame->retained_image || image) frame->revision = 0;
+    frame->retained_image = image;
+}
+
 void set_client_surface_compositor_pixmap( struct client_surface_compositor_frame *frame, Pixmap pixmap,
                                                  struct client_surface_cache_image *image )
 {
     assert( !frame->serial );
+    retain_client_surface_frame_image( frame, NULL );
     if (frame->pixmap) rb_remove( &client_surface_compositor_pixmaps, &frame->pixmap_entry );
     frame->pixmap = pixmap;
     frame->image = image;
@@ -176,7 +192,12 @@ static void note_client_surface_compositor_snapshot(
     RECT rect = {0, 0, target->window_width, target->window_height};
 
     if ((frame = get_client_surface_compositor_pixmap( target, pixmap )))
+    {
+        /* A GUI checkpoint writes the installed pool image. Native requests
+         * retain their own input if an older cache image is still in flight. */
+        retain_client_surface_frame_image( frame, NULL );
         note_client_surface_compositor_damage( target, frame, &rect );
+    }
 }
 
 static uint32_t client_surface_present_serial;
@@ -588,11 +609,11 @@ BOOL process_client_surface_native_present( struct client_surface_compositor_tar
             frame->complete = frame->idle = TRUE;
         }
         TRACE_(csperf)( "ticks=%llu event=native_present_receipt window=%lx pixmap=%lx serial=%u copy=%u success=%u\n",
-                       client_surface_perf_time(), present->window, frame->pixmap, frame->serial,
+                       client_surface_perf_time(), present->window, present->pixmap, frame->serial,
                        present->copied, present->success );
         if (present->copy)
             TRACE_(csperf)( "ticks=%llu event=publish_copy_complete window=%lx pixmap=%lx serial=%u generation=%llu epoch=%llu success=%u\n",
-                           client_surface_perf_time(), present->window, frame->pixmap, frame->serial,
+                           client_surface_perf_time(), present->window, present->pixmap, frame->serial,
                            (unsigned long long)frame->publish_generation,
                            (unsigned long long)frame->publish_epoch, present->success );
         if (!present->success && !IsRectEmpty( &present->copy_rect ))
@@ -650,7 +671,8 @@ BOOL submit_client_surface_present( struct client_surface_compositor_target *tar
     frame->native_present = (struct client_surface_native_present){
         .window_owner = target->window_owner,
         .window = target->present_window, .content = x11drv_native_window_content( target->window_owner ),
-        .pixmap = frame->pixmap, .serial = serial,
+        .pixmap = client_surface_cache_pixmap( client_surface_compositor_frame_image( frame ) ), .serial = serial,
+        .source_image = frame->retained_image ? client_surface_cache_acquire( frame->retained_image ) : NULL,
         .width = target->window_width, .height = target->window_height, .copy = TRUE,
         .generation = publish_generation, .epoch = publish_epoch,
         .shape = shape, .shape_count = shape_count,
@@ -661,11 +683,12 @@ BOOL submit_client_surface_present( struct client_surface_compositor_target *tar
      * both checked copies. The embedded
      * request is already covered by target admission; submit cannot allocate. */
     if (copy_rect) frame->native_present.copy_rect = *copy_rect;
+    TRACE_(csperf)( "ticks=%llu event=native_commit_admit window=%lx pixmap=%lx serial=%u copy=1 commit=%u generation=%llu epoch=%llu\n",
+                   client_surface_perf_time(), frame->native_present.content, frame->native_present.pixmap, serial,
+                   frame->native_present.committing,
+                   (unsigned long long)publish_generation, (unsigned long long)publish_epoch );
     client_surface_submit_native_present( &target->native_presents, &frame->native_present );
     if (serial_ret) *serial_ret = serial;
-    TRACE_(csperf)( "ticks=%llu event=native_commit_admit window=%lx pixmap=%lx serial=%u copy=1 generation=%llu epoch=%llu\n",
-                   client_surface_perf_time(), frame->native_present.content, frame->pixmap, serial,
-                   (unsigned long long)publish_generation, (unsigned long long)publish_epoch );
     return TRUE;
 }
 
@@ -827,6 +850,7 @@ struct client_surface_compositor_frame *get_client_surface_compositor_frame(
             (target->assembly_generation && index == target->assembly_frame) ||
             !client_surface_compositor_frame_writable( &target->frames[index] )) continue;
         target->next_frame = (index + 1) % ARRAY_SIZE(target->frames);
+        retain_client_surface_frame_image( &target->frames[index], NULL );
         return &target->frames[index];
     }
     return alloc_client_surface_compositor_mailbox( target );
@@ -916,6 +940,7 @@ struct client_surface_compositor_frame *acquire_client_surface_compositor_assemb
             !client_surface_compositor_frame_writable( frame ))
             continue;
         target->next_frame = (index + 1) % ARRAY_SIZE(target->frames);
+        retain_client_surface_frame_image( frame, NULL );
         return frame;
     }
     return alloc_client_surface_compositor_mailbox( target );
@@ -1847,7 +1872,7 @@ BOOL admit_client_surface_publication( struct client_surface_compositor_job *job
         return TRUE;
     }
     if (!frame) return FALSE;
-    allocation->source_image = client_surface_cache_acquire( frame->image );
+    allocation->source_image = client_surface_cache_acquire( client_surface_compositor_frame_image( frame ) );
     allocation->release.op = CLIENT_SURFACE_COMPOSITOR_PRESENT;
     allocation->release.u.present = job->u.present;
     allocation->release.async = TRUE;

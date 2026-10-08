@@ -28,6 +28,7 @@ struct client_surface_native_present
     struct x11drv_native_window *window_owner; /* retained by the admitted frame */
     Window window, content;
     Pixmap pixmap;
+    struct client_surface_cache_image *source_image; /* optional immutable owner-cache input lease */
     unsigned int width, height, serial;
     UINT64 generation, epoch;
     RECT copy_rect; /* empty for full-frame publication; otherwise a restore */

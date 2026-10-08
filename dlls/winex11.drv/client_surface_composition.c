@@ -31,6 +31,9 @@ static void start_client_surface_cache_copy( struct client_surface_compositor_bi
                                              unsigned int depth );
 static void complete_client_surface_output_transform( void *context, BOOL success );
 static void complete_client_surface_output_transform_batch( void *context, BOOL success );
+static void complete_client_surface_frame_copy( struct client_surface_compositor_target *target,
+    struct client_surface_compositor_frame *frame, struct client_surface_compositor_binding *binding,
+    UINT64 epoch, UINT64 sequence, const RECT *damage, BOOL success );
 static BOOL client_surface_cached_frame_matches_layout( const struct client_surface_compositor_binding *binding,
                                                          const struct client_surface_scene_layout *layout );
 
@@ -218,6 +221,8 @@ static void free_client_surface_cached_image( struct client_surface_cached_image
 
 static void free_client_surface_compositor_binding( struct client_surface_compositor_binding *binding )
 {
+    unsigned int i;
+
     assert( binding->retired && !client_surface_cache_read_pending( binding ) );
     /* Releasing the consumer endpoint also permits the producer to retire
      * unacknowledged slots. Keep it, the mapping and both cache images until
@@ -226,6 +231,8 @@ static void free_client_surface_compositor_binding( struct client_surface_compos
     release_client_surface_compositor_pool( binding->pool );
     free_client_surface_cached_image( &binding->latest_image );
     free_client_surface_cached_image( &binding->spare_image );
+    for (i = 0; i < ARRAY_SIZE(binding->retained_images); ++i)
+        free_client_surface_cached_image( &binding->retained_images[i] );
     client_surface_free_owned_metadata( &binding->memory, binding, sizeof(*binding) );
 }
 
@@ -877,6 +884,24 @@ static void start_client_surface_cache_copy( struct client_surface_compositor_bi
     Pixmap source = frame.source;
     UINT64 control = copy->control;
 
+    if (image->storage && client_surface_cache_shared( image->storage ))
+    {
+        unsigned int i;
+
+        /* Output frames may keep complete cache images instead of copying
+         * them. Retain a bounded set until those readers return, rather than
+         * continually destroying and reallocating their former spare. */
+        for (i = 0; i < ARRAY_SIZE(binding->retained_images); ++i)
+            if (!binding->retained_images[i].storage ||
+                !client_surface_cache_shared( binding->retained_images[i].storage ))
+            {
+                struct client_surface_cached_image previous = *image;
+                *image = binding->retained_images[i];
+                binding->retained_images[i] = previous;
+                break;
+            }
+    }
+
     assert( !binding->retired && !client_surface_cache_read_pending( binding ) );
     TRACE( "reading handoff hwnd %p identity %s sequence %s into owner cache\n", binding->window,
            wine_dbgstr_longlong( binding->identity ), wine_dbgstr_longlong( control ) );
@@ -1049,10 +1074,10 @@ static struct client_surface_output_transform *alloc_client_surface_output_trans
                          sizeof(*transform) + count * sizeof(XRectangle) ))) return NULL;
     transform->image = frame->image;
     transform->source = client_surface_cache_acquire( binding->latest_image.storage );
-    if (needs_catchup) transform->catchup = client_surface_cache_acquire( latest->image );
+    if (needs_catchup) transform->catchup = client_surface_cache_acquire( client_surface_compositor_frame_image( latest ) );
     transform->native = (struct client_surface_cache_transform){
         .source = binding->latest_image.pixmap,
-        .catchup = needs_catchup ? target->latest : 0,
+        .catchup = needs_catchup ? client_surface_cache_pixmap( transform->catchup ) : 0,
         .source_visual = slot->source_visual, .destination_visual = target->visual,
         .source_width = slot->width, .source_height = slot->height,
         .destination = plan->destination, .catchup_rect = *catchup,
@@ -1158,6 +1183,24 @@ static BOOL copy_client_surface_handoff_to_frame(
                    plan->steady, !!target->assembly_generation, target->mailbox_pending,
                    !!target->mailbox_publish_generation, frame->pixmap == target->latest,
                    frame->pixmap == target->published, !!frame->serial );
+    if (!batch && plan->steady && native && incoming_full &&
+        !plan->destination.left && !plan->destination.top &&
+        slot->width == target->window_width && slot->height == target->window_height)
+    {
+        /* The completed owner image is already the whole output. Keep its
+         * immutable reference rather than copying it into another private
+         * pixmap. The pool ID remains the GUI checkpoint/retirement identity;
+         * later partial assemblies catch up from this retained image. */
+        retain_client_surface_frame_image( frame, binding->latest_image.storage );
+        TRACE_(csperf)( "ticks=%llu event=output_image_retain frame=%lx image=%p source=%lx\n",
+                       client_surface_perf_time(), frame->pixmap, frame->retained_image,
+                       binding->latest_image.pixmap );
+        trace_client_surface_source( "retain_output", binding, binding->latest_control,
+            slot->source_sequence, target->window, binding->latest_image.pixmap, TRUE );
+        complete_client_surface_frame_copy( target, frame, binding, plan->epoch,
+                                            slot->source_sequence, damage, TRUE );
+        return TRUE;
+    }
     if (batch)
     {
         struct client_surface_output_transform *transform;

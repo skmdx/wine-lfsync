@@ -89,6 +89,7 @@ struct client_surface_compositor_binding
     UINT64 source_sequence;
     UINT64 source_epoch;
     struct client_surface_cached_image latest_image, spare_image;
+    struct client_surface_cached_image retained_images[CLIENT_SURFACE_COMPOSITOR_FRAME_COUNT];
     struct client_surface_handoff_slot latest_frame;
     UINT64 latest_control;
     UINT64 replay_epoch;
@@ -122,6 +123,7 @@ struct client_surface_compositor_frame
     struct client_surface_compositor_job *waiter;
     Pixmap pixmap;
     struct client_surface_cache_image *image; /* borrowed from the installed pair/mailbox */
+    struct client_surface_cache_image *retained_image; /* immutable full-frame owner cache, if no assembly is needed */
     struct rb_entry pixmap_entry;
     UINT64 revision;
     uint32_t serial;
@@ -305,6 +307,10 @@ extern void reset_client_surface_owner_repair( struct client_surface_owner_repai
 extern void set_client_surface_compositor_pixmap( struct client_surface_compositor_frame *frame, Pixmap pixmap,
                                                  struct client_surface_cache_image *image );
 extern BOOL client_surface_compositor_frame_writable( const struct client_surface_compositor_frame *frame );
+extern struct client_surface_cache_image *client_surface_compositor_frame_image(
+    const struct client_surface_compositor_frame *frame );
+extern void retain_client_surface_frame_image( struct client_surface_compositor_frame *frame,
+                                               struct client_surface_cache_image *image );
 extern struct client_surface_compositor_binding *next_client_surface_compositor_binding(
     struct client_surface_compositor_binding *binding );
 extern BOOL client_surface_frame_copy_pending( const struct client_surface_compositor_frame *frame );
