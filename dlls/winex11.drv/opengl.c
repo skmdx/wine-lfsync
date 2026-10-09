@@ -2380,13 +2380,6 @@ static enum client_surface_gpu_snapshot_result snapshot_client_surface_gpu( stru
      * into a caller-side glFinish after the copy has already been submitted. */
     if (snapshot_create_sync && snapshot_destroy_sync && snapshot_wait_sync &&
         !(completion = prepare_snapshot_completion( image ))) return GPU_SNAPSHOT_RETRY;
-    /* Rotation already restored the application's bindings. An independently
-     * rendered image needs only its completion fence, not copy-state setup. */
-    if (direct_image)
-    {
-        blit = begin ? client_surface_perf_time() : 0;
-        goto copied;
-    }
 bind:
     funcs->p_glGetIntegerv( GL_READ_FRAMEBUFFER_BINDING, &read_fbo );
     funcs->p_glGetIntegerv( GL_DRAW_FRAMEBUFFER_BINDING, &draw_fbo );
@@ -2395,6 +2388,11 @@ bind:
     srgb = funcs->p_glIsEnabled( GL_FRAMEBUFFER_SRGB );
     funcs->p_glBindFramebuffer( GL_READ_FRAMEBUFFER, source_framebuffer );
     funcs->p_glGetIntegerv( GL_READ_BUFFER, &read_buffer );
+    if (direct_image)
+    {
+        blit = begin ? client_surface_perf_time() : 0;
+        goto copied;
+    }
     if (!buffer) funcs->p_glGenRenderbuffers( 1, &buffer );
     funcs->p_glBindRenderbuffer( GL_RENDERBUFFER, buffer );
     snapshot_bind_image( GL_RENDERBUFFER, image->image );
@@ -2520,15 +2518,12 @@ copied:
     }
 done:
     if (completion) client_surface_free_owned_metadata( &completion->memory, completion, sizeof(*completion) );
-    if (!direct_image)
-    {
-        if (scissor) funcs->p_glEnable( GL_SCISSOR_TEST );
-        if (srgb) funcs->p_glEnable( GL_FRAMEBUFFER_SRGB );
-        funcs->p_glBindRenderbuffer( GL_RENDERBUFFER, renderbuffer );
-        funcs->p_glReadBuffer( read_buffer );
-        funcs->p_glBindFramebuffer( GL_READ_FRAMEBUFFER, read_fbo );
-        funcs->p_glBindFramebuffer( GL_DRAW_FRAMEBUFFER, draw_fbo );
-    }
+    if (scissor) funcs->p_glEnable( GL_SCISSOR_TEST );
+    if (srgb) funcs->p_glEnable( GL_FRAMEBUFFER_SRGB );
+    funcs->p_glBindRenderbuffer( GL_RENDERBUFFER, renderbuffer );
+    funcs->p_glReadBuffer( read_buffer );
+    funcs->p_glBindFramebuffer( GL_READ_FRAMEBUFFER, read_fbo );
+    funcs->p_glBindFramebuffer( GL_DRAW_FRAMEBUFFER, draw_fbo );
     if (fbo) funcs->p_glDeleteFramebuffers( 1, &fbo );
     if (buffer) funcs->p_glDeleteRenderbuffers( 1, &buffer );
     /* Host submission spans plus the worker's actual fence wait distinguish
