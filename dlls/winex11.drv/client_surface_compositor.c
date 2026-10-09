@@ -69,6 +69,7 @@ static UINT64 client_surface_compositor_wake_serial;
 static UINT64 client_surface_compositor_sequence;
 static LONGLONG client_surface_compositor_domain;
 static UINT64 client_surface_native_update_serial;
+static __thread BOOL is_compositor_thread;
 
 static struct client_surface_owner_notifications *client_surface_owner_notifications;
 
@@ -257,6 +258,15 @@ void wake_client_surface_compositor(void)
     UINT64 value = 1;
     int ret;
 
+    if (is_compositor_thread)
+    {
+        /* Local completions need another traversal, not a write/read through
+         * our own wake fd. The scan's serial check prevents sleeping before
+         * this newly runnable work is inspected. */
+        wake_client_surface_compositor_queues();
+        TRACE_(csperf)( "ticks=%llu event=actor_rescan\n", client_surface_perf_time() );
+        return;
+    }
     do
 #ifdef __linux__
         ret = write( client_surface_compositor_notify[1], &value, sizeof(value) );
@@ -1041,6 +1051,7 @@ static BOOL process_client_surface_compositor_jobs(void)
 static void client_surface_compositor_thread( void *context )
 {
     (void)context;
+    is_compositor_thread = TRUE;
     for (;;)
     {
         struct client_surface_compositor_scan scan;
