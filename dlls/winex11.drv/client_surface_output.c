@@ -847,7 +847,10 @@ struct client_surface_compositor_frame *get_client_surface_compositor_frame(
     /* A reserved scene's complete image owns its publication ticket until
      * submission. New source images remain in the independent owner cache. */
     if (target->mailbox_pending && target->mailbox_publish_generation) return NULL;
-    for (i = 0; i < ARRAY_SIZE(target->frames); ++i)
+    /* Prefer a private output over the GUI checkpoint. Imported source views
+     * can be retained there without copying; the checkpoint must keep its own
+     * storage because the GUI may hold it after newer frames are published. */
+    for (i = 0; i < ARRAY_SIZE(target->frames) * (preserve_backing ? 1 : 2); ++i)
     {
         unsigned int index = (target->next_frame + i) % ARRAY_SIZE(target->frames);
 
@@ -860,7 +863,7 @@ struct client_surface_compositor_frame *get_client_surface_compositor_frame(
         if (!target->frames[index].pixmap || target->frames[index].serial ||
             target->frames[index].pixmap == target->latest ||
             target->frames[index].pixmap == target->published ||
-            (preserve_backing && target->frames[index].pixmap == target->backing) ||
+            ((target->frames[index].pixmap == target->backing) != (i >= ARRAY_SIZE(target->frames))) ||
             (target->mailbox_pending && index == target->mailbox_frame) ||
             (target->assembly_generation && index == target->assembly_frame) ||
             !client_surface_compositor_frame_writable( &target->frames[index] )) continue;
