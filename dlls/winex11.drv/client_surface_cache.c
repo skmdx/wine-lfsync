@@ -56,6 +56,10 @@ struct client_surface_cache_image
     unsigned int transform_count;
     struct x11drv_native_window_read *read;
     struct client_surface_cache_image *copy_source;
+    struct client_surface_cache_image *parent;
+    void (*read_release)(void *);
+    void *read_context;
+    BOOL imported;
     BOOL waiting, started;
     Pixmap pixmap, source;
     Pixmap seed;
@@ -255,6 +259,17 @@ static void create_cache_image( struct client_surface_cache_image *image )
     if (!x11drv_open_private_display( &worker->display, &worker->errors, &worker->error )) return;
     display = worker->display;
     worker->error = 0;
+    if (image->imported)
+    {
+        image->pixmap = client_surface_xcb_import( display, image->source,
+            image->width, image->height, image->depth );
+        image->success = !!image->pixmap;
+        TRACE_(csperf)( "ticks=%llu event=cache_native_import image=%p source=%lx pixmap=%lx success=%u\n",
+                       client_surface_perf_time(), image, image->source, image->pixmap, image->success );
+        if ((image->acquired = image->success))
+            x11drv_client_surface_trace_image( "acquire", "owner_cache", display, image->pixmap, image->bytes );
+        return;
+    }
     image->pixmap = XCreatePixmap( display, root_window, image->width, image->height, image->depth );
     if (image->pixmap)
     {
@@ -1028,7 +1043,7 @@ static struct client_surface_cache_image *create_client_surface_cache_image(
     const struct client_surface_memory_scope *owners, enum client_surface_memory_class purpose,
     Window window, unsigned int width, unsigned int height,
     unsigned int depth, UINT64 bytes, void (*wake)(void),
-    client_surface_cache_callback complete, void *context )
+    client_surface_cache_callback complete, void *context, Pixmap import )
 {
     struct client_surface_cache_image *image;
 
@@ -1037,6 +1052,8 @@ static struct client_surface_cache_image *create_client_surface_cache_image(
     image->width = width;
     image->height = height;
     image->depth = depth;
+    image->source = import;
+    image->imported = !!import;
     pthread_mutex_lock( &cache_mutex );
     assert( !cache_wake || cache_wake == wake );
     cache_wake = wake;
@@ -1066,7 +1083,49 @@ struct client_surface_cache_image *client_surface_cache_create(
     client_surface_cache_callback complete, void *context )
 {
     return create_client_surface_cache_image( owners, CLIENT_SURFACE_MEMORY_SOURCE, None,
-                                              width, height, depth, bytes, wake, complete, context );
+                                              width, height, depth, bytes, wake, complete, context, None );
+}
+
+struct client_surface_cache_image *client_surface_cache_import(
+    const struct client_surface_memory_scope *owners, Pixmap source,
+    unsigned int width, unsigned int height, unsigned int depth, UINT64 bytes,
+    void (*wake)(void), client_surface_cache_callback complete, void *context )
+{
+    return create_client_surface_cache_image( owners, CLIENT_SURFACE_MEMORY_SOURCE, None,
+        width, height, depth, bytes, wake, complete, context, source );
+}
+
+struct client_surface_cache_image *client_surface_cache_view(
+    struct client_surface_cache_image *storage, void (*release)(void *), void *context )
+{
+    struct client_surface_cache_image *image;
+
+    assert( storage->imported && storage->pixmap && storage->operation == CACHE_IDLE );
+    if (!(image = allocate_cache_image( &storage->memory, CLIENT_SURFACE_MEMORY_SOURCE, 0 ))) return NULL;
+    pthread_mutex_lock( &cache_mutex );
+    if (image_count == CLIENT_SURFACE_CACHE_IMAGE_LIMIT ||
+        source_count == CLIENT_SURFACE_CACHE_IMAGE_LIMIT - CLIENT_SURFACE_CACHE_OUTPUT_RESERVE)
+    {
+        pthread_mutex_unlock( &cache_mutex );
+        discard_cache_image( image );
+        return NULL;
+    }
+    ++image_count;
+    ++source_count;
+    ++storage->refs;
+    image->parent = storage;
+    image->acquired = TRUE;
+    image->pixmap = storage->pixmap;
+    image->width = storage->width;
+    image->height = storage->height;
+    image->depth = storage->depth;
+    image->owner = storage->owner;
+    image->read_release = release;
+    image->read_context = context;
+    TRACE_(csperf)( "ticks=%llu event=cache_view_create image=%p parent=%p pixmap=%lx parent_refs=%u count=%u\n",
+                   client_surface_perf_time(), image, storage, image->pixmap, storage->refs, image_count );
+    pthread_mutex_unlock( &cache_mutex );
+    return image;
 }
 
 struct client_surface_cache_image *client_surface_cache_create_output(
@@ -1075,7 +1134,7 @@ struct client_surface_cache_image *client_surface_cache_create_output(
     client_surface_cache_callback complete, void *context )
 {
     return create_client_surface_cache_image( owners, CLIENT_SURFACE_MEMORY_OUTPUT, window,
-                                              width, height, depth, bytes, wake, complete, context );
+                                              width, height, depth, bytes, wake, complete, context, None );
 }
 
 BOOL client_surface_cache_reserve_output_pair(
@@ -1155,7 +1214,8 @@ void client_surface_cache_copy( struct client_surface_cache_image *image, Pixmap
                                 client_surface_cache_callback complete, void *context )
 {
     pthread_mutex_lock( &cache_mutex );
-    assert( image->acquired && image->refs == 1 && image->purpose == CLIENT_SURFACE_MEMORY_SOURCE );
+    assert( image->acquired && !image->parent && !image->imported && image->refs == 1 &&
+            image->purpose == CLIENT_SURFACE_MEMORY_SOURCE );
     image->source = source;
     image->copy_width = image->width;
     image->copy_height = image->height;
@@ -1268,6 +1328,8 @@ BOOL client_surface_cache_transform_output( struct client_surface_cache_image *i
 
 void client_surface_cache_release( struct client_surface_cache_image *image )
 {
+    void (*wake)(void) = NULL;
+
     if (!image) return;
     pthread_mutex_lock( &cache_mutex );
     assert( image->refs );
@@ -1276,13 +1338,28 @@ void client_surface_cache_release( struct client_surface_cache_image *image )
                    client_surface_perf_time(), image, image->pixmap, image->refs );
     if (!image->refs)
     {
-        if (image->acquired)
-            x11drv_client_surface_trace_image( "retire", cache_image_kind( image ),
-                                              image->owner->display,
-                                              image->pixmap, image->bytes );
-        queue_cache_image( image, CACHE_RELEASE, NULL, NULL );
+        if (image->parent)
+        {
+            /* A view owns no X resource. Return its read on the actor, after
+             * every asynchronous output/native reference has gone away. */
+            assert( image->operation == CACHE_IDLE );
+            image->operation = CACHE_RELEASE;
+            image->next = NULL;
+            *completed_tail = image;
+            completed_tail = &image->next;
+            wake = cache_wake;
+        }
+        else
+        {
+            if (image->acquired)
+                x11drv_client_surface_trace_image( "retire", cache_image_kind( image ),
+                                                  image->owner->display,
+                                                  image->pixmap, image->bytes );
+            queue_cache_image( image, CACHE_RELEASE, NULL, NULL );
+        }
     }
     pthread_mutex_unlock( &cache_mutex );
+    if (wake) wake();
 }
 
 BOOL client_surface_complete_cache( unsigned int budget )
@@ -1299,6 +1376,24 @@ BOOL client_surface_complete_cache( unsigned int budget )
             break;
         }
         if (!(completed_head = image->next)) completed_tail = &completed_head;
+        if (image->parent && image->operation == CACHE_RELEASE)
+        {
+            void (*release)(void *) = image->read_release;
+            void *context = image->read_context;
+
+            source = image->parent;
+            --image_count;
+            --source_count;
+            TRACE_(csperf)( "ticks=%llu event=cache_view_return image=%p parent=%p pixmap=%lx count=%u\n",
+                           client_surface_perf_time(), image, source, image->pixmap, image_count );
+            pthread_mutex_unlock( &cache_mutex );
+            client_surface_release_scoped_memory( &image->memory, image->purpose, image->bytes );
+            client_surface_free_owned_metadata( &image->memory, image, sizeof(*image) );
+            client_surface_cache_release( source );
+            release( context );
+            progressed = TRUE;
+            continue;
+        }
         source = image->copy_source;
         image->copy_source = NULL;
         image->operation = CACHE_IDLE;

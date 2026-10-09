@@ -623,6 +623,21 @@ BOOL process_client_surface_native_present( struct client_surface_compositor_tar
         finish_client_surface_compositor_frame( target, frame );
         progressed = TRUE;
     }
+    /* Mailbox or scene work can replace a checkpoint without completing a
+     * native Present in this scan. Return obsolete views in either case;
+     * otherwise their source slots wait for unrelated future native work. */
+    for (i = 0; i < ARRAY_SIZE(target->frames); ++i)
+    {
+        struct client_surface_compositor_frame *frame = &target->frames[i];
+
+        if (!frame->retained_image || frame->serial || frame->pixmap == target->backing ||
+            frame->pixmap == target->latest || frame->pixmap == target->published ||
+            (target->mailbox_pending && target->mailbox_frame == i) ||
+            (target->assembly_generation && target->assembly_frame == i) ||
+            client_surface_frame_copy_pending( frame )) continue;
+        retain_client_surface_frame_image( frame, NULL );
+        progressed = TRUE;
+    }
     if (progressed) wake_client_surface_compositor_queues();
     return progressed;
 }

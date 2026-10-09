@@ -30,22 +30,26 @@ enum client_surface_presentation_mode
 #define CLIENT_SURFACE_HANDOFF_BITMAP_WORDS (CLIENT_SURFACE_HANDOFF_CHANNELS / 64)
 #define CLIENT_SURFACE_HANDOFF_MAX_POOLS_PER_CONSUMER 512
 #define CLIENT_SURFACE_HANDOFF_MAGIC ((UINT64)0x57435348414e444full)
-#define CLIENT_SURFACE_HANDOFF_VERSION 13
+#define CLIENT_SURFACE_HANDOFF_VERSION 14
+
+/* Each source can publish once before its read receipt permits reuse. */
+C_ASSERT( CLIENT_SURFACE_HANDOFF_RING_SIZE >= CLIENT_SURFACE_SOURCE_FRAME_COUNT );
 
 #define CLIENT_SURFACE_HANDOFF_NATIVE_X11 0x0001
 #define CLIENT_SURFACE_HANDOFF_FULL_DAMAGE 0x0002
 #define CLIENT_SURFACE_HANDOFF_CLIPPED 0x0004
 #define CLIENT_SURFACE_HANDOFF_XFIXES_CLIP 0x0008
 #define CLIENT_SURFACE_HANDOFF_PIXMAP_CLIP 0x0010
-/* Producer-owned snapshot: finish any read before ACK, without retaining its XID. */
+/* Producer-owned snapshot: finish all reads before returning its source slot. */
 #define CLIENT_SURFACE_HANDOFF_COPY_SOURCE 0x0020
 #define CLIENT_SURFACE_HANDOFF_ENDPOINT_PRODUCER 0x0001
 #define CLIENT_SURFACE_HANDOFF_ENDPOINT_CONSUMER 0x0002
 
 /* Only completed immutable image metadata enters the ring. The producer owns
  * a slot until producer_sequence publishes it; consumer_sequence returns it
- * after the owner's checked cache copy, or without a read when the owner
- * supersedes an unused image. Placement and publication context
+ * once the owner has accepted its metadata. Source storage has an independent
+ * receipt, returned only after all reads of that publication finish.
+ * Placement and publication context
  * belong to the owner's scene, never to the completed image descriptor. */
 struct DECLSPEC_ALIGN(64) client_surface_handoff_slot
 {
@@ -63,6 +67,8 @@ struct DECLSPEC_ALIGN(64) client_surface_handoff_slot
     RECT damage;
     UINT64 source_sequence;
     UINT64 damage_base_sequence;
+    UINT64 storage_id; /* nonzero for immutable GPU storage; unique within the producer process */
+    UINT source_index;
 };
 
 C_ASSERT( sizeof(struct client_surface_handoff_slot) == 128 );
@@ -73,9 +79,11 @@ C_ASSERT( sizeof(struct client_surface_handoff_slot) == 128 );
 struct DECLSPEC_ALIGN(64) client_surface_handoff_channel
 {
     LONG64 producer_sequence;
-    UINT64 producer_padding[7];
+    LONG64 source_publications[CLIENT_SURFACE_SOURCE_FRAME_COUNT];
+    UINT64 producer_padding[7 - CLIENT_SURFACE_SOURCE_FRAME_COUNT];
     LONG64 consumer_sequence;
-    UINT64 consumer_padding[7];
+    LONG64 source_releases[CLIENT_SURFACE_SOURCE_FRAME_COUNT];
+    UINT64 consumer_padding[7 - CLIENT_SURFACE_SOURCE_FRAME_COUNT];
     UINT64 cookie;
     UINT64 identity;
     UINT producer_process;
@@ -115,6 +123,12 @@ static inline BOOL client_surface_handoff_consumed( const struct client_surface_
 
     /* Outstanding publications are bounded by RING_SIZE, including at wrap. */
     return consumed - publication < ((UINT64)1 << 63);
+}
+
+static inline BOOL client_surface_handoff_source_released( const struct client_surface_handoff_channel *channel,
+                                                           unsigned int index, UINT64 publication )
+{
+    return __atomic_load_n( &channel->source_releases[index], __ATOMIC_ACQUIRE ) == publication;
 }
 
 enum client_surface_completion_kind

@@ -17,6 +17,7 @@
 
 #include <dlfcn.h>
 #include <assert.h>
+#include <unistd.h>
 
 #include "x11drv.h"
 #include "client_surface_xcb.h"
@@ -29,6 +30,11 @@ WINE_DECLARE_DEBUG_CHANNEL(csperf);
 #include <X11/Xlib-xcb.h>
 #include <xcb/xcbext.h>
 #include <xcb/present.h>
+
+#ifdef SONAME_LIBXCB_DRI3
+#include <xcb/dri3.h>
+#define CLIENT_SURFACE_DRI3 1
+#endif
 
 static typeof(XGetXCBConnection) *pXGetXCBConnection;
 static typeof(xcb_present_pixmap_checked) *pxcb_present_pixmap_checked;
@@ -385,3 +391,103 @@ void client_surface_xcb_free_gc_async( Display *display, unsigned int gc,
 }
 
 #endif
+
+#ifdef CLIENT_SURFACE_DRI3
+static typeof(xcb_dri3_query_version) *pxcb_dri3_query_version;
+static typeof(xcb_dri3_query_version_reply) *pxcb_dri3_query_version_reply;
+static typeof(xcb_dri3_buffers_from_pixmap) *pxcb_dri3_buffers_from_pixmap;
+static typeof(xcb_dri3_buffers_from_pixmap_reply) *pxcb_dri3_buffers_from_pixmap_reply;
+static typeof(xcb_dri3_buffers_from_pixmap_reply_fds) *pxcb_dri3_buffers_from_pixmap_reply_fds;
+static typeof(xcb_dri3_buffers_from_pixmap_strides) *pxcb_dri3_buffers_from_pixmap_strides;
+static typeof(xcb_dri3_buffers_from_pixmap_offsets) *pxcb_dri3_buffers_from_pixmap_offsets;
+static typeof(xcb_dri3_pixmap_from_buffers_checked) *pxcb_dri3_pixmap_from_buffers_checked;
+static pthread_once_t dri3_once = PTHREAD_ONCE_INIT;
+static BOOL dri3_initialized;
+
+static void init_client_surface_dri3(void)
+{
+    void *module;
+
+    if (!(module = dlopen( SONAME_LIBXCB_DRI3, RTLD_NOW ))) return;
+#define LOAD_DRI3(f) if (!(p##f = dlsym( module, #f ))) goto failed
+    LOAD_DRI3( xcb_dri3_query_version );
+    LOAD_DRI3( xcb_dri3_query_version_reply );
+    LOAD_DRI3( xcb_dri3_buffers_from_pixmap );
+    LOAD_DRI3( xcb_dri3_buffers_from_pixmap_reply );
+    LOAD_DRI3( xcb_dri3_buffers_from_pixmap_reply_fds );
+    LOAD_DRI3( xcb_dri3_buffers_from_pixmap_strides );
+    LOAD_DRI3( xcb_dri3_buffers_from_pixmap_offsets );
+    LOAD_DRI3( xcb_dri3_pixmap_from_buffers_checked );
+#undef LOAD_DRI3
+    dri3_initialized = TRUE;
+    return;
+failed:
+    dlclose( module );
+}
+#endif
+
+Pixmap client_surface_xcb_import( Display *display, Pixmap source, unsigned int width,
+                                  unsigned int height, unsigned int depth )
+{
+#ifdef CLIENT_SURFACE_DRI3
+    xcb_dri3_buffers_from_pixmap_reply_t *reply;
+    xcb_dri3_query_version_reply_t *version;
+    xcb_generic_error_t *error = NULL;
+    xcb_connection_t *connection;
+    unsigned int i;
+    uint32_t strides[4] = {0}, offsets[4] = {0};
+    Pixmap pixmap = None;
+    int *fds;
+
+    if (!client_surface_xcb_available( display )) return None;
+    pthread_once( &dri3_once, init_client_surface_dri3 );
+    if (!dri3_initialized) return None;
+    XFlush( display );
+    connection = pXGetXCBConnection( display );
+    version = pxcb_dri3_query_version_reply( connection,
+        pxcb_dri3_query_version( connection, 1, 2 ), &error );
+    if (!version || error || version->major_version != 1 || version->minor_version < 2)
+    {
+        free( error );
+        free( version );
+        return None;
+    }
+    free( version );
+    reply = pxcb_dri3_buffers_from_pixmap_reply( connection,
+        pxcb_dri3_buffers_from_pixmap( connection, source ), &error );
+    if (!reply || error)
+    {
+        free( error );
+        free( reply );
+        return None;
+    }
+    fds = pxcb_dri3_buffers_from_pixmap_reply_fds( connection, reply );
+    if (!reply->nfd || reply->nfd > 4 || reply->width != width || reply->height != height ||
+        reply->depth != depth)
+    {
+        for (i = 0; i < reply->nfd; ++i) close( fds[i] );
+        free( reply );
+        return None;
+    }
+    for (i = 0; i < reply->nfd; ++i)
+    {
+        strides[i] = pxcb_dri3_buffers_from_pixmap_strides( reply )[i];
+        offsets[i] = pxcb_dri3_buffers_from_pixmap_offsets( reply )[i];
+    }
+    pixmap = pxcb_generate_id( connection );
+    error = pxcb_request_check( connection, pxcb_dri3_pixmap_from_buffers_checked( connection,
+        pixmap, root_window, reply->nfd, width, height,
+        strides[0], offsets[0], strides[1], offsets[1], strides[2], offsets[2], strides[3], offsets[3],
+        reply->depth, reply->bpp, reply->modifier, fds ));
+    /* The import request takes ownership of every descriptor, including on error. */
+    if (error)
+    {
+        free( error );
+        pixmap = None;
+    }
+    free( reply );
+    return pixmap;
+#else
+    return None;
+#endif
+}

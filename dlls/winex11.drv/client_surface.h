@@ -91,6 +91,7 @@ extern BOOL x11drv_client_snapshot_upload( struct x11drv_client_snapshot **snaps
                                           unsigned int width, unsigned int height, BOOL top_down,
                                           const struct x11drv_snapshot_format *format );
 extern Pixmap x11drv_client_snapshot_pixmap( const struct x11drv_client_snapshot *snapshot );
+extern UINT64 x11drv_client_snapshot_storage_id( const struct x11drv_client_snapshot *snapshot );
 extern SIZE x11drv_client_snapshot_size( const struct x11drv_client_snapshot *snapshot );
 extern void x11drv_client_snapshot_release_staging( struct x11drv_client_snapshot *snapshot );
 extern struct x11drv_client_snapshot *x11drv_client_snapshot_share( struct x11drv_client_snapshot *snapshot );

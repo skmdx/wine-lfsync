@@ -82,6 +82,7 @@ struct client_surface_completed_frame
     UINT64 target_epoch;
     UINT64 image;
     UINT64 visual;
+    UINT64 storage_id;
     UINT flags;
     SIZE size;
     RECT damage;

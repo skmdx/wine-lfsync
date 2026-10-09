@@ -116,7 +116,7 @@ static BOOL retire_source_mapping( struct x11drv_client_surface_retirement *reti
 {
     struct client_surface_handoff_shared *shared = retirement->view;
     struct client_surface_handoff_channel *channel = retirement->channel;
-    unsigned int index = channel - shared->channels;
+    unsigned int i, index = channel - shared->channels;
     BOOL ready;
 
     /* Closing prevents new reads without pretending that a checked X11 copy
@@ -127,10 +127,15 @@ static BOOL retire_source_mapping( struct x11drv_client_surface_retirement *reti
         __atomic_fetch_or( &shared->ready_bitmap[index / 64], (UINT64)1 << (index % 64), __ATOMIC_RELEASE );
         wake_retiring_source_owner( retirement );
     }
-    ready = !(__atomic_load_n( &channel->endpoints, __ATOMIC_ACQUIRE ) &
-              CLIENT_SURFACE_HANDOFF_ENDPOINT_CONSUMER) ||
-            __atomic_load_n( &channel->consumer_sequence, __ATOMIC_ACQUIRE ) ==
-            __atomic_load_n( &channel->producer_sequence, __ATOMIC_ACQUIRE );
+    ready = TRUE;
+    if (__atomic_load_n( &channel->endpoints, __ATOMIC_ACQUIRE ) & CLIENT_SURFACE_HANDOFF_ENDPOINT_CONSUMER)
+    {
+        ready = __atomic_load_n( &channel->consumer_sequence, __ATOMIC_ACQUIRE ) ==
+                __atomic_load_n( &channel->producer_sequence, __ATOMIC_ACQUIRE );
+        for (i = 0; i < CLIENT_SURFACE_SOURCE_FRAME_COUNT; ++i)
+            ready &= client_surface_handoff_source_released( channel, i,
+                __atomic_load_n( &channel->source_publications[i], __ATOMIC_ACQUIRE ) );
+    }
     if (!ready) return FALSE;
 
     TRACE( "releasing source mapping identity %s cookie %s after readers completed, view %p fd %d\n",

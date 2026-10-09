@@ -1436,6 +1436,8 @@ then
                         [WINE_CHECK_SONAME(xcb,xcb_poll_for_reply)])
         AC_CHECK_HEADER([xcb/present.h],
                         [WINE_CHECK_SONAME(xcb-present,xcb_present_pixmap_checked)])
+        AC_CHECK_HEADER([xcb/dri3.h],
+                        [WINE_CHECK_SONAME(xcb-dri3,xcb_dri3_pixmap_from_buffers_checked)])
 
         dnl *** Check for XICCallback struct
         AC_CHECK_MEMBERS([XICCallback.callback, XEvent.xcookie],,,[$xlib_includes])

@@ -276,7 +276,7 @@ static BOOL acquire_client_surface_handoff( struct client_surface *surface,
 
                 if (source->published)
                 {
-                    if (!client_surface_handoff_consumed( surface->handoff->channel, source->publication )) continue;
+                    if (!client_surface_handoff_source_released( surface->handoff->channel, index, source->publication )) continue;
                     source->published = FALSE;
                 }
                 if (!pass && __atomic_load_n( &source->reservation, __ATOMIC_ACQUIRE )) continue;
@@ -310,7 +310,7 @@ static BOOL acquire_client_surface_handoff( struct client_surface *surface,
             const struct client_surface_source *source = surface->handoff->sources + i;
 
             available |= !source->published ||
-                         client_surface_handoff_consumed( surface->handoff->channel, source->publication );
+                         client_surface_handoff_source_released( surface->handoff->channel, i, source->publication );
         }
         if (!available)
             client_surface_handoff_wait_sequence( &surface->handoff->shared->release_sequence, sequence, 10 );
@@ -352,6 +352,7 @@ static BOOL prepare_client_surface_handoff_locked( struct client_surface *surfac
     source = surface->handoff->sources + present->handoff_index;
     source->target_epoch = present->target_epoch;
     source->source = source->source_visual = 0;
+    source->storage_id = 0;
     source->width = source->height = source->flags = 0;
     if (!surface->backend->handoff->prepare( surface, source, present ))
     {
@@ -446,6 +447,7 @@ BOOL client_surface_freeze_frame_locked( struct client_surface *surface,
         frame->target_epoch = present->target_epoch;
         frame->image = source->source;
         frame->visual = source->source_visual;
+        frame->storage_id = source->storage_id;
         frame->flags = source->flags;
         frame->size = (SIZE){source->width, source->height};
         SetRect( &frame->damage, 0, 0, source->width, source->height );
@@ -516,7 +518,8 @@ BOOL client_surface_publish_handoff_locked( struct client_surface *surface,
             produced - consumed < CLIENT_SURFACE_HANDOFF_RING_SIZE &&
             frame->surface_id == client_surface_get_identity( surface ) && frame->frame_id == present->serial &&
             frame->target_epoch == present->target_epoch && frame->image == source->source &&
-            frame->visual == source->source_visual && frame->size.cx == source->width &&
+            frame->visual == source->source_visual && frame->storage_id == source->storage_id &&
+            frame->size.cx == source->width &&
             frame->size.cy == source->height && frame->flags == source->flags &&
             (frame->flags & CLIENT_SURFACE_HANDOFF_COPY_SOURCE) && surface->hwnd && target.valid &&
             __atomic_load_n( &source->reservation, __ATOMIC_ACQUIRE ) == present->handoff_control &&
@@ -553,11 +556,17 @@ BOOL client_surface_publish_handoff_locked( struct client_surface *surface,
             .target_epoch = frame->target_epoch, .width = frame->size.cx, .height = frame->size.cy,
             .flags = frame->flags, .source_sequence = frame->frame_id,
             .damage = frame->damage, .damage_base_sequence = frame->damage_base_frame,
+            .storage_id = frame->storage_id,
+            .source_index = present->handoff_index,
         };
         if (frame->damage_base_frame) slot->flags &= ~CLIENT_SURFACE_HANDOFF_FULL_DAMAGE;
         else slot->flags |= CLIENT_SURFACE_HANDOFF_FULL_DAMAGE;
         source->publication = produced + 1;
         source->published = TRUE;
+        /* A fresh receipt must differ even when the publication counter wraps
+         * to zero. Descriptor consumption alone never permits storage reuse. */
+        __atomic_store_n( &channel->source_releases[present->handoff_index], ~(produced + 1), __ATOMIC_RELAXED );
+        __atomic_store_n( &channel->source_publications[present->handoff_index], produced + 1, __ATOMIC_RELEASE );
         __atomic_store_n( &source->reservation, 0, __ATOMIC_RELEASE );
         ready_time = TRACE_ON(csperf) ? client_surface_perf_time() : 0;
         __atomic_store_n( &channel->producer_sequence, produced + 1, __ATOMIC_RELEASE );
@@ -595,7 +604,7 @@ BOOL client_surface_handoff_write_available( const struct client_surface *surfac
     {
         const struct client_surface_source *source = surface->handoff->sources + i;
 
-        if ((!source->published || client_surface_handoff_consumed( surface->handoff->channel, source->publication )) &&
+        if ((!source->published || client_surface_handoff_source_released( surface->handoff->channel, i, source->publication )) &&
             !__atomic_load_n( &source->reservation, __ATOMIC_ACQUIRE )) return TRUE;
     }
     return FALSE;

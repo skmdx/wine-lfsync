@@ -42,6 +42,7 @@ struct snapshot_connection
 static pthread_mutex_t snapshot_connections_lock = PTHREAD_MUTEX_INITIALIZER;
 static struct list snapshot_connections = LIST_INIT( snapshot_connections );
 static unsigned int snapshot_connection_count;
+static LONG64 snapshot_serial;
 #define SNAPSHOT_CONNECTION_LIMIT 64
 
 struct x11drv_client_snapshot
@@ -49,6 +50,7 @@ struct x11drv_client_snapshot
     struct list retirement_entry;
     struct client_surface_memory_scope memory;
     LONG refs;
+    UINT64 storage_id;
     struct snapshot_connection *connection;
     Pixmap pixmap;
     GC gc;
@@ -236,6 +238,11 @@ Pixmap x11drv_client_snapshot_pixmap( const struct x11drv_client_snapshot *snaps
     return snapshot ? snapshot->pixmap : 0;
 }
 
+UINT64 x11drv_client_snapshot_storage_id( const struct x11drv_client_snapshot *snapshot )
+{
+    return snapshot ? snapshot->storage_id : 0;
+}
+
 SIZE x11drv_client_snapshot_size( const struct x11drv_client_snapshot *snapshot )
 {
     return snapshot ? snapshot->size : (SIZE){0};
@@ -369,6 +376,7 @@ static struct x11drv_client_snapshot *snapshot_alloc( const struct client_surfac
     snapshot->size = (SIZE){width, height};
     snapshot->depth = depth;
     snapshot->refs = 1;
+    snapshot->storage_id = InterlockedIncrement64( &snapshot_serial );
     if (!client_surface_reserve_scoped_memory( &snapshot->memory, CLIENT_SURFACE_MEMORY_SOURCE, bytes )) goto failed;
     snapshot->bytes = bytes;
     return snapshot;

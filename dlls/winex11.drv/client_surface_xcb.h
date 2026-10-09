@@ -13,6 +13,9 @@ struct client_surface_xcb_request
 BOOL client_surface_xcb_present( Display *display, Window window, Pixmap pixmap,
                                  unsigned int serial, struct client_surface_xcb_request *request );
 BOOL client_surface_xcb_available( Display *display );
+/* Worker-only import; returned pixmap belongs to display and survives source destruction. */
+Pixmap client_surface_xcb_import( Display *display, Pixmap source, unsigned int width,
+                                  unsigned int height, unsigned int depth );
 BOOL client_surface_xcb_check_direct( Display *display, Window owner, Window drawable,
                                       unsigned int width, unsigned int height, const RECT *rect );
 void client_surface_xcb_flush( Display *display, struct client_surface_xcb_request *request );

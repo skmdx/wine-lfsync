@@ -631,6 +631,7 @@ static BOOL x11drv_client_surface_handoff_complete( struct client_surface *clien
     if (frame->gpu_copy)
     {
         image->source = frame->pixmap;
+        image->storage_id = x11drv_client_snapshot_storage_id( frame->snapshot );
         x11drv_client_surface_set_gpu_snapshot( surface, frame->snapshot );
         image->source_visual = default_visual.visualid;
         image->flags |= CLIENT_SURFACE_HANDOFF_COPY_SOURCE;

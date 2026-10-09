@@ -220,7 +220,7 @@ struct gdi_dc_funcs
 };
 
 /* increment this when changing driver tables or shared driver-facing structures */
-#define WINE_GDI_DRIVER_VERSION 158
+#define WINE_GDI_DRIVER_VERSION 159
 
 #define GDI_PRIORITY_NULL_DRV        0  /* null driver */
 #define GDI_PRIORITY_FONT_DRV      100  /* any font driver */
@@ -260,6 +260,7 @@ struct client_surface_source
     BOOL published;
     UINT64 source;
     UINT64 source_visual;
+    UINT64 storage_id;
     UINT64 target_epoch;
     UINT width, height;
     UINT flags;

@@ -64,6 +64,15 @@ struct client_surface_cache_image *client_surface_cache_create(
     unsigned int depth, UINT64 bytes, void (*wake)(void),
     client_surface_cache_callback complete, void *context );
 
+struct client_surface_cache_image *client_surface_cache_import(
+    const struct client_surface_memory_scope *memory, Pixmap source,
+    unsigned int width, unsigned int height, unsigned int depth, UINT64 bytes,
+    void (*wake)(void), client_surface_cache_callback complete, void *context );
+/* A publication view retains independent native storage and one source read.
+ * release runs on the actor after the view's last native reader has returned. */
+struct client_surface_cache_image *client_surface_cache_view(
+    struct client_surface_cache_image *storage, void (*release)(void *), void *context );
+
 /* Output admission retains its own purpose charge. Native storage has no
  * borrowed target pointer; the caller validates installation on completion. */
 struct client_surface_cache_image *client_surface_cache_create_output(

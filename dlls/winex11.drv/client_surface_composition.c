@@ -227,12 +227,18 @@ static void free_client_surface_compositor_binding( struct client_surface_compos
     /* Releasing the consumer endpoint also permits the producer to retire
      * unacknowledged slots. Keep it, the mapping and both cache images until
      * our last native read and checked reply have completed. */
-    release_client_surface_compositor_binding_server( binding );
-    release_client_surface_compositor_pool( binding->pool );
     free_client_surface_cached_image( &binding->latest_image );
     free_client_surface_cached_image( &binding->spare_image );
     for (i = 0; i < ARRAY_SIZE(binding->retained_images); ++i)
         free_client_surface_cached_image( &binding->retained_images[i] );
+    for (i = 0; i < ARRAY_SIZE(binding->imports); ++i)
+    {
+        client_surface_cache_release( binding->imports[i].storage );
+        binding->imports[i].storage = NULL;
+    }
+    if (binding->read_count) return;
+    release_client_surface_compositor_binding_server( binding );
+    release_client_surface_compositor_pool( binding->pool );
     client_surface_free_owned_metadata( &binding->memory, binding, sizeof(*binding) );
 }
 
@@ -722,7 +728,7 @@ static BOOL get_client_surface_compositor_source(
     /* Transport slots and native images rotate independently. In particular,
      * three source images through a four-slot ring never match the previous
      * image at the same ring position. Reuse metadata by its exact native
-     * tuple within this binding; the ring index only selects a miss victim. */
+     * tuple within this binding, including the producer's replay spare. */
     for (i = 0; i < ARRAY_SIZE(binding->sources); ++i)
         if (client_surface_source_cache_matches( &binding->sources[i], slot )) break;
     if (i == ARRAY_SIZE(binding->sources)) return FALSE;
@@ -730,6 +736,34 @@ static BOOL get_client_surface_compositor_source(
     *source = cache->pixmap;
     *source_depth = cache->depth;
     return TRUE;
+}
+
+static void return_client_surface_source_read( struct client_surface_compositor_binding *binding,
+                                               unsigned int index, UINT64 control )
+{
+    struct client_surface_handoff_channel *channel = binding->channel;
+
+    /* A retained native view can outlive later publications. Return only its
+     * source; unrelated returned storage must not wait for a cumulative ACK. */
+    if (index >= CLIENT_SURFACE_SOURCE_FRAME_COUNT ||
+        __atomic_load_n( &channel->source_publications[index], __ATOMIC_ACQUIRE ) != control) return;
+    __atomic_store_n( &channel->source_releases[index], control, __ATOMIC_RELEASE );
+    client_surface_handoff_wake_release( binding->pool->shared );
+}
+
+static void release_client_surface_import_read( void *context )
+{
+    struct client_surface_source_read *read = context;
+    struct client_surface_compositor_binding *binding = read->binding;
+
+    assert( binding && binding->read_count );
+    trace_client_surface_source( "cache_release", binding, read->control, read->sequence,
+                                 read->source, read->cache, TRUE );
+    return_client_surface_source_read( binding, read->source_index, read->control );
+    read->binding = NULL;
+    --binding->read_count;
+    if (binding->retired && !client_surface_cache_read_pending( binding ))
+        free_client_surface_compositor_binding( binding );
 }
 
 static void release_client_surface_cached_source( struct client_surface_compositor_binding *binding,
@@ -744,15 +778,16 @@ static void release_client_surface_cached_source( struct client_surface_composit
     /* Descriptor publication pins the independent producer image. Sending a
      * request is not permission to return it; this runs after the checked
      * read, or after rejecting a descriptor without submitting any read. */
+    if (!copy->retained) return_client_surface_source_read( binding, copy->frame.source_index, copy->control );
     __atomic_store_n( &channel->consumer_sequence, copy->control, __ATOMIC_RELEASE );
     if (!success && !binding->latest_image.pixmap)
         __atomic_store_n( &channel->closed, 1, __ATOMIC_RELEASE );
-    trace_client_surface_source( "cache_release", binding, copy->control, copy->frame.source_sequence,
-                                 0, binding->latest_image.pixmap, success );
+    if (!copy->retained)
+        trace_client_surface_source( "cache_release", binding, copy->control, copy->frame.source_sequence,
+                                     0, binding->latest_image.pixmap, success );
     TRACE( "%s handoff hwnd %p identity %s sequence %s after owner cache copy\n",
            success || binding->latest_image.pixmap ? "released" : "lost", binding->window,
            wine_dbgstr_longlong( binding->identity ), wine_dbgstr_longlong( copy->control ) );
-    client_surface_handoff_wake_release( binding->pool->shared );
     if (binding->retired)
     {
         free_client_surface_compositor_binding( binding );
@@ -797,6 +832,7 @@ static void finish_client_surface_cache_copy( struct client_surface_compositor_b
         }
 
         binding->latest_image = binding->spare_image;
+        if (previous.read_lease) free_client_surface_cached_image( &previous );
         binding->spare_image = previous;
         binding->latest_frame = copy->frame;
         binding->latest_frame.source = binding->latest_image.pixmap;
@@ -875,6 +911,101 @@ static void complete_client_surface_cache_fallback( void *context, BOOL success 
     complete_client_surface_cache_read( binding, success, FALSE );
 }
 
+static void adopt_client_surface_import( struct client_surface_compositor_binding *binding,
+                                         unsigned int depth )
+{
+    struct client_surface_cache_copy *copy = &binding->cache_copy;
+    struct client_surface_handoff_slot *frame = &copy->frame;
+    struct client_surface_imported_image *import = &binding->imports[copy->import_index];
+    struct client_surface_source_read *read = &binding->reads[frame->source_index];
+    struct client_surface_cache_image *view;
+
+    assert( !read->binding );
+    if (!(view = client_surface_cache_view( import->storage, release_client_surface_import_read, read )))
+    {
+        release_client_surface_cached_source( binding, FALSE );
+        return;
+    }
+    *read = (struct client_surface_source_read){binding, copy->control, frame->source_sequence,
+        frame->source, client_surface_cache_pixmap( view ), frame->source_index};
+    ++binding->read_count;
+    copy->retained = TRUE;
+    free_client_surface_cached_image( &binding->spare_image );
+    binding->spare_image = (struct client_surface_cached_image){view, read->cache,
+        frame->width, frame->height, depth, TRUE};
+    TRACE_(csperf)( "ticks=%llu event=cache_import_view identity=%s cookie=%s token=%s sequence=%s "
+                   "source=%lx pixmap=%lx storage_id=%s image=%p\n", client_surface_perf_time(),
+                   wine_dbgstr_longlong( binding->identity ), wine_dbgstr_longlong( binding->cookie ),
+                   wine_dbgstr_longlong( copy->control ), wine_dbgstr_longlong( frame->source_sequence ),
+                   read->source, read->cache, wine_dbgstr_longlong( frame->storage_id ), view );
+    finish_client_surface_cache_copy( binding, TRUE );
+}
+
+static void complete_client_surface_import( void *context, BOOL success )
+{
+    struct client_surface_compositor_binding *binding = context;
+    struct client_surface_cache_copy *copy = &binding->cache_copy;
+    struct client_surface_imported_image *import = &binding->imports[copy->import_index];
+    unsigned int depth = copy->import_depth;
+
+    copy->native_pending = FALSE;
+    if (binding->retired)
+    {
+        release_client_surface_cached_source( binding, FALSE );
+        return;
+    }
+    if (success)
+    {
+        adopt_client_surface_import( binding, depth );
+        return;
+    }
+    client_surface_cache_release( import->storage );
+    memset( import, 0, sizeof(*import) );
+    /* Import is optional. Keep the checked independent-copy path on providers
+     * which cannot import this storage; never adopt an unverified alias. */
+    binding->import_disabled = TRUE;
+    start_client_surface_cache_copy( binding, depth );
+}
+
+static BOOL import_client_surface_cache( struct client_surface_compositor_binding *binding,
+                                         unsigned int depth )
+{
+    struct client_surface_cache_copy *copy = &binding->cache_copy;
+    struct client_surface_handoff_slot *frame = &copy->frame;
+    struct client_surface_imported_image *import;
+    unsigned int i;
+
+    if (!frame->storage_id || binding->import_disabled) return FALSE;
+    copy->import_depth = depth;
+    for (i = 0; i < ARRAY_SIZE(binding->imports); ++i)
+        if (binding->imports[i].storage_id == frame->storage_id &&
+            binding->imports[i].source == frame->source) break;
+    if (i < ARRAY_SIZE(binding->imports))
+    {
+        copy->import_index = i;
+        adopt_client_surface_import( binding, depth );
+        return TRUE;
+    }
+    /* Source slots and the producer's last-image spare can all have stable
+     * native storage. Fill that bounded set before evicting an old import. */
+    for (i = 0; i < ARRAY_SIZE(binding->imports); ++i)
+        if (!binding->imports[i].storage) break;
+    copy->import_index = i < ARRAY_SIZE(binding->imports) ? i : copy->index;
+    import = &binding->imports[copy->import_index];
+    client_surface_cache_release( import->storage );
+    *import = (struct client_surface_imported_image){frame->storage_id, frame->source};
+    import->storage = client_surface_cache_import( &binding->memory, frame->source,
+        frame->width, frame->height, depth, client_surface_pixmap_bytes( frame->width, frame->height, depth ),
+        wake_client_surface_compositor, complete_client_surface_import, binding );
+    if (!import->storage)
+    {
+        memset( import, 0, sizeof(*import) );
+        return FALSE;
+    }
+    copy->native_pending = TRUE;
+    return TRUE;
+}
+
 static void start_client_surface_cache_copy( struct client_surface_compositor_binding *binding,
                                              unsigned int depth )
 {
@@ -883,6 +1014,11 @@ static void start_client_surface_cache_copy( struct client_surface_compositor_bi
     struct client_surface_handoff_slot frame = copy->frame;
     Pixmap source = frame.source;
     UINT64 control = copy->control;
+
+    assert( !binding->retired && !client_surface_cache_read_pending( binding ) );
+    TRACE( "reading handoff hwnd %p identity %s sequence %s into owner cache\n", binding->window,
+           wine_dbgstr_longlong( binding->identity ), wine_dbgstr_longlong( control ) );
+    if (import_client_surface_cache( binding, depth )) return;
 
     if (image->storage && client_surface_cache_shared( image->storage ))
     {
@@ -902,9 +1038,6 @@ static void start_client_surface_cache_copy( struct client_surface_compositor_bi
             }
     }
 
-    assert( !binding->retired && !client_surface_cache_read_pending( binding ) );
-    TRACE( "reading handoff hwnd %p identity %s sequence %s into owner cache\n", binding->window,
-           wine_dbgstr_longlong( binding->identity ), wine_dbgstr_longlong( control ) );
     /* An old latest image can still be a scene output's source after swapping
      * into the spare. Both cross-connection reclaim and fallback writes must
      * wait for that read; retain its reference and admit a separate candidate. */
@@ -956,8 +1089,9 @@ static void complete_client_surface_source_query( struct client_surface_geometry
         release_client_surface_cached_source( binding, FALSE );
         return;
     }
-    binding->sources[copy->index] = (struct client_surface_source_cache){frame->source,
+    binding->sources[binding->next_source_cache] = (struct client_surface_source_cache){frame->source,
         frame->target_epoch, frame->source_visual, frame->width, frame->height, query->depth};
+    binding->next_source_cache = (binding->next_source_cache + 1) % ARRAY_SIZE(binding->sources);
     start_client_surface_cache_copy( binding, query->depth );
 }
 
@@ -973,6 +1107,7 @@ static BOOL cache_client_surface_handoff( struct client_surface_compositor_bindi
 
     assert( !binding->retired && !client_surface_cache_read_pending( binding ) );
     copy->frame = frame;
+    copy->retained = FALSE;
     copy->index = index;
     copy->control = control;
     copy->started = client_surface_perf_time();
@@ -982,7 +1117,7 @@ static BOOL cache_client_surface_handoff( struct client_surface_compositor_bindi
         frame.toplevel != wine_server_user_handle( binding->toplevel ) ||
         !(frame.flags & CLIENT_SURFACE_HANDOFF_NATIVE_X11) ||
         !(frame.flags & CLIENT_SURFACE_HANDOFF_COPY_SOURCE) || !frame.width || !frame.height ||
-        !frame.source_visual) goto rejected;
+        !frame.source_visual || frame.source_index >= CLIENT_SURFACE_SOURCE_FRAME_COUNT) goto rejected;
     if (binding->latest_image.pixmap && frame.source_sequence < binding->latest_frame.source_sequence)
     {
         success = TRUE;
@@ -1185,12 +1320,16 @@ static BOOL copy_client_surface_handoff_to_frame(
                    frame->pixmap == target->published, !!frame->serial );
     if (!batch && plan->steady && native && incoming_full &&
         !plan->destination.left && !plan->destination.top &&
-        slot->width == target->window_width && slot->height == target->window_height)
+        slot->width == target->window_width && slot->height == target->window_height &&
+        (!binding->latest_image.read_lease || frame->pixmap != target->backing))
     {
         /* The completed owner image is already the whole output. Keep its
          * immutable reference rather than copying it into another private
          * pixmap. The pool ID remains the GUI checkpoint/retirement identity;
-         * later partial assemblies catch up from this retained image. */
+         * later partial assemblies catch up from this retained image.
+         * The installed GUI checkpoint can outlive newer publications, so
+         * give that frame independent storage instead of pinning a producer
+         * source until the checkpoint itself is selected for reuse. */
         retain_client_surface_frame_image( frame, binding->latest_image.storage );
         TRACE_(csperf)( "ticks=%llu event=output_image_retain frame=%lx image=%p source=%lx\n",
                        client_surface_perf_time(), frame->pixmap, frame->retained_image,
@@ -1951,7 +2090,6 @@ static BOOL coalesce_client_surface_handoffs( struct client_surface_compositor_b
     struct client_surface_handoff_channel *channel = binding->channel;
     const struct client_surface_handoff_slot *newest;
     struct client_surface_scene scene;
-    UINT64 previous = *consumed;
 
     assert( !client_surface_cache_read_pending( binding ) && produced != *consumed );
     if (!target || target->quiescing || target->assembly_generation || !target->scene.valid ||
@@ -1973,6 +2111,7 @@ static BOOL coalesce_client_surface_handoffs( struct client_surface_compositor_b
         ++*consumed;
         /* No native request has read this slot. The producer can now reuse
          * it, but cannot replace newest before its separate read receipt. */
+        return_client_surface_source_read( binding, slot.source_index, *consumed );
         __atomic_store_n( &channel->consumer_sequence, *consumed, __ATOMIC_RELEASE );
         TRACE_(csperf)( "ticks=%llu event=cache_skip identity=%s cookie=%s token=%s sequence=%s "
                        "pixmap=%s retained_token=%s retained_sequence=%s cached_sequence=%s scene=%s\n",
@@ -1982,7 +2121,6 @@ static BOOL coalesce_client_surface_handoffs( struct client_surface_compositor_b
                        wine_dbgstr_longlong( produced ), wine_dbgstr_longlong( newest->source_sequence ),
                        wine_dbgstr_longlong( binding->latest_frame.source_sequence ), wine_dbgstr_longlong( scene.epoch ) );
     }
-    if (*consumed != previous) client_surface_handoff_wake_release( binding->pool->shared );
     if (produced - *consumed != 1) return FALSE;
     /* Native Complete/Idle or a new READY wakes the actor. Preserve the hint
      * across its armed rescan without reporting a parked image as progress.

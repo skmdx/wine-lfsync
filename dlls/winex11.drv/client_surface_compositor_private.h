@@ -59,6 +59,22 @@ struct client_surface_cached_image
     struct client_surface_cache_image *storage;
     Pixmap pixmap;
     unsigned int width, height, depth;
+    BOOL read_lease;
+};
+
+struct client_surface_imported_image
+{
+    UINT64 storage_id;
+    Pixmap source;
+    struct client_surface_cache_image *storage;
+};
+
+struct client_surface_source_read
+{
+    struct client_surface_compositor_binding *binding;
+    UINT64 control, sequence;
+    Pixmap source, cache;
+    unsigned int source_index;
 };
 
 struct client_surface_cache_copy
@@ -69,6 +85,9 @@ struct client_surface_cache_copy
     struct client_surface_handoff_slot frame;
     UINT64 control, started;
     unsigned int index;
+    unsigned int import_index;
+    unsigned int import_depth;
+    BOOL retained;
 };
 
 struct client_surface_compositor_binding
@@ -78,7 +97,12 @@ struct client_surface_compositor_binding
     struct client_surface_compositor_pool *pool;
     struct client_surface_compositor_queue *queue;
     struct client_surface_handoff_channel *channel;
-    struct client_surface_source_cache sources[CLIENT_SURFACE_HANDOFF_RING_SIZE];
+    struct client_surface_source_cache sources[CLIENT_SURFACE_SOURCE_FRAME_COUNT + 1];
+    unsigned int next_source_cache;
+    struct client_surface_imported_image imports[CLIENT_SURFACE_SOURCE_FRAME_COUNT + 1];
+    struct client_surface_source_read reads[CLIENT_SURFACE_SOURCE_FRAME_COUNT];
+    unsigned int read_count;
+    BOOL import_disabled;
     HWND toplevel;
     HWND window;
     process_id_t process;
