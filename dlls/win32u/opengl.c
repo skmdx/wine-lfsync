@@ -308,12 +308,14 @@ static const char *framebuffer_vertex_shader =
 "    vec2(1.0, 0.0),\n"
 "    vec2(1.0, 1.0)\n"
 ");\n"
+"layout(location = 0) in float flip_y;\n"
 "out vec2 uv;\n"
 "\n"
 "void main(void)\n"
 "{\n"
 "    gl_Position = pos[gl_VertexID];\n"
 "    uv = tex[gl_VertexID];\n"
+"    if (flip_y != 0.0) uv.y = 1.0 - uv.y;\n"
 "}\n"
 ;
 
@@ -423,6 +425,7 @@ struct framebuffer_surface
     UINT64                 storage_bytes;
     struct client_surface_memory_scope memory;
     BOOL                   storage_valid;
+    BOOL                   flipped;
     GLenum                 depth_format;
 };
 
@@ -593,6 +596,8 @@ static void init_framebuffer_attachment( struct opengl_drawable *drawable, GLenu
         break;
     case GL_TEXTURE:
         if (desc->samples) ERR( "Unexpected samples %u\n", desc->samples );
+        if (framebuffer_from_opengl_drawable( drawable )->flipped && internal_format == GL_RGB8)
+            internal_format = GL_RGB;
         funcs->p_glBindTexture( GL_TEXTURE_2D, name );
         funcs->p_glTexImage2D( GL_TEXTURE_2D, 0, internal_format, size.cx, size.cy, 0, format_from_pfd( desc ), GL_BYTE, NULL );
         funcs->p_glTexParameteri( GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0 );
@@ -650,6 +655,8 @@ static GLuint create_framebuffer( struct opengl_drawable *drawable, const struct
     funcs->p_glGenFramebuffers( 1, &fbo );
     if (!fbo) return 0;
     funcs->p_glBindFramebuffer( GL_FRAMEBUFFER, fbo );
+    if (framebuffer_from_opengl_drawable( drawable )->flipped)
+        funcs->p_glFramebufferParameteri( GL_FRAMEBUFFER, GL_FRAMEBUFFER_FLIP_Y_MESA, GL_TRUE );
 
     for (GLuint i = 0; i < count; i++)
     {
@@ -916,6 +923,7 @@ static void blit_framebuffer_surface( struct opengl_drawable *drawable, const SI
         pthread_mutex_unlock( &gamma_lock );
 
         funcs->p_glViewport( 0, 0, dst.cx, dst.cy );
+        funcs->p_glVertexAttrib1f( 0, framebuffer_from_opengl_drawable( drawable )->flipped );
         funcs->p_glDrawArrays( GL_TRIANGLE_STRIP, 0, 4 );
     }
 
@@ -931,7 +939,9 @@ static BOOL blit_framebuffer_surface_checked( struct opengl_drawable *drawable, 
     return display_funcs.p_glGetError() == GL_NO_ERROR;
 }
 
-static BOOL present_framebuffer_surface( struct opengl_drawable *drawable )
+static BOOL isolate_framebuffer_write( struct opengl_drawable *target );
+
+static BOOL present_framebuffer_surface( struct opengl_drawable *drawable, BOOL client_capture )
 {
     struct framebuffer_surface *surface = framebuffer_from_opengl_drawable( drawable );
     struct opengl_drawable *target = surface->target;
@@ -943,7 +953,8 @@ static BOOL present_framebuffer_surface( struct opengl_drawable *drawable )
     {
         if (!is_client_surface_window( target->client, 0 )) return FALSE;
         client_surface_update( target->client );
-        return target->funcs->swap_framebuffer( target, drawable->read_fbo );
+        return target->funcs->swap_framebuffer( target, drawable->read_fbo, surface->flipped,
+                                               client_capture ? isolate_framebuffer_write : NULL );
     }
     if (target->funcs->swap_blit)
     {
@@ -955,12 +966,47 @@ static BOOL present_framebuffer_surface( struct opengl_drawable *drawable )
     return opengl_drawable_swap( target );
 }
 
+static BOOL isolate_framebuffer_write( struct opengl_drawable *target )
+{
+    const struct opengl_funcs *funcs = &display_funcs;
+    GLsync ready;
+
+    if (!(ready = funcs->p_glFenceSync( GL_SYNC_GPU_COMMANDS_COMPLETE, 0 ))) return FALSE;
+    funcs->p_glFlush();
+    if (!make_null_context_current( target ))
+    {
+        funcs->p_glDeleteSync( ready );
+        return FALSE;
+    }
+    funcs->p_glWaitSync( ready, 0, GL_TIMEOUT_IGNORED );
+    funcs->p_glDeleteSync( ready );
+    return TRUE;
+}
+
+static GLenum detach_framebuffer_surface( struct opengl_drawable *drawable, BOOL front_write )
+{
+    struct framebuffer_surface *surface = framebuffer_from_opengl_drawable( drawable );
+    struct opengl_drawable *target = surface->target;
+    GLenum error = GL_NO_ERROR;
+
+    if (target && target->funcs->detach_framebuffer)
+        error = target->funcs->detach_framebuffer( target, drawable->read_fbo, front_write, isolate_framebuffer_write );
+    make_client_context_current();
+    return error;
+}
+
 static void framebuffer_surface_flush( struct opengl_drawable *drawable, UINT flags )
 {
     struct framebuffer_surface *surface = framebuffer_from_opengl_drawable( drawable );
 
     TRACE( "%s, flags %#x\n", debugstr_opengl_drawable( drawable ), flags );
 
+    if ((flags & GL_FLUSH_UPDATED) && framebuffer_surface_needs_resize( drawable ) &&
+        detach_framebuffer_surface( drawable, FALSE ) != GL_NO_ERROR)
+    {
+        surface->storage_valid = FALSE;
+        return;
+    }
     if (flags & (GL_FLUSH_UPDATED | GL_FLUSH_PRESENT)) make_null_context_current( surface->target );
 
     if ((flags & GL_FLUSH_UPDATED) && framebuffer_surface_needs_resize( drawable ))
@@ -1002,7 +1048,7 @@ static void framebuffer_surface_flush( struct opengl_drawable *drawable, UINT fl
 
         if (flags & GL_FLUSH_PRESENT)
         {
-            present_framebuffer_surface( drawable );
+            present_framebuffer_surface( drawable, FALSE );
         }
     }
 
@@ -1013,6 +1059,11 @@ static BOOL framebuffer_surface_swap( struct opengl_drawable *drawable )
 {
     struct framebuffer_surface *surface = framebuffer_from_opengl_drawable( drawable );
     const struct opengl_funcs *funcs = &display_funcs;
+    struct opengl_context *context = NtCurrentTeb()->glContext;
+    BOOL client_capture = surface->flipped && context && get_opengl_thread_data()->client_current &&
+        surface->target && surface->target->funcs->swap_framebuffer &&
+        drawable->read_fbo == drawable->draw_fbo && use_default_gamma_ramp();
+    GLint read_fbo = 0, draw_fbo = 0;
     BOOL ret = TRUE;
 
     TRACE( "%s\n", debugstr_opengl_drawable( drawable ) );
@@ -1022,7 +1073,25 @@ static BOOL framebuffer_surface_swap( struct opengl_drawable *drawable )
         RtlSetLastWin32Error( ERROR_NOT_ENOUGH_MEMORY );
         return FALSE;
     }
-    if (drawable->doublebuffer || surface->target) make_null_context_current( surface->target );
+    if (client_capture)
+    {
+        struct opengl_client_context *client = opengl_client_context_from_client( context->client_context );
+        GLenum error = funcs->p_glGetError();
+
+        if (error)
+        {
+            if (!client->last_error) client->last_error = error;
+            client_capture = FALSE;
+        }
+        else
+        {
+            TRACE( "capturing framebuffer in client context %p\n", context );
+            funcs->p_glGetIntegerv( GL_READ_FRAMEBUFFER_BINDING, &read_fbo );
+            funcs->p_glGetIntegerv( GL_DRAW_FRAMEBUFFER_BINDING, &draw_fbo );
+        }
+    }
+    if (!client_capture && (drawable->doublebuffer || surface->target))
+        make_null_context_current( surface->target );
 
     if (drawable->doublebuffer)
     {
@@ -1062,10 +1131,33 @@ static BOOL framebuffer_surface_swap( struct opengl_drawable *drawable )
 
     if (surface->target)
     {
-        ret = present_framebuffer_surface( drawable );
+        ret = present_framebuffer_surface( drawable, client_capture );
+        if (!ret && detach_framebuffer_surface( drawable, TRUE ) != GL_NO_ERROR)
+        {
+            struct wgl_pixel_format desc = pixel_formats[drawable->format - 1];
+            SIZE empty = {0};
+
+            /* A failed Swap must not leave the previous published front as
+             * the application's next writable back buffer. If preservation
+             * cannot allocate, detach its storage and retry allocation on the
+             * next drawable update, retaining the separately owned image. */
+            make_null_context_current( surface->target );
+            resize_framebuffer( drawable, &desc, drawable->draw_fbo, empty );
+            if (drawable->read_fbo != drawable->draw_fbo)
+            {
+                desc.samples = desc.sample_buffers = 0;
+                resize_framebuffer( drawable, &desc, drawable->read_fbo, empty );
+            }
+            surface->storage_valid = FALSE;
+        }
     }
 
     make_client_context_current();
+    if (client_capture)
+    {
+        funcs->p_glBindFramebuffer( GL_READ_FRAMEBUFFER, read_fbo );
+        funcs->p_glBindFramebuffer( GL_DRAW_FRAMEBUFFER, draw_fbo );
+    }
 
     return ret;
 }
@@ -1118,6 +1210,26 @@ static struct opengl_drawable *framebuffer_surface_create( int format, struct cl
         return NULL;
     }
 
+    if (target && target->funcs->swap_framebuffer && display_funcs.p_glGetStringi &&
+        display_funcs.p_glFramebufferParameteri && display_funcs.p_glCopyImageSubData)
+    {
+        GLint count;
+        BOOL flip = FALSE, copy = FALSE;
+
+        display_funcs.p_glGetIntegerv( GL_NUM_EXTENSIONS, &count );
+        for (GLint i = 0; i < count; ++i)
+        {
+            const char *extension = (const char *)display_funcs.p_glGetStringi( GL_EXTENSIONS, i );
+
+            flip |= !strcmp( extension, "GL_MESA_framebuffer_flip_y" );
+            copy |= !strcmp( extension, "GL_ARB_copy_image" );
+        }
+        surface->flipped = flip && copy && !draw_desc.samples && !surface->base.stereo &&
+            !(draw_desc.pfd.dwFlags & (PFD_SWAP_COPY | PFD_SWAP_EXCHANGE)) &&
+            draw_desc.pfd.cRedBits == 8 && draw_desc.pfd.cGreenBits == 8 &&
+            draw_desc.pfd.cBlueBits == 8;
+        TRACE( "snapshot copy capabilities flip %u copy %u flipped %u\n", flip, copy, surface->flipped );
+    }
     surface->depth_format = draw_desc.pfd.cDepthBits ? depth_format_from_pfd( &draw_desc ) : 0;
     if (target && draw_desc.pfd.cDepthBits == 32 && !draw_desc.pfd.cStencilBits)
     {
@@ -3206,7 +3318,7 @@ static GLenum win32u_context_enable_framebuffer( struct opengl_context *context 
     GLsync ready;
     GLenum error;
 
-    if (source->draw_fbo) return GL_NO_ERROR;
+    if (source->draw_fbo) return detach_framebuffer_surface( source, TRUE );
     if (!source->client || !source->doublebuffer || context != NtCurrentTeb()->glContext)
         return GL_INVALID_OPERATION;
     /* The copy runs in the shared internal context. Queue a GPU dependency on

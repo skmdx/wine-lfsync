@@ -215,6 +215,9 @@ struct gl_drawable
     BOOL                           memory_registered;
     LONG64                         egl_geometry_epoch; /* last native target observed by EGL */
     struct glx_completion_context *completion;
+    struct x11drv_client_snapshot *render_snapshot;
+    GLuint render_texture;
+    BOOL framebuffer_private;
 };
 
 static struct gl_drawable *impl_from_opengl_drawable( struct opengl_drawable *base )
@@ -340,6 +343,7 @@ static const struct opengl_funcs *funcs;
 static PFN_eglCreateImageKHR snapshot_create_image;
 static PFN_eglDestroyImageKHR snapshot_destroy_image;
 static PFN_glEGLImageTargetRenderbufferStorageOES snapshot_bind_image;
+static PFN_glEGLImageTargetTexture2DOES snapshot_bind_texture;
 static PFN_eglCreateSyncKHR snapshot_create_sync;
 static PFN_eglDestroySyncKHR snapshot_destroy_sync;
 static PFN_eglClientWaitSyncKHR snapshot_wait_sync;
@@ -549,6 +553,7 @@ static void init_snapshot_image_funcs(void)
     snapshot_create_image = (void *)funcs->p_eglGetProcAddress( "eglCreateImageKHR" );
     snapshot_destroy_image = (void *)funcs->p_eglGetProcAddress( "eglDestroyImageKHR" );
     snapshot_bind_image = (void *)funcs->p_eglGetProcAddress( "glEGLImageTargetRenderbufferStorageOES" );
+    snapshot_bind_texture = (void *)funcs->p_eglGetProcAddress( "glEGLImageTargetTexture2DOES" );
     if (has_extension( funcs->p_eglQueryString( egl->display, EGL_EXTENSIONS ), "EGL_KHR_fence_sync" ))
     {
         snapshot_create_sync = (void *)funcs->p_eglGetProcAddress( "eglCreateSyncKHR" );
@@ -2092,6 +2097,186 @@ static const struct x11drv_client_snapshot_image_ops snapshot_image_ops =
     release_snapshot_image,
 };
 
+static struct egl_snapshot_image *import_snapshot_image( struct x11drv_client_snapshot *snapshot, EGLint *error )
+{
+    static const EGLint attribs[] = {EGL_IMAGE_PRESERVED_KHR, EGL_TRUE, EGL_NONE};
+    struct egl_snapshot_image *image = x11drv_client_snapshot_get_image( snapshot );
+    struct client_surface_memory_scope memory = {0};
+    Pixmap pixmap = x11drv_client_snapshot_pixmap( snapshot );
+    SIZE size = x11drv_client_snapshot_size( snapshot );
+
+    if (image) return image;
+    *error = EGL_BAD_ALLOC;
+    client_surface_memory_scope_copy( &memory, x11drv_client_snapshot_memory( snapshot ), TRUE );
+    if (!(image = client_surface_alloc_scoped_metadata( &memory, 1, sizeof(*image) )))
+    {
+        client_surface_memory_scope_destroy( &memory );
+        return NULL;
+    }
+    image->memory = memory;
+    image->image = snapshot_create_image( egl->display, EGL_NO_CONTEXT, EGL_NATIVE_PIXMAP_KHR,
+                                          (EGLClientBuffer)pixmap, attribs );
+    if (!image->image)
+    {
+        *error = funcs->p_eglGetError();
+        TRACE_(csperf)( "ticks=%llu event=gpu_snapshot_import_failed pixmap=%lx error=%#x\n",
+                       client_surface_perf_time(), pixmap, *error );
+        client_surface_free_owned_metadata( &image->memory, image, sizeof(*image) );
+        return NULL;
+    }
+    x11drv_client_snapshot_set_image( snapshot, image, &snapshot_image_ops );
+    TRACE( "imported EGL source pixmap %#lx size %ux%u\n", pixmap, (unsigned int)size.cx, (unsigned int)size.cy );
+    return image;
+}
+
+/* Transfer rendered storage only after selecting a distinct writable image
+ * for the next back buffer. Front writes first detach both logical buffers. */
+static BOOL rotate_render_snapshot( struct opengl_drawable *base, struct client_surface_frame *present,
+                                    GLuint framebuffer, struct x11drv_client_snapshot **capture,
+                                    struct egl_snapshot_image **capture_image, BOOL *direct_image )
+{
+    struct gl_drawable *gl = impl_from_opengl_drawable( base );
+    struct x11drv_client_snapshot *next = NULL;
+    struct egl_snapshot_image *next_image;
+    GLint read_fbo, texture, front, back, type, format;
+    EGLint error;
+    BOOL direct = FALSE, success = TRUE;
+    SIZE size;
+
+    funcs->p_glGetIntegerv( GL_READ_FRAMEBUFFER_BINDING, &read_fbo );
+    funcs->p_glGetIntegerv( GL_TEXTURE_BINDING_2D, &texture );
+    funcs->p_glBindFramebuffer( GL_READ_FRAMEBUFFER, framebuffer );
+    funcs->p_glGetFramebufferAttachmentParameteriv( GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                                                    GL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE, &type );
+    if (type != GL_TEXTURE) goto done;
+    funcs->p_glGetFramebufferAttachmentParameteriv( GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                                                    GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME, &front );
+    funcs->p_glGetFramebufferAttachmentParameteriv( GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT1,
+                                                    GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME, &back );
+    if (!front || !back) goto done;
+    funcs->p_glBindTexture( GL_TEXTURE_2D, front );
+    funcs->p_glGetTexLevelParameteriv( GL_TEXTURE_2D, 0, GL_TEXTURE_INTERNAL_FORMAT, &format );
+    size = gl->render_snapshot ? x11drv_client_snapshot_size( gl->render_snapshot ) : (SIZE){0};
+    direct = gl->render_snapshot && gl->render_texture == front &&
+             size.cx == base->virtual_size.cx && size.cy == base->virtual_size.cy;
+    if (format != GL_RGB && format != GL_RGB8 && !direct) goto done;
+    if (direct)
+    {
+        next = *capture;
+        next_image = *capture_image;
+    }
+    else
+    {
+        if (!x11drv_client_snapshot_prepare_storage( &next, x11drv_client_snapshot_memory( *capture ),
+                base->virtual_size.cx, base->virtual_size.cy, default_visual.depth )) goto failed;
+        if (!(next_image = import_snapshot_image( next, &error ))) goto failed;
+    }
+    funcs->p_glBindTexture( GL_TEXTURE_2D, back );
+    snapshot_bind_texture( GL_TEXTURE_2D, next_image->image );
+    if (funcs->p_glGetError() != GL_NO_ERROR) goto failed;
+    if (direct)
+    {
+        *capture = gl->render_snapshot;
+        *capture_image = x11drv_client_snapshot_get_image( *capture );
+        present->capture.context = *capture;
+    }
+    else x11drv_client_snapshot_release( gl->render_snapshot );
+    gl->render_snapshot = next;
+    gl->render_texture = back;
+    *direct_image = direct;
+    goto done;
+failed:
+    if (!direct) x11drv_client_snapshot_release( next );
+    success = FALSE;
+done:
+    funcs->p_glBindTexture( GL_TEXTURE_2D, texture );
+    funcs->p_glBindFramebuffer( GL_READ_FRAMEBUFFER, read_fbo );
+    return success;
+}
+
+static GLenum x11drv_egl_surface_detach_framebuffer( struct opengl_drawable *base, GLuint framebuffer,
+                                                    BOOL front_write, opengl_drawable_isolate_func isolate )
+{
+    struct gl_drawable *gl = impl_from_opengl_drawable( base );
+    struct client_surface_memory_scope memory = {0};
+    GLuint old[2] = {0}, replacement[2] = {0};
+    GLint read_fbo, texture, format, width[2], height[2];
+    UINT64 bytes = 0;
+    GLenum error = GL_NO_ERROR;
+
+    if (!gl->render_snapshot)
+    {
+        gl->framebuffer_private |= front_write;
+        return GL_NO_ERROR;
+    }
+    if (isolate && !isolate( base )) return GL_INVALID_OPERATION;
+    funcs->p_glGetIntegerv( GL_READ_FRAMEBUFFER_BINDING, &read_fbo );
+    funcs->p_glGetIntegerv( GL_TEXTURE_BINDING_2D, &texture );
+    funcs->p_glBindFramebuffer( GL_READ_FRAMEBUFFER, framebuffer );
+    for (unsigned int i = 0; i < ARRAY_SIZE(old); ++i)
+    {
+        funcs->p_glGetFramebufferAttachmentParameteriv( GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0 + i,
+                                                        GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME, (GLint *)&old[i] );
+        funcs->p_glBindTexture( GL_TEXTURE_2D, old[i] );
+        funcs->p_glGetTexLevelParameteriv( GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH, &width[i] );
+        funcs->p_glGetTexLevelParameteriv( GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT, &height[i] );
+        bytes += (UINT64)width[i] * height[i] * 4;
+    }
+    if (!client_surface_memory_scope_init( &memory, base->client->hwnd, 0 ) ||
+        !client_surface_reserve_scoped_memory( &memory, CLIENT_SURFACE_MEMORY_STAGING, bytes ))
+    {
+        error = GL_OUT_OF_MEMORY;
+        goto done;
+    }
+    funcs->p_glGenTextures( ARRAY_SIZE(replacement), replacement );
+    for (unsigned int i = 0; i < ARRAY_SIZE(old); ++i)
+    {
+        funcs->p_glBindTexture( GL_TEXTURE_2D, old[i] );
+        funcs->p_glGetTexLevelParameteriv( GL_TEXTURE_2D, 0, GL_TEXTURE_INTERNAL_FORMAT, &format );
+        funcs->p_glBindTexture( GL_TEXTURE_2D, replacement[i] );
+        funcs->p_glTexImage2D( GL_TEXTURE_2D, 0, format, width[i], height[i], 0, GL_RGB, GL_UNSIGNED_BYTE, NULL );
+        funcs->p_glTexParameteri( GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0 );
+        /* Recovery after an allocation failure may already have discarded
+         * the attachment storage. Empty textures are incomplete and cannot
+         * be copy-image operands, even for a zero-sized copy. */
+        if (width[i] && height[i])
+            funcs->p_glCopyImageSubData( old[i], GL_TEXTURE_2D, 0, 0, 0, 0,
+                                       replacement[i], GL_TEXTURE_2D, 0, 0, 0, 0, width[i], height[i], 1 );
+    }
+    /* This rare transition leaves no GPU reader borrowing the old draw
+     * storage when its lease and temporary storage charge are released. */
+    funcs->p_glFinish();
+    error = funcs->p_glGetError();
+    if (!error)
+    {
+        for (unsigned int i = 0; i < ARRAY_SIZE(old); ++i)
+            funcs->p_glFramebufferTexture( GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0 + i, replacement[i], 0 );
+        if ((error = funcs->p_glGetError()))
+        {
+            for (unsigned int i = 0; i < ARRAY_SIZE(old); ++i)
+                funcs->p_glFramebufferTexture( GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0 + i, old[i], 0 );
+            goto release_charge;
+        }
+        funcs->p_glDeleteTextures( ARRAY_SIZE(old), old );
+        for (unsigned int i = 0; i < ARRAY_SIZE(old); ++i)
+            if (texture == old[i]) texture = 0;
+        memset( replacement, 0, sizeof(replacement) );
+        x11drv_client_snapshot_release( gl->render_snapshot );
+        gl->render_snapshot = NULL;
+        gl->render_texture = 0;
+        gl->framebuffer_private |= front_write;
+        TRACE( "detached native framebuffer %u for %s\n", framebuffer, front_write ? "front write" : "resize" );
+    }
+release_charge:
+    client_surface_release_scoped_memory( &memory, CLIENT_SURFACE_MEMORY_STAGING, bytes );
+done:
+    funcs->p_glDeleteTextures( ARRAY_SIZE(replacement), replacement );
+    funcs->p_glBindTexture( GL_TEXTURE_2D, texture );
+    funcs->p_glBindFramebuffer( GL_READ_FRAMEBUFFER, read_fbo );
+    client_surface_memory_scope_destroy( &memory );
+    return error;
+}
+
 static struct egl_snapshot_completion *prepare_snapshot_completion( struct egl_snapshot_image *image )
 {
     struct egl_snapshot_completion *completion = image->pending;
@@ -2129,14 +2314,15 @@ enum client_surface_gpu_snapshot_result
     GPU_SNAPSHOT_PENDING,
 };
 
-/* Runs in the FBO wrapper's internal context, after its color/gamma blit.
+/* Image copies may use the application context. Other capture operations
+ * must first isolate themselves from application GL state.
  * RETRY rejects this frame before a GPU write; a later presentation can try
  * again. PENDING transfers the exact fence to both the image and completion.
  * Neither outcome permits a CPU overwrite of the capture storage. */
 static enum client_surface_gpu_snapshot_result snapshot_client_surface_gpu( struct opengl_drawable *base,
-                                        struct client_surface_frame *present, GLuint source_framebuffer )
+                                        struct client_surface_frame *present, GLuint source_framebuffer, BOOL flipped,
+                                        opengl_drawable_isolate_func isolate )
 {
-    static const EGLint attribs[] = {EGL_IMAGE_PRESERVED_KHR, EGL_TRUE, EGL_NONE};
     struct x11drv_client_snapshot *snapshot;
     struct egl_snapshot_completion *completion = NULL;
     struct egl_snapshot_image *image;
@@ -2145,7 +2331,9 @@ static enum client_surface_gpu_snapshot_result snapshot_client_surface_gpu( stru
     GLint read_fbo, draw_fbo, read_buffer, renderbuffer;
     GLuint fbo = 0, buffer = 0;
     GLboolean scissor, srgb;
+    BOOL copy_image = FALSE, direct_image = FALSE, new_image;
     GLenum status, error;
+    EGLint import_error;
     Pixmap pixmap;
     enum client_surface_gpu_snapshot_result ret = GPU_SNAPSHOT_RETRY;
     unsigned long long begin = TRACE_ON(csperf) ? client_surface_perf_time() : 0;
@@ -2161,35 +2349,20 @@ static enum client_surface_gpu_snapshot_result snapshot_client_surface_gpu( stru
         return GPU_SNAPSHOT_COMPLETE;
     }
     if (!(snapshot = x11drv_client_surface_prepare_gpu_snapshot( base->client, present ))) return GPU_SNAPSHOT_RETRY;
-    pixmap = x11drv_client_snapshot_pixmap( snapshot );
-    if (!(image = x11drv_client_snapshot_get_image( snapshot )))
+    new_image = !x11drv_client_snapshot_get_image( snapshot );
+    if (!(image = import_snapshot_image( snapshot, &import_error )))
     {
-        struct client_surface_memory_scope memory = {0};
-
-        client_surface_memory_scope_copy( &memory, x11drv_client_snapshot_memory( snapshot ), TRUE );
-        if (!(image = client_surface_alloc_scoped_metadata( &memory, 1, sizeof(*image) )))
-        {
-            client_surface_memory_scope_destroy( &memory );
-            return GPU_SNAPSHOT_RETRY;
-        }
-        image->memory = memory;
-        image->image = snapshot_create_image( egl->display, EGL_NO_CONTEXT, EGL_NATIVE_PIXMAP_KHR,
-                                               (EGLClientBuffer)pixmap, attribs );
-        if (!image->image)
-        {
-            EGLint error = funcs->p_eglGetError();
-
-            WARN( "Failed to import EGL source pixmap %#lx, error %#x\n", pixmap, error );
-            TRACE_(csperf)( "ticks=%llu event=gpu_snapshot_import_failed pixmap=%lx error=%#x\n",
-                           client_surface_perf_time(), pixmap, error );
-            client_surface_free_owned_metadata( &image->memory, image, sizeof(*image) );
-            release_opengl_capture( present );
-            return error == EGL_BAD_ALLOC || error == EGL_BAD_ACCESS ? GPU_SNAPSHOT_RETRY : GPU_SNAPSHOT_FAILED;
-        }
-        x11drv_client_snapshot_set_image( snapshot, image, &snapshot_image_ops );
-        TRACE( "imported EGL source pixmap %#lx size %ux%u from visual %#lx to %#lx\n",
-               pixmap, source->width, source->height, surface->source_visual, default_visual.visualid );
+        release_opengl_capture( present );
+        return import_error == EGL_BAD_ALLOC || import_error == EGL_BAD_ACCESS ? GPU_SNAPSHOT_RETRY : GPU_SNAPSHOT_FAILED;
     }
+    if (new_image)
+        TRACE( "imported EGL source pixmap %#lx size %ux%u from visual %#lx to %#lx\n",
+               x11drv_client_snapshot_pixmap( snapshot ), source->width, source->height,
+               surface->source_visual, default_visual.visualid );
+    if (flipped && source_framebuffer && snapshot_bind_texture && !impl_from_opengl_drawable( base )->framebuffer_private)
+        if (!rotate_render_snapshot( base, present, source_framebuffer, &snapshot, &image, &direct_image ))
+            return GPU_SNAPSHOT_RETRY;
+    pixmap = x11drv_client_snapshot_pixmap( snapshot );
     imported = begin ? client_surface_perf_time() : 0;
     if (funcs->p_glGetError() != GL_NO_ERROR) return GPU_SNAPSHOT_FAILED;
     /* Reserve completion ownership before issuing the private GPU write.
@@ -2197,6 +2370,7 @@ static enum client_surface_gpu_snapshot_result snapshot_client_surface_gpu( stru
      * into a caller-side glFinish after the copy has already been submitted. */
     if (snapshot_create_sync && snapshot_destroy_sync && snapshot_wait_sync &&
         !(completion = prepare_snapshot_completion( image ))) return GPU_SNAPSHOT_RETRY;
+bind:
     funcs->p_glGetIntegerv( GL_READ_FRAMEBUFFER_BINDING, &read_fbo );
     funcs->p_glGetIntegerv( GL_DRAW_FRAMEBUFFER_BINDING, &draw_fbo );
     funcs->p_glGetIntegerv( GL_RENDERBUFFER_BINDING, &renderbuffer );
@@ -2204,9 +2378,66 @@ static enum client_surface_gpu_snapshot_result snapshot_client_surface_gpu( stru
     srgb = funcs->p_glIsEnabled( GL_FRAMEBUFFER_SRGB );
     funcs->p_glBindFramebuffer( GL_READ_FRAMEBUFFER, source_framebuffer );
     funcs->p_glGetIntegerv( GL_READ_BUFFER, &read_buffer );
-    funcs->p_glGenRenderbuffers( 1, &buffer );
+    if (direct_image)
+    {
+        blit = begin ? client_surface_perf_time() : 0;
+        goto copied;
+    }
+    if (!buffer) funcs->p_glGenRenderbuffers( 1, &buffer );
     funcs->p_glBindRenderbuffer( GL_RENDERBUFFER, buffer );
     snapshot_bind_image( GL_RENDERBUFFER, image->image );
+    if (flipped && source_framebuffer && funcs->p_glCopyImageSubData)
+    {
+        GLint type, name, texture, source_format, destination_format;
+
+        funcs->p_glGetFramebufferAttachmentParameteriv( GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+            GL_FRAMEBUFFER_ATTACHMENT_OBJECT_TYPE, &type );
+        if (type == GL_TEXTURE)
+        {
+            funcs->p_glGetFramebufferAttachmentParameteriv( GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME, &name );
+            funcs->p_glGetIntegerv( GL_TEXTURE_BINDING_2D, &texture );
+            funcs->p_glBindTexture( GL_TEXTURE_2D, name );
+            funcs->p_glGetTexLevelParameteriv( GL_TEXTURE_2D, 0, GL_TEXTURE_INTERNAL_FORMAT, &source_format );
+            funcs->p_glBindTexture( GL_TEXTURE_2D, texture );
+            funcs->p_glGetRenderbufferParameteriv( GL_RENDERBUFFER, GL_RENDERBUFFER_INTERNAL_FORMAT, &destination_format );
+            if (destination_format == GL_RGB)
+            {
+                GLint red, green, blue, alpha;
+
+                funcs->p_glGetRenderbufferParameteriv( GL_RENDERBUFFER, GL_RENDERBUFFER_RED_SIZE, &red );
+                funcs->p_glGetRenderbufferParameteriv( GL_RENDERBUFFER, GL_RENDERBUFFER_GREEN_SIZE, &green );
+                funcs->p_glGetRenderbufferParameteriv( GL_RENDERBUFFER, GL_RENDERBUFFER_BLUE_SIZE, &blue );
+                funcs->p_glGetRenderbufferParameteriv( GL_RENDERBUFFER, GL_RENDERBUFFER_ALPHA_SIZE, &alpha );
+                if (red != 8 || green != 8 || blue != 8 || alpha) destination_format = GL_NONE;
+            }
+            TRACE( "snapshot copy formats source %#x destination %#x\n", source_format, destination_format );
+            if (source_format == GL_RGB && destination_format == GL_RGB)
+            {
+                blit = begin ? client_surface_perf_time() : 0;
+                funcs->p_glCopyImageSubData( name, GL_TEXTURE_2D, 0, 0, 0, 0,
+                    buffer, GL_RENDERBUFFER, 0, 0, 0, 0, source->width, source->height, 1 );
+                copy_image = TRUE;
+                goto copied;
+            }
+        }
+    }
+    if (isolate)
+    {
+        /* Restore application bindings before changing context. Renderbuffer
+         * storage is shared, but bindings belong to the current context. */
+        funcs->p_glBindRenderbuffer( GL_RENDERBUFFER, renderbuffer );
+        funcs->p_glBindFramebuffer( GL_READ_FRAMEBUFFER, read_fbo );
+        if (!isolate( base ))
+        {
+            ret = GPU_SNAPSHOT_FAILED;
+            funcs->p_glBindFramebuffer( GL_READ_FRAMEBUFFER, source_framebuffer );
+            goto done;
+        }
+        TRACE( "isolated snapshot format fallback\n" );
+        isolate = NULL;
+        goto bind;
+    }
     funcs->p_glGenFramebuffers( 1, &fbo );
     funcs->p_glBindFramebuffer( GL_DRAW_FRAMEBUFFER, fbo );
     funcs->p_glFramebufferRenderbuffer( GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, buffer );
@@ -2227,7 +2458,10 @@ static enum client_surface_gpu_snapshot_result snapshot_client_surface_gpu( stru
     blit = begin ? client_surface_perf_time() : 0;
     funcs->p_glBlitFramebuffer( 0, 0, source->width, source->height, 0, source->height, source->width, 0,
                                 GL_COLOR_BUFFER_BIT, GL_NEAREST );
-    ret = funcs->p_glGetError() == GL_NO_ERROR ? GPU_SNAPSHOT_COMPLETE : GPU_SNAPSHOT_FAILED;
+copied:
+    error = funcs->p_glGetError();
+    if (error) WARN( "Snapshot image copy %u failed with GL error %#x\n", copy_image, error );
+    ret = error == GL_NO_ERROR ? GPU_SNAPSHOT_COMPLETE : GPU_SNAPSHOT_FAILED;
     copied = begin ? client_surface_perf_time() : 0;
     /* Keep the source's fence reference even if the common completion times
      * out or discards a stale scene. Storage preparation refuses reuse until
@@ -2286,12 +2520,12 @@ done:
      * queueing from native readiness; they are not GPU execution timestamps. */
     TRACE_(csperf)( "ticks=%llu event=gpu_snapshot identity=%s control=%s target_epoch=%s "
                    "begin=%llu imported=%llu blit=%llu copied=%llu flushed=%llu "
-                   "width=%u height=%u pixmap=%lx fence=%u result=%d outcome=%u\n", client_surface_perf_time(),
+                   "width=%u height=%u pixmap=%lx fence=%u result=%d outcome=%u copy_image=%u direct_image=%u\n", client_surface_perf_time(),
                    wine_dbgstr_longlong( __atomic_load_n( &base->client->identity, __ATOMIC_ACQUIRE ) ),
                    wine_dbgstr_longlong( present->handoff_control ), wine_dbgstr_longlong( present->target_epoch ),
                    begin, imported, blit, copied, flushed, source->width, source->height,
                    pixmap, !!present->completion.wait,
-                   ret == GPU_SNAPSHOT_COMPLETE || ret == GPU_SNAPSHOT_PENDING ? 1 : -1, ret );
+                   ret == GPU_SNAPSHOT_COMPLETE || ret == GPU_SNAPSHOT_PENDING ? 1 : -1, ret, copy_image, direct_image );
     return ret;
 }
 
@@ -2300,6 +2534,7 @@ static void x11drv_egl_surface_destroy( struct opengl_drawable *base )
     struct gl_drawable *gl = impl_from_opengl_drawable( base );
 
     TRACE( "drawable %s\n", debugstr_opengl_drawable( base ) );
+    x11drv_client_snapshot_release( gl->render_snapshot );
     if (gl->memory_registered) x11drv_client_surface_release_gl_memory( impl_from_client_surface( base->client ) );
 }
 
@@ -2474,7 +2709,8 @@ static BOOL refresh_prepared_egl_surface( struct opengl_drawable *base,
 }
 
 static BOOL x11drv_egl_surface_present( struct opengl_drawable *base, GLuint framebuffer,
-                                       struct opengl_drawable *source, opengl_drawable_blit_func blit )
+                                       struct opengl_drawable *source, opengl_drawable_blit_func blit, BOOL flipped,
+                                       opengl_drawable_isolate_func isolate )
 {
     struct egl_present_completion *completion = NULL;
     struct gl_drawable *gl = impl_from_opengl_drawable( base );
@@ -2504,6 +2740,18 @@ static BOOL x11drv_egl_surface_present( struct opengl_drawable *base, GLuint fra
         frame_id = 0;
     }
     client_surface_begin_present( base->client, 1 );
+    if (isolate && !(present.handoff_control && surface->direct_snapshot && !present.direct_snapshot &&
+                    present.completion.kind == CLIENT_SURFACE_COMPLETION_EXACT))
+    {
+        if (!isolate( base ))
+        {
+            client_surface_submit_present( base->client, &present );
+            complete_opengl_present( base->client, &present, FALSE, FALSE, expected_size, 0 );
+            return FALSE;
+        }
+        TRACE( "isolated prepared framebuffer fallback\n" );
+        isolate = NULL;
+    }
     if (frame_id && !(completion = client_surface_alloc_scoped_metadata( &surface->memory, 1, sizeof(*completion) )))
     {
         client_surface_submit_present( base->client, &present );
@@ -2537,7 +2785,7 @@ static BOOL x11drv_egl_surface_present( struct opengl_drawable *base, GLuint fra
         BOOL copied;
 
         if (present.handoff_control)
-            gpu = snapshot_client_surface_gpu( base, &present, framebuffer );
+            gpu = snapshot_client_surface_gpu( base, &present, framebuffer, flipped, isolate );
         copied = gpu == GPU_SNAPSHOT_COMPLETE || gpu == GPU_SNAPSHOT_PENDING ||
                  (gpu == GPU_SNAPSHOT_UNSUPPORTED && snapshot_client_surface( base, &present, framebuffer,
                                                     framebuffer ? GL_COLOR_ATTACHMENT0 : GL_BACK ));
@@ -2606,18 +2854,31 @@ static BOOL x11drv_egl_surface_present( struct opengl_drawable *base, GLuint fra
 
 static BOOL x11drv_egl_surface_swap( struct opengl_drawable *base )
 {
-    return x11drv_egl_surface_present( base, 0, NULL, NULL );
+    return x11drv_egl_surface_present( base, 0, NULL, NULL, FALSE, NULL );
 }
 
-static BOOL x11drv_egl_surface_swap_framebuffer( struct opengl_drawable *base, GLuint framebuffer )
+static BOOL x11drv_egl_surface_swap_framebuffer( struct opengl_drawable *base, GLuint framebuffer, BOOL flipped,
+                                               opengl_drawable_isolate_func isolate )
 {
-    return x11drv_egl_surface_present( base, framebuffer, NULL, NULL );
+    struct gl_drawable *gl = impl_from_opengl_drawable( base );
+    struct x11drv_client_snapshot *rendered = gl->render_snapshot;
+    BOOL ret = x11drv_egl_surface_present( base, framebuffer, NULL, NULL, flipped, isolate );
+
+    /* A superseded frame or CPU fallback can succeed without rotating the
+     * native back storage. The generic FBO has already swapped attachments;
+     * its next back may still be owned by a published image. */
+    if (ret && rendered && gl->render_snapshot == rendered)
+        ret = x11drv_egl_surface_detach_framebuffer( base, framebuffer, FALSE, isolate ) == GL_NO_ERROR;
+    return ret;
 }
 
 static BOOL x11drv_egl_surface_swap_blit( struct opengl_drawable *base, struct opengl_drawable *source,
                                           opengl_drawable_blit_func blit )
 {
-    return x11drv_egl_surface_present( base, 0, source, blit );
+    if (impl_from_opengl_drawable( base )->render_snapshot &&
+        x11drv_egl_surface_detach_framebuffer( base, source->read_fbo, FALSE, NULL ) != GL_NO_ERROR)
+        return FALSE;
+    return x11drv_egl_surface_present( base, 0, source, blit, FALSE, NULL );
 }
 
 static struct opengl_driver_funcs x11drv_driver_funcs =
@@ -2663,6 +2924,7 @@ static const struct opengl_drawable_funcs x11drv_egl_snapshot_surface_funcs =
     .flush = x11drv_egl_surface_flush,
     .swap = x11drv_egl_surface_swap,
     .swap_framebuffer = x11drv_egl_surface_swap_framebuffer,
+    .detach_framebuffer = x11drv_egl_surface_detach_framebuffer,
     .swap_blit = x11drv_egl_surface_swap_blit,
 };
 

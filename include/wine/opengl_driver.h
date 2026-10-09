@@ -119,7 +119,7 @@ struct __GLsync
 #include "wine/gdi_driver.h"
 
 /* Wine internal opengl driver version, needs to be bumped upon opengl_funcs changes. */
-#define WINE_OPENGL_DRIVER_VERSION 44
+#define WINE_OPENGL_DRIVER_VERSION 46
 
 struct opengl_drawable;
 
@@ -220,6 +220,7 @@ struct egl_platform
 };
 
 typedef BOOL (*opengl_drawable_blit_func)( struct opengl_drawable *source, const SIZE *destination );
+typedef BOOL (*opengl_drawable_isolate_func)( struct opengl_drawable *target );
 
 struct opengl_drawable_funcs
 {
@@ -229,8 +230,15 @@ struct opengl_drawable_funcs
     /* swap and present the drawable buffers, called from render thread */
     BOOL (*swap)( struct opengl_drawable *iface );
     /* Optional presentation of COLOR_ATTACHMENT0 from a resolved internal FBO.
-     * Called in the internal context, with default gamma and virtual dimensions. */
-    BOOL (*swap_framebuffer)( struct opengl_drawable *iface, GLuint framebuffer );
+     * With isolate, only state-independent image copies may use the current
+     * application context. Call isolate before blits, readback or native swaps.
+     * Without isolate the internal context is already current. */
+    BOOL (*swap_framebuffer)( struct opengl_drawable *iface, GLuint framebuffer, BOOL flipped,
+                             opengl_drawable_isolate_func isolate );
+    /* Preserve the logical buffers in private storage before front writes or
+     * storage replacement. The callback orders prior GL work and isolates state. */
+    GLenum (*detach_framebuffer)( struct opengl_drawable *iface, GLuint framebuffer, BOOL front_write,
+                                  opengl_drawable_isolate_func isolate );
     /* Optional generic framebuffer presentation. Invoke blit synchronously in
      * the current internal context, after preparing the native target and
      * choosing its output extent. The source and callback are borrowed only

@@ -882,6 +882,23 @@ static enum buffer_mask buffer_mask_from_enum( GLenum buffer )
     }
 }
 
+static BOOL prepare_front_buffer_write( TEB *teb, struct opengl_context *ctx,
+                                       struct opengl_drawable *draw, GLenum buffer )
+{
+    const struct opengl_funcs *funcs = teb->glTable;
+    GLint current = -1;
+    GLenum error;
+
+    if (!draw->draw_fbo || !(buffer_mask_from_enum( buffer ) & MASK_FRONT)) return TRUE;
+    /* Buffer selection is invalid during Begin/End. Do not move storage
+     * before the native query has established that this call may proceed. */
+    funcs->p_glGetIntegerv( GL_DRAW_BUFFER, &current );
+    if (current == -1) return FALSE;
+    if (!(error = funcs->p_context_enable_framebuffer( ctx ))) return TRUE;
+    set_gl_error( teb, error );
+    return FALSE;
+}
+
 static BOOL context_draws_back( struct opengl_context *ctx )
 {
     for (int i = 0; i < ARRAY_SIZE(ctx->draw_buffers); i++)
@@ -1309,6 +1326,9 @@ static const GLenum *set_default_fbo_draw_buffers( TEB *teb, struct opengl_conte
         set_default_fbo_buffers( teb, ctx );
     }
 
+    for (GLsizei i = 0; i < count; ++i)
+        if (!prepare_front_buffer_write( teb, ctx, draw, src[i] )) return NULL;
+
     memset( ctx->draw_buffers, 0, sizeof(ctx->draw_buffers) );
     for (GLsizei i = 0; i < count; i++)
     {
@@ -1362,18 +1382,21 @@ void wrap_glNamedFramebufferDrawBuffers( TEB *teb, GLuint fbo, GLsizei n, const 
     p_glNamedFramebufferDrawBuffers( fbo, n, bufs );
 }
 
-static GLenum set_default_fbo_draw_buffer( struct opengl_context *ctx, struct opengl_drawable *draw, GLint src )
+static BOOL set_default_fbo_draw_buffer( TEB *teb, struct opengl_context *ctx, struct opengl_drawable *draw,
+                                        GLenum src, GLenum *dst )
 {
-    GLenum dst = drawable_buffer_from_buffer( draw, src );
-    if (src && !dst)
+    *dst = drawable_buffer_from_buffer( draw, src );
+    if (src && !*dst)
     {
         WARN( "Invalid draw buffer %#x for context %p\n", src, ctx );
-        return src;
+        *dst = src;
+        return TRUE;
     }
+    if (!prepare_front_buffer_write( teb, ctx, draw, src )) return FALSE;
     memset( ctx->draw_buffers, 0, sizeof(ctx->draw_buffers) );
     ctx->draw_buffers[0] = src;
     ctx->draw_buffer_count = 0;
-    return dst;
+    return TRUE;
 }
 
 void wrap_glDrawBuffer( TEB *teb, GLenum buf, PFN_glDrawBuffer p_glDrawBuffer )
@@ -1382,7 +1405,7 @@ void wrap_glDrawBuffer( TEB *teb, GLenum buf, PFN_glDrawBuffer p_glDrawBuffer )
     struct opengl_context *ctx;
 
     if ((ctx = get_current_context( teb, &draw, NULL, NULL )) && !ctx->draw_fbo)
-        buf = set_default_fbo_draw_buffer( ctx, draw, buf );
+        if (!set_default_fbo_draw_buffer( teb, ctx, draw, buf, &buf )) return;
 
     p_glDrawBuffer( buf );
 }
@@ -1394,7 +1417,7 @@ void wrap_glFramebufferDrawBufferEXT( TEB *teb, GLuint fbo, GLenum mode, PFN_glF
 
     if ((ctx = get_current_context( teb, &draw, NULL, NULL )) && !fbo)
     {
-        mode = set_default_fbo_draw_buffer( ctx, draw, mode );
+        if (!set_default_fbo_draw_buffer( teb, ctx, draw, mode, &mode )) return;
         fbo = draw->draw_fbo;
     }
 
@@ -1408,7 +1431,7 @@ void wrap_glNamedFramebufferDrawBuffer( TEB *teb, GLuint fbo, GLenum buf, PFN_gl
 
     if ((ctx = get_current_context( teb, &draw, NULL, NULL )) && !fbo)
     {
-        buf = set_default_fbo_draw_buffer( ctx, draw, buf );
+        if (!set_default_fbo_draw_buffer( teb, ctx, draw, buf, &buf )) return;
         fbo = draw->draw_fbo;
     }
 
