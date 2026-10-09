@@ -836,10 +836,10 @@ static void execute_native_present( struct client_surface_native_work *work )
     if (!x11drv_open_private_display( &worker->display, &worker->errors, &worker->error )) return;
     display = worker->display;
     worker->error = 0;
-    /* The canonical content child is automatically composited into its parent.
-     * Committing the accepted SOURCE region therefore publishes it as well.
-     * Later GDI writes use the same content and cannot be replaced by a second
-     * copy of this frame. Expose restoration still reads the current content. */
+    /* The stable content child shares its parent's redirected backing.
+     * Committing SOURCE therefore publishes it without another composition.
+     * Later GDI writes use the same storage and cannot be replaced by a second
+     * copy of this frame. */
     gc = XCreateGC( display, destination, GCGraphicsExposures | GCSubwindowMode, &values );
     if (!gc) return;
     if (present->committing)

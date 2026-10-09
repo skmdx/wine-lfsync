@@ -310,7 +310,7 @@ Window x11drv_native_window_read_init( struct x11drv_native_window_read *read,
 Window x11drv_native_window_read_drawable( const struct x11drv_native_window_read *read )
 {
     assert( read->window );
-    return read->content ? read->window->content : read->window->window;
+    return read->window->window;
 }
 
 Window x11drv_native_window_content_read_init( struct x11drv_native_window_read *read,
@@ -319,7 +319,7 @@ Window x11drv_native_window_content_read_init( struct x11drv_native_window_read 
     x11drv_native_window_read_init( read, window );
     read->content = TRUE;
     read->content_epoch = epoch;
-    return window->content;
+    return window->window;
 }
 
 Window x11drv_native_window_content( const struct x11drv_native_window *window )
@@ -369,7 +369,10 @@ static void prepare_native_content( struct client_surface_native_work *work )
         {
             XLockDisplay( display );
             window->content_serial = XNextRequest( display );
-            pXCompositeRedirectWindow( display, window->content, CompositeRedirectAutomatic );
+            /* Redirect the native backing, leaving the stable GDI child on
+             * that same storage. Redirecting the child itself adds another
+             * full-image composition after each accepted SOURCE copy. */
+            pXCompositeRedirectWindow( display, window->window, CompositeRedirectAutomatic );
             XUnlockDisplay( display );
         }
 #endif
@@ -697,7 +700,7 @@ static void release_native_content( struct client_surface_native_work *work )
          * the background reference on this same receipt as Unredirect. */
         if (window->content_remap_bytes) XSetWindowBackground( window->content_display, window->content, 0 );
         if (!InterlockedCompareExchange( &window->content_error, 0, 0 ))
-            pXCompositeUnredirectWindow( window->content_display, window->content, CompositeRedirectAutomatic );
+            pXCompositeUnredirectWindow( window->content_display, window->window, CompositeRedirectAutomatic );
         x11drv_queue_stream_barrier( window->content_display, &window->content_barrier );
     }
     x11drv_poll_stream_barrier( window->content_display, &window->content_barrier, NULL );
