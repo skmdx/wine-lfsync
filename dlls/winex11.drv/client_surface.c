@@ -470,7 +470,7 @@ static BOOL x11drv_client_surface_handoff_prepare(
     struct client_surface_target target;
     struct x11drv_client_surface *surface = impl_from_client_surface( client );
     struct client_surface_memory_scope memory = {0};
-    const struct client_surface_memory_scope *owners;
+    const struct client_surface_memory_scope *owners = NULL;
     struct x11drv_client_snapshot *cached = surface->gpu_snapshot ? surface->gpu_snapshot : surface->snapshot;
     unsigned int index = present->handoff_index;
     BOOL ret = FALSE;
@@ -495,7 +495,7 @@ static BOOL x11drv_client_surface_handoff_prepare(
         if (!client->content_valid || !cached) return FALSE;
         owners = x11drv_client_snapshot_memory( cached );
     }
-    else
+    else if (native)
     {
         if (!client_surface_memory_scope_init( &memory, client->hwnd, present->memory_domain )) return FALSE;
         owners = &memory;
