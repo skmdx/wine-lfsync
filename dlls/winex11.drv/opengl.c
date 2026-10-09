@@ -1327,10 +1327,20 @@ static void complete_opengl_present( struct client_surface *client, struct clien
     struct client_surface_capture capture = present->capture;
     struct client_surface_present_result result;
 
-    /* Native shared-monitor deferral has no private GL capture. Exact CPU
-     * capture and synchronous GPU fallback keep their owner until completion
-     * returns; the asynchronous path transfers it to the completion FIFO. */
+    /* Native shared-monitor deferral has no private GL capture. A private
+     * capture stays with the caller unless transferred to the reserved FIFO. */
     assert( !capture.release || present->completion.kind != CLIENT_SURFACE_COMPLETION_SHARED );
+    if (submitted && completed && present->completion_job &&
+        present->completion.kind == CLIENT_SURFACE_COMPLETION_EXACT &&
+        capture.context && capture.apply && capture.release && !capture.read &&
+        !present->handoff_control && !present->completion.wait)
+    {
+        /* The pixels are already owned, but a reparent can still be retiring
+         * the old transport. Keep this capture in submission order until the
+         * replacement source slot is available or the target is superseded. */
+        client_surface_enqueue_prepared_present( client, present, size );
+        return;
+    }
     result = client_surface_complete_present( client, present, submitted, completed, size, timeout );
     if (capture.release) capture.release( capture.context );
     if (submitted && result.owner == CLIENT_SURFACE_PRESENT_CALLER && !result.image_complete)

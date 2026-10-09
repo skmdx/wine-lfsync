@@ -454,6 +454,8 @@ struct client_surface_memory_scope
 };
 
 W32KAPI BOOL client_surface_memory_scope_init( struct client_surface_memory_scope *scope, HWND hwnd, UINT64 domain );
+/* The caller supplies the top-level owner from its captured presentation scene. */
+W32KAPI BOOL client_surface_memory_scope_init_owner( struct client_surface_memory_scope *scope, HWND toplevel, UINT64 domain );
 W32KAPI void client_surface_memory_scope_copy( struct client_surface_memory_scope *dst,
                                               const struct client_surface_memory_scope *src, BOOL include_owner );
 W32KAPI void client_surface_memory_scope_destroy( struct client_surface_memory_scope *scope );
@@ -631,6 +633,8 @@ W32KAPI void client_surface_set_present_completion( struct client_surface_frame 
                                                      client_surface_completion_wait_func wait,
                                                      client_surface_completion_release_func release,
                                                      void *context );
+/* An exact private capture with no wait callback must already be complete;
+ * enqueue then transfers its capture ownership for deferred FIFO adoption. */
 W32KAPI void client_surface_enqueue_prepared_present( struct client_surface *surface,
                                            struct client_surface_frame *present,
                                            const SIZE *expected_size );

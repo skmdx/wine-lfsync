@@ -1328,14 +1328,17 @@ BOOL client_surface_try_complete_present( struct client_surface *surface, struct
         source_pending = (target.offscreen || present->direct_snapshot) &&
             (surface->active || surface->server_cached) &&
             client_surface_capture_current_locked( surface, &target, present ) &&
-            !client_surface_handoff_write_available( surface );
+            (!client_surface_handoff_write_available( surface ) ||
+             (present->capture.context && present->capture.size.cx && !present->capture.read &&
+              !client_surface_prepare_source_locked( surface, present )));
         pthread_mutex_unlock( &surface->present_lock );
     }
     if (source_pending)
     {
-        /* A shared native completion has no private SOURCE reservation yet.
-         * Keep its FIFO ownership while the owner drains published slots,
-         * allowing target writers to run between adoption attempts. */
+        /* Keep FIFO ownership while the owner drains published slots or
+         * retires the old transport after reparenting. Target writers can
+         * run between attempts; the original target and deadline still gate
+         * adoption of an already captured image. */
         TRACE( "event=source_adoption_deferred surface=%p serial=%s\n",
                surface, wine_dbgstr_longlong( present->serial ) );
         pthread_mutex_unlock( &surface->completion_lock );

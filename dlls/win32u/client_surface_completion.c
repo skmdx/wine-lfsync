@@ -632,7 +632,7 @@ static BOOL finish_deferred_present( struct client_surface *surface, struct clie
     /* The FIFO execution lease includes capture, publication and both final
      * releases. Return the fence reference before the image reservation. A
      * failed or cancelled frame cannot capture, but still retires both. */
-    completion.release( completion.context );
+    if (completion.release) completion.release( completion.context );
     if (capture.release) capture.release( capture.context );
     released = begin ? client_surface_perf_time() : 0;
     TRACE( "event=completion_release surface=%p serial=%s completion=%p capture=%p\n",
@@ -1117,10 +1117,18 @@ void client_surface_enqueue_present( struct client_surface_completion_job **tick
     assert( present->serial );
     assert( !present->completion_job );
     assert( present->completion.kind != CLIENT_SURFACE_COMPLETION_NONE );
-    assert( present->completion.external_result && present->completion.wait && present->completion.release );
+    assert( present->completion.external_result );
+    /* A synchronous private capture has no remaining native wait or fence.
+     * It still needs the FIFO while a previous transport is being retired. */
+    assert( (present->completion.wait && present->completion.release) ||
+            (present->completion.kind == CLIENT_SURFACE_COMPLETION_EXACT &&
+             !present->completion.wait && !present->completion.release &&
+             present->capture.context && present->capture.apply &&
+             present->capture.release && !present->capture.read) );
     assert( InterlockedCompareExchange( &surface->external_completion_count, 0, 0 ) > 0 );
     *ticket = NULL;
     job->present = *present;
+    if (!present->completion.wait) job->native_status = CLIENT_SURFACE_COMPLETION_SIGNALED;
     job->has_expected_size = !!expected_size;
     if (expected_size) job->expected_size = *expected_size;
     TRACE( "event=present_result surface=%p serial=%s owner=%u completion=%u image=0 handoff=%u frame=%u kind=%u mode=%u\n",

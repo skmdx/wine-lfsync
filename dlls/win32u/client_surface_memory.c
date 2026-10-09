@@ -325,25 +325,38 @@ static void release_memory_account( struct client_surface_memory_account *accoun
     client_surface_release_metadata_memory( sizeof(*account) );
 }
 
-BOOL client_surface_memory_scope_init( struct client_surface_memory_scope *scope, HWND hwnd, UINT64 domain )
+static BOOL init_memory_scope( struct client_surface_memory_scope *scope, DWORD process, UINT64 domain )
 {
-    DWORD process;
-    HWND root;
-
     assert( !scope->owner && !scope->domain );
-    if (hwnd)
-    {
-        if (!(root = NtUserGetAncestor( hwnd, GA_ROOT )) || !get_window_thread( root, &process ))
-        {
-            WARN( "failed to find image owner for hwnd %p root %p\n", hwnd, root );
-            return FALSE;
-        }
-        if (!(scope->owner = acquire_memory_account( MEMORY_OWNER, process ))) return FALSE;
-    }
+    if (process && !(scope->owner = acquire_memory_account( MEMORY_OWNER, process ))) return FALSE;
     if ((scope->domain = acquire_memory_account( MEMORY_NATIVE_DOMAIN, domain ))) return TRUE;
     release_memory_account( scope->owner );
     scope->owner = NULL;
     return FALSE;
+}
+
+BOOL client_surface_memory_scope_init( struct client_surface_memory_scope *scope, HWND hwnd, UINT64 domain )
+{
+    DWORD process = 0;
+    HWND root;
+
+    if (hwnd && (!(root = NtUserGetAncestor( hwnd, GA_ROOT )) || !get_window_thread( root, &process )))
+    {
+        WARN( "failed to find image owner for hwnd %p root %p\n", hwnd, root );
+        return FALSE;
+    }
+    return init_memory_scope( scope, process, domain );
+}
+
+BOOL client_surface_memory_scope_init_owner( struct client_surface_memory_scope *scope, HWND toplevel, UINT64 domain )
+{
+    DWORD process;
+
+    /* Capture already owns a validated target. Charge that target's owner;
+     * do not resolve a different root if the HWND is reparented concurrently.
+     * Completion independently validates the captured target/scene epochs. */
+    if (!toplevel || !get_window_thread( toplevel, &process )) return FALSE;
+    return init_memory_scope( scope, process, domain );
 }
 
 void client_surface_memory_scope_copy( struct client_surface_memory_scope *dst,

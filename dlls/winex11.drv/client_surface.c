@@ -368,7 +368,8 @@ struct x11drv_client_snapshot *x11drv_client_surface_prepare_gpu_snapshot(
     BOOL ret;
 
     assert( present->handoff_index < ARRAY_SIZE(surface->sources) && !present->capture.context );
-    if (!client_surface_memory_scope_init( &memory, client->hwnd, 0 )) return NULL;
+    /* Account to the captured scene even if the HWND is being reparented. */
+    if (!client_surface_memory_scope_init_owner( &memory, present->scene.toplevel, 0 )) return NULL;
     /* Transfer the slot's reference to this capture before any native work.
      * Completion applies it only after validating the original reservation;
      * cancellation releases it through the same capture owner. */
