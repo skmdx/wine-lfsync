@@ -128,7 +128,7 @@ static inline BOOL client_surface_handoff_consumed( const struct client_surface_
 static inline BOOL client_surface_handoff_source_released( const struct client_surface_handoff_channel *channel,
                                                            unsigned int index, UINT64 publication )
 {
-    return __atomic_load_n( &channel->source_releases[index], __ATOMIC_ACQUIRE ) == publication;
+    return (UINT64)__atomic_load_n( &channel->source_releases[index], __ATOMIC_ACQUIRE ) == publication;
 }
 
 enum client_surface_completion_kind

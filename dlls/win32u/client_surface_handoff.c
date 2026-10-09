@@ -49,6 +49,7 @@ struct client_surface_handoff
     UINT64 cookie;
     BOOL release_pending;
     unsigned int waiters;
+    LONG borrowers;
     int ready_fd;
 };
 
@@ -120,12 +121,13 @@ void client_surface_release_handoff( struct client_surface *surface )
     struct client_surface_handoff_lease lease;
 
     if (!surface->handoff->view) return;
-    /* Exact WSI completions may finish on a worker after a target update has
-     * detached this mapping.  Keep the view and producer endpoint alive until
-     * those frames have either published or abandoned their private reservation.
+    /* Retain the mapping for frames which actually borrow a reservation.
+     * Independent captures can await a replacement binding after reparenting;
+     * counting those completions would prevent the binding they need from ever
+     * retiring. Native readers retain their images through backend retirement.
      * A source-capacity waiter also retains the view while its lock is dropped. */
     if (surface->handoff->waiters || surface->native_present_count ||
-        InterlockedCompareExchange( &surface->external_completion_count, 0, 0 ))
+        InterlockedCompareExchange( &surface->handoff->borrowers, 0, 0 ))
     {
         if (surface->handoff->waiters)
             TRACE( "retaining handoff mapping identity %s cookie %s for %u source waiters\n",
@@ -160,10 +162,10 @@ static BOOL map_client_surface_handoff( struct client_surface *surface, const st
     void *view = NULL;
     NTSTATUS status;
 
-    if (surface->handoff->release_pending) return FALSE;
     if (surface->handoff->view)
     {
-        if (!__atomic_load_n( &surface->handoff->channel->closed, __ATOMIC_ACQUIRE )) return TRUE;
+        if (!surface->handoff->release_pending &&
+            !__atomic_load_n( &surface->handoff->channel->closed, __ATOMIC_ACQUIRE )) return TRUE;
         /* Retire a closed binding even when its consumer is still finishing
          * a cache copy. The retirement object retains that mapping and its
          * source images until the actual read completes. */
@@ -356,7 +358,7 @@ static BOOL prepare_client_surface_handoff_locked( struct client_surface *surfac
     source->width = source->height = source->flags = 0;
     if (!surface->backend->handoff->prepare( surface, source, present ))
     {
-        UINT64 expected = token;
+        LONG64 expected = token;
         __atomic_compare_exchange_n( &source->reservation, &expected, 0, 0,
                                      __ATOMIC_RELEASE, __ATOMIC_RELAXED );
         return FALSE;
@@ -364,6 +366,7 @@ static BOOL prepare_client_surface_handoff_locked( struct client_surface *surfac
     present->handoff_control = token;
     present->handoff_source = source;
     present->handoff_channel = surface->handoff->channel;
+    InterlockedIncrement( &surface->handoff->borrowers );
     return TRUE;
 }
 
@@ -376,12 +379,14 @@ BOOL client_surface_prepare_handoff_locked( struct client_surface *surface,
 void client_surface_abandon_handoff_locked( struct client_surface *surface,
                                             struct client_surface_frame *present )
 {
-    UINT64 expected = present->handoff_control;
+    LONG64 expected = present->handoff_control;
 
     if (!expected || !surface->handoff->channel) return;
     __atomic_compare_exchange_n( &surface->handoff->sources[present->handoff_index].reservation, &expected, 0, 0,
                                  __ATOMIC_RELEASE, __ATOMIC_RELAXED );
     present->handoff_control = 0;
+    assert( InterlockedCompareExchange( &surface->handoff->borrowers, 0, 0 ) > 0 );
+    InterlockedDecrement( &surface->handoff->borrowers );
 }
 
 static BOOL source_capture_current( struct client_surface *surface, struct client_surface_frame *present )
@@ -591,6 +596,8 @@ BOOL client_surface_publish_handoff_locked( struct client_surface *surface,
     TRACE( "published handoff identity %s sequence %s channel %td\n",
            wine_dbgstr_longlong( client_surface_get_identity( surface ) ), wine_dbgstr_longlong( produced + 1 ), index );
     present->handoff_control = 0;
+    assert( InterlockedCompareExchange( &surface->handoff->borrowers, 0, 0 ) > 0 );
+    InterlockedDecrement( &surface->handoff->borrowers );
     return TRUE;
 }
 
@@ -643,8 +650,7 @@ void client_surface_handoff_wait( struct client_surface *surface )
         pthread_mutex_lock( &surface->completion_lock );
     }
     pthread_mutex_lock( &surface->present_lock );
-    if (!--surface->handoff->waiters && surface->handoff->release_pending &&
-        !InterlockedCompareExchange( &surface->external_completion_count, 0, 0 ))
+    if (!--surface->handoff->waiters && surface->handoff->release_pending)
         client_surface_release_handoff( surface );
     pthread_mutex_unlock( &surface->present_lock );
 }
@@ -653,8 +659,7 @@ void client_surface_handoff_retire_closed( struct client_surface *surface )
 {
     pthread_mutex_lock( &surface->present_lock );
     if (surface->handoff->channel &&
-        __atomic_load_n( &surface->handoff->channel->closed, __ATOMIC_ACQUIRE ) &&
-        !InterlockedCompareExchange( &surface->external_completion_count, 0, 0 ))
+        __atomic_load_n( &surface->handoff->channel->closed, __ATOMIC_ACQUIRE ))
         client_surface_release_handoff( surface );
     pthread_mutex_unlock( &surface->present_lock );
 }
@@ -666,10 +671,9 @@ void client_surface_handoff_completed( struct client_surface *surface )
      * Its validity does not keep a revoked transport alive: the last token
      * must retire that channel even when no target update requested release.
      * release_handoff still accounts for native submission and source waiters. */
-    if ((surface->handoff->release_pending ||
-         (surface->handoff->channel &&
-          __atomic_load_n( &surface->handoff->channel->closed, __ATOMIC_ACQUIRE ))) &&
-        !InterlockedCompareExchange( &surface->external_completion_count, 0, 0 ))
+    if (surface->handoff->release_pending ||
+        (surface->handoff->channel &&
+         __atomic_load_n( &surface->handoff->channel->closed, __ATOMIC_ACQUIRE )))
         client_surface_release_handoff( surface );
     /* An abandoned image or the last completion can also satisfy the
      * source waiter, without an owner copy producing a release wake. */
