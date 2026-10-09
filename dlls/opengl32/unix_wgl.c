@@ -1393,7 +1393,10 @@ void wrap_glFramebufferDrawBufferEXT( TEB *teb, GLuint fbo, GLenum mode, PFN_glF
     struct opengl_context *ctx;
 
     if ((ctx = get_current_context( teb, &draw, NULL, NULL )) && !fbo)
+    {
         mode = set_default_fbo_draw_buffer( ctx, draw, mode );
+        fbo = draw->draw_fbo;
+    }
 
     p_glFramebufferDrawBufferEXT( fbo, mode );
 }
@@ -1404,7 +1407,10 @@ void wrap_glNamedFramebufferDrawBuffer( TEB *teb, GLuint fbo, GLenum buf, PFN_gl
     struct opengl_context *ctx;
 
     if ((ctx = get_current_context( teb, &draw, NULL, NULL )) && !fbo)
+    {
         buf = set_default_fbo_draw_buffer( ctx, draw, buf );
+        fbo = draw->draw_fbo;
+    }
 
     p_glNamedFramebufferDrawBuffer( fbo, buf );
 }
@@ -1438,7 +1444,10 @@ void wrap_glFramebufferReadBufferEXT( TEB *teb, GLuint fbo, GLenum mode, PFN_glF
     struct opengl_context *ctx;
 
     if ((ctx = get_current_context( teb, NULL, &read, NULL )) && !fbo)
+    {
         mode = set_default_fbo_read_buffer( ctx, read, mode );
+        fbo = read->read_fbo;
+    }
 
     p_glFramebufferReadBufferEXT( fbo, mode );
 }
@@ -1449,7 +1458,10 @@ void wrap_glNamedFramebufferReadBuffer( TEB *teb, GLuint fbo, GLenum src, PFN_gl
     struct opengl_context *ctx;
 
     if ((ctx = get_current_context( teb, NULL, &read, NULL )) && !fbo)
+    {
         src = set_default_fbo_read_buffer( ctx, read, src );
+        fbo = read->read_fbo;
+    }
 
     p_glNamedFramebufferReadBuffer( fbo, src );
 }
