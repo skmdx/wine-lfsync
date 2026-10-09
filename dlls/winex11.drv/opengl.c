@@ -2007,6 +2007,7 @@ struct egl_snapshot_completion
 {
     struct client_surface_memory_scope memory;
     LONG refs;
+    LONG signaled;
     EGLSyncKHR sync;
     /* Only the queued completion owns the drawable and mapping references.
      * Image retirement must test the fence without dereferencing these. */
@@ -2047,7 +2048,10 @@ static struct client_surface_completion_result wait_snapshot_completion( void *c
     }
     result = snapshot_wait_sync( egl->display, completion->sync, 0, (EGLTimeKHR)timeout * 1000000 );
     if (result == EGL_CONDITION_SATISFIED_KHR)
+    {
+        InterlockedExchange( &completion->signaled, TRUE );
         return client_surface_completion_result( CLIENT_SURFACE_COMPLETION_SIGNALED );
+    }
     if (result == EGL_TIMEOUT_EXPIRED_KHR)
         return client_surface_completion_result( CLIENT_SURFACE_COMPLETION_PENDING );
     return client_surface_completion_result( CLIENT_SURFACE_COMPLETION_FAILED );
@@ -2066,8 +2070,11 @@ static BOOL snapshot_image_ready( void *context )
 {
     struct egl_snapshot_image *image = context;
 
-    return !image->pending || snapshot_wait_sync( egl->display, image->pending->sync, 0, 0 ) ==
-                             EGL_CONDITION_SATISFIED_KHR;
+    if (!image->pending || InterlockedCompareExchange( &image->pending->signaled, 0, 0 )) return TRUE;
+    if (snapshot_wait_sync( egl->display, image->pending->sync, 0, 0 ) != EGL_CONDITION_SATISFIED_KHR)
+        return FALSE;
+    InterlockedExchange( &image->pending->signaled, TRUE );
+    return TRUE;
 }
 
 static void release_snapshot_image( void *context )
