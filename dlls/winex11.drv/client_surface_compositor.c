@@ -330,7 +330,6 @@ static void wait_client_surface_compositor_work( const struct client_surface_com
                        scan->handoff_remaining, wine_dbgstr_longlong( scan->pool_generation ) );
         ret = poll( waiters, count, timeout );
     } while (ret < 0 && errno == EINTR);
-    wake_client_surface_compositor_queues();
     if (ret < 0) WARN( "client-surface compositor poll failed, error %d\n", errno );
 }
 
@@ -1041,12 +1040,17 @@ static BOOL process_client_surface_compositor_jobs(void)
 
 static void client_surface_compositor_thread( void *context )
 {
-    BOOL armed = FALSE;
-
     (void)context;
     for (;;)
     {
-        struct client_surface_compositor_scan scan =
+        struct client_surface_compositor_scan scan;
+
+        /* Arm before the traversal which decides whether to sleep. Work
+         * arriving before arming is observed by that traversal; later work
+         * leaves a wake pending. A separate quiet traversal before arming
+         * only repeats every queue, source and output scan. */
+        arm_client_surface_compositor_work();
+        scan = (struct client_surface_compositor_scan)
         {
             .wake_serial = client_surface_compositor_wake_serial,
             .timeout = -1,
@@ -1054,8 +1058,8 @@ static void client_surface_compositor_thread( void *context )
 
         init_client_surface_output_scan( &scan );
         init_client_surface_source_scan( &scan );
-        TRACE_(csperf)( "ticks=%llu event=compositor_scan_begin targets=%u armed=%u generation=%s pools=%u pool_generation=%s\n",
-                       client_surface_perf_time(), scan.target_count, armed,
+        TRACE_(csperf)( "ticks=%llu event=compositor_scan_begin targets=%u armed=1 generation=%s pools=%u pool_generation=%s\n",
+                       client_surface_perf_time(), scan.target_count,
                        wine_dbgstr_longlong( scan.generation ), scan.pool_count,
                        wine_dbgstr_longlong( scan.pool_generation ) );
         do
@@ -1075,18 +1079,8 @@ static void client_surface_compositor_thread( void *context )
         /* Helpers acquiring output credit can consume events too. Count
          * those wakes even when their caller could not submit any work. */
         if (scan.progressed || scan.wake_serial != client_surface_compositor_wake_serial)
-        {
-            armed = FALSE;
             continue;
-        }
-        if (!armed)
-        {
-            arm_client_surface_compositor_work();
-            armed = TRUE;
-            continue;
-        }
         wait_client_surface_compositor_work( &scan );
-        armed = FALSE;
     }
 }
 

@@ -935,10 +935,10 @@ static void queue_completion_job_locked( struct client_surface *surface,
     list_add_tail( &surface->completion_queue->jobs, &job->entry );
     if (empty) queue_ready_surface_locked( surface );
     TRACE_(csperf)( "ticks=%llu event=completion_queue identity=%s serial=%s control=%s target_epoch=%s "
-                   "head=%u\n", client_surface_perf_time(),
+                   "head=%u native_status=%u\n", client_surface_perf_time(),
                    wine_dbgstr_longlong( client_surface_get_identity( surface ) ),
                    wine_dbgstr_longlong( job->present.serial ), wine_dbgstr_longlong( job->present.handoff_control ),
-                   wine_dbgstr_longlong( job->present.target_epoch ), empty );
+                   wine_dbgstr_longlong( job->present.target_epoch ), empty, job->native_status );
     TRACE( "event=completion_enqueue surface=%p serial=%s completion=%p capture=%p\n",
            surface, wine_dbgstr_longlong( job->present.serial ), job->present.completion.context,
            job->present.capture.context );
