@@ -695,7 +695,7 @@ BOOL submit_client_surface_present( struct client_surface_compositor_target *tar
         .committing = !copy_rect,
         .wake = wake_client_surface_compositor};
     /* Serial ownership prevents pool/target release and image reuse through
-     * both checked copies. The embedded
+     * the checked publication. The embedded
      * request is already covered by target admission; submit cannot allocate. */
     if (copy_rect) frame->native_present.copy_rect = *copy_rect;
     TRACE_(csperf)( "ticks=%llu event=native_commit_admit window=%lx pixmap=%lx serial=%u copy=1 commit=%u generation=%llu epoch=%llu\n",

@@ -820,54 +820,46 @@ static void execute_native_present( struct client_surface_native_work *work )
     Display *display;
     GC gc;
     RECT full = {0, 0, present->width, present->height};
+    Drawable source = present->committing ? present->pixmap : present->content;
+    Drawable destination = present->committing ? present->content : present->window;
+    const RECT *rect = present->committing ? &present->commit_rect :
+                      IsRectEmpty( &present->copy_rect ) ? &full : &present->copy_rect;
+    NTSTATUS status = x11drv_native_window_content_status( present->window_owner );
 
-    for (;;)
+    present->success = FALSE;
+    if ((present->waiting = status == STATUS_PENDING))
     {
-        Drawable source = present->committing ? present->pixmap : present->content;
-        Drawable destination = present->committing ? present->content : present->window;
-        const RECT *rect = present->committing ? &present->commit_rect :
-                          IsRectEmpty( &present->copy_rect ) ? &full : &present->copy_rect;
-        NTSTATUS status = x11drv_native_window_content_status( present->window_owner );
-
-        present->success = FALSE;
-        if ((present->waiting = status == STATUS_PENDING))
-        {
-            poll( NULL, 0, 1 );
-            return;
-        }
-        if (status) return;
-        if (!x11drv_open_private_display( &worker->display, &worker->errors, &worker->error )) return;
-        display = worker->display;
-        worker->error = 0;
-        /* Commit only the accepted SOURCE region. Publication reads the shared
-         * content at server execution, so a later GDI write cannot be replaced
-         * by the old private frame even if this request was stopped in native code. */
-        present->copied = !present->committing;
-        gc = XCreateGC( display, destination, GCGraphicsExposures | GCSubwindowMode, &values );
-        if (gc)
-        {
-            if (present->committing)
-                XSetClipRectangles( display, gc, 0, 0, present->shape, present->shape_count, Unsorted );
-            XCopyArea( display, source, destination, gc, rect->left, rect->top,
-                       rect->right - rect->left, rect->bottom - rect->top, rect->left, rect->top );
-            TRACE_(csperf)( "ticks=%llu event=xlib_copy_request source=%lx destination=%lx width=%u height=%u clipped=%u route=%s\n",
-                           client_surface_perf_time(), source, destination, rect->right - rect->left,
-                           rect->bottom - rect->top, present->committing,
-                           present->committing ? "source_commit" : "present" );
-            XFreeGC( display, gc );
-            XSync( display, False );
-            present->success = !worker->error;
-        }
-        if (!present->success || !present->committing) return;
-        /* Both stages use the same retained frame and native FIFO lane. No
-         * actor decision is needed between the checked commit and publication. */
+        poll( NULL, 0, 1 );
+        return;
+    }
+    if (status) return;
+    if (!x11drv_open_private_display( &worker->display, &worker->errors, &worker->error )) return;
+    display = worker->display;
+    worker->error = 0;
+    /* The canonical content child is automatically composited into its parent.
+     * Committing the accepted SOURCE region therefore publishes it as well.
+     * Later GDI writes use the same content and cannot be replaced by a second
+     * copy of this frame. Expose restoration still reads the current content. */
+    gc = XCreateGC( display, destination, GCGraphicsExposures | GCSubwindowMode, &values );
+    if (!gc) return;
+    if (present->committing)
+        XSetClipRectangles( display, gc, 0, 0, present->shape, present->shape_count, Unsorted );
+    TRACE_(csperf)( "ticks=%llu event=native_present_admit window=%lx pixmap=%lx content=%lx serial=%u copy=1 generation=%llu epoch=%llu\n",
+                   client_surface_perf_time(), present->window, present->pixmap, present->content, present->serial,
+                   (unsigned long long)present->generation, (unsigned long long)present->epoch );
+    present->copied = TRUE;
+    XCopyArea( display, source, destination, gc, rect->left, rect->top,
+               rect->right - rect->left, rect->bottom - rect->top, rect->left, rect->top );
+    TRACE_(csperf)( "ticks=%llu event=xlib_copy_request source=%lx destination=%lx width=%u height=%u clipped=%u route=%s\n",
+                   client_surface_perf_time(), source, destination, rect->right - rect->left,
+                   rect->bottom - rect->top, present->committing,
+                   present->committing ? "source_commit" : "present" );
+    XFreeGC( display, gc );
+    XSync( display, False );
+    present->success = !worker->error;
+    if (present->success && present->committing)
         TRACE_(csperf)( "ticks=%llu event=native_commit_receipt window=%lx pixmap=%lx serial=%u success=1\n",
                        client_surface_perf_time(), present->content, present->pixmap, present->serial );
-        TRACE_(csperf)( "ticks=%llu event=native_present_admit window=%lx pixmap=%lx serial=%u copy=1 generation=%llu epoch=%llu\n",
-                       client_surface_perf_time(), present->window, present->content, present->serial,
-                       (unsigned long long)present->generation, (unsigned long long)present->epoch );
-        present->committing = FALSE;
-    }
 }
 
 static void finish_native_present( struct client_surface_native_work *work )
@@ -882,8 +874,7 @@ static void finish_native_present( struct client_surface_native_work *work )
         pthread_mutex_unlock( &cache_mutex );
         return;
     }
-    /* The actor keeps the lane across the SOURCE commit and current-content
-     * publication, releasing it only after the final checked copy. */
+    /* The actor keeps the Window lane until it consumes the checked receipt. */
     WriteRelease( &present->complete, TRUE );
     wake();
 }
