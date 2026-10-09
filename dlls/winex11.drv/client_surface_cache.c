@@ -92,7 +92,7 @@ static struct cache_worker cache_workers[4];
 static __thread struct cache_worker *native_worker;
 static unsigned int worker_count, image_count, source_count, next_worker;
 static struct cache_worker present_workers[4];
-static unsigned int present_worker_count, next_present_worker;
+static unsigned int present_worker_count;
 static struct client_surface_cache_image *completed_head, **completed_tail = &completed_head;
 static void (*cache_wake)(void);
 
@@ -744,23 +744,25 @@ static struct cache_worker *create_cache_worker( struct cache_worker *workers, u
 }
 
 static struct cache_worker *select_existing_worker( struct cache_worker *workers, unsigned int count,
-                                                    unsigned int *next )
+                                                    unsigned int first )
 {
     struct cache_worker *worker = NULL;
     unsigned int i, index;
 
     for (i = 0; i < count; ++i)
     {
-        index = (*next + i) % count;
+        index = (first + i) % count;
         if (!worker || workers[index].pending < worker->pending) worker = &workers[index];
     }
-    if (worker) *next = (worker - workers + 1) % count;
     return worker;
 }
 
 static struct cache_worker *select_existing_cache_worker(void)
 {
-    return select_existing_worker( cache_workers, worker_count, &next_worker );
+    struct cache_worker *worker = select_existing_worker( cache_workers, worker_count, next_worker );
+
+    if (worker) next_worker = (worker - cache_workers + 1) % worker_count;
+    return worker;
 }
 
 static struct cache_worker *select_cache_worker(void)
@@ -876,7 +878,7 @@ static void finish_native_present( struct client_surface_native_work *work )
     if (present->waiting)
     {
         pthread_mutex_lock( &cache_mutex );
-        queue_native_work( select_existing_worker( present_workers, present_worker_count, &next_present_worker ), work );
+        queue_native_work( select_existing_worker( present_workers, present_worker_count, 0 ), work );
         pthread_mutex_unlock( &cache_mutex );
         return;
     }
@@ -895,7 +897,7 @@ void client_surface_release_native_present( struct client_surface_native_present
     {
         assert( queue->head == present && ReadAcquire( &present->complete ) );
         if ((queue->head = present->next))
-            queue_native_work( select_existing_worker( present_workers, present_worker_count, &next_present_worker ),
+            queue_native_work( select_existing_worker( present_workers, present_worker_count, 0 ),
                                &queue->head->work );
         else queue->tail = NULL;
         present->queue = NULL;
@@ -920,7 +922,9 @@ void client_surface_submit_native_present( struct client_surface_native_present_
     else
     {
         queue->head = present;
-        queue_native_work( select_existing_worker( present_workers, present_worker_count, &next_present_worker ), &present->work );
+        /* Reuse an idle executor and its X connection before spreading work.
+         * A busy executor still loses to one with fewer pending requests. */
+        queue_native_work( select_existing_worker( present_workers, present_worker_count, 0 ), &present->work );
     }
     queue->tail = present;
     pthread_mutex_unlock( &cache_mutex );
