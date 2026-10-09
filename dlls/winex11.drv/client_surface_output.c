@@ -649,7 +649,7 @@ BOOL submit_client_surface_present( struct client_surface_compositor_target *tar
                                            const struct client_surface_compositor_binding *binding,
                                            const RECT *damage )
 {
-    XRectangle single_shape = {0}, *shape = NULL;
+    XRectangle *shape = NULL;
     unsigned int shape_count = 0, i, j, index = 0;
     unsigned int first = binding ? binding->scene_index : 0;
     unsigned int end = binding ? first + 1 : target->scene.count;
@@ -659,8 +659,7 @@ BOOL submit_client_surface_present( struct client_surface_compositor_target *tar
     if (!copy_rect && target->scene.valid && target->scene.strategy == OWNER_COMPOSITE)
     {
         for (i = first; i < end; ++i) shape_count += target->scene.layouts[i].clip->rdh.nCount;
-        if (shape_count == 1) shape = &single_shape;
-        else if (shape_count && !(shape = client_surface_alloc_owned_array( &target->memory, shape_count, sizeof(*shape) )))
+        if (shape_count && !(shape = client_surface_alloc_owned_array( &target->memory, shape_count, sizeof(*shape) )))
             return FALSE;
         for (i = first; i < end; ++i)
         {
@@ -695,11 +694,6 @@ BOOL submit_client_surface_present( struct client_surface_compositor_target *tar
         .commit_rect = damage ? *damage : (RECT){0, 0, target->window_width, target->window_height},
         .committing = !copy_rect,
         .wake = wake_client_surface_compositor};
-    if (shape_count == 1)
-    {
-        frame->native_present.single_shape = single_shape;
-        frame->native_present.shape = &frame->native_present.single_shape;
-    }
     /* Serial ownership prevents pool/target release and image reuse through
      * both checked copies. The embedded
      * request is already covered by target admission; submit cannot allocate. */
