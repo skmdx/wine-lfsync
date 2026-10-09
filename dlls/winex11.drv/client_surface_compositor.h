@@ -111,7 +111,7 @@ struct client_surface_compositor_job
      * and release its binding between dispatcher slices. */
     struct
     {
-        unsigned int phase, index, count, needed, found, bound;
+        unsigned int index, count, needed, found, bound;
         BOOL cursor_set;
         process_id_t process;
         UINT64 identity, generation;
@@ -179,6 +179,7 @@ struct client_surface_compositor_job
             const struct client_surface_handoff_desc *handoffs;
             unsigned int count;
             UINT64 epoch;
+            BOOL started;
         } scene_check;
         /* SWEEP_HANDOFFS adopts layouts only when installing the plan, then
          * clears this pointer/count. Failure, stale and unchanged plans leave
@@ -188,6 +189,7 @@ struct client_surface_compositor_job
             struct client_surface_scene_layout *layouts;
             unsigned int count;
             UINT64 epoch, mark;
+            enum { SCENE_INSTALL_SWEEP, SCENE_INSTALL_ALLOCATE, SCENE_INSTALL_MEMBERS } phase;
         } scene_install;
         /* The producer retains source; destination has an owned native lease. */
         struct
@@ -196,6 +198,7 @@ struct client_surface_compositor_job
             UINT64 identity, scene_epoch;
             struct x11drv_native_window *window_owner, *source_owner;
             struct client_surface_window_query query;
+            enum { DIRECT_PLAN_ADMIT, DIRECT_PLAN_RETIRE_BINDINGS, DIRECT_PLAN_WAIT_CONTENT } phase;
         } direct_plan;
         /* RENEW_DIRECT consumes a completed, caller-owned observation. */
         struct

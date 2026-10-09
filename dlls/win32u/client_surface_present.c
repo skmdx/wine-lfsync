@@ -433,187 +433,186 @@ static BOOL claim_client_surface_retry( struct client_surface *surface, UINT64 g
     }
 }
 
-BOOL client_surface_end_present_internal( struct client_surface *surface,
-                                          const SIZE *expected_size, BOOL new_content,
-                                          struct client_surface_frame *present )
+enum client_surface_composition_status
 {
-    struct client_surface_target target;
-    HWND hwnd = 0, toplevel = 0;
+    CLIENT_SURFACE_COMPOSITION_FAILED,
+    CLIENT_SURFACE_COMPOSITION_STALE,
+    CLIENT_SURFACE_COMPOSITION_SKIPPED,
+    CLIENT_SURFACE_COMPOSITION_COPIED,
+    CLIENT_SURFACE_COMPOSITION_DIRECT,
+};
+
+struct client_surface_composition_result
+{
+    enum client_surface_composition_status status;
+    BOOL authorized;
+};
+
+/* The caller has validated the source and holds present_lock. This operation
+ * owns the composition DC and reports scene adoption separately from source
+ * validity: a failed composition must not discard a completed source image. */
+static struct client_surface_composition_result compose_client_surface_locked(
+    struct client_surface *surface, const struct client_surface_target *target,
+    struct client_surface_frame *present )
+{
+    struct client_surface_composition_result result =
+        { CLIENT_SURFACE_COMPOSITION_FAILED, present->scene.authoritative };
+    HWND hwnd = surface->hwnd;
     HRGN surface_region = 0;
-    BOOL commit = FALSE, compose = FALSE, composed = FALSE, copied = FALSE, offscreen = FALSE;
-    BOOL region_valid = TRUE, sync = !!present->scene.generation, wake = FALSE;
-    BOOL authorized = present->scene.authoritative;
-    BOOL begin_valid = TRUE, composition_retry = FALSE;
-    BOOL scene_retry = FALSE, source_valid = FALSE, direct = FALSE, direct_proof = FALSE;
+    BOOL sync = !!present->scene.generation, begin_valid = TRUE;
     HDC hdc = 0;
 
-    assert( present );
-    /* The caller owns a surface reference and completion_lock.  present_lock
-     * serializes detach, membership transitions and native target changes, so
-     * the process-wide registry lock is neither needed for lifetime nor for
-     * target validation on the per-frame path. */
-    pthread_mutex_lock( &surface->present_lock );
-    client_surface_get_target( surface, &target );
-    if (ReadAcquire( &surface->closing ) || client_surface_target_is_updating( surface ) ||
-        client_surface_present_expired( present ) ||
-        present->target == CLIENT_SURFACE_FRAME_TARGET_INVALID ||
-        present->target_epoch != target.epoch ||
-        present->scene.toplevel != target.toplevel)
-    {
-        TRACE( "discarding %s presentation across target state change\n",
-               debugstr_client_surface( surface ) );
-    }
-    else if (new_content && present->serial <= surface->composed_serial)
-    {
-        present->result = CLIENT_SURFACE_FRAME_SUPERSEDED;
-        TRACE( "discarding superseded presentation %s serial %s, composed %s\n",
-               debugstr_client_surface( surface ), wine_dbgstr_longlong( present->serial ),
-               wine_dbgstr_longlong( surface->composed_serial ) );
-    }
-    else if ((hwnd = surface->hwnd) &&
-             target.valid &&
-             (InterlockedCompareExchange( &surface->active, 0, 0 ) ||
-              InterlockedCompareExchange( &surface->server_cached, 0, 0 )))
-    {
-        if (sync) TRACE( "client surface %p starts composition epoch commit\n", hwnd );
-        if (new_content || InterlockedCompareExchange( &surface->content_valid, 0, 0 ))
-        {
-            compose = client_surface_validate_size_locked( surface, &target, expected_size );
-            offscreen = target.offscreen;
-        }
-        else
-            TRACE( "not recomposing incomplete cached content for %s\n",
-                   debugstr_client_surface( surface ) );
-    }
-    source_valid = compose && new_content;
-    if (compose && !offscreen && present->mode == CLIENT_SURFACE_PRESENTATION_DIRECT)
+    if (!target->offscreen && present->mode == CLIENT_SURFACE_PRESENTATION_DIRECT)
     {
         /* The native WSI call already presented on the owner's attached
          * target. Keep the same source/epoch checks without a DC, copy, fence
          * or per-frame server transaction on the generation-zero path. */
-        direct = composed = TRUE;
-        /* A native Present can complete while renewal is still PREPARING.
-         * Replay may acknowledge it only on the exact unchanged attachment,
-         * never after a resize or a detach/reattach discarded that image. */
-        direct_proof = new_content || surface->direct_content_epoch == present->target_epoch;
-        compose = FALSE;
+        result.status = CLIENT_SURFACE_COMPOSITION_DIRECT;
+        return result;
     }
-    if (compose && offscreen && !present->scene.valid) compose = FALSE;
-    if (compose && offscreen &&
+    if (target->offscreen && !present->scene.valid) return result;
+    if (target->offscreen &&
         client_surface_backend_has_cap( surface, CLIENT_SURFACE_BACKEND_OWNER_COMPOSITOR ))
     {
         /* This backend never submits work to an owner-owned native target.
          * Hidden frames remain reusable source content; a visible handoff
          * failure is rejected and retried through the scene slow path. */
         if (!NtUserIsWindowVisible( hwnd ))
-            composed = client_surface_scene_current( &present->scene );
-        else
-            scene_retry = TRUE;
-        compose = FALSE;
-    }
-    if (compose && sync)
-    {
-        authorized = begin_client_surface_composition( hwnd, surface, present, &begin_valid );
-        if (!authorized)
         {
-            /* Only the authoritative producer for an HWND may touch its
-             * composition destination.  A still-current denial is therefore a
-             * successful no-op; a stale denial is retried in the new scene. */
-            composed = begin_valid && client_surface_scene_current( &present->scene );
-            scene_retry = !composed;
-            compose = FALSE;
+            if (client_surface_scene_current( &present->scene ))
+                result.status = CLIENT_SURFACE_COMPOSITION_SKIPPED;
         }
+        else
+            result.status = CLIENT_SURFACE_COMPOSITION_STALE;
+        return result;
     }
-    else if (compose && !authorized)
+    if (sync) result.authorized = begin_client_surface_composition( hwnd, surface, present, &begin_valid );
+    if (!result.authorized)
     {
-        /* Steady-state presents also obey the server's active-over-cache
-         * producer choice.  The shared identity is covered by the top-level
-         * scene seqlock, so this adds no per-frame server round trip. */
-        composed = begin_valid && client_surface_scene_current( &present->scene );
-        scene_retry = !composed;
-        compose = FALSE;
+        /* A current denial is a successful no-op. Steady-state presents use
+         * the shared producer choice without adding a server round trip. */
+        result.status = begin_valid && client_surface_scene_current( &present->scene ) ?
+                        CLIENT_SURFACE_COMPOSITION_SKIPPED : CLIENT_SURFACE_COMPOSITION_STALE;
+        return result;
     }
 
     /* Fetch cross-process clipping in one server scene snapshot.  Monitor-DPI
      * conversion and DCE refresh remain outside surfaces_lock. */
-    if (compose && offscreen)
+    if (target->offscreen)
     {
-        region_valid = get_cached_client_surface_region( surface, hwnd, &target,
-                                                         present, &surface_region );
-        if (!region_valid)
+        DWORD flags = DCX_CACHE | DCX_USESTYLE | WINE_DCX_CLIENT_SURFACE;
+
+        if (!get_cached_client_surface_region( surface, hwnd, target, present, &surface_region ))
         {
             WARN( "failed to derive client surface clip state\n" );
-            if (!client_surface_scene_current( &present->scene )) scene_retry = TRUE;
-            compose = FALSE;
+            if (!client_surface_scene_current( &present->scene )) result.status = CLIENT_SURFACE_COMPOSITION_STALE;
+            return result;
         }
-        else
+        /* Local scene mutations invalidate DCEs; NtUserGetDCEx refreshes
+         * foreign HWNDs. The private key separates composition from app DCs.
+         * Region-only backends need no reset of the borrowed DC's GDI state. */
+        if (client_surface_backend_has_cap( surface, CLIENT_SURFACE_BACKEND_READ_ONLY_DC ))
+            flags |= DCX_NORESETATTRS;
+        if (!(hdc = NtUserGetDCEx( hwnd, 0, flags )))
         {
-            /* Local DCE invalidation already follows every scene mutation;
-             * foreign HWNDs are refreshed unconditionally by NtUserGetDCEx.
-             * Forcing another server fetch here made every local frame pay an
-             * avoidable round trip despite a matching scene token. */
-            /* Keep composition DCEs distinct from ordinary application DCs. */
-            DWORD flags = DCX_CACHE | DCX_USESTYLE | WINE_DCX_CLIENT_SURFACE;
-
-            /* A region-only backend leaves the borrowed DC unchanged. Avoid
-             * resetting all GDI state (fonts, pens, mapping, driver objects)
-             * on each frame just to query SYSRGN. Other backends retain the
-             * normal reset contract. The private composition cache key still
-             * separates this DCE from application drawing DCs. */
-            if (client_surface_backend_has_cap( surface, CLIENT_SURFACE_BACKEND_READ_ONLY_DC ))
-                flags |= DCX_NORESETATTRS;
-            hdc = NtUserGetDCEx( hwnd, 0, flags );
-            if (!hdc)
-            {
-                WARN( "failed to acquire composition DC for %s\n", debugstr_client_surface( surface ) );
-                compose = FALSE;
-            }
+            WARN( "failed to acquire composition DC for %s\n", debugstr_client_surface( surface ) );
+            return result;
         }
     }
 
-    if (compose && offscreen && !client_surface_scene_current( &present->scene ))
+    if (target->offscreen && !client_surface_scene_current( &present->scene ))
     {
         TRACE( "discarding %s composition across scene change\n",
                debugstr_client_surface( surface ) );
-        compose = FALSE;
-        scene_retry = TRUE;
+        result.status = CLIENT_SURFACE_COMPOSITION_STALE;
+        goto done;
     }
 
     /* Driver composition can include an X round trip.  Serialize only this
      * surface while it runs, allowing independent surfaces to keep moving. */
-    if (compose)
-    {
-        copied = client_surface_backend_present( surface, &present->scene, hdc, surface_region,
-                                                 sync, sync );
-        composed = copied;
-    }
-    if (copied && offscreen && !client_surface_scene_current( &present->scene ))
+    if (client_surface_backend_present( surface, &present->scene, hdc, surface_region, sync, sync ))
+        result.status = CLIENT_SURFACE_COMPOSITION_COPIED;
+    if (result.status == CLIENT_SURFACE_COMPOSITION_COPIED && target->offscreen &&
+        !client_surface_scene_current( &present->scene ))
     {
         TRACE( "not committing %s composition invalidated while copying\n",
                debugstr_client_surface( surface ) );
-        composed = FALSE;
-        scene_retry = TRUE;
+        result.status = CLIENT_SURFACE_COMPOSITION_STALE;
     }
+done:
     if (hdc) NtUserReleaseDC( hwnd, hdc );
+    return result;
+}
+
+BOOL client_surface_end_present_internal( struct client_surface *surface,
+                                          const SIZE *expected_size, BOOL new_content,
+                                          struct client_surface_frame *present )
+{
+    struct client_surface_composition_result result =
+        { CLIENT_SURFACE_COMPOSITION_FAILED, present->scene.authoritative };
+    struct client_surface_target target;
+    BOOL sync = !!present->scene.generation, source_valid = FALSE, direct_proof = FALSE;
+    BOOL commit, retry, composed, wake = FALSE;
+    HWND hwnd = 0, toplevel = 0;
+
+    /* The caller owns a surface reference and completion_lock. present_lock
+     * protects detach, membership and native target changes during adoption. */
+    pthread_mutex_lock( &surface->present_lock );
+    client_surface_get_target( surface, &target );
+    if (ReadAcquire( &surface->closing ) || client_surface_target_is_updating( surface ) ||
+        client_surface_present_expired( present ) ||
+        present->target == CLIENT_SURFACE_FRAME_TARGET_INVALID ||
+        present->target_epoch != target.epoch || present->scene.toplevel != target.toplevel)
+    {
+        TRACE( "discarding %s presentation across target state change\n", debugstr_client_surface( surface ) );
+        goto finish;
+    }
+    if (new_content && present->serial <= surface->composed_serial)
+    {
+        present->result = CLIENT_SURFACE_FRAME_SUPERSEDED;
+        TRACE( "discarding superseded presentation %s serial %s, composed %s\n",
+               debugstr_client_surface( surface ), wine_dbgstr_longlong( present->serial ),
+               wine_dbgstr_longlong( surface->composed_serial ) );
+        goto finish;
+    }
+    if (!(hwnd = surface->hwnd) || !target.valid ||
+        !(InterlockedCompareExchange( &surface->active, 0, 0 ) ||
+          InterlockedCompareExchange( &surface->server_cached, 0, 0 ))) goto finish;
+    if (sync) TRACE( "client surface %p starts composition epoch commit\n", hwnd );
+    if (!new_content && !InterlockedCompareExchange( &surface->content_valid, 0, 0 ))
+    {
+        TRACE( "not recomposing incomplete cached content for %s\n", debugstr_client_surface( surface ) );
+        goto finish;
+    }
+    if (!client_surface_validate_size_locked( surface, &target, expected_size )) goto finish;
+    source_valid = new_content;
+    result = compose_client_surface_locked( surface, &target, present );
+    /* Replay may acknowledge a DIRECT image only on its unchanged native
+     * attachment, never after a detach/reattach discarded that image. */
+    direct_proof = result.status == CLIENT_SURFACE_COMPOSITION_DIRECT &&
+                   (new_content || surface->direct_content_epoch == present->target_epoch);
+finish:
     if (ReadAcquire( &surface->closing ) || client_surface_present_expired( present ))
     {
         present->result = CLIENT_SURFACE_FRAME_COMPLETION_FAILED;
-        source_valid = composed = direct_proof = FALSE;
+        source_valid = direct_proof = FALSE;
+        if (result.status != CLIENT_SURFACE_COMPOSITION_STALE) result.status = CLIENT_SURFACE_COMPOSITION_FAILED;
     }
     if (source_valid)
     {
         surface->composed_serial = present->serial;
-        surface->direct_content_epoch = direct ? present->target_epoch : 0;
+        surface->direct_content_epoch = result.status == CLIENT_SURFACE_COMPOSITION_DIRECT ? present->target_epoch : 0;
         InterlockedExchange( &surface->content_valid, TRUE );
     }
-    if (composed && sync && !direct &&
-        (InterlockedCompareExchange( &surface->active, 0, 0 ) ||
-         InterlockedCompareExchange( &surface->server_cached, 0, 0 )))
-        commit = TRUE;
-    composition_retry = sync && authorized && !composed && !scene_retry;
+    composed = result.status == CLIENT_SURFACE_COMPOSITION_DIRECT ||
+               result.status == CLIENT_SURFACE_COMPOSITION_COPIED || result.status == CLIENT_SURFACE_COMPOSITION_SKIPPED;
+    commit = composed && sync && result.status != CLIENT_SURFACE_COMPOSITION_DIRECT &&
+             (InterlockedCompareExchange( &surface->active, 0, 0 ) ||
+              InterlockedCompareExchange( &surface->server_cached, 0, 0 ));
+    retry = result.status == CLIENT_SURFACE_COMPOSITION_STALE || (sync && result.authorized && !composed);
     pthread_mutex_unlock( &surface->present_lock );
 
-    if (direct && direct_proof && sync && present->scene.mode == CLIENT_SURFACE_PRESENTATION_DIRECT &&
+    if (direct_proof && sync && present->scene.mode == CLIENT_SURFACE_PRESENTATION_DIRECT &&
         present->scene.authoritative && client_surface_scene_current( &present->scene ) &&
         surface->backend->complete_direct)
         surface->backend->complete_direct( surface, present );
@@ -626,7 +625,7 @@ BOOL client_surface_end_present_internal( struct client_surface *surface,
                                                     present->scene.epoch, &wake );
     if (wake && toplevel) NtUserPostMessage( toplevel, WM_WINE_UPDATEWINDOWSTATE, 0, 0 );
 
-    if ((scene_retry || composition_retry) && present->scene.toplevel &&
+    if (retry && present->scene.toplevel &&
         claim_client_surface_retry( surface, present->scene.generation ))
         client_surface_geometry_ready( present->scene.toplevel );
     return composed;

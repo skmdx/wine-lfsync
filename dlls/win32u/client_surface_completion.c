@@ -464,18 +464,42 @@ static enum client_surface_admission_reason acquire_completion_domain_locked( st
     return CLIENT_SURFACE_ACCEPTED;
 }
 
-/* Include creation reservations and still-exiting threads in the four slots.
- * A callback's RETIRE is not evidence that its native thread has exited. No
- * replacement can reuse that slot until the native thread has been joined. */
+/* Return with the executor lock held so callers can admit work atomically
+ * with publishing the new worker. Native thread creation must run unlocked.
+ * Only FREE slots are reusable: RETIRE still owns its slot until thread join. */
+static BOOL start_completion_worker_locked(void)
+{
+    struct client_surface_completion_worker *worker = NULL;
+    struct ntdll_thread *native_thread;
+    unsigned int i;
+    NTSTATUS status;
+    HANDLE thread;
+
+    for (i = 0; i < ARRAY_SIZE(completion_workers); ++i)
+        if (completion_workers[i].state == COMPLETION_WORKER_FREE)
+        {
+            worker = &completion_workers[i];
+            worker->state = COMPLETION_WORKER_STARTING;
+            break;
+        }
+    if (!worker) return FALSE;
+
+    pthread_mutex_unlock( &completion_executor_lock );
+    status = ntdll_create_joinable_thread( &thread, &native_thread, client_surface_completion_thread, worker );
+    pthread_mutex_lock( &completion_executor_lock );
+    worker->thread = status ? NULL : thread;
+    worker->native_thread = native_thread;
+    worker->state = status ? COMPLETION_WORKER_FREE : COMPLETION_WORKER_RUNNING;
+    pthread_cond_broadcast( &completion_executor_cond );
+    if (status) WARN( "Failed to create client-surface completion worker, status %#lx\n", (unsigned long)status );
+    return !status;
+}
+
 enum client_surface_admission_reason client_surface_activate_completion( struct client_surface_completion_job *job,
                                                                         UINT64 id )
 {
-    struct client_surface_completion_worker *worker = NULL;
     struct client_surface_completion_domain *domain;
     unsigned int i, running = 0, domains;
-    NTSTATUS status;
-    HANDLE thread;
-    struct ntdll_thread *native_thread;
     enum client_surface_admission_reason reason;
 
     if (ReadAcquire( &job->surface->closing )) return CLIENT_SURFACE_STALE_OR_CLOSED;
@@ -505,34 +529,13 @@ enum client_surface_admission_reason client_surface_activate_completion( struct 
     /* Creation never reserves a domain. Concurrent cold callers can use free
      * slots without depending on a still-STARTING thread; successful callers
      * coalesce onto the same domain when reserving under this lock. */
-    for (i = 0; i < ARRAY_SIZE(completion_workers); ++i)
-        if (completion_workers[i].state == COMPLETION_WORKER_FREE)
-        {
-            worker = &completion_workers[i];
-            worker->state = COMPLETION_WORKER_STARTING;
-            break;
-        }
-    if (!worker) reason = acquire_completion_domain_locked( job, id );
-unlock:
-    pthread_mutex_unlock( &completion_executor_lock );
-    if (!worker) goto done;
-
-    /* The system thread invokes this Unix entry directly, including for a
-     * Windows process whose machine differs from the host. Creation itself
-     * must not hold the executor lock or a native presentation lock. */
-    status = ntdll_create_joinable_thread( &thread, &native_thread, client_surface_completion_thread, worker );
-    pthread_mutex_lock( &completion_executor_lock );
-    worker->thread = status ? NULL : thread;
-    worker->native_thread = native_thread;
-    worker->state = status ? COMPLETION_WORKER_FREE : COMPLETION_WORKER_RUNNING;
+    start_completion_worker_locked();
     /* Publishing the clean worker and assigning the ticket are atomic. An
      * unrelated caller cannot take the sole idle worker between our capacity
      * check and admission while other free thread slots remain available. */
     reason = acquire_completion_domain_locked( job, id );
-    pthread_cond_broadcast( &completion_executor_cond );
+unlock:
     pthread_mutex_unlock( &completion_executor_lock );
-    if (status) WARN( "Failed to create client-surface completion worker, status %#lx\n", (unsigned long)status );
-done:
     if (reason != CLIENT_SURFACE_ACCEPTED)
         TRACE( "event=completion_admission_failed surface=%p domain=%s reason=%u scope=%u\n",
                job->surface, wine_dbgstr_longlong( id ), reason, CLIENT_SURFACE_CAPACITY_NONE );
@@ -542,11 +545,7 @@ done:
 BOOL client_surface_prepare_retirement( struct client_surface *surface )
 {
     struct client_surface_completion_domain *domain;
-    struct client_surface_completion_worker *worker;
     unsigned int i, running, starting;
-    NTSTATUS status;
-    HANDLE thread;
-    struct ntdll_thread *native_thread;
 
     /* Cleanup ownership is dormant metadata, not a native execution ticket.
      * Concurrent surface creation must not consume the four execution slots
@@ -567,23 +566,7 @@ BOOL client_surface_prepare_retirement( struct client_surface *surface )
             pthread_cond_wait( &completion_executor_cond, &completion_executor_lock );
             continue;
         }
-        worker = NULL;
-        for (i = 0; i < ARRAY_SIZE(completion_workers); ++i)
-            if (completion_workers[i].state == COMPLETION_WORKER_FREE)
-            {
-                worker = &completion_workers[i];
-                worker->state = COMPLETION_WORKER_STARTING;
-                break;
-            }
-        pthread_mutex_unlock( &completion_executor_lock );
-        if (!worker) return FALSE;
-        status = ntdll_create_joinable_thread( &thread, &native_thread, client_surface_completion_thread, worker );
-        pthread_mutex_lock( &completion_executor_lock );
-        worker->thread = status ? NULL : thread;
-        worker->native_thread = native_thread;
-        worker->state = status ? COMPLETION_WORKER_FREE : COMPLETION_WORKER_RUNNING;
-        pthread_cond_broadcast( &completion_executor_cond );
-        if (status)
+        if (!start_completion_worker_locked())
         {
             pthread_mutex_unlock( &completion_executor_lock );
             return FALSE;

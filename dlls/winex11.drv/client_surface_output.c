@@ -1432,12 +1432,12 @@ BOOL install_client_surface_direct_plan( struct client_surface_compositor_job *j
     UINT64 scene_id = job->u.direct_plan.scene_epoch;
     BOOL accepted = FALSE, allocated = FALSE;
 
-    if (job->scan.phase)
+    if (job->u.direct_plan.phase != DIRECT_PLAN_ADMIT)
     {
         scene_id = job->scan.generation;
         if (!target || !get_client_surface_direct_scene( job->toplevel, scene_id, &current )) goto done;
         accepted = TRUE;
-        if (job->scan.phase == 2) goto done;
+        if (job->u.direct_plan.phase == DIRECT_PLAN_WAIT_CONTENT) goto done;
         goto sweep;
     }
     /* The shared candidate is only an early rejection hint. The prepare and
@@ -1508,7 +1508,7 @@ BOOL install_client_surface_direct_plan( struct client_surface_compositor_job *j
      * output allocation until the host-success publication ACK. */
     quiesce_client_surface_compositor_target( target );
     target->scene.valid = FALSE;
-    job->scan.phase = 1;
+    job->u.direct_plan.phase = DIRECT_PLAN_RETIRE_BINDINGS;
     job->scan.generation = scene_id;
 sweep:
     if (!sweep_client_surface_compositor_handoffs( job, 0, budget ))
@@ -1524,7 +1524,7 @@ sweep:
         .direct_owner = x11drv_native_window_acquire( job->u.direct_plan.source_owner ),
     };
     hide_client_surface_present_window( target );
-    job->scan.phase = 2;
+    job->u.direct_plan.phase = DIRECT_PLAN_WAIT_CONTENT;
     if (x11drv_native_window_content_status( target->window_owner ) == STATUS_PENDING) *done = FALSE;
     update_client_surface_notification_plan( target );
     SetRectEmpty( &target->restore_rect );

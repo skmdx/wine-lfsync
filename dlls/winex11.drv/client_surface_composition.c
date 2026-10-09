@@ -542,10 +542,10 @@ BOOL check_client_surface_compositor_scene( struct client_surface_compositor_job
     job->result = FALSE;
     if (!target || !target->scene.valid || target->scene.strategy != OWNER_COMPOSITE ||
         target->scene.epoch != job->u.scene_check.epoch) return TRUE;
-    if (!job->scan.phase)
+    if (!job->u.scene_check.started)
     {
         job->scan.generation = target->binding_generation;
-        job->scan.phase = 1;
+        job->u.scene_check.started = TRUE;
     }
     if (job->scan.generation != target->binding_generation) return TRUE;
     while (job->scan.index < job->u.scene_check.count && *budget)
@@ -603,7 +603,7 @@ BOOL install_client_surface_scene_plan( struct client_surface_compositor_target 
     unsigned int count = job->u.scene_install.count;
 
     job->result = FALSE;
-    if (job->scan.phase == 1)
+    if (job->u.scene_install.phase == SCENE_INSTALL_ALLOCATE)
     {
         if (count)
         {
@@ -618,7 +618,7 @@ BOOL install_client_surface_scene_plan( struct client_surface_compositor_target 
         finish_client_surface_compositor_assembly( target, TRUE );
         free_client_surface_scene_plan( target );
         job->scan.generation = target->binding_generation;
-        job->scan.phase = 2;
+        job->u.scene_install.phase = SCENE_INSTALL_MEMBERS;
     }
     if (job->scan.generation != target->binding_generation) return TRUE;
     while (job->scan.index < count && *budget)

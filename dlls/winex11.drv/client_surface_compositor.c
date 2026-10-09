@@ -530,19 +530,30 @@ static struct client_surface_compositor_target *client_surface_compositor_job_ta
     return target;
 }
 
-static BOOL client_surface_compositor_job_ready( struct client_surface_compositor_job *job,
-                                                struct client_surface_compositor_target *target,
-                                                BOOL *rejected )
+enum client_surface_job_wait
 {
-    unsigned int i;
+    COMPOSITOR_JOB_READY,
+    COMPOSITOR_JOB_REJECTED,
+    COMPOSITOR_JOB_QUERY_PENDING,
+    COMPOSITOR_JOB_WAIT_CONTENT,
+    COMPOSITOR_JOB_WAIT_TARGET,
+    COMPOSITOR_JOB_WAIT_SOURCE,
+    COMPOSITOR_JOB_WAIT_POOL,
+};
+
+/* Revalidate admission and maintain the native barrier on each attempt:
+ * control jobs and scene changes can run while this FIFO head is parked.
+ * The query itself starts only once and retains its request until completion. */
+static enum client_surface_job_wait prepare_client_surface_compositor_job(
+    struct client_surface_compositor_job *job, struct client_surface_compositor_target *target )
+{
     BOOL drain = FALSE;
 
-    *rejected = FALSE;
     /* Authenticated DIRECT admission has already invalidated the old plan.
      * Its continuation only retires bindings and rechecks the selected scene. */
-    if (job->op == CLIENT_SURFACE_COMPOSITOR_DIRECT_PLAN && job->scan.phase)
-        return job->scan.phase != 2 || !target ||
-               x11drv_native_window_content_status( target->window_owner ) != STATUS_PENDING;
+    if (job->op == CLIENT_SURFACE_COMPOSITOR_DIRECT_PLAN && job->u.direct_plan.phase != DIRECT_PLAN_ADMIT)
+        return job->u.direct_plan.phase == DIRECT_PLAN_WAIT_CONTENT && target ?
+               COMPOSITOR_JOB_WAIT_CONTENT : COMPOSITOR_JOB_READY;
     if (job->op == CLIENT_SURFACE_COMPOSITOR_DIRECT_PLAN)
     {
         struct client_surface_window_query *query = &job->u.direct_plan.query;
@@ -551,10 +562,10 @@ static BOOL client_surface_compositor_job_ready( struct client_surface_composito
          * Scene admission is checked again after this receipt completes. */
         if (!query->started)
             start_client_surface_window_query( query, job->u.direct_plan.window_owner, NULL );
-        if (!ReadAcquire( &query->complete )) return FALSE;
+        if (!ReadAcquire( &query->complete )) return COMPOSITOR_JOB_QUERY_PENDING;
     }
     if (job->op == CLIENT_SURFACE_COMPOSITOR_QUERY_WINDOW ||
-        job->op == CLIENT_SURFACE_COMPOSITOR_ADMIT_PRESENT) return TRUE;
+        job->op == CLIENT_SURFACE_COMPOSITOR_ADMIT_PRESENT) return COMPOSITOR_JOB_READY;
     if (job->op == CLIENT_SURFACE_COMPOSITOR_PRESENT)
     {
         struct client_surface_output_allocation *allocation = job->u.present.allocation;
@@ -569,13 +580,12 @@ static BOOL client_surface_compositor_job_ready( struct client_surface_composito
             client_surface_compositor_frame_image( frame ) != allocation->source_image ||
             !client_surface_output_checkpoint_scene_current( &allocation->scene ))
         {
-            *rejected = TRUE;
-            return TRUE;
+            return COMPOSITOR_JOB_REJECTED;
         }
     }
     if (job->op == CLIENT_SURFACE_COMPOSITOR_CREATE_POOL || job->op == CLIENT_SURFACE_COMPOSITOR_COPY_POOL ||
-        job->op == CLIENT_SURFACE_COMPOSITOR_DROP_SEED) return TRUE;
-    if (!target) return TRUE;
+        job->op == CLIENT_SURFACE_COMPOSITOR_DROP_SEED) return COMPOSITOR_JOB_READY;
+    if (!target) return COMPOSITOR_JOB_READY;
     if (job->op == CLIENT_SURFACE_COMPOSITOR_DIRECT_PLAN ||
         job->op == CLIENT_SURFACE_COMPOSITOR_RETIRE_POOL)
     {
@@ -586,24 +596,21 @@ static BOOL client_surface_compositor_job_ready( struct client_surface_composito
         if (!current)
         {
             target->quiescing = target->native_updates || target->deferred_update;
-            *rejected = TRUE;
-            return TRUE;
+            return COMPOSITOR_JOB_REJECTED;
         }
         /* Admission may fail after native completion or a server mutation.
          * Pause new work, but preserve assembly/mailbox ownership until the
          * exact scene RPC accepts. Other native barriers remain independent. */
         target->quiescing = TRUE;
         detach_client_surface_output_transform( target );
-        for (i = 0; i < ARRAY_SIZE(target->frames); ++i)
-            if (target->frames[i].serial) return FALSE;
-        return TRUE;
+        return COMPOSITOR_JOB_WAIT_TARGET;
     }
     /* These probes never mutate native geometry or consume an output. They
      * must answer while that target's older Present work is still pending. */
     if (job->op == CLIENT_SURFACE_COMPOSITOR_TRY_BEGIN_UPDATE ||
         job->op == CLIENT_SURFACE_COMPOSITOR_CHECK_UPDATE ||
         job->op == CLIENT_SURFACE_COMPOSITOR_FINISH_UPDATE ||
-        job->op == CLIENT_SURFACE_COMPOSITOR_END_UPDATE) return TRUE;
+        job->op == CLIENT_SURFACE_COMPOSITOR_END_UPDATE) return COMPOSITOR_JOB_READY;
     /* The copy uses immutable scene/binding references. Inspecting those
      * references, or resolving source availability from completed owner
      * caches, neither mutates nor releases its output. A queued resolve can
@@ -613,7 +620,7 @@ static BOOL client_surface_compositor_job_ready( struct client_surface_composito
      * and receipt checks, including its already-resolved no-op. */
     if (job->op == CLIENT_SURFACE_COMPOSITOR_CHECK_SCENE ||
         job->op == CLIENT_SURFACE_COMPOSITOR_CHECK_CACHE ||
-        job->op == CLIENT_SURFACE_COMPOSITOR_RESOLVE_SOURCES) return TRUE;
+        job->op == CLIENT_SURFACE_COMPOSITOR_RESOLVE_SOURCES) return COMPOSITOR_JOB_READY;
     /* Expose restoration records its own deferred work if necessary. */
     /* Unlike checked XCB copies, transforms own every native input and their
      * completion record. Mutation/removal detaches adoption, not native work. */
@@ -631,8 +638,7 @@ static BOOL client_surface_compositor_job_ready( struct client_surface_composito
             TRACE_(csperf)( "ticks=%llu event=output_read_reject hwnd=%p op=%u source=%lx revision=%llu\n",
                            client_surface_perf_time(), target->toplevel, job->op, source,
                            (unsigned long long)frame->revision );
-            *rejected = TRUE;
-            return TRUE;
+            return COMPOSITOR_JOB_REJECTED;
         }
     }
     /* Preserve the scene, binding and frame referenced by the request. Only
@@ -665,14 +671,39 @@ static BOOL client_surface_compositor_job_ready( struct client_surface_composito
         client_surface_cancel_native_presents( &target->native_presents );
         process_client_surface_native_present( target );
     }
+    if (drain) return COMPOSITOR_JOB_WAIT_TARGET;
+    if (job->op == CLIENT_SURFACE_COMPOSITOR_PRESENT) return COMPOSITOR_JOB_WAIT_SOURCE;
+    if (job->op == CLIENT_SURFACE_COMPOSITOR_FREE_POOL) return COMPOSITOR_JOB_WAIT_POOL;
+    return COMPOSITOR_JOB_READY;
+}
+
+/* Observation only. All cancellation and barrier changes belong to prepare. */
+static BOOL client_surface_compositor_job_ready( const struct client_surface_compositor_job *job,
+                                                const struct client_surface_compositor_target *target,
+                                                enum client_surface_job_wait wait )
+{
+    unsigned int i;
+
+    switch (wait)
+    {
+    case COMPOSITOR_JOB_QUERY_PENDING:
+        return FALSE;
+    case COMPOSITOR_JOB_WAIT_CONTENT:
+        return x11drv_native_window_content_status( target->window_owner ) != STATUS_PENDING;
+    case COMPOSITOR_JOB_READY:
+    case COMPOSITOR_JOB_REJECTED:
+        return TRUE;
+    default:
+        break;
+    }
     for (i = 0; i < ARRAY_SIZE(target->frames); ++i)
     {
-        struct client_surface_compositor_frame *frame = &target->frames[i];
+        const struct client_surface_compositor_frame *frame = &target->frames[i];
 
         if (!frame->serial) continue;
-        if (drain ||
-            (job->op == CLIENT_SURFACE_COMPOSITOR_PRESENT && frame->pixmap == job->u.present.source) ||
-            (job->op == CLIENT_SURFACE_COMPOSITOR_FREE_POOL &&
+        if (wait == COMPOSITOR_JOB_WAIT_TARGET ||
+            (wait == COMPOSITOR_JOB_WAIT_SOURCE && frame->pixmap == job->u.present.source) ||
+            (wait == COMPOSITOR_JOB_WAIT_POOL &&
              (frame->pixmap == job->u.retired_pixmaps[0] || frame->pixmap == job->u.retired_pixmaps[1]))) return FALSE;
     }
     return TRUE;
@@ -825,7 +856,13 @@ static BOOL step_client_surface_compositor_job( struct client_surface_compositor
                        client_surface_perf_time(), job->toplevel, job->op,
                        (unsigned long long)job->sequence, (unsigned long long)job->queue->retired_through );
     }
-    else if (!client_surface_compositor_job_ready( job, target, &rejected )) return FALSE;
+    else
+    {
+        enum client_surface_job_wait wait = prepare_client_surface_compositor_job( job, target );
+
+        if (!client_surface_compositor_job_ready( job, target, wait )) return FALSE;
+        rejected = wait == COMPOSITOR_JOB_REJECTED;
+    }
     prepare_client_surface_notification( job );
     job->result = FALSE;
     if (!rejected)
@@ -860,10 +897,10 @@ static BOOL step_client_surface_compositor_job( struct client_surface_compositor
             break;
         }
         case CLIENT_SURFACE_COMPOSITOR_SWEEP_HANDOFFS:
-            if (!job->scan.phase)
+            if (job->u.scene_install.phase == SCENE_INSTALL_SWEEP)
             {
                 if (!(done = sweep_client_surface_compositor_handoffs( job, job->u.scene_install.mark, budget ))) break;
-                job->scan.phase = 1;
+                job->u.scene_install.phase = SCENE_INSTALL_ALLOCATE;
             }
             if (target) done = install_client_surface_scene_plan( target, job, budget );
             else job->result = TRUE;
@@ -883,8 +920,8 @@ static BOOL step_client_surface_compositor_job( struct client_surface_compositor
     *progressed = TRUE;
     if (!done)
     {
-        TRACE_(csperf)( "ticks=%llu event=compositor_job_yield hwnd=%p op=%u phase=%u index=%u\n",
-                       client_surface_perf_time(), job->toplevel, job->op, job->scan.phase, job->scan.index );
+        TRACE_(csperf)( "ticks=%llu event=compositor_job_yield hwnd=%p op=%u index=%u\n",
+                       client_surface_perf_time(), job->toplevel, job->op, job->scan.index );
         *runnable = TRUE;
         return FALSE;
     }
