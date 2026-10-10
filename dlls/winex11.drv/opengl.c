@@ -2567,18 +2567,18 @@ static void x11drv_egl_surface_flush( struct opengl_drawable *base, UINT flags )
     if (flags & GL_FLUSH_INTERVAL) funcs->p_eglSwapInterval( egl->display, abs( base->interval ) );
     if (flags & GL_FLUSH_UPDATED)
     {
-        EGLint width, height;
+        EGLint width;
 
         /* Mesa's X11 platform updates the native drawable geometry and
          * invalidates its old buffers while querying the EGL surface size.
          * Do that before the application's next GL command can render into
-         * buffers which still have the previous X window dimensions. */
-        if (!funcs->p_eglQuerySurface( egl->display, base->surface, EGL_WIDTH, &width ) ||
-            !funcs->p_eglQuerySurface( egl->display, base->surface, EGL_HEIGHT, &height ))
+         * buffers which still have the previous X window dimensions. Either
+         * dimension query refreshes both sizes; querying the other repeats
+         * the same native geometry round trip. */
+        if (!funcs->p_eglQuerySurface( egl->display, base->surface, EGL_WIDTH, &width ))
             ERR( "Failed to refresh resized EGL surface %s\n", debugstr_opengl_drawable( base ) );
         else
-            TRACE( "Refreshed EGL surface %s to %dx%d\n",
-                   debugstr_opengl_drawable( base ), width, height );
+            TRACE( "Refreshed EGL surface %s width %d\n", debugstr_opengl_drawable( base ), width );
     }
     if (!(flags & GL_FLUSH_PRESENT)) return;
 
