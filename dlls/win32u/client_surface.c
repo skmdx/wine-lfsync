@@ -532,7 +532,8 @@ void client_surface_prepare_scene( struct client_surface *surface )
         }
         /* Keep the deferred native update on its owned replay path instead
          * of submitting the same owner again here. */
-        if (status != STATUS_PENDING) update_window_state( toplevel );
+        if (status == STATUS_SUCCESS) update_window_client_surface_scene( toplevel );
+        else if (status != STATUS_PENDING) update_window_state( toplevel );
     }
     else if (wake && toplevel)
         NtUserPostMessage( toplevel, WM_WINE_UPDATEWINDOWSTATE, 0, 0 );

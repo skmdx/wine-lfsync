@@ -816,7 +816,7 @@ BOOL X11DRV_client_surface_backing_retire( struct x11drv_win_data *data )
     return TRUE;
 }
 
-NTSTATUS X11DRV_client_surface_prepare_owner( struct x11drv_win_data *data )
+static NTSTATUS renew_client_surface_owner( struct x11drv_win_data *data )
 {
     struct client_surface_scene scene;
     NTSTATUS status;
@@ -856,6 +856,24 @@ NTSTATUS X11DRV_client_surface_prepare_owner( struct x11drv_win_data *data )
             X11DRV_client_surface_backing_cancel_geometry( data, 0 );
             return STATUS_SUCCESS;
         }
+        /* This operation attempted renewal and now owns the checkpoint
+         * fallback. Do not turn it into a fresh preparation on a GUI wake. */
+        return STATUS_MORE_PROCESSING_REQUIRED;
+    }
+    return STATUS_NOT_SUPPORTED;
+}
+
+NTSTATUS X11DRV_client_surface_prepare_owner( struct x11drv_win_data *data )
+{
+    NTSTATUS status;
+
+    /* A pending allocation owns the checkpoint chosen after a rejected
+     * renewal. Resume it rather than starting another renewal attempt. */
+    if (!data->client_surface_pending_allocation)
+    {
+        status = renew_client_surface_owner( data );
+        if (status != STATUS_NOT_SUPPORTED && status != STATUS_MORE_PROCESSING_REQUIRED)
+            return status;
     }
     /* Without an authenticated retained attachment, preserve GDI/background
      * pixels before the next producer can choose or fall back to composition. */

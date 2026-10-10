@@ -335,6 +335,7 @@ extern void update_window_state( HWND hwnd );
 extern NTSTATUS publish_window_state( HWND hwnd );
 extern NTSTATUS client_surface_publish_window( HWND hwnd );
 extern NTSTATUS prepare_window_client_surfaces( HWND hwnd );
+extern void update_window_client_surface_scene( HWND hwnd );
 extern void client_surface_prepare_scene( struct client_surface *surface );
 extern NTSTATUS update_window_client_surface_backing( HWND hwnd );
 extern void detach_client_surface_identity( UINT64 identity );

@@ -4886,12 +4886,20 @@ NTSTATUS publish_window_state( HWND hwnd )
     return update_window_state_flags( hwnd, WINE_SWP_CLIENT_SURFACE_PUBLISH );
 }
 
-NTSTATUS prepare_window_client_surfaces( HWND hwnd )
+void update_window_client_surface_scene( HWND hwnd )
 {
-    return update_window_state_flags( hwnd, WINE_SWP_CLIENT_SURFACE_PREPARE );
+    if (user_driver->pUpdateClientSurfaceScene( hwnd )) update_client_surfaces( hwnd );
+    else update_window_state( hwnd );
 }
 
-static NTSTATUS update_client_surface_backing_state( HWND hwnd, BOOL enable, BOOL prepare )
+enum client_surface_owner_update
+{
+    CLIENT_SURFACE_OWNER_PREPARE,
+    CLIENT_SURFACE_OWNER_ENABLE_BACKING,
+    CLIENT_SURFACE_OWNER_DISABLE_BACKING,
+};
+
+static NTSTATUS update_client_surface_owner_state( HWND hwnd, enum client_surface_owner_update operation )
 {
     struct window_rects rects;
     NTSTATUS status = STATUS_NOT_SUPPORTED;
@@ -4920,17 +4928,30 @@ static NTSTATUS update_client_surface_backing_state( HWND hwnd, BOOL enable, BOO
             return status;
     }
 
-    /* Backing notifications change neither Win32 geometry nor the GDI
-     * surface. Let the driver handle its retained native state directly,
-     * provided its current geometry agrees with the authoritative window. */
+    /* Owner transactions may consume an existing native attachment without
+     * changing Win32 geometry or creating a GDI surface. The driver checks
+     * that its retained geometry still matches this authoritative sample. */
     context = set_thread_dpi_awareness_context( get_window_dpi_awareness_context( hwnd ));
     if (get_window_rects( hwnd, COORDS_PARENT, &rects, get_thread_dpi() ))
     {
         rects = map_window_rects_virt_to_raw( rects, get_thread_dpi() );
-        status = user_driver->pUpdateClientSurfaceBacking( hwnd, enable, prepare, &rects );
+        if (operation == CLIENT_SURFACE_OWNER_PREPARE)
+            status = user_driver->pPrepareClientSurfaceScene( hwnd, &rects );
+        else
+            status = user_driver->pUpdateClientSurfaceBacking( hwnd,
+                operation == CLIENT_SURFACE_OWNER_ENABLE_BACKING, &rects );
     }
     if (status == STATUS_SUCCESS) update_client_surfaces( hwnd );
     set_thread_dpi_awareness_context( context );
+    return status;
+}
+
+NTSTATUS prepare_window_client_surfaces( HWND hwnd )
+{
+    NTSTATUS status = update_client_surface_owner_state( hwnd, CLIENT_SURFACE_OWNER_PREPARE );
+
+    if (status == STATUS_NOT_SUPPORTED)
+        status = update_window_state_flags( hwnd, WINE_SWP_CLIENT_SURFACE_PREPARE );
     return status;
 }
 
@@ -4962,7 +4983,8 @@ NTSTATUS update_window_client_surface_backing( HWND hwnd )
     }
     driver_flags = enable ? WINE_SWP_CLIENT_SURFACE_BACKING_ENABLE : WINE_SWP_CLIENT_SURFACE_BACKING_DISABLE;
     if (prepare) driver_flags |= WINE_SWP_CLIENT_SURFACE_PREPARE;
-    status = update_client_surface_backing_state( hwnd, enable, prepare );
+    status = update_client_surface_owner_state( hwnd, prepare ? CLIENT_SURFACE_OWNER_PREPARE :
+        enable ? CLIENT_SURFACE_OWNER_ENABLE_BACKING : CLIENT_SURFACE_OWNER_DISABLE_BACKING );
     if (status == STATUS_NOT_SUPPORTED)
         status = update_window_state_flags( hwnd, driver_flags );
     if (status == STATUS_SUCCESS && prepare) client_surface_end_prepare( &scene );

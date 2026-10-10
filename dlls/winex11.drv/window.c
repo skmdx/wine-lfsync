@@ -4706,7 +4706,65 @@ static BOOL get_desired_wm_state( DWORD style, const struct window_rects *rects 
     return WithdrawnState;
 }
 
-NTSTATUS X11DRV_UpdateClientSurfaceBacking( HWND hwnd, BOOL enable, BOOL prepare,
+/* Owner transactions consume geometry already applied by WindowPosChanged.
+ * A pending native mutation must finish through that boundary first. */
+static BOOL client_surface_owner_geometry_current( struct x11drv_win_data *data,
+                                                   const struct window_rects *rects )
+{
+    return data->whole_window && data->client_window && !data->embedded && !data->shaped &&
+        !data->state_locks && !data->reparenting && !data->parent_invalid &&
+        !data->use_alpha && !data->client_surface_opacity_valid && !data->is_fullscreen &&
+        !data->client_surface_backing && !data->client_surface_backing_spare && !data->client_surface_redirected &&
+        !data->client_surface_opacity_staged && !data->client_surface_staged &&
+        !data->wm_state_serial && !data->net_wm_state_serial &&
+        data->desired_state.wm_state == NormalState && data->pending_state.wm_state == NormalState &&
+        (!data->managed || data->current_state.wm_state == NormalState) &&
+        !memcmp( &data->rects, rects, sizeof(*rects) ) &&
+        EqualRect( &data->desired_state.rect, &data->pending_state.rect ) &&
+        EqualRect( &data->pending_state.rect, &rects->visible );
+}
+
+BOOL X11DRV_UpdateClientSurfaceScene( HWND hwnd )
+{
+    struct x11drv_win_data *data;
+    struct client_surface_scene scene;
+    BOOL current;
+
+    if (!(data = get_win_data( hwnd ))) return FALSE;
+    /* Server admission can precede native staging cleanup. Only a fully
+     * settled attachment can consume a scene update without that cleanup. */
+    current = client_surface_owner_geometry_current( data, &data->rects ) &&
+        !data->client_surface_pending_allocation &&
+        client_surface_get_toplevel_scene( hwnd, &scene ) && scene.valid &&
+        scene.mode == CLIENT_SURFACE_PRESENTATION_DIRECT && scene.direct_candidate &&
+        client_surface_scene_snapshot_current( hwnd, scene.epoch );
+    release_win_data( data );
+    return current;
+}
+
+NTSTATUS X11DRV_PrepareClientSurfaceScene( HWND hwnd, const struct window_rects *rects )
+{
+    struct x11drv_win_data *data;
+    struct client_surface_scene scene;
+    NTSTATUS status = STATUS_NOT_SUPPORTED;
+    UINT64 geometry_scope;
+
+    if (!(data = get_win_data( hwnd ))) return status;
+    if (client_surface_owner_geometry_current( data, rects ))
+    {
+        geometry_scope = X11DRV_client_surface_geometry_begin( data );
+        client_surface_capture_scene_state( hwnd, &scene );
+        XFlush( gdi_display );
+        status = X11DRV_client_surface_prepare_owner( data );
+        if (status != STATUS_SUCCESS && status != STATUS_PENDING && status != STATUS_NOT_SUPPORTED)
+            client_surface_fail_scene( &scene );
+        X11DRV_client_surface_geometry_end( data, geometry_scope, status );
+    }
+    release_win_data( data );
+    return status;
+}
+
+NTSTATUS X11DRV_UpdateClientSurfaceBacking( HWND hwnd, BOOL enable,
                                            const struct window_rects *rects )
 {
     struct x11drv_win_data *data;
@@ -4718,7 +4776,7 @@ NTSTATUS X11DRV_UpdateClientSurfaceBacking( HWND hwnd, BOOL enable, BOOL prepare
     /* A completed composition backing can receive another enable while its
      * staged frame is still being copied. Reapplying the same state through
      * WindowPosChanged would cancel that publication for no native change. */
-    if (enable && !prepare && data->client_surface_backing_enabled && data->client_surface_backing &&
+    if (enable && data->client_surface_backing_enabled && data->client_surface_backing &&
         data->client_surface_staged && !data->client_surface_pending_allocation &&
         data->client_surface_backing_width == rects->visible.right - rects->visible.left &&
         data->client_surface_backing_height == rects->visible.bottom - rects->visible.top &&
@@ -4734,45 +4792,19 @@ NTSTATUS X11DRV_UpdateClientSurfaceBacking( HWND hwnd, BOOL enable, BOOL prepare
      * be created or retired. Geometry, staging and an existing output pool
      * still require the ordinary window update and its quiescing boundary.
      * Only managed windows receive WM_STATE property changes. */
-    if (!data->whole_window || !data->client_window || data->embedded || data->shaped ||
-        data->state_locks || data->reparenting || data->parent_invalid ||
-        data->use_alpha || data->client_surface_opacity_valid || data->is_fullscreen ||
-        data->client_surface_backing || data->client_surface_backing_spare || data->client_surface_redirected ||
-        data->client_surface_opacity_staged || data->client_surface_staged ||
-        data->wm_state_serial || data->net_wm_state_serial ||
-        data->desired_state.wm_state != NormalState || data->pending_state.wm_state != NormalState ||
-        (data->managed && data->current_state.wm_state != NormalState) ||
-        memcmp( &data->rects, rects, sizeof(*rects) ))
-        goto done;
-    /* ConfigureNotify may still be queued after the native resize completed.
-     * Require the requested geometry to have been sent, with no delayed
-     * change. Preparation still synchronizes the GUI connection and checks
-     * the actual native parentage and extents before renewing DIRECT. */
-    if (!EqualRect( &data->desired_state.rect, &data->pending_state.rect ) ||
-        !EqualRect( &data->pending_state.rect, &rects->visible ))
-        goto done;
+    if (!client_surface_owner_geometry_current( data, rects )) goto done;
     client_surface_get_toplevel_scene( hwnd, &scene );
-    if (enable ? (!prepare || scene.valid || !scene.direct_candidate) :
-        (!scene.valid || scene.generation || scene.mode != CLIENT_SURFACE_PRESENTATION_DIRECT))
+    if (enable || !scene.valid || scene.generation || scene.mode != CLIENT_SURFACE_PRESENTATION_DIRECT)
         goto done;
 
     geometry_scope = X11DRV_client_surface_geometry_begin( data );
     XFlush( gdi_display );
     data->client_surface_backing_enabled = enable;
     status = STATUS_SUCCESS;
-    if (prepare)
-    {
-        /* This keeps the exact native geometry/identity checks, failed
-         * renewal checkpoint fallback and server preparation handshake. */
-        client_surface_capture_scene_state( hwnd, &scene );
-        status = X11DRV_client_surface_prepare_owner( data );
-        if (status != STATUS_SUCCESS && status != STATUS_PENDING)
-            client_surface_fail_scene( &scene );
-    }
-    else if (!X11DRV_client_surface_backing_retire( data )) destroy_client_surface_backing( data );
+    if (!X11DRV_client_surface_backing_retire( data )) destroy_client_surface_backing( data );
     X11DRV_client_surface_geometry_end( data, geometry_scope, status );
-    TRACE( "win %p backing state enable %u prepare %u scene %s status %#x\n",
-           hwnd, enable, prepare, wine_dbgstr_longlong(scene.epoch), (unsigned int)status );
+    TRACE( "win %p backing state enable %u scene %s status %#x\n",
+           hwnd, enable, wine_dbgstr_longlong(scene.epoch), (unsigned int)status );
     XFlush( data->display );
 done:
     release_win_data( data );
@@ -5333,7 +5365,9 @@ LRESULT X11DRV_WindowMessage( HWND hwnd, UINT msg, WPARAM wp, LPARAM lp )
                 X11DRV_SetWindowRgn( hwnd, (HRGN)1, FALSE );
             if (types & X11DRV_CLIENT_SURFACE_UPDATE_PUBLISH)
                 send_message( hwnd, WM_WINE_UPDATEWINDOWSTATE, WINE_PUBLISH_CLIENT_SURFACES, 0 );
-            send_message( hwnd, WM_WINE_UPDATEWINDOWSTATE, WINE_UPDATE_CLIENT_SURFACE_HANDOFFS, 0 );
+            /* Deferred geometry must replay its native state operation.
+             * A scene refresh no longer reapplies WindowPosChanged. */
+            send_message( hwnd, WM_WINE_UPDATEWINDOWSTATE, 0, 0 );
             X11DRV_client_surface_backing_finish_deferred_update( hwnd, serial, notifications );
         }
         return 0;

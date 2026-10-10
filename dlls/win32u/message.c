@@ -2318,7 +2318,11 @@ static LRESULT handle_internal_message( HWND hwnd, UINT msg, WPARAM wparam, LPAR
             return status;
         }
         else if (wparam == WINE_UPDATE_CLIENT_SURFACE_HANDOFFS)
-            update_window_state( hwnd );
+        {
+            /* The driver can consume an admitted scene without replaying
+             * native geometry. Transitions retain their full state update. */
+            update_window_client_surface_scene( hwnd );
+        }
         else if (wparam == WINE_RESOLVE_CLIENT_SURFACE_SOURCES)
             client_surface_resolve_sources( hwnd );
         else update_window_state( hwnd );
