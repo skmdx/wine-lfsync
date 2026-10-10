@@ -576,11 +576,12 @@ static BOOL x11drv_egl_surface_create( struct client_surface *client, int format
     }
     /* A foreign-process target always uses the owner compositor. Retain its
      * application front/back buffers in the existing FBO wrapper and copy
-     * completed images directly into independent GPU source storage. */
+     * completed images directly into independent GPU source storage. The
+     * owned pixmaps need EGL image support, not XComposite redirection. */
     NtUserGetWindowThread( client->hwnd, &process );
-    if (usexcomposite && process && process != GetCurrentProcessId())
+    if (process && process != GetCurrentProcessId())
         pthread_once( &snapshot_once, init_snapshot_image_funcs );
-    surface->direct_snapshot = usexcomposite && process && process != GetCurrentProcessId() &&
+    surface->direct_snapshot = process && process != GetCurrentProcessId() &&
         !gl->base.stereo && snapshot_create_image && snapshot_destroy_image && snapshot_bind_image &&
         has_extension( funcs->p_eglQueryString( egl->display, EGL_EXTENSIONS ), "EGL_KHR_image_pixmap" );
     gl->base.needs_framebuffer = !usexcomposite || surface->direct_snapshot;
