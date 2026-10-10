@@ -220,7 +220,7 @@ struct gdi_dc_funcs
 };
 
 /* increment this when changing driver tables or shared driver-facing structures */
-#define WINE_GDI_DRIVER_VERSION 159
+#define WINE_GDI_DRIVER_VERSION 160
 
 #define GDI_PRIORITY_NULL_DRV        0  /* null driver */
 #define GDI_PRIORITY_FONT_DRV      100  /* any font driver */
@@ -417,6 +417,7 @@ struct client_surface_frame
     enum client_surface_frame_target target;
     BOOL replay; /* publish retained completed storage without another native source read */
     BOOL direct_snapshot; /* preserve an OpenGL image while DIRECT renewal is pending */
+    BOOL source_unreserved; /* submitted completion still needs a SOURCE storage reservation */
     UINT64 handoff_control;
     unsigned int handoff_index;
     /* Borrowed from the prepared reservation until its completion/capture is
@@ -567,6 +568,7 @@ struct client_surface
     LONG64                             completed_image_serial; /* independently frozen image, not mutable DIRECT content */
     LONG                               external_completion_count; /* causal tokens currently in flight */
     LONG                               driver_completion_count; /* shared native monitor tokens in flight */
+    LONG                               unreserved_source_count; /* prevent successors stealing a waiting capture's storage */
     LONG                               driver_completion_waiters; /* pending shared-monitor mode transitions */
     LONG                               native_present_count; /* native presentation calls currently in flight */
     LONG                               target_update_waiters; /* pending native target mutations */

@@ -665,6 +665,7 @@ static BOOL client_surface_present_busy_locked( struct client_surface *surface, 
     return InterlockedCompareExchange( &surface->target_update_waiters, 0, 0 ) ||
            surface->native_present_count ||
            (external_completion ? surface->driver_completion_count || surface->driver_completion_waiters ||
+                                  surface->unreserved_source_count ||
                                   (surface->backend->handoff &&
                                    surface->backend->handoff->serialize( surface ) &&
                                    InterlockedCompareExchange( &surface->external_completion_count, 0, 0 )) :
@@ -971,6 +972,13 @@ static void client_surface_register_completion_locked( struct client_surface *su
 {
     if (present->completion.kind == CLIENT_SURFACE_COMPLETION_NONE) return;
     InterlockedIncrement( &surface->external_completion_count );
+    /* A CPU/private fallback can reach the FIFO without a SOURCE slot.
+     * Its successors must not reserve every slot returned by the owner:
+     * they cannot release those reservations before this head completes. */
+    present->source_unreserved = !present->handoff_control &&
+        (present->capture.context || present->target == CLIENT_SURFACE_FRAME_TARGET_OFFSCREEN || present->direct_snapshot) &&
+        client_surface_backend_has_cap( surface, CLIENT_SURFACE_BACKEND_OWNER_SCENE_PLAN );
+    if (present->source_unreserved) ++surface->unreserved_source_count;
     if (present->completion.kind == CLIENT_SURFACE_COMPLETION_SHARED)
         surface->driver_completion_count++;
 }
@@ -1233,6 +1241,12 @@ struct client_surface_present_result client_surface_complete_present_locked( str
          * disappears. Serialize that transition and detachment with them. */
         pthread_mutex_lock( &surface->present_lock );
         assert( InterlockedCompareExchange( &surface->external_completion_count, 0, 0 ) > 0 );
+        if (present->source_unreserved)
+        {
+            assert( surface->unreserved_source_count > 0 );
+            if (!--surface->unreserved_source_count) wake = TRUE;
+            present->source_unreserved = FALSE;
+        }
         if (present->completion.kind == CLIENT_SURFACE_COMPLETION_SHARED)
         {
             assert( surface->driver_completion_count > 0 );

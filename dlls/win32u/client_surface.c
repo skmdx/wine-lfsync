@@ -595,6 +595,7 @@ void client_surface_retire_resources( struct client_surface *surface )
     assert( !surface->external_completion_count );
     client_surface_handoff_destroy( surface );
     assert( !surface->driver_completion_count );
+    assert( !surface->unreserved_source_count );
     assert( !surface->driver_completion_waiters );
     assert( !surface->native_present_count );
     assert( !surface->target_update_waiters );

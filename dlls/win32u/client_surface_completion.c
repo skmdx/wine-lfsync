@@ -682,34 +682,46 @@ static BOOL finish_deferred_present( struct client_surface *surface, struct clie
     return TRUE;
 }
 
+static DWORD completion_clock(void)
+{
+    struct timespec now;
+
+    /* NtGetTickCount is a server-updated snapshot. When all producers wait,
+     * it can stay unchanged for 16 ms, extending a 1 ms retry over several
+     * timed wakes. Match the monotonic clock used by the condition wait. */
+    clock_gettime( CLOCK_MONOTONIC, &now );
+    return now.tv_sec * 1000 + now.tv_nsec / 1000000;
+}
+
 static struct client_surface_completion_result poll_completion_job( struct client_surface *surface,
                                                                      struct client_surface_completion_job *job )
 {
     struct client_surface_completion_result result;
     DWORD now = NtGetTickCount(), elapsed = now - job->present.submission_time;
     DWORD remaining = elapsed < CLIENT_SURFACE_PRESENT_TIMEOUT ? CLIENT_SURFACE_PRESENT_TIMEOUT - elapsed : 0;
-    DWORD poll_start = now;
+    DWORD poll_start = completion_clock(), poll_end;
 
     /* One native poll per turn, without renewing the submission deadline. */
     result = client_surface_poll_present_completion( surface, &job->present,
                 min( remaining, (DWORD)CLIENT_SURFACE_COMPLETION_POLL_TIMEOUT_MS ) );
     if (result.status == CLIENT_SURFACE_COMPLETION_FAILED) return result;
     now = NtGetTickCount();
+    poll_end = completion_clock();
     elapsed = now - job->present.submission_time;
     if (client_surface_present_expired( &job->present ) ||
         elapsed >= CLIENT_SURFACE_PRESENT_TIMEOUT)
     {
         TRACE_(csperf)( "ticks=%llu event=completion_timeout identity=%s serial=%s elapsed=%u timeout=%u poll_elapsed=%u\n",
                        client_surface_perf_time(), wine_dbgstr_longlong( client_surface_get_identity( surface ) ),
-                       wine_dbgstr_longlong( job->present.serial ), elapsed, CLIENT_SURFACE_PRESENT_TIMEOUT, now - poll_start );
+                       wine_dbgstr_longlong( job->present.serial ), elapsed, CLIENT_SURFACE_PRESENT_TIMEOUT, poll_end - poll_start );
         WARN( "timed out waiting for presentation completion for %s serial %s\n",
               debugstr_client_surface( surface ), wine_dbgstr_longlong( job->present.serial ) );
         result.status = CLIENT_SURFACE_COMPLETION_FAILED;
         return result;
     }
     if (result.status != CLIENT_SURFACE_COMPLETION_PENDING) return result;
-    job->poll_due = now;
-    if (now == poll_start)
+    job->poll_due = poll_end;
+    if (poll_end == poll_start)
     {
         /* Immediate GLX/EGL queries back off without occupying a worker. The
          * native query and subsequent capture themselves have no hard bound. */
@@ -752,7 +764,7 @@ static enum client_surface_completion_worker_disposition execute_completion_job(
         /* A RETIRE disposition belongs to the thread returning from the
          * native wait. Its domain stays blocked until that thread exits;
          * the later adoption-only attempt must not retire its new worker. */
-        job->poll_due = NtGetTickCount() + job->poll_delay;
+        job->poll_due = completion_clock() + job->poll_delay;
         job->poll_delay = min( job->poll_delay * 2, (DWORD)4 );
         result.status = CLIENT_SURFACE_COMPLETION_PENDING;
     }
@@ -901,7 +913,7 @@ static void client_surface_completion_thread( void *context )
     struct client_surface_completion_worker *worker = context;
     struct client_surface_completion_job *job;
     struct client_surface *surface;
-    DWORD idle_started = NtGetTickCount(), now, delay;
+    DWORD idle_started = completion_clock(), now, delay;
     enum client_surface_completion_worker_disposition disposition;
     unsigned int i;
 
@@ -916,7 +928,7 @@ static void client_surface_completion_thread( void *context )
         pthread_mutex_lock( &completion_executor_lock );
         for (;;)
         {
-            now = NtGetTickCount();
+            now = completion_clock();
             delay = CLIENT_SURFACE_COMPLETION_WORKER_IDLE_TIMEOUT_MS;
             if ((surface = next_completion_surface_locked( worker, now, &delay, FALSE ))) break;
             if (completion_demand_locked( 1 )) idle_started = now;
@@ -949,7 +961,7 @@ static void client_surface_completion_thread( void *context )
         disposition = CLIENT_SURFACE_COMPLETION_WORKER_REUSE;
         if (job) disposition = execute_completion_job( surface, job, worker, TRUE );
         else execute_surface_retirement( surface, worker );
-        idle_started = NtGetTickCount();
+        idle_started = completion_clock();
         if (disposition == CLIENT_SURFACE_COMPLETION_WORKER_RETIRE)
         {
             TRACE( "event=completion_retire surface=%p slot=%u\n",
