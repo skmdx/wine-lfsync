@@ -631,11 +631,7 @@ static void finish_cache_image( struct client_surface_native_work *work )
     pthread_mutex_lock( &cache_mutex );
     if (image->waiting)
     {
-        unsigned int i;
-
         queue_native_work( worker, work );
-        if (!image->started)
-            for (i = 0; i < worker_count; ++i) pthread_cond_signal( &cache_workers[i].cond );
         pthread_mutex_unlock( &cache_mutex );
         return;
     }
@@ -660,6 +656,15 @@ static void finish_cache_image( struct client_surface_native_work *work )
     wake();
 }
 
+static BOOL cache_work_is_movable( struct client_surface_native_work *work )
+{
+    struct client_surface_cache_image *image;
+
+    if (work->execute != execute_cache_image) return TRUE;
+    image = CONTAINING_RECORD( work, struct client_surface_cache_image, work );
+    return !image->started && image->operation != CACHE_RELEASE;
+}
+
 static BOOL steal_cache_work( struct cache_worker *worker )
 {
     unsigned int i;
@@ -672,20 +677,9 @@ static BOOL steal_cache_work( struct cache_worker *worker )
         if (from == worker) continue;
         for (cursor = &from->head; (work = *cursor); cursor = &work->next)
         {
-            struct client_surface_cache_image *image = NULL;
-
-            if (work->execute == execute_cache_image)
-            {
-                image = CONTAINING_RECORD( work, struct client_surface_cache_image, work );
-                if (image->started || image->operation == CACHE_RELEASE) continue;
-            }
+            if (!cache_work_is_movable( work )) continue;
             if (!(*cursor = work->next)) from->tail = cursor;
             --from->pending;
-            if (image)
-            {
-                image->worker = worker;
-                if (image->operation == CACHE_CREATE) image->owner = worker;
-            }
             queue_native_work( worker, work );
             return TRUE;
         }
@@ -777,6 +771,25 @@ static struct cache_worker *select_cache_worker(void)
 
 static void queue_native_work( struct cache_worker *worker, struct client_surface_native_work *work )
 {
+    if (worker->cache && cache_work_is_movable( work ))
+    {
+        unsigned int i;
+
+        /* Route movable work directly to an idle executor. Waking every
+         * peer to steal one item creates competing Xlib/Wine readers and
+         * scheduler work even when only one native operation can progress.
+         * Busy peers still steal queued work when they finish their call. */
+        if (worker->pending)
+            for (i = 0; i < worker_count; ++i)
+                if (!cache_workers[i].pending) { worker = &cache_workers[i]; break; }
+        if (work->execute == execute_cache_image)
+        {
+            struct client_surface_cache_image *image = CONTAINING_RECORD( work, struct client_surface_cache_image, work );
+
+            image->worker = worker;
+            if (image->operation == CACHE_CREATE) image->owner = worker;
+        }
+    }
     work->next = NULL;
     *worker->tail = work;
     worker->tail = &work->next;
@@ -803,12 +816,9 @@ BOOL client_surface_prepare_native_work(void)
 
 void client_surface_submit_native_work( struct client_surface_native_work *work )
 {
-    unsigned int i;
-
     pthread_mutex_lock( &cache_mutex );
     assert( worker_count );
     queue_native_work( select_existing_cache_worker(), work );
-    for (i = 0; i < worker_count; ++i) pthread_cond_signal( &cache_workers[i].cond );
     pthread_mutex_unlock( &cache_mutex );
 }
 
@@ -987,15 +997,7 @@ static void queue_cache_image( struct client_surface_cache_image *image, enum ca
     image->work.execute = execute_cache_image;
     image->work.finished = finish_cache_image;
     queue_native_work( worker, &image->work );
-    if (operation != CACHE_RELEASE)
-    {
-        unsigned int i;
-
-        /* Assignment is only a preference until execution starts. Wake idle
-         * peers so work queued during a busy interval cannot become
-         * stranded behind an unrelated native call on the chosen worker. */
-        for (i = 0; i < worker_count; ++i) pthread_cond_signal( &cache_workers[i].cond );
-    }
+    worker = image->worker;
     TRACE_(csperf)( "ticks=%llu event=cache_image_queue image=%p operation=%u worker=%u pending=%u count=%u purpose=%u\n",
                    client_surface_perf_time(), image, operation, (unsigned int)(worker - cache_workers), worker->pending, image_count,
                    image->purpose );
