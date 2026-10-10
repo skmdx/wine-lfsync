@@ -1806,6 +1806,7 @@ static void release_glx_present_completion( void *context )
 static BOOL snapshot_client_surface( struct opengl_drawable *base, struct client_surface_frame *present,
                                      GLuint source_framebuffer, GLenum source_buffer )
 {
+    static const struct x11drv_snapshot_format bgra8 = {4, 0xff0000, 0xff00, 0xff, 0xff000000};
     struct client_surface_target target;
     static const GLenum pack_params[] = {GL_PACK_ALIGNMENT, GL_PACK_ROW_LENGTH,
                                         GL_PACK_SKIP_ROWS, GL_PACK_SKIP_PIXELS};
@@ -1875,7 +1876,7 @@ static BOOL snapshot_client_surface( struct opengl_drawable *base, struct client
         funcs->p_glGetIntegerv( pack_params[i], &pack_values[i] );
         funcs->p_glPixelStorei( pack_params[i], i ? 0 : 1 );
     }
-    funcs->p_glReadPixels( 0, 0, size.cx, size.cy, GL_RGBA, GL_UNSIGNED_BYTE, pixels );
+    funcs->p_glReadPixels( 0, 0, size.cx, size.cy, GL_BGRA, GL_UNSIGNED_BYTE, pixels );
     for (i = 0; i < ARRAY_SIZE(pack_params); ++i)
         funcs->p_glPixelStorei( pack_params[i], pack_values[i] );
     funcs->p_glBindBuffer( GL_PIXEL_PACK_BUFFER, buffer );
@@ -1884,7 +1885,7 @@ static BOOL snapshot_client_surface( struct opengl_drawable *base, struct client
     if (source_framebuffer && funcs->p_glGetError() != GL_NO_ERROR) return FALSE;
 
     return x11drv_client_surface_snapshot( base->client, present, pixels, size.cx, size.cy,
-                                           FALSE, &x11drv_snapshot_rgba8 );
+                                           FALSE, &bgra8 );
 }
 
 static BOOL blit_client_surface_output( struct opengl_drawable *base,
