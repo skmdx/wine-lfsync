@@ -24,7 +24,12 @@
 #pragma makedep unix
 #endif
 
+#include "config.h"
+
 #include <assert.h>
+#ifdef HAVE_SCHED_H
+#include <sched.h>
+#endif
 #include "ntstatus.h"
 #include "winternl.h"
 #include "ddk/wdm.h"
@@ -3684,7 +3689,11 @@ BOOL WINAPI NtUserPeekMessage( MSG *msg_out, HWND hwnd, UINT first, UINT last, U
                 params.locks = *(DWORD *)ret_ptr;
                 params.restore = TRUE;
             }
-            NtYieldExecution();
+#ifdef HAVE_SCHED_YIELD
+            /* PeekMessage ignores the yield status. Avoid the per-thread
+             * resource queries NtYieldExecution needs to compute it. */
+            sched_yield();
+#endif
             KeUserDispatchCallback( &params.dispatch, sizeof(params), &ret_ptr, &ret_len );
         }
         return FALSE;
