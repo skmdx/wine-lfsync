@@ -702,14 +702,14 @@ void client_surface_wait_present_locked( struct client_surface *surface, BOOL ex
     for (;;)
     {
         while (client_surface_present_busy_locked( surface, external_completion ))
-            pthread_cond_wait( &surface->completion_cond, &surface->completion_lock );
+            client_surface_wait_completion_locked( surface );
         if (!external_completion || !InterlockedCompareExchange( &surface->external_completion_count, 0, 0 ) ||
             client_surface_handoff_write_available( surface )) break;
 
         client_surface_handoff_wait( surface );
     }
     if (!external_completion && !--surface->driver_completion_waiters)
-        pthread_cond_broadcast( &surface->completion_cond );
+        client_surface_wake_completion_locked( surface );
     /* Retire a discarded owner cache before the next native submission adds
      * a completion reference. Otherwise that new frame can pin the closed
      * channel while its capture needs to map the replacement channel. */
@@ -999,7 +999,7 @@ void client_surface_submit_present( struct client_surface *surface,
     client_surface_submit_present_locked( surface, present );
     assert( surface->native_present_count > 0 );
     if (!--surface->native_present_count)
-        pthread_cond_broadcast( &surface->completion_cond );
+        client_surface_wake_completion_locked( surface );
     client_surface_handoff_completed( surface );
     pthread_mutex_unlock( &surface->present_lock );
     client_surface_unlock_present( surface );
@@ -1243,7 +1243,7 @@ struct client_surface_present_result client_surface_complete_present_locked( str
         memset( &present->capture, 0, sizeof(present->capture) );
         client_surface_handoff_completed( surface );
         pthread_mutex_unlock( &surface->present_lock );
-        if (wake) pthread_cond_broadcast( &surface->completion_cond );
+        if (wake) client_surface_wake_completion_locked( surface );
     }
     result.image_complete = completed || source_valid;
     result.handoff = handed_off ? CLIENT_SURFACE_HANDOFF_QUEUED : CLIENT_SURFACE_HANDOFF_NOT_QUEUED;
@@ -1291,7 +1291,7 @@ struct client_surface_present_result client_surface_complete_present( struct cli
     present->completion_job = NULL;
     client_surface_lock_present( surface );
     while (client_surface_target_is_updating( surface ))
-        pthread_cond_wait( &surface->completion_cond, &surface->completion_lock );
+        client_surface_wait_completion_locked( surface );
     ret = client_surface_complete_present_locked( surface, present, submitted,
                                                   external_completed, expected_size, timeout );
     client_surface_unlock_present( surface );

@@ -220,6 +220,7 @@ extern BOOL is_cache_dc( HDC hdc );
 
 /* message.c */
 extern void check_for_events( UINT flags );
+extern void wait_client_surface_messages( HANDLE event );
 extern UINT get_send_message_flags(void);
 
 /* systray.c */

@@ -475,7 +475,7 @@ BOOL client_surface_freeze_frame_locked( struct client_surface *surface,
     if (pinned)
     {
         if (!InterlockedDecrement( &surface->external_completion_count ))
-            pthread_cond_broadcast( &surface->completion_cond );
+            client_surface_wake_completion_locked( surface );
         client_surface_handoff_completed( surface );
     }
     pthread_mutex_unlock( &surface->present_lock );

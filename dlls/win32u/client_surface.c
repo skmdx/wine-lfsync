@@ -207,7 +207,7 @@ static void end_client_surface_target_operation( struct client_surface *surface 
     assert( surface->native_present_count == 1 && client_surface_target_is_updating( surface ) );
     --surface->native_present_count;
     WriteRelease( &surface->target_store->updating, FALSE );
-    pthread_cond_broadcast( &surface->completion_cond );
+    client_surface_wake_completion_locked( surface );
 }
 
 static BOOL insert_client_surface_index( struct client_surface *surface )
@@ -467,7 +467,7 @@ static void client_surface_wait_driver_completion_locked( struct client_surface 
      * be waited here: an offscreen completion may itself require the pending
      * show transition to reach the X server. */
     while (surface->native_present_count || surface->driver_completion_count)
-        pthread_cond_wait( &surface->completion_cond, &surface->completion_lock );
+        client_surface_wait_completion_locked( surface );
 }
 
 static void client_surface_lock_target( struct client_surface *surface )
@@ -485,7 +485,7 @@ static void client_surface_unlock_target( struct client_surface *surface )
 {
     assert( InterlockedCompareExchange( &surface->target_update_waiters, 0, 0 ) > 0 );
     if (!InterlockedDecrement( &surface->target_update_waiters ))
-        pthread_cond_broadcast( &surface->completion_cond );
+        client_surface_wake_completion_locked( surface );
     client_surface_unlock_present( surface );
 }
 

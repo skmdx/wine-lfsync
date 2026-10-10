@@ -7779,6 +7779,71 @@ struct focused_test_case
     void (*func)(void);
 };
 
+static DWORD WINAPI internal_completion_messages_thread( void *arg )
+{
+    const UINT messages[] = {WM_APP, WM_APP + 1, WM_WINE_UPDATEWINDOWSTATE};
+    const UINT types[] = {MSG_POSTED, MSG_NOTIFY, MSG_POSTED};
+    struct __server_request_info info;
+    UINT i, status;
+    MSG msg;
+
+    PeekMessageW( &msg, NULL, 0, 0, PM_NOREMOVE );
+    for (i = 0; i < ARRAY_SIZE(messages); ++i)
+    {
+        memset( &info, 0, sizeof(info) );
+        info.u.req.send_message_request.__header.req = REQ_send_message;
+        info.u.req.send_message_request.id = GetCurrentThreadId();
+        info.u.req.send_message_request.type = types[i];
+        info.u.req.send_message_request.msg = messages[i];
+        status = p_wine_server_call( &info );
+        ok( !status, "queue message %u status %#x\n", i, status );
+    }
+    for (i = 0; i < 4; ++i)
+    {
+        memset( &info, 0, sizeof(info) );
+        info.u.req.get_message_request.__header.req = REQ_get_message;
+        info.u.req.get_message_request.flags = PM_REMOVE | PM_QS_POSTMESSAGE;
+        info.u.req.get_message_request.get_last = ~0u;
+        if (i < 2)
+        {
+            info.u.req.get_message_request.internal = GET_MESSAGE_INTERNAL_POSTED;
+            info.u.req.get_message_request.get_first = WM_WINE_UPDATEWINDOWSTATE;
+        }
+        status = p_wine_server_call( &info );
+        if (i == 1)
+        {
+            ok( status == STATUS_PENDING, "application message escaped internal filter, status %#x\n", status );
+            ok( MsgWaitForMultipleObjectsEx( 0, NULL, 0, QS_POSTMESSAGE, 0 ) == WAIT_TIMEOUT,
+                "unread application post kept the internal wait signaled\n" );
+            continue;
+        }
+        ok( !status, "get message %u status %#x\n", i, status );
+        if (!status)
+        {
+            UINT index = i == 0 ? 2 : i == 2 ? 1 : 0;
+            ok( info.u.reply.get_message_reply.msg == messages[index], "get %u returned %#x\n",
+                i, info.u.reply.get_message_reply.msg );
+            ok( info.u.reply.get_message_reply.type == types[index], "get %u type %u\n",
+                i, info.u.reply.get_message_reply.type );
+        }
+    }
+    ok( PostThreadMessageW( GetCurrentThreadId(), WM_APP + 2, 0, 0 ), "posting a new wake failed\n" );
+    ok( MsgWaitForMultipleObjectsEx( 0, NULL, 0, QS_POSTMESSAGE, 0 ) == WAIT_OBJECT_0,
+        "new posted work did not wake the queue\n" );
+    ok( PeekMessageW( &msg, NULL, WM_APP + 2, WM_APP + 2, PM_REMOVE ), "new post was lost\n" );
+    return 0;
+}
+
+static void test_internal_completion_messages(void)
+{
+    HANDLE thread = CreateThread( NULL, 0, internal_completion_messages_thread, NULL, 0, NULL );
+
+    ok( !!thread, "CreateThread failed %lu\n", GetLastError() );
+    if (!thread) return;
+    ok( WaitForSingleObject( thread, 5000 ) == WAIT_OBJECT_0, "internal message test timed out\n" );
+    CloseHandle( thread );
+}
+
 static BOOL run_focused_test_case( const char *name, char **argv )
 {
     static const struct focused_test_case cases[] =
@@ -7786,6 +7851,8 @@ static BOOL run_focused_test_case( const char *name, char **argv )
         {"surface-window-lifetime", "surface renewal bound to an exact window", test_surface_window_lifetime},
         {"completion-provenance", "client surface completion result provenance",
          test_completion_result_provenance},
+        {"internal-completion-messages", "internal completion wait message isolation",
+         test_internal_completion_messages},
         {"presentation-modes", "client surface presentation modes", test_presentation_modes},
         {"candidate-selection", "native candidates and completed producer selection", test_candidate_selection},
         {"generation-membership", "client surface generation membership",
@@ -8066,6 +8133,7 @@ START_TEST(client_surface)
     test_surface_lifetimes( argv );
     trace( "testing client surface completion result provenance\n" );
     test_completion_result_provenance();
+    test_internal_completion_messages();
     trace( "testing client surface generation handoff storage\n" );
     test_handoff_storage();
     test_handoff_cold_visibility();

@@ -22,6 +22,8 @@ struct client_surface_geometry
 };
 
 extern BOOL client_surface_completion_init( struct client_surface *surface );
+extern void client_surface_wait_completion_locked( struct client_surface *surface );
+extern void client_surface_wake_completion_locked( struct client_surface *surface );
 extern struct client_surface_admission client_surface_reserve_completion_storage(
     struct client_surface *surface, struct client_surface_completion_job **ticket );
 extern enum client_surface_admission_reason client_surface_activate_completion( struct client_surface_completion_job *job,

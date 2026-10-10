@@ -95,7 +95,7 @@ struct peek_message_filter
     UINT last;
     UINT mask;
     UINT flags;
-    BOOL internal;
+    UINT internal;
 };
 
 /* info about the message currently being received by the current thread */
@@ -3071,7 +3071,7 @@ static int peek_message( MSG *msg, const struct peek_message_filter *filter )
         wake_mask = filter->mask & (QS_SENDMESSAGE | QS_SMRESULT);
 
         if (check_queue_bits( wake_mask, filter->mask, wake_mask | signal_bits, filter->mask | clear_bits,
-                              &wake_bits, &changed_bits, filter->internal ))
+                              &wake_bits, &changed_bits, filter->internal == GET_MESSAGE_INTERNAL_HARDWARE ))
             res = STATUS_PENDING;
         else SERVER_START_REQ( get_message )
         {
@@ -3440,7 +3440,7 @@ static BOOL process_driver_events( UINT events_mask, UINT wake_mask, UINT change
     /* process every pending internal hardware messages */
     if (check_internal_bits( QS_HARDWARE ))
     {
-        struct peek_message_filter filter = {.internal = TRUE};
+        struct peek_message_filter filter = {.internal = GET_MESSAGE_INTERNAL_HARDWARE};
         MSG msg;
         peek_message( &msg, &filter );
     }
@@ -3572,6 +3572,24 @@ DWORD WINAPI NtUserMsgWaitForMultipleObjectsEx( DWORD count, const HANDLE *handl
 
     return wait_objects( count+1, wait_handles, timeout,
                          (flags & MWMO_INPUTAVAILABLE) ? mask : 0, mask, flags );
+}
+
+/* Native presentation can need an asynchronous owner update on this thread.
+ * Consume only internal state/driver notifications, never application posted
+ * or sent messages, while waiting for the native completion wakeup. */
+void wait_client_surface_messages( HANDLE event )
+{
+    struct peek_message_filter filter = {.first = WM_WINE_UPDATEWINDOWSTATE,
+        .last = WM_WINE_LAST_DRIVER_MSG, .flags = PM_REMOVE | PM_QS_POSTMESSAGE,
+        .internal = GET_MESSAGE_INTERNAL_POSTED};
+    LARGE_INTEGER zero = {0};
+    MSG msg;
+
+    while (NtWaitForSingleObject( event, FALSE, &zero ) == STATUS_TIMEOUT)
+    {
+        peek_message( &msg, &filter );
+        if (NtUserMsgWaitForMultipleObjectsEx( 1, &event, INFINITE, QS_POSTMESSAGE, 0 ) != 1) break;
+    }
 }
 
 /***********************************************************************

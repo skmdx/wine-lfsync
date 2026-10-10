@@ -62,9 +62,44 @@ struct client_surface_completion_queue
     struct client_surface *surface;
     struct list jobs;
     struct list ready_entry;
+    struct list waiters; /* protected by surface->completion_lock */
     unsigned int reservations;
     struct client_surface_completion_domain *retirement_domain;
 };
+
+struct client_surface_completion_waiter
+{
+    struct list entry;
+    HANDLE event;
+};
+
+void client_surface_wait_completion_locked( struct client_surface *surface )
+{
+    struct client_surface_completion_waiter waiter;
+
+    if (surface->owner_thread != GetCurrentThreadId() ||
+        NtCreateEvent( &waiter.event, EVENT_ALL_ACCESS, NULL, NotificationEvent, FALSE ))
+    {
+        pthread_cond_wait( &surface->completion_cond, &surface->completion_lock );
+        return;
+    }
+    list_add_tail( &surface->completion_queue->waiters, &waiter.entry );
+    pthread_mutex_unlock( &surface->completion_lock );
+    wait_client_surface_messages( waiter.event );
+    pthread_mutex_lock( &surface->completion_lock );
+    list_remove( &waiter.entry );
+    NtClose( waiter.event );
+}
+
+void client_surface_wake_completion_locked( struct client_surface *surface )
+{
+    struct client_surface_completion_waiter *waiter;
+
+    pthread_cond_broadcast( &surface->completion_cond );
+    LIST_FOR_EACH_ENTRY( waiter, &surface->completion_queue->waiters,
+                         struct client_surface_completion_waiter, entry )
+        NtSetEvent( waiter->event, NULL );
+}
 
 #define CLIENT_SURFACE_MAX_DEFERRED_PRESENTS 64
 #define CLIENT_SURFACE_MAX_PROCESS_DEFERRED_PRESENTS 1024
@@ -216,6 +251,7 @@ BOOL client_surface_completion_init( struct client_surface *surface )
     queue->surface = surface;
     list_init( &queue->jobs );
     list_init( &queue->ready_entry );
+    list_init( &queue->waiters );
     surface->completion_queue = queue;
     return TRUE;
 }
@@ -226,6 +262,7 @@ void client_surface_completion_destroy( struct client_surface *surface )
 
     assert( list_empty( &queue->jobs ) );
     assert( list_empty( &queue->ready_entry ) );
+    assert( list_empty( &queue->waiters ) );
     assert( !queue->reservations );
     if (queue->retirement_domain)
     {

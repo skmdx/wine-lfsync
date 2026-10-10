@@ -3460,8 +3460,21 @@ DECL_HANDLER(get_message)
                               WM_WINE_LAST_DRIVER_MSG, req->flags, reply ))
         return;
 
-    if (req->internal) /* check for internal messages only, leave queue flags unchanged */
+    if (req->internal) /* never dispatch application messages during an internal wait */
     {
+        if (req->internal == GET_MESSAGE_INTERNAL_POSTED)
+        {
+            unsigned int first = max( req->get_first, 0x80000000u );
+
+            if (get_posted_message( queue, get_win, first, req->get_last, req->flags, reply )) return;
+            /* Leave application messages queued, but arm the next wait for
+             * new posted work instead of spinning on those unread messages. */
+            SHARED_WRITE_BEGIN( queue_shm, queue_shm_t )
+            {
+                shared->changed_bits &= ~QS_POSTMESSAGE;
+            }
+            SHARED_WRITE_END;
+        }
         set_error( STATUS_PENDING );
         return;
     }
