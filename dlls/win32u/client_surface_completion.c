@@ -52,6 +52,7 @@ struct client_surface_completion_job
     enum client_surface_completion_status native_status;
     SIZE expected_size;
     DWORD poll_due, poll_delay; /* A zero delay marks a job that has not run yet. */
+    LONG adoption_sequence;
     BOOL has_expected_size;
 };
 
@@ -63,6 +64,7 @@ struct client_surface_completion_queue
     struct list jobs;
     struct list ready_entry;
     struct list waiters; /* protected by surface->completion_lock */
+    LONG adoption_sequence; /* atomic; present-lock releases wake deferred adoption */
     unsigned int reservations;
     struct client_surface_completion_domain *retirement_domain;
 };
@@ -365,6 +367,21 @@ static void queue_ready_surface_locked( struct client_surface *surface )
 static void wait_completion_executor_locked( DWORD timeout )
 {
     client_surface_cond_timedwait( &completion_executor_cond, &completion_executor_lock, timeout );
+}
+
+void client_surface_resume_completion( struct client_surface *surface )
+{
+    if (!InterlockedCompareExchange( &surface->external_completion_count, 0, 0 )) return;
+    InterlockedIncrement( &surface->completion_queue->adoption_sequence );
+    pthread_mutex_lock( &completion_executor_lock );
+    /* A running worker observes the sequence when it returns its FIFO head.
+     * Wake idle workers only for an already deferred adoption, not for each
+     * producer unlock while a native fence is still pending. */
+    if (!list_empty( &surface->completion_queue->ready_entry ) &&
+        !list_empty( &surface->completion_queue->jobs ) &&
+        completion_head( surface )->native_status != CLIENT_SURFACE_COMPLETION_PENDING)
+        pthread_cond_broadcast( &completion_executor_cond );
+    pthread_mutex_unlock( &completion_executor_lock );
 }
 
 UINT64 client_surface_allocate_completion_domains( unsigned int count )
@@ -756,6 +773,9 @@ static enum client_surface_completion_worker_disposition execute_completion_job(
         worker->finishing = TRUE;
         pthread_mutex_unlock( &completion_executor_lock );
     }
+    /* Sample before attempting adoption so an unlock racing its failure is
+     * not lost when the FIFO head returns to the ready queue. */
+    job->adoption_sequence = InterlockedCompareExchange( &surface->completion_queue->adoption_sequence, 0, 0 );
     if (result.status != CLIENT_SURFACE_COMPLETION_PENDING &&
         !finish_deferred_present( surface, &job->present,
                                   job->has_expected_size ? &job->expected_size : NULL, result, poll ))
@@ -875,6 +895,8 @@ static struct client_surface *next_completion_surface_locked(
         }
         else if (completion_domain_owner_locked( domain ) || worker->domain) continue;
         if (cancel || !job || !job->poll_delay || (INT)(now - job->poll_due) >= 0) return surface;
+        if (job->native_status != CLIENT_SURFACE_COMPLETION_PENDING && job->adoption_sequence !=
+            InterlockedCompareExchange( &queue->adoption_sequence, 0, 0 )) return surface;
         *delay = min( *delay, job->poll_due - now );
     }
     return NULL;

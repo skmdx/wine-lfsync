@@ -639,6 +639,7 @@ void client_surface_lock_present( struct client_surface *surface )
 
 static void client_surface_present_unlocked( struct client_surface *surface )
 {
+    client_surface_resume_completion( surface );
     client_surface_apply_pending_update( surface );
     if (InterlockedCompareExchange( &surface->external_completion_count, 0, 0 )) return;
     client_surface_resume_recompose( surface );
