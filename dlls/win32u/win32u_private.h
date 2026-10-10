@@ -63,6 +63,7 @@ extern BOOL window_surface_flush( struct window_surface *surface );
 extern void cleanup_window_paints( HWND hwnd );
 struct window_paint;
 extern struct window_paint *begin_window_paint( HWND hwnd );
+extern struct window_paint *begin_window_paint_callback( HWND hwnd );
 extern void end_window_paint( struct window_paint *paint, BOOL success );
 extern void window_surface_set_clip( struct window_surface *surface, HRGN clip_region );
 extern void window_surface_set_layered( struct window_surface *surface, COLORREF color_key, UINT alpha_bits, UINT alpha_mask );

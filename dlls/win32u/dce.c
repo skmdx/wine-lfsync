@@ -69,6 +69,7 @@ struct window_paint
     UINT64 token;
     BOOL ended, failed, beginning, cancelled;
     UINT surface_count;
+    UINT callbacks;
 };
 
 /* These are EndPaint obligations, not a worker queue. The painting thread
@@ -2052,6 +2053,25 @@ failed:
     return NULL;
 }
 
+struct window_paint *begin_window_paint_callback( HWND hwnd )
+{
+    struct window_paint *paint;
+
+    hwnd = get_full_window_handle( hwnd );
+    /* A synchronous paint callback cannot outlive its enclosing operation.
+     * Its writes belong to that operation's native receipt and flush set.
+     * BeginPaint itself keeps a separate scope because its HDC may escape
+     * the callback and be ended later by the application. */
+    LIST_FOR_EACH_ENTRY( paint, &get_user_thread_info()->window_paints, struct window_paint, entry )
+    {
+        if (paint->hwnd != hwnd || !paint->token || !paint->beginning || paint->ended || paint->cancelled)
+            continue;
+        ++paint->callbacks;
+        return paint;
+    }
+    return begin_window_paint( hwnd );
+}
+
 /* Enroll an individual operation, not the lifetime of a retained DC. An
  * enclosing paint already owns the native receipt and surface flushes. */
 BOOL begin_dc_write( DC *dc )
@@ -2082,6 +2102,12 @@ void end_window_paint( struct window_paint *paint, BOOL success )
     NTSTATUS status;
 
     if (!paint) return;
+    paint->failed |= !success;
+    if (paint->callbacks)
+    {
+        --paint->callbacks;
+        return;
+    }
     if (!paint->token)
     {
         free_window_paint( paint );
@@ -2089,7 +2115,6 @@ void end_window_paint( struct window_paint *paint, BOOL success )
     }
     paint->beginning = FALSE;
     paint->ended = TRUE;
-    paint->failed |= !success;
     SERVER_START_REQ( end_window_paint )
     {
         req->token = paint->token;

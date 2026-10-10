@@ -6079,8 +6079,9 @@ static void test_paint_receipts(void)
     drain_scene_notification_counts( &updates, &prepares, 0, &counts );
     ok( counts.prepare == 1, "stale paint commit sent %u retry notifications\n", counts.prepare );
 
-    /* A full writer refuses BeginPaint before validation; one spare slot
-     * admits BeginPaint but refuses its nested erase/nonclient callbacks. */
+    /* A full writer refuses BeginPaint before validation. One spare slot
+     * also covers its synchronous erase/nonclient callbacks; they cannot
+     * outlive the enclosing receipt or require a second admission. */
     for (limit = ARRAY_SIZE(held); limit >= ARRAY_SIZE(held) - 1; --limit)
     {
         admitted = 0;
@@ -6106,8 +6107,9 @@ static void test_paint_receipts(void)
             /* A failed native paint restores its update after the marker
              * completes, not synchronously when EndPaint returns. */
             pump_messages( 20 );
-            ok( get_paint_update( class_window, FALSE ) & UPDATE_PAINT,
-                "refused paint at %u reservations lost its update\n", limit );
+            updates = get_paint_update( class_window, FALSE );
+            ok( !!(updates & UPDATE_PAINT) == (limit == ARRAY_SIZE(held)),
+                "paint at %u reservations left update flags %#x\n", limit, updates );
         }
         for (i = 0; i < admitted; ++i)
         {

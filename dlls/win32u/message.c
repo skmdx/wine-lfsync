@@ -473,7 +473,7 @@ static LRESULT dispatch_win_proc_params( struct win_proc_params *params, size_t 
     thread_info->msg_call_depth++;
     if (params->msg == WM_PAINT || params->msg == WM_NCPAINT || params->msg == WM_ERASEBKGND)
     {
-        struct window_paint *paint = begin_window_paint( params->hwnd );
+        struct window_paint *paint = begin_window_paint_callback( params->hwnd );
 
         if (paint)
         {
