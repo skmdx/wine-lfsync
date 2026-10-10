@@ -585,7 +585,7 @@ BOOL x11drv_client_snapshot_upload( struct x11drv_client_snapshot **storage,
 
     if (!width || !height || width > 0xffff || height > 0xffff) return FALSE;
     if (!client_surface_get_execution_domain( &domain )) return FALSE;
-    if (!snapshot || snapshot->size.cx != width || snapshot->size.cy != height ||
+    if (!snapshot || snapshot->size.cx != width || snapshot->size.cy != height || snapshot->depth != default_visual.depth ||
         !snapshot->connection || snapshot->connection->domain != domain || snapshot->memory.domain != memory->domain ||
         InterlockedCompareExchange( &snapshot->refs, 0, 0 ) != 1)
     {
