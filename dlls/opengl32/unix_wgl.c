@@ -1006,10 +1006,12 @@ BOOL wrap_wglSwapBuffers( TEB *teb, HDC hdc )
 {
     const struct opengl_funcs *funcs = get_dc_funcs( hdc );
     struct opengl_context *ctx;
-    BOOL ret;
+    BOOL ret, mapped;
 
     if (!funcs->p_wglSwapBuffers) return FALSE;
 
+    ctx = get_current_context( teb, NULL, NULL, NULL );
+    mapped = ctx && (ctx->draw->draw_fbo || ctx->read->read_fbo);
     resolve_default_fbo( teb, FALSE );
 
     if (!(ret = funcs->p_wglSwapBuffers( hdc )))
@@ -1018,10 +1020,12 @@ BOOL wrap_wglSwapBuffers( TEB *teb, HDC hdc )
         flush_context( teb, funcs->p_glFlush );
     }
 
-    /* The internal context exchanged the default FBO attachments. Rebind
-     * them and restore the application's logical buffer selections before
-     * another draw can reach the old back buffer, now the front buffer. */
-    if ((ctx = get_current_context( teb, NULL, NULL, NULL )))
+    /* Only an emulated default framebuffer can exchange its attachments.
+     * Include both sides of a drawable transition: leaving emulation also
+     * needs to restore native framebuffer zero. Ordinary native swaps keep
+     * the application's bindings and buffer selections without GL commands. */
+    if ((ctx = get_current_context( teb, NULL, NULL, NULL )) &&
+        (mapped || ctx->draw->draw_fbo || ctx->read->read_fbo))
     {
         pop_default_fbo( teb );
         set_default_fbo_buffers( teb, ctx );
