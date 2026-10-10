@@ -1514,7 +1514,7 @@ BOOL macdrv_GetWindowStyleMasks(HWND hwnd, UINT style, UINT ex_style, UINT *styl
 /***********************************************************************
  *              WindowPosChanged   (MACDRV.@)
  */
-NTSTATUS macdrv_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UINT swp_flags,
+NTSTATUS macdrv_WindowPosChanged(HWND hwnd, HWND insert_after, const POINT *owner_hint, UINT swp_flags,
                                  const struct window_rects *new_rects, struct window_surface *surface)
 {
     BOOL fullscreen = swp_flags & WINE_SWP_FULLSCREEN;

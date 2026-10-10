@@ -2133,7 +2133,8 @@ static BOOL apply_window_pos( HWND hwnd, HWND insert_after, UINT swp_flags, stru
 {
     struct window_rects monitor_rects;
     WND *win;
-    HWND owner_hint, surface_win = 0, toplevel;
+    HWND surface_win = 0, toplevel;
+    POINT owner_hint = {new_rects->window.left - 1, new_rects->window.top - 1};
     struct ratio raw_dpi, dpi = get_thread_dpi();
     BOOL ret, is_layered, is_child, need_icons = FALSE, client_surface_pending = FALSE;
     BOOL frame_changed = !!(swp_flags & SWP_FRAMECHANGED);
@@ -2317,11 +2318,6 @@ static BOOL apply_window_pos( HWND hwnd, HWND insert_after, UINT swp_flags, stru
             user_driver->pSetWindowIcons( hwnd, icon, &ii, icon_small, &ii_small );
         }
 
-        owner_hint = NtUserGetWindowRelative(hwnd, GW_OWNER);
-        /* fallback to any window that is right below our top left corner */
-        if (!owner_hint) owner_hint = NtUserWindowFromPoint(new_rects->window.left - 1, new_rects->window.top - 1);
-        if (owner_hint) owner_hint = NtUserGetAncestor(owner_hint, GA_ROOT);
-
         /* Retiring the GDI surface after DIRECT publication needs the DCE
          * refresh above, but does not change the native frame. Do not turn
          * that synthetic refresh into a driver scene invalidation which
@@ -2333,7 +2329,7 @@ static BOOL apply_window_pos( HWND hwnd, HWND insert_after, UINT swp_flags, stru
             scene.mode == CLIENT_SURFACE_PRESENTATION_DIRECT)
             swp_flags &= ~SWP_FRAMECHANGED;
 
-        status = user_driver->pWindowPosChanged( hwnd, insert_after, owner_hint, swp_flags, &monitor_rects,
+        status = user_driver->pWindowPosChanged( hwnd, insert_after, &owner_hint, swp_flags, &monitor_rects,
                                                 get_driver_window_surface( new_surface, raw_dpi ) );
         TRACE( "win %p flags %#x native update status %#lx\n", hwnd, swp_flags, (unsigned long)status );
         if (native_status) *native_status = status;

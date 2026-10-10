@@ -431,20 +431,26 @@ BOOL WAYLAND_WindowPosChanging(HWND hwnd, UINT swp_flags, BOOL shaped, const str
 /***********************************************************************
  *           WAYLAND_WindowPosChanged
  */
-NTSTATUS WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, HWND owner_hint, UINT swp_flags,
+NTSTATUS WAYLAND_WindowPosChanged(HWND hwnd, HWND insert_after, const POINT *owner_hint, UINT swp_flags,
                                   const struct window_rects *new_rects, struct window_surface *surface)
 {
     HWND owner = NtUserGetAncestor(hwnd, GA_ROOT);
     struct wayland_surface *owner_surface;
     struct wayland_win_data *data, *owner_data;
     BOOL managed, fullscreen = swp_flags & WINE_SWP_FULLSCREEN;
+    HWND hint = NtUserGetWindowRelative(hwnd, GW_OWNER);
+
+    /* Keep the Win32 coordinates and hit-test ordering from the common
+     * path. Other backends do not need this Wayland parent hint. */
+    if (!hint) hint = NtUserWindowFromPoint(owner_hint->x, owner_hint->y);
+    if (hint) hint = NtUserGetAncestor(hint, GA_ROOT);
 
     TRACE("hwnd %p new_rects %s after %p flags %08x\n", hwnd, debugstr_window_rects(new_rects), insert_after, swp_flags);
 
     /* Get the managed state with win_data unlocked, as is_window_managed
      * may need to query win_data information about other HWNDs and thus
      * acquire the lock itself internally. */
-    if (!(managed = is_window_managed(hwnd, swp_flags, fullscreen)) && surface) owner = owner_hint;
+    if (!(managed = is_window_managed(hwnd, swp_flags, fullscreen)) && surface) owner = hint;
 
     if (!(data = wayland_win_data_get(hwnd))) return STATUS_SUCCESS;
     owner_data = owner && owner != hwnd ? wayland_win_data_get(owner) : NULL;
