@@ -1135,10 +1135,13 @@ BOOL x11drv_poll_stream_barrier( Display *display, struct x11drv_stream_barrier 
     XUnlockDisplay( display );
     if ((long)(processed - barrier->serial) < 0)
     {
+        struct pollfd fd = { .fd = ConnectionNumber( display ), .events = POLLIN };
+
         /* Another reader can consume the socket response into Xlib after
-         * our check. Waiting on that shared fd would then miss the receipt.
-         * Yield before retrying the Xlib state, which remains the proof. */
-        poll( NULL, 0, 1 );
+         * our check, so keep the bounded retry even when the fd is quiet.
+         * Otherwise wake as soon as input arrives. Readiness is only a hint;
+         * the next Xlib sequence check still authenticates the receipt. */
+        poll( &fd, 1, 1 );
         return FALSE;
     }
     barrier->complete = TRUE;
