@@ -345,9 +345,20 @@ static void release_native_snapshot( void *context )
 static BOOL apply_gpu_snapshot( void *context, struct client_surface *client, struct client_surface_frame *present )
 {
     struct x11drv_client_surface *surface = impl_from_client_surface( client );
-    struct x11drv_client_source_frame *frame = surface->sources + present->handoff_index;
+    struct x11drv_client_source_frame *frame;
 
-    assert( !frame->snapshot );
+    if (!present->handoff_control)
+    {
+        x11drv_client_snapshot_release( surface->gpu_spare );
+        surface->gpu_spare = surface->gpu_snapshot;
+        surface->gpu_snapshot = x11drv_client_snapshot_share( context );
+        return TRUE;
+    }
+    /* A capture made during preparation can acquire its SOURCE reservation
+     * only when the core validates completion. Return that slot's old image. */
+    assert( present->handoff_index < ARRAY_SIZE(surface->sources) );
+    frame = surface->sources + present->handoff_index;
+    x11drv_client_surface_release_source_frame( frame );
     frame->snapshot = x11drv_client_snapshot_share( context );
     frame->pixmap = x11drv_client_snapshot_pixmap( context );
     frame->width = present->capture.size.cx;
@@ -359,35 +370,43 @@ static BOOL apply_gpu_snapshot( void *context, struct client_surface *client, st
 }
 
 struct x11drv_client_snapshot *x11drv_client_surface_prepare_gpu_snapshot(
-    struct client_surface *client, struct client_surface_frame *present )
+    struct client_surface *client, struct client_surface_frame *present, const SIZE *size )
 {
     struct x11drv_client_surface *surface = impl_from_client_surface( client );
-    struct x11drv_client_source_frame *frame = surface->sources + present->handoff_index;
+    struct x11drv_client_source_frame *frame;
     struct client_surface_memory_scope memory = {0};
     struct x11drv_client_snapshot *snapshot;
     BOOL ret;
 
-    assert( present->handoff_index < ARRAY_SIZE(surface->sources) && !present->capture.context );
+    assert( !present->capture.context );
     /* Account to the captured scene even if the HWND is being reparented. */
     if (!client_surface_memory_scope_init_owner( &memory, present->scene.toplevel, 0 )) return NULL;
-    /* Transfer the slot's reference to this capture before any native work.
-     * Completion applies it only after validating the original reservation;
-     * cancellation releases it through the same capture owner. */
+    /* Transfer returned storage before any native work. A provisional frame
+     * has no SOURCE slot yet and borrows only the spare image. Completion
+     * validates its target before applying either capture; cancellation
+     * releases the image through the same capture owner. */
     pthread_mutex_lock( &client->present_lock );
-    snapshot = frame->snapshot;
-    if (snapshot && snapshot == surface->gpu_snapshot)
+    if (!present->handoff_control)
     {
-        /* The returned slot still holds the last completed replay image.
-         * Rotate it out until a later completion replaces that image instead
-         * of allocating and discarding storage on every capture. Preparation
-         * still checks all readers, the GPU fence and the allocation domain. */
         snapshot = surface->gpu_spare;
-        surface->gpu_spare = frame->snapshot;
+        surface->gpu_spare = NULL;
     }
-    memset( frame, 0, sizeof(*frame) );
+    else
+    {
+        assert( present->handoff_index < ARRAY_SIZE(surface->sources) );
+        frame = surface->sources + present->handoff_index;
+        snapshot = frame->snapshot;
+        if (snapshot && snapshot == surface->gpu_snapshot)
+        {
+            /* Keep the replay image immutable until a later completion
+             * replaces it. Storage preparation still checks readers/fences. */
+            snapshot = surface->gpu_spare;
+            surface->gpu_spare = frame->snapshot;
+        }
+        memset( frame, 0, sizeof(*frame) );
+    }
     pthread_mutex_unlock( &client->present_lock );
-    ret = x11drv_client_snapshot_prepare_storage( &snapshot, &memory, present->handoff_source->width,
-                                                  present->handoff_source->height, default_visual.depth );
+    ret = x11drv_client_snapshot_prepare_storage( &snapshot, &memory, size->cx, size->cy, default_visual.depth );
     client_surface_memory_scope_destroy( &memory );
     present->capture.context = snapshot;
     present->capture.apply = apply_gpu_snapshot;

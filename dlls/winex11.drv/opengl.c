@@ -2055,8 +2055,9 @@ static struct client_surface_completion_result wait_snapshot_completion( void *c
     /* The completion token keeps this mapping alive. A revoked handoff
      * cannot publish the write, even if its GPU fence eventually signals.
      * Retire its callback promptly while the image retains the real fence. */
-    if (__atomic_load_n( &completion->source->reservation, __ATOMIC_ACQUIRE ) != completion->control ||
-        __atomic_load_n( &completion->channel->closed, __ATOMIC_ACQUIRE ))
+    if (completion->source &&
+        (__atomic_load_n( &completion->source->reservation, __ATOMIC_ACQUIRE ) != completion->control ||
+         __atomic_load_n( &completion->channel->closed, __ATOMIC_ACQUIRE )))
     {
         TRACE( "cancelled EGL source completion for control %s\n",
                wine_dbgstr_longlong( completion->control ) );
@@ -2339,6 +2340,8 @@ static enum client_surface_gpu_snapshot_result snapshot_client_surface_gpu( stru
     struct egl_snapshot_image *image;
     struct x11drv_client_surface *surface = impl_from_client_surface( base->client );
     struct client_surface_source *source = present->handoff_source;
+    struct client_surface_target target;
+    SIZE size = base->virtual_size;
     GLint read_fbo, draw_fbo, read_buffer, renderbuffer;
     GLuint fbo = 0, buffer = 0;
     GLboolean scissor, srgb;
@@ -2353,13 +2356,16 @@ static enum client_surface_gpu_snapshot_result snapshot_client_surface_gpu( stru
     /* This capability was established from the backend, visual and required
      * entry points. A runtime import or FBO error is not a new capability. */
     if (!surface->direct_snapshot) return GPU_SNAPSHOT_UNSUPPORTED;
-    if (source->width != base->virtual_size.cx || source->height != base->virtual_size.cy)
+    if (!source) client_surface_get_target( base->client, &target );
+    if ((source && (source->width != size.cx || source->height != size.cy)) ||
+        (!source && (target.virtual_rect.right - target.virtual_rect.left != size.cx ||
+                     target.virtual_rect.bottom - target.virtual_rect.top != size.cy)))
     {
         present->target = CLIENT_SURFACE_FRAME_TARGET_INVALID;
         present->result = CLIENT_SURFACE_FRAME_SUPERSEDED;
         return GPU_SNAPSHOT_COMPLETE;
     }
-    if (!(snapshot = x11drv_client_surface_prepare_gpu_snapshot( base->client, present ))) return GPU_SNAPSHOT_RETRY;
+    if (!(snapshot = x11drv_client_surface_prepare_gpu_snapshot( base->client, present, &size ))) return GPU_SNAPSHOT_RETRY;
     new_image = !x11drv_client_snapshot_get_image( snapshot );
     if (!(image = import_snapshot_image( snapshot, &import_error )))
     {
@@ -2368,7 +2374,7 @@ static enum client_surface_gpu_snapshot_result snapshot_client_surface_gpu( stru
     }
     if (new_image)
         TRACE( "imported EGL source pixmap %#lx size %ux%u from visual %#lx to %#lx\n",
-               x11drv_client_snapshot_pixmap( snapshot ), source->width, source->height,
+               x11drv_client_snapshot_pixmap( snapshot ), (unsigned int)size.cx, (unsigned int)size.cy,
                surface->source_visual, default_visual.visualid );
     if (flipped && source_framebuffer && snapshot_bind_texture && !impl_from_opengl_drawable( base )->framebuffer_private)
         if (!rotate_render_snapshot( base, present, source_framebuffer, &snapshot, &image, &direct_image ))
@@ -2427,7 +2433,7 @@ bind:
             {
                 blit = begin ? client_surface_perf_time() : 0;
                 funcs->p_glCopyImageSubData( name, GL_TEXTURE_2D, 0, 0, 0, 0,
-                    buffer, GL_RENDERBUFFER, 0, 0, 0, 0, source->width, source->height, 1 );
+                    buffer, GL_RENDERBUFFER, 0, 0, 0, 0, size.cx, size.cy, 1 );
                 copy_image = TRUE;
                 goto copied;
             }
@@ -2467,7 +2473,7 @@ bind:
     funcs->p_glDisable( GL_FRAMEBUFFER_SRGB );
     /* Native X pixmap coordinates have their origin at the top left. */
     blit = begin ? client_surface_perf_time() : 0;
-    funcs->p_glBlitFramebuffer( 0, 0, source->width, source->height, 0, source->height, source->width, 0,
+    funcs->p_glBlitFramebuffer( 0, 0, size.cx, size.cy, 0, size.cy, size.cx, 0,
                                 GL_COLOR_BUFFER_BIT, GL_NEAREST );
 copied:
     error = funcs->p_glGetError();
@@ -2514,8 +2520,8 @@ copied:
         if (surface->snapshot_pixels || surface->snapshot)
             x11drv_client_surface_release_snapshot_staging( surface );
         pthread_mutex_unlock( &base->client->present_lock );
-        source->source = pixmap;
-        present->capture.size = (SIZE){source->width, source->height};
+        if (source) source->source = pixmap;
+        present->capture.size = size;
     }
 done:
     if (completion) client_surface_free_owned_metadata( &completion->memory, completion, sizeof(*completion) );
@@ -2529,12 +2535,13 @@ done:
     if (buffer) funcs->p_glDeleteRenderbuffers( 1, &buffer );
     /* Host submission spans plus the worker's actual fence wait distinguish
      * queueing from native readiness; they are not GPU execution timestamps. */
-    TRACE_(csperf)( "ticks=%llu event=gpu_snapshot identity=%s control=%s target_epoch=%s "
+    TRACE_(csperf)( "ticks=%llu event=gpu_snapshot identity=%s completion=%p control=%s target_epoch=%s "
                    "begin=%llu imported=%llu blit=%llu copied=%llu flushed=%llu "
                    "width=%u height=%u pixmap=%lx fence=%u result=%d outcome=%u copy_image=%u direct_image=%u\n", client_surface_perf_time(),
                    wine_dbgstr_longlong( __atomic_load_n( &base->client->identity, __ATOMIC_ACQUIRE ) ),
+                   present->completion.context,
                    wine_dbgstr_longlong( present->handoff_control ), wine_dbgstr_longlong( present->target_epoch ),
-                   begin, imported, blit, copied, flushed, source->width, source->height,
+                   begin, imported, blit, copied, flushed, (unsigned int)size.cx, (unsigned int)size.cy,
                    pixmap, !!present->completion.wait,
                    ret == GPU_SNAPSHOT_COMPLETE || ret == GPU_SNAPSHOT_PENDING ? 1 : -1, ret, copy_image, direct_image );
     return ret;
@@ -2795,8 +2802,7 @@ static BOOL x11drv_egl_surface_present( struct opengl_drawable *base, GLuint fra
         enum client_surface_gpu_snapshot_result gpu = GPU_SNAPSHOT_UNSUPPORTED;
         BOOL copied;
 
-        if (present.handoff_control)
-            gpu = snapshot_client_surface_gpu( base, &present, framebuffer, flipped, isolate );
+        gpu = snapshot_client_surface_gpu( base, &present, framebuffer, flipped, isolate );
         copied = gpu == GPU_SNAPSHOT_COMPLETE || gpu == GPU_SNAPSHOT_PENDING ||
                  (gpu == GPU_SNAPSHOT_UNSUPPORTED && snapshot_client_surface( base, &present, framebuffer,
                                                     framebuffer ? GL_COLOR_ATTACHMENT0 : GL_BACK ));

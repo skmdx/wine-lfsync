@@ -148,6 +148,6 @@ extern void x11drv_client_surface_retire_resource( struct x11drv_client_surface_
 /* The prepared frame owns the capture, including when preparation fails.
  * Native allocation/upload runs outside the surface's present lock. */
 extern struct x11drv_client_snapshot *x11drv_client_surface_prepare_gpu_snapshot(
-    struct client_surface *client, struct client_surface_frame *present );
+    struct client_surface *client, struct client_surface_frame *present, const SIZE *size );
 
 #endif /* __WINE_X11DRV_CLIENT_SURFACE_H */
