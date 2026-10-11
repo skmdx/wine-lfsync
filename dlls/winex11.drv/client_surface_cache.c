@@ -42,13 +42,11 @@ struct cache_worker
     BOOL cache;
 };
 
-struct client_surface_cache_image
+struct cache_image_native
 {
     struct client_surface_native_work work;
     struct client_surface_memory_scope memory;
-    struct client_surface_cache_image *next;
     struct cache_worker *worker, *owner;
-    enum cache_operation operation;
     enum cache_image_kind kind;
     client_surface_cache_callback complete;
     void *context;
@@ -56,23 +54,33 @@ struct client_surface_cache_image
     unsigned int transform_count;
     struct x11drv_native_window_read *read;
     struct client_surface_cache_image *copy_source;
-    struct client_surface_cache_image *parent;
-    void (*read_release)(void *);
-    void *read_context;
     BOOL imported;
     BOOL waiting, started;
-    Pixmap pixmap, source;
+    Pixmap source;
     Pixmap seed;
     UINT64 seed_bytes;
     Window window;
     GC transfer_gc, window_gc;
-    unsigned int width, height, depth;
     unsigned int copy_width, copy_height;
     unsigned int xcb_gc;
-    unsigned int refs;
     enum client_surface_memory_class purpose;
     UINT64 bytes;
-    BOOL acquired, success, window_gc_ready;
+    BOOL success, window_gc_ready;
+};
+
+struct client_surface_cache_image
+{
+    struct client_surface_cache_image *next, *parent;
+    enum cache_operation operation;
+    unsigned int refs;
+    Pixmap pixmap;
+    unsigned int width, height, depth;
+    BOOL acquired;
+    void (*read_release)(void *);
+    void *read_context;
+    /* A read view retains its parent's native storage. Only an owning image
+     * allocates the native work, resource and accounting state below. */
+    struct cache_image_native native[];
 };
 
 /* The bound includes live, queued, executing, completed and retiring images.
@@ -100,7 +108,7 @@ static const char *cache_image_kind( const struct client_surface_cache_image *im
 {
     static const char *const names[] = {"owner_cache", "output_mailbox", "output_pair"};
 
-    return names[image->kind];
+    return names[image->native->kind];
 }
 
 /* Only an executing native work item can use this private connection. */
@@ -252,96 +260,96 @@ done:
 
 static void create_cache_image( struct client_surface_cache_image *image )
 {
-    struct cache_worker *worker = image->worker;
+    struct cache_worker *worker = image->native->worker;
     XGCValues values = {.graphics_exposures = False};
     Display *display;
 
     if (!x11drv_open_private_display( &worker->display, &worker->errors, &worker->error )) return;
     display = worker->display;
     worker->error = 0;
-    if (image->imported)
+    if (image->native->imported)
     {
-        image->pixmap = client_surface_xcb_import( display, image->source,
+        image->pixmap = client_surface_xcb_import( display, image->native->source,
             image->width, image->height, image->depth );
-        image->success = !!image->pixmap;
+        image->native->success = !!image->pixmap;
         TRACE_(csperf)( "ticks=%llu event=cache_native_import image=%p source=%lx pixmap=%lx success=%u\n",
-                       client_surface_perf_time(), image, image->source, image->pixmap, image->success );
-        if ((image->acquired = image->success))
-            x11drv_client_surface_trace_image( "acquire", "owner_cache", display, image->pixmap, image->bytes );
+                       client_surface_perf_time(), image, image->native->source, image->pixmap, image->native->success );
+        if ((image->acquired = image->native->success))
+            x11drv_client_surface_trace_image( "acquire", "owner_cache", display, image->pixmap, image->native->bytes );
         return;
     }
     image->pixmap = XCreatePixmap( display, root_window, image->width, image->height, image->depth );
     if (image->pixmap)
     {
-        image->transfer_gc = XCreateGC( display, image->pixmap, GCGraphicsExposures, &values );
+        image->native->transfer_gc = XCreateGC( display, image->pixmap, GCGraphicsExposures, &values );
     }
     XSync( display, False );
-    image->success = image->pixmap && image->transfer_gc && !worker->error;
+    image->native->success = image->pixmap && image->native->transfer_gc && !worker->error;
     TRACE_(csperf)( "ticks=%llu event=cache_native_alloc image=%p pixmap=%lx display=%p error=%d "
                    "sync_calls=1 success=%u worker=%u scope=%p\n", client_surface_perf_time(), image, image->pixmap, display,
-                   worker->error, image->success, (unsigned int)(worker - cache_workers), &image->memory );
-    if ((image->acquired = image->success))
+                   worker->error, image->native->success, (unsigned int)(worker - cache_workers), &image->native->memory );
+    if ((image->acquired = image->native->success))
     {
-        image->xcb_gc = XGContextFromGC( image->transfer_gc );
-        x11drv_client_surface_trace_image( "acquire", "owner_cache", display, image->pixmap, image->bytes );
+        image->native->xcb_gc = XGContextFromGC( image->native->transfer_gc );
+        x11drv_client_surface_trace_image( "acquire", "owner_cache", display, image->pixmap, image->native->bytes );
     }
 }
 
 static BOOL prepare_window_copy_gc( struct client_surface_cache_image *image )
 {
-    struct cache_worker *worker = image->worker;
+    struct cache_worker *worker = image->native->worker;
     XGCValues values = {.graphics_exposures = True, .subwindow_mode = IncludeInferiors};
 
-    if (image->window_gc_ready) return TRUE;
-    if (!image->window_gc)
-        image->window_gc = XCreateGC( worker->display, image->pixmap,
+    if (image->native->window_gc_ready) return TRUE;
+    if (!image->native->window_gc)
+        image->native->window_gc = XCreateGC( worker->display, image->pixmap,
                                     GCGraphicsExposures | GCSubwindowMode, &values );
     /* Window inputs need coverage receipts. Keep their immutable GC separate
      * from the exposure-free transfer GC used by normal XCB cache copies. */
     XSync( worker->display, False );
-    image->window_gc_ready = image->window_gc && !worker->error;
-    if (!image->window_gc_ready && image->window_gc)
+    image->native->window_gc_ready = image->native->window_gc && !worker->error;
+    if (!image->native->window_gc_ready && image->native->window_gc)
     {
         int error = worker->error;
 
         /* XCreateGC can return an Xlib object for a rejected server request.
          * A surviving spare must not validate that stale object on its next
          * read merely because this worker's error has since been cleared. */
-        XFreeGC( worker->display, image->window_gc );
-        image->window_gc = NULL;
+        XFreeGC( worker->display, image->native->window_gc );
+        image->native->window_gc = NULL;
         XSync( worker->display, False );
         worker->error = error;
     }
-    return image->window_gc_ready;
+    return image->native->window_gc_ready;
 }
 
 static BOOL acquire_content_seed( struct client_surface_cache_image *image )
 {
 #ifdef SONAME_LIBXCOMPOSITE
-    struct cache_worker *worker = image->worker;
+    struct cache_worker *worker = image->native->worker;
     Display *display = worker->display;
     Window root;
     unsigned int width = 0, height = 0, border, depth = 0;
     int x, y;
     BOOL valid;
 
-    if (!client_surface_reserve_scoped_memory( &image->memory, CLIENT_SURFACE_MEMORY_OUTPUT, image->bytes ))
+    if (!client_surface_reserve_scoped_memory( &image->native->memory, CLIENT_SURFACE_MEMORY_OUTPUT, image->native->bytes ))
         return FALSE;
-    image->seed_bytes = image->bytes;
-    image->seed = pXCompositeNameWindowPixmap( display, image->source );
+    image->native->seed_bytes = image->native->bytes;
+    image->native->seed = pXCompositeNameWindowPixmap( display, image->native->source );
     XSync( display, False );
     if (worker->error)
     {
-        image->seed = 0;
+        image->native->seed = 0;
         return FALSE;
     }
-    valid = XGetGeometry( display, image->seed, &root, &x, &y, &width, &height, &border, &depth );
+    valid = XGetGeometry( display, image->native->seed, &root, &x, &y, &width, &height, &border, &depth );
     /* Naming pins the old backing across unmap/resize. Only an admitted
      * extent may become this request's input; scene validation is separate. */
-    valid = valid && width == image->copy_width && height == image->copy_height && depth == image->depth &&
-            client_surface_pixmap_bytes( width, height, depth ) <= image->seed_bytes;
+    valid = valid && width == image->native->copy_width && height == image->native->copy_height && depth == image->depth &&
+            client_surface_pixmap_bytes( width, height, depth ) <= image->native->seed_bytes;
     TRACE_(csperf)( "ticks=%llu event=content_seed_acquire image=%p window=%lx pixmap=%lx width=%u height=%u bytes=%llu\n",
-                   client_surface_perf_time(), image, image->source, image->seed, width, height, (unsigned long long)image->seed_bytes );
+                   client_surface_perf_time(), image, image->native->source, image->native->seed, width, height, (unsigned long long)image->native->seed_bytes );
     return valid;
 #else
     return FALSE;
@@ -350,22 +358,22 @@ static BOOL acquire_content_seed( struct client_surface_cache_image *image )
 
 static void release_content_seed( struct client_surface_cache_image *image )
 {
-    if (image->seed)
+    if (image->native->seed)
     {
-        XFreePixmap( image->worker->display, image->seed );
-        XSync( image->worker->display, False );
+        XFreePixmap( image->native->worker->display, image->native->seed );
+        XSync( image->native->worker->display, False );
         TRACE_(csperf)( "ticks=%llu event=content_seed_release image=%p pixmap=%lx bytes=%llu\n",
-                       client_surface_perf_time(), image, image->seed, (unsigned long long)image->seed_bytes );
-        image->seed = 0;
+                       client_surface_perf_time(), image, image->native->seed, (unsigned long long)image->native->seed_bytes );
+        image->native->seed = 0;
     }
-    client_surface_release_scoped_memory( &image->memory, CLIENT_SURFACE_MEMORY_OUTPUT, image->seed_bytes );
-    image->seed_bytes = 0;
+    client_surface_release_scoped_memory( &image->native->memory, CLIENT_SURFACE_MEMORY_OUTPUT, image->native->seed_bytes );
+    image->native->seed_bytes = 0;
 }
 
 static void copy_cache_image( struct client_surface_cache_image *image )
 {
-    struct cache_worker *worker = image->worker;
-    struct x11drv_native_window_read *read = image->read;
+    struct cache_worker *worker = image->native->worker;
+    struct x11drv_native_window_read *read = image->native->read;
     XGCValues values = {.graphics_exposures = False};
     Display *display = worker->display;
     GC gc;
@@ -382,18 +390,18 @@ static void copy_cache_image( struct client_surface_cache_image *image )
 
         if (read->copy_error)
         {
-            image->success = FALSE;
+            image->native->success = FALSE;
             goto done;
         }
         status = read->content_epoch ? x11drv_native_window_seed_begin( read ) : STATUS_SUCCESS;
         if (status == STATUS_PENDING)
         {
-            image->waiting = TRUE;
+            image->native->waiting = TRUE;
             return;
         }
         if (status || (read->content_epoch && !acquire_content_seed( image )))
         {
-            image->success = FALSE;
+            image->native->success = FALSE;
             if (!status)
             {
                 read->copy_error = worker->error;
@@ -407,11 +415,11 @@ static void copy_cache_image( struct client_surface_cache_image *image )
         if (read->content_epoch) x11drv_native_window_seed_end( read );
         if (!prepare_window_copy_gc( image ))
         {
-            image->success = FALSE;
+            image->native->success = FALSE;
             read->copy_error = worker->error;
             goto done;
         }
-        gc = image->window_gc;
+        gc = image->native->window_gc;
         x11drv_native_window_read_begin( read, display );
     }
     else
@@ -423,39 +431,39 @@ static void copy_cache_image( struct client_surface_cache_image *image )
             XSetClipOrigin( display, gc, 0, 0 );
         }
     }
-    if (gc) XCopyArea( display, image->seed ? image->seed : image->source, image->pixmap, gc,
-                      0, 0, image->copy_width, image->copy_height, 0, 0 );
+    if (gc) XCopyArea( display, image->native->seed ? image->native->seed : image->native->source, image->pixmap, gc,
+                      0, 0, image->native->copy_width, image->native->copy_height, 0, 0 );
     if (read) x11drv_native_window_read_end( read );
     else
     {
-        image->success = !!gc;
+        image->native->success = !!gc;
         /* Retire the connection-local GC in the copy's checked stream, so
          * completion also permits another worker to reuse the image. */
         if (gc) XFreeGC( display, gc );
         XSync( display, False );
-        image->success = image->success && !worker->error;
+        image->native->success = image->native->success && !worker->error;
     }
 receipt:
     if (read)
     {
-        image->waiting = !x11drv_native_window_read_complete( read, &image->success );
-        if (image->waiting) return;
+        image->native->waiting = !x11drv_native_window_read_complete( read, &image->native->success );
+        if (image->native->waiting) return;
     }
 done:
-    input = image->seed ? image->seed : image->source;
+    input = image->native->seed ? image->native->seed : image->native->source;
     if (read) release_content_seed( image );
     TRACE_(csperf)( "ticks=%llu event=%s image=%p source=%lx input=%lx destination=%lx "
                    "display=%p width=%u height=%u error=%d sync_calls=%u receipt=%lu copy_serial=%lu success=%u\n", client_surface_perf_time(),
-                   image->purpose == CLIENT_SURFACE_MEMORY_OUTPUT ? "output_pair_native_copy" : "cache_native_fallback",
-                   image, image->source, input, image->pixmap, display, image->copy_width,
-                   image->copy_height, read ? read->copy_error : worker->error, !read,
-                   read ? read->copy.serial : 0, read ? read->copy_serial : 0, image->success );
+                   image->native->purpose == CLIENT_SURFACE_MEMORY_OUTPUT ? "output_pair_native_copy" : "cache_native_fallback",
+                   image, image->native->source, input, image->pixmap, display, image->native->copy_width,
+                   image->native->copy_height, read ? read->copy_error : worker->error, !read,
+                   read ? read->copy.serial : 0, read ? read->copy_serial : 0, image->native->success );
 }
 
 static void transform_cache_image( struct client_surface_cache_image *image )
 {
-    const struct client_surface_cache_transform *transform = image->transform;
-    struct cache_worker *worker = image->worker;
+    const struct client_surface_cache_transform *transform = image->native->transform;
+    struct cache_worker *worker = image->native->worker;
     Display *display = worker->display;
     XGCValues values = {.graphics_exposures = False};
     BOOL copied = TRUE, rendered = FALSE;
@@ -465,7 +473,7 @@ static void transform_cache_image( struct client_surface_cache_image *image )
 
     worker->error = 0;
     gc = XCreateGC( display, image->pixmap, GCGraphicsExposures, &values );
-    for (; gc && copied && index < image->transform_count; ++index, transform = transform->next)
+    for (; gc && copied && index < image->native->transform_count; ++index, transform = transform->next)
     {
         assert( transform && (!index || !transform->catchup) );
         rendered = FALSE;
@@ -501,33 +509,33 @@ static void transform_cache_image( struct client_surface_cache_image *image )
                     transform->clipped ? transform->clips : NULL,
                     transform->clipped ? transform->clip_count : 0, 0, 0 );
                 if (!rendered)
-                    copied = client_surface_copy_image( display, &image->memory, transform->source,
+                    copied = client_surface_copy_image( display, &image->native->memory, transform->source,
                         image->pixmap, gc, transform->source_visual, transform->destination_visual,
                         transform->source_width, transform->source_height, &transform->destination );
             }
         }
-        if (image->transform_count > 1)
+        if (image->native->transform_count > 1)
             TRACE_(csperf)( "ticks=%llu event=output_transform_command image=%p command=%p index=%u count=%u "
                            "source=%lx destination=%lx catchup=%lx native=%u rendered=%u copied=%u\n", client_surface_perf_time(),
-                           image, transform, index, image->transform_count, transform->source, image->pixmap,
+                           image, transform, index, image->native->transform_count, transform->source, image->pixmap,
                            transform->catchup, transform->native, rendered, copied );
     }
-    image->success = gc && copied;
+    image->native->success = gc && copied;
     /* Even a failed allocation may have returned an Xlib handle. Its
      * retirement and all transforms share this one checked completion. */
     if (gc) XFreeGC( display, gc );
     XSync( display, False );
     error = worker->error;
-    image->success = image->success && !error;
+    image->native->success = image->native->success && !error;
     TRACE_(csperf)( "ticks=%llu event=output_transform_native image=%p source=%lx destination=%lx "
                    "catchup=%lx display=%p rendered=%u error=%d success=%u count=%u executed=%u\n", client_surface_perf_time(),
-                   image, image->transform->source, image->pixmap, image->transform->catchup, display,
-                   rendered, error, image->success, image->transform_count, index );
+                   image, image->native->transform->source, image->pixmap, image->native->transform->catchup, display,
+                   rendered, error, image->native->success, image->native->transform_count, index );
 }
 
 static void create_output_image( struct client_surface_cache_image *image )
 {
-    struct cache_worker *worker = image->worker;
+    struct cache_worker *worker = image->native->worker;
     Display *display;
 
     if (!x11drv_open_private_display( &worker->display, &worker->errors, &worker->error )) return;
@@ -535,69 +543,69 @@ static void create_output_image( struct client_surface_cache_image *image )
     worker->error = 0;
     image->pixmap = XCreatePixmap( display, root_window, image->width, image->height, image->depth );
     XSync( display, False );
-    image->success = image->pixmap && !worker->error;
+    image->native->success = image->pixmap && !worker->error;
     TRACE_(csperf)( "ticks=%llu event=%s image=%p window=%lx pixmap=%lx display=%p "
                    "width=%u height=%u depth=%u sync_calls=1 error=%d success=%u scope=%p\n",
-                   client_surface_perf_time(), image->kind == CACHE_IMAGE_OUTPUT_PAIR ? "output_pair_native_alloc" : "output_mailbox_alloc",
-                   image, image->window, image->pixmap, display, image->width, image->height,
-                   image->depth, worker->error, image->success, &image->memory );
-    if ((image->acquired = image->success))
-        x11drv_client_surface_trace_image( "acquire", cache_image_kind( image ), display, image->pixmap, image->bytes );
+                   client_surface_perf_time(), image->native->kind == CACHE_IMAGE_OUTPUT_PAIR ? "output_pair_native_alloc" : "output_mailbox_alloc",
+                   image, image->native->window, image->pixmap, display, image->width, image->height,
+                   image->depth, worker->error, image->native->success, &image->native->memory );
+    if ((image->acquired = image->native->success))
+        x11drv_client_surface_trace_image( "acquire", cache_image_kind( image ), display, image->pixmap, image->native->bytes );
 }
 
 static void destroy_cache_image( struct client_surface_cache_image *image )
 {
-    struct cache_worker *worker = image->worker;
+    struct cache_worker *worker = image->native->worker;
     Display *display = worker->display;
 
-    assert( worker == image->owner && !image->window_gc );
+    assert( worker == image->native->owner && !image->native->window_gc );
     /* Every native object was created on this worker's process-lifetime
      * connection. An open failure can leave only an empty image record. */
-    assert( display || (!image->transfer_gc && !image->window_gc && !image->pixmap) );
+    assert( display || (!image->native->transfer_gc && !image->native->window_gc && !image->pixmap) );
     worker->error = 0;
-    if (image->transfer_gc) XFreeGC( display, image->transfer_gc );
+    if (image->native->transfer_gc) XFreeGC( display, image->native->transfer_gc );
     if (image->pixmap) XFreePixmap( display, image->pixmap );
-    if (image->transfer_gc || image->pixmap) XSync( display, False );
+    if (image->native->transfer_gc || image->pixmap) XSync( display, False );
     TRACE_(csperf)( "ticks=%llu event=cache_native_free image=%p pixmap=%lx display=%p error=%d "
                    "owner_display=%p kind=%s scope=%p\n", client_surface_perf_time(), image, image->pixmap, display, worker->error,
-                   display, cache_image_kind( image ), &image->memory );
+                   display, cache_image_kind( image ), &image->native->memory );
     if (image->acquired)
-        x11drv_client_surface_trace_image( "free", cache_image_kind( image ), display, image->pixmap, image->bytes );
-    client_surface_release_scoped_memory( &image->memory, image->purpose, image->bytes );
+        x11drv_client_surface_trace_image( "free", cache_image_kind( image ), display, image->pixmap, image->native->bytes );
+    client_surface_release_scoped_memory( &image->native->memory, image->native->purpose, image->native->bytes );
 }
 
 static void queue_native_work( struct cache_worker *worker, struct client_surface_native_work *work );
 
 static void execute_cache_image( struct client_surface_native_work *work )
 {
-    struct client_surface_cache_image *image = CONTAINING_RECORD( work, struct client_surface_cache_image, work );
+    struct client_surface_cache_image *image = CONTAINING_RECORD( work, struct client_surface_cache_image, native[0].work );
 
-    image->started = TRUE;
+    image->native->started = TRUE;
     if ((image->operation == CACHE_COPY || image->operation == CACHE_TRANSFORM) &&
-        !x11drv_open_private_display( &image->worker->display, &image->worker->errors, &image->worker->error ))
+        !x11drv_open_private_display( &image->native->worker->display, &image->native->worker->errors, &image->native->worker->error ))
     {
-        image->waiting = image->success = FALSE;
-        if (image->read)
+        image->native->waiting = image->native->success = FALSE;
+        if (image->native->read)
         {
-            x11drv_native_window_read_finish( image->read );
-            image->read = NULL;
+            x11drv_native_window_read_finish( image->native->read );
+            image->native->read = NULL;
         }
         return;
     }
     switch (image->operation)
     {
     case CACHE_CREATE:
-        if (image->purpose == CLIENT_SURFACE_MEMORY_SOURCE) create_cache_image( image );
+        if (image->native->purpose == CLIENT_SURFACE_MEMORY_SOURCE) create_cache_image( image );
         else create_output_image( image );
         break;
     case CACHE_COPY:
-        image->waiting = image->read && !x11drv_native_window_copy_ready( image->read );
-        if (image->waiting) break;
+        image->native->waiting = image->native->read && !x11drv_native_window_copy_ready( image->native->read );
+        if (image->native->waiting) break;
         copy_cache_image( image );
-        if (image->read && !image->waiting)
+        if (image->native->read && !image->native->waiting)
         {
-            x11drv_native_window_read_finish( image->read );
-            image->read = NULL;
+            x11drv_native_window_read_finish( image->native->read );
+            image->native->read = NULL;
         }
         break;
     case CACHE_TRANSFORM: transform_cache_image( image ); break;
@@ -607,28 +615,28 @@ static void execute_cache_image( struct client_surface_native_work *work )
     /* Waiting for content admission alone has not attached any resource to
      * this executor. A later retry must remain movable until a native copy
      * actually owns its GC/seed and receipt on this connection. */
-    if (image->waiting && !image->window_gc && !image->seed) image->started = FALSE;
+    if (image->native->waiting && !image->native->window_gc && !image->native->seed) image->native->started = FALSE;
     /* Xlib GC handles belong to the executing connection. Their retirement
      * precedes completion, so the next write can use another worker without
      * touching this connection or retaining an unaccounted native object. */
-    if (!image->waiting && image->window_gc)
+    if (!image->native->waiting && image->native->window_gc)
     {
-        XFreeGC( image->worker->display, image->window_gc );
-        XSync( image->worker->display, False );
-        image->window_gc = NULL;
-        image->window_gc_ready = FALSE;
+        XFreeGC( image->native->worker->display, image->native->window_gc );
+        XSync( image->native->worker->display, False );
+        image->native->window_gc = NULL;
+        image->native->window_gc_ready = FALSE;
     }
 }
 
 static void finish_cache_image( struct client_surface_native_work *work )
 {
-    struct client_surface_cache_image *image = CONTAINING_RECORD( work, struct client_surface_cache_image, work );
-    struct cache_worker *worker = image->worker;
+    struct client_surface_cache_image *image = CONTAINING_RECORD( work, struct client_surface_cache_image, native[0].work );
+    struct cache_worker *worker = image->native->worker;
     enum cache_operation operation = image->operation;
     void (*wake)(void);
 
     pthread_mutex_lock( &cache_mutex );
-    if (image->waiting)
+    if (image->native->waiting)
     {
         queue_native_work( worker, work );
         pthread_mutex_unlock( &cache_mutex );
@@ -637,7 +645,7 @@ static void finish_cache_image( struct client_surface_native_work *work )
     if (operation == CACHE_RELEASE)
     {
         --image_count;
-        if (image->purpose == CLIENT_SURFACE_MEMORY_SOURCE) --source_count;
+        if (image->native->purpose == CLIENT_SURFACE_MEMORY_SOURCE) --source_count;
     }
     else
     {
@@ -650,7 +658,7 @@ static void finish_cache_image( struct client_surface_native_work *work )
     wake = cache_wake;
     pthread_mutex_unlock( &cache_mutex );
     if (operation == CACHE_RELEASE)
-        client_surface_free_owned_metadata( &image->memory, image, sizeof(*image) );
+        client_surface_free_owned_metadata( &image->native->memory, image, sizeof(*image) + sizeof(*image->native) );
     /* The actor may immediately release the completed object's context. */
     wake();
 }
@@ -660,8 +668,8 @@ static BOOL cache_work_is_movable( struct client_surface_native_work *work )
     struct client_surface_cache_image *image;
 
     if (work->execute != execute_cache_image) return TRUE;
-    image = CONTAINING_RECORD( work, struct client_surface_cache_image, work );
-    return !image->started && image->operation != CACHE_RELEASE;
+    image = CONTAINING_RECORD( work, struct client_surface_cache_image, native[0].work );
+    return !image->native->started && image->operation != CACHE_RELEASE;
 }
 
 static BOOL steal_cache_work( struct cache_worker *worker )
@@ -783,10 +791,10 @@ static void queue_native_work( struct cache_worker *worker, struct client_surfac
                 if (!cache_workers[i].pending) { worker = &cache_workers[i]; break; }
         if (work->execute == execute_cache_image)
         {
-            struct client_surface_cache_image *image = CONTAINING_RECORD( work, struct client_surface_cache_image, work );
+            struct client_surface_cache_image *image = CONTAINING_RECORD( work, struct client_surface_cache_image, native[0].work );
 
-            image->worker = worker;
-            if (image->operation == CACHE_CREATE) image->owner = worker;
+            image->native->worker = worker;
+            if (image->operation == CACHE_CREATE) image->native->owner = worker;
         }
     }
     work->next = NULL;
@@ -986,28 +994,28 @@ static void queue_cache_image( struct client_surface_cache_image *image, enum ca
     struct cache_worker *worker;
 
     assert( image->operation == CACHE_IDLE );
-    assert( !image->window_gc );
-    image->started = FALSE;
-    worker = image->worker = operation == CACHE_COPY || operation == CACHE_TRANSFORM ?
-        select_existing_cache_worker() : image->owner;
+    assert( !image->native->window_gc );
+    image->native->started = FALSE;
+    worker = image->native->worker = operation == CACHE_COPY || operation == CACHE_TRANSFORM ?
+        select_existing_cache_worker() : image->native->owner;
     image->operation = operation;
-    image->complete = complete;
-    image->context = context;
-    image->work.execute = execute_cache_image;
-    image->work.finished = finish_cache_image;
-    queue_native_work( worker, &image->work );
-    worker = image->worker;
+    image->native->complete = complete;
+    image->native->context = context;
+    image->native->work.execute = execute_cache_image;
+    image->native->work.finished = finish_cache_image;
+    queue_native_work( worker, &image->native->work );
+    worker = image->native->worker;
     TRACE_(csperf)( "ticks=%llu event=cache_image_queue image=%p operation=%u worker=%u pending=%u count=%u purpose=%u\n",
                    client_surface_perf_time(), image, operation, (unsigned int)(worker - cache_workers), worker->pending, image_count,
-                   image->purpose );
+                   image->native->purpose );
 }
 
 static void discard_cache_image( struct client_surface_cache_image *image )
 {
     if (!image) return;
     assert( image->operation == CACHE_IDLE && !image->pixmap && !image->acquired );
-    client_surface_release_scoped_memory( &image->memory, image->purpose, image->bytes );
-    client_surface_free_owned_metadata( &image->memory, image, sizeof(*image) );
+    client_surface_release_scoped_memory( &image->native->memory, image->native->purpose, image->native->bytes );
+    client_surface_free_owned_metadata( &image->native->memory, image, sizeof(*image) + sizeof(*image->native) );
 }
 
 static struct client_surface_cache_image *allocate_cache_image(
@@ -1017,21 +1025,21 @@ static struct client_surface_cache_image *allocate_cache_image(
     struct client_surface_cache_image *image;
 
     client_surface_memory_scope_copy( &memory, owners, TRUE );
-    if (!(image = client_surface_alloc_scoped_metadata( &memory, 1, sizeof(*image) )))
+    if (!(image = client_surface_alloc_scoped_metadata( &memory, 1, sizeof(*image) + sizeof(*image->native) )))
     {
         client_surface_memory_scope_destroy( &memory );
         return NULL;
     }
-    image->memory = memory;
+    image->native->memory = memory;
     image->refs = 1;
-    image->purpose = purpose;
-    image->kind = purpose == CLIENT_SURFACE_MEMORY_SOURCE ? CACHE_IMAGE_SOURCE : CACHE_IMAGE_OUTPUT_MAILBOX;
-    if (!client_surface_reserve_scoped_memory( &image->memory, purpose, bytes ))
+    image->native->purpose = purpose;
+    image->native->kind = purpose == CLIENT_SURFACE_MEMORY_SOURCE ? CACHE_IMAGE_SOURCE : CACHE_IMAGE_OUTPUT_MAILBOX;
+    if (!client_surface_reserve_scoped_memory( &image->native->memory, purpose, bytes ))
     {
         discard_cache_image( image );
         return NULL;
     }
-    image->bytes = bytes;
+    image->native->bytes = bytes;
     return image;
 }
 
@@ -1044,26 +1052,26 @@ static struct client_surface_cache_image *create_client_surface_cache_image(
     struct client_surface_cache_image *image;
 
     if (!(image = allocate_cache_image( owners, purpose, bytes ))) return NULL;
-    image->window = window;
+    image->native->window = window;
     image->width = width;
     image->height = height;
     image->depth = depth;
-    image->source = import;
-    image->imported = !!import;
+    image->native->source = import;
+    image->native->imported = !!import;
     pthread_mutex_lock( &cache_mutex );
     assert( !cache_wake || cache_wake == wake );
     cache_wake = wake;
     if (image_count == CLIENT_SURFACE_CACHE_IMAGE_LIMIT ||
         (purpose == CLIENT_SURFACE_MEMORY_SOURCE &&
          source_count == CLIENT_SURFACE_CACHE_IMAGE_LIMIT - CLIENT_SURFACE_CACHE_OUTPUT_RESERVE) ||
-        !(image->worker = select_cache_worker()))
+        !(image->native->worker = select_cache_worker()))
     {
         pthread_mutex_unlock( &cache_mutex );
         goto failed;
     }
     ++image_count;
     if (purpose == CLIENT_SURFACE_MEMORY_SOURCE) ++source_count;
-    image->owner = image->worker;
+    image->native->owner = image->native->worker;
     queue_cache_image( image, CACHE_CREATE, complete, context );
     pthread_mutex_unlock( &cache_mutex );
     return image;
@@ -1096,16 +1104,16 @@ struct client_surface_cache_image *client_surface_cache_view(
 {
     struct client_surface_cache_image *image;
 
-    assert( storage->imported && storage->pixmap && storage->operation == CACHE_IDLE );
+    assert( storage->native->imported && storage->pixmap && storage->operation == CACHE_IDLE );
     /* The parent reference keeps this allocation's owner and domain alive.
      * A read view owns metadata, but no separate image storage or scope. */
-    if (!(image = client_surface_alloc_scoped_metadata( &storage->memory, 1, sizeof(*image) ))) return NULL;
+    if (!(image = client_surface_alloc_scoped_metadata( &storage->native->memory, 1, sizeof(*image) ))) return NULL;
     pthread_mutex_lock( &cache_mutex );
     if (image_count == CLIENT_SURFACE_CACHE_IMAGE_LIMIT ||
         source_count == CLIENT_SURFACE_CACHE_IMAGE_LIMIT - CLIENT_SURFACE_CACHE_OUTPUT_RESERVE)
     {
         pthread_mutex_unlock( &cache_mutex );
-        client_surface_free_scoped_metadata( &storage->memory, image, sizeof(*image) );
+        client_surface_free_scoped_metadata( &storage->native->memory, image, sizeof(*image) );
         return NULL;
     }
     ++image_count;
@@ -1118,7 +1126,6 @@ struct client_surface_cache_image *client_surface_cache_view(
     image->width = storage->width;
     image->height = storage->height;
     image->depth = storage->depth;
-    image->owner = storage->owner;
     image->read_release = release;
     image->read_context = context;
     TRACE_(csperf)( "ticks=%llu event=cache_view_create image=%p parent=%p pixmap=%lx parent_refs=%u count=%u\n",
@@ -1146,12 +1153,12 @@ BOOL client_surface_cache_reserve_output_pair(
     for (i = 0; i < 2; ++i)
     {
         if (!(images[i] = allocate_cache_image( memory, CLIENT_SURFACE_MEMORY_OUTPUT, bytes_per_image ))) goto failed;
-        images[i]->kind = CACHE_IMAGE_OUTPUT_PAIR;
+        images[i]->native->kind = CACHE_IMAGE_OUTPUT_PAIR;
     }
     pthread_mutex_lock( &cache_mutex );
     assert( !cache_wake || cache_wake == wake );
     cache_wake = wake;
-    if (image_count > CLIENT_SURFACE_CACHE_IMAGE_LIMIT - 2 || !(images[0]->worker = select_cache_worker()))
+    if (image_count > CLIENT_SURFACE_CACHE_IMAGE_LIMIT - 2 || !(images[0]->native->worker = select_cache_worker()))
     {
         pthread_mutex_unlock( &cache_mutex );
         goto failed;
@@ -1159,10 +1166,10 @@ BOOL client_surface_cache_reserve_output_pair(
     /* The first admitted worker also guarantees a release executor for the
      * second record if another worker cannot be started. Creation is queued
      * only after the caller has initialized the shared completion context. */
-    images[1]->worker = select_cache_worker();
-    assert( images[1]->worker );
-    images[0]->owner = images[0]->worker;
-    images[1]->owner = images[1]->worker;
+    images[1]->native->worker = select_cache_worker();
+    assert( images[1]->native->worker );
+    images[0]->native->owner = images[0]->native->worker;
+    images[1]->native->owner = images[1]->native->worker;
     image_count += 2;
     TRACE_(csperf)( "ticks=%llu event=output_pair_reserve first=%p second=%p bytes=%llu count=%u\n",
                    client_surface_perf_time(), images[0], images[1], (unsigned long long)bytes_per_image, image_count );
@@ -1187,7 +1194,7 @@ void client_surface_cache_create_output_pair( struct client_surface_cache_image 
     for (i = 0; i < 2; ++i)
     {
         image = images[i];
-        assert( image && image->kind == CACHE_IMAGE_OUTPUT_PAIR && image->operation == CACHE_IDLE &&
+        assert( image && image->native->kind == CACHE_IMAGE_OUTPUT_PAIR && image->operation == CACHE_IDLE &&
                 image->refs == 1 && !image->pixmap );
         image->width = width;
         image->height = height;
@@ -1206,18 +1213,18 @@ Pixmap client_surface_cache_pixmap( const struct client_surface_cache_image *ima
 unsigned int client_surface_cache_gc( const struct client_surface_cache_image *image )
 {
     assert( image->acquired && image->operation == CACHE_IDLE );
-    return image->xcb_gc;
+    return image->native->xcb_gc;
 }
 
 void client_surface_cache_copy( struct client_surface_cache_image *image, Pixmap source,
                                 client_surface_cache_callback complete, void *context )
 {
     pthread_mutex_lock( &cache_mutex );
-    assert( image->acquired && !image->parent && !image->imported && image->refs == 1 &&
-            image->purpose == CLIENT_SURFACE_MEMORY_SOURCE );
-    image->source = source;
-    image->copy_width = image->width;
-    image->copy_height = image->height;
+    assert( image->acquired && !image->parent && !image->native->imported && image->refs == 1 &&
+            image->native->purpose == CLIENT_SURFACE_MEMORY_SOURCE );
+    image->native->source = source;
+    image->native->copy_width = image->width;
+    image->native->copy_height = image->height;
     queue_cache_image( image, CACHE_COPY, complete, context );
     pthread_mutex_unlock( &cache_mutex );
 }
@@ -1229,14 +1236,14 @@ static void copy_output( struct client_surface_cache_image *image, struct client
     assert( !!source != !!read && source != image );
     if (source) client_surface_cache_acquire( source );
     pthread_mutex_lock( &cache_mutex );
-    assert( image->acquired && image->refs == 1 && image->purpose == CLIENT_SURFACE_MEMORY_OUTPUT );
-    assert( !image->copy_source && width && height && width <= image->width && height <= image->height );
+    assert( image->acquired && image->refs == 1 && image->native->purpose == CLIENT_SURFACE_MEMORY_OUTPUT );
+    assert( !image->native->copy_source && width && height && width <= image->width && height <= image->height );
     assert( !source || (width <= source->width && height <= source->height) );
-    image->source = read ? x11drv_native_window_read_drawable( read ) : source->pixmap;
-    image->copy_source = source;
-    image->read = read;
-    image->copy_width = width;
-    image->copy_height = height;
+    image->native->source = read ? x11drv_native_window_read_drawable( read ) : source->pixmap;
+    image->native->copy_source = source;
+    image->native->read = read;
+    image->native->copy_width = width;
+    image->native->copy_height = height;
     queue_cache_image( image, CACHE_COPY, complete, context );
     pthread_mutex_unlock( &cache_mutex );
 }
@@ -1290,7 +1297,7 @@ BOOL client_surface_cache_write_pending( const struct client_surface_cache_image
 
 static BOOL acquire_output_write( struct client_surface_cache_image *image )
 {
-    assert( image->purpose == CLIENT_SURFACE_MEMORY_OUTPUT );
+    assert( image->native->purpose == CLIENT_SURFACE_MEMORY_OUTPUT );
     if (!image->acquired || image->refs != 1 || image->operation != CACHE_IDLE) return FALSE;
     ++image->refs;
     TRACE_(csperf)( "ticks=%llu event=cache_image_reference image=%p pixmap=%lx acquire=1 refs=%u\n",
@@ -1318,8 +1325,8 @@ BOOL client_surface_cache_transform_output( struct client_surface_cache_image *i
         pthread_mutex_unlock( &cache_mutex );
         return FALSE;
     }
-    image->transform = transform;
-    image->transform_count = count;
+    image->native->transform = transform;
+    image->native->transform_count = count;
     queue_cache_image( image, CACHE_TRANSFORM, complete, context );
     pthread_mutex_unlock( &cache_mutex );
     return TRUE;
@@ -1352,8 +1359,8 @@ void client_surface_cache_release( struct client_surface_cache_image *image )
         {
             if (image->acquired)
                 x11drv_client_surface_trace_image( "retire", cache_image_kind( image ),
-                                                  image->owner->display,
-                                                  image->pixmap, image->bytes );
+                                                  image->native->owner->display,
+                                                  image->pixmap, image->native->bytes );
             queue_cache_image( image, CACHE_RELEASE, NULL, NULL );
         }
     }
@@ -1386,20 +1393,20 @@ BOOL client_surface_complete_cache( unsigned int budget )
             TRACE_(csperf)( "ticks=%llu event=cache_view_return image=%p parent=%p pixmap=%lx count=%u\n",
                            client_surface_perf_time(), image, source, image->pixmap, image_count );
             pthread_mutex_unlock( &cache_mutex );
-            client_surface_free_scoped_metadata( &source->memory, image, sizeof(*image) );
+            client_surface_free_scoped_metadata( &source->native->memory, image, sizeof(*image) );
             client_surface_cache_release( source );
             release( context );
             progressed = TRUE;
             continue;
         }
-        source = image->copy_source;
-        image->copy_source = NULL;
+        source = image->native->copy_source;
+        image->native->copy_source = NULL;
         image->operation = CACHE_IDLE;
-        image->transform = NULL;
-        image->transform_count = 0;
+        image->native->transform = NULL;
+        image->native->transform_count = 0;
         pthread_mutex_unlock( &cache_mutex );
         client_surface_cache_release( source );
-        image->complete( image->context, image->success );
+        image->native->complete( image->native->context, image->native->success );
         progressed = TRUE;
     }
     return progressed;
