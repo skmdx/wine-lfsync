@@ -4664,7 +4664,7 @@ enum inproc_sync_type
 @END
 
 /* The owner observed successful native presentation on its attached target.
- * Reserve publication through the same READY/PUBLISHING transition as copies. */
+ * Commit publication, retaining the GUI exposure ACK for staged transitions. */
 @REQ(complete_client_surface_direct_plan)
     user_handle_t handle;
     unsigned __int64 scene_id;

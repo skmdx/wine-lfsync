@@ -33,6 +33,7 @@ struct client_surface_native_present
     UINT64 generation, epoch;
     RECT copy_rect; /* empty for full-frame publication; otherwise a restore */
     XRectangle *shape;
+    XRectangle single_shape; /* common clip; charged with the admitted frame */
     unsigned int shape_count;
     RECT commit_rect;
     BOOL committing, waiting;

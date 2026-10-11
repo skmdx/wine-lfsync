@@ -928,11 +928,12 @@ BOOL client_surface_scene_snapshot_current( HWND toplevel, UINT64 scene_id )
            current.epoch == scene_id;
 }
 
-static BOOL read_client_surface_placement( struct client_surface *surface, struct client_surface_scene *scene )
+static BOOL read_client_surface_placement( struct client_surface *surface,
+                                           const struct client_surface_target *target,
+                                           struct client_surface_scene *scene )
 {
     struct object_lock producer_lock = OBJECT_LOCK_INIT;
     const window_shm_t *producer_shm = NULL;
-    struct client_surface_target target;
     process_id_t producer_process = 0;
     UINT64 producer_id = 0;
     HWND hwnd, toplevel;
@@ -945,12 +946,11 @@ static BOOL read_client_surface_placement( struct client_surface *surface, struc
                   !InterlockedCompareExchange( &surface->server_cached, 0, 0 )))
         return FALSE;
 
-    /* target writers hold completion_lock across a topology change, so its
-     * seqlock snapshot is the authoritative root for this presentation.
+    /* Target writers hold completion_lock across a topology change, so the
+     * caller's target snapshot is the authoritative root for this observation.
      * Calling NtUserGetAncestor() here would invert completion_lock and the
      * process USER lock against concurrent SetWindowPos(). */
-    client_surface_get_target( surface, &target );
-    if (!(toplevel = target.toplevel)) return FALSE;
+    if (!(toplevel = target->toplevel)) return FALSE;
     if (!read_client_surface_scene( toplevel, scene, &producer_process, &producer_id )) return FALSE;
 
     while (hwnd != toplevel &&
@@ -974,7 +974,20 @@ static BOOL read_client_surface_placement( struct client_surface *surface, struc
 
 BOOL client_surface_get_scene( struct client_surface *surface, struct client_surface_scene *scene )
 {
-    return read_client_surface_placement( surface, scene ) && scene->valid;
+    struct client_surface_target target;
+
+    client_surface_get_target( surface, &target );
+    return read_client_surface_placement( surface, &target, scene ) && scene->valid;
+}
+
+BOOL client_surface_get_scene_target_locked( struct client_surface *surface, struct client_surface_scene *scene,
+                                             struct client_surface_target *target )
+{
+    /* Target publication also holds present_lock. Its owner can observe the
+     * placement without taking the leaf snapshot mutex again. Native calls
+     * still require a fresh observation after they return. */
+    *target = surface->target_store->target;
+    return read_client_surface_placement( surface, target, scene ) && scene->valid;
 }
 
 BOOL client_surface_scene_current( const struct client_surface_scene *scene )
@@ -1110,9 +1123,10 @@ static BOOL client_surface_update_present_scene_internal_locked(
     ready = client_surface_backend_update( surface, &next, &update );
     end_client_surface_target_operation( surface );
     if (ReadAcquire( &surface->closing )) return FALSE;
-    /* Preserve only an established offscreen native lifetime. */
+    /* Staging changes publication, not an unchanged offscreen image's native
+     * lifetime. Keep pending images when the backend preserved their storage. */
     preserve_native = ready && update == CLIENT_SURFACE_TARGET_UPDATE_PRESERVED && current.valid &&
-        current.offscreen && next.offscreen && next.mode == current.mode &&
+        current.offscreen && next.offscreen &&
         next.toplevel == current.toplevel && next.dpi_num == current.dpi_num && next.dpi_den == current.dpi_den &&
         next.virtual_rect.right - next.virtual_rect.left == current.virtual_rect.right - current.virtual_rect.left &&
         next.virtual_rect.bottom - next.virtual_rect.top == current.virtual_rect.bottom - current.virtual_rect.top &&
@@ -1374,7 +1388,7 @@ static BOOL client_surface_owner_handles_exposure( struct client_surface *surfac
     /* This routes incidental exposure to the owner, not proof of a warm
      * image. The owner resolves its actual inventory and requests any cold
      * source explicitly. PREPARING blocks publication, not layout reads. */
-    if (!read_client_surface_placement( surface, &scene ) || !scene.authoritative ||
+    if (!read_client_surface_placement( surface, &target, &scene ) || !scene.authoritative ||
         scene.toplevel != toplevel || scene.mode != target.mode ||
         NtUserGetAncestor( hwnd, GA_ROOT ) != toplevel ||
         !client_surface_scene_snapshot_current( toplevel, scene.epoch )) return FALSE;
@@ -1711,8 +1725,7 @@ BOOL client_surface_update( struct client_surface *surface )
 
     client_surface_lock_target( surface );
     pthread_mutex_lock( &surface->present_lock );
-    client_surface_get_target( surface, &target );
-    scene_valid = client_surface_get_scene( surface, &scene );
+    scene_valid = client_surface_get_scene_target_locked( surface, &scene, &target );
     if (scene_valid && target.valid &&
         target.toplevel == scene.toplevel &&
         surface->target_scene_epoch == scene.epoch &&
@@ -1723,8 +1736,7 @@ BOOL client_surface_update( struct client_surface *surface )
         /* GL storage and flush paths need current geometry without selecting
          * or attaching a DIRECT target before a real native presentation. */
         ret = client_surface_update_present_scene_internal_locked( surface, NULL, FALSE );
-        client_surface_get_target( surface, &target );
-        scene_valid = client_surface_get_scene( surface, &scene );
+        scene_valid = client_surface_get_scene_target_locked( surface, &scene, &target );
         ret = ret && scene_valid && target.valid &&
               target.toplevel == scene.toplevel &&
               surface->target_scene_epoch == scene.epoch &&

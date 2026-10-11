@@ -748,7 +748,7 @@ static void prepare_client_surface_present_locked( struct client_surface *surfac
      * geometry.  Reapplying an unchanged scene on every GL/Vulkan frame made
      * resize queries and X11 target setup part of the steady-state hot path. */
     pthread_mutex_lock( &surface->present_lock );
-    client_surface_get_scene( surface, &present->scene );
+    client_surface_get_scene_target_locked( surface, &present->scene, &target );
     if (!replay && surface->hwnd && InterlockedCompareExchange( &surface->active, 0, 0 ) &&
         !present->scene.authoritative)
     {
@@ -759,9 +759,8 @@ static void prepare_client_surface_present_locked( struct client_surface *surfac
 
         if (wake && toplevel)
             NtUserPostMessage( toplevel, WM_WINE_UPDATEWINDOWSTATE, 0, 0 );
-        client_surface_get_scene( surface, &present->scene );
+        client_surface_get_scene_target_locked( surface, &present->scene, &target );
     }
-    client_surface_get_target( surface, &target );
     for (retry = 0; retry < 2 && surface->hwnd &&
          (!present->scene.valid || !target.valid ||
           target.toplevel != present->scene.toplevel ||
@@ -778,8 +777,7 @@ static void prepare_client_surface_present_locked( struct client_surface *surfac
             client_surface_update_present_scene_locked( surface, &present->scene, !replay );
         else
             client_surface_update_present_scene_locked( surface, NULL, !replay );
-        client_surface_get_scene( surface, &present->scene );
-        client_surface_get_target( surface, &target );
+        client_surface_get_scene_target_locked( surface, &present->scene, &target );
     }
     /* PREPARING can consume one geometry resample before the owner admits
      * DIRECT in the next. Admission and native attachment are separate
@@ -793,8 +791,7 @@ static void prepare_client_surface_present_locked( struct client_surface *surfac
          surface->target_scene_mode != present->scene.mode))
     {
         client_surface_update_present_scene_locked( surface, &present->scene, TRUE );
-        client_surface_get_scene( surface, &present->scene );
-        client_surface_get_target( surface, &target );
+        client_surface_get_scene_target_locked( surface, &present->scene, &target );
     }
     native_valid = target.valid;
     /* Only client_surface_update_present_locked() may mark a server scene as

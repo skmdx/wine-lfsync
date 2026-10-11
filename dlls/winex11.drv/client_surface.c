@@ -332,7 +332,7 @@ static BOOL x11drv_client_surface_update( struct client_surface *client,
     /* update_offscreen returns without redirecting or attaching an existing
      * offscreen window. Moving that window preserves its image; resizing it
      * does not. The core also requires unchanged ownership, extent and DPI. */
-    else if (current.offscreen && target->offscreen && current.mode == target->mode)
+    else if (current.offscreen && target->offscreen)
         *update = CLIENT_SURFACE_TARGET_UPDATE_PRESERVED;
     return TRUE;
 }

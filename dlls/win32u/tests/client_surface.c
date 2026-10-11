@@ -706,18 +706,20 @@ static void complete_direct_surface_generation( HWND hwnd, UINT64 surface, struc
     status = direct_plan_request( hwnd, surface, generation.scene_generation, TRUE, &accepted );
     ok( !status && accepted, "DIRECT owner completion status %#x accepted %u\n", status, accepted );
     drain_scene_notification_counts( &updates, &prepares, 0, &counts );
-    ok( !counts.publish, "DIRECT native reservation queued %u GUI copies\n", counts.publish );
+    ok( counts.backing == 1 && !counts.prepare && !counts.publish,
+        "DIRECT completion notifications backing %u prepare %u publish %u\n",
+        counts.backing, counts.prepare, counts.publish );
     status = set_surface_state( hwnd, 0, 0, 0, state );
-    ok( !status && state->generation == generation.generation && !state->pending && state->ready,
-        "DIRECT bypassed publication: status %#x generation %s pending %u ready %u\n", status,
+    ok( !status && !state->generation && !state->pending && !state->ready,
+        "DIRECT completion did not publish: status %#x generation %s pending %u ready %u\n", status,
         wine_dbgstr_longlong( state->generation ), state->pending, state->ready );
     status = direct_plan_ack( hwnd, generation.scene_generation + 2, TRUE, &accepted );
     ok( !status && !accepted, "wrong scene ACK status %#x accepted %u\n", status, accepted );
     status = direct_plan_ack( hwnd, generation.scene_generation, TRUE, &accepted );
-    ok( !status && accepted, "common DIRECT publication ACK status %#x accepted %u\n", status, accepted );
+    ok( !status && !accepted, "duplicate DIRECT publication ACK status %#x accepted %u\n", status, accepted );
     drain_scene_notification_counts( &updates, &prepares, 0, &counts );
-    ok( counts.backing == 1 && !counts.prepare && !counts.publish,
-        "DIRECT ACK notifications backing %u prepare %u publish %u\n",
+    ok( !counts.backing && !counts.prepare && !counts.publish,
+        "duplicate DIRECT ACK notifications backing %u prepare %u publish %u\n",
         counts.backing, counts.prepare, counts.publish );
     status = set_surface_state( hwnd, 0, 0, 0, state );
     ok( !status && !state->generation && !state->pending && !state->ready &&
@@ -830,7 +832,7 @@ static void test_direct_strategy_scene(void)
     status = direct_plan_request( hwnd, surface, fresh, TRUE, &accepted );
     ok( !status && accepted, "fresh DIRECT completion status %#x accepted %u\n", status, accepted );
     status = direct_plan_ack( hwnd, fresh, TRUE, &accepted );
-    ok( !status && accepted, "fresh DIRECT ACK status %#x accepted %u\n", status, accepted );
+    ok( !status && !accepted, "duplicate fresh DIRECT ACK status %#x accepted %u\n", status, accepted );
     set_surface_state( hwnd, 0, 0, 0, &state );
     ok( !state.generation && state.mode == CLIENT_SURFACE_PRESENTATION_DIRECT, "fresh DIRECT did not finish\n" );
     status = prepare_direct_plan( hwnd, surface, fresh, &rejected );
@@ -956,7 +958,7 @@ static void test_direct_renewal_scene(void)
     status = direct_plan_request( hwnd, surface, fresh, TRUE, &accepted );
     ok( !status && accepted, "renewed native completion status %#x accepted %u\n", status, accepted );
     status = direct_plan_ack( hwnd, fresh, TRUE, &accepted );
-    ok( !status && accepted, "renewed native ACK status %#x accepted %u\n", status, accepted );
+    ok( !status && !accepted, "duplicate renewed native ACK status %#x accepted %u\n", status, accepted );
     set_surface_state( hwnd, 0, 0, 0, &state );
     ok( !state.generation && state.mode == CLIENT_SURFACE_PRESENTATION_DIRECT,
         "renewed DIRECT did not finish\n" );
@@ -1020,7 +1022,7 @@ static void test_candidate_selection(void)
     status = direct_plan_request( hwnd, first, state.scene_generation, TRUE, &accepted );
     ok( !status && accepted, "completed candidate was rejected: status %#x accepted %u\n", status, accepted );
     status = direct_plan_ack( hwnd, state.scene_generation, TRUE, &accepted );
-    ok( !status && accepted, "candidate ACK status %#x accepted %u\n", status, accepted );
+    ok( !status && !accepted, "duplicate candidate ACK status %#x accepted %u\n", status, accepted );
 
     status = set_surface_state( hwnd, second, flags, 0, &state );
     ok( !status, "second registration status %#x\n", status );

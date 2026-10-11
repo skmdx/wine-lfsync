@@ -2491,30 +2491,11 @@ DECL_HANDLER(cancel_client_surface_handoffs)
     end_client_surface_scene_change( top );
 }
 
-DECL_HANDLER(publish_client_surface_handoff)
+static void publish_client_surface_generation( struct window *top, int success )
 {
-    struct window *top, *win;
-    int invalidated;
+    int invalidated = top->client_surface_transaction.epoch != top->client_surface_scene_generation;
 
-    reply->accepted = 0;
-    if (!(win = get_window( req->handle ))) return;
-    top = get_toplevel_window( win );
-    if (win != top) return;
-    if (!top->thread || top->thread->process != current->process)
-    {
-        set_error( STATUS_ACCESS_DENIED );
-        return;
-    }
-    if (!client_surface_is_publishing( top ) ||
-        (top->client_surface_transaction.publication != CLIENT_SURFACE_PUBLICATION_HANDOFF &&
-         (req->success || current != top->thread)) ||
-        req->generation != client_surface_transaction_generation( top ) ||
-        req->scene_generation != top->client_surface_transaction.epoch)
-        return;
-
-    invalidated = top->client_surface_transaction.epoch != top->client_surface_scene_generation;
-    reply->accepted = 1;
-    if (!req->success)
+    if (!success)
     {
         if (top->client_surface_transaction.staged && invalidated)
             retire_stale_client_surface_exposure( top, 0 );
@@ -2539,10 +2520,34 @@ DECL_HANDLER(publish_client_surface_handoff)
                                 WINE_PUBLISH_CLIENT_SURFACES, 0 );
         return;
     }
-    if (!invalidated) top->client_surface_ack_scene = req->scene_generation;
+    if (!invalidated) top->client_surface_ack_scene = top->client_surface_transaction.epoch;
     finish_client_surface_publication( top );
     if (invalidated && is_visible( top ) && has_client_surface( top ))
         restart_client_surface_generation( top );
+}
+
+DECL_HANDLER(publish_client_surface_handoff)
+{
+    struct window *top, *win;
+
+    reply->accepted = 0;
+    if (!(win = get_window( req->handle ))) return;
+    top = get_toplevel_window( win );
+    if (win != top) return;
+    if (!top->thread || top->thread->process != current->process)
+    {
+        set_error( STATUS_ACCESS_DENIED );
+        return;
+    }
+    if (!client_surface_is_publishing( top ) ||
+        (top->client_surface_transaction.publication != CLIENT_SURFACE_PUBLICATION_HANDOFF &&
+         (req->success || current != top->thread)) ||
+        req->generation != client_surface_transaction_generation( top ) ||
+        req->scene_generation != top->client_surface_transaction.epoch)
+        return;
+
+    reply->accepted = 1;
+    publish_client_surface_generation( top, req->success );
 }
 
 static void get_client_surface_handoff_desc( struct window *win, struct window *top,
@@ -5784,11 +5789,11 @@ DECL_HANDLER(complete_client_surface_direct_plan)
         !complete_client_surface_generation( top, surface, req->scene_id, 0 ))
         return;
 
-    /* The same reservation and ACK protect both owner copy and attachment.
-     * Only the native presentation which supplies the image proof differs. */
+    /* This request already carries the native image proof. Commit publication
+     * in the same transaction; staged exposure still waits for the GUI ACK. */
     top->client_surface_transaction.phase = CLIENT_SURFACE_PHASE_PUBLISHING;
     top->client_surface_transaction.publication = CLIENT_SURFACE_PUBLICATION_HANDOFF;
-    update_client_surface_publication( top );
+    publish_client_surface_generation( top, 1 );
     reply->accepted = 1;
 }
 
