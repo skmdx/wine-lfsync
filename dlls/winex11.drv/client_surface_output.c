@@ -582,7 +582,7 @@ unsigned int count_client_surface_compositor_frames(
     return count;
 }
 
-static void process_client_surface_present_events( struct client_surface_compositor_target *target )
+static void process_client_surface_expose( struct client_surface_compositor_target *target )
 {
     RECT rect;
 
@@ -859,7 +859,6 @@ struct client_surface_compositor_frame *get_client_surface_compositor_frame(
 {
     unsigned int i;
 
-    process_client_surface_present_events( target );
     /* A reserved scene's complete image owns its publication ticket until
      * submission. New source images remain in the independent owner cache. */
     if (target->mailbox_pending && target->mailbox_publish_generation) return NULL;
@@ -959,7 +958,6 @@ struct client_surface_compositor_frame *acquire_client_surface_compositor_assemb
 {
     unsigned int i;
 
-    process_client_surface_present_events( target );
     for (i = 0; i < ARRAY_SIZE(target->frames); ++i)
     {
         unsigned int index = (target->next_frame + i) % ARRAY_SIZE(target->frames);
@@ -1792,7 +1790,9 @@ BOOL process_client_surface_compositor_targets( struct client_surface_compositor
                     WARN( "failed to notify deferred native update for %p\n", target->toplevel );
             }
         }
-        process_client_surface_present_events( target );
+        /* Expose work belongs to this fair target traversal. Frame credit
+         * acquisition does not consume events and must not poll it again. */
+        process_client_surface_expose( target );
         progressed |= process_client_surface_native_present( target );
         progressed |= process_client_surface_compositor_restore( target );
         progressed |= replay_client_surface_scene_sources( target, &budget );
