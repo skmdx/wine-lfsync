@@ -310,13 +310,28 @@ static void publish_client_surface_target( struct client_surface *surface,
 {
     struct client_surface_target_store *store = surface->target_store;
     struct client_surface_target next = *target;
+    HWND indexed_toplevel;
     unsigned int bucket;
 
     pthread_mutex_lock( &registry_lock );
-    if (surface->indexed_toplevel)
+    indexed_toplevel = surface->indexed ? target->toplevel : NULL;
+    /* Geometry and scene revisions do not change index membership. Avoid a
+     * bucket walk for each surface when updating an entire toplevel. */
+    if (surface->indexed_toplevel != indexed_toplevel)
     {
-        bucket = client_surface_index_hash( (UINT_PTR)surface->indexed_toplevel );
-        remove_client_surface_chain( &client_surface_toplevel_index[bucket], surface, FALSE );
+        if (surface->indexed_toplevel)
+        {
+            bucket = client_surface_index_hash( (UINT_PTR)surface->indexed_toplevel );
+            remove_client_surface_chain( &client_surface_toplevel_index[bucket], surface, FALSE );
+        }
+        surface->indexed_toplevel = indexed_toplevel;
+        surface->toplevel_next = NULL;
+        if (indexed_toplevel)
+        {
+            bucket = client_surface_index_hash( (UINT_PTR)indexed_toplevel );
+            surface->toplevel_next = client_surface_toplevel_index[bucket];
+            client_surface_toplevel_index[bucket] = surface;
+        }
     }
 
     pthread_mutex_lock( &store->mutex );
@@ -325,14 +340,6 @@ static void publish_client_surface_target( struct client_surface *surface,
     store->target = next;
     pthread_mutex_unlock( &store->mutex );
 
-    surface->indexed_toplevel = surface->indexed ? target->toplevel : NULL;
-    surface->toplevel_next = NULL;
-    if (surface->indexed_toplevel)
-    {
-        bucket = client_surface_index_hash( (UINT_PTR)target->toplevel );
-        surface->toplevel_next = client_surface_toplevel_index[bucket];
-        client_surface_toplevel_index[bucket] = surface;
-    }
     pthread_mutex_unlock( &registry_lock );
     TRACE( "event=target identity=%s sequence=%s epoch=%s preserved=%u toplevel=%p "
            "position=%d,%d size=%dx%d mode=%u valid=%u surface=%p\n",
