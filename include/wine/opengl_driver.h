@@ -119,9 +119,16 @@ struct __GLsync
 #include "wine/gdi_driver.h"
 
 /* Wine internal opengl driver version, needs to be bumped upon opengl_funcs changes. */
-#define WINE_OPENGL_DRIVER_VERSION 47
+#define WINE_OPENGL_DRIVER_VERSION 48
 
 struct opengl_drawable;
+
+/* Resolved internal FBO textures, valid for this presentation call only. */
+struct opengl_framebuffer
+{
+    struct opengl_drawable *source;
+    GLuint front, back;
+};
 
 struct opengl_context
 {
@@ -233,7 +240,7 @@ struct opengl_drawable_funcs
      * With isolate, only state-independent image copies may use the current
      * application context. Call isolate before blits, readback or native swaps.
      * Without isolate the internal context is already current. */
-    BOOL (*swap_framebuffer)( struct opengl_drawable *iface, struct opengl_drawable *source, BOOL flipped,
+    BOOL (*swap_framebuffer)( struct opengl_drawable *iface, const struct opengl_framebuffer *framebuffer, BOOL flipped,
                              opengl_drawable_isolate_func isolate );
     /* Preserve the logical buffers in private storage before front writes or
      * storage replacement. The callback orders prior GL work and isolates state. */

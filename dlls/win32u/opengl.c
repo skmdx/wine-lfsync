@@ -941,7 +941,7 @@ static BOOL blit_framebuffer_surface_checked( struct opengl_drawable *drawable, 
 
 static BOOL isolate_framebuffer_write( struct opengl_drawable *target );
 
-static BOOL present_framebuffer_surface( struct opengl_drawable *drawable, BOOL client_capture )
+static BOOL present_framebuffer_surface( struct opengl_drawable *drawable, BOOL client_capture, const GLuint *colors )
 {
     struct framebuffer_surface *surface = framebuffer_from_opengl_drawable( drawable );
     struct opengl_drawable *target = surface->target;
@@ -951,9 +951,29 @@ static BOOL present_framebuffer_surface( struct opengl_drawable *drawable, BOOL 
     if (target->funcs->swap_framebuffer && drawable->read_fbo == drawable->draw_fbo &&
         use_default_gamma_ramp())
     {
+        struct opengl_framebuffer framebuffer = {.source = drawable};
+        const struct opengl_funcs *funcs = &display_funcs;
+        GLint read_fbo;
+
         if (!is_client_surface_window( target->client, 0 )) return FALSE;
         client_surface_update( target->client );
-        return target->funcs->swap_framebuffer( target, drawable, surface->flipped,
+        if (colors)
+        {
+            framebuffer.front = colors[0];
+            framebuffer.back = colors[1];
+        }
+        else
+        {
+            funcs->p_glGetIntegerv( GL_READ_FRAMEBUFFER_BINDING, &read_fbo );
+            funcs->p_glBindFramebuffer( GL_READ_FRAMEBUFFER, drawable->read_fbo );
+            funcs->p_glGetFramebufferAttachmentParameteriv( GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                    GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME, (GLint *)&framebuffer.front );
+            if (drawable->doublebuffer)
+                funcs->p_glGetFramebufferAttachmentParameteriv( GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT1,
+                        GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME, (GLint *)&framebuffer.back );
+            funcs->p_glBindFramebuffer( GL_READ_FRAMEBUFFER, read_fbo );
+        }
+        return target->funcs->swap_framebuffer( target, &framebuffer, surface->flipped,
                                                client_capture ? isolate_framebuffer_write : NULL );
     }
     if (target->funcs->swap_blit)
@@ -1048,7 +1068,7 @@ static void framebuffer_surface_flush( struct opengl_drawable *drawable, UINT fl
 
         if (flags & GL_FLUSH_PRESENT)
         {
-            present_framebuffer_surface( drawable, FALSE );
+            present_framebuffer_surface( drawable, FALSE, NULL );
         }
     }
 
@@ -1064,6 +1084,7 @@ static BOOL framebuffer_surface_swap( struct opengl_drawable *drawable )
         surface->target && surface->target->funcs->swap_framebuffer &&
         drawable->read_fbo == drawable->draw_fbo && use_default_gamma_ramp();
     GLint read_fbo = 0, draw_fbo = 0;
+    GLuint colors[2] = {0};
     BOOL ret = TRUE;
 
     TRACE( "%s\n", debugstr_opengl_drawable( drawable ) );
@@ -1119,6 +1140,8 @@ static BOOL framebuffer_surface_swap( struct opengl_drawable *drawable )
         funcs->p_glGetFramebufferAttachmentParameteriv( GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT1, GL_FRAMEBUFFER_ATTACHMENT_OBJECT_NAME, &back );
         funcs->p_glFramebufferTexture( GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, back, 0 );
         funcs->p_glFramebufferTexture( GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT1, front, 0 );
+        colors[0] = back;
+        colors[1] = front;
 
         if (drawable->stereo)
         {
@@ -1131,7 +1154,7 @@ static BOOL framebuffer_surface_swap( struct opengl_drawable *drawable )
 
     if (surface->target)
     {
-        ret = present_framebuffer_surface( drawable, client_capture );
+        ret = present_framebuffer_surface( drawable, client_capture, colors );
         if (!ret && detach_framebuffer_surface( drawable, TRUE ) != GL_NO_ERROR)
         {
             struct wgl_pixel_format desc = pixel_formats[drawable->format - 1];
