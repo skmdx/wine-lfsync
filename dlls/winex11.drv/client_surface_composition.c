@@ -834,8 +834,11 @@ static void finish_client_surface_cache_copy( struct client_surface_compositor_b
         binding->latest_image = binding->spare_image;
         if (previous.read_lease) free_client_surface_cached_image( &previous );
         binding->spare_image = previous;
-        binding->latest_frame = copy->frame;
-        binding->latest_frame.source = binding->latest_image.pixmap;
+        binding->latest_frame = (struct client_surface_cached_frame){
+            .target_epoch = copy->frame.target_epoch, .source_visual = copy->frame.source_visual,
+            .source_sequence = copy->frame.source_sequence,
+            .damage_base_sequence = copy->frame.damage_base_sequence, .damage = copy->frame.damage,
+            .width = copy->frame.width, .height = copy->frame.height, .flags = copy->frame.flags};
         binding->latest_control = copy->control;
         binding->latest_index = copy->index;
         if (target)
@@ -1152,40 +1155,10 @@ static BOOL get_client_surface_compositor_catchup(
     const struct client_surface_compositor_target *target,
     const struct client_surface_compositor_frame *frame, RECT *rect )
 {
-    UINT64 revision;
-    BOOL initialized = FALSE;
-
     if (frame->revision == target->revision) return TRUE;
-    if (!frame->revision || frame->revision > target->revision ||
-        target->revision - frame->revision > ARRAY_SIZE(target->damages))
-    {
+    if (!frame->revision || frame->revision > target->revision)
         *rect = (RECT){0, 0, target->window_width, target->window_height};
-        return TRUE;
-    }
-
-    for (revision = frame->revision + 1; revision <= target->revision; ++revision)
-    {
-        const struct client_surface_compositor_damage *damage =
-            &target->damages[revision % ARRAY_SIZE(target->damages)];
-
-        if (damage->revision != revision)
-        {
-            *rect = (RECT){0, 0, target->window_width, target->window_height};
-            return TRUE;
-        }
-        if (!initialized)
-        {
-            *rect = damage->rect;
-            initialized = TRUE;
-        }
-        else
-        {
-            rect->left = min( rect->left, damage->rect.left );
-            rect->top = min( rect->top, damage->rect.top );
-            rect->right = max( rect->right, damage->rect.right );
-            rect->bottom = max( rect->bottom, damage->rect.bottom );
-        }
-    }
+    else *rect = frame->damage;
     return TRUE;
 }
 
@@ -1198,7 +1171,7 @@ static struct client_surface_output_transform *alloc_client_surface_output_trans
     struct client_surface_compositor_frame *latest =
         get_client_surface_compositor_pixmap( target, target->latest );
     struct client_surface_output_transform *transform;
-    const struct client_surface_handoff_slot *slot = &binding->latest_frame;
+    const struct client_surface_cached_frame *slot = &binding->latest_frame;
     SIZE_T count = plan->clip->rdh.nCount;
 
     assert( !target->transform );
@@ -1288,7 +1261,7 @@ static BOOL copy_client_surface_handoff_to_frame(
     struct client_surface_compositor_target *target,
     struct client_surface_compositor_binding *binding,
     struct client_surface_compositor_frame *frame, unsigned int source_depth,
-    const struct client_surface_handoff_slot *slot,
+    const struct client_surface_cached_frame *slot,
     const struct client_surface_composition_plan *plan, const RECT *damage, BOOL batch )
 {
     const XRectangle *clips = (const XRectangle *)plan->clip->Buffer;
@@ -1718,15 +1691,12 @@ static void complete_client_surface_output_transform_batch( void *context, BOOL 
 static BOOL client_surface_cached_frame_matches_layout( const struct client_surface_compositor_binding *binding,
                                                          const struct client_surface_scene_layout *layout )
 {
-    const struct client_surface_handoff_slot *slot = &binding->latest_frame;
+    const struct client_surface_cached_frame *slot = &binding->latest_frame;
     const RECT *destination = &layout->geometry.monitor_rect;
     unsigned int width = destination->right > destination->left ? destination->right - destination->left : 0;
     unsigned int height = destination->bottom > destination->top ? destination->bottom - destination->top : 0;
 
-    return binding->latest_image.pixmap && slot->cookie == binding->cookie && slot->identity == binding->identity &&
-           slot->producer_process == binding->process && slot->window == wine_server_user_handle( binding->window ) &&
-           slot->toplevel == wine_server_user_handle( binding->toplevel ) &&
-           (slot->flags & CLIENT_SURFACE_HANDOFF_NATIVE_X11) && width && height &&
+    return binding->latest_image.pixmap && width && height &&
            slot->width && slot->height && slot->source_visual &&
            ((slot->width == width && slot->height == height) ||
             (slot->width == layout->geometry.virtual_rect.right - layout->geometry.virtual_rect.left &&
@@ -1844,7 +1814,7 @@ pending:
 
 static BOOL compose_client_surface_cached_frame( struct client_surface_compositor_binding *binding )
 {
-    const struct client_surface_handoff_slot *slot;
+    const struct client_surface_cached_frame *slot;
     struct client_surface_composition_plan plan;
     struct client_surface_scene current;
     const struct client_surface_scene_layout *layout;
@@ -2069,11 +2039,11 @@ release:
 static BOOL client_surface_handoff_matches_cache( const struct client_surface_compositor_binding *binding,
                                                  const struct client_surface_handoff_slot *slot )
 {
-    const struct client_surface_handoff_slot *cached = &binding->latest_frame;
+    const struct client_surface_cached_frame *cached = &binding->latest_frame;
 
-    return slot->cookie == cached->cookie && slot->identity == cached->identity &&
-           slot->producer_process == cached->producer_process && slot->window == cached->window &&
-           slot->toplevel == cached->toplevel && slot->target_epoch == cached->target_epoch &&
+    return slot->cookie == binding->cookie && slot->identity == binding->identity &&
+           slot->producer_process == binding->process && slot->window == wine_server_user_handle( binding->window ) &&
+           slot->toplevel == wine_server_user_handle( binding->toplevel ) && slot->target_epoch == cached->target_epoch &&
            slot->source && slot->source_visual == cached->source_visual &&
            slot->width == cached->width && slot->height == cached->height &&
            (slot->flags & (CLIENT_SURFACE_HANDOFF_NATIVE_X11 | CLIENT_SURFACE_HANDOFF_COPY_SOURCE)) ==

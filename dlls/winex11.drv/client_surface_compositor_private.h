@@ -21,7 +21,6 @@
 #define CLIENT_SURFACE_COPY_BATCH_SIZE CLIENT_SURFACE_CACHE_TRANSFORM_LIMIT
 #define CLIENT_SURFACE_COMPOSITOR_FRAME_COUNT 3
 #define CLIENT_SURFACE_COMPOSITOR_MAX_INFLIGHT 2
-#define CLIENT_SURFACE_COMPOSITOR_DAMAGE_HISTORY 64
 
 extern pthread_mutex_t client_surface_compositor_mutex;
 extern void wake_client_surface_compositor(void);
@@ -90,6 +89,19 @@ struct client_surface_cache_copy
     BOOL retained;
 };
 
+/* Accepted images belong to one immutable binding. Keep only image metadata,
+ * not another copy of the ring's producer identity and source-slot ownership. */
+struct client_surface_cached_frame
+{
+    UINT64 target_epoch;
+    VisualID source_visual;
+    UINT64 source_sequence;
+    UINT64 damage_base_sequence;
+    RECT damage;
+    unsigned int width, height;
+    unsigned int flags;
+};
+
 struct client_surface_compositor_binding
 {
     struct rb_entry registry_entry;
@@ -114,7 +126,7 @@ struct client_surface_compositor_binding
     UINT64 source_epoch;
     struct client_surface_cached_image latest_image, spare_image;
     struct client_surface_cached_image retained_images[CLIENT_SURFACE_COMPOSITOR_FRAME_COUNT];
-    struct client_surface_handoff_slot latest_frame;
+    struct client_surface_cached_frame latest_frame;
     UINT64 latest_control;
     UINT64 replay_epoch;
     UINT64 replay_generation;
@@ -136,12 +148,6 @@ struct client_surface_scene_plan
     BOOL valid;
 };
 
-struct client_surface_compositor_damage
-{
-    UINT64 revision;
-    RECT rect;
-};
-
 struct client_surface_compositor_frame
 {
     struct client_surface_compositor_job *waiter;
@@ -150,15 +156,12 @@ struct client_surface_compositor_frame
     struct client_surface_cache_image *retained_image; /* immutable full-frame owner cache, if no assembly is needed */
     struct rb_entry pixmap_entry;
     UINT64 revision;
+    RECT damage; /* changes since this frame's checked revision */
     uint32_t serial;
-    uint32_t last_complete_serial;
     unsigned int width;
     unsigned int height;
     UINT64 publish_generation;
     UINT64 publish_epoch;
-    BOOL complete;
-    BOOL idle;
-    BOOL last_complete_success;
     BOOL publish_pending;
     BOOL request_pending;
     struct client_surface_native_present native_present;
@@ -190,7 +193,6 @@ struct client_surface_compositor_target
     Pixmap latest;
     Pixmap published;
     UINT64 revision;
-    struct client_surface_compositor_damage damages[CLIENT_SURFACE_COMPOSITOR_DAMAGE_HISTORY];
     unsigned int published_width;
     unsigned int published_height;
     RECT restore_rect;

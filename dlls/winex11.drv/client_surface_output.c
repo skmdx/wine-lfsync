@@ -165,22 +165,30 @@ void note_client_surface_compositor_damage(
     struct client_surface_compositor_target *target,
     struct client_surface_compositor_frame *frame, const RECT *rect )
 {
-    struct client_surface_compositor_damage *damage;
+    UINT64 previous = target->revision;
+    unsigned int i;
+    RECT damage;
     RECT bounds = {0, 0, target->window_width, target->window_height};
 
     if (!(++target->revision))
     {
-        unsigned int i;
-
         target->revision = 1;
-        memset( target->damages, 0, sizeof(target->damages) );
         for (i = 0; i < ARRAY_SIZE(target->frames); ++i) target->frames[i].revision = 0;
     }
-    damage = &target->damages[target->revision % ARRAY_SIZE(target->damages)];
-    damage->revision = target->revision;
     /* A child can extend beyond its owner. Only pixels inside the output
      * need catching up when this frame is reused as a later checkpoint. */
-    intersect_rect( &damage->rect, rect, &bounds );
+    intersect_rect( &damage, rect, &bounds );
+    for (i = 0; i < ARRAY_SIZE(target->frames); ++i)
+    {
+        struct client_surface_compositor_frame *other = &target->frames[i];
+
+        if (other == frame || !other->revision) continue;
+        /* A completed full copy may advance the revision without publishing
+         * new damage. Start its next interval at that checked checkpoint. */
+        if (other->revision == previous || IsRectEmpty( &other->damage )) other->damage = damage;
+        else add_bounds_rect( &other->damage, &damage );
+    }
+    SetRectEmpty( &frame->damage );
     frame->revision = target->revision;
     target->latest = frame->pixmap;
 }
@@ -520,11 +528,10 @@ static void finish_client_surface_compositor_frame(
     struct client_surface_compositor_target *target,
     struct client_surface_compositor_frame *frame )
 {
-    if (!frame->serial || frame->request_pending || !frame->complete || !frame->idle) return;
+    assert( frame->serial && !frame->request_pending );
     TRACE( "%s serial %u pixmap %#lx completed and became idle\n",
            frame->native_present.copy ? "staged copy" : "X Present", frame->serial, frame->pixmap );
     frame->serial = 0;
-    frame->complete = frame->idle = FALSE;
     /* Give completed sources a chance to replace a steady mailbox before it is
      * submitted. A reserved topology publication keeps its original order. */
     if (target->mailbox_publish_generation) flush_client_surface_compositor_mailbox( target );
@@ -534,9 +541,9 @@ static void complete_client_surface_compositor_frame(
     struct client_surface_compositor_target *target,
     struct client_surface_compositor_frame *frame )
 {
-    BOOL success = frame->last_complete_success;
+    BOOL success = frame->native_present.success;
 
-    if (frame->request_pending || !frame->complete) return;
+    assert( frame->serial && !frame->request_pending );
     client_surface_release_native_present( &frame->native_present );
     if (frame->waiter)
     {
@@ -602,12 +609,6 @@ BOOL process_client_surface_native_present( struct client_surface_compositor_tar
 
         if (!frame->request_pending || !ReadAcquire( &present->complete )) continue;
         frame->request_pending = FALSE;
-        if (present->copied || !present->success)
-        {
-            frame->last_complete_success = present->success;
-            frame->last_complete_serial = frame->serial;
-            frame->complete = frame->idle = TRUE;
-        }
         TRACE_(csperf)( "ticks=%llu event=native_present_receipt window=%lx pixmap=%lx serial=%u copy=%u success=%u\n",
                        client_surface_perf_time(), present->window, present->pixmap, frame->serial,
                        present->copied, present->success );
@@ -619,8 +620,14 @@ BOOL process_client_surface_native_present( struct client_surface_compositor_tar
         if (!present->success && !IsRectEmpty( &present->copy_rect ))
             NtUserPostMessage( target->toplevel, WM_WINE_UPDATEWINDOWSTATE,
                                WINE_UPDATE_CLIENT_SURFACE_HANDOFFS, 0 );
-        complete_client_surface_compositor_frame( target, frame );
-        finish_client_surface_compositor_frame( target, frame );
+        /* The acquired native receipt owns the completion result. The actor
+         * consumes it and returns serial ownership in this same traversal;
+         * there is no independently pending idle or completion state. */
+        if (present->copied || !present->success)
+        {
+            complete_client_surface_compositor_frame( target, frame );
+            finish_client_surface_compositor_frame( target, frame );
+        }
         progressed = TRUE;
     }
     /* Mailbox or scene work can replace a checkpoint without completing a
@@ -677,9 +684,6 @@ BOOL submit_client_surface_present( struct client_surface_compositor_target *tar
     }
     if (!(serial = ++client_surface_present_serial)) serial = ++client_surface_present_serial;
     frame->serial = serial;
-    frame->last_complete_serial = 0;
-    frame->last_complete_success = FALSE;
-    frame->complete = frame->idle = FALSE;
     frame->publish_generation = publish_generation;
     frame->publish_epoch = publish_epoch;
     frame->publish_pending = !!publish_generation;
@@ -1642,9 +1646,7 @@ static BOOL client_surface_compositor_restore_ready( const struct client_surface
         !target->published || target->published_width < target->window_width ||
         target->published_height < target->window_height) return FALSE;
     for (i = 0; i < ARRAY_SIZE(target->frames); ++i)
-        if (target->frames[i].serial &&
-            (target->frames[i].request_pending || !target->frames[i].complete ||
-             (target->frames[i].pixmap == target->published && !target->frames[i].idle))) return FALSE;
+        if (target->frames[i].serial) return FALSE;
     return TRUE;
 }
 
