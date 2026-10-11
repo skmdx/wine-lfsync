@@ -113,6 +113,8 @@ struct client_surface_compositor_target
     UINT64 mailbox_publish_epoch;
     UINT64 assembly_generation;
     UINT64 assembly_epoch;
+    UINT64 published_generation;
+    UINT64 published_epoch;
     UINT64 scene_epoch;
     BOOL mailbox_pending;
     BOOL assembly_pending;
@@ -1452,6 +1454,7 @@ static BOOL complete_client_surface_handoff_generation( HWND toplevel, UINT64 ge
 static BOOL publish_client_surface_handoff_generation( HWND toplevel, UINT64 generation,
                                                        UINT64 scene_generation, BOOL success )
 {
+    struct client_surface_compositor_target *target;
     BOOL accepted = FALSE;
     NTSTATUS status;
 
@@ -1468,6 +1471,15 @@ static BOOL publish_client_surface_handoff_generation( HWND toplevel, UINT64 gen
     TRACE( "published owner generation %s epoch %s status %#lx accepted %u success %u\n",
            wine_dbgstr_longlong( generation ), wine_dbgstr_longlong( scene_generation ),
            (unsigned long)status, accepted, success );
+    if (!status && accepted && success &&
+        (target = find_client_surface_compositor_target( toplevel )))
+    {
+        /* Publication outlives its native frame. A producer may have sampled
+         * this transaction before the ACK and deliver after its frame retired.
+         * Such an image is a steady update, not a new all-producer assembly. */
+        target->published_generation = generation;
+        target->published_epoch = scene_generation;
+    }
     return !status && accepted && success;
 }
 
@@ -1572,6 +1584,7 @@ static BOOL compose_client_surface_handoff(
     unsigned int destination_width, destination_height, i, source_depth = 0;
     BOOL xfixes_clip, pixmap_clip;
     BOOL composed = FALSE, copied = FALSE, dropped = FALSE;
+    BOOL assembling = FALSE;
 
     /* A producer can observe the new even scene before the GUI thread's
      * topology job reaches this connection. Keep that frame READY until its
@@ -1670,11 +1683,14 @@ static BOOL compose_client_surface_handoff(
         if (slot->scene_generation)
             previous_publish = find_client_surface_pending_publication(
                 target, slot->scene_generation, slot->scene_epoch );
-        if (slot->scene_generation && !previous_publish && target->assembly_pending &&
+        assembling = slot->scene_generation && !previous_publish &&
+                     (target->published_generation != slot->scene_generation ||
+                      target->published_epoch != slot->scene_epoch);
+        if (assembling && target->assembly_pending &&
             (target->assembly_generation != slot->scene_generation ||
              target->assembly_epoch != slot->scene_epoch))
             finish_client_surface_compositor_assembly( target, TRUE );
-        if (!slot->scene_generation || previous_publish)
+        if (!assembling)
             frame = get_client_surface_compositor_frame( target );
         else if (target->assembly_pending &&
                  target->assembly_generation == slot->scene_generation &&
@@ -1687,7 +1703,7 @@ static BOOL compose_client_surface_handoff(
                           binding, slot, &source, &source_depth ))
             goto release;
 
-        if (slot->scene_generation && !previous_publish && !target->assembly_pending)
+        if (assembling && !target->assembly_pending)
         {
             target->assembly_pending = TRUE;
             target->assembly_generation = slot->scene_generation;
@@ -1706,7 +1722,7 @@ static BOOL compose_client_surface_handoff(
             frame->width = target->window_width;
             frame->height = target->window_height;
         }
-        if (copied && slot->scene_generation && !previous_publish)
+        if (copied && assembling)
         {
             assert( !binding->held_control );
             binding->held_control = control;
@@ -1752,7 +1768,7 @@ static BOOL compose_client_surface_handoff(
         }
     }
 release:
-    if (!copied && slot->scene_generation && !previous_publish && target &&
+    if (!copied && assembling && target &&
         target->assembly_pending && target->assembly_generation == slot->scene_generation &&
         target->assembly_epoch == slot->scene_epoch)
         finish_client_surface_compositor_assembly( target, TRUE );
