@@ -1724,17 +1724,17 @@ void recompose_client_surface( HWND hwnd, UINT64 identity )
     client_surface_release( selected );
 }
 
-BOOL client_surface_update( struct client_surface *surface )
+static BOOL update_client_surface_target( struct client_surface *surface,
+                                           struct client_surface_target *target, BOOL *updated )
 {
-    struct client_surface_target target;
     struct client_surface_scene scene;
     BOOL scene_valid, ret = FALSE;
 
     client_surface_lock_target( surface );
     pthread_mutex_lock( &surface->present_lock );
-    scene_valid = client_surface_get_scene_target_locked( surface, &scene, &target );
-    if (scene_valid && target.valid &&
-        target.toplevel == scene.toplevel &&
+    scene_valid = client_surface_get_scene_target_locked( surface, &scene, target );
+    if (scene_valid && target->valid &&
+        target->toplevel == scene.toplevel &&
         surface->target_scene_epoch == scene.epoch &&
         surface->target_scene_mode == scene.mode)
         ret = TRUE;
@@ -1743,29 +1743,42 @@ BOOL client_surface_update( struct client_surface *surface )
         /* GL storage and flush paths need current geometry without selecting
          * or attaching a DIRECT target before a real native presentation. */
         ret = client_surface_update_present_scene_internal_locked( surface, NULL, FALSE );
-        scene_valid = client_surface_get_scene_target_locked( surface, &scene, &target );
-        ret = ret && scene_valid && target.valid &&
-              target.toplevel == scene.toplevel &&
+        scene_valid = client_surface_get_scene_target_locked( surface, &scene, target );
+        ret = ret && scene_valid && target->valid &&
+              target->toplevel == scene.toplevel &&
               surface->target_scene_epoch == scene.epoch &&
               surface->target_scene_mode == scene.mode;
     }
+    if (updated) *updated = InterlockedExchange( &surface->updated, FALSE );
     pthread_mutex_unlock( &surface->present_lock );
     client_surface_unlock_target( surface );
     return ret;
 }
 
-BOOL client_surface_get_size( struct client_surface *surface, SIZE *virtual_size, SIZE *monitor_size )
+BOOL client_surface_update( struct client_surface *surface )
 {
-    struct client_surface_geometry geometry;
+    struct client_surface_target target;
+
+    return update_client_surface_target( surface, &target, NULL );
+}
+
+BOOL client_surface_get_size( struct client_surface *surface, BOOL update,
+                              SIZE *virtual_size, SIZE *monitor_size )
+{
+    struct client_surface_target target;
     BOOL updated;
 
-    updated = InterlockedExchange( &surface->updated, FALSE );
-    client_surface_get_geometry( surface, &geometry );
+    if (update) update_client_surface_target( surface, &target, &updated );
+    else
+    {
+        updated = InterlockedExchange( &surface->updated, FALSE );
+        client_surface_get_target( surface, &target );
+    }
 
-    virtual_size->cx = max( 1, geometry.virtual_rect.right - geometry.virtual_rect.left );
-    virtual_size->cy = max( 1, geometry.virtual_rect.bottom - geometry.virtual_rect.top );
-    monitor_size->cx = max( 1, geometry.monitor_rect.right - geometry.monitor_rect.left );
-    monitor_size->cy = max( 1, geometry.monitor_rect.bottom - geometry.monitor_rect.top );
+    virtual_size->cx = max( 1, target.virtual_rect.right - target.virtual_rect.left );
+    virtual_size->cy = max( 1, target.virtual_rect.bottom - target.virtual_rect.top );
+    monitor_size->cx = max( 1, target.monitor_rect.right - target.monitor_rect.left );
+    monitor_size->cy = max( 1, target.monitor_rect.bottom - target.monitor_rect.top );
 
     return updated;
 }

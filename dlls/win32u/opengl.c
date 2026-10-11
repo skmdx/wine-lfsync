@@ -135,7 +135,7 @@ void *opengl_drawable_create( UINT size, const struct opengl_drawable_funcs *fun
 
     if ((drawable->client = client))
     {
-        client_surface_get_size( client, &drawable->virtual_size, &drawable->monitor_size );
+        client_surface_get_size( client, FALSE, &drawable->virtual_size, &drawable->monitor_size );
         client_surface_add_ref( client );
     }
 
@@ -202,8 +202,7 @@ static void opengl_drawable_flush( struct opengl_drawable *drawable, int interva
     /* Both native drawables and explicit storage must observe foreign-owner
      * geometry before the next GL command. Resizing only at SwapBuffers loses
      * the part of a one-frame repaint outside the old drawable extent. */
-    client_surface_update( drawable->client );
-    if (client_surface_get_size( drawable->client, &drawable->virtual_size, &drawable->monitor_size ))
+    if (client_surface_get_size( drawable->client, TRUE, &drawable->virtual_size, &drawable->monitor_size ))
         flags |= GL_FLUSH_UPDATED;
     if (framebuffer_surface_needs_resize( drawable )) flags |= GL_FLUSH_UPDATED;
 
