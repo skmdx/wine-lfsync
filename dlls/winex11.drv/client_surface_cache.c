@@ -65,7 +65,7 @@ struct client_surface_cache_image
     Pixmap seed;
     UINT64 seed_bytes;
     Window window;
-    GC gc, transfer_gc, window_gc;
+    GC transfer_gc, window_gc;
     unsigned int width, height, depth;
     unsigned int copy_width, copy_height;
     unsigned int xcb_gc;
@@ -416,8 +416,7 @@ static void copy_cache_image( struct client_surface_cache_image *image )
     }
     else
     {
-        if (!image->gc) image->gc = XCreateGC( display, image->pixmap, GCGraphicsExposures, &values );
-        gc = image->gc;
+        gc = XCreateGC( display, image->pixmap, GCGraphicsExposures, &values );
         if (gc)
         {
             XSetClipMask( display, gc, None );
@@ -429,8 +428,12 @@ static void copy_cache_image( struct client_surface_cache_image *image )
     if (read) x11drv_native_window_read_end( read );
     else
     {
+        image->success = !!gc;
+        /* Retire the connection-local GC in the copy's checked stream, so
+         * completion also permits another worker to reuse the image. */
+        if (gc) XFreeGC( display, gc );
         XSync( display, False );
-        image->success = gc && !worker->error;
+        image->success = image->success && !worker->error;
     }
 receipt:
     if (read)
@@ -458,34 +461,35 @@ static void transform_cache_image( struct client_surface_cache_image *image )
     BOOL copied = TRUE, rendered = FALSE;
     unsigned int index = 0;
     int error;
+    GC gc;
 
     worker->error = 0;
-    if (!image->gc) image->gc = XCreateGC( display, image->pixmap, GCGraphicsExposures, &values );
-    for (; image->gc && copied && index < image->transform_count; ++index, transform = transform->next)
+    gc = XCreateGC( display, image->pixmap, GCGraphicsExposures, &values );
+    for (; gc && copied && index < image->transform_count; ++index, transform = transform->next)
     {
         assert( transform && (!index || !transform->catchup) );
         rendered = FALSE;
-        XSetClipMask( display, image->gc, None );
-        XSetClipOrigin( display, image->gc, 0, 0 );
+        XSetClipMask( display, gc, None );
+        XSetClipOrigin( display, gc, 0, 0 );
         if (transform->catchup)
         {
             const RECT *rect = &transform->catchup_rect;
 
-            XCopyArea( display, transform->catchup, image->pixmap, image->gc,
+            XCopyArea( display, transform->catchup, image->pixmap, gc,
                        rect->left, rect->top, rect->right - rect->left, rect->bottom - rect->top,
                        rect->left, rect->top );
         }
         if (transform->clip_count)
         {
             if (transform->clipped)
-                XSetClipRectangles( display, image->gc, transform->destination.left,
+                XSetClipRectangles( display, gc, transform->destination.left,
                                     transform->destination.top, (XRectangle *)transform->clips,
                                     transform->clip_count, YXBanded );
             if (transform->native)
             {
                 const RECT *rect = &transform->source_damage;
 
-                XCopyArea( display, transform->source, image->pixmap, image->gc,
+                XCopyArea( display, transform->source, image->pixmap, gc,
                            rect->left, rect->top, rect->right - rect->left, rect->bottom - rect->top,
                            transform->destination.left + rect->left, transform->destination.top + rect->top );
             }
@@ -498,7 +502,7 @@ static void transform_cache_image( struct client_surface_cache_image *image )
                     transform->clipped ? transform->clip_count : 0, 0, 0 );
                 if (!rendered)
                     copied = client_surface_copy_image( display, &image->memory, transform->source,
-                        image->pixmap, image->gc, transform->source_visual, transform->destination_visual,
+                        image->pixmap, gc, transform->source_visual, transform->destination_visual,
                         transform->source_width, transform->source_height, &transform->destination );
             }
         }
@@ -508,17 +512,13 @@ static void transform_cache_image( struct client_surface_cache_image *image )
                            image, transform, index, image->transform_count, transform->source, image->pixmap,
                            transform->catchup, transform->native, rendered, copied );
     }
+    image->success = gc && copied;
+    /* Even a failed allocation may have returned an Xlib handle. Its
+     * retirement and all transforms share this one checked completion. */
+    if (gc) XFreeGC( display, gc );
     XSync( display, False );
     error = worker->error;
-    image->success = image->gc && copied && !error;
-    /* A failed GC allocation can still return an Xlib handle. Retire it on
-     * its private connection before returning this image to actor reuse. */
-    if (!image->success && image->gc)
-    {
-        XFreeGC( display, image->gc );
-        image->gc = NULL;
-        XSync( display, False );
-    }
+    image->success = image->success && !error;
     TRACE_(csperf)( "ticks=%llu event=output_transform_native image=%p source=%lx destination=%lx "
                    "catchup=%lx display=%p rendered=%u error=%d success=%u count=%u executed=%u\n", client_surface_perf_time(),
                    image, image->transform->source, image->pixmap, image->transform->catchup, display,
@@ -550,10 +550,10 @@ static void destroy_cache_image( struct client_surface_cache_image *image )
     struct cache_worker *worker = image->worker;
     Display *display = worker->display;
 
-    assert( worker == image->owner && !image->gc && !image->window_gc );
+    assert( worker == image->owner && !image->window_gc );
     /* Every native object was created on this worker's process-lifetime
      * connection. An open failure can leave only an empty image record. */
-    assert( display || (!image->gc && !image->transfer_gc && !image->window_gc && !image->pixmap) );
+    assert( display || (!image->transfer_gc && !image->window_gc && !image->pixmap) );
     worker->error = 0;
     if (image->transfer_gc) XFreeGC( display, image->transfer_gc );
     if (image->pixmap) XFreePixmap( display, image->pixmap );
@@ -607,16 +607,15 @@ static void execute_cache_image( struct client_surface_native_work *work )
     /* Waiting for content admission alone has not attached any resource to
      * this executor. A later retry must remain movable until a native copy
      * actually owns its GC/seed and receipt on this connection. */
-    if (image->waiting && !image->gc && !image->window_gc && !image->seed) image->started = FALSE;
+    if (image->waiting && !image->window_gc && !image->seed) image->started = FALSE;
     /* Xlib GC handles belong to the executing connection. Their retirement
      * precedes completion, so the next write can use another worker without
      * touching this connection or retaining an unaccounted native object. */
-    if (!image->waiting && (image->gc || image->window_gc))
+    if (!image->waiting && image->window_gc)
     {
-        if (image->gc) XFreeGC( image->worker->display, image->gc );
-        if (image->window_gc) XFreeGC( image->worker->display, image->window_gc );
+        XFreeGC( image->worker->display, image->window_gc );
         XSync( image->worker->display, False );
-        image->gc = image->window_gc = NULL;
+        image->window_gc = NULL;
         image->window_gc_ready = FALSE;
     }
 }
@@ -987,7 +986,7 @@ static void queue_cache_image( struct client_surface_cache_image *image, enum ca
     struct cache_worker *worker;
 
     assert( image->operation == CACHE_IDLE );
-    assert( !image->gc && !image->window_gc );
+    assert( !image->window_gc );
     image->started = FALSE;
     worker = image->worker = operation == CACHE_COPY || operation == CACHE_TRANSFORM ?
         select_existing_cache_worker() : image->owner;
