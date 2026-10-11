@@ -1724,34 +1724,50 @@ void recompose_client_surface( HWND hwnd, UINT64 identity )
     client_surface_release( selected );
 }
 
+static BOOL client_surface_target_current_locked( struct client_surface *surface,
+                                                   struct client_surface_target *target )
+{
+    struct client_surface_scene scene;
+
+    return client_surface_get_scene_target_locked( surface, &scene, target ) && target->valid &&
+           target->toplevel == scene.toplevel && surface->target_scene_epoch == scene.epoch &&
+           surface->target_scene_mode == scene.mode;
+}
+
 static BOOL update_client_surface_target( struct client_surface *surface,
                                            struct client_surface_target *target, BOOL *updated )
 {
-    struct client_surface_scene scene;
-    BOOL scene_valid, ret = FALSE;
+    BOOL target_writer = FALSE, ret;
 
+    client_surface_lock_present( surface );
+    /* An unchanged target only needs a snapshot. Do not advertise a writer
+     * or wake its waiters for each GL command. Existing writers and native
+     * operations still take precedence through the normal admission path. */
+    if (!surface->native_present_count && !surface->driver_completion_count &&
+        !ReadAcquire( &surface->target_update_waiters ))
+    {
+        pthread_mutex_lock( &surface->present_lock );
+        if ((ret = client_surface_target_current_locked( surface, target ))) goto done;
+        pthread_mutex_unlock( &surface->present_lock );
+    }
+    client_surface_unlock_present( surface );
+
+    target_writer = TRUE;
     client_surface_lock_target( surface );
     pthread_mutex_lock( &surface->present_lock );
-    scene_valid = client_surface_get_scene_target_locked( surface, &scene, target );
-    if (scene_valid && target->valid &&
-        target->toplevel == scene.toplevel &&
-        surface->target_scene_epoch == scene.epoch &&
-        surface->target_scene_mode == scene.mode)
-        ret = TRUE;
-    else if (surface->hwnd)
+    ret = client_surface_target_current_locked( surface, target );
+    if (!ret && surface->hwnd)
     {
         /* GL storage and flush paths need current geometry without selecting
          * or attaching a DIRECT target before a real native presentation. */
         ret = client_surface_update_present_scene_internal_locked( surface, NULL, FALSE );
-        scene_valid = client_surface_get_scene_target_locked( surface, &scene, target );
-        ret = ret && scene_valid && target->valid &&
-              target->toplevel == scene.toplevel &&
-              surface->target_scene_epoch == scene.epoch &&
-              surface->target_scene_mode == scene.mode;
+        ret = client_surface_target_current_locked( surface, target ) && ret;
     }
+done:
     if (updated) *updated = InterlockedExchange( &surface->updated, FALSE );
     pthread_mutex_unlock( &surface->present_lock );
-    client_surface_unlock_target( surface );
+    if (target_writer) client_surface_unlock_target( surface );
+    else client_surface_unlock_present( surface );
     return ret;
 }
 
