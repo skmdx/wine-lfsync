@@ -1612,6 +1612,12 @@ static BOOL compose_client_surface_handoff(
         dropped = TRUE;
         goto release;
     }
+    if (slot->scene_generation)
+        previous_publish = find_client_surface_pending_publication(
+            target, slot->scene_generation, slot->scene_epoch );
+    assembling = slot->scene_generation && !previous_publish &&
+                 (target->published_generation != slot->scene_generation ||
+                  target->published_epoch != slot->scene_epoch);
     destination_width = slot->destination.right > slot->destination.left ?
                         slot->destination.right - slot->destination.left : 0;
     destination_height = slot->destination.bottom > slot->destination.top ?
@@ -1680,12 +1686,6 @@ static BOOL compose_client_surface_handoff(
              * before it can become the next owner snapshot. */
             if (!slot->clip_count) damage = slot->destination;
         }
-        if (slot->scene_generation)
-            previous_publish = find_client_surface_pending_publication(
-                target, slot->scene_generation, slot->scene_epoch );
-        assembling = slot->scene_generation && !previous_publish &&
-                     (target->published_generation != slot->scene_generation ||
-                      target->published_epoch != slot->scene_epoch);
         if (assembling && target->assembly_pending &&
             (target->assembly_generation != slot->scene_generation ||
              target->assembly_epoch != slot->scene_epoch))
