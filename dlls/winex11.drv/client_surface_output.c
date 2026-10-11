@@ -698,8 +698,8 @@ BOOL submit_client_surface_present( struct client_surface_compositor_target *tar
      * the checked publication. The embedded
      * request is already covered by target admission; submit cannot allocate. */
     if (copy_rect) frame->native_present.copy_rect = *copy_rect;
-    TRACE_(csperf)( "ticks=%llu event=native_commit_admit window=%lx pixmap=%lx serial=%u copy=1 commit=%u generation=%llu epoch=%llu scene=%llu\n",
-                   client_surface_perf_time(), frame->native_present.content, frame->native_present.pixmap, serial,
+    TRACE_(csperf)( "ticks=%llu event=native_commit_admit window=%lx pixmap=%lx frame=%lx serial=%u copy=1 commit=%u generation=%llu epoch=%llu scene=%llu\n",
+                   client_surface_perf_time(), frame->native_present.content, frame->native_present.pixmap, frame->pixmap, serial,
                    frame->native_present.committing,
                    (unsigned long long)publish_generation, (unsigned long long)publish_epoch,
                    (unsigned long long)(target->scene.valid ? target->scene.epoch : 0) );
