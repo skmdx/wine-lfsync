@@ -836,10 +836,14 @@ static void test_direct_strategy_scene(void)
     status = prepare_direct_plan( hwnd, surface, fresh, &rejected );
     ok( !status && !rejected, "steady DIRECT started another scene: status %#x\n", status );
 
-    /* Change actual server placement without pumping the GUI preparation
-     * message. Consuming one ACK cannot prepare this later geometry. */
+    /* Replacing native resources revokes the attachment even if its last
+     * image was acknowledged. Do not pump the GUI preparation message. */
     status = set_scene_placement( hwnd, 3, 0, 0, 0 );
     ok( !status, "post-strategy geometry mutation status %#x\n", status );
+    status = set_native_barrier( hwnd, 0x7640, TRUE, &barrier );
+    ok( !status, "post-strategy barrier begin status %#x\n", status );
+    status = set_native_barrier( hwnd, 0x7640, FALSE, &barrier );
+    ok( !status, "post-strategy barrier end status %#x\n", status );
     status = set_surface_state( hwnd, 0, CLIENT_SURFACE_STATE_PREPARE_BEGIN, 0, &preparing );
     ok( !status && preparing.publish, "real mutation skipped PREPARING: status %#x publish %u\n",
         status, preparing.publish );
@@ -894,10 +898,27 @@ static void test_direct_renewal_scene(void)
     status = prepare_direct_scene( hwnd, surface, previous, previous, &fresh );
     ok( !status && !fresh, "steady DIRECT renewal status %#x scene %s\n", status, wine_dbgstr_longlong( fresh ) );
 
-    /* Exercise the real server transition without pumping its native owner
-     * preparation. Backend tests separately prove the new attachment check. */
-    status = set_scene_placement( hwnd, 3, 0, 0, 0 );
+    /* Ordinary move/resize keeps the attachment, but does not ACK a new-size
+     * image. Native resource replacement below must still require proof. */
+    status = set_scene_placement( hwnd, 3, 8, 0, 0 );
     ok( !status, "renewal placement status %#x\n", status );
+    status = set_surface_state( hwnd, 0, CLIENT_SURFACE_STATE_PREPARE_BEGIN, 0, &state );
+    ok( !status && !state.publish && !state.generation && state.scene_generation != previous &&
+        state.mode == CLIENT_SURFACE_PRESENTATION_DIRECT, "geometry revoked the retained attachment\n" );
+    preparing = state.scene_generation;
+    status = set_surface_state( hwnd, 0, CLIENT_SURFACE_STATE_GEOMETRY_READY, 0, &state );
+    ok( !status && !state.generation && state.scene_generation == preparing &&
+        state.mode == CLIENT_SURFACE_PRESENTATION_DIRECT, "geometry-ready restarted retained DIRECT\n" );
+    status = set_surface_state( hwnd, 0, CLIENT_SURFACE_STATE_PREPARE_BEGIN, 0, &state );
+    ok( !status && !state.publish, "geometry-ready requested a composition checkpoint\n" );
+    status = direct_plan_ack( hwnd, state.scene_generation, TRUE, &accepted );
+    ok( !status && !accepted, "geometry continuity accepted an unsubmitted image ACK\n" );
+    status = set_native_barrier( hwnd, 0x7641, TRUE, &barrier );
+    ok( !status, "geometry continuity barrier begin status %#x\n", status );
+    status = set_surface_state( hwnd, 0, 0, 0, &state );
+    ok( !status && state.mode != CLIENT_SURFACE_PRESENTATION_DIRECT, "native barrier retained DIRECT\n" );
+    status = set_native_barrier( hwnd, 0x7641, FALSE, &barrier );
+    ok( !status, "geometry continuity barrier end status %#x\n", status );
     status = set_surface_state( hwnd, 0, CLIENT_SURFACE_STATE_PREPARE_BEGIN, 0, &state );
     ok( !status && state.publish && !state.generation, "renewal did not require native preparation\n" );
     preparing = state.scene_generation;

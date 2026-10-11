@@ -292,6 +292,7 @@ struct window
     unsigned int    paint_failed : 1;
     unsigned long long client_surface_scene_generation; /* even when the scene is stable */
     unsigned long long client_surface_direct_scene; /* authenticated owner strategy */
+    int             client_surface_direct_continuation; /* retained attachment across top-level geometry */
     unsigned long long client_surface_ack_scene; /* last successful owner publication */
     unsigned long long client_surface_direct_surface;
     unsigned int     client_surface_scene_change_depth;
@@ -1120,6 +1121,7 @@ static struct window *create_window( struct window *parent, struct window *owner
     win->present_rect = empty_rect;
     win->client_surface_scene_generation = 0;
     win->client_surface_direct_scene = win->client_surface_direct_surface = 0;
+    win->client_surface_direct_continuation = 0;
     win->client_surface_ack_scene = 0;
     win->client_surface_scene_change_depth = 0;
     win->prop_inuse     = 0;
@@ -1374,6 +1376,7 @@ static void adjust_client_surface_subtree_count( struct window *win, int delta )
  * validate the same even sequence before and after native composition. */
 static void begin_client_surface_scene_change( struct window *top )
 {
+    top->client_surface_direct_continuation = 0;
     top->client_surface_transaction.source_pending = 0;
     if (top->client_surface_scene_change_depth++) return;
     assert( !(top->client_surface_scene_generation & 1) );
@@ -1406,7 +1409,7 @@ static void end_client_surface_scene_change( struct window *top )
     if (top->handle)
         post_message_coalesced( top->handle, WM_WINE_UPDATEWINDOWSTATE,
                                 WINE_UPDATE_CLIENT_SURFACE_HANDOFFS, 0 );
-    if (!client_surface_is_publishing( top ) &&
+    if (!client_surface_is_publishing( top ) && !client_surface_direct_eligible( top ) &&
         (top->client_surface_transaction.staged || (is_visible( top ) && has_client_surface( top ))))
     {
         if (top->client_surface_transaction.source_pending)
@@ -1421,6 +1424,7 @@ static void end_client_surface_scene_change( struct window *top )
  * seqlock cycle so every earlier transaction token becomes stale. */
 static void invalidate_client_surface_scene( struct window *top )
 {
+    top->client_surface_direct_continuation = 0;
     assert( !(top->client_surface_scene_generation & 1) );
     top->client_surface_scene_generation += 2;
     update_client_surface_publication( top );
@@ -1615,7 +1619,8 @@ static int client_surface_direct_eligible( struct window *top )
 {
     return !(top->client_surface_scene_generation & 1) &&
            !top->client_surface_transaction.staged && !top->client_surface_native_barrier &&
-           top->client_surface_direct_scene == top->client_surface_scene_generation &&
+           (top->client_surface_direct_scene == top->client_surface_scene_generation ||
+            top->client_surface_direct_continuation) &&
            top->client_surface_direct_surface &&
            client_surface_direct_candidate( top );
 }
@@ -4390,7 +4395,7 @@ static void set_window_pos( struct window *win, struct window *previous,
     struct window *client_surface_top = NULL;
     struct window *scene_top = get_toplevel_window( win );
     struct rectangle rect;
-    int client_changed, frame_changed, scene_change, placement_only;
+    int client_changed, frame_changed, scene_change, placement_only, direct_continuation;
     int visible = (win->style & WS_VISIBLE) || (swp_flags & SWP_SHOWWINDOW);
     int zorder_changed = 0;
 
@@ -4423,8 +4428,23 @@ static void set_window_pos( struct window *win, struct window *previous,
                    (scene_top->client_surface_subtree_count || win->client_surface_subtree_count);
     if (scene_change)
     {
+        /* The native child remains attached during ordinary top-level geometry
+         * changes. Its producer still updates the drawable before presenting;
+         * this is not proof that the WM has applied the new whole-window size.
+         * Keep the last publication ACK unchanged. Any other scene mutation,
+         * including a nested native barrier, revokes this continuity. */
+        direct_continuation = win == scene_top &&
+                              !(swp_flags & (SWP_FRAMECHANGED | SWP_STATECHANGED |
+                                             SWP_SHOWWINDOW | SWP_HIDEWINDOW)) &&
+                              (swp_flags & SWP_NOZORDER) &&
+                              list_empty( &win->children ) && list_empty( &win->unlinked ) &&
+                              !scene_top->client_surface_scene_change_depth &&
+                              scene_top->client_surface_transaction.phase == CLIENT_SURFACE_PHASE_IDLE &&
+                              client_surface_direct_eligible( scene_top );
         if (placement_only) begin_client_surface_cached_scene_change( scene_top );
         else begin_client_surface_scene_change( scene_top );
+        scene_top->client_surface_direct_continuation = direct_continuation;
+        if (direct_continuation) scene_top->client_surface_transaction.source_pending = 0;
     }
 
     if (has_client_surface( win ))
@@ -6132,6 +6152,7 @@ DECL_HANDLER(set_client_surface_state)
      * without changing producer authority or restarting an active plan. */
     if (completed_claim && selected_after == surface &&
         top->client_surface_transaction.phase == CLIENT_SURFACE_PHASE_IDLE &&
+        !client_surface_direct_eligible( top ) &&
         top->client_surface_ack_scene != top->client_surface_scene_generation &&
         client_surface_scene_published( top ))
         restart_client_surface_generation( top );
@@ -6181,7 +6202,8 @@ DECL_HANDLER(set_client_surface_state)
          * require the producer to update its target and republish content. */
         top->client_surface_transaction.owner_repair = 0;
         top->client_surface_transaction.source_pending = 0;
-        if (!client_surface_is_composing( top ) && is_visible( top ) && has_client_surface( top ))
+        if (!client_surface_is_composing( top ) && !client_surface_direct_eligible( top ) &&
+            is_visible( top ) && has_client_surface( top ))
             restart_client_surface_generation( top );
         else if (client_surface_is_composing( top ) && top->client_surface_transaction.pending)
         {
