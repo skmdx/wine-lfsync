@@ -237,6 +237,8 @@ static void free_client_surface_compositor_binding( struct client_surface_compos
         binding->imports[i].storage = NULL;
     }
     if (binding->read_count) return;
+    for (i = 0; i < ARRAY_SIZE(binding->reads); ++i)
+        client_surface_cache_destroy_view( &binding->memory, binding->reads[i].view );
     release_client_surface_compositor_binding_server( binding );
     release_client_surface_compositor_pool( binding->pool );
     client_surface_free_owned_metadata( &binding->memory, binding, sizeof(*binding) );
@@ -924,13 +926,14 @@ static void adopt_client_surface_import( struct client_surface_compositor_bindin
     struct client_surface_cache_image *view;
 
     assert( !read->binding );
-    if (!(view = client_surface_cache_view( import->storage, release_client_surface_import_read, read )))
+    if (!(view = client_surface_cache_view( &binding->memory, &read->view, import->storage,
+                                           release_client_surface_import_read, read )))
     {
         release_client_surface_cached_source( binding, FALSE );
         return;
     }
     *read = (struct client_surface_source_read){binding, copy->control, frame->source_sequence,
-        frame->source, client_surface_cache_pixmap( view ), frame->source_index};
+        frame->source, client_surface_cache_pixmap( view ), frame->source_index, view};
     ++binding->read_count;
     copy->retained = TRUE;
     free_client_surface_cached_image( &binding->spare_image );

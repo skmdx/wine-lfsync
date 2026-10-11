@@ -69,10 +69,14 @@ struct client_surface_cache_image *client_surface_cache_import(
     const struct client_surface_memory_scope *memory, Pixmap source,
     unsigned int width, unsigned int height, unsigned int depth, UINT64 bytes,
     void (*wake)(void), client_surface_cache_callback complete, void *context );
-/* A publication view retains independent native storage and one source read.
- * release runs on the actor after the view's last native reader has returned. */
+/* The read slot owns this metadata until destroy_view(). Each publication
+ * retains native storage and one source read; release runs on the actor after
+ * its last native reader, permitting the same slot to be used again. */
 struct client_surface_cache_image *client_surface_cache_view(
+    struct client_surface_memory_scope *memory, struct client_surface_cache_image **slot,
     struct client_surface_cache_image *storage, void (*release)(void *), void *context );
+void client_surface_cache_destroy_view( struct client_surface_memory_scope *memory,
+                                        struct client_surface_cache_image *image );
 
 /* Output admission retains its own purpose charge. Native storage has no
  * borrowed target pointer; the caller validates installation on completion. */

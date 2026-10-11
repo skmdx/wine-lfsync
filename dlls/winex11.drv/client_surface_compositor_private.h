@@ -74,6 +74,7 @@ struct client_surface_source_read
     UINT64 control, sequence;
     Pixmap source, cache;
     unsigned int source_index;
+    struct client_surface_cache_image *view;
 };
 
 struct client_surface_cache_copy

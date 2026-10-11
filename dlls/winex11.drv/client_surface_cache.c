@@ -1100,20 +1100,21 @@ struct client_surface_cache_image *client_surface_cache_import(
 }
 
 struct client_surface_cache_image *client_surface_cache_view(
+    struct client_surface_memory_scope *memory, struct client_surface_cache_image **slot,
     struct client_surface_cache_image *storage, void (*release)(void *), void *context )
 {
-    struct client_surface_cache_image *image;
+    struct client_surface_cache_image *image = *slot;
 
     assert( storage->native->imported && storage->pixmap && storage->operation == CACHE_IDLE );
-    /* The parent reference keeps this allocation's owner and domain alive.
-     * A read view owns metadata, but no separate image storage or scope. */
-    if (!(image = client_surface_alloc_scoped_metadata( &storage->native->memory, 1, sizeof(*image) ))) return NULL;
+    /* The read slot outlives every native reader. Retain its small descriptor
+     * between publications instead of allocating and charging each frame. */
+    if (!image && !(*slot = image = client_surface_alloc_scoped_metadata( memory, 1, sizeof(*image) ))) return NULL;
     pthread_mutex_lock( &cache_mutex );
+    assert( !image->refs && !image->parent && !image->acquired && image->operation == CACHE_IDLE );
     if (image_count == CLIENT_SURFACE_CACHE_IMAGE_LIMIT ||
         source_count == CLIENT_SURFACE_CACHE_IMAGE_LIMIT - CLIENT_SURFACE_CACHE_OUTPUT_RESERVE)
     {
         pthread_mutex_unlock( &cache_mutex );
-        client_surface_free_scoped_metadata( &storage->native->memory, image, sizeof(*image) );
         return NULL;
     }
     ++image_count;
@@ -1132,6 +1133,14 @@ struct client_surface_cache_image *client_surface_cache_view(
                    client_surface_perf_time(), image, storage, image->pixmap, storage->refs, image_count );
     pthread_mutex_unlock( &cache_mutex );
     return image;
+}
+
+void client_surface_cache_destroy_view( struct client_surface_memory_scope *memory,
+                                        struct client_surface_cache_image *image )
+{
+    if (!image) return;
+    assert( !image->refs && !image->parent && !image->acquired && image->operation == CACHE_IDLE );
+    client_surface_free_scoped_metadata( memory, image, sizeof(*image) );
 }
 
 struct client_surface_cache_image *client_surface_cache_create_output(
@@ -1392,8 +1401,10 @@ BOOL client_surface_complete_cache( unsigned int budget )
             --source_count;
             TRACE_(csperf)( "ticks=%llu event=cache_view_return image=%p parent=%p pixmap=%lx count=%u\n",
                            client_surface_perf_time(), image, source, image->pixmap, image_count );
+            image->parent = image->next = NULL;
+            image->operation = CACHE_IDLE;
+            image->acquired = FALSE;
             pthread_mutex_unlock( &cache_mutex );
-            client_surface_free_scoped_metadata( &source->native->memory, image, sizeof(*image) );
             client_surface_cache_release( source );
             release( context );
             progressed = TRUE;
