@@ -292,7 +292,14 @@ void drain_client_surface_notification( int fd )
     UINT64 value;
     int ret;
 
+#ifdef __linux__
+    /* One non-semaphore eventfd read consumes the accumulated counter.
+     * Later writes remain readable for the next armed traversal; draining
+     * until EAGAIN adds a syscall and can chase a continuous producer. */
+    do ret = read( fd, &value, sizeof(value) ); while (ret < 0 && errno == EINTR);
+#else
     do ret = read( fd, &value, sizeof(value) ); while (ret > 0 || (ret < 0 && errno == EINTR));
+#endif
 }
 
 static void arm_client_surface_compositor_work(void)
