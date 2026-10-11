@@ -4773,16 +4773,17 @@ NTSTATUS X11DRV_UpdateClientSurfaceBacking( HWND hwnd, BOOL enable,
     UINT64 geometry_scope;
 
     if (!(data = get_win_data( hwnd ))) return status;
-    /* A completed composition backing can receive another enable while its
-     * staged frame is still being copied. Reapplying the same state through
-     * WindowPosChanged would cancel that publication for no native change. */
+    /* Enabling an already completed backing does not mutate native state.
+     * This also applies after staging: replaying WindowPosChanged would
+     * detach an in-flight composition for no geometry or backing change. */
     if (enable && data->client_surface_backing_enabled && data->client_surface_backing &&
-        data->client_surface_staged && !data->client_surface_pending_allocation &&
+        !data->client_surface_pending_allocation && !data->client_surface_update_pending &&
+        !data->parent_invalid && !data->reparenting && !data->state_locks &&
         data->client_surface_backing_width == rects->visible.right - rects->visible.left &&
         data->client_surface_backing_height == rects->visible.bottom - rects->visible.top &&
         !memcmp( &data->rects, rects, sizeof(*rects) ))
     {
-        TRACE( "win %p retains enabled staged backing\n", hwnd );
+        TRACE( "win %p retains enabled backing\n", hwnd );
         /* Native geometry can be unchanged while repair advanced the scene. */
         X11DRV_client_surface_refresh_handoffs( hwnd );
         status = STATUS_SUCCESS;

@@ -698,6 +698,15 @@ BOOL submit_client_surface_present( struct client_surface_compositor_target *tar
      * the checked publication. The embedded
      * request is already covered by target admission; submit cannot allocate. */
     if (copy_rect) frame->native_present.copy_rect = *copy_rect;
+    if (publish_generation && TRACE_ON(csperf))
+    {
+        struct client_surface_scene scene = {0};
+
+        client_surface_get_toplevel_scene( target->toplevel, &scene );
+        TRACE_(csperf)( "ticks=%llu event=native_commit_scene serial=%u generation=%llu epoch=%llu mode=%u valid=%u pending=%u\n",
+                       client_surface_perf_time(), serial, (unsigned long long)scene.generation,
+                       (unsigned long long)scene.epoch, scene.mode, scene.valid, scene.publication_pending );
+    }
     TRACE_(csperf)( "ticks=%llu event=native_commit_admit window=%lx pixmap=%lx frame=%lx serial=%u copy=1 commit=%u generation=%llu epoch=%llu scene=%llu\n",
                    client_surface_perf_time(), frame->native_present.content, frame->native_present.pixmap, frame->pixmap, serial,
                    frame->native_present.committing,
