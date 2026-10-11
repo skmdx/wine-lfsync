@@ -2026,10 +2026,9 @@ static BOOL x11drv_surface_swap( struct opengl_drawable *base )
 
 struct egl_snapshot_completion
 {
-    struct client_surface_memory_scope memory;
-    LONG refs;
     LONG signaled;
     EGLSyncKHR sync;
+    struct x11drv_client_snapshot *snapshot;
     /* Only the queued completion owns the drawable and mapping references.
      * Image retirement must test the fence without dereferencing these. */
     struct opengl_drawable *drawable;
@@ -2042,15 +2041,8 @@ struct egl_snapshot_image
 {
     struct client_surface_memory_scope memory;
     EGLImageKHR image;
-    struct egl_snapshot_completion *pending;
+    struct egl_snapshot_completion completion;
 };
-
-static void release_snapshot_sync( struct egl_snapshot_completion *completion )
-{
-    if (!completion || InterlockedDecrement( &completion->refs )) return;
-    snapshot_destroy_sync( egl->display, completion->sync );
-    client_surface_free_owned_metadata( &completion->memory, completion, sizeof(*completion) );
-}
 
 static struct client_surface_completion_result wait_snapshot_completion( void *context, DWORD timeout )
 {
@@ -2084,18 +2076,19 @@ static void release_snapshot_completion( void *context )
     struct egl_snapshot_completion *completion = context;
     struct opengl_drawable *drawable = completion->drawable;
 
-    release_snapshot_sync( completion );
+    x11drv_client_snapshot_release( completion->snapshot );
     opengl_drawable_release( drawable );
 }
 
 static BOOL snapshot_image_ready( void *context )
 {
     struct egl_snapshot_image *image = context;
+    struct egl_snapshot_completion *completion = &image->completion;
 
-    if (!image->pending || InterlockedCompareExchange( &image->pending->signaled, 0, 0 )) return TRUE;
-    if (snapshot_wait_sync( egl->display, image->pending->sync, 0, 0 ) != EGL_CONDITION_SATISFIED_KHR)
+    if (!completion->sync || ReadAcquire( &completion->signaled )) return TRUE;
+    if (snapshot_wait_sync( egl->display, completion->sync, 0, 0 ) != EGL_CONDITION_SATISFIED_KHR)
         return FALSE;
-    InterlockedExchange( &image->pending->signaled, TRUE );
+    InterlockedExchange( &completion->signaled, TRUE );
     return TRUE;
 }
 
@@ -2104,7 +2097,7 @@ static void release_snapshot_image( void *context )
     struct egl_snapshot_image *image = context;
 
     snapshot_destroy_image( egl->display, image->image );
-    release_snapshot_sync( image->pending );
+    if (image->completion.sync) snapshot_destroy_sync( egl->display, image->completion.sync );
     client_surface_free_owned_metadata( &image->memory, image, sizeof(*image) );
 }
 
@@ -2285,34 +2278,6 @@ done:
     return error;
 }
 
-static struct egl_snapshot_completion *prepare_snapshot_completion( struct egl_snapshot_image *image )
-{
-    struct egl_snapshot_completion *completion = image->pending;
-    struct client_surface_memory_scope memory = {0};
-
-    /* Storage preparation proved sole image ownership and GPU completion.
-     * Once its callback has also released its reference, the image's existing
-     * metadata can carry another write without competing for process budget.
-     * Neither a pending fence nor another callback's references are reused. */
-    if (!completion || InterlockedCompareExchange( &completion->refs, 0, 0 ) != 1)
-    {
-        client_surface_memory_scope_copy( &memory, &image->memory, TRUE );
-        if (!(completion = client_surface_alloc_scoped_metadata( &memory, 1, sizeof(*completion) )))
-        {
-            client_surface_memory_scope_destroy( &memory );
-            return NULL;
-        }
-        completion->memory = memory;
-        return completion;
-    }
-    image->pending = NULL;
-    snapshot_destroy_sync( egl->display, completion->sync );
-    memory = completion->memory;
-    memset( completion, 0, sizeof(*completion) );
-    completion->memory = memory;
-    return completion;
-}
-
 enum client_surface_gpu_snapshot_result
 {
     GPU_SNAPSHOT_UNSUPPORTED,
@@ -2378,11 +2343,16 @@ static enum client_surface_gpu_snapshot_result snapshot_client_surface_gpu( stru
     pixmap = x11drv_client_snapshot_pixmap( snapshot );
     imported = begin ? client_surface_perf_time() : 0;
     if (funcs->p_glGetError() != GL_NO_ERROR) return GPU_SNAPSHOT_FAILED;
-    /* Reserve completion ownership before issuing the private GPU write.
-     * Metadata pressure must not turn an otherwise asynchronous capture
-     * into a caller-side glFinish after the copy has already been submitted. */
-    if (snapshot_create_sync && snapshot_destroy_sync && snapshot_wait_sync &&
-        !(completion = prepare_snapshot_completion( image ))) return GPU_SNAPSHOT_RETRY;
+    /* Completion metadata belongs to the image. Its queued callback pins the
+     * snapshot, so storage preparation cannot reuse it until both the callback
+     * and the GPU write are finished. No separate completion allocation or
+     * reference count is needed. */
+    if (snapshot_create_sync && snapshot_destroy_sync && snapshot_wait_sync)
+    {
+        completion = &image->completion;
+        if (completion->sync) snapshot_destroy_sync( egl->display, completion->sync );
+        memset( completion, 0, sizeof(*completion) );
+    }
     /* Rotation already restored the caller's bindings. Publishing that image
      * needs only completion ownership, not the state used by a snapshot copy. */
     if (direct_image)
@@ -2487,18 +2457,15 @@ copied:
         if (completion->sync)
         {
             funcs->p_glFlush();
-            completion->refs = 2;
+            completion->snapshot = x11drv_client_snapshot_share( snapshot );
             completion->drawable = base;
             completion->source = present->handoff_source;
             completion->channel = present->handoff_channel;
             completion->control = present->handoff_control;
             opengl_drawable_add_ref( base );
-            release_snapshot_sync( image->pending );
-            image->pending = completion;
             client_surface_set_present_completion( present, wait_snapshot_completion,
                                                      release_snapshot_completion, completion );
             ret = GPU_SNAPSHOT_PENDING;
-            completion = NULL; /* The image and queued callback own both references. */
         }
     }
     if (!present->completion.wait)
@@ -2522,7 +2489,6 @@ copied:
         present->capture.size = size;
     }
 done:
-    if (completion) client_surface_free_owned_metadata( &completion->memory, completion, sizeof(*completion) );
     if (!direct_image)
     {
         if (scissor) funcs->p_glEnable( GL_SCISSOR_TEST );
