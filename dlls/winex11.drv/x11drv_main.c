@@ -1354,6 +1354,16 @@ static NTSTATUS window_paint( struct x11drv_display_owner *owner, HWND hwnd, UIN
         }
         return STATUS_SUCCESS;
     }
+    if (operation == WINDOW_PAINT_EMPTY)
+    {
+        if (i == owner->paint_count || owner->paints[i].hwnd != hwnd || owner->paints[i].submitted)
+            return STATUS_INVALID_PARAMETER;
+        /* The writer completed this receipt in end_window_paint. No native
+         * writes need draining, even if the marker endpoint has failed. */
+        TRACE_(csperf)( "event=window_paint_empty hwnd=%p token=%llu\n", hwnd, (unsigned long long)token );
+        remove_window_paint( owner, i );
+        return STATUS_SUCCESS;
+    }
     if (InterlockedCompareExchange( &owner->paint_failed, 0, 0 ))
     {
         UINT64 identity;
@@ -1417,19 +1427,9 @@ static NTSTATUS window_paint( struct x11drv_display_owner *owner, HWND hwnd, UIN
                        owner, owner->paint_window, hwnd, (unsigned long long)token, owner->paint_count );
         return STATUS_SUCCESS;
     }
-    if ((operation != WINDOW_PAINT_SUBMIT && operation != WINDOW_PAINT_EMPTY) || i == owner->paint_count ||
+    if (operation != WINDOW_PAINT_SUBMIT || i == owner->paint_count ||
         owner->paints[i].hwnd != hwnd || owner->paints[i].submitted) return STATUS_INVALID_PARAMETER;
     owner->paints[i].submitted = TRUE;
-    if (operation == WINDOW_PAINT_EMPTY)
-    {
-        /* The GUI reservation covered the whole callback. Only actual DC or
-         * window-surface writes need a native content receipt; unrelated
-         * geometry requests retain their own stream ordering and barriers. */
-        TRACE_(csperf)( "event=window_paint_empty hwnd=%p token=%llu\n", hwnd, (unsigned long long)token );
-        complete_window_paint( owner, token, TRUE );
-        remove_window_paint( owner, i );
-        return STATUS_SUCCESS;
-    }
     flush_window_paints( owner );
     return STATUS_SUCCESS;
 }

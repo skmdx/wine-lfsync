@@ -6410,7 +6410,7 @@ struct end_window_paint_request
     char __pad_12[4];
     unsigned __int64 token;
     unsigned int cancel;
-    char __pad_28[4];
+    unsigned int empty;
 };
 struct end_window_paint_reply
 {
@@ -6712,7 +6712,7 @@ struct select_client_surface_direct_plan_reply
 };
 
 /* The owner observed successful native presentation on its attached target.
- * Reserve publication through the same READY/PUBLISHING transition as copies. */
+ * Commit publication, retaining the GUI exposure ACK for staged transitions. */
 struct complete_client_surface_direct_plan_request
 {
     struct request_header __header;
@@ -7807,6 +7807,6 @@ union generic_reply
     struct set_queue_paint_blocked_reply set_queue_paint_blocked_reply;
 };
 
-#define SERVER_PROTOCOL_VERSION 1035
+#define SERVER_PROTOCOL_VERSION 1036
 
 #endif /* __WINE_WINE_SERVER_PROTOCOL_H */

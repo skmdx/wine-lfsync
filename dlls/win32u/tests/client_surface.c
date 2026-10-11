@@ -6031,6 +6031,26 @@ static void test_paint_receipts(void)
     ok( !status && preparing.publish && !preparing.generation, "initial paint prepare status %#x\n", status );
     drain_scene_notifications( &updates, &prepares );
 
+    /* An empty callback returns its receipt at EndPaint, without a native
+     * completion request. It still invalidates the prior paint checkpoint. */
+    {
+        struct __server_request_info info = {0};
+
+        status = begin_paint_receipt( hwnd, &first );
+        ok( !status && first, "empty paint admission status %#x\n", status );
+        set_surface_state( hwnd, 0, 0, 0, &current );
+        info.u.req.end_window_paint_request.__header.req = REQ_end_window_paint;
+        info.u.req.end_window_paint_request.token = first;
+        info.u.req.end_window_paint_request.empty = TRUE;
+        status = p_wine_server_call( &info );
+        ok( !status, "empty paint end status %#x\n", status );
+        status = complete_paint_receipt( first, TRUE );
+        ok( status == STATUS_INVALID_PARAMETER, "empty paint retained receipt, status %#x\n", status );
+        status = set_surface_state( hwnd, 0, 0, 0, &result );
+        ok( !status && result.paint_serial > current.paint_serial,
+            "empty paint retained checkpoint, status %#x\n", status );
+    }
+
     set_paint_update( hwnd, RDW_INVALIDATE | RDW_ERASE | RDW_FRAME );
     status = set_surface_state( hwnd, 0, 0, 0, &current );
     ok( !status, "paint state query status %#x\n", status );

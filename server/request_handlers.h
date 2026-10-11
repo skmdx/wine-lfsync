@@ -2483,6 +2483,7 @@ C_ASSERT( offsetof(struct begin_window_paint_reply, token) == 8 );
 C_ASSERT( sizeof(struct begin_window_paint_reply) == 16 );
 C_ASSERT( offsetof(struct end_window_paint_request, token) == 16 );
 C_ASSERT( offsetof(struct end_window_paint_request, cancel) == 24 );
+C_ASSERT( offsetof(struct end_window_paint_request, empty) == 28 );
 C_ASSERT( sizeof(struct end_window_paint_request) == 32 );
 C_ASSERT( offsetof(struct complete_window_paint_request, token) == 16 );
 C_ASSERT( offsetof(struct complete_window_paint_request, success) == 24 );

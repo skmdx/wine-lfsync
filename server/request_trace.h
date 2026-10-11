@@ -3602,6 +3602,7 @@ static void dump_end_window_paint_request( const struct end_window_paint_request
 {
     dump_uint64( " token=", &req->token );
     fprintf( stderr, ", cancel=%08x", req->cancel );
+    fprintf( stderr, ", empty=%08x", req->empty );
 }
 
 static void dump_complete_window_paint_request( const struct complete_window_paint_request *req )

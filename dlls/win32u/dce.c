@@ -2132,6 +2132,8 @@ void end_window_paint( struct window_paint *paint, BOOL success )
     SERVER_START_REQ( end_window_paint )
     {
         req->token = paint->token;
+        req->empty = !paint->failed && !paint->cancelled &&
+                     !paint->native_required && !paint->surface_count;
         status = wine_server_call( req );
     }
     SERVER_END_REQ;

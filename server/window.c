@@ -4241,6 +4241,14 @@ DECL_HANDLER(end_window_paint)
     {
         paint->ended = 1;
         paint->failed |= !!req->cancel;
+        if (req->empty && !req->cancel)
+        {
+            /* No native writer exists for this callback. Finish its receipt
+             * in the writer's request instead of searching the global list
+             * again through the native completion protocol. */
+            invalidate_window_paint( paint->window );
+            release_window_paint( paint, paint->failed );
+        }
     }
 }
 
