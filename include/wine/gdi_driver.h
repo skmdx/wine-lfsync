@@ -220,7 +220,7 @@ struct gdi_dc_funcs
 };
 
 /* increment this when changing driver tables or shared driver-facing structures */
-#define WINE_GDI_DRIVER_VERSION 162
+#define WINE_GDI_DRIVER_VERSION 163
 
 #define GDI_PRIORITY_NULL_DRV        0  /* null driver */
 #define GDI_PRIORITY_FONT_DRV      100  /* any font driver */
@@ -790,6 +790,7 @@ struct gdi_device_manager
 #define WINDOW_PAINT_SUBMIT  1
 #define WINDOW_PAINT_CANCEL  2  /* STATUS_PENDING transfers the failed receipt to the driver */
 #define WINDOW_PAINT_QUERY   3  /* query receipt support without native I/O */
+#define WINDOW_PAINT_EMPTY   4  /* callback ended without DC or surface writes */
 
 struct vulkan_driver_funcs;
 struct opengl_driver_funcs;

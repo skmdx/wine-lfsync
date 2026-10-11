@@ -67,7 +67,7 @@ struct window_paint
     HWND hwnd;
     HDC hdc;
     UINT64 token;
-    BOOL ended, failed, beginning, cancelled;
+    BOOL ended, failed, beginning, cancelled, native_required;
     UINT surface_count;
     UINT callbacks;
 };
@@ -1977,7 +1977,9 @@ static void flush_window_paints(void)
         if (!flushed && !paint->failed)
             continue;
         status = paint->failed ? STATUS_UNSUCCESSFUL :
-                 user_driver->pWindowPaint( paint->hwnd, WINDOW_PAINT_SUBMIT, paint->token );
+                 user_driver->pWindowPaint( paint->hwnd,
+                     paint->native_required || paint->surface_count ? WINDOW_PAINT_SUBMIT : WINDOW_PAINT_EMPTY,
+                     paint->token );
         if (status != STATUS_SUCCESS)
         {
             cancel_native_window_paint( paint );
@@ -2032,6 +2034,9 @@ struct window_paint *begin_window_paint( HWND hwnd )
     if (!paint) goto failed;
     paint->hwnd = hwnd;
     paint->token = token;
+    /* Direct driver operations require their native receipt. Callback scopes
+     * below can instead prove no writes through the DC and surface owners. */
+    paint->native_required = TRUE;
     paint->beginning = TRUE;
     list_init( &paint->surfaces );
     paint->failed = token && user_driver->pWindowPaint( hwnd, WINDOW_PAINT_RESERVE, token ) != STATUS_SUCCESS;
@@ -2069,7 +2074,9 @@ struct window_paint *begin_window_paint_callback( HWND hwnd )
         ++paint->callbacks;
         return paint;
     }
-    return begin_window_paint( hwnd );
+    paint = begin_window_paint( hwnd );
+    if (paint) paint->native_required = FALSE;
+    return paint;
 }
 
 /* Enroll an individual operation, not the lifetime of a retained DC. An
@@ -2089,7 +2096,14 @@ BOOL begin_dc_write( DC *dc )
     if (status == STATUS_NOT_SUPPORTED) return TRUE;
     if (status != STATUS_SUCCESS) return FALSE;
     LIST_FOR_EACH_ENTRY( paint, &get_user_thread_info()->window_paints, struct window_paint, entry )
-        if (paint->hwnd == hwnd && !paint->ended && !paint->cancelled) return TRUE;
+        if (paint->hwnd == hwnd && !paint->ended && !paint->cancelled)
+        {
+            if (!paint->native_required)
+                TRACE_(csperf)( "event=window_paint_write hwnd=%p hdc=%p token=%llu\n",
+                               hwnd, dc->hSelf, (unsigned long long)paint->token );
+            paint->native_required = TRUE;
+            return TRUE;
+        }
     if (!(dc->write_paint = begin_window_paint( hwnd ))) return FALSE;
     dc->write_ref = dc->refcount;
     TRACE_(csperf)( "event=dc_write_begin hwnd=%p hdc=%p token=%llu ref=%d\n",
@@ -2143,6 +2157,7 @@ HDC WINAPI NtUserBeginPaint( HWND hwnd, PAINTSTRUCT *ps )
 
     paint = begin_window_paint( hwnd );
     if (!paint) return 0;
+    paint->native_required = FALSE;
     NtUserHideCaret( hwnd );
 
     if (!(hrgn = send_ncpaint( hwnd, NULL, &flags, 0, NULL ))) goto failed;
@@ -2235,6 +2250,7 @@ void erase_now( HWND hwnd, UINT rdw_flags )
         if (!get_update_flags( hwnd, &child, &flags ) || !flags) break;
         paint = begin_window_paint( child );
         if (!paint) break;
+        paint->native_required = FALSE;
         flags = request_flags;
         if (!(hrgn = send_ncpaint( hwnd, &from_child, &flags, child, &status )))
         {

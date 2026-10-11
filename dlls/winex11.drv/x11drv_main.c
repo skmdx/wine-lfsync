@@ -1417,9 +1417,19 @@ static NTSTATUS window_paint( struct x11drv_display_owner *owner, HWND hwnd, UIN
                        owner, owner->paint_window, hwnd, (unsigned long long)token, owner->paint_count );
         return STATUS_SUCCESS;
     }
-    if (operation != WINDOW_PAINT_SUBMIT || i == owner->paint_count ||
+    if ((operation != WINDOW_PAINT_SUBMIT && operation != WINDOW_PAINT_EMPTY) || i == owner->paint_count ||
         owner->paints[i].hwnd != hwnd || owner->paints[i].submitted) return STATUS_INVALID_PARAMETER;
     owner->paints[i].submitted = TRUE;
+    if (operation == WINDOW_PAINT_EMPTY)
+    {
+        /* The GUI reservation covered the whole callback. Only actual DC or
+         * window-surface writes need a native content receipt; unrelated
+         * geometry requests retain their own stream ordering and barriers. */
+        TRACE_(csperf)( "event=window_paint_empty hwnd=%p token=%llu\n", hwnd, (unsigned long long)token );
+        complete_window_paint( owner, token, TRUE );
+        remove_window_paint( owner, i );
+        return STATUS_SUCCESS;
+    }
     flush_window_paints( owner );
     return STATUS_SUCCESS;
 }
@@ -1555,7 +1565,7 @@ NTSTATUS X11DRV_WindowPaint( HWND hwnd, UINT operation, UINT64 token )
     NTSTATUS status;
 
     if (operation == WINDOW_PAINT_QUERY) return STATUS_SUCCESS;
-    if (!token || operation > WINDOW_PAINT_CANCEL) return STATUS_INVALID_PARAMETER;
+    if (!token || operation > WINDOW_PAINT_EMPTY) return STATUS_INVALID_PARAMETER;
     if (!data && operation == WINDOW_PAINT_CANCEL) return STATUS_SUCCESS;
     if (!data) data = x11drv_init_thread_data();
     owner = data->display_owner;
