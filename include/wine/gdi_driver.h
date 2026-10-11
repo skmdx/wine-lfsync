@@ -621,10 +621,14 @@ W32KAPI struct client_surface_admission client_surface_prepare_present( struct c
                                               struct client_surface_frame *present,
                                               BOOL external_completion, BOOL asynchronous );
 /* Each batch member owns one native use until submit_present registers its
+ * completion, or finish_native_present records a frame with no deferred
  * completion. State locks are released before entering the native driver. */
 W32KAPI void client_surface_begin_present( struct client_surface *surface, unsigned int count );
 W32KAPI void client_surface_submit_present( struct client_surface *surface,
                                              struct client_surface_frame *present );
+W32KAPI struct client_surface_present_result client_surface_finish_native_present( struct client_surface *surface,
+                                      struct client_surface_frame *present, BOOL submitted,
+                                      const SIZE *expected_size );
 W32KAPI struct client_surface_present_result client_surface_complete_present( struct client_surface *surface,
                                               struct client_surface_frame *present,
                                               BOOL submitted, BOOL external_completed,

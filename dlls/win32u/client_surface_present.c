@@ -1000,10 +1000,9 @@ static void client_surface_submit_present_locked( struct client_surface *surface
     }
 }
 
-void client_surface_submit_present( struct client_surface *surface,
-                                    struct client_surface_frame *present )
+static void finish_client_surface_native_present_locked( struct client_surface *surface,
+                                                         struct client_surface_frame *present )
 {
-    client_surface_lock_present( surface );
     pthread_mutex_lock( &surface->present_lock );
     client_surface_submit_present_locked( surface, present );
     assert( surface->native_present_count > 0 );
@@ -1011,6 +1010,13 @@ void client_surface_submit_present( struct client_surface *surface,
         client_surface_wake_completion_locked( surface );
     client_surface_handoff_completed( surface );
     pthread_mutex_unlock( &surface->present_lock );
+}
+
+void client_surface_submit_present( struct client_surface *surface,
+                                    struct client_surface_frame *present )
+{
+    client_surface_lock_present( surface );
+    finish_client_surface_native_present_locked( surface, present );
     client_surface_unlock_present( surface );
 }
 
@@ -1278,6 +1284,27 @@ static struct client_surface_completion_result wait_deferred_driver_completion( 
 static void release_deferred_driver_completion( void *context )
 {
     client_surface_release( context );
+}
+
+struct client_surface_present_result client_surface_finish_native_present( struct client_surface *surface,
+                                      struct client_surface_frame *present, BOOL submitted,
+                                      const SIZE *expected_size )
+{
+    struct client_surface_completion_job *job = present->completion_job;
+    struct client_surface_present_result ret;
+
+    /* With no deferred host completion, submission and image accounting are
+     * one transition. Keep the native target pinned until both are recorded;
+     * a target writer must not interpose between them. Native calls themselves
+     * still execute without completion_lock, exactly like queued submissions. */
+    assert( !present->serial && present->completion.kind == CLIENT_SURFACE_COMPLETION_NONE );
+    present->completion_job = NULL;
+    client_surface_lock_present( surface );
+    finish_client_surface_native_present_locked( surface, present );
+    ret = client_surface_complete_present_locked( surface, present, submitted, FALSE, expected_size, 0 );
+    client_surface_unlock_present( surface );
+    client_surface_cancel_completion( &job );
+    return ret;
 }
 
 struct client_surface_present_result client_surface_complete_present( struct client_surface *surface,

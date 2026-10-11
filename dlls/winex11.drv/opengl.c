@@ -1342,7 +1342,10 @@ static void complete_opengl_present( struct client_surface *client, struct clien
         client_surface_enqueue_prepared_present( client, present, size );
         return;
     }
-    result = client_surface_complete_present( client, present, submitted, completed, size, timeout );
+    if (!present->serial)
+        result = client_surface_finish_native_present( client, present, submitted, size );
+    else
+        result = client_surface_complete_present( client, present, submitted, completed, size, timeout );
     if (capture.release) capture.release( capture.context );
     if (submitted && result.owner == CLIENT_SURFACE_PRESENT_CALLER && !result.image_complete)
         WARN( "client-surface image did not complete for %s (completion %u handoff %u)\n",
@@ -2006,7 +2009,8 @@ static BOOL x11drv_surface_swap_blit( struct opengl_drawable *base, struct openg
         pglXSwapBuffers( gdi_display, gl->drawable );
         if (blit) TRACE( "native GLX generic framebuffer presentation for %s submitted\n",
                          debugstr_opengl_drawable( base ) );
-        client_surface_submit_present( base->client, &present );
+        if (present.completion.kind != CLIENT_SURFACE_COMPLETION_NONE)
+            client_surface_submit_present( base->client, &present );
     }
 
     client_surface_free_scoped_metadata( &surface->memory, completion, sizeof(*completion) );
@@ -2844,7 +2848,8 @@ static BOOL x11drv_egl_surface_present( struct opengl_drawable *base, GLuint fra
                      debugstr_opengl_drawable( base ), ret );
     if (framebuffer) TRACE( "native EGL framebuffer %u presentation for %s returned %u\n",
                             framebuffer, debugstr_opengl_drawable( base ), ret );
-    client_surface_submit_present( base->client, &present );
+    if (present.completion.kind != CLIENT_SURFACE_COMPLETION_NONE)
+        client_surface_submit_present( base->client, &present );
     if (!ret)
     {
         client_surface_free_scoped_metadata( &surface->memory, completion, sizeof(*completion) );
