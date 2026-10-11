@@ -113,6 +113,7 @@ static LONG client_surface_deferred_present_count;
 static pthread_mutex_t completion_executor_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_once_t completion_executor_once = PTHREAD_ONCE_INIT;
 static pthread_cond_t completion_executor_cond;
+static pthread_cond_t completion_work_cond;
 static int completion_executor_init_status;
 static struct list completion_ready_surfaces = LIST_INIT(completion_ready_surfaces);
 static LONGLONG completion_domain_counter;
@@ -241,6 +242,9 @@ int client_surface_cond_timedwait( pthread_cond_t *cond, pthread_mutex_t *mutex,
 static void init_completion_executor(void)
 {
     completion_executor_init_status = client_surface_cond_init( &completion_executor_cond );
+    if (completion_executor_init_status) return;
+    completion_executor_init_status = client_surface_cond_init( &completion_work_cond );
+    if (completion_executor_init_status) pthread_cond_destroy( &completion_executor_cond );
 }
 
 BOOL client_surface_completion_init( struct client_surface *surface )
@@ -366,7 +370,9 @@ static void queue_ready_surface_locked( struct client_surface *surface )
 
 static void wait_completion_executor_locked( DWORD timeout )
 {
-    client_surface_cond_timedwait( &completion_executor_cond, &completion_executor_lock, timeout );
+    /* Job availability has one consumer. Lifecycle and shared-probe waiters
+     * must not consume its signal or wake every idle worker on each frame. */
+    client_surface_cond_timedwait( &completion_work_cond, &completion_executor_lock, timeout );
 }
 
 void client_surface_resume_completion( struct client_surface *surface )
@@ -380,7 +386,10 @@ void client_surface_resume_completion( struct client_surface *surface )
     if (!list_empty( &surface->completion_queue->ready_entry ) &&
         !list_empty( &surface->completion_queue->jobs ) &&
         completion_head( surface )->native_status != CLIENT_SURFACE_COMPLETION_PENDING)
+    {
         pthread_cond_broadcast( &completion_executor_cond );
+        pthread_cond_signal( &completion_work_cond );
+    }
     pthread_mutex_unlock( &completion_executor_lock );
 }
 
@@ -471,6 +480,7 @@ static void reap_completion_workers(void)
         }
         else worker->state = COMPLETION_WORKER_EXITING;
         pthread_cond_broadcast( &completion_executor_cond );
+        pthread_cond_broadcast( &completion_work_cond );
         pthread_mutex_unlock( &completion_executor_lock );
         if (!status) NtClose( thread );
     }
@@ -817,6 +827,7 @@ static enum client_surface_completion_worker_disposition execute_completion_job(
     if (result.status != CLIENT_SURFACE_COMPLETION_PENDING)
         InterlockedDecrement( &client_surface_deferred_present_count );
     pthread_cond_broadcast( &completion_executor_cond );
+    pthread_cond_signal( &completion_work_cond );
     pthread_mutex_unlock( &completion_executor_lock );
     return result.worker;
 }
@@ -874,6 +885,7 @@ static void execute_surface_retirement( struct client_surface *surface,
     release_completion_domain_locked( domain );
     TRACE( "event=completion_cleanup_end slot=%u\n", (unsigned int)(worker - completion_workers) );
     pthread_cond_broadcast( &completion_executor_cond );
+    pthread_cond_signal( &completion_work_cond );
     pthread_mutex_unlock( &completion_executor_lock );
 }
 
@@ -1015,6 +1027,7 @@ static void queue_completion_job_locked( struct client_surface *surface,
            surface, wine_dbgstr_longlong( job->present.serial ), job->present.completion.context,
            job->present.capture.context );
     pthread_cond_broadcast( &completion_executor_cond );
+    pthread_cond_signal( &completion_work_cond );
 }
 
 void client_surface_queue_retirement( struct client_surface *surface )
@@ -1028,6 +1041,7 @@ void client_surface_queue_retirement( struct client_surface *surface )
     list_add_tail( &completion_ready_surfaces, &queue->ready_entry );
     TRACE( "event=completion_cleanup_queue surface=%p\n", surface );
     pthread_cond_broadcast( &completion_executor_cond );
+    pthread_cond_signal( &completion_work_cond );
     pthread_mutex_unlock( &completion_executor_lock );
 }
 
