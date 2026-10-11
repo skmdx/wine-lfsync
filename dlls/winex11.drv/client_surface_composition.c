@@ -2281,6 +2281,10 @@ void arm_client_surface_sources(void)
 
     for (pool = client_surface_compositor_pools; pool; pool = pool->next)
     {
+        /* Producer publication clears this handshake before signalling. An
+         * already armed source needs neither another read nor another store.
+         * The full traversal still observes publications racing this load. */
+        if (__atomic_load_n( &pool->shared->ready_parked, __ATOMIC_ACQUIRE )) continue;
         drain_client_surface_notification( pool->ready_fd );
         __atomic_store_n( &pool->shared->ready_parked, 1, __ATOMIC_RELEASE );
     }

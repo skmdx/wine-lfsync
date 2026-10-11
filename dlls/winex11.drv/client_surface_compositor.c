@@ -65,7 +65,7 @@ static int compare_client_surface_compositor_queue( const void *key, const struc
 static struct rb_tree client_surface_compositor_queues = {compare_client_surface_compositor_queue};
 static struct list client_surface_compositor_ready = LIST_INIT( client_surface_compositor_ready );
 static struct list client_surface_compositor_parked = LIST_INIT( client_surface_compositor_parked );
-static UINT64 client_surface_compositor_wake_serial;
+static LONG client_surface_compositor_wake_pending;
 static UINT64 client_surface_compositor_sequence;
 static LONGLONG client_surface_compositor_domain;
 static UINT64 client_surface_native_update_serial;
@@ -75,7 +75,7 @@ static struct client_surface_owner_notifications *client_surface_owner_notificat
 
 void wake_client_surface_compositor_queues(void)
 {
-    ++client_surface_compositor_wake_serial;
+    InterlockedExchange( &client_surface_compositor_wake_pending, TRUE );
     /* Native completion or a timer can make parked heads runnable. Move the
      * list in constant time; dispatch still inspects at most 64 queue heads. */
     list_move_tail( &client_surface_compositor_ready, &client_surface_compositor_parked );
@@ -261,12 +261,15 @@ void wake_client_surface_compositor(void)
     if (is_compositor_thread)
     {
         /* Local completions need another traversal, not a write/read through
-         * our own wake fd. The scan's serial check prevents sleeping before
+         * our own wake fd. The pending check prevents sleeping before
          * this newly runnable work is inspected. */
         wake_client_surface_compositor_queues();
         TRACE_(csperf)( "ticks=%llu event=actor_rescan\n", client_surface_perf_time() );
         return;
     }
+    /* One pending wake covers all work published before the actor arms its
+     * next full traversal. Publish the flag before writing the wake fd. */
+    if (InterlockedExchange( &client_surface_compositor_wake_pending, TRUE )) return;
     do
 #ifdef __linux__
         ret = write( client_surface_compositor_notify[1], &value, sizeof(value) );
@@ -304,18 +307,21 @@ void drain_client_surface_notification( int fd )
 
 static void arm_client_surface_compositor_work(void)
 {
-    drain_client_surface_notification( client_surface_compositor_notify[0] );
     /* A native callback can complete a parked head while the actor is busy.
      * Draining its wake must be followed by rechecking that head, even when
      * no poll was needed to resume the actor. Dispatch remains sliced. */
-    wake_client_surface_compositor_queues();
+    if (InterlockedExchange( &client_surface_compositor_wake_pending, FALSE ))
+    {
+        drain_client_surface_notification( client_surface_compositor_notify[0] );
+        list_move_tail( &client_surface_compositor_ready, &client_surface_compositor_parked );
+    }
     arm_client_surface_sources();
 }
 
 static void wait_client_surface_compositor_work( const struct client_surface_compositor_scan *scan )
 {
     struct pollfd waiters[CLIENT_SURFACE_HANDOFF_MAX_POOLS_PER_CONSUMER + CLIENT_SURFACE_COMPOSITOR_MAX_QUEUES + 1];
-    unsigned int count = 0;
+    unsigned int count = 0, source_start, i;
     DWORD elapsed;
     int ret, timeout = scan->timeout;
 
@@ -331,6 +337,7 @@ static void wait_client_surface_compositor_work( const struct client_surface_com
     pthread_mutex_unlock( &client_surface_compositor_mutex );
     waiters[count++] = (struct pollfd){client_surface_compositor_notify[0], POLLIN, 0};
     count += get_client_surface_output_waiters( scan, waiters + count, ARRAY_SIZE(waiters) - count );
+    source_start = count;
     count += get_client_surface_source_waiters( scan, waiters + count, ARRAY_SIZE(waiters) - count );
     /* The earliest deadline was collected during the traversal. Time spent
      * in later slices must not extend it, including across tick wraparound. */
@@ -348,6 +355,15 @@ static void wait_client_surface_compositor_work( const struct client_surface_com
         ret = poll( waiters, count, timeout );
     } while (ret < 0 && errno == EINTR);
     if (ret < 0) WARN( "client-surface compositor poll failed, error %d\n", errno );
+    if (waiters[0].revents & POLLIN) drain_client_surface_notification( waiters[0].fd );
+    /* A producer can write after the actor has drained and rearmed its
+     * handshake. Consume such delayed signals here even if it remains armed;
+     * the next full traversal precedes any further sleep. */
+    for (i = source_start; i < count; ++i)
+        if (waiters[i].revents & POLLIN) drain_client_surface_notification( waiters[i].fd );
+    /* A deadline or source/display fd can make a parked head runnable without
+     * a callback on our notification fd. Recheck after every actual wait. */
+    wake_client_surface_compositor_queues();
 }
 
 void quiesce_client_surface_compositor_target( struct client_surface_compositor_target *target )
@@ -1070,7 +1086,6 @@ static void client_surface_compositor_thread( void *context )
         arm_client_surface_compositor_work();
         scan = (struct client_surface_compositor_scan)
         {
-            .wake_serial = client_surface_compositor_wake_serial,
             .timeout = -1,
         };
 
@@ -1094,9 +1109,9 @@ static void client_surface_compositor_thread( void *context )
             progressed |= finish_client_surface_composition();
             scan.progressed |= progressed;
         } while (scan.remaining || scan.handoff_remaining);
-        /* Helpers acquiring output credit can consume events too. Count
-         * those wakes even when their caller could not submit any work. */
-        if (scan.progressed || scan.wake_serial != client_surface_compositor_wake_serial)
+        /* Helpers acquiring output credit can consume events too. Recheck
+         * their wakes even when the caller could not submit any work. */
+        if (scan.progressed || ReadAcquire( &client_surface_compositor_wake_pending ))
             continue;
         wait_client_surface_compositor_work( &scan );
     }

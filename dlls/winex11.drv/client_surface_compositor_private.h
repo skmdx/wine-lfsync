@@ -266,7 +266,7 @@ struct client_surface_binding_key
 
 struct client_surface_compositor_scan
 {
-    UINT64 generation, wake_serial, pool_generation;
+    UINT64 generation, pool_generation;
     unsigned int remaining, handoff_remaining;
     unsigned int target_count, pool_count;
     DWORD timeout_start;
