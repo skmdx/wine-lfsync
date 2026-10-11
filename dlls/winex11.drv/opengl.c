@@ -2149,7 +2149,7 @@ static struct egl_snapshot_image *import_snapshot_image( struct x11drv_client_sn
 /* Transfer rendered storage only after selecting a distinct writable image
  * for the next back buffer. Front writes first detach both logical buffers. */
 static BOOL rotate_render_snapshot( struct opengl_drawable *base, struct client_surface_frame *present,
-                                    GLuint framebuffer, struct x11drv_client_snapshot **capture,
+                                    GLuint framebuffer, SIZE source_size, struct x11drv_client_snapshot **capture,
                                     struct egl_snapshot_image **capture_image, BOOL *direct_image )
 {
     struct gl_drawable *gl = impl_from_opengl_drawable( base );
@@ -2175,7 +2175,7 @@ static BOOL rotate_render_snapshot( struct opengl_drawable *base, struct client_
     funcs->p_glGetTexLevelParameteriv( GL_TEXTURE_2D, 0, GL_TEXTURE_INTERNAL_FORMAT, &format );
     size = gl->render_snapshot ? x11drv_client_snapshot_size( gl->render_snapshot ) : (SIZE){0};
     direct = gl->render_snapshot && gl->render_texture == front &&
-             size.cx == base->virtual_size.cx && size.cy == base->virtual_size.cy;
+             size.cx == source_size.cx && size.cy == source_size.cy;
     if (format != GL_RGB && format != GL_RGB8 && !direct) goto done;
     if (direct)
     {
@@ -2185,7 +2185,7 @@ static BOOL rotate_render_snapshot( struct opengl_drawable *base, struct client_
     else
     {
         if (!x11drv_client_snapshot_prepare_storage( &next, x11drv_client_snapshot_memory( *capture ),
-                base->virtual_size.cx, base->virtual_size.cy, default_visual.depth )) goto failed;
+                source_size.cx, source_size.cy, default_visual.depth )) goto failed;
         if (!(next_image = import_snapshot_image( next, &error ))) goto failed;
     }
     funcs->p_glBindTexture( GL_TEXTURE_2D, back );
@@ -2337,7 +2337,7 @@ enum client_surface_gpu_snapshot_result
  * again. PENDING transfers the exact fence to both the image and completion.
  * Neither outcome permits a CPU overwrite of the capture storage. */
 static enum client_surface_gpu_snapshot_result snapshot_client_surface_gpu( struct opengl_drawable *base,
-                                        struct client_surface_frame *present, GLuint source_framebuffer, BOOL flipped,
+                                        struct client_surface_frame *present, GLuint source_framebuffer, SIZE size, BOOL flipped,
                                         opengl_drawable_isolate_func isolate )
 {
     struct x11drv_client_snapshot *snapshot;
@@ -2346,7 +2346,6 @@ static enum client_surface_gpu_snapshot_result snapshot_client_surface_gpu( stru
     struct x11drv_client_surface *surface = impl_from_client_surface( base->client );
     struct client_surface_source *source = present->handoff_source;
     struct client_surface_target target;
-    SIZE size = base->virtual_size;
     GLint read_fbo, draw_fbo, read_buffer, renderbuffer;
     GLuint fbo = 0, buffer = 0;
     GLboolean scissor, srgb;
@@ -2382,7 +2381,7 @@ static enum client_surface_gpu_snapshot_result snapshot_client_surface_gpu( stru
                x11drv_client_snapshot_pixmap( snapshot ), (unsigned int)size.cx, (unsigned int)size.cy,
                surface->source_visual, default_visual.visualid );
     if (flipped && source_framebuffer && snapshot_bind_texture && !impl_from_opengl_drawable( base )->framebuffer_private)
-        if (!rotate_render_snapshot( base, present, source_framebuffer, &snapshot, &image, &direct_image ))
+        if (!rotate_render_snapshot( base, present, source_framebuffer, size, &snapshot, &image, &direct_image ))
             return GPU_SNAPSHOT_RETRY;
     pixmap = x11drv_client_snapshot_pixmap( snapshot );
     imported = begin ? client_surface_perf_time() : 0;
@@ -2812,7 +2811,7 @@ static BOOL x11drv_egl_surface_present( struct opengl_drawable *base, GLuint fra
         enum client_surface_gpu_snapshot_result gpu = GPU_SNAPSHOT_UNSUPPORTED;
         BOOL copied;
 
-        gpu = snapshot_client_surface_gpu( base, &present, framebuffer, flipped, isolate );
+        gpu = snapshot_client_surface_gpu( base, &present, framebuffer, size, flipped, isolate );
         copied = gpu == GPU_SNAPSHOT_COMPLETE || gpu == GPU_SNAPSHOT_PENDING ||
                  (gpu == GPU_SNAPSHOT_UNSUPPORTED && snapshot_client_surface( base, &present, framebuffer,
                                                     framebuffer ? GL_COLOR_ATTACHMENT0 : GL_BACK ));
@@ -2885,12 +2884,15 @@ static BOOL x11drv_egl_surface_swap( struct opengl_drawable *base )
     return x11drv_egl_surface_present( base, 0, NULL, NULL, FALSE, NULL );
 }
 
-static BOOL x11drv_egl_surface_swap_framebuffer( struct opengl_drawable *base, GLuint framebuffer, BOOL flipped,
+static BOOL x11drv_egl_surface_swap_framebuffer( struct opengl_drawable *base, struct opengl_drawable *source, BOOL flipped,
                                                opengl_drawable_isolate_func isolate )
 {
     struct gl_drawable *gl = impl_from_opengl_drawable( base );
     struct x11drv_client_snapshot *rendered = gl->render_snapshot;
-    BOOL ret = x11drv_egl_surface_present( base, framebuffer, NULL, NULL, flipped, isolate );
+    GLuint framebuffer = source->read_fbo;
+    /* The native target may have observed a newer resize than the rendered
+     * storage. Capture and completion must use the source's dimensions. */
+    BOOL ret = x11drv_egl_surface_present( base, framebuffer, source, NULL, flipped, isolate );
 
     /* A superseded frame or CPU fallback can succeed without rotating the
      * native back storage. The generic FBO has already swapped attachments;

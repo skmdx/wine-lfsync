@@ -953,7 +953,7 @@ static BOOL present_framebuffer_surface( struct opengl_drawable *drawable, BOOL 
     {
         if (!is_client_surface_window( target->client, 0 )) return FALSE;
         client_surface_update( target->client );
-        return target->funcs->swap_framebuffer( target, drawable->read_fbo, surface->flipped,
+        return target->funcs->swap_framebuffer( target, drawable, surface->flipped,
                                                client_capture ? isolate_framebuffer_write : NULL );
     }
     if (target->funcs->swap_blit)
