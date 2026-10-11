@@ -768,6 +768,19 @@ static void release_client_surface_import_read( void *context )
         free_client_surface_compositor_binding( binding );
 }
 
+static void invalidate_client_surface_source_replay( struct client_surface_compositor_target *target,
+                                                     struct client_surface_compositor_binding *binding )
+{
+    binding->replay_epoch = 0;
+    if (!target) return;
+    /* Scene replacement can reassign indices while a native read is pending.
+     * Only use an index authenticated against the currently installed plan. */
+    if (target->scene.valid && binding->scene_index < target->scene.count &&
+        target->scene.members[binding->scene_index] == binding)
+        target->replay_member = min( target->replay_member, binding->scene_index );
+    else target->replay_member = 0;
+}
+
 static void release_client_surface_cached_source( struct client_surface_compositor_binding *binding,
                                                   BOOL success )
 {
@@ -799,12 +812,11 @@ static void release_client_surface_cached_source( struct client_surface_composit
     {
         struct client_surface_compositor_target *target = find_client_surface_compositor_target( binding->toplevel );
 
-        binding->replay_epoch = 0;
-        /* A new completed source also retries preceding dirty scene members.
-         * No target pointer is borrowed across this native copy. */
+        /* Preserve an earlier pending replay without rescanning clean members
+         * before this source. No target is borrowed across the native copy. */
+        invalidate_client_surface_source_replay( target, binding );
         if (target)
         {
-            target->replay_member = 0;
             retry_client_surface_compositor_mailbox( target );
         }
     }
@@ -1560,7 +1572,7 @@ static void complete_client_surface_frame_copy( struct client_surface_compositor
     if (!success)
     {
         binding->source_epoch = binding->source_sequence = 0;
-        binding->replay_epoch = 0;
+        invalidate_client_surface_source_replay( target, binding );
         frame->revision = 0;
         return;
     }
@@ -1962,8 +1974,7 @@ static BOOL compose_client_surface_cached_frame( struct client_surface_composito
 retry:
             /* Output backpressure retains the owner cache, never a producer
              * slot. Retry this image when output work makes progress. */
-            binding->replay_epoch = 0;
-            target->replay_member = min( target->replay_member, binding->scene_index );
+            invalidate_client_surface_source_replay( target, binding );
             return FALSE;
         }
         /* A failed publication can leave staging without a generation.
