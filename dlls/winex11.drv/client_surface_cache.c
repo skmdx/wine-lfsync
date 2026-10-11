@@ -1097,18 +1097,21 @@ struct client_surface_cache_image *client_surface_cache_view(
     struct client_surface_cache_image *image;
 
     assert( storage->imported && storage->pixmap && storage->operation == CACHE_IDLE );
-    if (!(image = allocate_cache_image( &storage->memory, CLIENT_SURFACE_MEMORY_SOURCE, 0 ))) return NULL;
+    /* The parent reference keeps this allocation's owner and domain alive.
+     * A read view owns metadata, but no separate image storage or scope. */
+    if (!(image = client_surface_alloc_scoped_metadata( &storage->memory, 1, sizeof(*image) ))) return NULL;
     pthread_mutex_lock( &cache_mutex );
     if (image_count == CLIENT_SURFACE_CACHE_IMAGE_LIMIT ||
         source_count == CLIENT_SURFACE_CACHE_IMAGE_LIMIT - CLIENT_SURFACE_CACHE_OUTPUT_RESERVE)
     {
         pthread_mutex_unlock( &cache_mutex );
-        discard_cache_image( image );
+        client_surface_free_scoped_metadata( &storage->memory, image, sizeof(*image) );
         return NULL;
     }
     ++image_count;
     ++source_count;
     ++storage->refs;
+    image->refs = 1;
     image->parent = storage;
     image->acquired = TRUE;
     image->pixmap = storage->pixmap;
@@ -1383,8 +1386,7 @@ BOOL client_surface_complete_cache( unsigned int budget )
             TRACE_(csperf)( "ticks=%llu event=cache_view_return image=%p parent=%p pixmap=%lx count=%u\n",
                            client_surface_perf_time(), image, source, image->pixmap, image_count );
             pthread_mutex_unlock( &cache_mutex );
-            client_surface_release_scoped_memory( &image->memory, image->purpose, image->bytes );
-            client_surface_free_owned_metadata( &image->memory, image, sizeof(*image) );
+            client_surface_free_scoped_metadata( &source->memory, image, sizeof(*image) );
             client_surface_cache_release( source );
             release( context );
             progressed = TRUE;
